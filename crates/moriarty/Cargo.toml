@@ -4,3 +4,5 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+crossterm = "0.28.1"
+ratatui = "0.29.0"
