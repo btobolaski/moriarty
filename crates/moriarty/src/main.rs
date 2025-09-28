@@ -1,3 +1,5 @@
+use std::io;
+
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
@@ -11,7 +13,8 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
     Frame, Terminal, TerminalOptions, Viewport,
 };
-use std::io;
+
+mod event_bus;
 
 #[derive(Clone, Copy, PartialEq)]
 enum AppMode {
@@ -76,11 +79,10 @@ fn ui_inline(frame: &mut Frame, app: &App) {
     let input = Paragraph::new(Text::from(app.input.as_str()))
         .style(Style::default().fg(Color::Yellow))
         .wrap(ratatui::widgets::Wrap { trim: true })
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!("Input ({}h) - Enter to send, Tab for About, Alt+/- to resize", app.input_height))
-        );
+        .block(Block::default().borders(Borders::ALL).title(format!(
+            "Input ({}h) - Enter to send, Tab for About, Alt+/- to resize",
+            app.input_height
+        )));
 
     frame.render_widget(input, chunks[0]);
 }
@@ -91,29 +93,37 @@ fn ui_fullscreen(frame: &mut Frame, _app: &App) {
     // Create centered about widget
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(30),
-            Constraint::Min(5),
-            Constraint::Percentage(30),
-        ].as_ref())
+        .constraints(
+            [
+                Constraint::Percentage(30),
+                Constraint::Min(5),
+                Constraint::Percentage(30),
+            ]
+            .as_ref(),
+        )
         .split(size);
 
     let horizontal_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(20),
-            Constraint::Min(20),
-            Constraint::Percentage(20),
-        ].as_ref())
+        .constraints(
+            [
+                Constraint::Percentage(20),
+                Constraint::Min(20),
+                Constraint::Percentage(20),
+            ]
+            .as_ref(),
+        )
         .split(chunks[1]);
 
-    let about = Paragraph::new(Text::from("About\n\nMoriarty Terminal App\n\nA demonstration of ratatui's inline viewport feature."))
-        .style(Style::default().fg(Color::White))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("About (Press Escape to return)")
-        );
+    let about = Paragraph::new(Text::from(
+        "About\n\nMoriarty Terminal App\n\nA demonstration of ratatui's inline viewport feature.",
+    ))
+    .style(Style::default().fg(Color::White))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("About (Press Escape to return)"),
+    );
 
     frame.render_widget(about, horizontal_chunks[1]);
 }
@@ -164,7 +174,8 @@ fn run_inline_mode(app: &mut App) -> Result<bool, Box<dyn std::error::Error>> {
                         app.input_height += 1;
                     }
                     KeyCode::Char('-') if key.modifiers.contains(event::KeyModifiers::ALT) => {
-                        if app.input_height > 3 { // Minimum height is 3
+                        if app.input_height > 3 {
+                            // Minimum height is 3
                             app.input_height -= 1;
                         }
                     }
