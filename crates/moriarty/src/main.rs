@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 mod logs;
+mod tui;
 
 #[tokio::main]
 async fn main() -> miette::Result<()> {
@@ -10,7 +11,20 @@ async fn main() -> miette::Result<()> {
 
     match cli.command {
         Command::Logs { file } => {
-            logs::read_file(file).await?;
+            // Read and parse the log file
+            let log_lines = logs::parser::read_file(file).await?;
+
+            // Initialize the terminal
+            let terminal = ratatui::init();
+
+            // Create and run the app
+            let app = tui::app::App::new(log_lines);
+            let result = app.run(terminal).await;
+
+            // Restore the terminal
+            ratatui::restore();
+
+            result?;
         }
     }
 
