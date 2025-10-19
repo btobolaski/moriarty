@@ -6,6 +6,11 @@ resolver = "2"
 # rebuilt if the other package's sources change.
 members = ["crates/*"]
 
+[profile.release]
+lto = "fat"
+opt-level = 3
+codegen-units = 1
+
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
