@@ -182,11 +182,12 @@ pub async fn read_file(file: impl AsRef<Path>) -> miette::Result<Vec<LogLine>> {
 
     for line in string_contents.split('\n') {
         if !line.is_empty() {
-            let log_line: LogLine = serde_json::from_str(line)
-                .into_diagnostic()
-                .inspect_err(|_| {
-                    println!("{line}");
-                })?;
+            let log_line: LogLine =
+                serde_json::from_str(line)
+                    .into_diagnostic()
+                    .inspect_err(|_| {
+                        println!("{line}");
+                    })?;
             log_lines.push(log_line);
         }
     }

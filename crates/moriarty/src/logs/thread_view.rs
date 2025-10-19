@@ -45,7 +45,7 @@ impl StatefulWidget for &ThreadView {
                 let wrapped_lines = if line_len == 0 {
                     1
                 } else {
-                    (line_len + content_width - 1) / content_width
+                    line_len.div_ceil(content_width)
                 };
                 line_count = line_count.saturating_add(wrapped_lines);
             }
