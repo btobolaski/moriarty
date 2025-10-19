@@ -17,6 +17,37 @@ pub enum LogLine {
     FileHistorySnapshot(FileHistorySnapshot),
     #[serde(rename = "summary")]
     Summary(Summary),
+    #[serde(rename = "system")]
+    System(SystemLogLine),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct SystemLogLine {
+    pub parent_uuid: Option<Uuid>,
+    pub logical_parent_uuid: Uuid,
+    pub is_sidechain: bool,
+    pub user_type: String,
+    pub cwd: String,
+    pub session_id: Uuid,
+    pub version: String,
+    pub git_branch: String,
+    pub subtype: String,
+    pub content: String,
+    pub is_meta: bool,
+    pub timestamp: DateTime<Utc>,
+    pub uuid: Uuid,
+    pub level: String,
+    pub compact_metadata: CompatctMetadata,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct CompatctMetadata {
+    pub trigger: String,
+    pub pre_tokens: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,6 +93,8 @@ pub struct UserLogLine {
     pub timestamp: DateTime<Utc>,
     pub tool_use_result: Option<ToolUseResult>,
     pub thinking_metadata: Option<ThinkingMetadata>,
+    pub is_visible_in_transcript_only: Option<bool>,
+    pub is_compact_summary: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
