@@ -102,6 +102,6 @@ impl App {
 
     fn render(&mut self, frame: &mut Frame) {
         let area = frame.area();
-        frame.render_stateful_widget(&self.thread_view, area, &mut self.scroll_state);
+        frame.render_stateful_widget(&mut self.thread_view, area, &mut self.scroll_state);
     }
 }
