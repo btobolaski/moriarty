@@ -61,7 +61,8 @@ impl ThreadView {
 
     fn update_heights_if_needed(&mut self, content_width: u16) {
         if content_width != self.cached_width {
-            let (heights, total_height) = Self::calculate_heights(&self.rendered_texts, content_width);
+            let (heights, total_height) =
+                Self::calculate_heights(&self.rendered_texts, content_width);
             self.heights = heights;
             self.total_height = total_height;
             self.cached_width = content_width;

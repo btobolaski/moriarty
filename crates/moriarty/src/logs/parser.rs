@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use tokio::fs::read_to_string;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum LogLine {
     #[serde(rename = "user")]
@@ -21,10 +21,69 @@ pub enum LogLine {
     System(SystemLogLine),
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "subtype")]
+#[serde(rename_all = "snake_case")]
+pub enum SystemLogLine {
+    Error(SystemLogError),
+    CompactBoundary(CompactBoundary),
+    Informational(SystemLogInformational),
+    ApiError(SystemLogError),
+    LocalCommand(LocalCommandLog),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
-pub struct SystemLogLine {
+pub struct LocalCommandLog {
+    pub parent_uuid: Option<Uuid>,
+    pub is_sidechain: bool,
+    pub user_type: String,
+    pub cwd: String,
+    pub session_id: Uuid,
+    pub version: String,
+    pub git_branch: String,
+    pub content: String,
+    pub level: String,
+    pub timestamp: DateTime<Utc>,
+    pub uuid: Uuid,
+    pub is_meta: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct SystemLogError {
+    pub parent_uuid: Uuid,
+    pub is_sidechain: bool,
+    pub user_type: String,
+    pub cwd: String,
+    pub session_id: String,
+    pub version: String,
+    pub git_branch: String,
+    pub level: String,
+    pub error: SystemLogErrorError,
+    pub retry_in_ms: f64,
+    pub retry_attempt: usize,
+    pub max_retries: usize,
+    pub timestamp: DateTime<Utc>,
+    pub uuid: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct SystemLogErrorError {
+    pub status: u16,
+    pub headers: HashMap<String, String>,
+    #[serde(rename = "requestID")]
+    pub request_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct CompactBoundary {
     pub parent_uuid: Option<Uuid>,
     pub logical_parent_uuid: Uuid,
     pub is_sidechain: bool,
@@ -33,19 +92,36 @@ pub struct SystemLogLine {
     pub session_id: Uuid,
     pub version: String,
     pub git_branch: String,
-    pub subtype: String,
     pub content: String,
     pub is_meta: bool,
     pub timestamp: DateTime<Utc>,
     pub uuid: Uuid,
     pub level: String,
-    pub compact_metadata: CompatctMetadata,
+    pub compact_metadata: CompactMetadata,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
-pub struct CompatctMetadata {
+pub struct SystemLogInformational {
+    pub parent_uuid: Uuid,
+    pub is_sidechain: bool,
+    pub git_branch: Option<String>,
+    pub user_type: String,
+    pub cwd: String,
+    pub session_id: Uuid,
+    pub version: String,
+    pub content: String,
+    pub is_meta: bool,
+    pub timestamp: DateTime<Utc>,
+    pub uuid: Uuid,
+    pub level: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct CompactMetadata {
     pub trigger: String,
     pub pre_tokens: usize,
 }
@@ -153,9 +229,19 @@ pub enum LogMessageTaggedContent {
         name: String,
         input: HashMap<String, serde_json::Value>,
     },
-    ToolResult {
+    ToolResult(ToolResult),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(untagged)]
+pub enum ToolResult {
+    Current {
         content: LogMessageContent,
         is_error: Option<bool>,
+        tool_use_id: String,
+    },
+    V1 {
         tool_use_id: String,
     },
 }
@@ -172,9 +258,10 @@ pub struct AssistantLogLine {
     pub version: String,
     pub git_branch: String,
     pub message: AssistantLogMessage,
-    pub request_id: String,
+    pub request_id: Option<String>,
     pub uuid: Uuid,
     pub timestamp: DateTime<Utc>,
+    pub is_api_error_message: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -184,6 +271,7 @@ pub struct AssistantLogMessage {
     pub r#type: String,
     pub role: String,
     pub model: String,
+    pub container: Option<String>,
     pub content: LogMessageContent,
     pub stop_reason: Option<String>,
     pub stop_sequence: Option<String>,
@@ -198,7 +286,14 @@ pub struct AssistantUsage {
     pub cache_read_input_tokens: usize,
     pub cache_creation: AssistantCacheCreation,
     pub output_tokens: usize,
-    pub service_tier: String,
+    pub service_tier: Option<String>,
+    pub server_tool_use: Option<ServerToolUse>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerToolUse {
+    pub web_search_requests: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
