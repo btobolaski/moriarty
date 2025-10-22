@@ -10,12 +10,11 @@ enum RenderedMessage {
 }
 
 pub struct ThreadView {
-    // Cache of rendered messages (these never change)
     rendered_messages: Vec<RenderedMessage>,
-    // Cache of heights (recalculated when width changes)
     heights: Vec<u16>,
     total_height: u16,
     cached_width: u16,
+    selected_index: usize,
 }
 
 impl ThreadView {
@@ -24,12 +23,13 @@ impl ThreadView {
         let rendered_messages: Vec<RenderedMessage> = contents
             .iter()
             .filter_map(|item| match item {
-                LogLine::User(user_msg) => Some(RenderedMessage::User(
-                    format!("{:#?}", user_msg.message),
-                )),
-                LogLine::Assistant(assistant_msg) => Some(RenderedMessage::Assistant(
-                    format!("{:#?}", assistant_msg.message),
-                )),
+                LogLine::User(user_msg) => {
+                    Some(RenderedMessage::User(format!("{:#?}", user_msg.message)))
+                }
+                LogLine::Assistant(assistant_msg) => Some(RenderedMessage::Assistant(format!(
+                    "{:#?}",
+                    assistant_msg.message
+                ))),
                 _ => None,
             })
             .collect();
@@ -43,10 +43,14 @@ impl ThreadView {
             heights,
             total_height,
             cached_width: initial_width,
+            selected_index: 0,
         }
     }
 
-    fn calculate_heights(rendered_messages: &[RenderedMessage], content_width: u16) -> (Vec<u16>, u16) {
+    fn calculate_heights(
+        rendered_messages: &[RenderedMessage],
+        content_width: u16,
+    ) -> (Vec<u16>, u16) {
         let mut heights = Vec::with_capacity(rendered_messages.len());
         let mut total_height = 0u16;
 
@@ -68,7 +72,7 @@ impl ThreadView {
                 line_count = line_count.saturating_add(wrapped_lines);
             }
 
-            // Add 1 line for the horizontal separator
+            // Account for separator line that visually divides messages in the UI
             let height = line_count.max(1).saturating_add(1);
             heights.push(height);
             total_height = total_height.saturating_add(height);
@@ -85,6 +89,64 @@ impl ThreadView {
             self.total_height = total_height;
             self.cached_width = content_width;
         }
+    }
+
+    /// Move selection to the next message. Returns true if selection moved.
+    pub fn select_next(&mut self) -> bool {
+        if self.selected_index + 1 < self.rendered_messages.len() {
+            self.selected_index += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Move selection to the previous message. Returns true if selection moved.
+    pub fn select_previous(&mut self) -> bool {
+        if self.selected_index > 0 {
+            self.selected_index -= 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Move selection to the first message.
+    pub fn select_first(&mut self) {
+        if !self.rendered_messages.is_empty() {
+            self.selected_index = 0;
+        }
+    }
+
+    /// Move selection to the last message.
+    pub fn select_last(&mut self) {
+        if !self.rendered_messages.is_empty() {
+            self.selected_index = self.rendered_messages.len() - 1;
+        }
+    }
+
+    /// Get the Y offset where the selected message starts.
+    pub fn get_selected_y_offset(&self) -> u16 {
+        self.heights
+            .iter()
+            .take(self.selected_index)
+            .copied()
+            .fold(0u16, |acc, h| acc.saturating_add(h))
+    }
+
+    /// Get the total number of messages.
+    pub fn get_message_count(&self) -> usize {
+        self.rendered_messages.len()
+    }
+
+    /// Get the currently selected index.
+    pub fn get_selected_index(&self) -> usize {
+        self.selected_index
+    }
+
+    /// Get the height of the selected message.
+    pub fn get_selected_height(&self) -> u16 {
+        self.heights.get(self.selected_index).copied().unwrap_or(0)
     }
 }
 
@@ -109,10 +171,22 @@ impl StatefulWidget for &mut ThreadView {
 
         // Render each message into the scroll buffer
         let mut y_offset = 0u16;
-        for (message, &height) in self.rendered_messages.iter().zip(self.heights.iter()) {
-            let (text, style) = match message {
+        for (index, (message, &height)) in self
+            .rendered_messages
+            .iter()
+            .zip(self.heights.iter())
+            .enumerate()
+        {
+            let (text, base_style) = match message {
                 RenderedMessage::User(text) => (text, Style::default().fg(Color::Blue)),
                 RenderedMessage::Assistant(text) => (text, Style::default()),
+            };
+
+            // Apply selection highlight if this is the selected message
+            let style = if index == self.selected_index {
+                base_style.add_modifier(ratatui::style::Modifier::REVERSED)
+            } else {
+                base_style
             };
 
             // Render the message text
@@ -121,7 +195,10 @@ impl StatefulWidget for &mut ThreadView {
                 .wrap(Wrap { trim: false })
                 .style(style);
 
-            scroll_view.render_widget(paragraph, Rect::new(0, y_offset, content_width, message_height));
+            scroll_view.render_widget(
+                paragraph,
+                Rect::new(0, y_offset, content_width, message_height),
+            );
 
             // Render horizontal separator line
             let separator_y = y_offset.saturating_add(message_height);
@@ -136,5 +213,356 @@ impl StatefulWidget for &mut ThreadView {
 
         // Render the scroll view to display the visible portion
         scroll_view.render(area, buf, state);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::logs::parser::{
+        AssistantCacheCreation, AssistantLogLine, AssistantLogMessage, AssistantUsage, LogMessage,
+        LogMessageContent, Summary, UserLogLine,
+    };
+    use chrono::Utc;
+    use uuid::Uuid;
+
+    /// Helper to create a minimal UserLogLine for testing
+    fn create_test_user_message(text: &str) -> LogLine {
+        LogLine::User(UserLogLine {
+            parent_uuid: None,
+            is_sidechain: false,
+            user_type: "test".to_string(),
+            cwd: "/test".to_string(),
+            session_id: Uuid::new_v4(),
+            version: "1.0.0".to_string(),
+            git_branch: "main".to_string(),
+            message: LogMessage {
+                role: "user".to_string(),
+                content: LogMessageContent::String(text.to_string()),
+            },
+            is_meta: None,
+            uuid: Uuid::new_v4(),
+            timestamp: Utc::now(),
+            tool_use_result: None,
+            thinking_metadata: None,
+            is_visible_in_transcript_only: None,
+            is_compact_summary: None,
+        })
+    }
+
+    /// Helper to create a minimal AssistantLogLine for testing
+    fn create_test_assistant_message(text: &str) -> LogLine {
+        LogLine::Assistant(AssistantLogLine {
+            parent_uuid: None,
+            is_sidechain: false,
+            user_type: "test".to_string(),
+            cwd: "/test".to_string(),
+            session_id: "test-session".to_string(),
+            version: "1.0.0".to_string(),
+            git_branch: "main".to_string(),
+            message: AssistantLogMessage {
+                id: "msg_test".to_string(),
+                r#type: "message".to_string(),
+                role: "assistant".to_string(),
+                model: "claude-3".to_string(),
+                container: None,
+                content: LogMessageContent::String(text.to_string()),
+                stop_reason: None,
+                stop_sequence: None,
+                usage: AssistantUsage {
+                    input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                    cache_creation: AssistantCacheCreation {
+                        ephemeral_5m_input_tokens: 0,
+                        ephemeral_1h_input_tokens: 0,
+                    },
+                    output_tokens: 0,
+                    service_tier: None,
+                    server_tool_use: None,
+                },
+            },
+            request_id: None,
+            uuid: Uuid::new_v4(),
+            timestamp: Utc::now(),
+            is_api_error_message: None,
+        })
+    }
+
+    #[test]
+    fn test_new_thread_view_starts_at_first_message() {
+        let messages = vec![
+            create_test_user_message("Hello"),
+            create_test_assistant_message("Hi there"),
+        ];
+        let view = ThreadView::new(messages);
+
+        assert_eq!(view.get_selected_index(), 0);
+        assert_eq!(view.get_message_count(), 2);
+    }
+
+    #[test]
+    fn test_new_thread_view_empty_messages() {
+        let view = ThreadView::new(vec![]);
+
+        assert_eq!(view.get_selected_index(), 0);
+        assert_eq!(view.get_message_count(), 0);
+    }
+
+    #[test]
+    fn test_select_next_moves_forward() {
+        let messages = vec![
+            create_test_user_message("First"),
+            create_test_assistant_message("Second"),
+            create_test_user_message("Third"),
+        ];
+        let mut view = ThreadView::new(messages);
+
+        assert_eq!(view.get_selected_index(), 0);
+
+        let moved = view.select_next();
+        assert!(moved);
+        assert_eq!(view.get_selected_index(), 1);
+
+        let moved = view.select_next();
+        assert!(moved);
+        assert_eq!(view.get_selected_index(), 2);
+    }
+
+    #[test]
+    fn test_select_next_stops_at_last_message() {
+        let messages = vec![
+            create_test_user_message("First"),
+            create_test_assistant_message("Second"),
+        ];
+        let mut view = ThreadView::new(messages);
+
+        view.select_next(); // Move to index 1
+        let moved = view.select_next(); // Try to move past end
+
+        assert!(!moved);
+        assert_eq!(view.get_selected_index(), 1);
+    }
+
+    #[test]
+    fn test_select_next_empty_list() {
+        let mut view = ThreadView::new(vec![]);
+
+        let moved = view.select_next();
+        assert!(!moved);
+        assert_eq!(view.get_selected_index(), 0);
+    }
+
+    #[test]
+    fn test_select_previous_moves_backward() {
+        let messages = vec![
+            create_test_user_message("First"),
+            create_test_assistant_message("Second"),
+            create_test_user_message("Third"),
+        ];
+        let mut view = ThreadView::new(messages);
+
+        view.select_next();
+        view.select_next();
+        assert_eq!(view.get_selected_index(), 2);
+
+        let moved = view.select_previous();
+        assert!(moved);
+        assert_eq!(view.get_selected_index(), 1);
+
+        let moved = view.select_previous();
+        assert!(moved);
+        assert_eq!(view.get_selected_index(), 0);
+    }
+
+    #[test]
+    fn test_select_previous_stops_at_first_message() {
+        let messages = vec![
+            create_test_user_message("First"),
+            create_test_assistant_message("Second"),
+        ];
+        let mut view = ThreadView::new(messages);
+
+        let moved = view.select_previous(); // Try to move before start
+
+        assert!(!moved);
+        assert_eq!(view.get_selected_index(), 0);
+    }
+
+    #[test]
+    fn test_select_first_from_middle() {
+        let messages = vec![
+            create_test_user_message("First"),
+            create_test_assistant_message("Second"),
+            create_test_user_message("Third"),
+        ];
+        let mut view = ThreadView::new(messages);
+
+        view.select_next();
+        view.select_next();
+        assert_eq!(view.get_selected_index(), 2);
+
+        view.select_first();
+        assert_eq!(view.get_selected_index(), 0);
+    }
+
+    #[test]
+    fn test_select_first_when_already_first() {
+        let messages = vec![
+            create_test_user_message("First"),
+            create_test_assistant_message("Second"),
+        ];
+        let mut view = ThreadView::new(messages);
+
+        view.select_first();
+        assert_eq!(view.get_selected_index(), 0);
+    }
+
+    #[test]
+    fn test_select_first_empty_list() {
+        let mut view = ThreadView::new(vec![]);
+
+        view.select_first();
+        assert_eq!(view.get_selected_index(), 0);
+    }
+
+    #[test]
+    fn test_select_last_from_middle() {
+        let messages = vec![
+            create_test_user_message("First"),
+            create_test_assistant_message("Second"),
+            create_test_user_message("Third"),
+        ];
+        let mut view = ThreadView::new(messages);
+
+        assert_eq!(view.get_selected_index(), 0);
+
+        view.select_last();
+        assert_eq!(view.get_selected_index(), 2);
+    }
+
+    #[test]
+    fn test_select_last_when_already_last() {
+        let messages = vec![
+            create_test_user_message("First"),
+            create_test_assistant_message("Second"),
+        ];
+        let mut view = ThreadView::new(messages);
+
+        view.select_last();
+        assert_eq!(view.get_selected_index(), 1);
+
+        view.select_last();
+        assert_eq!(view.get_selected_index(), 1);
+    }
+
+    #[test]
+    fn test_select_last_single_message() {
+        let messages = vec![create_test_user_message("Only")];
+        let mut view = ThreadView::new(messages);
+
+        view.select_last();
+        assert_eq!(view.get_selected_index(), 0);
+    }
+
+    #[test]
+    fn test_select_last_empty_list() {
+        let mut view = ThreadView::new(vec![]);
+
+        view.select_last();
+        assert_eq!(view.get_selected_index(), 0);
+    }
+
+    #[test]
+    fn test_get_selected_y_offset_first_message() {
+        let messages = vec![
+            create_test_user_message("First"),
+            create_test_assistant_message("Second"),
+        ];
+        let view = ThreadView::new(messages);
+
+        assert_eq!(view.get_selected_y_offset(), 0);
+    }
+
+    #[test]
+    fn test_get_selected_y_offset_cumulative() {
+        let messages = vec![
+            create_test_user_message("First"),
+            create_test_assistant_message("Second"),
+            create_test_user_message("Third"),
+        ];
+        let mut view = ThreadView::new(messages);
+
+        let first_offset = view.get_selected_y_offset();
+        assert_eq!(first_offset, 0);
+
+        view.select_next();
+        let second_offset = view.get_selected_y_offset();
+        assert!(
+            second_offset > 0,
+            "Second message should have non-zero offset"
+        );
+
+        let first_height = view.heights[0];
+        assert_eq!(second_offset, first_height);
+
+        view.select_next();
+        let third_offset = view.get_selected_y_offset();
+        let expected = first_height.saturating_add(view.heights[1]);
+        assert_eq!(third_offset, expected);
+    }
+
+    #[test]
+    fn test_get_selected_height() {
+        let messages = vec![
+            create_test_user_message("Short"),
+            create_test_assistant_message("This is a much longer message that will wrap"),
+        ];
+        let view = ThreadView::new(messages);
+
+        let height = view.get_selected_height();
+        assert!(height > 0);
+    }
+
+    #[test]
+    fn test_get_selected_height_empty_list() {
+        let view = ThreadView::new(vec![]);
+
+        let height = view.get_selected_height();
+        assert_eq!(height, 0);
+    }
+
+    #[test]
+    fn test_message_filtering() {
+        // ThreadView should filter out non-User and non-Assistant messages
+        let messages = vec![
+            create_test_user_message("User 1"),
+            LogLine::Summary(Summary {
+                summary: "Should be filtered".to_string(),
+                leaf_uuid: Uuid::new_v4(),
+            }),
+            create_test_assistant_message("Assistant 1"),
+        ];
+        let view = ThreadView::new(messages);
+
+        // Only 2 messages should be rendered (User and Assistant)
+        assert_eq!(view.get_message_count(), 2);
+    }
+
+    #[test]
+    fn test_selection_navigation_with_single_message() {
+        let messages = vec![create_test_user_message("Only message")];
+        let mut view = ThreadView::new(messages);
+
+        assert_eq!(view.get_selected_index(), 0);
+        assert!(!view.select_next()); // Can't go forward
+        assert!(!view.select_previous()); // Can't go backward
+        assert_eq!(view.get_selected_index(), 0);
+
+        view.select_first();
+        assert_eq!(view.get_selected_index(), 0);
+
+        view.select_last();
+        assert_eq!(view.get_selected_index(), 0);
     }
 }

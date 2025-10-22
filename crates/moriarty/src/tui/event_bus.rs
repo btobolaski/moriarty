@@ -21,6 +21,7 @@ pub enum Event {
 
 pub enum UIEvent {
     Key(KeyEvent),
+    #[allow(dead_code)]
     Paste(String),
     Render,
 }
