@@ -10,6 +10,7 @@ members = ["crates/*"]
 lto = "fat"
 opt-level = 3
 codegen-units = 1
+debug = true
 
 [workspace.package]
 version = "0.1.0"
