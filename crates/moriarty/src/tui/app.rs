@@ -4,7 +4,7 @@ use miette::IntoDiagnostic;
 use ratatui::{prelude::*, DefaultTerminal};
 use tui_scrollview::ScrollViewState;
 
-use crate::logs::{parser::LogLine, thread_view::ThreadView};
+use crate::logs::{message_modal::MessageModal, parser::LogLine, thread_view::ThreadView};
 
 use super::event_bus::{input_stream, Event, UIEvent};
 
@@ -14,6 +14,8 @@ pub struct App {
     should_quit: bool,
     current_scroll_y: u16,
     viewport_height: u16,
+    modal_open: bool,
+    modal_scroll_state: ScrollViewState,
 }
 
 impl App {
@@ -24,6 +26,8 @@ impl App {
             should_quit: false,
             current_scroll_y: 0,
             viewport_height: 0,
+            modal_open: false,
+            modal_scroll_state: ScrollViewState::default(),
         }
     }
 
@@ -110,10 +114,59 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        if self.modal_open {
+            self.handle_modal_keys(key);
+        } else {
+            self.handle_main_view_keys(key);
+        }
+    }
+
+    fn handle_modal_keys(&mut self, key: KeyEvent) {
+        match key.code {
+            // Close modal
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.modal_open = false;
+                self.modal_scroll_state = ScrollViewState::default();
+            }
+            // Scroll modal down
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.modal_scroll_state.scroll_down();
+            }
+            // Scroll modal up
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.modal_scroll_state.scroll_up();
+            }
+            // Page down in modal
+            KeyCode::Char('f') | KeyCode::PageDown => {
+                self.modal_scroll_state.scroll_page_down();
+            }
+            // Page up in modal
+            KeyCode::Char('b') | KeyCode::PageUp => {
+                self.modal_scroll_state.scroll_page_up();
+            }
+            // Jump to top of modal
+            KeyCode::Char('g') | KeyCode::Home => {
+                self.modal_scroll_state.scroll_to_top();
+            }
+            // Jump to bottom of modal
+            KeyCode::Char('G') | KeyCode::End => {
+                self.modal_scroll_state.scroll_to_bottom();
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_main_view_keys(&mut self, key: KeyEvent) {
         match key.code {
             // Quit
             KeyCode::Char('q') | KeyCode::Esc => {
                 self.should_quit = true;
+            }
+            // Open modal for selected message
+            KeyCode::Enter => {
+                if self.thread_view.get_message_count() > 0 {
+                    self.modal_open = true;
+                }
             }
             // Move selection down
             KeyCode::Char('j') | KeyCode::Down => {
@@ -150,15 +203,142 @@ impl App {
                 // Update scroll position to be at bottom (will be corrected on next render)
                 self.current_scroll_y = u16::MAX;
             }
-            _ => {
-                // Ignore other keys
-            }
+            _ => {}
         }
     }
 
     fn render(&mut self, frame: &mut Frame) {
         let area = frame.area();
         self.viewport_height = area.height;
+
+        // Always render the thread view
         frame.render_stateful_widget(&mut self.thread_view, area, &mut self.scroll_state);
+
+        // If modal is open, render it on top
+        if self.modal_open {
+            if let Some(message_text) = self.thread_view.get_selected_message() {
+                let modal = MessageModal::new(message_text);
+                frame.render_stateful_widget(modal, area, &mut self.modal_scroll_state);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::logs::parser::{LogMessage, LogMessageContent, UserLogLine};
+    use chrono::Utc;
+    use uuid::Uuid;
+
+    fn create_test_user_message(text: &str) -> LogLine {
+        LogLine::User(UserLogLine {
+            parent_uuid: None,
+            is_sidechain: false,
+            user_type: "test".to_string(),
+            cwd: "/test".to_string(),
+            session_id: Uuid::new_v4(),
+            version: "1.0.0".to_string(),
+            git_branch: "main".to_string(),
+            message: LogMessage {
+                role: "user".to_string(),
+                content: LogMessageContent::String(text.to_string()),
+            },
+            is_meta: None,
+            uuid: Uuid::new_v4(),
+            timestamp: Utc::now(),
+            tool_use_result: None,
+            thinking_metadata: None,
+            is_visible_in_transcript_only: None,
+            is_compact_summary: None,
+        })
+    }
+
+    #[test]
+    fn test_new_app_modal_closed() {
+        let messages = vec![create_test_user_message("Test")];
+        let app = App::new(messages);
+
+        assert!(!app.modal_open, "Modal should be closed initially");
+    }
+
+    #[test]
+    fn test_handle_key_enter_opens_modal() {
+        let messages = vec![create_test_user_message("Test")];
+        let mut app = App::new(messages);
+
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+
+        assert!(
+            app.modal_open,
+            "Enter key should open modal when messages exist"
+        );
+    }
+
+    #[test]
+    fn test_handle_key_enter_no_messages() {
+        let mut app = App::new(vec![]);
+
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+
+        assert!(
+            !app.modal_open,
+            "Enter key should not open modal when no messages"
+        );
+    }
+
+    #[test]
+    fn test_handle_key_esc_closes_modal() {
+        let messages = vec![create_test_user_message("Test")];
+        let mut app = App::new(messages);
+
+        app.modal_open = true;
+
+        app.handle_key(KeyEvent::from(KeyCode::Esc));
+
+        assert!(!app.modal_open, "Esc should close modal");
+    }
+
+    #[test]
+    fn test_handle_key_q_closes_modal() {
+        let messages = vec![create_test_user_message("Test")];
+        let mut app = App::new(messages);
+
+        app.modal_open = true;
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('q')));
+
+        assert!(!app.modal_open, "'q' should close modal when modal is open");
+    }
+
+    #[test]
+    fn test_handle_key_q_quits_when_modal_closed() {
+        let messages = vec![create_test_user_message("Test")];
+        let mut app = App::new(messages);
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('q')));
+
+        assert!(app.should_quit, "'q' should quit app when modal is closed");
+    }
+
+    #[test]
+    fn test_modal_blocks_main_navigation() {
+        let messages = vec![
+            create_test_user_message("First"),
+            create_test_user_message("Second"),
+        ];
+        let mut app = App::new(messages);
+
+        let initial_index = app.thread_view.get_selected_index();
+
+        app.modal_open = true;
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('j')));
+
+        assert_eq!(
+            app.thread_view.get_selected_index(),
+            initial_index,
+            "Main view selection should not change when modal is open"
+        );
     }
 }

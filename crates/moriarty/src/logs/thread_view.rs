@@ -3,6 +3,23 @@ use tui_scrollview::ScrollViewState;
 
 use super::parser::LogLine;
 
+/// Calculate the number of lines required to display text at the given width.
+/// Accounts for line wrapping based on character count.
+pub(super) fn calculate_text_height(text: &str, content_width: u16) -> u16 {
+    let mut line_count = 0u16;
+    for line in text.lines() {
+        let line_len = line.len() as u16;
+        // Calculate how many visual lines this will take when wrapped
+        let wrapped_lines = if line_len == 0 {
+            1
+        } else {
+            line_len.div_ceil(content_width)
+        };
+        line_count = line_count.saturating_add(wrapped_lines);
+    }
+    line_count.max(1)
+}
+
 #[derive(Debug, Clone)]
 enum RenderedMessage {
     User(String),
@@ -59,21 +76,10 @@ impl ThreadView {
                 RenderedMessage::User(text) | RenderedMessage::Assistant(text) => text,
             };
 
-            // Count lines, accounting for width-based wrapping
-            let mut line_count = 0u16;
-            for line in text.lines() {
-                let line_len = line.len() as u16;
-                // Calculate how many visual lines this will take when wrapped
-                let wrapped_lines = if line_len == 0 {
-                    1
-                } else {
-                    line_len.div_ceil(content_width)
-                };
-                line_count = line_count.saturating_add(wrapped_lines);
-            }
+            let line_count = calculate_text_height(text, content_width);
 
             // Account for separator line that visually divides messages in the UI
-            let height = line_count.max(1).saturating_add(1);
+            let height = line_count.saturating_add(1);
             heights.push(height);
             total_height = total_height.saturating_add(height);
         }
@@ -147,6 +153,14 @@ impl ThreadView {
     /// Get the height of the selected message.
     pub fn get_selected_height(&self) -> u16 {
         self.heights.get(self.selected_index).copied().unwrap_or(0)
+    }
+
+    pub fn get_selected_message(&self) -> Option<&str> {
+        self.rendered_messages
+            .get(self.selected_index)
+            .map(|msg| match msg {
+                RenderedMessage::User(text) | RenderedMessage::Assistant(text) => text.as_str(),
+            })
     }
 }
 
@@ -564,5 +578,56 @@ mod tests {
 
         view.select_last();
         assert_eq!(view.get_selected_index(), 0);
+    }
+
+    #[test]
+    fn test_get_selected_message_returns_text() {
+        let messages = vec![
+            create_test_user_message("User text"),
+            create_test_assistant_message("Assistant text"),
+        ];
+        let view = ThreadView::new(messages);
+
+        let message = view.get_selected_message();
+        assert!(message.is_some());
+        assert!(message.unwrap().contains("User text"));
+    }
+
+    #[test]
+    fn test_get_selected_message_empty_list() {
+        let view = ThreadView::new(vec![]);
+
+        let message = view.get_selected_message();
+        assert!(message.is_none());
+    }
+
+    #[test]
+    fn test_get_selected_message_after_navigation() {
+        let messages = vec![
+            create_test_user_message("First"),
+            create_test_assistant_message("Second"),
+        ];
+        let mut view = ThreadView::new(messages);
+
+        view.select_next();
+        let message = view.get_selected_message();
+        assert!(message.is_some());
+        assert!(message.unwrap().contains("Second"));
+    }
+
+    #[test]
+    fn test_get_selected_message_user_vs_assistant() {
+        let messages = vec![
+            create_test_user_message("User"),
+            create_test_assistant_message("Assistant"),
+        ];
+        let mut view = ThreadView::new(messages);
+
+        let user_msg = view.get_selected_message();
+        assert!(user_msg.is_some());
+
+        view.select_next();
+        let assistant_msg = view.get_selected_message();
+        assert!(assistant_msg.is_some());
     }
 }
