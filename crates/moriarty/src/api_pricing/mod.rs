@@ -47,6 +47,17 @@ fn display_costs(daily_costs: &[DailyCosts]) {
         println!("Date: {}", costs.date);
         println!("{}", "-".repeat(REPORT_WIDTH));
 
+        if costs.opus_costs.total() > 0.0 {
+            println!(
+                "  Opus:    Input: ${:>8.4}  Output: ${:>8.4}  Cache Write: ${:>8.4}  Cache Read: ${:>8.4}  Subtotal: ${:>8.4}",
+                costs.opus_costs.input,
+                costs.opus_costs.output,
+                costs.opus_costs.cache_write,
+                costs.opus_costs.cache_read,
+                costs.opus_costs.total()
+            );
+        }
+
         // Sonnet costs
         if costs.sonnet_costs.total() > 0.0 {
             println!(
@@ -187,6 +198,7 @@ mod tests {
                 cache_read: 0.25,
             },
             haiku_costs: TokenCosts::default(),
+            opus_costs: TokenCosts::default(),
         }];
 
         display_costs(&daily_costs);
@@ -209,6 +221,7 @@ mod tests {
                 cache_write: 0.25,
                 cache_read: 0.1,
             },
+            opus_costs: TokenCosts::default(),
         }];
 
         display_costs(&daily_costs);
@@ -226,6 +239,7 @@ mod tests {
                     cache_read: 0.25,
                 },
                 haiku_costs: TokenCosts::default(),
+                opus_costs: TokenCosts::default(),
             },
             DailyCosts {
                 date: NaiveDate::from_ymd_opt(2025, 10, 24).unwrap(),
@@ -236,6 +250,7 @@ mod tests {
                     cache_write: 0.25,
                     cache_read: 0.1,
                 },
+                opus_costs: TokenCosts::default(),
             },
         ];
 

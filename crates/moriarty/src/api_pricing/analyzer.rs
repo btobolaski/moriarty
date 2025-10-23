@@ -25,6 +25,7 @@ pub struct DailyUsage {
     pub date: NaiveDate,
     pub sonnet_usage: TokenCounts,
     pub haiku_usage: TokenCounts,
+    pub opus_usage: TokenCounts,
     pub unknown_usage: TokenCounts,
 }
 
@@ -34,6 +35,7 @@ impl DailyUsage {
             date,
             sonnet_usage: TokenCounts::default(),
             haiku_usage: TokenCounts::default(),
+            opus_usage: TokenCounts::default(),
             unknown_usage: TokenCounts::default(),
         }
     }
@@ -42,6 +44,7 @@ impl DailyUsage {
         match model_type {
             ModelType::Sonnet => self.sonnet_usage.add(&counts),
             ModelType::Haiku => self.haiku_usage.add(&counts),
+            ModelType::Opus => self.opus_usage.add(&counts),
             ModelType::Unknown => self.unknown_usage.add(&counts),
         }
     }
@@ -57,10 +60,16 @@ impl DailyUsage {
             .map(|p| p.calculate_cost(&self.haiku_usage))
             .unwrap_or_default();
 
+        let opus_costs = ModelType::Opus
+            .pricing()
+            .map(|p| p.calculate_cost(&self.opus_usage))
+            .unwrap_or_default();
+
         DailyCosts {
             date: self.date,
             sonnet_costs,
             haiku_costs,
+            opus_costs,
         }
     }
 }
@@ -70,11 +79,12 @@ pub struct DailyCosts {
     pub date: NaiveDate,
     pub sonnet_costs: TokenCosts,
     pub haiku_costs: TokenCosts,
+    pub opus_costs: TokenCosts,
 }
 
 impl DailyCosts {
     pub fn total(&self) -> f64 {
-        self.sonnet_costs.total() + self.haiku_costs.total()
+        self.sonnet_costs.total() + self.haiku_costs.total() + self.opus_costs.total()
     }
 }
 
@@ -337,6 +347,12 @@ mod tests {
                 output: 1.0,
                 cache_write: 0.25,
                 cache_read: 0.1,
+            },
+            opus_costs: TokenCosts {
+                input: 0.0,
+                output: 0.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
             },
         };
 

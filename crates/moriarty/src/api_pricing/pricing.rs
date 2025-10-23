@@ -31,6 +31,13 @@ impl ModelPricing {
         cache_read: 0.1,
     };
 
+    pub const OPUS: Self = Self {
+        input: 15.0,
+        output: 75.0,
+        cache_write: 18.75,
+        cache_read: 1.5,
+    };
+
     /// Calculate the cost for the given token counts
     pub fn calculate_cost(&self, usage: &TokenCounts) -> TokenCosts {
         TokenCosts {
@@ -46,6 +53,7 @@ impl ModelPricing {
 pub enum ModelType {
     Sonnet,
     Haiku,
+    Opus,
     Unknown,
 }
 
@@ -73,6 +81,8 @@ impl ModelType {
             Self::Sonnet
         } else if model_lower.contains("haiku") {
             Self::Haiku
+        } else if model_lower.contains("opus") {
+            Self::Opus
         } else {
             Self::Unknown
         }
@@ -82,6 +92,7 @@ impl ModelType {
         match self {
             Self::Sonnet => Some(ModelPricing::SONNET),
             Self::Haiku => Some(ModelPricing::HAIKU),
+            Self::Opus => Some(ModelPricing::OPUS),
             Self::Unknown => None,
         }
     }
@@ -92,6 +103,7 @@ impl fmt::Display for ModelType {
         match self {
             Self::Sonnet => write!(f, "Sonnet"),
             Self::Haiku => write!(f, "Haiku"),
+            Self::Opus => write!(f, "Opus"),
             Self::Unknown => write!(f, "Unknown"),
         }
     }
@@ -229,7 +241,6 @@ mod tests {
     fn test_model_type_from_string_unknown() {
         assert_eq!(ModelType::from_model_string("gpt-4"), ModelType::Unknown);
         assert_eq!(ModelType::from_model_string(""), ModelType::Unknown);
-        assert_eq!(ModelType::from_model_string("opus"), ModelType::Unknown);
     }
 
     #[test]
