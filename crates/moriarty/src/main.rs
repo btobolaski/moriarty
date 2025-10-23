@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+mod api_pricing;
 mod logs;
 mod tui;
 
@@ -28,6 +29,10 @@ async fn main() -> miette::Result<()> {
                 result?;
             }
         }
+        Command::ApiPricing { dir } => {
+            // Run the API pricing analysis
+            api_pricing::run(&dir).await?;
+        }
     }
 
     Ok(())
@@ -49,5 +54,10 @@ pub enum Command {
         /// non-zero exit code if the parsing failed.
         #[arg(long)]
         validate: bool,
+    },
+    ApiPricing {
+        /// The directory to analyze for API usage
+        #[arg(short, long)]
+        dir: PathBuf,
     },
 }

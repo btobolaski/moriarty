@@ -22,3 +22,6 @@ tokio = { version = "1.47.1", features = [
 ] }
 tui-scrollview = "0.5.1"
 uuid = { version = "1.18.1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tempfile = "3"
