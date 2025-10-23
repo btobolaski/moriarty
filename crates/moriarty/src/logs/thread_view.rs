@@ -1,15 +1,19 @@
 use ratatui::{prelude::*, widgets::StatefulWidget};
 use tui_scrollview::ScrollViewState;
 
-use super::parser::LogLine;
+use super::{formatter::format_log_line, parser::LogLine};
 
 /// Calculate the number of lines required to display text at the given width.
 /// Accounts for line wrapping based on character count.
 pub(super) fn calculate_text_height(text: &str, content_width: u16) -> u16 {
+    if content_width == 0 {
+        let line_count = text.lines().count();
+        return u16::try_from(line_count).unwrap_or(u16::MAX).max(1);
+    }
+
     let mut line_count = 0u16;
     for line in text.lines() {
-        let line_len = line.len() as u16;
-        // Calculate how many visual lines this will take when wrapped
+        let line_len = u16::try_from(line.len()).unwrap_or(u16::MAX);
         let wrapped_lines = if line_len == 0 {
             1
         } else {
@@ -21,9 +25,9 @@ pub(super) fn calculate_text_height(text: &str, content_width: u16) -> u16 {
 }
 
 #[derive(Debug, Clone)]
-enum RenderedMessage {
-    User(String),
-    Assistant(String),
+struct RenderedMessage {
+    formatted: String,
+    original: LogLine,
 }
 
 pub struct ThreadView {
@@ -36,18 +40,15 @@ pub struct ThreadView {
 
 impl ThreadView {
     pub fn new(contents: Vec<LogLine>) -> Self {
-        // Render message field using debug formatting
+        // Render all log lines using the formatter
         let rendered_messages: Vec<RenderedMessage> = contents
-            .iter()
-            .filter_map(|item| match item {
-                LogLine::User(user_msg) => {
-                    Some(RenderedMessage::User(format!("{:#?}", user_msg.message)))
+            .into_iter()
+            .map(|log_line| {
+                let formatted = format_log_line(&log_line);
+                RenderedMessage {
+                    formatted,
+                    original: log_line,
                 }
-                LogLine::Assistant(assistant_msg) => Some(RenderedMessage::Assistant(format!(
-                    "{:#?}",
-                    assistant_msg.message
-                ))),
-                _ => None,
             })
             .collect();
 
@@ -72,13 +73,8 @@ impl ThreadView {
         let mut total_height = 0u16;
 
         for message in rendered_messages {
-            let text = match message {
-                RenderedMessage::User(text) | RenderedMessage::Assistant(text) => text,
-            };
+            let line_count = calculate_text_height(&message.formatted, content_width);
 
-            let line_count = calculate_text_height(text, content_width);
-
-            // Account for separator line that visually divides messages in the UI
             let height = line_count.saturating_add(1);
             heights.push(height);
             total_height = total_height.saturating_add(height);
@@ -158,9 +154,14 @@ impl ThreadView {
     pub fn get_selected_message(&self) -> Option<&str> {
         self.rendered_messages
             .get(self.selected_index)
-            .map(|msg| match msg {
-                RenderedMessage::User(text) | RenderedMessage::Assistant(text) => text.as_str(),
-            })
+            .map(|msg| msg.formatted.as_str())
+    }
+
+    /// Get the original LogLine for the selected message (used by modal for debug view)
+    pub fn get_selected_log_line(&self) -> Option<&LogLine> {
+        self.rendered_messages
+            .get(self.selected_index)
+            .map(|msg| &msg.original)
     }
 }
 
@@ -191,9 +192,10 @@ impl StatefulWidget for &mut ThreadView {
             .zip(self.heights.iter())
             .enumerate()
         {
-            let (text, base_style) = match message {
-                RenderedMessage::User(text) => (text, Style::default().fg(Color::Blue)),
-                RenderedMessage::Assistant(text) => (text, Style::default()),
+            // Use blue for user messages, default for everything else
+            let base_style = match &message.original {
+                LogLine::User(_) => Style::default().fg(Color::Blue),
+                _ => Style::default(),
             };
 
             // Apply selection highlight if this is the selected message
@@ -205,7 +207,7 @@ impl StatefulWidget for &mut ThreadView {
 
             // Render the message text
             let message_height = height.saturating_sub(1);
-            let paragraph = Paragraph::new(text.as_str())
+            let paragraph = Paragraph::new(message.formatted.as_str())
                 .wrap(Wrap { trim: false })
                 .style(style);
 
@@ -548,19 +550,19 @@ mod tests {
 
     #[test]
     fn test_message_filtering() {
-        // ThreadView should filter out non-User and non-Assistant messages
+        // ThreadView now displays all log types (User, Assistant, Summary, etc.)
         let messages = vec![
             create_test_user_message("User 1"),
             LogLine::Summary(Summary {
-                summary: "Should be filtered".to_string(),
+                summary: "Summary message".to_string(),
                 leaf_uuid: Uuid::new_v4(),
             }),
             create_test_assistant_message("Assistant 1"),
         ];
         let view = ThreadView::new(messages);
 
-        // Only 2 messages should be rendered (User and Assistant)
-        assert_eq!(view.get_message_count(), 2);
+        // All 3 messages should be rendered
+        assert_eq!(view.get_message_count(), 3);
     }
 
     #[test]

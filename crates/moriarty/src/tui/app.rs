@@ -16,6 +16,7 @@ pub struct App {
     viewport_height: u16,
     modal_open: bool,
     modal_scroll_state: ScrollViewState,
+    modal_debug_content: Option<String>,
 }
 
 impl App {
@@ -28,6 +29,7 @@ impl App {
             viewport_height: 0,
             modal_open: false,
             modal_scroll_state: ScrollViewState::default(),
+            modal_debug_content: None,
         }
     }
 
@@ -123,32 +125,26 @@ impl App {
 
     fn handle_modal_keys(&mut self, key: KeyEvent) {
         match key.code {
-            // Close modal
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.modal_open = false;
                 self.modal_scroll_state = ScrollViewState::default();
+                self.modal_debug_content = None;
             }
-            // Scroll modal down
             KeyCode::Char('j') | KeyCode::Down => {
                 self.modal_scroll_state.scroll_down();
             }
-            // Scroll modal up
             KeyCode::Char('k') | KeyCode::Up => {
                 self.modal_scroll_state.scroll_up();
             }
-            // Page down in modal
             KeyCode::Char('f') | KeyCode::PageDown => {
                 self.modal_scroll_state.scroll_page_down();
             }
-            // Page up in modal
             KeyCode::Char('b') | KeyCode::PageUp => {
                 self.modal_scroll_state.scroll_page_up();
             }
-            // Jump to top of modal
             KeyCode::Char('g') | KeyCode::Home => {
                 self.modal_scroll_state.scroll_to_top();
             }
-            // Jump to bottom of modal
             KeyCode::Char('G') | KeyCode::End => {
                 self.modal_scroll_state.scroll_to_bottom();
             }
@@ -158,49 +154,41 @@ impl App {
 
     fn handle_main_view_keys(&mut self, key: KeyEvent) {
         match key.code {
-            // Quit
             KeyCode::Char('q') | KeyCode::Esc => {
                 self.should_quit = true;
             }
-            // Open modal for selected message
             KeyCode::Enter => {
                 if self.thread_view.get_message_count() > 0 {
+                    if let Some(log_line) = self.thread_view.get_selected_log_line() {
+                        self.modal_debug_content = Some(format!("{:#?}", log_line));
+                    }
                     self.modal_open = true;
                 }
             }
-            // Move selection down
             KeyCode::Char('j') | KeyCode::Down => {
                 self.thread_view.select_next();
                 self.ensure_selection_visible();
             }
-            // Move selection up
             KeyCode::Char('k') | KeyCode::Up => {
                 self.thread_view.select_previous();
                 self.ensure_selection_visible();
             }
-            // Page down
             KeyCode::Char('f') | KeyCode::PageDown => {
                 self.scroll_state.scroll_page_down();
-                // Update tracked scroll position (approximate)
                 self.current_scroll_y = self.current_scroll_y.saturating_add(self.viewport_height);
             }
-            // Page up
             KeyCode::Char('b') | KeyCode::PageUp => {
                 self.scroll_state.scroll_page_up();
-                // Update tracked scroll position (approximate)
                 self.current_scroll_y = self.current_scroll_y.saturating_sub(self.viewport_height);
             }
-            // Jump to first message
             KeyCode::Char('g') | KeyCode::Home => {
                 self.thread_view.select_first();
                 self.scroll_state.scroll_to_top();
                 self.current_scroll_y = 0;
             }
-            // Jump to last message (Shift+G)
             KeyCode::Char('G') | KeyCode::End => {
                 self.thread_view.select_last();
                 self.scroll_state.scroll_to_bottom();
-                // Update scroll position to be at bottom (will be corrected on next render)
                 self.current_scroll_y = u16::MAX;
             }
             _ => {}
@@ -214,10 +202,10 @@ impl App {
         // Always render the thread view
         frame.render_stateful_widget(&mut self.thread_view, area, &mut self.scroll_state);
 
-        // If modal is open, render it on top
+        // If modal is open, render it on top with cached debug output
         if self.modal_open {
-            if let Some(message_text) = self.thread_view.get_selected_message() {
-                let modal = MessageModal::new(message_text);
+            if let Some(ref debug_output) = self.modal_debug_content {
+                let modal = MessageModal::new(debug_output);
                 frame.render_stateful_widget(modal, area, &mut self.modal_scroll_state);
             }
         }
