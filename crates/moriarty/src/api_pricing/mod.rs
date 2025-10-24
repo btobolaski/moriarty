@@ -4,8 +4,61 @@ mod pricing;
 use std::path::Path;
 
 use analyzer::{AnalysisResult, DailyCosts};
+use tabled::{
+    settings::{object::Rows, style::Style, Alignment, Modify, Width},
+    Table, Tabled,
+};
 
-const REPORT_WIDTH: usize = 100;
+/// Minimum terminal width for using word-wrapping instead of truncation.
+/// On terminals wider than or equal to this, wrapping prevents cutting off currency values.
+/// On narrower terminals, truncation keeps output compact.
+const MIN_WIDTH_FOR_WRAPPING: usize = 100;
+
+/// Represents a row in the cost breakdown table
+#[derive(Tabled)]
+struct CostRow {
+    #[tabled(rename = "Model")]
+    model: String,
+    #[tabled(rename = "Input")]
+    input: String,
+    #[tabled(rename = "Output")]
+    output: String,
+    #[tabled(rename = "Cache Write")]
+    cache_write: String,
+    #[tabled(rename = "Cache Read")]
+    cache_read: String,
+    #[tabled(rename = "Subtotal")]
+    subtotal: String,
+}
+
+impl CostRow {
+    /// Creates a new cost row with pre-formatted currency strings.
+    ///
+    /// The subtotal is calculated at construction time since CostRow
+    /// is immutable and used only for display purposes.
+    fn new(model: &str, input: f64, output: f64, cache_write: f64, cache_read: f64) -> Self {
+        Self {
+            model: model.to_string(),
+            input: format!("${:.4}", input),
+            output: format!("${:.4}", output),
+            cache_write: format!("${:.4}", cache_write),
+            cache_read: format!("${:.4}", cache_read),
+            subtotal: format!("${:.4}", input + output + cache_write + cache_read),
+        }
+    }
+}
+
+/// Get the terminal width, with a fallback to 80 columns
+fn get_terminal_width() -> usize {
+    crossterm::terminal::size()
+        .map(|(cols, _)| cols as usize)
+        .unwrap_or(80)
+}
+
+/// Get a divider string of the specified width
+fn divider(width: usize) -> String {
+    "=".repeat(width)
+}
 
 /// Run the API pricing analysis on a directory
 pub async fn run(dir: &Path) -> miette::Result<()> {
@@ -25,9 +78,10 @@ pub async fn run(dir: &Path) -> miette::Result<()> {
 }
 
 fn display_analysis_summary(result: &AnalysisResult) {
-    println!("\n{}", "=".repeat(REPORT_WIDTH));
+    let term_width = get_terminal_width();
+    println!("\n{}", divider(term_width));
     println!("File Parsing Summary");
-    println!("{}", "=".repeat(REPORT_WIDTH));
+    println!("{}", divider(term_width));
     println!("  Successfully parsed: {} files", result.files_parsed);
     if result.files_failed > 0 {
         println!("  Failed to parse:     {} files", result.files_failed);
@@ -36,75 +90,81 @@ fn display_analysis_summary(result: &AnalysisResult) {
 }
 
 fn display_costs(daily_costs: &[DailyCosts]) {
-    println!("{}", "=".repeat(REPORT_WIDTH));
+    let term_width = get_terminal_width();
+    println!("{}", divider(term_width));
     println!("API Cost Report");
-    println!("{}", "=".repeat(REPORT_WIDTH));
+    println!("{}", divider(term_width));
     println!();
 
     let mut grand_total = 0.0;
 
     for costs in daily_costs {
         println!("Date: {}", costs.date);
-        println!("{}", "-".repeat(REPORT_WIDTH));
+        println!();
+
+        let mut rows = Vec::new();
 
         if costs.opus_costs.total() > 0.0 {
-            println!(
-                "  Opus:    Input: ${:>8.4}  Output: ${:>8.4}  Cache Write: ${:>8.4}  Cache Read: ${:>8.4}  Subtotal: ${:>8.4}",
+            rows.push(CostRow::new(
+                "Opus",
                 costs.opus_costs.input,
                 costs.opus_costs.output,
                 costs.opus_costs.cache_write,
                 costs.opus_costs.cache_read,
-                costs.opus_costs.total()
-            );
+            ));
         }
 
-        // Sonnet costs
         if costs.sonnet_costs.total() > 0.0 {
-            println!(
-                "  Sonnet:  Input: ${:>8.4}  Output: ${:>8.4}  Cache Write: ${:>8.4}  Cache Read: ${:>8.4}  Subtotal: ${:>8.4}",
+            rows.push(CostRow::new(
+                "Sonnet",
                 costs.sonnet_costs.input,
                 costs.sonnet_costs.output,
                 costs.sonnet_costs.cache_write,
                 costs.sonnet_costs.cache_read,
-                costs.sonnet_costs.total()
-            );
+            ));
         }
 
-        // Haiku costs
         if costs.haiku_costs.total() > 0.0 {
-            println!(
-                "  Haiku:   Input: ${:>8.4}  Output: ${:>8.4}  Cache Write: ${:>8.4}  Cache Read: ${:>8.4}  Subtotal: ${:>8.4}",
+            rows.push(CostRow::new(
+                "Haiku",
                 costs.haiku_costs.input,
                 costs.haiku_costs.output,
                 costs.haiku_costs.cache_write,
                 costs.haiku_costs.cache_read,
-                costs.haiku_costs.total()
-            );
+            ));
         }
+
+        let mut table = Table::new(&rows);
+        table
+            .with(Style::rounded())
+            .with(Modify::new(Rows::first()).with(Alignment::center()));
+
+        if term_width >= MIN_WIDTH_FOR_WRAPPING {
+            table.with(Width::wrap(term_width).keep_words(true));
+        } else {
+            table.with(Width::truncate(term_width));
+        }
+
+        println!("{}", table);
 
         let daily_total = costs.total();
         grand_total += daily_total;
 
-        println!(
-            "  {:<7}  {:<width$} Total: ${:>8.4}",
-            "",
-            "",
-            daily_total,
-            width = REPORT_WIDTH - 29
-        );
+        println!("Daily Total: ${:.4}", daily_total);
         println!();
     }
 
-    println!("{}", "=".repeat(REPORT_WIDTH));
+    println!("{}", divider(term_width));
     println!("Grand Total: ${:.4}", grand_total);
-    println!("{}", "=".repeat(REPORT_WIDTH));
+    println!("{}", divider(term_width));
 }
 
 fn display_warnings(result: &AnalysisResult) {
     if !result.unknown_models.is_empty() {
-        println!("\n{}", "=".repeat(REPORT_WIDTH));
+        let term_width = get_terminal_width();
+        println!("\n{}", divider(term_width));
         println!("WARNINGS");
-        println!("{}", "=".repeat(REPORT_WIDTH));
+        println!("{}", divider(term_width));
         println!(
             "\nUnknown models detected ({} unique):",
             result.unknown_models.len()
@@ -140,7 +200,7 @@ fn display_warnings(result: &AnalysisResult) {
             result.total_unknown_tokens.cache_read_tokens
         );
         println!("\n⚠️  These tokens are NOT included in the cost calculations above.");
-        println!("{}", "=".repeat(REPORT_WIDTH));
+        println!("{}", divider(term_width));
     }
 }
 
@@ -308,5 +368,37 @@ mod tests {
         };
 
         display_warnings(&result);
+    }
+
+    #[test]
+    fn test_cost_row_new_formats_currency() {
+        let row = CostRow::new("Sonnet", 1.2345, 2.3456, 0.5, 0.25);
+
+        assert_eq!(row.model, "Sonnet");
+        assert_eq!(row.input, "$1.2345");
+        assert_eq!(row.output, "$2.3456");
+        assert_eq!(row.cache_write, "$0.5000");
+        assert_eq!(row.cache_read, "$0.2500");
+        assert_eq!(row.subtotal, "$4.3301");
+    }
+
+    #[test]
+    fn test_cost_row_new_calculates_subtotal() {
+        let row = CostRow::new("Test", 1.0, 2.0, 0.5, 0.25);
+        assert_eq!(row.subtotal, "$3.7500");
+    }
+
+    #[test]
+    fn test_cost_row_new_handles_zero_costs() {
+        let row = CostRow::new("Haiku", 0.0, 0.0, 0.0, 0.0);
+        assert_eq!(row.subtotal, "$0.0000");
+    }
+
+    #[test]
+    fn test_divider_generates_correct_length() {
+        assert_eq!(divider(0), "");
+        assert_eq!(divider(1), "=");
+        assert_eq!(divider(5), "=====");
+        assert_eq!(divider(100).len(), 100);
     }
 }
