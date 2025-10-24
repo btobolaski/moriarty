@@ -205,6 +205,24 @@ mod tests {
     }
 
     #[test]
+    fn test_display_costs_single_day_opus_only() {
+        let date = NaiveDate::from_ymd_opt(2025, 10, 23).unwrap();
+        let daily_costs = vec![DailyCosts {
+            date,
+            opus_costs: TokenCosts {
+                input: 15.0,
+                output: 75.0,
+                cache_write: 18.75,
+                cache_read: 1.5,
+            },
+            sonnet_costs: TokenCosts::default(),
+            haiku_costs: TokenCosts::default(),
+        }];
+
+        display_costs(&daily_costs);
+    }
+
+    #[test]
     fn test_display_costs_single_day_both_models() {
         let date = NaiveDate::from_ymd_opt(2025, 10, 23).unwrap();
         let daily_costs = vec![DailyCosts {

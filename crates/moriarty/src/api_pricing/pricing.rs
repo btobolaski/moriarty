@@ -31,6 +31,8 @@ impl ModelPricing {
         cache_read: 0.1,
     };
 
+    /// Pricing for Opus models (effective as of 2025-10-23)
+    /// Applies to: claude-opus-*, claude-3-*-opus-*
     pub const OPUS: Self = Self {
         input: 15.0,
         output: 75.0,
@@ -66,6 +68,7 @@ impl ModelType {
     /// # Matching Rules
     /// - "sonnet" (case-insensitive) → Sonnet
     /// - "haiku" (case-insensitive) → Haiku
+    /// - "opus" (case-insensitive) → Opus
     /// - Everything else → Unknown
     ///
     /// # Examples
@@ -73,7 +76,8 @@ impl ModelType {
     /// # use moriarty::api_pricing::pricing::ModelType;
     /// assert_eq!(ModelType::from_model_string("claude-sonnet-4-20250514"), ModelType::Sonnet);
     /// assert_eq!(ModelType::from_model_string("claude-3-haiku-20240307"), ModelType::Haiku);
-    /// assert_eq!(ModelType::from_model_string("claude-opus-4"), ModelType::Unknown);
+    /// assert_eq!(ModelType::from_model_string("claude-opus-4"), ModelType::Opus);
+    /// assert_eq!(ModelType::from_model_string("gpt-4"), ModelType::Unknown);
     /// ```
     pub fn from_model_string(model: &str) -> Self {
         let model_lower = model.to_lowercase();
@@ -163,6 +167,15 @@ mod tests {
     }
 
     #[test]
+    fn test_opus_pricing_constants() {
+        let pricing = ModelPricing::OPUS;
+        assert_eq!(pricing.input, 15.0);
+        assert_eq!(pricing.output, 75.0);
+        assert_eq!(pricing.cache_write, 18.75);
+        assert_eq!(pricing.cache_read, 1.5);
+    }
+
+    #[test]
     fn test_calculate_cost_zero_tokens() {
         let pricing = ModelPricing::SONNET;
         let usage = TokenCounts::default();
@@ -210,6 +223,24 @@ mod tests {
     }
 
     #[test]
+    fn test_calculate_cost_opus_one_million_tokens() {
+        let pricing = ModelPricing::OPUS;
+        let usage = TokenCounts {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            cache_write_tokens: 1_000_000,
+            cache_read_tokens: 1_000_000,
+        };
+        let costs = pricing.calculate_cost(&usage);
+
+        assert_eq!(costs.input, 15.0);
+        assert_eq!(costs.output, 75.0);
+        assert_eq!(costs.cache_write, 18.75);
+        assert_eq!(costs.cache_read, 1.5);
+        assert_eq!(costs.total(), 110.25);
+    }
+
+    #[test]
     fn test_model_type_from_string_sonnet_variations() {
         assert_eq!(
             ModelType::from_model_string("claude-sonnet-4"),
@@ -238,6 +269,20 @@ mod tests {
     }
 
     #[test]
+    fn test_model_type_from_string_opus_variations() {
+        assert_eq!(
+            ModelType::from_model_string("claude-opus-4"),
+            ModelType::Opus
+        );
+        assert_eq!(ModelType::from_model_string("OPUS"), ModelType::Opus);
+        assert_eq!(
+            ModelType::from_model_string("Claude-Opus-3.5"),
+            ModelType::Opus
+        );
+        assert_eq!(ModelType::from_model_string("opus"), ModelType::Opus);
+    }
+
+    #[test]
     fn test_model_type_from_string_unknown() {
         assert_eq!(ModelType::from_model_string("gpt-4"), ModelType::Unknown);
         assert_eq!(ModelType::from_model_string(""), ModelType::Unknown);
@@ -247,6 +292,7 @@ mod tests {
     fn test_model_type_pricing() {
         assert!(ModelType::Sonnet.pricing().is_some());
         assert!(ModelType::Haiku.pricing().is_some());
+        assert!(ModelType::Opus.pricing().is_some());
         assert!(ModelType::Unknown.pricing().is_none());
     }
 
@@ -290,6 +336,7 @@ mod tests {
     fn test_model_type_display() {
         assert_eq!(format!("{}", ModelType::Sonnet), "Sonnet");
         assert_eq!(format!("{}", ModelType::Haiku), "Haiku");
+        assert_eq!(format!("{}", ModelType::Opus), "Opus");
         assert_eq!(format!("{}", ModelType::Unknown), "Unknown");
     }
 }

@@ -226,6 +226,7 @@ mod tests {
         assert_eq!(usage.date, date);
         assert_eq!(usage.sonnet_usage.input_tokens, 0);
         assert_eq!(usage.haiku_usage.input_tokens, 0);
+        assert_eq!(usage.opus_usage.input_tokens, 0);
         assert_eq!(usage.unknown_usage.input_tokens, 0);
     }
 
@@ -247,6 +248,26 @@ mod tests {
         assert_eq!(usage.sonnet_usage.output_tokens, 500);
         assert_eq!(usage.haiku_usage.input_tokens, 0);
         assert_eq!(usage.unknown_usage.input_tokens, 0);
+    }
+
+    #[test]
+    fn test_daily_usage_add_opus() {
+        let date = NaiveDate::from_ymd_opt(2025, 10, 23).unwrap();
+        let mut usage = DailyUsage::new(date);
+
+        let counts = TokenCounts {
+            input_tokens: 1000,
+            output_tokens: 500,
+            cache_write_tokens: 100,
+            cache_read_tokens: 50,
+        };
+
+        usage.add_usage(ModelType::Opus, counts);
+
+        assert_eq!(usage.opus_usage.input_tokens, 1000);
+        assert_eq!(usage.opus_usage.output_tokens, 500);
+        assert_eq!(usage.sonnet_usage.input_tokens, 0);
+        assert_eq!(usage.haiku_usage.input_tokens, 0);
     }
 
     #[test]
