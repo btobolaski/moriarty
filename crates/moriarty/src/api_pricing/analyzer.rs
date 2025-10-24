@@ -7,9 +7,12 @@ use chrono::NaiveDate;
 use miette::IntoDiagnostic;
 use tokio::fs;
 
-use crate::logs::parser::{self, LogLine};
+use crate::logs::parser::{self, LogLine, LogMessageContent, LogMessageTaggedContent};
 
-use super::pricing::{ModelType, TokenCosts, TokenCounts};
+use super::{
+    line_counter,
+    pricing::{ModelType, TokenCosts, TokenCounts},
+};
 
 #[derive(Debug, Default)]
 pub struct AnalysisResult {
@@ -27,6 +30,7 @@ pub struct DailyUsage {
     pub haiku_usage: TokenCounts,
     pub opus_usage: TokenCounts,
     pub unknown_usage: TokenCounts,
+    pub lines_changed: usize,
 }
 
 impl DailyUsage {
@@ -37,6 +41,7 @@ impl DailyUsage {
             haiku_usage: TokenCounts::default(),
             opus_usage: TokenCounts::default(),
             unknown_usage: TokenCounts::default(),
+            lines_changed: 0,
         }
     }
 
@@ -47,6 +52,10 @@ impl DailyUsage {
             ModelType::Opus => self.opus_usage.add(&counts),
             ModelType::Unknown => self.unknown_usage.add(&counts),
         }
+    }
+
+    pub fn add_lines_changed(&mut self, lines: usize) {
+        self.lines_changed += lines;
     }
 
     pub fn calculate_costs(&self) -> DailyCosts {
@@ -70,6 +79,7 @@ impl DailyUsage {
             sonnet_costs,
             haiku_costs,
             opus_costs,
+            lines_changed: self.lines_changed,
         }
     }
 }
@@ -80,6 +90,7 @@ pub struct DailyCosts {
     pub sonnet_costs: TokenCosts,
     pub haiku_costs: TokenCosts,
     pub opus_costs: TokenCosts,
+    pub lines_changed: usize,
 }
 
 impl DailyCosts {
@@ -143,14 +154,43 @@ pub async fn parse_log_file(
     Ok(usages)
 }
 
+/// Extract lines changed from assistant messages in a log file
+pub async fn parse_lines_changed(file: &Path) -> miette::Result<Vec<(NaiveDate, usize)>> {
+    let log_lines = parser::read_file(file).await?;
+    let mut results = Vec::new();
+
+    for line in log_lines {
+        if let LogLine::Assistant(assistant_line) = line {
+            let date = assistant_line.timestamp.date_naive();
+
+            // Check if content is an array (contains tool uses)
+            if let LogMessageContent::Vec(content_blocks) = &assistant_line.message.content {
+                for content_item in content_blocks {
+                    if let LogMessageTaggedContent::ToolUse { name, input, .. } = content_item {
+                        if let Some(lines) =
+                            line_counter::extract_lines_from_tool(name.as_str(), input)
+                        {
+                            results.push((date, lines));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(results)
+}
+
 /// Aggregate usage data by date
 pub fn aggregate_by_date(
     usages: Vec<(NaiveDate, ModelType, String, TokenCounts)>,
+    lines_changed: Vec<(NaiveDate, usize)>,
     unknown_models: &mut HashSet<String>,
     total_unknown_tokens: &mut TokenCounts,
 ) -> BTreeMap<NaiveDate, DailyUsage> {
     let mut daily_usage: BTreeMap<NaiveDate, DailyUsage> = BTreeMap::new();
 
+    // Aggregate token usage
     for (date, model_type, model_string, counts) in usages {
         // Track unknown models
         if model_type == ModelType::Unknown {
@@ -162,6 +202,14 @@ pub fn aggregate_by_date(
             .entry(date)
             .or_insert_with(|| DailyUsage::new(date))
             .add_usage(model_type, counts);
+    }
+
+    // Aggregate lines changed
+    for (date, lines) in lines_changed {
+        daily_usage
+            .entry(date)
+            .or_insert_with(|| DailyUsage::new(date))
+            .add_lines_changed(lines);
     }
 
     daily_usage
@@ -179,6 +227,7 @@ pub async fn analyze_directory(dir: &Path) -> miette::Result<AnalysisResult> {
     println!("Found {} log files to analyze", jsonl_files.len());
 
     let mut all_usages = Vec::new();
+    let mut all_lines_changed = Vec::new();
     let mut files_parsed = 0;
     let mut files_failed = 0;
 
@@ -193,12 +242,28 @@ pub async fn analyze_directory(dir: &Path) -> miette::Result<AnalysisResult> {
                 files_failed += 1;
             }
         }
+
+        // Parse lines changed (don't fail if this errors)
+        match parse_lines_changed(file).await {
+            Ok(lines) => all_lines_changed.extend(lines),
+            Err(e) => {
+                eprintln!(
+                    "Warning: Failed to parse lines changed from {:?}: {}",
+                    file, e
+                );
+            }
+        }
     }
 
     let mut unknown_models = HashSet::new();
     let mut total_unknown_tokens = TokenCounts::default();
 
-    let daily_usage = aggregate_by_date(all_usages, &mut unknown_models, &mut total_unknown_tokens);
+    let daily_usage = aggregate_by_date(
+        all_usages,
+        all_lines_changed,
+        &mut unknown_models,
+        &mut total_unknown_tokens,
+    );
     let daily_costs: Vec<DailyCosts> = daily_usage
         .into_values()
         .map(|usage| usage.calculate_costs())
@@ -228,6 +293,7 @@ mod tests {
         assert_eq!(usage.haiku_usage.input_tokens, 0);
         assert_eq!(usage.opus_usage.input_tokens, 0);
         assert_eq!(usage.unknown_usage.input_tokens, 0);
+        assert_eq!(usage.lines_changed, 0);
     }
 
     #[test]
@@ -350,6 +416,7 @@ mod tests {
         assert_eq!(costs.date, date);
         assert_eq!(costs.sonnet_costs.input, 3.0);
         assert_eq!(costs.sonnet_costs.output, 15.0);
+        assert_eq!(costs.lines_changed, 0);
     }
 
     #[test]
@@ -375,6 +442,7 @@ mod tests {
                 cache_read: 0.0,
                 cache_write: 0.0,
             },
+            lines_changed: 0,
         };
 
         assert!((costs.total() - 5.6).abs() < 1e-10);
@@ -386,7 +454,12 @@ mod tests {
         let mut unknown_models = HashSet::new();
         let mut total_unknown_tokens = TokenCounts::default();
 
-        let result = aggregate_by_date(usages, &mut unknown_models, &mut total_unknown_tokens);
+        let result = aggregate_by_date(
+            usages,
+            Vec::new(),
+            &mut unknown_models,
+            &mut total_unknown_tokens,
+        );
 
         assert!(result.is_empty());
         assert!(unknown_models.is_empty());
@@ -411,7 +484,12 @@ mod tests {
         let mut unknown_models = HashSet::new();
         let mut total_unknown_tokens = TokenCounts::default();
 
-        let result = aggregate_by_date(usages, &mut unknown_models, &mut total_unknown_tokens);
+        let result = aggregate_by_date(
+            usages,
+            Vec::new(),
+            &mut unknown_models,
+            &mut total_unknown_tokens,
+        );
 
         assert_eq!(result.len(), 1);
         assert!(result.contains_key(&date));
@@ -450,7 +528,12 @@ mod tests {
         let mut unknown_models = HashSet::new();
         let mut total_unknown_tokens = TokenCounts::default();
 
-        let result = aggregate_by_date(usages, &mut unknown_models, &mut total_unknown_tokens);
+        let result = aggregate_by_date(
+            usages,
+            Vec::new(),
+            &mut unknown_models,
+            &mut total_unknown_tokens,
+        );
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[&date1].sonnet_usage.input_tokens, 1000);
@@ -488,7 +571,12 @@ mod tests {
         let mut unknown_models = HashSet::new();
         let mut total_unknown_tokens = TokenCounts::default();
 
-        let result = aggregate_by_date(usages, &mut unknown_models, &mut total_unknown_tokens);
+        let result = aggregate_by_date(
+            usages,
+            Vec::new(),
+            &mut unknown_models,
+            &mut total_unknown_tokens,
+        );
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[&date].sonnet_usage.input_tokens, 1500);
@@ -526,7 +614,12 @@ mod tests {
         let mut unknown_models = HashSet::new();
         let mut total_unknown_tokens = TokenCounts::default();
 
-        let result = aggregate_by_date(usages, &mut unknown_models, &mut total_unknown_tokens);
+        let result = aggregate_by_date(
+            usages,
+            Vec::new(),
+            &mut unknown_models,
+            &mut total_unknown_tokens,
+        );
 
         assert_eq!(unknown_models.len(), 2);
         assert!(unknown_models.contains("claude-opus-4"));
@@ -567,7 +660,12 @@ mod tests {
         let mut unknown_models = HashSet::new();
         let mut total_unknown_tokens = TokenCounts::default();
 
-        let result = aggregate_by_date(usages, &mut unknown_models, &mut total_unknown_tokens);
+        let result = aggregate_by_date(
+            usages,
+            Vec::new(),
+            &mut unknown_models,
+            &mut total_unknown_tokens,
+        );
         let dates: Vec<_> = result.keys().collect();
 
         assert_eq!(dates, vec![&date2, &date1, &date3]);
@@ -726,5 +824,158 @@ mod tests {
         assert!(result.daily_costs.is_empty());
         assert_eq!(result.files_parsed, 0);
         assert_eq!(result.files_failed, 1);
+    }
+
+    #[test]
+    fn test_daily_usage_add_lines_changed() {
+        let date = NaiveDate::from_ymd_opt(2025, 10, 23).unwrap();
+        let mut usage = DailyUsage::new(date);
+
+        usage.add_lines_changed(100);
+        assert_eq!(usage.lines_changed, 100);
+
+        usage.add_lines_changed(50);
+        assert_eq!(usage.lines_changed, 150);
+    }
+
+    #[test]
+    fn test_aggregate_by_date_with_lines_changed() {
+        let date = NaiveDate::from_ymd_opt(2025, 10, 23).unwrap();
+
+        let usages = vec![(
+            date,
+            ModelType::Sonnet,
+            "claude-sonnet-4".to_string(),
+            TokenCounts::default(),
+        )];
+
+        let lines_changed = vec![(date, 100), (date, 50)];
+
+        let mut unknown_models = HashSet::new();
+        let mut total_unknown_tokens = TokenCounts::default();
+
+        let result = aggregate_by_date(
+            usages,
+            lines_changed,
+            &mut unknown_models,
+            &mut total_unknown_tokens,
+        );
+
+        assert_eq!(result[&date].lines_changed, 150);
+    }
+
+    #[test]
+    fn test_aggregate_by_date_lines_changed_different_dates() {
+        let date1 = NaiveDate::from_ymd_opt(2025, 10, 23).unwrap();
+        let date2 = NaiveDate::from_ymd_opt(2025, 10, 24).unwrap();
+
+        let lines_changed = vec![(date1, 100), (date2, 200), (date1, 50)];
+
+        let mut unknown_models = HashSet::new();
+        let mut total_unknown_tokens = TokenCounts::default();
+
+        let result = aggregate_by_date(
+            Vec::new(),
+            lines_changed,
+            &mut unknown_models,
+            &mut total_unknown_tokens,
+        );
+
+        assert_eq!(result[&date1].lines_changed, 150);
+        assert_eq!(result[&date2].lines_changed, 200);
+    }
+
+    #[tokio::test]
+    async fn test_parse_lines_changed_with_edit_tool() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("test.jsonl");
+
+        let log_content = r#"{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"00000000-0000-0000-0000-000000000000","version":"1.0.0","gitBranch":"main","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":[{"type":"tool_use","id":"tool_1","name":"Edit","input":{"file_path":"/test.rs","old_string":"line1\nline2","new_string":"line1\nmodified\nline3"}}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":500,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000001","timestamp":"2025-10-23T12:00:00Z","isApiErrorMessage":null}"#;
+        tokio::fs::write(&file_path, log_content).await.unwrap();
+
+        let result = parse_lines_changed(&file_path).await.unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, NaiveDate::from_ymd_opt(2025, 10, 23).unwrap());
+        assert_eq!(result[0].1, 3);
+    }
+
+    #[tokio::test]
+    async fn test_parse_lines_changed_with_write_tool() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("test.jsonl");
+
+        let log_content = r#"{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"00000000-0000-0000-0000-000000000000","version":"1.0.0","gitBranch":"main","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":[{"type":"tool_use","id":"tool_1","name":"Write","input":{"file_path":"/test.rs","content":"line1\nline2\nline3\nline4"}}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":500,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000001","timestamp":"2025-10-23T12:00:00Z","isApiErrorMessage":null}"#;
+        tokio::fs::write(&file_path, log_content).await.unwrap();
+
+        let result = parse_lines_changed(&file_path).await.unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, NaiveDate::from_ymd_opt(2025, 10, 23).unwrap());
+        assert_eq!(result[0].1, 4);
+    }
+
+    #[tokio::test]
+    async fn test_parse_lines_changed_with_notebook_edit_tool() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("test.jsonl");
+
+        let log_content = r#"{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"00000000-0000-0000-0000-000000000000","version":"1.0.0","gitBranch":"main","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":[{"type":"tool_use","id":"tool_1","name":"NotebookEdit","input":{"notebook_path":"/test.ipynb","new_source":"print('hello')\nprint('world')"}}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":500,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000001","timestamp":"2025-10-23T12:00:00Z","isApiErrorMessage":null}"#;
+        tokio::fs::write(&file_path, log_content).await.unwrap();
+
+        let result = parse_lines_changed(&file_path).await.unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, NaiveDate::from_ymd_opt(2025, 10, 23).unwrap());
+        assert_eq!(result[0].1, 2);
+    }
+
+    #[tokio::test]
+    async fn test_parse_lines_changed_multiple_tools_same_message() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("test.jsonl");
+
+        let log_content = r#"{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"00000000-0000-0000-0000-000000000000","version":"1.0.0","gitBranch":"main","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":[{"type":"tool_use","id":"tool_1","name":"Edit","input":{"file_path":"/test.rs","old_string":"old","new_string":"new"}},{"type":"tool_use","id":"tool_2","name":"Write","input":{"file_path":"/test2.rs","content":"line1\nline2"}}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":500,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000001","timestamp":"2025-10-23T12:00:00Z","isApiErrorMessage":null}"#;
+        tokio::fs::write(&file_path, log_content).await.unwrap();
+
+        let result = parse_lines_changed(&file_path).await.unwrap();
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].0, NaiveDate::from_ymd_opt(2025, 10, 23).unwrap());
+        assert_eq!(result[1].0, NaiveDate::from_ymd_opt(2025, 10, 23).unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_parse_lines_changed_empty_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("empty.jsonl");
+        tokio::fs::write(&file_path, "").await.unwrap();
+
+        let result = parse_lines_changed(&file_path).await.unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_parse_lines_changed_no_tool_uses() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("test.jsonl");
+
+        let log_content = r#"{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"00000000-0000-0000-0000-000000000000","version":"1.0.0","gitBranch":"main","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":"just text, no tools","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":500,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000001","timestamp":"2025-10-23T12:00:00Z","isApiErrorMessage":null}"#;
+        tokio::fs::write(&file_path, log_content).await.unwrap();
+
+        let result = parse_lines_changed(&file_path).await.unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_parse_lines_changed_ignores_non_modifying_tools() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("test.jsonl");
+
+        let log_content = r#"{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"00000000-0000-0000-0000-000000000000","version":"1.0.0","gitBranch":"main","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":[{"type":"tool_use","id":"tool_1","name":"Read","input":{"file_path":"/test.rs"}}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":500,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000001","timestamp":"2025-10-23T12:00:00Z","isApiErrorMessage":null}"#;
+        tokio::fs::write(&file_path, log_content).await.unwrap();
+
+        let result = parse_lines_changed(&file_path).await.unwrap();
+        assert!(result.is_empty());
     }
 }

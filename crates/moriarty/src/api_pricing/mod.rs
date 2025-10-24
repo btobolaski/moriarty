@@ -1,4 +1,5 @@
 mod analyzer;
+mod line_counter;
 mod pricing;
 
 use std::path::Path;
@@ -97,6 +98,7 @@ fn display_costs(daily_costs: &[DailyCosts]) {
     println!();
 
     let mut grand_total = 0.0;
+    let mut total_lines = 0usize;
 
     for costs in daily_costs {
         println!("Date: {}", costs.date);
@@ -149,13 +151,18 @@ fn display_costs(daily_costs: &[DailyCosts]) {
 
         let daily_total = costs.total();
         grand_total += daily_total;
+        total_lines += costs.lines_changed;
 
-        println!("Daily Total: ${:.4}", daily_total);
+        println!(
+            "Daily Total: ${:.4} | Lines Changed: {}",
+            daily_total, costs.lines_changed
+        );
         println!();
     }
 
     println!("{}", divider(term_width));
     println!("Grand Total: ${:.4}", grand_total);
+    println!("Total Lines Changed: {}", total_lines);
     println!("{}", divider(term_width));
 }
 
@@ -259,6 +266,7 @@ mod tests {
             },
             haiku_costs: TokenCosts::default(),
             opus_costs: TokenCosts::default(),
+            lines_changed: 145,
         }];
 
         display_costs(&daily_costs);
@@ -277,6 +285,7 @@ mod tests {
             },
             sonnet_costs: TokenCosts::default(),
             haiku_costs: TokenCosts::default(),
+            lines_changed: 0,
         }];
 
         display_costs(&daily_costs);
@@ -300,6 +309,7 @@ mod tests {
                 cache_read: 0.1,
             },
             opus_costs: TokenCosts::default(),
+            lines_changed: 0,
         }];
 
         display_costs(&daily_costs);
@@ -318,6 +328,7 @@ mod tests {
                 },
                 haiku_costs: TokenCosts::default(),
                 opus_costs: TokenCosts::default(),
+                lines_changed: 100,
             },
             DailyCosts {
                 date: NaiveDate::from_ymd_opt(2025, 10, 24).unwrap(),
@@ -329,6 +340,7 @@ mod tests {
                     cache_read: 0.1,
                 },
                 opus_costs: TokenCosts::default(),
+                lines_changed: 50,
             },
         ];
 
