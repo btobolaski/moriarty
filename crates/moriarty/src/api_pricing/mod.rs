@@ -6,7 +6,11 @@ use std::path::Path;
 
 use analyzer::{AnalysisResult, DailyCosts};
 use tabled::{
-    settings::{object::Rows, style::Style, Alignment, Modify, Width},
+    settings::{
+        object::Rows,
+        style::{HorizontalLine, Style},
+        Alignment, Modify, Width,
+    },
     Table, Tabled,
 };
 
@@ -18,6 +22,8 @@ const MIN_WIDTH_FOR_WRAPPING: usize = 100;
 /// Represents a row in the cost breakdown table
 #[derive(Tabled)]
 struct CostRow {
+    #[tabled(rename = "Date")]
+    date: String,
     #[tabled(rename = "Model")]
     model: String,
     #[tabled(rename = "Input")]
@@ -30,6 +36,8 @@ struct CostRow {
     cache_read: String,
     #[tabled(rename = "Subtotal")]
     subtotal: String,
+    #[tabled(rename = "Lines")]
+    lines: String,
 }
 
 impl CostRow {
@@ -37,14 +45,61 @@ impl CostRow {
     ///
     /// The subtotal is calculated at construction time since CostRow
     /// is immutable and used only for display purposes.
-    fn new(model: &str, input: f64, output: f64, cache_write: f64, cache_read: f64) -> Self {
+    fn new(
+        date: &str,
+        model: &str,
+        input: f64,
+        output: f64,
+        cache_write: f64,
+        cache_read: f64,
+        lines: &str,
+    ) -> Self {
         Self {
+            date: date.to_string(),
             model: model.to_string(),
             input: format!("${:.4}", input),
             output: format!("${:.4}", output),
             cache_write: format!("${:.4}", cache_write),
             cache_read: format!("${:.4}", cache_read),
             subtotal: format!("${:.4}", input + output + cache_write + cache_read),
+            lines: lines.to_string(),
+        }
+    }
+
+    /// Creates a total row for displaying daily summary.
+    ///
+    /// Uses empty strings for individual cost columns because showing per-model
+    /// costs in a total row would be misleading - users might confuse them for
+    /// additional costs rather than components of the subtotal.
+    fn new_total_row(lines_changed: usize, total_cost: f64) -> Self {
+        Self {
+            date: String::new(),
+            model: "Total".to_string(),
+            input: String::new(),
+            output: String::new(),
+            cache_write: String::new(),
+            cache_read: String::new(),
+            subtotal: format!("${:.4}", total_cost),
+            lines: lines_changed.to_string(),
+        }
+    }
+}
+
+/// Represents the grand total summary row
+#[derive(Tabled)]
+struct GrandTotalRow {
+    #[tabled(rename = "Grand Total")]
+    grand_total: String,
+    #[tabled(rename = "Total Lines Changed")]
+    total_lines_changed: String,
+}
+
+impl GrandTotalRow {
+    /// Creates a new grand total row with formatted values.
+    fn new(grand_total: f64, total_lines: usize) -> Self {
+        Self {
+            grand_total: format!("${:.4}", grand_total),
+            total_lines_changed: total_lines.to_string(),
         }
     }
 }
@@ -99,70 +154,231 @@ fn display_costs(daily_costs: &[DailyCosts]) {
 
     let mut grand_total = 0.0;
     let mut total_lines = 0usize;
+    let mut rows = Vec::new();
+    let mut total_row_indices = Vec::new();
 
     for costs in daily_costs {
-        println!("Date: {}", costs.date);
-        println!();
+        let date_str = costs.date.to_string();
 
-        let mut rows = Vec::new();
+        // Show date only on the first model row to visually group all models
+        // used on the same day, reducing table clutter. Subsequent model rows
+        // for the same day will have empty date cells.
+        let mut first_row = true;
 
         if costs.opus_costs.total() > 0.0 {
             rows.push(CostRow::new(
+                if first_row { &date_str } else { "" },
                 "Opus",
                 costs.opus_costs.input,
                 costs.opus_costs.output,
                 costs.opus_costs.cache_write,
                 costs.opus_costs.cache_read,
+                "",
             ));
+            first_row = false;
         }
 
         if costs.sonnet_costs.total() > 0.0 {
             rows.push(CostRow::new(
+                if first_row { &date_str } else { "" },
                 "Sonnet",
                 costs.sonnet_costs.input,
                 costs.sonnet_costs.output,
                 costs.sonnet_costs.cache_write,
                 costs.sonnet_costs.cache_read,
+                "",
             ));
+            first_row = false;
         }
 
         if costs.haiku_costs.total() > 0.0 {
             rows.push(CostRow::new(
+                if first_row { &date_str } else { "" },
                 "Haiku",
                 costs.haiku_costs.input,
                 costs.haiku_costs.output,
                 costs.haiku_costs.cache_write,
                 costs.haiku_costs.cache_read,
+                "",
             ));
         }
 
-        let mut table = Table::new(&rows);
-        table
-            .with(Style::rounded())
-            .with(Modify::new(Rows::first()).with(Alignment::center()));
-
-        if term_width >= MIN_WIDTH_FOR_WRAPPING {
-            table.with(Width::wrap(term_width).keep_words(true));
-        } else {
-            table.with(Width::truncate(term_width));
-        }
-
-        println!("{}", table);
-
+        // Add total row for this day
         let daily_total = costs.total();
         grand_total += daily_total;
         total_lines += costs.lines_changed;
 
-        println!(
-            "Daily Total: ${:.4} | Lines Changed: {}",
-            daily_total, costs.lines_changed
-        );
-        println!();
+        rows.push(CostRow::new_total_row(costs.lines_changed, daily_total));
+        total_row_indices.push(rows.len() - 1);
     }
 
+    let mut table = Table::new(&rows);
+
+    // Build horizontal separator lines after each day's total row (except the last one)
+    // to visually separate different days while maintaining continuous vertical borders.
+    //
+    // The tabled crate's Style::horizontals() method requires compile-time constant array
+    // sizes, preventing dynamic separator placement. This macro generates match arms for
+    // common day counts (1-31 days, covering a full month of usage data).
+    //
+    // Limitation: For reports with >31 days, visual separators are not added. The table
+    // remains functional but loses visual day grouping. This is an acceptable tradeoff
+    // since most users analyze shorter time periods (weekly/monthly).
+    let num_separators = total_row_indices.len().saturating_sub(1);
+
+    macro_rules! apply_separators {
+        ($table:expr, $indices:expr, $sep:expr, $count:expr) => {{
+            // Build array by indexing into total_row_indices and offsetting by 2
+            // (+1 for header row, +1 to place separator after the total row)
+            let mut arr = [($indices[0] + 2, $sep); $count];
+            for i in 0..$count {
+                arr[i] = ($indices[i] + 2, $sep);
+            }
+            $table.with(Style::rounded().horizontals(arr))
+        }};
+    }
+
+    if num_separators > 0 {
+        // Use rounded style box-drawing characters for visual consistency
+        let separator_line = HorizontalLine::full('─', '┼', '├', '┤');
+
+        match num_separators {
+            1 => {
+                apply_separators!(table, total_row_indices, separator_line, 1);
+            }
+            2 => {
+                apply_separators!(table, total_row_indices, separator_line, 2);
+            }
+            3 => {
+                apply_separators!(table, total_row_indices, separator_line, 3);
+            }
+            4 => {
+                apply_separators!(table, total_row_indices, separator_line, 4);
+            }
+            5 => {
+                apply_separators!(table, total_row_indices, separator_line, 5);
+            }
+            6 => {
+                apply_separators!(table, total_row_indices, separator_line, 6);
+            }
+            7 => {
+                apply_separators!(table, total_row_indices, separator_line, 7);
+            }
+            8 => {
+                apply_separators!(table, total_row_indices, separator_line, 8);
+            }
+            9 => {
+                apply_separators!(table, total_row_indices, separator_line, 9);
+            }
+            10 => {
+                apply_separators!(table, total_row_indices, separator_line, 10);
+            }
+            11 => {
+                apply_separators!(table, total_row_indices, separator_line, 11);
+            }
+            12 => {
+                apply_separators!(table, total_row_indices, separator_line, 12);
+            }
+            13 => {
+                apply_separators!(table, total_row_indices, separator_line, 13);
+            }
+            14 => {
+                apply_separators!(table, total_row_indices, separator_line, 14);
+            }
+            15 => {
+                apply_separators!(table, total_row_indices, separator_line, 15);
+            }
+            16 => {
+                apply_separators!(table, total_row_indices, separator_line, 16);
+            }
+            17 => {
+                apply_separators!(table, total_row_indices, separator_line, 17);
+            }
+            18 => {
+                apply_separators!(table, total_row_indices, separator_line, 18);
+            }
+            19 => {
+                apply_separators!(table, total_row_indices, separator_line, 19);
+            }
+            20 => {
+                apply_separators!(table, total_row_indices, separator_line, 20);
+            }
+            21 => {
+                apply_separators!(table, total_row_indices, separator_line, 21);
+            }
+            22 => {
+                apply_separators!(table, total_row_indices, separator_line, 22);
+            }
+            23 => {
+                apply_separators!(table, total_row_indices, separator_line, 23);
+            }
+            24 => {
+                apply_separators!(table, total_row_indices, separator_line, 24);
+            }
+            25 => {
+                apply_separators!(table, total_row_indices, separator_line, 25);
+            }
+            26 => {
+                apply_separators!(table, total_row_indices, separator_line, 26);
+            }
+            27 => {
+                apply_separators!(table, total_row_indices, separator_line, 27);
+            }
+            28 => {
+                apply_separators!(table, total_row_indices, separator_line, 28);
+            }
+            29 => {
+                apply_separators!(table, total_row_indices, separator_line, 29);
+            }
+            30 => {
+                apply_separators!(table, total_row_indices, separator_line, 30);
+            }
+            31 => {
+                apply_separators!(table, total_row_indices, separator_line, 31);
+            }
+            _ => {
+                // >31 days: use basic rounded style without separators
+                table.with(Style::rounded());
+            }
+        }
+    } else {
+        table.with(Style::rounded());
+    }
+
+    table.with(Modify::new(Rows::first()).with(Alignment::center()));
+
+    if term_width >= MIN_WIDTH_FOR_WRAPPING {
+        table.with(Width::wrap(term_width).keep_words(true));
+    } else {
+        table.with(Width::truncate(term_width));
+    }
+
+    println!("{}", table);
+    println!();
+
+    display_grand_total(grand_total, total_lines);
+}
+
+fn display_grand_total(grand_total: f64, total_lines: usize) {
+    let term_width = get_terminal_width();
     println!("{}", divider(term_width));
-    println!("Grand Total: ${:.4}", grand_total);
-    println!("Total Lines Changed: {}", total_lines);
+    println!("Summary");
+    println!("{}", divider(term_width));
+    println!();
+
+    let row = GrandTotalRow::new(grand_total, total_lines);
+    let mut table = Table::new(vec![row]);
+
+    table.with(Style::rounded());
+    table.with(Modify::new(Rows::first()).with(Alignment::center()));
+
+    if term_width >= MIN_WIDTH_FOR_WRAPPING {
+        table.with(Width::wrap(term_width).keep_words(true));
+    } else {
+        table.with(Width::truncate(term_width));
+    }
+
+    println!("{}", table);
     println!("{}", divider(term_width));
 }
 
@@ -348,6 +564,172 @@ mod tests {
     }
 
     #[test]
+    fn test_display_costs_three_days() {
+        // Tests num_separators = 2 match branch
+        let daily_costs = vec![
+            DailyCosts {
+                date: NaiveDate::from_ymd_opt(2025, 10, 23).unwrap(),
+                sonnet_costs: TokenCosts {
+                    input: 1.0,
+                    output: 1.0,
+                    cache_write: 0.0,
+                    cache_read: 0.0,
+                },
+                haiku_costs: TokenCosts::default(),
+                opus_costs: TokenCosts::default(),
+                lines_changed: 100,
+            },
+            DailyCosts {
+                date: NaiveDate::from_ymd_opt(2025, 10, 24).unwrap(),
+                haiku_costs: TokenCosts {
+                    input: 0.5,
+                    output: 0.5,
+                    cache_write: 0.0,
+                    cache_read: 0.0,
+                },
+                sonnet_costs: TokenCosts::default(),
+                opus_costs: TokenCosts::default(),
+                lines_changed: 50,
+            },
+            DailyCosts {
+                date: NaiveDate::from_ymd_opt(2025, 10, 25).unwrap(),
+                opus_costs: TokenCosts {
+                    input: 2.0,
+                    output: 2.0,
+                    cache_write: 0.0,
+                    cache_read: 0.0,
+                },
+                sonnet_costs: TokenCosts::default(),
+                haiku_costs: TokenCosts::default(),
+                lines_changed: 75,
+            },
+        ];
+
+        display_costs(&daily_costs);
+    }
+
+    #[test]
+    fn test_display_costs_day_with_all_three_models() {
+        // Verify separator placement when multiple models create multiple rows per day
+        let daily_costs = vec![
+            DailyCosts {
+                date: NaiveDate::from_ymd_opt(2025, 10, 23).unwrap(),
+                opus_costs: TokenCosts {
+                    input: 1.0,
+                    output: 1.0,
+                    cache_write: 0.0,
+                    cache_read: 0.0,
+                },
+                sonnet_costs: TokenCosts {
+                    input: 2.0,
+                    output: 2.0,
+                    cache_write: 0.0,
+                    cache_read: 0.0,
+                },
+                haiku_costs: TokenCosts {
+                    input: 0.5,
+                    output: 0.5,
+                    cache_write: 0.0,
+                    cache_read: 0.0,
+                },
+                lines_changed: 100,
+            },
+            DailyCosts {
+                date: NaiveDate::from_ymd_opt(2025, 10, 24).unwrap(),
+                sonnet_costs: TokenCosts {
+                    input: 1.0,
+                    output: 1.0,
+                    cache_write: 0.0,
+                    cache_read: 0.0,
+                },
+                haiku_costs: TokenCosts::default(),
+                opus_costs: TokenCosts::default(),
+                lines_changed: 50,
+            },
+        ];
+
+        display_costs(&daily_costs);
+    }
+
+    #[test]
+    fn test_display_costs_ten_days() {
+        // Tests num_separators = 9 (near end of explicit match branches)
+        let daily_costs: Vec<_> = (1..=10)
+            .map(|day| DailyCosts {
+                date: NaiveDate::from_ymd_opt(2025, 10, day).unwrap(),
+                sonnet_costs: TokenCosts {
+                    input: 1.0,
+                    output: 1.0,
+                    cache_write: 0.0,
+                    cache_read: 0.0,
+                },
+                haiku_costs: TokenCosts::default(),
+                opus_costs: TokenCosts::default(),
+                lines_changed: 10,
+            })
+            .collect();
+
+        display_costs(&daily_costs);
+    }
+
+    #[test]
+    fn test_display_costs_thirty_one_days() {
+        // Tests num_separators = 30 (last explicit match branch)
+        let daily_costs: Vec<_> = (1..=31)
+            .map(|day| DailyCosts {
+                date: NaiveDate::from_ymd_opt(2025, 10, day).unwrap(),
+                sonnet_costs: TokenCosts {
+                    input: 1.0,
+                    output: 1.0,
+                    cache_write: 0.0,
+                    cache_read: 0.0,
+                },
+                haiku_costs: TokenCosts::default(),
+                opus_costs: TokenCosts::default(),
+                lines_changed: 10,
+            })
+            .collect();
+
+        display_costs(&daily_costs);
+    }
+
+    #[test]
+    fn test_display_costs_thirty_two_days_uses_fallback() {
+        // Tests fallback branch for >31 days
+        // Use January (31 days) + 1 day from February
+        let mut daily_costs: Vec<_> = (1..=31)
+            .map(|day| DailyCosts {
+                date: NaiveDate::from_ymd_opt(2025, 1, day).unwrap(),
+                sonnet_costs: TokenCosts {
+                    input: 1.0,
+                    output: 1.0,
+                    cache_write: 0.0,
+                    cache_read: 0.0,
+                },
+                haiku_costs: TokenCosts::default(),
+                opus_costs: TokenCosts::default(),
+                lines_changed: 10,
+            })
+            .collect();
+
+        // Add one more day from February to get 32 total days
+        daily_costs.push(DailyCosts {
+            date: NaiveDate::from_ymd_opt(2025, 2, 1).unwrap(),
+            sonnet_costs: TokenCosts {
+                input: 1.0,
+                output: 1.0,
+                cache_write: 0.0,
+                cache_read: 0.0,
+            },
+            haiku_costs: TokenCosts::default(),
+            opus_costs: TokenCosts::default(),
+            lines_changed: 10,
+        });
+
+        display_costs(&daily_costs);
+    }
+
+    #[test]
     fn test_display_warnings_no_unknown_models() {
         let result = AnalysisResult {
             daily_costs: vec![],
@@ -384,26 +766,60 @@ mod tests {
 
     #[test]
     fn test_cost_row_new_formats_currency() {
-        let row = CostRow::new("Sonnet", 1.2345, 2.3456, 0.5, 0.25);
+        let row = CostRow::new("2025-10-23", "Sonnet", 1.2345, 2.3456, 0.5, 0.25, "100");
 
+        assert_eq!(row.date, "2025-10-23");
         assert_eq!(row.model, "Sonnet");
         assert_eq!(row.input, "$1.2345");
         assert_eq!(row.output, "$2.3456");
         assert_eq!(row.cache_write, "$0.5000");
         assert_eq!(row.cache_read, "$0.2500");
         assert_eq!(row.subtotal, "$4.3301");
+        assert_eq!(row.lines, "100");
     }
 
     #[test]
     fn test_cost_row_new_calculates_subtotal() {
-        let row = CostRow::new("Test", 1.0, 2.0, 0.5, 0.25);
+        let row = CostRow::new("2025-10-23", "Test", 1.0, 2.0, 0.5, 0.25, "");
         assert_eq!(row.subtotal, "$3.7500");
     }
 
     #[test]
     fn test_cost_row_new_handles_zero_costs() {
-        let row = CostRow::new("Haiku", 0.0, 0.0, 0.0, 0.0);
+        let row = CostRow::new("", "Haiku", 0.0, 0.0, 0.0, 0.0, "");
         assert_eq!(row.subtotal, "$0.0000");
+    }
+
+    #[test]
+    fn test_cost_row_new_total_row_formats_correctly() {
+        let row = CostRow::new_total_row(1234, 56.789);
+
+        assert_eq!(row.date, "");
+        assert_eq!(row.model, "Total");
+        assert_eq!(row.input, "");
+        assert_eq!(row.output, "");
+        assert_eq!(row.cache_write, "");
+        assert_eq!(row.cache_read, "");
+        assert_eq!(row.subtotal, "$56.7890");
+        assert_eq!(row.lines, "1234");
+    }
+
+    #[test]
+    fn test_cost_row_new_total_row_zero_values() {
+        let row = CostRow::new_total_row(0, 0.0);
+
+        assert_eq!(row.date, "");
+        assert_eq!(row.model, "Total");
+        assert_eq!(row.subtotal, "$0.0000");
+        assert_eq!(row.lines, "0");
+    }
+
+    #[test]
+    fn test_cost_row_new_total_row_large_numbers() {
+        let row = CostRow::new_total_row(999999, 12345.6789);
+
+        assert_eq!(row.subtotal, "$12345.6789");
+        assert_eq!(row.lines, "999999");
     }
 
     #[test]
@@ -412,5 +828,53 @@ mod tests {
         assert_eq!(divider(1), "=");
         assert_eq!(divider(5), "=====");
         assert_eq!(divider(100).len(), 100);
+    }
+
+    #[test]
+    fn test_grand_total_row_new_formats_currency() {
+        let row = GrandTotalRow::new(143.7082, 13010);
+
+        assert_eq!(row.grand_total, "$143.7082");
+        assert_eq!(row.total_lines_changed, "13010");
+    }
+
+    #[test]
+    fn test_grand_total_row_new_handles_zero() {
+        let row = GrandTotalRow::new(0.0, 0);
+
+        assert_eq!(row.grand_total, "$0.0000");
+        assert_eq!(row.total_lines_changed, "0");
+    }
+
+    #[test]
+    fn test_grand_total_row_new_handles_large_numbers() {
+        let row = GrandTotalRow::new(99999.9999, 999999);
+
+        assert_eq!(row.grand_total, "$99999.9999");
+        assert_eq!(row.total_lines_changed, "999999");
+    }
+
+    // Smoke tests for display_grand_total - verify the function doesn't panic
+    // with various input values. These tests don't assert on output format since
+    // that would require capturing stdout or refactoring the function signature.
+
+    #[test]
+    fn test_display_grand_total_zero_values() {
+        display_grand_total(0.0, 0);
+    }
+
+    #[test]
+    fn test_display_grand_total_typical_values() {
+        display_grand_total(143.7082, 13010);
+    }
+
+    #[test]
+    fn test_display_grand_total_large_values() {
+        display_grand_total(12345.6789, 999999);
+    }
+
+    #[test]
+    fn test_display_grand_total_small_values() {
+        display_grand_total(0.0001, 1);
     }
 }
