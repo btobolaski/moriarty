@@ -3,9 +3,10 @@ use std::{
     path::Path,
 };
 
+use async_walkdir::WalkDir;
 use chrono::{Local, NaiveDate};
+use futures::stream::StreamExt;
 use miette::IntoDiagnostic;
-use tokio::fs;
 
 use crate::logs::parser::{self, LogLine, LogMessageContent, LogMessageTaggedContent};
 
@@ -31,6 +32,15 @@ impl DateTimezone {
             Self::Utc => timestamp.date_naive(),
         }
     }
+}
+
+/// Returns true if the model string represents a synthetic/internal model
+/// that should be excluded from billing calculations.
+///
+/// Synthetic models are internal processing steps, not billable API calls.
+#[inline]
+fn is_synthetic_model(model: &str) -> bool {
+    model.eq_ignore_ascii_case("<synthetic>")
 }
 
 #[derive(Debug, Default)]
@@ -121,22 +131,15 @@ impl DailyCosts {
 /// Recursively walk a directory and find all .jsonl files
 pub async fn find_jsonl_files(dir: &Path) -> miette::Result<Vec<std::path::PathBuf>> {
     let mut jsonl_files = Vec::new();
-    let mut stack = vec![dir.to_path_buf()];
+    let mut entries = WalkDir::new(dir);
 
-    while let Some(current_dir) = stack.pop() {
-        let mut entries = fs::read_dir(&current_dir).await.into_diagnostic()?;
+    while let Some(entry) = entries.next().await {
+        let entry = entry.into_diagnostic()?;
 
-        while let Some(entry) = entries.next_entry().await.into_diagnostic()? {
-            let path = entry.path();
-            let metadata = entry.metadata().await.into_diagnostic()?;
-
-            if metadata.is_dir() {
-                stack.push(path);
-            } else if metadata.is_file() {
-                if let Some(extension) = path.extension() {
-                    if extension == "jsonl" {
-                        jsonl_files.push(path);
-                    }
+        if entry.file_type().await.into_diagnostic()?.is_file() {
+            if let Some(extension) = entry.path().extension() {
+                if extension == "jsonl" {
+                    jsonl_files.push(entry.path());
                 }
             }
         }
@@ -158,11 +161,7 @@ pub async fn parse_log_file(
 
     for line in log_lines {
         if let LogLine::Assistant(assistant_line) = line {
-            if assistant_line
-                .message
-                .model
-                .eq_ignore_ascii_case("<synthetic>")
-            {
+            if is_synthetic_model(&assistant_line.message.model) {
                 continue;
             }
 
@@ -198,11 +197,7 @@ pub async fn parse_lines_changed(
 
     for line in log_lines {
         if let LogLine::Assistant(assistant_line) = line {
-            if assistant_line
-                .message
-                .model
-                .eq_ignore_ascii_case("<synthetic>")
-            {
+            if is_synthetic_model(&assistant_line.message.model) {
                 continue;
             }
 

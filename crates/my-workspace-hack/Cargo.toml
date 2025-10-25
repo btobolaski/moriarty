@@ -13,4 +13,11 @@ publish = false
 # are managed by hakari.
 
 ### BEGIN HAKARI SECTION
+[dependencies]
+fastrand = { version = "2" }
+memchr = { version = "2" }
+
+[build-dependencies]
+memchr = { version = "2" }
+
 ### END HAKARI SECTION
