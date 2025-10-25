@@ -29,9 +29,22 @@ async fn main() -> miette::Result<()> {
                 result?;
             }
         }
-        Command::ApiPricing { dir } => {
+        Command::ApiPricing { dir, timezone } => {
+            // Parse timezone argument
+            let tz = match timezone.to_lowercase().as_str() {
+                "local" => api_pricing::DateTimezone::Local,
+                "utc" => api_pricing::DateTimezone::Utc,
+                _ => {
+                    eprintln!(
+                        "Error: Invalid timezone '{}'. Must be 'local' or 'utc'",
+                        timezone
+                    );
+                    std::process::exit(1);
+                }
+            };
+
             // Run the API pricing analysis
-            api_pricing::run(&dir).await?;
+            api_pricing::run(&dir, tz).await?;
         }
     }
 
@@ -59,5 +72,8 @@ pub enum Command {
         /// The directory to analyze for API usage
         #[arg(short, long)]
         dir: PathBuf,
+        /// Timezone to use for date determination (local or utc)
+        #[arg(long, default_value = "local")]
+        timezone: String,
     },
 }

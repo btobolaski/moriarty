@@ -3,7 +3,7 @@ use std::{
     path::Path,
 };
 
-use chrono::NaiveDate;
+use chrono::{Local, NaiveDate};
 use miette::IntoDiagnostic;
 use tokio::fs;
 
@@ -13,6 +13,25 @@ use super::{
     line_counter,
     pricing::{ModelType, TokenCosts, TokenCounts},
 };
+
+/// Timezone to use when extracting dates from timestamps
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DateTimezone {
+    /// Use the system's local timezone
+    Local,
+    /// Use UTC timezone
+    Utc,
+}
+
+impl DateTimezone {
+    /// Convert a UTC timestamp to a date in this timezone
+    pub fn to_date(self, timestamp: &chrono::DateTime<chrono::Utc>) -> NaiveDate {
+        match self {
+            Self::Local => timestamp.with_timezone(&Local).date_naive(),
+            Self::Utc => timestamp.date_naive(),
+        }
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct AnalysisResult {
@@ -132,6 +151,7 @@ pub async fn find_jsonl_files(dir: &Path) -> miette::Result<Vec<std::path::PathB
 /// internal processing steps rather than billable API usage.
 pub async fn parse_log_file(
     file: &Path,
+    timezone: DateTimezone,
 ) -> miette::Result<Vec<(NaiveDate, ModelType, String, TokenCounts)>> {
     let log_lines = parser::read_file(file).await?;
     let mut usages = Vec::new();
@@ -146,7 +166,7 @@ pub async fn parse_log_file(
                 continue;
             }
 
-            let date = assistant_line.timestamp.date_naive();
+            let date = timezone.to_date(&assistant_line.timestamp);
             let model_string = assistant_line.message.model.clone();
             let model_type = ModelType::from_model_string(&model_string);
             let usage = &assistant_line.message.usage;
@@ -169,7 +189,10 @@ pub async fn parse_log_file(
 ///
 /// Filters out entries with model `<synthetic>` (case-insensitive), as these represent
 /// internal processing steps rather than billable API usage.
-pub async fn parse_lines_changed(file: &Path) -> miette::Result<Vec<(NaiveDate, usize)>> {
+pub async fn parse_lines_changed(
+    file: &Path,
+    timezone: DateTimezone,
+) -> miette::Result<Vec<(NaiveDate, usize)>> {
     let log_lines = parser::read_file(file).await?;
     let mut results = Vec::new();
 
@@ -183,7 +206,7 @@ pub async fn parse_lines_changed(file: &Path) -> miette::Result<Vec<(NaiveDate, 
                 continue;
             }
 
-            let date = assistant_line.timestamp.date_naive();
+            let date = timezone.to_date(&assistant_line.timestamp);
 
             // Check if content is an array (contains tool uses)
             if let LogMessageContent::Vec(content_blocks) = &assistant_line.message.content {
@@ -238,7 +261,10 @@ pub fn aggregate_by_date(
 }
 
 /// Analyze all log files in a directory and return daily costs
-pub async fn analyze_directory(dir: &Path) -> miette::Result<AnalysisResult> {
+pub async fn analyze_directory(
+    dir: &Path,
+    timezone: DateTimezone,
+) -> miette::Result<AnalysisResult> {
     let jsonl_files = find_jsonl_files(dir).await?;
 
     if jsonl_files.is_empty() {
@@ -254,7 +280,7 @@ pub async fn analyze_directory(dir: &Path) -> miette::Result<AnalysisResult> {
     let mut files_failed = 0;
 
     for file in &jsonl_files {
-        match parse_log_file(file).await {
+        match parse_log_file(file, timezone).await {
             Ok(usages) => {
                 all_usages.extend(usages);
                 files_parsed += 1;
@@ -266,7 +292,7 @@ pub async fn analyze_directory(dir: &Path) -> miette::Result<AnalysisResult> {
         }
 
         // Parse lines changed (don't fail if this errors)
-        match parse_lines_changed(file).await {
+        match parse_lines_changed(file, timezone).await {
             Ok(lines) => all_lines_changed.extend(lines),
             Err(e) => {
                 eprintln!(
@@ -764,7 +790,7 @@ mod tests {
         let file_path = temp_dir.path().join("empty.jsonl");
         tokio::fs::write(&file_path, "").await.unwrap();
 
-        let result = parse_log_file(&file_path).await.unwrap();
+        let result = parse_log_file(&file_path, DateTimezone::Utc).await.unwrap();
         assert!(result.is_empty());
     }
 
@@ -776,7 +802,7 @@ mod tests {
         let log_content = r#"{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"00000000-0000-0000-0000-000000000000","version":"1.0.0","gitBranch":"main","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4-20250514","container":null,"content":"test","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1000,"cache_creation_input_tokens":100,"cache_read_input_tokens":50,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":500,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000001","timestamp":"2025-10-23T12:00:00Z","isApiErrorMessage":null}"#;
         tokio::fs::write(&file_path, log_content).await.unwrap();
 
-        let result = parse_log_file(&file_path).await.unwrap();
+        let result = parse_log_file(&file_path, DateTimezone::Utc).await.unwrap();
 
         assert_eq!(result.len(), 1);
         let (date, model_type, model_string, counts) = &result[0];
@@ -799,7 +825,7 @@ mod tests {
 {"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"00000000-0000-0000-0000-000000000000","version":"1.0.0","gitBranch":"main","message":{"id":"msg_2","type":"message","role":"assistant","model":"claude-haiku-3","container":null,"content":"test","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":2000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":1000,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000002","timestamp":"2025-10-24T12:00:00Z","isApiErrorMessage":null}"#;
         tokio::fs::write(&file_path, log_content).await.unwrap();
 
-        let result = parse_log_file(&file_path).await.unwrap();
+        let result = parse_log_file(&file_path, DateTimezone::Utc).await.unwrap();
 
         assert_eq!(result.len(), 2);
 
@@ -819,7 +845,7 @@ mod tests {
 {"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"00000000-0000-0000-0000-000000000000","version":"1.0.0","gitBranch":"main","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":"test","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":500,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000002","timestamp":"2025-10-23T12:00:00Z","isApiErrorMessage":null}"#;
         tokio::fs::write(&file_path, log_content).await.unwrap();
 
-        let result = parse_log_file(&file_path).await.unwrap();
+        let result = parse_log_file(&file_path, DateTimezone::Utc).await.unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].1, ModelType::Sonnet);
@@ -828,7 +854,9 @@ mod tests {
     #[tokio::test]
     async fn test_analyze_directory_empty() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let result = analyze_directory(temp_dir.path()).await.unwrap();
+        let result = analyze_directory(temp_dir.path(), DateTimezone::Utc)
+            .await
+            .unwrap();
 
         assert!(result.daily_costs.is_empty());
         assert_eq!(result.files_parsed, 0);
@@ -842,7 +870,9 @@ mod tests {
             .await
             .unwrap();
 
-        let result = analyze_directory(temp_dir.path()).await.unwrap();
+        let result = analyze_directory(temp_dir.path(), DateTimezone::Utc)
+            .await
+            .unwrap();
         assert!(result.daily_costs.is_empty());
         assert_eq!(result.files_parsed, 0);
         assert_eq!(result.files_failed, 1);
@@ -915,7 +945,9 @@ mod tests {
         let log_content = r#"{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"00000000-0000-0000-0000-000000000000","version":"1.0.0","gitBranch":"main","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":[{"type":"tool_use","id":"tool_1","name":"Edit","input":{"file_path":"/test.rs","old_string":"line1\nline2","new_string":"line1\nmodified\nline3"}}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":500,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000001","timestamp":"2025-10-23T12:00:00Z","isApiErrorMessage":null}"#;
         tokio::fs::write(&file_path, log_content).await.unwrap();
 
-        let result = parse_lines_changed(&file_path).await.unwrap();
+        let result = parse_lines_changed(&file_path, DateTimezone::Utc)
+            .await
+            .unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0, NaiveDate::from_ymd_opt(2025, 10, 23).unwrap());
@@ -930,7 +962,9 @@ mod tests {
         let log_content = r#"{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"00000000-0000-0000-0000-000000000000","version":"1.0.0","gitBranch":"main","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":[{"type":"tool_use","id":"tool_1","name":"Write","input":{"file_path":"/test.rs","content":"line1\nline2\nline3\nline4"}}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":500,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000001","timestamp":"2025-10-23T12:00:00Z","isApiErrorMessage":null}"#;
         tokio::fs::write(&file_path, log_content).await.unwrap();
 
-        let result = parse_lines_changed(&file_path).await.unwrap();
+        let result = parse_lines_changed(&file_path, DateTimezone::Utc)
+            .await
+            .unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0, NaiveDate::from_ymd_opt(2025, 10, 23).unwrap());
@@ -945,7 +979,9 @@ mod tests {
         let log_content = r#"{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"00000000-0000-0000-0000-000000000000","version":"1.0.0","gitBranch":"main","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":[{"type":"tool_use","id":"tool_1","name":"NotebookEdit","input":{"notebook_path":"/test.ipynb","new_source":"print('hello')\nprint('world')"}}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":500,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000001","timestamp":"2025-10-23T12:00:00Z","isApiErrorMessage":null}"#;
         tokio::fs::write(&file_path, log_content).await.unwrap();
 
-        let result = parse_lines_changed(&file_path).await.unwrap();
+        let result = parse_lines_changed(&file_path, DateTimezone::Utc)
+            .await
+            .unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0, NaiveDate::from_ymd_opt(2025, 10, 23).unwrap());
@@ -960,7 +996,9 @@ mod tests {
         let log_content = r#"{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"00000000-0000-0000-0000-000000000000","version":"1.0.0","gitBranch":"main","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":[{"type":"tool_use","id":"tool_1","name":"Edit","input":{"file_path":"/test.rs","old_string":"old","new_string":"new"}},{"type":"tool_use","id":"tool_2","name":"Write","input":{"file_path":"/test2.rs","content":"line1\nline2"}}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":500,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000001","timestamp":"2025-10-23T12:00:00Z","isApiErrorMessage":null}"#;
         tokio::fs::write(&file_path, log_content).await.unwrap();
 
-        let result = parse_lines_changed(&file_path).await.unwrap();
+        let result = parse_lines_changed(&file_path, DateTimezone::Utc)
+            .await
+            .unwrap();
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].0, NaiveDate::from_ymd_opt(2025, 10, 23).unwrap());
@@ -973,7 +1011,9 @@ mod tests {
         let file_path = temp_dir.path().join("empty.jsonl");
         tokio::fs::write(&file_path, "").await.unwrap();
 
-        let result = parse_lines_changed(&file_path).await.unwrap();
+        let result = parse_lines_changed(&file_path, DateTimezone::Utc)
+            .await
+            .unwrap();
         assert!(result.is_empty());
     }
 
@@ -985,7 +1025,9 @@ mod tests {
         let log_content = r#"{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"00000000-0000-0000-0000-000000000000","version":"1.0.0","gitBranch":"main","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":"just text, no tools","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":500,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000001","timestamp":"2025-10-23T12:00:00Z","isApiErrorMessage":null}"#;
         tokio::fs::write(&file_path, log_content).await.unwrap();
 
-        let result = parse_lines_changed(&file_path).await.unwrap();
+        let result = parse_lines_changed(&file_path, DateTimezone::Utc)
+            .await
+            .unwrap();
         assert!(result.is_empty());
     }
 
@@ -997,7 +1039,9 @@ mod tests {
         let log_content = r#"{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"00000000-0000-0000-0000-000000000000","version":"1.0.0","gitBranch":"main","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":[{"type":"tool_use","id":"tool_1","name":"Read","input":{"file_path":"/test.rs"}}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":500,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000001","timestamp":"2025-10-23T12:00:00Z","isApiErrorMessage":null}"#;
         tokio::fs::write(&file_path, log_content).await.unwrap();
 
-        let result = parse_lines_changed(&file_path).await.unwrap();
+        let result = parse_lines_changed(&file_path, DateTimezone::Utc)
+            .await
+            .unwrap();
         assert!(result.is_empty());
     }
 
@@ -1010,7 +1054,7 @@ mod tests {
 {"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"00000000-0000-0000-0000-000000000000","version":"1.0.0","gitBranch":"main","message":{"id":"msg_2","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":"test","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":2000,"cache_creation_input_tokens":100,"cache_read_input_tokens":50,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":1000,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000002","timestamp":"2025-10-23T12:00:00Z","isApiErrorMessage":null}"#;
         tokio::fs::write(&file_path, log_content).await.unwrap();
 
-        let result = parse_log_file(&file_path).await.unwrap();
+        let result = parse_log_file(&file_path, DateTimezone::Utc).await.unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].2, "claude-sonnet-4");
@@ -1026,7 +1070,7 @@ mod tests {
 {"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"00000000-0000-0000-0000-000000000000","version":"1.0.0","gitBranch":"main","message":{"id":"msg_2","type":"message","role":"assistant","model":"<Synthetic>","container":null,"content":"test","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1500,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":750,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000002","timestamp":"2025-10-23T12:00:00Z","isApiErrorMessage":null}"#;
         tokio::fs::write(&file_path, log_content).await.unwrap();
 
-        let result = parse_log_file(&file_path).await.unwrap();
+        let result = parse_log_file(&file_path, DateTimezone::Utc).await.unwrap();
 
         assert!(result.is_empty());
     }
@@ -1040,7 +1084,9 @@ mod tests {
 {"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"00000000-0000-0000-0000-000000000000","version":"1.0.0","gitBranch":"main","message":{"id":"msg_2","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":[{"type":"tool_use","id":"tool_2","name":"Edit","input":{"file_path":"/test2.rs","old_string":"a","new_string":"b\nc"}}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":2000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":1000,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000002","timestamp":"2025-10-23T12:00:00Z","isApiErrorMessage":null}"#;
         tokio::fs::write(&file_path, log_content).await.unwrap();
 
-        let result = parse_lines_changed(&file_path).await.unwrap();
+        let result = parse_lines_changed(&file_path, DateTimezone::Utc)
+            .await
+            .unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0, NaiveDate::from_ymd_opt(2025, 10, 23).unwrap());
@@ -1056,7 +1102,9 @@ mod tests {
 {"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"00000000-0000-0000-0000-000000000000","version":"1.0.0","gitBranch":"main","message":{"id":"msg_2","type":"message","role":"assistant","model":"<Synthetic>","container":null,"content":[{"type":"tool_use","id":"tool_2","name":"Write","input":{"file_path":"/test2.rs","content":"line1\nline2"}}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":2000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":1000,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000002","timestamp":"2025-10-23T12:00:00Z","isApiErrorMessage":null}"#;
         tokio::fs::write(&file_path, log_content).await.unwrap();
 
-        let result = parse_lines_changed(&file_path).await.unwrap();
+        let result = parse_lines_changed(&file_path, DateTimezone::Utc)
+            .await
+            .unwrap();
 
         assert!(result.is_empty());
     }
@@ -1070,7 +1118,7 @@ mod tests {
 {"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"00000000-0000-0000-0000-000000000000","version":"1.0.0","gitBranch":"main","message":{"id":"msg_2","type":"message","role":"assistant","model":"<synthetic>","container":null,"content":"test","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":2000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":1000,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000002","timestamp":"2025-10-23T12:00:00Z","isApiErrorMessage":null}"#;
         tokio::fs::write(&file_path, log_content).await.unwrap();
 
-        let result = parse_log_file(&file_path).await.unwrap();
+        let result = parse_log_file(&file_path, DateTimezone::Utc).await.unwrap();
 
         assert!(result.is_empty());
     }
@@ -1084,7 +1132,9 @@ mod tests {
 {"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"00000000-0000-0000-0000-000000000000","version":"1.0.0","gitBranch":"main","message":{"id":"msg_2","type":"message","role":"assistant","model":"<synthetic>","container":null,"content":[{"type":"tool_use","id":"tool_2","name":"Write","input":{"file_path":"/test2.rs","content":"test"}}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":2000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":1000,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000002","timestamp":"2025-10-23T12:00:00Z","isApiErrorMessage":null}"#;
         tokio::fs::write(&file_path, log_content).await.unwrap();
 
-        let result = parse_lines_changed(&file_path).await.unwrap();
+        let result = parse_lines_changed(&file_path, DateTimezone::Utc)
+            .await
+            .unwrap();
 
         assert!(result.is_empty());
     }

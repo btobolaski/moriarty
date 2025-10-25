@@ -5,6 +5,9 @@ mod pricing;
 use std::path::Path;
 
 use analyzer::{AnalysisResult, DailyCosts};
+
+// Re-export DateTimezone for use in main.rs
+pub use analyzer::DateTimezone;
 use tabled::{
     settings::{
         object::Rows,
@@ -117,8 +120,8 @@ fn divider(width: usize) -> String {
 }
 
 /// Run the API pricing analysis on a directory
-pub async fn run(dir: &Path) -> miette::Result<()> {
-    let result = analyzer::analyze_directory(dir).await?;
+pub async fn run(dir: &Path, timezone: DateTimezone) -> miette::Result<()> {
+    let result = analyzer::analyze_directory(dir, timezone).await?;
 
     display_analysis_summary(&result);
 
