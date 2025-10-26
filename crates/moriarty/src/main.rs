@@ -6,6 +6,7 @@ use mcp::McpServers;
 mod api_pricing;
 mod logs;
 mod mcp;
+mod persistence;
 mod tui;
 
 #[tokio::main]
