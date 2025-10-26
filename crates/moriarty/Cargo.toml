@@ -26,6 +26,7 @@ tokio = { version = "1.47.1", features = [
   "time",
   "process",
 ] }
+toml = "0.9.8"
 tui-scrollview = "0.5.1"
 uuid = { version = "1.18.1", features = ["v4", "serde"] }
 
