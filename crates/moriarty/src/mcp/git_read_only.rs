@@ -15,7 +15,7 @@ use tokio::process::Command;
 pub struct StatusArgs {
     /// The directory of the project
     pub project_dir: PathBuf,
-    /// Any arguments to add to `git status`
+    /// Any arguments to add to `git status`, same interface as the git cli.
     pub args: Vec<String>,
 }
 
@@ -23,7 +23,23 @@ pub struct StatusArgs {
 pub struct DiffArgs {
     /// The directory of the project
     pub project_dir: PathBuf,
-    /// Any arguments to add to `git diff`
+    /// Any arguments to add to `git diff`, same interface as the git cli.
+    pub args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct LogArgs {
+    /// The directory of the project
+    pub project_dir: PathBuf,
+    /// Any arguments to add to `git log`, same interface as the git cli.
+    pub args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ShowArgs {
+    /// The directory of the project
+    pub project_dir: PathBuf,
+    /// Any argument to add to `git show~, same interface as the git cli.
     pub args: Vec<String>,
 }
 
@@ -143,6 +159,112 @@ impl GitReadOnly {
             Err(error) => Err(McpError {
                 code: ErrorCode::INTERNAL_ERROR,
                 message: format!("diff failed: {error:?}").into(),
+                data: None,
+            }),
+        }
+    }
+
+    #[tool(description = "Runs `git show` with the provided args")]
+    async fn show(
+        &self,
+        Parameters(args): Parameters<ShowArgs>,
+    ) -> Result<Json<CommandResult>, McpError> {
+        let ShowArgs { project_dir, args } = args;
+
+        let mut cmd = Command::new("git");
+        cmd.arg("show");
+        cmd.current_dir(project_dir);
+
+        for arg in args {
+            cmd.arg(arg);
+        }
+
+        match cmd.output().await {
+            Ok(result) => {
+                let stderr = match str::from_utf8(result.stderr.as_ref()) {
+                    Ok(stderr) => stderr.to_string(),
+                    Err(error) => {
+                        return Err(McpError {
+                            code: ErrorCode::INTERNAL_ERROR,
+                            message: format!("stderr invalid: {error:?}").into(),
+                            data: None,
+                        });
+                    }
+                };
+
+                let stdout = match str::from_utf8(result.stdout.as_ref()) {
+                    Ok(stdout) => stdout.to_string(),
+                    Err(error) => {
+                        return Err(McpError {
+                            code: ErrorCode::INTERNAL_ERROR,
+                            message: format!("stdout invalid: {error:?}").into(),
+                            data: None,
+                        })
+                    }
+                };
+
+                Ok(Json(CommandResult {
+                    exit_code: result.status.code().unwrap_or(-1),
+                    stderr,
+                    stdout,
+                }))
+            }
+            Err(error) => Err(McpError {
+                code: ErrorCode::INTERNAL_ERROR,
+                message: format!("show failed: {error:?}").into(),
+                data: None,
+            }),
+        }
+    }
+
+    #[tool(description = "Runs `git log` with the provided args")]
+    async fn log(
+        &self,
+        Parameters(args): Parameters<LogArgs>,
+    ) -> Result<Json<CommandResult>, McpError> {
+        let LogArgs { project_dir, args } = args;
+
+        let mut cmd = Command::new("git");
+        cmd.arg("log");
+        cmd.current_dir(project_dir);
+
+        for arg in args {
+            cmd.arg(arg);
+        }
+
+        match cmd.output().await {
+            Ok(result) => {
+                let stderr = match str::from_utf8(result.stderr.as_ref()) {
+                    Ok(stderr) => stderr.to_string(),
+                    Err(error) => {
+                        return Err(McpError {
+                            code: ErrorCode::INTERNAL_ERROR,
+                            message: format!("stderr invalid: {error:?}").into(),
+                            data: None,
+                        });
+                    }
+                };
+
+                let stdout = match str::from_utf8(result.stdout.as_ref()) {
+                    Ok(stdout) => stdout.to_string(),
+                    Err(error) => {
+                        return Err(McpError {
+                            code: ErrorCode::INTERNAL_ERROR,
+                            message: format!("stdout invalid: {error:?}").into(),
+                            data: None,
+                        })
+                    }
+                };
+
+                Ok(Json(CommandResult {
+                    exit_code: result.status.code().unwrap_or(-1),
+                    stderr,
+                    stdout,
+                }))
+            }
+            Err(error) => Err(McpError {
+                code: ErrorCode::INTERNAL_ERROR,
+                message: format!("log failed: {error:?}").into(),
                 data: None,
             }),
         }

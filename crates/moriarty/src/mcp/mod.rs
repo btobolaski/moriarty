@@ -52,9 +52,12 @@ async fn install_mcp_server() -> miette::Result<()> {
     // Remove any existing installation first to ensure a clean reinstall.
     // Errors are ignored because the server may not be installed yet, and other errors
     // (missing claude binary, permissions) will be caught by the subsequent add command.
-    eprintln!("Removing existing {} MCP server (if present)...", MCP_SERVER_NAME);
+    eprintln!(
+        "Removing existing {} MCP server (if present)...",
+        MCP_SERVER_NAME
+    );
     let _ = Command::new("claude")
-        .args(["mcp", "rm", MCP_SERVER_NAME])
+        .args(["mcp", "remove", MCP_SERVER_NAME])
         .status()
         .await;
 
