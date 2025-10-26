@@ -908,6 +908,11 @@ version = "0.1.0"
 dependencies = [
  "fastrand",
  "memchr",
+ "serde_core",
+ "serde_json",
+ "toml_datetime",
+ "toml_parser",
+ "winnow",
 ]
 
 [[package]]

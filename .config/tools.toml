@@ -1,0 +1,6 @@
+
+[commands]
+lint = ["cargo", "clippy"]
+test = ["cargo", "nextest", "run"]
+build = ["cargo", "build"]
+format = ["cargo", "format"]

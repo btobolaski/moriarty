@@ -16,8 +16,18 @@ publish = false
 [dependencies]
 fastrand = { version = "2" }
 memchr = { version = "2" }
+serde_core = { version = "1", default-features = false, features = ["alloc", "rc", "result", "std"] }
+serde_json = { version = "1", features = ["alloc"] }
+toml_datetime = { version = "0.7", features = ["serde"] }
+toml_parser = { version = "1" }
+winnow = { version = "0.7" }
 
 [build-dependencies]
 memchr = { version = "2" }
+serde_core = { version = "1", default-features = false, features = ["alloc", "rc", "result", "std"] }
+serde_json = { version = "1", features = ["alloc"] }
+toml_datetime = { version = "0.7", features = ["serde"] }
+toml_parser = { version = "1" }
+winnow = { version = "0.7" }
 
 ### END HAKARI SECTION
