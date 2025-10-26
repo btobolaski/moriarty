@@ -82,7 +82,7 @@ impl GitReadOnly {
                 };
 
                 Ok(Json(CommandResult {
-                    exit_code: result.status.code().unwrap(),
+                    exit_code: result.status.code().unwrap_or(-1),
                     stderr,
                     stdout,
                 }))
@@ -135,7 +135,7 @@ impl GitReadOnly {
                 };
 
                 Ok(Json(CommandResult {
-                    exit_code: result.status.code().unwrap(),
+                    exit_code: result.status.code().unwrap_or(-1),
                     stderr,
                     stdout,
                 }))
