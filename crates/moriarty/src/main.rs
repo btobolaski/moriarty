@@ -1,9 +1,11 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use mcp::McpServers;
 
 mod api_pricing;
 mod logs;
+mod mcp;
 mod tui;
 
 #[tokio::main]
@@ -46,6 +48,9 @@ async fn main() -> miette::Result<()> {
             // Run the API pricing analysis
             api_pricing::run(&dir, tz).await?;
         }
+        Command::Mcp { server } => {
+            server.run().await?;
+        }
     }
 
     Ok(())
@@ -75,5 +80,10 @@ pub enum Command {
         /// Timezone to use for date determination (local or utc)
         #[arg(long, default_value = "local")]
         timezone: String,
+    },
+    /// Runs one of the mcp servers
+    Mcp {
+        #[command(subcommand)]
+        server: McpServers,
     },
 }
