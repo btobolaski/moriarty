@@ -1,6 +1,6 @@
 
 [commands]
 lint = ["cargo", "clippy", "--all-targets", "--", "--deny", "warnings"]
-test = ["cargo", "nextest", "run"]
+test = ["cargo", "nextest", "run", "--no-fail-fast"]
 build = ["cargo", "build"]
 format = ["cargo", "fmt"]

@@ -22,8 +22,9 @@ use miette::IntoDiagnostic;
 use rmcp::{transport::stdio, ServiceExt};
 use tool_runner::ToolRunner;
 
+pub mod approvals;
 pub mod git_read_only;
-mod tool_runner;
+pub mod tool_runner;
 
 #[derive(Debug, Subcommand)]
 pub enum McpServers {

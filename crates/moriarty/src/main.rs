@@ -4,6 +4,8 @@ use clap::{Parser, Subcommand};
 use mcp::McpServers;
 
 mod api_pricing;
+mod approval_tui;
+mod hashing;
 mod logs;
 mod mcp;
 mod persistence;
@@ -52,6 +54,30 @@ async fn main() -> miette::Result<()> {
         Command::Mcp { server } => {
             server.run().await?;
         }
+        Command::ApproveProject { project_dir } => {
+            // Initialize the terminal
+            let terminal = ratatui::init();
+
+            // Create and run the approval app
+            let app = approval_tui::ApprovalApp::new(project_dir).await?;
+            let approved = app.run(terminal).await;
+
+            // Restore the terminal
+            ratatui::restore();
+
+            // Exit with appropriate code
+            match approved {
+                Ok(true) => {
+                    println!("✓ Project tools approved successfully!");
+                    Ok(())
+                }
+                Ok(false) => {
+                    eprintln!("✗ Approval cancelled");
+                    std::process::exit(1);
+                }
+                Err(e) => Err(e),
+            }?;
+        }
     }
 
     Ok(())
@@ -86,5 +112,10 @@ pub enum Command {
     Mcp {
         #[command(subcommand)]
         server: McpServers,
+    },
+    /// Approve project tools for MCP server execution
+    ApproveProject {
+        /// The project directory containing .config/tools.toml
+        project_dir: PathBuf,
     },
 }

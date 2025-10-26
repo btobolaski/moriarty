@@ -113,16 +113,20 @@ enum ProjectCommand {
     Format,
 }
 
-impl std::fmt::Display for ProjectCommand {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let value = match self {
+impl ProjectCommand {
+    fn as_str(&self) -> &'static str {
+        match self {
             Self::Lint => "lint",
             Self::Test => "test",
             Self::Build => "build",
             Self::Format => "format",
-        };
+        }
+    }
+}
 
-        value.fmt(f)
+impl std::fmt::Display for ProjectCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.as_str().fmt(f)
     }
 }
 
@@ -196,6 +200,90 @@ impl ToolRunner {
                 });
             }
         };
+
+        // Verify approval before executing
+        let command_name = cmd.as_str();
+        let approvals = super::approvals::ProjectApprovals::load()
+            .await
+            .map_err(|e| McpError {
+                code: ErrorCode::INTERNAL_ERROR,
+                message: format!("Failed to load approvals: {}", e).into(),
+                data: None,
+            })?;
+
+        let verification_result = approvals
+            .verify_project(&canonical_dir, command_name)
+            .await
+            .map_err(|e| McpError {
+                code: ErrorCode::INTERNAL_ERROR,
+                message: format!("Failed to verify approvals: {}", e).into(),
+                data: None,
+            })?;
+
+        use super::approvals::VerificationResult;
+        match verification_result {
+            VerificationResult::Approved => {
+                // Continue with execution
+            }
+            VerificationResult::NotApproved => {
+                return Err(McpError {
+                    code: ErrorCode::INVALID_REQUEST,
+                    message: format!(
+                        "Project tools not approved. Run: moriarty approve-project {}",
+                        canonical_dir.display()
+                    )
+                    .into(),
+                    data: None,
+                });
+            }
+            VerificationResult::ConfigHashMismatch { expected, actual } => {
+                return Err(McpError {
+                    code: ErrorCode::INVALID_REQUEST,
+                    message: format!(
+                        "tools.toml has been modified since approval. \
+                        Run: moriarty approve-project {} \
+                        (expected: {}, actual: {})",
+                        canonical_dir.display(),
+                        expected,
+                        actual
+                    )
+                    .into(),
+                    data: None,
+                });
+            }
+            VerificationResult::BinaryHashMismatch {
+                command,
+                expected,
+                actual,
+            } => {
+                return Err(McpError {
+                    code: ErrorCode::INVALID_REQUEST,
+                    message: format!(
+                        "Binary for '{}' command has been modified since approval. \
+                        Run: moriarty approve-project {} \
+                        (expected: {}, actual: {})",
+                        command,
+                        canonical_dir.display(),
+                        expected,
+                        actual
+                    )
+                    .into(),
+                    data: None,
+                });
+            }
+            VerificationResult::CommandNotApproved { command } => {
+                return Err(McpError {
+                    code: ErrorCode::INVALID_REQUEST,
+                    message: format!(
+                        "Command '{}' not approved. Run: moriarty approve-project {}",
+                        command,
+                        canonical_dir.display()
+                    )
+                    .into(),
+                    data: None,
+                });
+            }
+        }
 
         let maybe_command = match cmd {
             ProjectCommand::Build => settings.commands.build,
@@ -303,7 +391,14 @@ impl Default for ToolRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp::approvals;
+    use std::path::Path;
     use tempfile::TempDir;
+
+    // IMPORTANT: Tests use `_xdg_dir` variables to keep TempDir instances alive.
+    // TempDir deletes its directory when dropped, so binding it to a variable (even
+    // with underscore prefix) prevents premature cleanup. Without this binding, the
+    // temporary XDG_CONFIG_HOME directory would be deleted before the test completes.
 
     fn setup_project_dir_with_config(config_content: &str) -> TempDir {
         let temp_dir = TempDir::new().unwrap();
@@ -311,6 +406,60 @@ mod tests {
         std::fs::create_dir(&config_dir).unwrap();
         std::fs::write(config_dir.join("tools.toml"), config_content).unwrap();
         temp_dir
+    }
+
+    /// Safe to use std::env::set_var because cargo nextest isolates each test in a separate process.
+    fn setup_isolated_xdg_config() -> tempfile::TempDir {
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+        temp_dir
+    }
+
+    /// Pre-approves tools to bypass the approval TUI in integration tests.
+    /// Helper to approve a project with the given config content.
+    /// Returns the canonical project path for use in assertions.
+    async fn approve_project_config(
+        project_dir: &Path,
+        config_content: &str,
+    ) -> PathBuf {
+        use std::collections::HashMap;
+
+        let canonical_path = project_dir.canonicalize().unwrap();
+        let config: ProjectConfig = toml::from_str(config_content).unwrap();
+        let tools_config_hash = crate::hashing::hash_string(config_content);
+
+        let mut commands = HashMap::new();
+        for (name, cmd_array) in approvals::get_all_commands(&config.commands) {
+            let binary_name = &cmd_array[0];
+            let (original_path, resolved_path) =
+                approvals::resolve_binary_path_with_original(binary_name, &canonical_path).unwrap();
+            let binary_hash = crate::hashing::hash_file(&resolved_path).await.unwrap();
+
+            commands.insert(
+                name,
+                approvals::CommandApproval {
+                    original_path: original_path.to_string_lossy().to_string(),
+                    canonical_path: resolved_path.to_string_lossy().to_string(),
+                    binary_hash,
+                },
+            );
+        }
+
+        let canonical_path_clone = canonical_path.clone();
+        approvals::ProjectApprovals::update(move |approvals| {
+            approvals.approve_project(canonical_path_clone, tools_config_hash, commands);
+        })
+        .await
+        .unwrap();
+
+        canonical_path
+    }
+
+    async fn setup_project_dir_with_approvals(config_content: &str) -> (TempDir, TempDir) {
+        let xdg_dir = setup_isolated_xdg_config();
+        let temp_dir = setup_project_dir_with_config(config_content);
+        approve_project_config(temp_dir.path(), config_content).await;
+        (temp_dir, xdg_dir)
     }
 
     #[tokio::test]
@@ -393,12 +542,13 @@ lint = ["cargo", "clippy"]
 
     #[tokio::test]
     async fn test_run_command_success() {
-        let temp_dir = setup_project_dir_with_config(
+        let (temp_dir, _xdg_dir) = setup_project_dir_with_approvals(
             r#"
 [commands]
 test = ["echo", "test output"]
 "#,
-        );
+        )
+        .await;
 
         let args = RunArgs {
             project_dir: temp_dir.path().to_path_buf(),
@@ -413,12 +563,14 @@ test = ["echo", "test output"]
 
     #[tokio::test]
     async fn test_run_command_not_configured() {
-        let temp_dir = setup_project_dir_with_config(
+        // Verify that commands not in tools.toml are rejected even if approved
+        let (temp_dir, _xdg_dir) = setup_project_dir_with_approvals(
             r#"
 [commands]
 lint = ["cargo", "clippy"]
 "#,
-        );
+        )
+        .await;
 
         let args = RunArgs {
             project_dir: temp_dir.path().to_path_buf(),
@@ -428,19 +580,21 @@ lint = ["cargo", "clippy"]
 
         match result {
             Err(error) => {
-                assert_eq!(error.code, ErrorCode::RESOURCE_NOT_FOUND);
-                assert!(error.message.contains("not configured"));
+                assert_eq!(error.code, ErrorCode::INVALID_REQUEST);
+                assert!(error.message.contains("not approved"));
             }
             Ok(_) => panic!("Expected error for unconfigured command"),
         }
     }
 
     #[tokio::test]
-    async fn test_run_command_empty_array() {
+    async fn test_run_command_not_approved() {
+        // Unlike other tests, deliberately skip approval setup to test rejection path
+        let _xdg_dir = setup_isolated_xdg_config();
         let temp_dir = setup_project_dir_with_config(
             r#"
 [commands]
-test = []
+test = ["echo", "hello"]
 "#,
         );
 
@@ -452,21 +606,22 @@ test = []
 
         match result {
             Err(error) => {
-                assert_eq!(error.code, ErrorCode::RESOURCE_NOT_FOUND);
-                assert!(error.message.contains("not configured"));
+                assert_eq!(error.code, ErrorCode::INVALID_REQUEST);
+                assert!(error.message.contains("not approved"));
             }
-            Ok(_) => panic!("Expected error for empty command array"),
+            Ok(_) => panic!("Expected error for unapproved project"),
         }
     }
 
     #[tokio::test]
     async fn test_run_command_nonzero_exit() {
-        let temp_dir = setup_project_dir_with_config(
+        let (temp_dir, _xdg_dir) = setup_project_dir_with_approvals(
             r#"
 [commands]
 test = ["sh", "-c", "exit 1"]
 "#,
-        );
+        )
+        .await;
 
         let args = RunArgs {
             project_dir: temp_dir.path().to_path_buf(),
@@ -479,13 +634,25 @@ test = ["sh", "-c", "exit 1"]
     }
 
     #[tokio::test]
-    async fn test_run_command_invalid_executable() {
-        let temp_dir = setup_project_dir_with_config(
+    async fn test_run_command_config_hash_mismatch() {
+        // Simulate an attacker modifying tools.toml after legitimate approval
+        let (temp_dir, _xdg_dir) = setup_project_dir_with_approvals(
             r#"
 [commands]
-test = ["this-command-does-not-exist-anywhere"]
+test = ["echo", "original"]
 "#,
-        );
+        )
+        .await;
+
+        let config_path = temp_dir.path().join(".config/tools.toml");
+        std::fs::write(
+            config_path,
+            r#"
+[commands]
+test = ["echo", "modified"]
+"#,
+        )
+        .unwrap();
 
         let args = RunArgs {
             project_dir: temp_dir.path().to_path_buf(),
@@ -495,10 +662,10 @@ test = ["this-command-does-not-exist-anywhere"]
 
         match result {
             Err(error) => {
-                assert_eq!(error.code, ErrorCode::INTERNAL_ERROR);
-                assert!(error.message.contains("failed to run"));
+                assert_eq!(error.code, ErrorCode::INVALID_REQUEST);
+                assert!(error.message.contains("tools.toml has been modified"));
             }
-            Ok(_) => panic!("Expected error for invalid executable"),
+            Ok(_) => panic!("Expected error for modified config"),
         }
     }
 
@@ -512,12 +679,13 @@ test = ["this-command-does-not-exist-anywhere"]
 
     #[tokio::test]
     async fn test_run_lint_handler() {
-        let temp_dir = setup_project_dir_with_config(
+        let (temp_dir, _xdg_dir) = setup_project_dir_with_approvals(
             r#"
 [commands]
 lint = ["echo", "Running lint"]
 "#,
-        );
+        )
+        .await;
 
         let server = ToolRunner::default();
         let args = RunArgs {
@@ -532,12 +700,13 @@ lint = ["echo", "Running lint"]
 
     #[tokio::test]
     async fn test_run_build_handler() {
-        let temp_dir = setup_project_dir_with_config(
+        let (temp_dir, _xdg_dir) = setup_project_dir_with_approvals(
             r#"
 [commands]
 build = ["echo", "Building project"]
 "#,
-        );
+        )
+        .await;
 
         let server = ToolRunner::default();
         let args = RunArgs {
@@ -552,12 +721,13 @@ build = ["echo", "Building project"]
 
     #[tokio::test]
     async fn test_run_formatter_handler() {
-        let temp_dir = setup_project_dir_with_config(
+        let (temp_dir, _xdg_dir) = setup_project_dir_with_approvals(
             r#"
 [commands]
 format = ["echo", "Formatting code"]
 "#,
-        );
+        )
+        .await;
 
         let server = ToolRunner::default();
         let args = RunArgs {
@@ -572,12 +742,13 @@ format = ["echo", "Formatting code"]
 
     #[tokio::test]
     async fn test_run_tests_handler() {
-        let temp_dir = setup_project_dir_with_config(
+        let (temp_dir, _xdg_dir) = setup_project_dir_with_approvals(
             r#"
 [commands]
 test = ["echo", "Running tests"]
 "#,
-        );
+        )
+        .await;
 
         let server = ToolRunner::default();
         let args = RunArgs {
@@ -618,12 +789,13 @@ test = ["echo", "hello"]
 
     #[tokio::test]
     async fn test_resolves_symlinks_in_tool_runner() {
-        let temp_dir = setup_project_dir_with_config(
+        let (temp_dir, _xdg_dir) = setup_project_dir_with_approvals(
             r#"
 [commands]
 test = ["echo", "hello"]
 "#,
-        );
+        )
+        .await;
 
         // Create a symlink to the project directory
         let link_dir = TempDir::new().unwrap();
@@ -644,5 +816,334 @@ test = ["echo", "hello"]
         // Should succeed - canonicalize resolves the symlink
         let tool_result = result.unwrap();
         assert_eq!(tool_result.is_error, Some(false));
+    }
+
+    #[tokio::test]
+    async fn test_detects_binary_swap_toctou_attack() {
+        // TOCTOU attack: Approve legitimate binary, then swap with malicious one
+        // This simulates an attacker replacing a binary after approval but before execution
+        use std::io::Write;
+
+        let _xdg_dir = setup_isolated_xdg_config();
+
+        // Create a custom script that will be approved
+        let temp_dir = TempDir::new().unwrap();
+        let config_dir = temp_dir.path().join(".config");
+        std::fs::create_dir(&config_dir).unwrap();
+
+        let script_path = temp_dir.path().join("legitimate.sh");
+        let mut script = std::fs::File::create(&script_path).unwrap();
+        writeln!(script, "#!/usr/bin/env bash").unwrap();
+        writeln!(script, "echo 'legitimate'").unwrap();
+        drop(script);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script_path, perms).unwrap();
+        }
+
+        let config_content = format!(
+            r#"
+[commands]
+test = ["{}"]
+"#,
+            script_path.display()
+        );
+
+        std::fs::write(config_dir.join("tools.toml"), &config_content).unwrap();
+
+        // Approve the legitimate binary
+        approve_project_config(temp_dir.path(), &config_content).await;
+
+        // TOCTOU attack: Swap the binary with malicious content after approval
+        let mut malicious_script = std::fs::File::create(&script_path).unwrap();
+        writeln!(malicious_script, "#!/usr/bin/env bash").unwrap();
+        writeln!(malicious_script, "echo 'malicious'").unwrap();
+        writeln!(malicious_script, "rm -rf /").unwrap(); // Simulated malicious command
+        drop(malicious_script);
+
+        // Attempt to execute - should be rejected due to hash mismatch
+        let args = RunArgs {
+            project_dir: temp_dir.path().to_path_buf(),
+        };
+
+        let result = ToolRunner::run_command(ProjectCommand::Test, args).await;
+
+        match result {
+            Err(error) => {
+                assert_eq!(error.code, ErrorCode::INVALID_REQUEST);
+                let msg_lower = error.message.to_lowercase();
+                assert!(
+                    (msg_lower.contains("binary") || msg_lower.contains("modified"))
+                        && (msg_lower.contains("hash") || msg_lower.contains("sha256")),
+                    "Error should indicate binary hash mismatch. Got: {}",
+                    error.message
+                );
+            }
+            Ok(_) => panic!("TOCTOU attack should be detected - binary was swapped after approval"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_detects_symlink_target_change_toctou() {
+        // TOCTOU via symlink: Approve binary via symlink, then change symlink target
+        // This tests that canonical path verification prevents symlink manipulation
+        #[cfg(not(unix))]
+        return; // Skip on non-Unix systems
+
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::PermissionsExt;
+
+            let _xdg_dir = setup_isolated_xdg_config();
+
+            let temp_dir = TempDir::new().unwrap();
+            let config_dir = temp_dir.path().join(".config");
+            std::fs::create_dir(&config_dir).unwrap();
+
+            // Create legitimate binary
+            let legitimate_path = temp_dir.path().join("legitimate.sh");
+            let mut legitimate = std::fs::File::create(&legitimate_path).unwrap();
+            writeln!(legitimate, "#!/usr/bin/env bash").unwrap();
+            writeln!(legitimate, "echo 'legitimate'").unwrap();
+            drop(legitimate);
+            let mut perms = std::fs::metadata(&legitimate_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&legitimate_path, perms).unwrap();
+
+            // Create malicious binary
+            let malicious_path = temp_dir.path().join("malicious.sh");
+            let mut malicious = std::fs::File::create(&malicious_path).unwrap();
+            writeln!(malicious, "#!/usr/bin/env bash").unwrap();
+            writeln!(malicious, "echo 'malicious'").unwrap();
+            drop(malicious);
+            let mut perms = std::fs::metadata(&malicious_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&malicious_path, perms).unwrap();
+
+            // Create symlink pointing to legitimate binary
+            let symlink_path = temp_dir.path().join("script.sh");
+            std::os::unix::fs::symlink(&legitimate_path, &symlink_path).unwrap();
+
+            let config_content = format!(
+                r#"
+[commands]
+test = ["{}"]
+"#,
+                symlink_path.display()
+            );
+
+            std::fs::write(config_dir.join("tools.toml"), &config_content).unwrap();
+
+            // Approve via symlink (resolves to legitimate binary)
+            approve_project_config(temp_dir.path(), &config_content).await;
+
+            // TOCTOU attack: Change symlink to point to malicious binary
+            std::fs::remove_file(&symlink_path).unwrap();
+            std::os::unix::fs::symlink(&malicious_path, &symlink_path).unwrap();
+
+            // Attempt execution - should be rejected (canonical path changed)
+            let args = RunArgs {
+                project_dir: temp_dir.path().to_path_buf(),
+            };
+
+            let result = ToolRunner::run_command(ProjectCommand::Test, args).await;
+
+            match result {
+                Err(error) => {
+                    assert_eq!(error.code, ErrorCode::INVALID_REQUEST);
+                    let msg_lower = error.message.to_lowercase();
+                    assert!(
+                        (msg_lower.contains("canonical path")
+                            || msg_lower.contains("binary")
+                            || msg_lower.contains("modified"))
+                            && (msg_lower.contains("hash") || msg_lower.contains("sha256")),
+                        "Error should indicate path or hash mismatch. Got: {}",
+                        error.message
+                    );
+                }
+                Ok(_) => {
+                    panic!("Symlink TOCTOU attack should be detected - target was changed")
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_full_approval_lifecycle() {
+        // Integration test: approve → execute → modify config → reject → re-approve → execute
+        // This validates the complete approval workflow end-to-end
+        use std::io::Write;
+
+        // Setup isolated XDG config to avoid cross-test contamination
+        let xdg_dir = setup_isolated_xdg_config();
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_dir = temp_dir.path().join(".config");
+        std::fs::create_dir(&config_dir).unwrap();
+
+        let script_path = temp_dir.path().join("test.sh");
+        let mut script = std::fs::File::create(&script_path).unwrap();
+        writeln!(script, "#!/usr/bin/env bash").unwrap();
+        writeln!(script, "echo 'test'").unwrap();
+        drop(script);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script_path, perms).unwrap();
+        }
+
+        let config_content_v1 = format!(
+            r#"
+[commands]
+test = ["{}"]
+"#,
+            script_path.display()
+        );
+
+        std::fs::write(config_dir.join("tools.toml"), &config_content_v1).unwrap();
+
+        // Step 1: Initial approval
+        approve_project_config(temp_dir.path(), &config_content_v1).await;
+
+        // Step 2: Execute command - should succeed
+        let args = RunArgs {
+            project_dir: temp_dir.path().to_path_buf(),
+        };
+
+        let result = ToolRunner::run_command(ProjectCommand::Test, args.clone()).await;
+        if let Err(ref e) = result {
+            panic!("Initial execution should succeed, but got error: {:?}", e);
+        }
+        assert!(result.is_ok());
+
+        // Step 3: Modify tools.toml
+        let config_content_v2 = format!(
+            r#"
+[commands]
+test = ["{}"]
+build = ["echo", "build"]
+"#,
+            script_path.display()
+        );
+
+        std::fs::write(config_dir.join("tools.toml"), &config_content_v2).unwrap();
+
+        // Step 4: Attempt execution - should fail due to config hash mismatch
+        let result = ToolRunner::run_command(ProjectCommand::Test, args.clone()).await;
+        match result {
+            Err(error) => {
+                assert_eq!(error.code, ErrorCode::INVALID_REQUEST);
+                let msg_lower = error.message.to_lowercase();
+                assert!(
+                    msg_lower.contains("modified")
+                        || msg_lower.contains("hash")
+                        || msg_lower.contains("sha256"),
+                    "Error should indicate config modification. Got: {}",
+                    error.message
+                );
+            }
+            Ok(_) => panic!("Execution should fail after config modification"),
+        }
+
+        // Step 5: Re-approve with new config
+        approve_project_config(temp_dir.path(), &config_content_v2).await;
+
+        // Step 6: Execute command again - should succeed with new approval
+        let result = ToolRunner::run_command(ProjectCommand::Test, args).await;
+        assert!(result.is_ok(), "Execution should succeed after re-approval");
+
+        // Keep xdg_dir alive
+        drop(xdg_dir);
+    }
+
+    #[tokio::test]
+    async fn test_approval_lifecycle_with_binary_modification() {
+        // Integration test: approve → modify binary → reject → re-approve → execute
+        // Validates that binary hash verification works throughout the lifecycle
+        use std::io::Write;
+
+        // Setup isolated XDG config to avoid cross-test contamination
+        let xdg_dir = setup_isolated_xdg_config();
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_dir = temp_dir.path().join(".config");
+        std::fs::create_dir(&config_dir).unwrap();
+
+        let script_path = temp_dir.path().join("build.sh");
+        let mut script = std::fs::File::create(&script_path).unwrap();
+        writeln!(script, "#!/usr/bin/env bash").unwrap();
+        writeln!(script, "echo 'version 1'").unwrap();
+        drop(script);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script_path, perms).unwrap();
+        }
+
+        let config_content = format!(
+            r#"
+[commands]
+build = ["{}"]
+"#,
+            script_path.display()
+        );
+
+        std::fs::write(config_dir.join("tools.toml"), &config_content).unwrap();
+
+        // Approve version 1
+        approve_project_config(temp_dir.path(), &config_content).await;
+
+        // Execute - should succeed
+        let args = RunArgs {
+            project_dir: temp_dir.path().to_path_buf(),
+        };
+        let result = ToolRunner::run_command(ProjectCommand::Build, args.clone()).await;
+        if let Err(ref e) = result {
+            panic!("Initial execution should succeed, but got error: {:?}", e);
+        }
+        assert!(result.is_ok());
+
+        // Modify the binary
+        let mut script = std::fs::File::create(&script_path).unwrap();
+        writeln!(script, "#!/usr/bin/env bash").unwrap();
+        writeln!(script, "echo 'version 2 - modified'").unwrap();
+        drop(script);
+
+        // Attempt execution - should fail due to binary hash mismatch
+        let result = ToolRunner::run_command(ProjectCommand::Build, args.clone()).await;
+        match result {
+            Err(error) => {
+                assert_eq!(error.code, ErrorCode::INVALID_REQUEST);
+                let msg_lower = error.message.to_lowercase();
+                assert!(
+                    (msg_lower.contains("binary") || msg_lower.contains("modified"))
+                        && (msg_lower.contains("hash") || msg_lower.contains("sha256")),
+                    "Error should indicate binary modification. Got: {}",
+                    error.message
+                );
+            }
+            Ok(_) => panic!("Execution should fail after binary modification"),
+        }
+
+        // Re-approve with modified binary
+        approve_project_config(temp_dir.path(), &config_content).await;
+
+        // Execute again - should succeed with new approval
+        let result = ToolRunner::run_command(ProjectCommand::Build, args).await;
+        assert!(result.is_ok(), "Execution should succeed after re-approval");
+
+        // Keep xdg_dir alive
+        drop(xdg_dir);
     }
 }

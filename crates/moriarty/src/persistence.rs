@@ -212,10 +212,12 @@ impl FileType {
 
 #[cfg(test)]
 mod tests {
+    //! Test isolation strategy: These tests modify XDG_CONFIG_HOME environment variables,
+    //! requiring separate processes to avoid race conditions. Use `cargo nextest run` which
+    //! provides process isolation; `cargo test` uses thread-level isolation and will fail.
+
     use super::*;
     use serde::{Deserialize, Serialize};
-    use std::env;
-    use std::sync::LazyLock;
     use tempfile::TempDir;
 
     #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -224,24 +226,16 @@ mod tests {
         count: i32,
     }
 
-    /// Shared test directory to avoid filesystem cleanup overhead between tests.
-    /// Using a single temp directory with unique filenames per test instead of
-    /// creating/destroying temp dirs for each test improves test performance.
-    static TEST_XDG_DIR: LazyLock<TempDir> = LazyLock::new(|| {
-        let temp = TempDir::new().unwrap();
-        env::set_var("XDG_CONFIG_HOME", temp.path());
-        temp
-    });
-
-    /// Forces LazyLock initialization by dereferencing the static.
-    /// This must be called at the start of each test to ensure XDG_CONFIG_HOME is set.
-    fn ensure_xdg_initialized() {
-        let _ = &*TEST_XDG_DIR;
+    /// Safe to use std::env::set_var because cargo nextest isolates each test in a separate process.
+    fn setup_isolated_xdg_config() -> TempDir {
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+        temp_dir
     }
 
     #[tokio::test]
     async fn test_build_path_creates_valid_path() {
-        ensure_xdg_initialized();
+        let _xdg_dir = setup_isolated_xdg_config();
 
         let path = FileType::Config
             .build_path("test_build_path.toml")
@@ -254,7 +248,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_path_creates_directories() {
-        ensure_xdg_initialized();
+        let _xdg_dir = setup_isolated_xdg_config();
 
         let path = FileType::Config
             .build_path("test_build_dirs.toml")
@@ -266,7 +260,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_persist_writes_valid_toml() {
-        ensure_xdg_initialized();
+        let _xdg_dir = setup_isolated_xdg_config();
 
         let config = TestConfig {
             value: "test".to_string(),
@@ -278,7 +272,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Verify file exists and contains valid TOML
         let path = FileType::Config
             .build_path("test_persist_writes.toml")
             .await
@@ -292,7 +285,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_reads_valid_toml() {
-        ensure_xdg_initialized();
+        let _xdg_dir = setup_isolated_xdg_config();
 
         let original = TestConfig {
             value: "test".to_string(),
@@ -310,7 +303,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_persist_overwrites_existing_file() {
-        ensure_xdg_initialized();
+        let _xdg_dir = setup_isolated_xdg_config();
 
         let config1 = TestConfig {
             value: "first".to_string(),
@@ -336,7 +329,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_nonexistent_file_returns_error() {
-        ensure_xdg_initialized();
+        let _xdg_dir = setup_isolated_xdg_config();
 
         let result: miette::Result<TestConfig> = FileType::Config.load("nonexistent.toml").await;
 
@@ -347,7 +340,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_malformed_toml_returns_error() {
-        ensure_xdg_initialized();
+        let _xdg_dir = setup_isolated_xdg_config();
 
         let path = FileType::Config.build_path("bad.toml").await.unwrap();
         tokio::fs::write(&path, "not valid toml {[}").await.unwrap();
@@ -361,7 +354,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_persist_empty_string() {
-        ensure_xdg_initialized();
+        let _xdg_dir = setup_isolated_xdg_config();
 
         let config = TestConfig {
             value: "".to_string(),
@@ -381,7 +374,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_persist_special_characters() {
-        ensure_xdg_initialized();
+        let _xdg_dir = setup_isolated_xdg_config();
 
         let config = TestConfig {
             value: "quotes\"and'newlines\nand\ttabs".to_string(),
@@ -401,7 +394,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_persist_unicode() {
-        ensure_xdg_initialized();
+        let _xdg_dir = setup_isolated_xdg_config();
 
         let config = TestConfig {
             value: "日本語 🦀 Émojis".to_string(),
@@ -418,7 +411,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_round_trip_preserves_data() {
-        ensure_xdg_initialized();
+        let _xdg_dir = setup_isolated_xdg_config();
 
         let test_cases = [
             (
