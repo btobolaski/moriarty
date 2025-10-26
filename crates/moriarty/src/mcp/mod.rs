@@ -1,3 +1,20 @@
+//! MCP (Model Context Protocol) servers for Moriarty.
+//!
+//! This module provides two MCP servers:
+//!
+//! - [`git_read_only`]: Read-only git operations (status, diff, log, show)
+//! - [`tool_runner`]: Project-configured tool execution (lint, test, build, format)
+//!
+//! # Usage
+//!
+//! Servers can be run via the CLI:
+//!
+//! ```bash
+//! moriarty mcp git-read-only
+//! moriarty mcp project-tools
+//! moriarty mcp install  # Install both servers to Claude Code
+//! ```
+
 use clap::Subcommand;
 
 use git_read_only::GitReadOnly;
@@ -23,24 +40,8 @@ impl McpServers {
         match self {
             Self::GitReadOnly => {
                 let server = GitReadOnly::default();
-
-                for tool in server.tool_router.list_all() {
-                    eprintln!("\n{}: {}", tool.name, tool.description.unwrap_or_default());
-
-                    if let Some(output_schema) = &tool.output_schema {
-                        eprintln!(
-                            " Output schema: {}",
-                            serde_json::to_string_pretty(output_schema).unwrap()
-                        );
-                    } else {
-                        eprintln!(" Output: Unstructured text");
-                    }
-                }
-
                 let service = server.serve(stdio()).await.into_diagnostic()?;
-
                 service.waiting().await.into_diagnostic()?;
-
                 Ok(())
             }
             Self::ProjectTools => {
@@ -76,13 +77,13 @@ async fn install_mcp_server() -> miette::Result<()> {
         Ok(())
     } else {
         Err(miette::miette!(
-            "Failed to install {} server(s): {}",
+            "Failed to install {} server(s):\n{}",
             errors.len(),
             errors
                 .iter()
-                .map(|(name, _)| **name)
+                .map(|(name, err)| format!("  - {}: {}", name, err))
                 .collect::<Vec<_>>()
-                .join(", ")
+                .join("\n")
         ))
     }
 }
@@ -90,7 +91,6 @@ async fn install_mcp_server() -> miette::Result<()> {
 async fn install_single_mcp_server(server_name: &str) -> miette::Result<()> {
     use tokio::process::Command;
 
-    // Remove any existing installation first to ensure a clean reinstall.
     // Errors are ignored because the server may not be installed yet, and other errors
     // (missing claude binary, permissions) will be caught by the subsequent add command.
     eprintln!(
