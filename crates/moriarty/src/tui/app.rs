@@ -223,6 +223,7 @@ mod tests {
         LogLine::User(UserLogLine {
             parent_uuid: None,
             is_sidechain: false,
+            agent_id: None,
             user_type: "test".to_string(),
             cwd: "/test".to_string(),
             session_id: Uuid::new_v4(),

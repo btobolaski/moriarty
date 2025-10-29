@@ -227,6 +227,7 @@ mod tests {
         UserLogLine {
             parent_uuid: None,
             is_sidechain: false,
+            agent_id: None,
             user_type: "test".to_string(),
             cwd: "/test".to_string(),
             session_id: Uuid::new_v4(),
@@ -250,6 +251,7 @@ mod tests {
         AssistantLogLine {
             parent_uuid: None,
             is_sidechain: false,
+            agent_id: None,
             user_type: "test".to_string(),
             cwd: "/test".to_string(),
             session_id: "session".to_string(),

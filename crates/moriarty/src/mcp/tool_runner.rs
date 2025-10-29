@@ -418,10 +418,7 @@ mod tests {
     /// Pre-approves tools to bypass the approval TUI in integration tests.
     /// Helper to approve a project with the given config content.
     /// Returns the canonical project path for use in assertions.
-    async fn approve_project_config(
-        project_dir: &Path,
-        config_content: &str,
-    ) -> PathBuf {
+    async fn approve_project_config(project_dir: &Path, config_content: &str) -> PathBuf {
         use std::collections::HashMap;
 
         let canonical_path = project_dir.canonicalize().unwrap();

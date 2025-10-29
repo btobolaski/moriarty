@@ -158,6 +158,8 @@ pub struct FileHistorySnapshotSnapshot {
 pub struct UserLogLine {
     pub parent_uuid: Option<Uuid>,
     pub is_sidechain: bool,
+    /// Identifier for the agent/task that created this message. None for main conversation messages.
+    pub agent_id: Option<String>,
     pub user_type: String,
     pub cwd: String,
     pub session_id: Uuid,
@@ -252,6 +254,8 @@ pub enum ToolResult {
 pub struct AssistantLogLine {
     pub parent_uuid: Option<Uuid>,
     pub is_sidechain: bool,
+    /// Identifier for the agent/task that created this message. None for main conversation messages.
+    pub agent_id: Option<String>,
     pub user_type: String,
     pub cwd: String,
     pub session_id: String,
@@ -321,4 +325,172 @@ pub async fn read_file(file: impl AsRef<Path>) -> miette::Result<Vec<LogLine>> {
     }
 
     Ok(log_lines)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_user_log_line_with_agent_id() {
+        let json = serde_json::json!({
+            "agentId": "agent-123",
+            "parentUuid": null,
+            "isSidechain": false,
+            "userType": "test",
+            "cwd": "/test",
+            "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+            "version": "1.0",
+            "gitBranch": "main",
+            "message": {"role": "user", "content": "test"},
+            "uuid": "550e8400-e29b-41d4-a716-446655440001",
+            "timestamp": "2025-01-01T00:00:00Z"
+        });
+        let line: UserLogLine = serde_json::from_value(json).unwrap();
+        assert_eq!(line.agent_id, Some("agent-123".to_string()));
+    }
+
+    #[test]
+    fn test_parse_user_log_line_with_null_agent_id() {
+        let json = serde_json::json!({
+            "agentId": null,
+            "parentUuid": null,
+            "isSidechain": false,
+            "userType": "test",
+            "cwd": "/test",
+            "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+            "version": "1.0",
+            "gitBranch": "main",
+            "message": {"role": "user", "content": "test"},
+            "uuid": "550e8400-e29b-41d4-a716-446655440001",
+            "timestamp": "2025-01-01T00:00:00Z"
+        });
+        let line: UserLogLine = serde_json::from_value(json).unwrap();
+        assert_eq!(line.agent_id, None);
+    }
+
+    #[test]
+    fn test_parse_user_log_line_without_agent_id() {
+        let json = serde_json::json!({
+            "parentUuid": null,
+            "isSidechain": false,
+            "userType": "test",
+            "cwd": "/test",
+            "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+            "version": "1.0",
+            "gitBranch": "main",
+            "message": {"role": "user", "content": "test"},
+            "uuid": "550e8400-e29b-41d4-a716-446655440001",
+            "timestamp": "2025-01-01T00:00:00Z"
+        });
+        let line: UserLogLine = serde_json::from_value(json).unwrap();
+        assert_eq!(line.agent_id, None);
+    }
+
+    #[test]
+    fn test_parse_assistant_log_line_with_agent_id() {
+        let json = serde_json::json!({
+            "agentId": "task-456",
+            "parentUuid": null,
+            "isSidechain": false,
+            "userType": "test",
+            "cwd": "/test",
+            "sessionId": "test-session",
+            "version": "1.0",
+            "gitBranch": "main",
+            "message": {
+                "id": "msg-1",
+                "type": "message",
+                "role": "assistant",
+                "content": "response",
+                "model": "claude-3-5-sonnet",
+                "stop_reason": "end_turn",
+                "usage": {
+                    "input_tokens": 100,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation": {
+                        "ephemeral_5m_input_tokens": 0,
+                        "ephemeral_1h_input_tokens": 0
+                    },
+                    "output_tokens": 50
+                }
+            },
+            "uuid": "550e8400-e29b-41d4-a716-446655440002",
+            "timestamp": "2025-01-01T00:00:00Z"
+        });
+        let line: AssistantLogLine = serde_json::from_value(json).unwrap();
+        assert_eq!(line.agent_id, Some("task-456".to_string()));
+    }
+
+    #[test]
+    fn test_parse_assistant_log_line_with_null_agent_id() {
+        let json = serde_json::json!({
+            "agentId": null,
+            "parentUuid": null,
+            "isSidechain": false,
+            "userType": "test",
+            "cwd": "/test",
+            "sessionId": "test-session",
+            "version": "1.0",
+            "gitBranch": "main",
+            "message": {
+                "id": "msg-1",
+                "type": "message",
+                "role": "assistant",
+                "content": "response",
+                "model": "claude-3-5-sonnet",
+                "stop_reason": "end_turn",
+                "usage": {
+                    "input_tokens": 100,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation": {
+                        "ephemeral_5m_input_tokens": 0,
+                        "ephemeral_1h_input_tokens": 0
+                    },
+                    "output_tokens": 50
+                }
+            },
+            "uuid": "550e8400-e29b-41d4-a716-446655440002",
+            "timestamp": "2025-01-01T00:00:00Z"
+        });
+        let line: AssistantLogLine = serde_json::from_value(json).unwrap();
+        assert_eq!(line.agent_id, None);
+    }
+
+    #[test]
+    fn test_parse_assistant_log_line_without_agent_id() {
+        let json = serde_json::json!({
+            "parentUuid": null,
+            "isSidechain": false,
+            "userType": "test",
+            "cwd": "/test",
+            "sessionId": "test-session",
+            "version": "1.0",
+            "gitBranch": "main",
+            "message": {
+                "id": "msg-1",
+                "type": "message",
+                "role": "assistant",
+                "content": "response",
+                "model": "claude-3-5-sonnet",
+                "stop_reason": "end_turn",
+                "usage": {
+                    "input_tokens": 100,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation": {
+                        "ephemeral_5m_input_tokens": 0,
+                        "ephemeral_1h_input_tokens": 0
+                    },
+                    "output_tokens": 50
+                }
+            },
+            "uuid": "550e8400-e29b-41d4-a716-446655440002",
+            "timestamp": "2025-01-01T00:00:00Z"
+        });
+        let line: AssistantLogLine = serde_json::from_value(json).unwrap();
+        assert_eq!(line.agent_id, None);
+    }
 }
