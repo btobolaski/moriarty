@@ -34,7 +34,11 @@ async fn main() -> miette::Result<()> {
                 result?;
             }
         }
-        Command::ApiPricing { dir, timezone } => {
+        Command::ApiPricing {
+            dir,
+            timezone,
+            conversations,
+        } => {
             // Parse timezone argument
             let tz = match timezone.to_lowercase().as_str() {
                 "local" => api_pricing::DateTimezone::Local,
@@ -49,7 +53,7 @@ async fn main() -> miette::Result<()> {
             };
 
             // Run the API pricing analysis
-            api_pricing::run(&dir, tz).await?;
+            api_pricing::run(&dir, tz, conversations).await?;
         }
         Command::Mcp { server } => {
             server.run().await?;
@@ -107,6 +111,9 @@ pub enum Command {
         /// Timezone to use for date determination (local or utc)
         #[arg(long, default_value = "local")]
         timezone: String,
+        /// Aggregate by conversation/session instead of by date
+        #[arg(long)]
+        conversations: bool,
     },
     /// Runs one of the mcp servers
     Mcp {

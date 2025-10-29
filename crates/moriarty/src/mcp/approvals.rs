@@ -996,7 +996,7 @@ mod tests {
 
         // Wait for both operations
         let _ = write_handle.await.expect("Write should complete");
-        let _ = read_handle.await.expect("Read task should complete");
+        read_handle.await.expect("Read task should complete");
 
         // Verify final state is consistent
         let final_approvals = ProjectApprovals::load().await.unwrap();

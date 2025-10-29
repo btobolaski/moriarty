@@ -4,7 +4,7 @@ use std::{
 };
 
 use async_walkdir::WalkDir;
-use chrono::{Local, NaiveDate};
+use chrono::{DateTime, Local, NaiveDate, Utc};
 use futures::stream::StreamExt;
 use miette::IntoDiagnostic;
 
@@ -46,6 +46,18 @@ fn is_synthetic_model(model: &str) -> bool {
 #[derive(Debug, Default)]
 pub struct AnalysisResult {
     pub daily_costs: Vec<DailyCosts>,
+    pub unknown_models: HashSet<String>,
+    pub total_unknown_tokens: TokenCounts,
+    pub files_parsed: usize,
+    pub files_failed: usize,
+}
+
+/// Result of analyzing log files by conversation/session
+///
+/// Sessions are identified by session_id from log files and sorted chronologically.
+#[derive(Debug, Default)]
+pub struct SessionAnalysisResult {
+    pub session_costs: Vec<SessionCosts>,
     pub unknown_models: HashSet<String>,
     pub total_unknown_tokens: TokenCounts,
     pub files_parsed: usize,
@@ -128,6 +140,119 @@ impl DailyCosts {
     }
 }
 
+/// Accumulator for session token usage.
+///
+/// Automatically expands start_time/end_time bounds as usage is added,
+/// enabling duration tracking without manual timestamp management.
+#[derive(Debug)]
+pub struct SessionUsage {
+    pub session_id: String,
+    pub start_time: DateTime<Utc>,
+    pub end_time: DateTime<Utc>,
+    pub sonnet_usage: TokenCounts,
+    pub haiku_usage: TokenCounts,
+    pub opus_usage: TokenCounts,
+    pub unknown_usage: TokenCounts,
+    pub lines_changed: usize,
+}
+
+impl SessionUsage {
+    pub fn new(session_id: String, timestamp: DateTime<Utc>) -> Self {
+        Self {
+            session_id,
+            start_time: timestamp,
+            end_time: timestamp,
+            sonnet_usage: TokenCounts::default(),
+            haiku_usage: TokenCounts::default(),
+            opus_usage: TokenCounts::default(),
+            unknown_usage: TokenCounts::default(),
+            lines_changed: 0,
+        }
+    }
+
+    fn update_time_range(&mut self, timestamp: DateTime<Utc>) {
+        if timestamp < self.start_time {
+            self.start_time = timestamp;
+        }
+        if timestamp > self.end_time {
+            self.end_time = timestamp;
+        }
+    }
+
+    pub fn add_usage(
+        &mut self,
+        model_type: ModelType,
+        counts: TokenCounts,
+        timestamp: DateTime<Utc>,
+    ) {
+        match model_type {
+            ModelType::Sonnet => self.sonnet_usage.add(&counts),
+            ModelType::Haiku => self.haiku_usage.add(&counts),
+            ModelType::Opus => self.opus_usage.add(&counts),
+            ModelType::Unknown => self.unknown_usage.add(&counts),
+        }
+        self.update_time_range(timestamp);
+    }
+
+    pub fn add_lines_changed(&mut self, lines: usize, timestamp: DateTime<Utc>) {
+        self.lines_changed += lines;
+        self.update_time_range(timestamp);
+    }
+
+    pub fn calculate_costs(&self) -> SessionCosts {
+        let sonnet_costs = ModelType::Sonnet
+            .pricing()
+            .map(|p| p.calculate_cost(&self.sonnet_usage))
+            .unwrap_or_default();
+
+        let haiku_costs = ModelType::Haiku
+            .pricing()
+            .map(|p| p.calculate_cost(&self.haiku_usage))
+            .unwrap_or_default();
+
+        let opus_costs = ModelType::Opus
+            .pricing()
+            .map(|p| p.calculate_cost(&self.opus_usage))
+            .unwrap_or_default();
+
+        SessionCosts {
+            session_id: self.session_id.clone(),
+            start_time: self.start_time,
+            end_time: self.end_time,
+            sonnet_costs,
+            haiku_costs,
+            opus_costs,
+            lines_changed: self.lines_changed,
+        }
+    }
+}
+
+/// Computed costs for a single conversation/session
+///
+/// Contains dollar amounts for each model's usage within a session,
+/// along with the session's time range and code changes. Includes
+/// a convenience method to calculate session duration in minutes.
+#[derive(Debug)]
+pub struct SessionCosts {
+    pub session_id: String,
+    pub start_time: DateTime<Utc>,
+    pub end_time: DateTime<Utc>,
+    pub sonnet_costs: TokenCosts,
+    pub haiku_costs: TokenCosts,
+    pub opus_costs: TokenCosts,
+    pub lines_changed: usize,
+}
+
+impl SessionCosts {
+    pub fn total(&self) -> f64 {
+        self.sonnet_costs.total() + self.haiku_costs.total() + self.opus_costs.total()
+    }
+
+    pub fn duration_minutes(&self) -> i64 {
+        (self.end_time - self.start_time).num_minutes()
+    }
+}
+
 /// Recursively walk a directory and find all .jsonl files
 pub async fn find_jsonl_files(dir: &Path) -> miette::Result<Vec<std::path::PathBuf>> {
     let mut jsonl_files = Vec::new();
@@ -148,16 +273,76 @@ pub async fn find_jsonl_files(dir: &Path) -> miette::Result<Vec<std::path::PathB
     Ok(jsonl_files)
 }
 
+// Type aliases for message tuples
+type DateBasedMessage = (NaiveDate, ModelType, String, TokenCounts);
+type SessionBasedMessage = (String, DateTime<Utc>, ModelType, String, TokenCounts);
+
+/// Deduplicates messages by requestId, keeping only the final message per streaming group.
+///
+/// For messages with the same requestId, retains the one with the highest output_tokens.
+/// Messages without a requestId (non-streaming) are kept as-is.
+///
+/// ## Design Decision: Using output_tokens as Finality Heuristic
+///
+/// This function uses `max(output_tokens)` to identify the final message in a streaming group.
+/// This works because streaming responses accumulate tokens monotonically - each subsequent
+/// message has equal or greater token counts than the previous.
+///
+/// **Alternative considered**: Using message timestamps for ordering. While more semantically
+/// correct, this would require restructuring the message tuples to include timestamps in
+/// `parse_log_file`, significantly complicating the codebase. The current approach is simpler
+/// and handles all realistic streaming scenarios correctly.
+///
+/// **Known limitations**:
+/// - If all messages have zero output_tokens, keeps the first encountered (acceptable)
+/// - Assumes in-order message delivery (true for Claude API in practice)
+/// - If the API ever sent decreasing token counts, this would fail (not observed)
+fn deduplicate_by_request_id<T>(
+    messages: Vec<(Option<String>, T)>,
+    get_output_tokens: impl Fn(&T) -> u64,
+) -> Vec<T> {
+    let mut result: Vec<T> = Vec::new();
+    let mut request_id_to_index: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+
+    for (request_id, payload) in messages {
+        if let Some(req_id) = request_id {
+            // Message has a requestId - part of a streaming group
+            if let Some(&existing_idx) = request_id_to_index.get(&req_id) {
+                // Keep the message with higher output_tokens (final message)
+                if get_output_tokens(&payload) > get_output_tokens(&result[existing_idx]) {
+                    result[existing_idx] = payload;
+                }
+            } else {
+                // First occurrence of this requestId
+                request_id_to_index.insert(req_id, result.len());
+                result.push(payload);
+            }
+        } else {
+            // No requestId - non-streaming message, keep as-is
+            result.push(payload);
+        }
+    }
+
+    result
+}
+
 /// Parse a log file and extract token usage
 ///
 /// Filters out entries with model `<synthetic>` (case-insensitive), as these represent
 /// internal processing steps rather than billable API usage.
+///
+/// Deduplicates streaming API responses by requestId. When multiple messages share
+/// the same requestId (streaming responses), only the final message (with highest
+/// output_tokens) is counted to avoid inflating costs.
 pub async fn parse_log_file(
     file: &Path,
     timezone: DateTimezone,
 ) -> miette::Result<Vec<(NaiveDate, ModelType, String, TokenCounts)>> {
     let log_lines = parser::read_file(file).await?;
-    let mut usages = Vec::new();
+
+    // Temporary structure to hold all messages with their requestId
+    let mut all_messages: Vec<(Option<String>, DateBasedMessage)> = Vec::new();
 
     for line in log_lines {
         if let LogLine::Assistant(assistant_line) = line {
@@ -177,9 +362,71 @@ pub async fn parse_log_file(
                 cache_read_tokens: usage.cache_read_input_tokens,
             };
 
-            usages.push((date, model_type, model_string, counts));
+            all_messages.push((
+                assistant_line.request_id.clone(),
+                (date, model_type, model_string, counts),
+            ));
         }
     }
+
+    // Deduplicate streaming messages by requestId
+    let usages = deduplicate_by_request_id(
+        all_messages,
+        |tuple: &(NaiveDate, ModelType, String, TokenCounts)| tuple.3.output_tokens as u64,
+    );
+
+    Ok(usages)
+}
+
+/// Parse a log file and extract token usage by session
+///
+/// Filters out entries with model `<synthetic>` (case-insensitive), as these represent
+/// internal processing steps rather than billable API usage.
+///
+/// Deduplicates streaming API responses by requestId. When multiple messages share
+/// the same requestId (streaming responses), only the final message (with highest
+/// output_tokens) is counted to avoid inflating costs.
+pub async fn parse_log_file_by_session(
+    file: &Path,
+) -> miette::Result<Vec<(String, DateTime<Utc>, ModelType, String, TokenCounts)>> {
+    let log_lines = parser::read_file(file).await?;
+
+    // Temporary structure to hold all messages with their requestId
+    let mut all_messages: Vec<(Option<String>, SessionBasedMessage)> = Vec::new();
+
+    for line in log_lines {
+        if let LogLine::Assistant(assistant_line) = line {
+            if is_synthetic_model(&assistant_line.message.model) {
+                continue;
+            }
+
+            let session_id = assistant_line.session_id.clone();
+            let timestamp = assistant_line.timestamp;
+            let model_string = assistant_line.message.model.clone();
+            let model_type = ModelType::from_model_string(&model_string);
+            let usage = &assistant_line.message.usage;
+
+            let counts = TokenCounts {
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+                cache_write_tokens: usage.cache_creation_input_tokens,
+                cache_read_tokens: usage.cache_read_input_tokens,
+            };
+
+            all_messages.push((
+                assistant_line.request_id.clone(),
+                (session_id, timestamp, model_type, model_string, counts),
+            ));
+        }
+    }
+
+    // Deduplicate streaming messages by requestId
+    let usages = deduplicate_by_request_id(
+        all_messages,
+        |tuple: &(String, DateTime<Utc>, ModelType, String, TokenCounts)| {
+            tuple.4.output_tokens as u64
+        },
+    );
 
     Ok(usages)
 }
@@ -211,6 +458,43 @@ pub async fn parse_lines_changed(
                             line_counter::extract_lines_from_tool(name.as_str(), input)
                         {
                             results.push((date, lines));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(results)
+}
+
+/// Extract lines changed from assistant messages in a log file by session
+///
+/// Filters out entries with model `<synthetic>` (case-insensitive), as these represent
+/// internal processing steps rather than billable API usage.
+pub async fn parse_lines_changed_by_session(
+    file: &Path,
+) -> miette::Result<Vec<(String, DateTime<Utc>, usize)>> {
+    let log_lines = parser::read_file(file).await?;
+    let mut results = Vec::new();
+
+    for line in log_lines {
+        if let LogLine::Assistant(assistant_line) = line {
+            if is_synthetic_model(&assistant_line.message.model) {
+                continue;
+            }
+
+            let session_id = assistant_line.session_id.clone();
+            let timestamp = assistant_line.timestamp;
+
+            // Check if content is an array (contains tool uses)
+            if let LogMessageContent::Vec(content_blocks) = &assistant_line.message.content {
+                for content_item in content_blocks {
+                    if let LogMessageTaggedContent::ToolUse { name, input, .. } = content_item {
+                        if let Some(lines) =
+                            line_counter::extract_lines_from_tool(name.as_str(), input)
+                        {
+                            results.push((session_id.clone(), timestamp, lines));
                         }
                     }
                 }
@@ -253,6 +537,40 @@ pub fn aggregate_by_date(
     }
 
     daily_usage
+}
+
+/// Aggregate usage data by session
+pub fn aggregate_by_session(
+    usages: Vec<(String, DateTime<Utc>, ModelType, String, TokenCounts)>,
+    lines_changed: Vec<(String, DateTime<Utc>, usize)>,
+    unknown_models: &mut HashSet<String>,
+    total_unknown_tokens: &mut TokenCounts,
+) -> BTreeMap<String, SessionUsage> {
+    let mut session_usage: BTreeMap<String, SessionUsage> = BTreeMap::new();
+
+    // Aggregate token usage
+    for (session_id, timestamp, model_type, model_string, counts) in usages {
+        // Track unknown models
+        if model_type == ModelType::Unknown {
+            unknown_models.insert(model_string);
+            total_unknown_tokens.add(&counts);
+        }
+
+        session_usage
+            .entry(session_id.clone())
+            .or_insert_with(|| SessionUsage::new(session_id, timestamp))
+            .add_usage(model_type, counts, timestamp);
+    }
+
+    // Aggregate lines changed
+    for (session_id, timestamp, lines) in lines_changed {
+        session_usage
+            .entry(session_id.clone())
+            .or_insert_with(|| SessionUsage::new(session_id, timestamp))
+            .add_lines_changed(lines, timestamp);
+    }
+
+    session_usage
 }
 
 /// Analyze all log files in a directory and return daily costs
@@ -314,6 +632,72 @@ pub async fn analyze_directory(
 
     Ok(AnalysisResult {
         daily_costs,
+        unknown_models,
+        total_unknown_tokens,
+        files_parsed,
+        files_failed,
+    })
+}
+
+/// Analyze all log files in a directory and return session costs
+pub async fn analyze_directory_by_session(dir: &Path) -> miette::Result<SessionAnalysisResult> {
+    let jsonl_files = find_jsonl_files(dir).await?;
+
+    if jsonl_files.is_empty() {
+        eprintln!("Warning: No .jsonl files found in directory");
+        return Ok(SessionAnalysisResult::default());
+    }
+
+    println!("Found {} log files to analyze", jsonl_files.len());
+
+    let mut all_usages = Vec::new();
+    let mut all_lines_changed = Vec::new();
+    let mut files_parsed = 0;
+    let mut files_failed = 0;
+
+    for file in &jsonl_files {
+        match parse_log_file_by_session(file).await {
+            Ok(usages) => {
+                all_usages.extend(usages);
+                files_parsed += 1;
+            }
+            Err(e) => {
+                eprintln!("Warning: Failed to parse {:?}: {}", file, e);
+                files_failed += 1;
+            }
+        }
+
+        // Parse lines changed (don't fail if this errors)
+        match parse_lines_changed_by_session(file).await {
+            Ok(lines) => all_lines_changed.extend(lines),
+            Err(e) => {
+                eprintln!(
+                    "Warning: Failed to parse lines changed from {:?}: {}",
+                    file, e
+                );
+            }
+        }
+    }
+
+    let mut unknown_models = HashSet::new();
+    let mut total_unknown_tokens = TokenCounts::default();
+
+    let session_usage = aggregate_by_session(
+        all_usages,
+        all_lines_changed,
+        &mut unknown_models,
+        &mut total_unknown_tokens,
+    );
+    let mut session_costs: Vec<SessionCosts> = session_usage
+        .into_values()
+        .map(|usage| usage.calculate_costs())
+        .collect();
+
+    // Sort sessions chronologically (oldest first) by start_time
+    session_costs.sort_by_key(|s| s.start_time);
+
+    Ok(SessionAnalysisResult {
+        session_costs,
         unknown_models,
         total_unknown_tokens,
         files_parsed,
@@ -1132,5 +1516,269 @@ mod tests {
             .unwrap();
 
         assert!(result.is_empty());
+    }
+
+    // ============================================================================
+    // Tests for streaming message deduplication
+    // ============================================================================
+    // Streaming API responses send multiple partial messages with the same requestId.
+    // These tests verify that we correctly deduplicate by keeping only the message
+    // with the highest output_tokens (the final, complete message).
+
+    #[tokio::test]
+    async fn test_parse_log_file_deduplicates_streaming_messages_by_request_id() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("test.jsonl");
+
+        let log_content = r#"{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"session-1","version":"1.0.0","gitBranch":"main","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":"partial","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":8,"cache_creation_input_tokens":17932,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":2,"service_tier":null,"server_tool_use":null}},"requestId":"req-123","uuid":"00000000-0000-0000-0000-000000000001","timestamp":"2025-10-23T12:00:00Z","isApiErrorMessage":null}
+{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"session-1","version":"1.0.0","gitBranch":"main","message":{"id":"msg_2","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":"partial","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":8,"cache_creation_input_tokens":17932,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":2,"service_tier":null,"server_tool_use":null}},"requestId":"req-123","uuid":"00000000-0000-0000-0000-000000000002","timestamp":"2025-10-23T12:00:01Z","isApiErrorMessage":null}
+{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"session-1","version":"1.0.0","gitBranch":"main","message":{"id":"msg_3","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":"partial","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":8,"cache_creation_input_tokens":17932,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":2,"service_tier":null,"server_tool_use":null}},"requestId":"req-123","uuid":"00000000-0000-0000-0000-000000000003","timestamp":"2025-10-23T12:00:02Z","isApiErrorMessage":null}
+{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"session-1","version":"1.0.0","gitBranch":"main","message":{"id":"msg_4","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":"final complete response","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":8,"cache_creation_input_tokens":17932,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":835,"service_tier":null,"server_tool_use":null}},"requestId":"req-123","uuid":"00000000-0000-0000-0000-000000000004","timestamp":"2025-10-23T12:00:03Z","isApiErrorMessage":null}"#;
+        tokio::fs::write(&file_path, log_content).await.unwrap();
+
+        let result = parse_log_file(&file_path, DateTimezone::Utc).await.unwrap();
+
+        assert_eq!(
+            result.len(),
+            1,
+            "Should only count the final message in streaming group, but got {} messages",
+            result.len()
+        );
+
+        let (_date, model_type, _model_string, counts) = &result[0];
+        assert_eq!(model_type, &ModelType::Sonnet);
+        assert_eq!(counts.input_tokens, 8);
+        assert_eq!(counts.output_tokens, 835, "Should have final output count");
+        assert_eq!(
+            counts.cache_write_tokens, 17932,
+            "Should count cache_write only once"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_log_file_by_session_deduplicates_streaming_messages() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("test.jsonl");
+
+        // Same test data as above
+        let log_content = r#"{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"session-1","version":"1.0.0","gitBranch":"main","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":"partial","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":8,"cache_creation_input_tokens":17932,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":2,"service_tier":null,"server_tool_use":null}},"requestId":"req-123","uuid":"00000000-0000-0000-0000-000000000001","timestamp":"2025-10-23T12:00:00Z","isApiErrorMessage":null}
+{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"session-1","version":"1.0.0","gitBranch":"main","message":{"id":"msg_2","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":"partial","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":8,"cache_creation_input_tokens":17932,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":2,"service_tier":null,"server_tool_use":null}},"requestId":"req-123","uuid":"00000000-0000-0000-0000-000000000002","timestamp":"2025-10-23T12:00:01Z","isApiErrorMessage":null}
+{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"session-1","version":"1.0.0","gitBranch":"main","message":{"id":"msg_3","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":"partial","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":8,"cache_creation_input_tokens":17932,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":2,"service_tier":null,"server_tool_use":null}},"requestId":"req-123","uuid":"00000000-0000-0000-0000-000000000003","timestamp":"2025-10-23T12:00:02Z","isApiErrorMessage":null}
+{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"session-1","version":"1.0.0","gitBranch":"main","message":{"id":"msg_4","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":"final","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":8,"cache_creation_input_tokens":17932,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":835,"service_tier":null,"server_tool_use":null}},"requestId":"req-123","uuid":"00000000-0000-0000-0000-000000000004","timestamp":"2025-10-23T12:00:03Z","isApiErrorMessage":null}"#;
+        tokio::fs::write(&file_path, log_content).await.unwrap();
+
+        let result = parse_log_file_by_session(&file_path).await.unwrap();
+
+        assert_eq!(
+            result.len(),
+            1,
+            "Should only count the final message, but got {} messages",
+            result.len()
+        );
+
+        let (session_id, _timestamp, _model_type, _model_string, counts) = &result[0];
+        assert_eq!(session_id, "session-1");
+        assert_eq!(counts.output_tokens, 835);
+        assert_eq!(counts.cache_write_tokens, 17932);
+    }
+
+    #[tokio::test]
+    async fn test_parse_log_file_handles_multiple_streaming_groups() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("test.jsonl");
+
+        let log_content = r#"{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"session-1","version":"1.0.0","gitBranch":"main","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":"","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":8,"cache_creation_input_tokens":17932,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":2,"service_tier":null,"server_tool_use":null}},"requestId":"req-123","uuid":"00000000-0000-0000-0000-000000000001","timestamp":"2025-10-23T12:00:00Z","isApiErrorMessage":null}
+{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"session-1","version":"1.0.0","gitBranch":"main","message":{"id":"msg_2","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":"","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":8,"cache_creation_input_tokens":17932,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":2,"service_tier":null,"server_tool_use":null}},"requestId":"req-123","uuid":"00000000-0000-0000-0000-000000000002","timestamp":"2025-10-23T12:00:01Z","isApiErrorMessage":null}
+{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"session-1","version":"1.0.0","gitBranch":"main","message":{"id":"msg_3","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":"","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":8,"cache_creation_input_tokens":17932,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":835,"service_tier":null,"server_tool_use":null}},"requestId":"req-123","uuid":"00000000-0000-0000-0000-000000000003","timestamp":"2025-10-23T12:00:02Z","isApiErrorMessage":null}
+{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"session-1","version":"1.0.0","gitBranch":"main","message":{"id":"msg_4","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":"","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":12,"cache_creation_input_tokens":5361,"cache_read_input_tokens":17932,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":2,"service_tier":null,"server_tool_use":null}},"requestId":"req-456","uuid":"00000000-0000-0000-0000-000000000004","timestamp":"2025-10-23T12:01:00Z","isApiErrorMessage":null}
+{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"session-1","version":"1.0.0","gitBranch":"main","message":{"id":"msg_5","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":"","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":12,"cache_creation_input_tokens":5361,"cache_read_input_tokens":17932,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":867,"service_tier":null,"server_tool_use":null}},"requestId":"req-456","uuid":"00000000-0000-0000-0000-000000000005","timestamp":"2025-10-23T12:01:01Z","isApiErrorMessage":null}"#;
+        tokio::fs::write(&file_path, log_content).await.unwrap();
+
+        let result = parse_log_file(&file_path, DateTimezone::Utc).await.unwrap();
+
+        assert_eq!(
+            result.len(),
+            2,
+            "Should have 2 entries (one per request), but got {}",
+            result.len()
+        );
+
+        // First request: final message has output_tokens=835
+        assert_eq!(result[0].3.output_tokens, 835);
+        assert_eq!(result[0].3.cache_write_tokens, 17932);
+
+        // Second request: final message has output_tokens=867
+        assert_eq!(result[1].3.output_tokens, 867);
+        assert_eq!(result[1].3.cache_write_tokens, 5361);
+        assert_eq!(result[1].3.cache_read_tokens, 17932);
+    }
+
+    #[tokio::test]
+    async fn test_parse_log_file_preserves_non_streaming_messages() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("test.jsonl");
+
+        // Message without requestId should be preserved
+        let log_content = r#"{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"session-1","version":"1.0.0","gitBranch":"main","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":"test","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":500,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000001","timestamp":"2025-10-23T12:00:00Z","isApiErrorMessage":null}"#;
+        tokio::fs::write(&file_path, log_content).await.unwrap();
+
+        let result = parse_log_file(&file_path, DateTimezone::Utc).await.unwrap();
+
+        // Messages without requestId should be kept as-is
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].3.input_tokens, 1000);
+        assert_eq!(result[0].3.output_tokens, 500);
+    }
+
+    #[test]
+    fn test_aggregate_by_date_with_deduplicated_streaming_data() {
+        // This test shows the CORRECT cost when using deduplicated data
+        let date = NaiveDate::from_ymd_opt(2025, 10, 23).unwrap();
+
+        // Only the final message from a 4-message streaming group
+        let usages = vec![(
+            date,
+            ModelType::Sonnet,
+            "claude-sonnet-4".to_string(),
+            TokenCounts {
+                input_tokens: 8,
+                output_tokens: 835,
+                cache_write_tokens: 17932,
+                cache_read_tokens: 0,
+            },
+        )];
+
+        let mut unknown_models = HashSet::new();
+        let mut total_unknown_tokens = TokenCounts::default();
+
+        let result = aggregate_by_date(
+            usages,
+            Vec::new(),
+            &mut unknown_models,
+            &mut total_unknown_tokens,
+        );
+
+        assert_eq!(result.len(), 1);
+        let daily_usage = &result[&date];
+        assert_eq!(daily_usage.sonnet_usage.cache_write_tokens, 17932);
+
+        // Calculate cost (Sonnet pricing: cache_write = $3.75 per million)
+        // 17932 tokens * $3.75 / 1M = $0.06725
+        let daily_costs = daily_usage.calculate_costs();
+        // This should be around $0.12 (input + output + cache_write)
+        assert!(
+            daily_costs.sonnet_costs.cache_write > 0.06
+                && daily_costs.sonnet_costs.cache_write < 0.07,
+            "Cache write cost should be ~$0.067, got ${}",
+            daily_costs.sonnet_costs.cache_write
+        );
+    }
+
+    #[test]
+    fn test_aggregate_by_date_with_buggy_non_deduplicated_data() {
+        // This test shows the INCORRECT cost when NOT deduplicating (current bug)
+        let date = NaiveDate::from_ymd_opt(2025, 10, 23).unwrap();
+
+        // All 4 messages from streaming group (buggy behavior)
+        let usages = vec![
+            (
+                date,
+                ModelType::Sonnet,
+                "claude-sonnet-4".to_string(),
+                TokenCounts {
+                    input_tokens: 8,
+                    output_tokens: 2,
+                    cache_write_tokens: 17932,
+                    cache_read_tokens: 0,
+                },
+            ),
+            (
+                date,
+                ModelType::Sonnet,
+                "claude-sonnet-4".to_string(),
+                TokenCounts {
+                    input_tokens: 8,
+                    output_tokens: 2,
+                    cache_write_tokens: 17932,
+                    cache_read_tokens: 0,
+                },
+            ),
+            (
+                date,
+                ModelType::Sonnet,
+                "claude-sonnet-4".to_string(),
+                TokenCounts {
+                    input_tokens: 8,
+                    output_tokens: 2,
+                    cache_write_tokens: 17932,
+                    cache_read_tokens: 0,
+                },
+            ),
+            (
+                date,
+                ModelType::Sonnet,
+                "claude-sonnet-4".to_string(),
+                TokenCounts {
+                    input_tokens: 8,
+                    output_tokens: 835,
+                    cache_write_tokens: 17932,
+                    cache_read_tokens: 0,
+                },
+            ),
+        ];
+
+        let mut unknown_models = HashSet::new();
+        let mut total_unknown_tokens = TokenCounts::default();
+
+        let result = aggregate_by_date(
+            usages,
+            Vec::new(),
+            &mut unknown_models,
+            &mut total_unknown_tokens,
+        );
+
+        assert_eq!(result.len(), 1);
+        let daily_usage = &result[&date];
+
+        // BUG: cache_write counted 4 times!
+        assert_eq!(
+            daily_usage.sonnet_usage.cache_write_tokens,
+            17932 * 4,
+            "Bug: cache_write counted 4 times instead of once"
+        );
+
+        let daily_costs = daily_usage.calculate_costs();
+        // With 4x counting: 71728 * $3.75 / 1M = $0.269
+        assert!(
+            daily_costs.sonnet_costs.cache_write > 0.26,
+            "Buggy behavior: cache_write should be inflated to ~$0.27, got ${}",
+            daily_costs.sonnet_costs.cache_write
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_log_file_handles_zero_output_tokens() {
+        // Edge case: all messages in streaming group have zero output_tokens
+        // Should keep the first message encountered
+        let temp_dir = tempfile::tempdir().unwrap();
+        let log_file = temp_dir.path().join("test.jsonl");
+
+        // Create a log with streaming messages all having zero output_tokens
+        let log_content = r#"{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"00000000-0000-0000-0000-000000000000","version":"1.0.0","gitBranch":"main","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":"response 1","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"cache_creation_input_tokens":100,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":0,"service_tier":null,"server_tool_use":null}},"requestId":"req-123","uuid":"00000000-0000-0000-0000-000000000001","timestamp":"2025-10-23T12:00:00Z","isApiErrorMessage":null}
+{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"00000000-0000-0000-0000-000000000000","version":"1.0.0","gitBranch":"main","message":{"id":"msg_2","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":"response 2","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"cache_creation_input_tokens":100,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":0,"service_tier":null,"server_tool_use":null}},"requestId":"req-123","uuid":"00000000-0000-0000-0000-000000000002","timestamp":"2025-10-23T12:00:01Z","isApiErrorMessage":null}
+{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"00000000-0000-0000-0000-000000000000","version":"1.0.0","gitBranch":"main","message":{"id":"msg_3","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":"response 3","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"cache_creation_input_tokens":100,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":0,"service_tier":null,"server_tool_use":null}},"requestId":"req-123","uuid":"00000000-0000-0000-0000-000000000003","timestamp":"2025-10-23T12:00:02Z","isApiErrorMessage":null}"#;
+
+        tokio::fs::write(&log_file, log_content).await.unwrap();
+
+        let result = parse_log_file(&log_file, DateTimezone::Utc).await.unwrap();
+
+        // Should have exactly 1 message (deduplicated from 3)
+        assert_eq!(result.len(), 1);
+
+        let (_, _, _, counts) = &result[0];
+        // When all have zero output_tokens, keeps the first encountered
+        assert_eq!(counts.output_tokens, 0);
+        assert_eq!(counts.input_tokens, 10);
+        assert_eq!(counts.cache_write_tokens, 100);
     }
 }

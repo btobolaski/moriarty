@@ -160,11 +160,11 @@ fn render_command_review(
     }
 
     if !warnings.is_empty() {
-        content.push_str("\n");
+        content.push('\n');
         for warning in warnings {
             content.push_str(&format!("{}\n", warning));
         }
-        content.push_str("\n");
+        content.push('\n');
     }
 
     // Show script contents if applicable
