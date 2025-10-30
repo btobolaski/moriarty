@@ -57,6 +57,8 @@ pub enum FileType {
     /// Config files are for user configuration. They can be modified at runtime so, they are not
     /// just for immutable configuration.
     Config,
+    /// State files are for application state, logs, and runtime data.
+    State,
 }
 
 impl FileType {
@@ -67,6 +69,7 @@ impl FileType {
     /// This method follows the XDG Base Directory specification and creates parent
     /// directories as needed. The file path is constructed based on the FileType:
     /// - `Config`: `$XDG_CONFIG_HOME/moriarty/{file_name}`
+    /// - `State`: `$XDG_STATE_HOME/moriarty/{file_name}`
     ///
     /// # Arguments
     ///
@@ -89,13 +92,13 @@ impl FileType {
     /// # }
     /// ```
     pub async fn build_path(&self, file_name: &'static str) -> miette::Result<PathBuf> {
+        let file_type = *self; // Copy the enum value to move into the closure
         let result = spawn_blocking(move || {
             let xdg_dirs = xdg::BaseDirectories::with_prefix(Self::APP_PREFIX);
 
-            // Allow single match: structured for future FileType variants (Data, Cache, State)
-            #[allow(clippy::single_match_else)]
-            match self {
+            match file_type {
                 Self::Config => xdg_dirs.place_config_file(file_name).into_diagnostic(),
+                Self::State => xdg_dirs.place_state_file(file_name).into_diagnostic(),
             }
         });
 

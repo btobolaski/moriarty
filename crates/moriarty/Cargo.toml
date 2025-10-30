@@ -30,6 +30,9 @@ tokio = { version = "1.47.1", features = [
 ] }
 fs2 = "0.4"
 toml = "0.9.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
 tui-scrollview = "0.5.1"
 uuid = { version = "1.18.1", features = ["v4", "serde"] }
 which = "7.0"
