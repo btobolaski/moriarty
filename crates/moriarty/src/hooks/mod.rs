@@ -51,8 +51,8 @@ async fn exec_hook_impl<R: Read>(reader: R) -> Result<()> {
     };
 
     // Limit input size to 1MB to prevent DoS via memory exhaustion
-    const MAX_INPUT_SIZE: usize = 1024 * 1024;
-    const LOG_TRUNCATE_SIZE: usize = 500;
+    const MAX_INPUT_SIZE: usize = 1024 * 1024 * 100;
+    const LOG_TRUNCATE_SIZE: usize = 50000;
 
     let mut input = String::new();
     let bytes_read = reader
