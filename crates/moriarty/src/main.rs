@@ -10,6 +10,7 @@ mod hooks;
 mod logs;
 mod mcp;
 mod persistence;
+mod project_config;
 mod tui;
 
 #[tokio::main]

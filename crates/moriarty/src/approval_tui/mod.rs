@@ -15,12 +15,9 @@ use tokio::fs::read_to_string;
 use tui_scrollview::ScrollViewState;
 
 use crate::{
-    mcp::{
-        approvals::{
-            get_all_commands, is_script, is_within_project, is_writable, read_script_contents,
-            resolve_binary_path_with_original, CommandApproval, ProjectApprovals,
-        },
-        tool_runner::ProjectConfig,
+    project_config::{
+        is_script, is_within_project, is_writable, read_script_contents,
+        resolve_binary_path_with_original, CommandApproval, ProjectApprovals, ProjectConfig,
     },
     tui::event_bus::{input_stream, Event, UIEvent},
 };
@@ -64,7 +61,7 @@ impl ApprovalApp {
             .with_context(|| format!("Failed to parse {}", tools_config_path.display()))?;
 
         // Get all configured commands
-        let commands = get_all_commands(&config.commands);
+        let commands = config.commands.all();
 
         if commands.is_empty() {
             return Err(miette::miette!(

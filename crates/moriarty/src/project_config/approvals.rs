@@ -31,7 +31,7 @@ use tokio::fs::read_to_string;
 
 use crate::{hashing, persistence::FileType};
 
-use super::tool_runner::{Commands, ProjectConfig};
+use super::config::ProjectConfig;
 
 const APPROVALS_FILE: &str = "project_approvals.toml";
 
@@ -365,26 +365,6 @@ pub async fn read_script_contents(path: &Path) -> Result<String> {
         .with_context(|| format!("Failed to read script: {}", path.display()))
 }
 
-/// Get all commands from a project config
-pub fn get_all_commands(commands: &Commands) -> Vec<(String, Vec<String>)> {
-    let mut result = Vec::new();
-
-    if let Some(cmd) = &commands.lint {
-        result.push(("lint".to_string(), cmd.clone()));
-    }
-    if let Some(cmd) = &commands.test {
-        result.push(("test".to_string(), cmd.clone()));
-    }
-    if let Some(cmd) = &commands.build {
-        result.push(("build".to_string(), cmd.clone()));
-    }
-    if let Some(cmd) = &commands.format {
-        result.push(("format".to_string(), cmd.clone()));
-    }
-
-    result
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -590,38 +570,6 @@ mod tests {
 
         let result = is_writable(temp_dir.path()).await.unwrap();
         assert!(result, "Writable directory should be detected as writable");
-    }
-
-    #[test]
-    fn test_get_all_commands_empty() {
-        let commands = Commands {
-            lint: None,
-            test: None,
-            build: None,
-            format: None,
-        };
-
-        let result = get_all_commands(&commands);
-        assert_eq!(result.len(), 0);
-    }
-
-    #[test]
-    fn test_get_all_commands_all_present() {
-        let commands = Commands {
-            lint: Some(vec!["cargo".to_string(), "clippy".to_string()]),
-            test: Some(vec!["cargo".to_string(), "test".to_string()]),
-            build: Some(vec!["cargo".to_string(), "build".to_string()]),
-            format: Some(vec!["cargo".to_string(), "fmt".to_string()]),
-        };
-
-        let result = get_all_commands(&commands);
-        assert_eq!(result.len(), 4);
-
-        let names: Vec<String> = result.iter().map(|(name, _)| name.clone()).collect();
-        assert!(names.contains(&"lint".to_string()));
-        assert!(names.contains(&"test".to_string()));
-        assert!(names.contains(&"build".to_string()));
-        assert!(names.contains(&"format".to_string()));
     }
 
     #[test]

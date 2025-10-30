@@ -22,7 +22,6 @@ use miette::IntoDiagnostic;
 use rmcp::{transport::stdio, ServiceExt};
 use tool_runner::ToolRunner;
 
-pub mod approvals;
 pub mod git_read_only;
 pub mod tool_runner;
 

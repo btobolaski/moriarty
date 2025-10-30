@@ -67,7 +67,6 @@
 
 use std::path::PathBuf;
 
-use miette::IntoDiagnostic;
 use rmcp::{
     handler::server::{tool::ToolRouter, wrapper::Parameters},
     model::*,
@@ -75,29 +74,9 @@ use rmcp::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use tokio::{fs::read_to_string, process::Command};
+use tokio::process::Command;
 
-/// Project configuration loaded from `.config/tools.toml`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProjectConfig {
-    /// Available tool commands
-    pub commands: Commands,
-}
-
-/// Tool command definitions.
-///
-/// Each field is optional and contains the command and its arguments as a string array.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Commands {
-    /// Linter command (e.g., `["cargo", "clippy"]`)
-    pub lint: Option<Vec<String>>,
-    /// Test command (e.g., `["cargo", "nextest", "run"]`)
-    pub test: Option<Vec<String>>,
-    /// Build command (e.g., `["cargo", "build"]`)
-    pub build: Option<Vec<String>>,
-    /// Formatter command (e.g., `["cargo", "fmt"]`)
-    pub format: Option<Vec<String>>,
-}
+use crate::project_config::{load_project_settings, ProjectApprovals, VerificationResult};
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RunArgs {
@@ -154,29 +133,6 @@ pub struct ToolRunner {
 }
 
 impl ToolRunner {
-    async fn load_project_settings(canonical_dir: PathBuf) -> miette::Result<ProjectConfig> {
-        // Path is already canonicalized by the caller to prevent traversal attacks
-        let mut config_path = canonical_dir.clone();
-        config_path.push(".config");
-        config_path.push("tools.toml");
-
-        let project_settings_contents = read_to_string(&config_path)
-            .await
-            .into_diagnostic()
-            .map_err(|error| {
-                error.context(format!(
-                    "failed to read project settings: {}",
-                    config_path.to_string_lossy()
-                ))
-            })?;
-
-        let settings: ProjectConfig = toml::from_str(project_settings_contents.as_str())
-            .into_diagnostic()
-            .map_err(|error| error.context("failed to parse project settings"))?;
-
-        Ok(settings)
-    }
-
     async fn run_command(cmd: ProjectCommand, args: RunArgs) -> Result<CallToolResult, McpError> {
         // Canonicalize path to prevent traversal attacks
         let canonical_dir = args.project_dir.canonicalize().map_err(|e| McpError {
@@ -190,7 +146,7 @@ impl ToolRunner {
             data: None,
         })?;
 
-        let settings = match Self::load_project_settings(canonical_dir.clone()).await {
+        let settings = match load_project_settings(canonical_dir.clone()).await {
             Ok(settings) => settings,
             Err(error) => {
                 return Err(McpError {
@@ -203,13 +159,11 @@ impl ToolRunner {
 
         // Verify approval before executing
         let command_name = cmd.as_str();
-        let approvals = super::approvals::ProjectApprovals::load()
-            .await
-            .map_err(|e| McpError {
-                code: ErrorCode::INTERNAL_ERROR,
-                message: format!("Failed to load approvals: {}", e).into(),
-                data: None,
-            })?;
+        let approvals = ProjectApprovals::load().await.map_err(|e| McpError {
+            code: ErrorCode::INTERNAL_ERROR,
+            message: format!("Failed to load approvals: {}", e).into(),
+            data: None,
+        })?;
 
         let verification_result = approvals
             .verify_project(&canonical_dir, command_name)
@@ -220,7 +174,6 @@ impl ToolRunner {
                 data: None,
             })?;
 
-        use super::approvals::VerificationResult;
         match verification_result {
             VerificationResult::Approved => {
                 // Continue with execution
@@ -391,7 +344,7 @@ impl Default for ToolRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mcp::approvals;
+    use crate::project_config::{approvals, ProjectConfig};
     use std::path::Path;
     use tempfile::TempDir;
 
@@ -426,7 +379,7 @@ mod tests {
         let tools_config_hash = crate::hashing::hash_string(config_content);
 
         let mut commands = HashMap::new();
-        for (name, cmd_array) in approvals::get_all_commands(&config.commands) {
+        for (name, cmd_array) in config.commands.all() {
             let binary_name = &cmd_array[0];
             let (original_path, resolved_path) =
                 approvals::resolve_binary_path_with_original(binary_name, &canonical_path).unwrap();
@@ -471,7 +424,7 @@ format = ["cargo", "fmt"]
 "#,
         );
 
-        let config = ToolRunner::load_project_settings(temp_dir.path().to_path_buf())
+        let config = load_project_settings(temp_dir.path().to_path_buf())
             .await
             .unwrap();
 
@@ -502,7 +455,7 @@ lint = ["cargo", "clippy"]
 "#,
         );
 
-        let config = ToolRunner::load_project_settings(temp_dir.path().to_path_buf())
+        let config = load_project_settings(temp_dir.path().to_path_buf())
             .await
             .unwrap();
 
@@ -519,7 +472,7 @@ lint = ["cargo", "clippy"]
     async fn test_load_project_settings_missing_file() {
         let temp_dir = TempDir::new().unwrap();
 
-        let result = ToolRunner::load_project_settings(temp_dir.path().to_path_buf()).await;
+        let result = load_project_settings(temp_dir.path().to_path_buf()).await;
 
         assert!(result.is_err());
         let error_msg = format!("{:?}", result.unwrap_err());
@@ -530,7 +483,7 @@ lint = ["cargo", "clippy"]
     async fn test_load_project_settings_malformed_toml() {
         let temp_dir = setup_project_dir_with_config("this is not valid toml [[[");
 
-        let result = ToolRunner::load_project_settings(temp_dir.path().to_path_buf()).await;
+        let result = load_project_settings(temp_dir.path().to_path_buf()).await;
 
         assert!(result.is_err());
         let error_msg = format!("{:?}", result.unwrap_err());
