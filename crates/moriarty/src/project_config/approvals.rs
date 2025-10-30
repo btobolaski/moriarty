@@ -1340,8 +1340,16 @@ command = ["echo", "check"]
 
         // Load approvals and verify checks were persisted
         let approvals = ProjectApprovals::load().await.unwrap();
-        let project_key = temp_dir.path().canonicalize().unwrap().to_string_lossy().to_string();
-        let approval = approvals.projects.get(&project_key).expect("Project should be approved");
+        let project_key = temp_dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let approval = approvals
+            .projects
+            .get(&project_key)
+            .expect("Project should be approved");
 
         // Verify both commands and checks are saved
         assert_eq!(approval.commands.len(), 1, "Should have 1 command");
@@ -1353,7 +1361,10 @@ command = ["echo", "check"]
 
         // Verify check approvals contain correct data
         let audit_approval = &approval.checks["security-audit"];
-        assert!(!audit_approval.binary_hash.is_empty(), "Binary hash should be set");
+        assert!(
+            !audit_approval.binary_hash.is_empty(),
+            "Binary hash should be set"
+        );
     }
 
     #[tokio::test]
@@ -1378,14 +1389,25 @@ canonical_path = "/bin/echo"
 binary_hash = "abc123"
 "#;
 
-        std::fs::write(approvals_dir.join("project_approvals.toml"), old_format_toml).unwrap();
+        std::fs::write(
+            approvals_dir.join("project_approvals.toml"),
+            old_format_toml,
+        )
+        .unwrap();
 
         // Load approvals - should succeed with checks field defaulting to empty HashMap
         let approvals = ProjectApprovals::load().await.unwrap();
-        let approval = approvals.projects.get("/test/project").expect("Project should load");
+        let approval = approvals
+            .projects
+            .get("/test/project")
+            .expect("Project should load");
 
         assert_eq!(approval.commands.len(), 1);
-        assert_eq!(approval.checks.len(), 0, "Checks should default to empty HashMap");
+        assert_eq!(
+            approval.checks.len(),
+            0,
+            "Checks should default to empty HashMap"
+        );
         assert_eq!(approval.tools_config_hash, "hash123");
     }
 }

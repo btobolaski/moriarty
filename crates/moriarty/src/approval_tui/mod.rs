@@ -6,7 +6,7 @@
 //!
 //! Event handlers are async to support atomic file I/O with locking during final approval.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent};
 use futures::StreamExt;
 use miette::{Context, IntoDiagnostic, Result};
 use ratatui::DefaultTerminal;
@@ -403,6 +403,7 @@ impl ApprovalApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::KeyModifiers;
     use std::io::Write;
     use tempfile::TempDir;
 
@@ -1006,7 +1007,10 @@ command = ["./scripts/custom-check.sh"]
         );
 
         // Verify hash was computed for the resolved file
-        assert!(!check.binary_hash.is_empty(), "Binary hash should be computed");
+        assert!(
+            !check.binary_hash.is_empty(),
+            "Binary hash should be computed"
+        );
 
         // Verify script was detected
         assert!(check.is_script, "Should detect script from shebang");
