@@ -205,17 +205,17 @@ impl ToolRunner {
                 });
             }
             VerificationResult::BinaryHashMismatch {
-                command,
+                item,
                 expected,
                 actual,
             } => {
                 return Err(McpError {
                     code: ErrorCode::INVALID_REQUEST,
                     message: format!(
-                        "Binary for '{}' command has been modified since approval. \
+                        "Binary for '{}' has been modified since approval. \
                         Run: moriarty approve-project {} \
                         (expected: {}, actual: {})",
-                        command,
+                        item,
                         canonical_dir.display(),
                         expected,
                         actual
@@ -224,12 +224,12 @@ impl ToolRunner {
                     data: None,
                 });
             }
-            VerificationResult::CommandNotApproved { command } => {
+            VerificationResult::ItemNotApproved { item } => {
                 return Err(McpError {
                     code: ErrorCode::INVALID_REQUEST,
                     message: format!(
-                        "Command '{}' not approved. Run: moriarty approve-project {}",
-                        command,
+                        "Tool '{}' not approved. Run: moriarty approve-project {}",
+                        item,
                         canonical_dir.display()
                     )
                     .into(),
@@ -344,8 +344,7 @@ impl Default for ToolRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::project_config::{approvals, ProjectConfig};
-    use std::path::Path;
+    use crate::project_config::approvals;
     use tempfile::TempDir;
 
     // IMPORTANT: Tests use `_xdg_dir` variables to keep TempDir instances alive.
@@ -368,47 +367,10 @@ mod tests {
         temp_dir
     }
 
-    /// Pre-approves tools to bypass the approval TUI in integration tests.
-    /// Helper to approve a project with the given config content.
-    /// Returns the canonical project path for use in assertions.
-    async fn approve_project_config(project_dir: &Path, config_content: &str) -> PathBuf {
-        use std::collections::HashMap;
-
-        let canonical_path = project_dir.canonicalize().unwrap();
-        let config: ProjectConfig = toml::from_str(config_content).unwrap();
-        let tools_config_hash = crate::hashing::hash_string(config_content);
-
-        let mut commands = HashMap::new();
-        for (name, cmd_array) in config.commands.all() {
-            let binary_name = &cmd_array[0];
-            let (original_path, resolved_path) =
-                approvals::resolve_binary_path_with_original(binary_name, &canonical_path).unwrap();
-            let binary_hash = crate::hashing::hash_file(&resolved_path).await.unwrap();
-
-            commands.insert(
-                name,
-                approvals::CommandApproval {
-                    original_path: original_path.to_string_lossy().to_string(),
-                    canonical_path: resolved_path.to_string_lossy().to_string(),
-                    binary_hash,
-                },
-            );
-        }
-
-        let canonical_path_clone = canonical_path.clone();
-        approvals::ProjectApprovals::update(move |approvals| {
-            approvals.approve_project(canonical_path_clone, tools_config_hash, commands);
-        })
-        .await
-        .unwrap();
-
-        canonical_path
-    }
-
     async fn setup_project_dir_with_approvals(config_content: &str) -> (TempDir, TempDir) {
         let xdg_dir = setup_isolated_xdg_config();
         let temp_dir = setup_project_dir_with_config(config_content);
-        approve_project_config(temp_dir.path(), config_content).await;
+        approvals::approve_project_config(temp_dir.path(), config_content).await;
         (temp_dir, xdg_dir)
     }
 
@@ -806,7 +768,7 @@ test = ["{}"]
         std::fs::write(config_dir.join("tools.toml"), &config_content).unwrap();
 
         // Approve the legitimate binary
-        approve_project_config(temp_dir.path(), &config_content).await;
+        approvals::approve_project_config(temp_dir.path(), &config_content).await;
 
         // TOCTOU attack: Swap the binary with malicious content after approval
         let mut malicious_script = std::fs::File::create(&script_path).unwrap();
@@ -890,7 +852,7 @@ test = ["{}"]
             std::fs::write(config_dir.join("tools.toml"), &config_content).unwrap();
 
             // Approve via symlink (resolves to legitimate binary)
-            approve_project_config(temp_dir.path(), &config_content).await;
+            approvals::approve_project_config(temp_dir.path(), &config_content).await;
 
             // TOCTOU attack: Change symlink to point to malicious binary
             std::fs::remove_file(&symlink_path).unwrap();
@@ -961,7 +923,7 @@ test = ["{}"]
         std::fs::write(config_dir.join("tools.toml"), &config_content_v1).unwrap();
 
         // Step 1: Initial approval
-        approve_project_config(temp_dir.path(), &config_content_v1).await;
+        approvals::approve_project_config(temp_dir.path(), &config_content_v1).await;
 
         // Step 2: Execute command - should succeed
         let args = RunArgs {
@@ -1004,7 +966,7 @@ build = ["echo", "build"]
         }
 
         // Step 5: Re-approve with new config
-        approve_project_config(temp_dir.path(), &config_content_v2).await;
+        approvals::approve_project_config(temp_dir.path(), &config_content_v2).await;
 
         // Step 6: Execute command again - should succeed with new approval
         let result = ToolRunner::run_command(ProjectCommand::Test, args).await;
@@ -1052,7 +1014,7 @@ build = ["{}"]
         std::fs::write(config_dir.join("tools.toml"), &config_content).unwrap();
 
         // Approve version 1
-        approve_project_config(temp_dir.path(), &config_content).await;
+        approvals::approve_project_config(temp_dir.path(), &config_content).await;
 
         // Execute - should succeed
         let args = RunArgs {
@@ -1087,7 +1049,7 @@ build = ["{}"]
         }
 
         // Re-approve with modified binary
-        approve_project_config(temp_dir.path(), &config_content).await;
+        approvals::approve_project_config(temp_dir.path(), &config_content).await;
 
         // Execute again - should succeed with new approval
         let result = ToolRunner::run_command(ProjectCommand::Build, args).await;

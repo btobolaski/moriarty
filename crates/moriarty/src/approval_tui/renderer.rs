@@ -48,43 +48,56 @@ fn render_project_overview(
         .style(Style::default().fg(Color::Cyan).bold());
     frame.render_widget(title, chunks[0]);
 
-    // Content with scrolling
-    let mut scroll_view = ScrollView::new(Size::new(
-        chunks[1].width.saturating_sub(2),
-        (state.commands.len() as u16 * 2 + 10).max(chunks[1].height.saturating_sub(2)),
-    ));
+    // Calculate total items for scroll view height
+    let total_items = state.commands.len() + state.checks.len();
+    let content_height = (total_items as u16 * 2 + 15).max(chunks[1].height.saturating_sub(2));
 
-    let content = format!(
-        "Project: {}\n\
-        \n\
-        This project has configured {} command(s) that will be approved:\n\
-        \n\
-        {}\n\
-        \n\
-        These commands will have access to:\n\
+    // Content with scrolling
+    let mut scroll_view =
+        ScrollView::new(Size::new(chunks[1].width.saturating_sub(2), content_height));
+
+    let mut content = format!("Project: {}\n\n", state.project_dir.display());
+
+    // Commands section
+    if !state.commands.is_empty() {
+        content.push_str(&format!(
+            "Commands ({}):\n\n{}\n\n",
+            state.commands.len(),
+            state
+                .commands
+                .iter()
+                .map(|cmd| format!("  • {} → {}", cmd.name, cmd.command_array.join(" ")))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+
+    // Checks section
+    if !state.checks.is_empty() {
+        content.push_str(&format!(
+            "Checks ({}):\n\n{}\n\n",
+            state.checks.len(),
+            state
+                .checks
+                .iter()
+                .map(|check| format!("  • {} → {}", check.name, check.command_array.join(" ")))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+
+    content.push_str(
+        "These tools will have access to:\n\
         - Read/write access to the project directory\n\
         - Full filesystem access with your user permissions\n\
         - Network access\n\
         \n\
-        Press Enter to review each command, or q to cancel.",
-        state.project_dir.display(),
-        state.commands.len(),
-        state
-            .commands
-            .iter()
-            .map(|cmd| format!("  • {} → {}", cmd.name, cmd.command_array.join(" ")))
-            .collect::<Vec<_>>()
-            .join("\n")
+        Press Enter to review each item, or q to cancel.",
     );
 
     scroll_view.render_widget(
         Paragraph::new(content).wrap(Wrap { trim: false }),
-        Rect::new(
-            0,
-            0,
-            chunks[1].width.saturating_sub(2),
-            state.commands.len() as u16 * 2 + 10,
-        ),
+        Rect::new(0, 0, chunks[1].width.saturating_sub(2), content_height),
     );
 
     frame.render_stateful_widget(scroll_view, chunks[1], scroll_state);
@@ -111,14 +124,42 @@ fn render_command_review(
         ])
         .split(area);
 
-    let current = &state.commands[state.current_command_index];
+    let Some(current) = state.current_item() else {
+        // Defensive: Should be unreachable due to validation in new() and handle_overview_keys()
+        let title = Paragraph::new("Error: Empty Section")
+            .block(Block::default().borders(Borders::ALL))
+            .style(Style::default().fg(Color::Red).bold());
+        frame.render_widget(title, chunks[0]);
+
+        let content = Paragraph::new(
+            "No items in this section. This is a bug in the navigation logic.\n\
+            Press q to cancel and report this issue.",
+        )
+        .wrap(Wrap { trim: false })
+        .style(Style::default().fg(Color::Red));
+        frame.render_widget(content, chunks[1]);
+
+        let help = Paragraph::new("q to cancel").style(Style::default().fg(Color::Red));
+        frame.render_widget(help, chunks[2]);
+        return;
+    };
+
+    // Determine section label and counts
+    let (section_label, current_num, total_num) = match state.current_section {
+        super::approval_state::Section::Commands => (
+            "Command",
+            state.current_item_index + 1,
+            state.commands.len(),
+        ),
+        super::approval_state::Section::Checks => {
+            ("Check", state.current_item_index + 1, state.checks.len())
+        }
+    };
 
     // Title
     let title = Paragraph::new(format!(
-        "Command Review ({}/{}): {}",
-        state.current_command_index + 1,
-        state.commands.len(),
-        current.name
+        "{} Review ({}/{}): {}",
+        section_label, current_num, total_num, current.name
     ))
     .block(Block::default().borders(Borders::ALL))
     .style(Style::default().fg(Color::Cyan).bold());
@@ -202,7 +243,25 @@ fn render_in_project_warning(state: &ApprovalState, frame: &mut Frame) {
         ])
         .split(area);
 
-    let current = &state.commands[state.current_command_index];
+    let Some(current) = state.current_item() else {
+        // Defensive: Should be unreachable due to validation in new() and handle_overview_keys()
+        let title = Paragraph::new("Error: Empty Section")
+            .block(Block::default().borders(Borders::ALL))
+            .style(Style::default().fg(Color::Red).bold());
+        frame.render_widget(title, chunks[0]);
+
+        let content = Paragraph::new(
+            "No items in this section. This is a bug in the navigation logic.\n\
+            Press q to cancel and report this issue.",
+        )
+        .wrap(Wrap { trim: false })
+        .style(Style::default().fg(Color::Red));
+        frame.render_widget(content, chunks[1]);
+
+        let help = Paragraph::new("q to cancel").style(Style::default().fg(Color::Red));
+        frame.render_widget(help, chunks[2]);
+        return;
+    };
 
     // Title
     let title = Paragraph::new("⚠⚠⚠ SECURITY WARNING ⚠⚠⚠")
@@ -260,40 +319,63 @@ fn render_summary(state: &ApprovalState, scroll_state: &mut ScrollViewState, fra
         .style(Style::default().fg(Color::Green).bold());
     frame.render_widget(title, chunks[0]);
 
-    // Content with scrolling
-    let content_height =
-        (state.commands.len() as u16 * 4 + 10).max(chunks[1].height.saturating_sub(2));
+    // Calculate content height for both commands and checks
+    let total_items = state.commands.len() + state.checks.len();
+    let content_height = (total_items as u16 * 4 + 15).max(chunks[1].height.saturating_sub(2));
     let mut scroll_view =
         ScrollView::new(Size::new(chunks[1].width.saturating_sub(2), content_height));
 
-    let command_list = state
-        .commands
-        .iter()
-        .map(|cmd| {
-            format!(
-                "✓ {} → {}\n  Binary: {}\n  Hash: {}",
-                cmd.name,
-                cmd.command_array.join(" "),
-                cmd.canonical_path.display(),
-                cmd.binary_hash
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n");
+    let mut content = format!(
+        "You have reviewed and approved all items for:\n\
+        {}\n\n",
+        state.project_dir.display()
+    );
 
-    let content = format!(
-        "You have reviewed and approved all commands for:\n\
-        {}\n\
-        \n\
-        Approved commands:\n\
-        {}\n\
-        \n\
-        These approvals will be saved to:\n\
+    // Commands section
+    if !state.commands.is_empty() {
+        let command_list = state
+            .commands
+            .iter()
+            .map(|cmd| {
+                format!(
+                    "✓ {} → {}\n  Binary: {}\n  Hash: {}",
+                    cmd.name,
+                    cmd.command_array.join(" "),
+                    cmd.canonical_path.display(),
+                    cmd.binary_hash
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        content.push_str(&format!("Approved commands:\n{}\n\n", command_list));
+    }
+
+    // Checks section
+    if !state.checks.is_empty() {
+        let check_list = state
+            .checks
+            .iter()
+            .map(|check| {
+                format!(
+                    "✓ {} → {}\n  Binary: {}\n  Hash: {}",
+                    check.name,
+                    check.command_array.join(" "),
+                    check.canonical_path.display(),
+                    check.binary_hash
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        content.push_str(&format!("Approved checks:\n{}\n\n", check_list));
+    }
+
+    content.push_str(
+        "These approvals will be saved to:\n\
         ~/.config/moriarty/project_approvals.toml\n\
         \n\
         Press Enter to save and complete approval, or q to cancel.",
-        state.project_dir.display(),
-        command_list
     );
 
     scroll_view.render_widget(
@@ -328,15 +410,18 @@ fn render_approved(state: &ApprovalState, frame: &mut Frame) {
     frame.render_widget(title, chunks[0]);
 
     // Content
+    let total_items = state.commands.len() + state.checks.len();
     let content = format!(
         "Successfully approved project tools for:\n\
         {}\n\
         \n\
-        {} command(s) have been approved and saved.\n\
+        {} item(s) have been approved and saved ({} commands, {} checks).\n\
         \n\
-        The MCP server will now execute these commands when requested by Claude.",
+        The MCP server will now execute these tools when requested by Claude.",
         state.project_dir.display(),
-        state.commands.len()
+        total_items,
+        state.commands.len(),
+        state.checks.len()
     );
 
     let paragraph = Paragraph::new(content)

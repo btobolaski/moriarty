@@ -52,6 +52,9 @@ pub struct ProjectApproval {
     pub last_approved: DateTime<Utc>,
     /// Approved commands with their binary hashes
     pub commands: HashMap<String, CommandApproval>,
+    /// Approved checks with their binary hashes
+    #[serde(default)]
+    pub checks: HashMap<String, CommandApproval>,
 }
 
 /// Approval data for a single command
@@ -65,6 +68,13 @@ pub struct CommandApproval {
     pub binary_hash: String,
 }
 
+/// Type of item being verified
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ItemType {
+    Command,
+    Check,
+}
+
 /// Result of verifying project approval status
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerificationResult {
@@ -76,12 +86,12 @@ pub enum VerificationResult {
     ConfigHashMismatch { expected: String, actual: String },
     /// Binary hash doesn't match (executable changed)
     BinaryHashMismatch {
-        command: String,
+        item: String,
         expected: String,
         actual: String,
     },
-    /// Command is configured but not in approvals
-    CommandNotApproved { command: String },
+    /// Item (command or check) is configured but not in approvals
+    ItemNotApproved { item: String },
 }
 
 impl ProjectApprovals {
@@ -145,11 +155,32 @@ impl ProjectApprovals {
         approvals.save().await
     }
 
-    /// Verify that a project is approved and its hashes match
+    /// Verify that a project command is approved and its hashes match
     pub async fn verify_project(
         &self,
         project_dir: &Path,
         command_name: &str,
+    ) -> Result<VerificationResult> {
+        self.verify_item(project_dir, command_name, ItemType::Command)
+            .await
+    }
+
+    /// Verify that a project check is approved and its hashes match
+    pub async fn verify_check(
+        &self,
+        project_dir: &Path,
+        check_name: &str,
+    ) -> Result<VerificationResult> {
+        self.verify_item(project_dir, check_name, ItemType::Check)
+            .await
+    }
+
+    /// Generic verification for commands or checks
+    async fn verify_item(
+        &self,
+        project_dir: &Path,
+        item_name: &str,
+        item_type: ItemType,
     ) -> Result<VerificationResult> {
         // Canonicalize the project directory
         let canonical_dir = project_dir
@@ -186,31 +217,73 @@ impl ProjectApprovals {
             });
         }
 
-        // Check if the requested command is approved
-        let Some(command_approval) = approval.commands.get(command_name) else {
-            return Ok(VerificationResult::CommandNotApproved {
-                command: command_name.to_string(),
-            });
-        };
-
-        // Parse the config to get the command array
+        // Parse the config once for both commands and checks
         let config: ProjectConfig = toml::from_str(&tools_config_content)
             .into_diagnostic()
             .with_context(|| format!("Failed to parse {}", tools_config_path.display()))?;
 
-        // Get the command array for verification
-        let command_array = match command_name {
-            "lint" => config.commands.lint,
-            "test" => config.commands.test,
-            "build" => config.commands.build,
-            "format" => config.commands.format,
-            _ => None,
-        };
+        // Get the appropriate approval map and command array based on item type.
+        //
+        // ARCHITECTURAL NOTE: Commands and checks are handled asymmetrically BY DESIGN:
+        //
+        // Commands use a fixed struct with 4 predefined fields (lint, test, build, format) because
+        // they correspond directly to the MCP protocol's standardized tools (run_lint, run_test,
+        // run_build, run_formatter). These are part of the public API contract that MCP clients
+        // expect. The fixed structure ensures type safety and prevents runtime errors when the
+        // MCP server receives requests for these standardized operations.
+        //
+        // Checks use a dynamic Vec<Check> because they are arbitrary user-defined validation
+        // scripts (e.g., security audits, license checks) with no standardized names or count.
+        // Projects can define zero, one, or many checks with any names they choose.
+        //
+        // This asymmetry is intentional and correct - it reflects the fundamental difference
+        // between protocol-defined operations (commands) and user-defined operations (checks).
+        let (item_approval, command_array) = match item_type {
+            ItemType::Command => {
+                let Some(command_approval) = approval.commands.get(item_name) else {
+                    return Ok(VerificationResult::ItemNotApproved {
+                        item: item_name.to_string(),
+                    });
+                };
 
-        let Some(command_array) = command_array else {
-            return Ok(VerificationResult::CommandNotApproved {
-                command: command_name.to_string(),
-            });
+                // Get the command array for verification
+                let command_array = match item_name {
+                    "lint" => config.commands.lint,
+                    "test" => config.commands.test,
+                    "build" => config.commands.build,
+                    "format" => config.commands.format,
+                    _ => None,
+                };
+
+                let Some(command_array) = command_array else {
+                    return Ok(VerificationResult::ItemNotApproved {
+                        item: item_name.to_string(),
+                    });
+                };
+
+                (command_approval, command_array)
+            }
+            ItemType::Check => {
+                let Some(check_approval) = approval.checks.get(item_name) else {
+                    return Ok(VerificationResult::ItemNotApproved {
+                        item: item_name.to_string(),
+                    });
+                };
+
+                // Find the check in the config
+                let check = config
+                    .checks
+                    .as_ref()
+                    .and_then(|checks| checks.iter().find(|c| c.name == item_name));
+
+                let Some(check) = check else {
+                    return Ok(VerificationResult::ItemNotApproved {
+                        item: item_name.to_string(),
+                    });
+                };
+
+                (check_approval, check.command.clone())
+            }
         };
 
         let binary_name = &command_array[0];
@@ -220,35 +293,35 @@ impl ProjectApprovals {
         // Hash immediately after resolution to prevent TOCTOU attacks
         let current_binary_hash = hashing::hash_file(&canonical_path).await?;
 
-        if original_path.to_string_lossy() != command_approval.original_path {
+        if original_path.to_string_lossy() != item_approval.original_path {
             return Ok(VerificationResult::BinaryHashMismatch {
-                command: command_name.to_string(),
-                expected: command_approval.binary_hash.clone(),
+                item: item_name.to_string(),
+                expected: item_approval.binary_hash.clone(),
                 actual: format!(
                     "original path changed from {} to {}",
-                    command_approval.original_path,
+                    item_approval.original_path,
                     original_path.display()
                 ),
             });
         }
 
-        if canonical_path.to_string_lossy() != command_approval.canonical_path {
+        if canonical_path.to_string_lossy() != item_approval.canonical_path {
             return Ok(VerificationResult::BinaryHashMismatch {
-                command: command_name.to_string(),
-                expected: command_approval.binary_hash.clone(),
+                item: item_name.to_string(),
+                expected: item_approval.binary_hash.clone(),
                 actual: format!(
                     "canonical path changed from {} to {}",
-                    command_approval.canonical_path,
+                    item_approval.canonical_path,
                     canonical_path.display()
                 ),
             });
         }
 
         // Check if binary hash matches
-        if current_binary_hash != command_approval.binary_hash {
+        if current_binary_hash != item_approval.binary_hash {
             return Ok(VerificationResult::BinaryHashMismatch {
-                command: command_name.to_string(),
-                expected: command_approval.binary_hash.clone(),
+                item: item_name.to_string(),
+                expected: item_approval.binary_hash.clone(),
                 actual: current_binary_hash,
             });
         }
@@ -262,6 +335,7 @@ impl ProjectApprovals {
         project_dir: PathBuf,
         tools_config_hash: String,
         commands: HashMap<String, CommandApproval>,
+        checks: HashMap<String, CommandApproval>,
     ) {
         let project_key = project_dir.to_string_lossy().to_string();
         self.projects.insert(
@@ -270,6 +344,7 @@ impl ProjectApprovals {
                 tools_config_hash,
                 last_approved: Utc::now(),
                 commands,
+                checks,
             },
         );
     }
@@ -391,7 +466,14 @@ mod tests {
             },
         );
 
-        approvals.approve_project(project_dir.clone(), tools_hash.clone(), commands.clone());
+        let checks = HashMap::new();
+
+        approvals.approve_project(
+            project_dir.clone(),
+            tools_hash.clone(),
+            commands.clone(),
+            checks,
+        );
 
         let project_key = project_dir.to_string_lossy().to_string();
         assert!(approvals.projects.contains_key(&project_key));
@@ -400,6 +482,279 @@ mod tests {
         assert_eq!(approval.tools_config_hash, tools_hash);
         assert_eq!(approval.commands.len(), 1);
         assert!(approval.commands.contains_key("lint"));
+    }
+
+    #[test]
+    fn test_approve_project_with_checks() {
+        let mut approvals = ProjectApprovals::default();
+        let project_dir = PathBuf::from("/test/project");
+        let tools_hash = "sha256:abc123".to_string();
+
+        let mut commands = HashMap::new();
+        commands.insert(
+            "lint".to_string(),
+            CommandApproval {
+                original_path: "cargo".to_string(),
+                canonical_path: "/usr/bin/cargo".to_string(),
+                binary_hash: "sha256:def456".to_string(),
+            },
+        );
+
+        let mut checks = HashMap::new();
+        checks.insert(
+            "security-audit".to_string(),
+            CommandApproval {
+                original_path: "cargo".to_string(),
+                canonical_path: "/usr/bin/cargo".to_string(),
+                binary_hash: "sha256:abc789".to_string(),
+            },
+        );
+
+        approvals.approve_project(
+            project_dir.clone(),
+            tools_hash.clone(),
+            commands.clone(),
+            checks.clone(),
+        );
+
+        let project_key = project_dir.to_string_lossy().to_string();
+        assert!(approvals.projects.contains_key(&project_key));
+
+        let approval = &approvals.projects[&project_key];
+        assert_eq!(approval.tools_config_hash, tools_hash);
+        assert_eq!(approval.commands.len(), 1);
+        assert!(approval.commands.contains_key("lint"));
+        assert_eq!(approval.checks.len(), 1);
+        assert!(approval.checks.contains_key("security-audit"));
+    }
+
+    #[tokio::test]
+    async fn test_verify_check_approved() {
+        // Test that verify_check correctly verifies an approved check
+        use tempfile::TempDir;
+
+        let _xdg_dir = TempDir::new().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", _xdg_dir.path());
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_dir = temp_dir.path().join(".config");
+        std::fs::create_dir(&config_dir).unwrap();
+
+        let config_content = r#"
+[commands]
+
+[[checks]]
+name = "audit"
+command = ["echo", "test"]
+"#;
+
+        std::fs::write(config_dir.join("tools.toml"), config_content).unwrap();
+
+        // Use the helper to approve the project with checks
+        approve_project_config(temp_dir.path(), config_content).await;
+
+        // Load approvals and verify the check
+        let approvals = ProjectApprovals::load().await.unwrap();
+        let result = approvals
+            .verify_check(temp_dir.path(), "audit")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result,
+            VerificationResult::Approved,
+            "Approved check should verify successfully"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_verify_check_not_approved() {
+        // Test that verify_check returns NotApproved for unapproved checks
+        use tempfile::TempDir;
+
+        let _xdg_dir = TempDir::new().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", _xdg_dir.path());
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_dir = temp_dir.path().join(".config");
+        std::fs::create_dir(&config_dir).unwrap();
+
+        let config_content = r#"
+[commands]
+
+[[checks]]
+name = "audit"
+command = ["echo", "test"]
+"#;
+
+        std::fs::write(config_dir.join("tools.toml"), config_content).unwrap();
+
+        // Don't approve - just load approvals
+        let approvals = ProjectApprovals::load().await.unwrap();
+        let result = approvals
+            .verify_check(temp_dir.path(), "audit")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result,
+            VerificationResult::NotApproved,
+            "Unapproved check should return NotApproved"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_verify_check_config_hash_mismatch() {
+        use tempfile::TempDir;
+
+        let _xdg_dir = TempDir::new().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", _xdg_dir.path());
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_dir = temp_dir.path().join(".config");
+        std::fs::create_dir(&config_dir).unwrap();
+
+        let config_content = r#"
+[commands]
+
+[[checks]]
+name = "audit"
+command = ["echo", "test"]
+"#;
+
+        std::fs::write(config_dir.join("tools.toml"), config_content).unwrap();
+
+        // Approve the project
+        approve_project_config(temp_dir.path(), config_content).await;
+
+        // Modify the config
+        let new_config_content = r#"
+[commands]
+
+[[checks]]
+name = "audit"
+command = ["echo", "modified"]
+"#;
+        std::fs::write(config_dir.join("tools.toml"), new_config_content).unwrap();
+
+        // Verify should detect config hash mismatch
+        let approvals = ProjectApprovals::load().await.unwrap();
+        let result = approvals
+            .verify_check(temp_dir.path(), "audit")
+            .await
+            .unwrap();
+
+        match result {
+            VerificationResult::ConfigHashMismatch { .. } => {
+                // Expected
+            }
+            _ => panic!(
+                "Expected ConfigHashMismatch for modified config, got {:?}",
+                result
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_verify_check_binary_hash_mismatch() {
+        use tempfile::TempDir;
+
+        let _xdg_dir = TempDir::new().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", _xdg_dir.path());
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_dir = temp_dir.path().join(".config");
+        std::fs::create_dir(&config_dir).unwrap();
+
+        // Create a script
+        let scripts_dir = temp_dir.path().join("scripts");
+        std::fs::create_dir(&scripts_dir).unwrap();
+        let script_path = scripts_dir.join("check.sh");
+        std::fs::write(&script_path, "#!/bin/bash\necho 'original'\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let permissions = std::fs::Permissions::from_mode(0o755);
+            std::fs::set_permissions(&script_path, permissions).unwrap();
+        }
+
+        let config_content = format!(
+            r#"
+[commands]
+
+[[checks]]
+name = "custom-check"
+command = ["{}"]
+"#,
+            script_path.display()
+        );
+
+        std::fs::write(config_dir.join("tools.toml"), &config_content).unwrap();
+
+        // Approve the project
+        approve_project_config(temp_dir.path(), &config_content).await;
+
+        // Modify the script (change the hash)
+        std::fs::write(&script_path, "#!/bin/bash\necho 'modified'\n").unwrap();
+
+        // Verify should detect binary hash mismatch
+        let approvals = ProjectApprovals::load().await.unwrap();
+        let result = approvals
+            .verify_check(temp_dir.path(), "custom-check")
+            .await
+            .unwrap();
+
+        match result {
+            VerificationResult::BinaryHashMismatch { item, .. } => {
+                assert_eq!(item, "custom-check");
+            }
+            _ => panic!(
+                "Expected BinaryHashMismatch for modified binary, got {:?}",
+                result
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_verify_check_not_in_config() {
+        use tempfile::TempDir;
+
+        let _xdg_dir = TempDir::new().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", _xdg_dir.path());
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_dir = temp_dir.path().join(".config");
+        std::fs::create_dir(&config_dir).unwrap();
+
+        let config_content = r#"
+[commands]
+
+[[checks]]
+name = "audit"
+command = ["echo", "test"]
+"#;
+
+        std::fs::write(config_dir.join("tools.toml"), config_content).unwrap();
+
+        // Approve the project
+        approve_project_config(temp_dir.path(), config_content).await;
+
+        // Try to verify a check that wasn't in the config
+        let approvals = ProjectApprovals::load().await.unwrap();
+        let result = approvals
+            .verify_check(temp_dir.path(), "nonexistent-check")
+            .await
+            .unwrap();
+
+        match result {
+            VerificationResult::ItemNotApproved { item } => {
+                assert_eq!(item, "nonexistent-check");
+            }
+            _ => panic!(
+                "Expected ItemNotApproved for check not in config, got {:?}",
+                result
+            ),
+        }
     }
 
     #[test]
@@ -788,7 +1143,7 @@ mod tests {
                 );
 
                 ProjectApprovals::update(move |approvals| {
-                    approvals.approve_project(project_dir, tools_hash, commands);
+                    approvals.approve_project(project_dir, tools_hash, commands, HashMap::new());
                 })
                 .await
                 .expect("Concurrent approval should succeed");
@@ -857,7 +1212,7 @@ mod tests {
                 );
 
                 ProjectApprovals::update(move |approvals| {
-                    approvals.approve_project(project_dir, tools_hash, commands);
+                    approvals.approve_project(project_dir, tools_hash, commands, HashMap::new());
                 })
                 .await
                 .expect("Concurrent update should succeed");
@@ -915,7 +1270,7 @@ mod tests {
                     },
                 );
 
-                approvals.approve_project(project_dir, tools_hash, commands);
+                approvals.approve_project(project_dir, tools_hash, commands, HashMap::new());
 
                 // Simulate slow operation
                 std::thread::sleep(Duration::from_millis(100));
@@ -953,4 +1308,141 @@ mod tests {
             assert_eq!(approval.commands.len(), 1);
         }
     }
+
+    #[tokio::test]
+    async fn test_save_approvals_persists_checks() {
+        use tempfile::TempDir;
+
+        let _xdg_dir = TempDir::new().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", _xdg_dir.path());
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_dir = temp_dir.path().join(".config");
+        std::fs::create_dir(&config_dir).unwrap();
+
+        let config_content = r#"
+[commands]
+lint = ["echo", "lint"]
+
+[[checks]]
+name = "security-audit"
+command = ["echo", "audit"]
+
+[[checks]]
+name = "license-check"
+command = ["echo", "check"]
+"#;
+
+        std::fs::write(config_dir.join("tools.toml"), config_content).unwrap();
+
+        // Approve the project using the helper
+        approve_project_config(temp_dir.path(), config_content).await;
+
+        // Load approvals and verify checks were persisted
+        let approvals = ProjectApprovals::load().await.unwrap();
+        let project_key = temp_dir.path().canonicalize().unwrap().to_string_lossy().to_string();
+        let approval = approvals.projects.get(&project_key).expect("Project should be approved");
+
+        // Verify both commands and checks are saved
+        assert_eq!(approval.commands.len(), 1, "Should have 1 command");
+        assert!(approval.commands.contains_key("lint"));
+
+        assert_eq!(approval.checks.len(), 2, "Should have 2 checks");
+        assert!(approval.checks.contains_key("security-audit"));
+        assert!(approval.checks.contains_key("license-check"));
+
+        // Verify check approvals contain correct data
+        let audit_approval = &approval.checks["security-audit"];
+        assert!(!audit_approval.binary_hash.is_empty(), "Binary hash should be set");
+    }
+
+    #[tokio::test]
+    async fn test_load_approvals_without_checks_field() {
+        use tempfile::TempDir;
+
+        let xdg_dir = TempDir::new().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", xdg_dir.path());
+
+        // Create old-format approval TOML without checks field
+        let approvals_dir = xdg_dir.path().join("moriarty");
+        std::fs::create_dir_all(&approvals_dir).unwrap();
+
+        let old_format_toml = r#"
+[projects."/test/project"]
+tools_config_hash = "hash123"
+last_approved = "2024-01-01T00:00:00Z"
+
+[projects."/test/project".commands.lint]
+original_path = "/bin/echo"
+canonical_path = "/bin/echo"
+binary_hash = "abc123"
+"#;
+
+        std::fs::write(approvals_dir.join("project_approvals.toml"), old_format_toml).unwrap();
+
+        // Load approvals - should succeed with checks field defaulting to empty HashMap
+        let approvals = ProjectApprovals::load().await.unwrap();
+        let approval = approvals.projects.get("/test/project").expect("Project should load");
+
+        assert_eq!(approval.commands.len(), 1);
+        assert_eq!(approval.checks.len(), 0, "Checks should default to empty HashMap");
+        assert_eq!(approval.tools_config_hash, "hash123");
+    }
+}
+
+/// Test helper to pre-approve a project with the given config content.
+/// This bypasses the approval TUI for integration tests.
+/// Returns the canonical project path for use in assertions.
+#[cfg(test)]
+pub async fn approve_project_config(project_dir: &Path, config_content: &str) -> PathBuf {
+    let canonical_path = project_dir.canonicalize().unwrap();
+    let config: ProjectConfig = toml::from_str(config_content).unwrap();
+    let tools_config_hash = crate::hashing::hash_string(config_content);
+
+    // Process commands
+    let mut commands = HashMap::new();
+    for (name, cmd_array) in config.commands.all() {
+        let binary_name = &cmd_array[0];
+        let (original_path, resolved_path) =
+            resolve_binary_path_with_original(binary_name, &canonical_path).unwrap();
+        let binary_hash = crate::hashing::hash_file(&resolved_path).await.unwrap();
+
+        commands.insert(
+            name,
+            CommandApproval {
+                original_path: original_path.to_string_lossy().to_string(),
+                canonical_path: resolved_path.to_string_lossy().to_string(),
+                binary_hash,
+            },
+        );
+    }
+
+    // Process checks
+    let mut checks = HashMap::new();
+    if let Some(check_configs) = config.checks {
+        for check in check_configs {
+            let binary_name = &check.command[0];
+            let (original_path, resolved_path) =
+                resolve_binary_path_with_original(binary_name, &canonical_path).unwrap();
+            let binary_hash = crate::hashing::hash_file(&resolved_path).await.unwrap();
+
+            checks.insert(
+                check.name,
+                CommandApproval {
+                    original_path: original_path.to_string_lossy().to_string(),
+                    canonical_path: resolved_path.to_string_lossy().to_string(),
+                    binary_hash,
+                },
+            );
+        }
+    }
+
+    let canonical_path_clone = canonical_path.clone();
+    ProjectApprovals::update(move |approvals| {
+        approvals.approve_project(canonical_path_clone, tools_config_hash, commands, checks);
+    })
+    .await
+    .unwrap();
+
+    canonical_path
 }
