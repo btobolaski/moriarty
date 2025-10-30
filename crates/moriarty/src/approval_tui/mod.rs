@@ -974,15 +974,14 @@ command = ["echo", "license"]
             std::fs::set_permissions(&script_path, permissions).unwrap();
         }
 
-        let config_content = format!(
-            r#"
+        let config_content = r#"
 [commands]
 
 [[checks]]
 name = "custom-check"
 command = ["./scripts/custom-check.sh"]
 "#
-        );
+        .to_string();
 
         std::fs::write(config_dir.join("tools.toml"), &config_content).unwrap();
 

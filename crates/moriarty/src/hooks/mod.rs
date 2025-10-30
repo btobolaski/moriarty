@@ -152,13 +152,13 @@ async fn exec_hook_impl<R: Read>(reader: R) -> Result<()> {
 }
 
 /// Helper to create a HookOutput that allows execution with an optional reason
-fn allow_hook(reason: impl Into<String>) -> HookOutput {
+fn allow_hook() -> HookOutput {
     HookOutput {
         continue_execution: None,
         stop_reason: None,
         suppress_output: None,
         decision: Some(HookDecision::Allow),
-        reason: Some(reason.into()),
+        reason: None,
     }
 }
 
@@ -208,7 +208,7 @@ async fn handle_stop_hook() -> Result<HookOutput> {
         }
         Err(_) => {
             info!("No CLAUDE_PROJECT_DIR set, allowing without checks");
-            return Ok(allow_hook("No project context"));
+            return Ok(allow_hook());
         }
     };
 
@@ -221,10 +221,7 @@ async fn handle_stop_hook() -> Result<HookOutput> {
                 error = %e,
                 "Failed to canonicalize project directory"
             );
-            return Ok(allow_hook(format!(
-                "Project directory does not exist: {}",
-                project_dir.display()
-            )));
+            return Ok(allow_hook());
         }
     };
 
@@ -236,7 +233,7 @@ async fn handle_stop_hook() -> Result<HookOutput> {
                 error = %e,
                 "No .config/tools.toml found, allowing without checks"
             );
-            return Ok(allow_hook("No project configuration"));
+            return Ok(allow_hook());
         }
     };
 
@@ -245,7 +242,7 @@ async fn handle_stop_hook() -> Result<HookOutput> {
         Some(checks) if !checks.is_empty() => checks,
         _ => {
             info!("No checks defined in config, allowing");
-            return Ok(allow_hook("No checks configured"));
+            return Ok(allow_hook());
         }
     };
 
@@ -493,10 +490,7 @@ async fn handle_stop_hook() -> Result<HookOutput> {
 
     if failures.is_empty() {
         info!("All checks passed");
-        Ok(allow_hook(format!(
-            "All checks passed:\n\n{}",
-            all_output.join("\n\n")
-        )))
+        Ok(allow_hook())
     } else {
         error!(failure_count = failures.len(), "Some checks failed");
         Ok(deny_hook(format!(
@@ -628,7 +622,7 @@ mod tests {
         let result = handle_stop_hook().await.expect("Should succeed");
 
         assert_eq!(result.decision, Some(HookDecision::Allow));
-        assert!(result.reason.unwrap().contains("No project context"));
+        assert_eq!(result.reason, None);
     }
 
     #[tokio::test]
@@ -642,7 +636,7 @@ mod tests {
         let result = handle_stop_hook().await.expect("Should succeed");
 
         assert_eq!(result.decision, Some(HookDecision::Allow));
-        assert!(result.reason.unwrap().contains("No project configuration"));
+        assert_eq!(result.reason, None);
     }
 
     #[tokio::test]
@@ -667,7 +661,7 @@ lint = ["echo", "lint"]
         let result = handle_stop_hook().await.expect("Should succeed");
 
         assert_eq!(result.decision, Some(HookDecision::Allow));
-        assert!(result.reason.unwrap().contains("No checks configured"));
+        assert_eq!(result.reason, None);
     }
 
     #[tokio::test]
@@ -792,8 +786,7 @@ command = ["echo", "test"]
         let result = handle_stop_hook().await.expect("Should succeed");
 
         assert_eq!(result.decision, Some(HookDecision::Allow));
-        let reason = result.reason.unwrap();
-        assert!(reason.contains("All checks passed"), "Reason: {}", reason);
+        assert_eq!(result.reason, None);
     }
 
     #[tokio::test]
@@ -845,12 +838,7 @@ command = ["echo", "test"]
         let result = handle_stop_hook().await.expect("Should succeed");
 
         assert_eq!(result.decision, Some(HookDecision::Allow));
-        let reason = result.reason.unwrap();
-        assert!(
-            reason.contains("All checks passed"),
-            "Should pass all checks: {}",
-            reason
-        );
+        assert_eq!(result.reason, None);
     }
 
     #[tokio::test]
