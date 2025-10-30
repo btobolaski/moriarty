@@ -6,6 +6,7 @@ use mcp::McpServers;
 mod api_pricing;
 mod approval_tui;
 mod hashing;
+mod hooks;
 mod logs;
 mod mcp;
 mod persistence;
