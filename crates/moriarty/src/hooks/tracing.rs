@@ -6,7 +6,7 @@
 //! - Timing information
 //! - Errors and failures
 //!
-//! Logs are written to XDG_STATE_HOME/moriarty/hooks/hooks.log with daily rotation.
+//! Logs are written in JSON format to XDG_STATE_HOME/moriarty/hooks/hooks.log with daily rotation.
 
 use crate::persistence::FileType;
 use miette::{IntoDiagnostic, Result};
@@ -15,14 +15,14 @@ use std::path::PathBuf;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-/// Initialize tracing for hooks with file-based logging
+/// Initialize tracing for hooks with file-based JSON logging
 ///
 /// Returns a `WorkerGuard` that must be held for the lifetime of the application.
 /// When dropped, the guard flushes any remaining logs.
 ///
 /// # Log Location
 ///
-/// Logs are written to `$XDG_STATE_HOME/moriarty/hooks/hooks.log` (or
+/// Logs are written in JSON format to `$XDG_STATE_HOME/moriarty/hooks/hooks.log` (or
 /// `~/.local/state/moriarty/hooks/hooks.log` on most systems).
 ///
 /// # Log Rotation
@@ -65,10 +65,10 @@ pub async fn init_tracing() -> Result<WorkerGuard> {
         .unwrap_or_else(|_| EnvFilter::new("info"))
         .add_directive("moriarty::hooks=debug".parse().into_diagnostic()?);
 
-    // Build subscriber with file output
+    // Build subscriber with JSON file output
     let file_layer = fmt::layer()
+        .json()
         .with_writer(non_blocking)
-        .with_ansi(false) // No ANSI colors in log files
         .with_target(true)
         .with_thread_ids(true)
         .with_file(true)

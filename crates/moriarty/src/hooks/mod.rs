@@ -20,9 +20,7 @@ pub mod tracing;
 use crate::HooksCommand;
 use ::tracing::{error, info};
 use miette::Result;
-use regex::Regex;
 use std::io::Read;
-use std::sync::LazyLock;
 
 /// Execute hooks command
 pub async fn exec_hooks(cmd: HooksCommand) -> Result<()> {
@@ -114,38 +112,9 @@ async fn exec_hook_impl<R: Read>(reader: R) -> Result<()> {
         miette::miette!("Failed to parse hook input: {}", e)
     })?;
 
-    info!(
-        session_id = %hook_input.session_id,
-        transcript_path = %hook_input.transcript_path,
-        cwd = %hook_input.cwd,
-        permission_mode = ?hook_input.permission_mode,
-        event_data = ?hook_input.event_data,
-        "Successfully parsed hook input"
-    );
-
-    // Environment variables affect hook execution (PATH, shell config, etc.) and differ
-    // between parent and subprocess contexts. Logging them aids debugging execution issues.
-    info!("Logging environment variables:");
-    for (key, value) in std::env::vars() {
-        if is_sensitive_env_var(&key) {
-            info!(env_var = %key, value = "[REDACTED]", "Environment variable");
-        } else {
-            info!(env_var = %key, value = %value, "Environment variable");
-        }
-    }
+    info!(?hook_input, "Successfully parsed hook input");
 
     Ok(())
-}
-
-/// Regex pattern for detecting sensitive environment variable names
-static SENSITIVE_ENV_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)(TOKEN|SECRET|PASSWORD|PASS|PASSWD|CREDENTIAL|AUTH|APIKEY|_KEY$|^.*_KEY_|PRIVATE|WEBHOOK|SESSION)")
-        .expect("Invalid regex pattern")
-});
-
-/// Check if an environment variable name suggests it contains sensitive data
-fn is_sensitive_env_var(key: &str) -> bool {
-    SENSITIVE_ENV_PATTERN.is_match(key)
 }
 
 #[cfg(test)]
@@ -261,71 +230,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_exec_hook_redacts_sensitive_env_vars() {
-        let _xdg_dir = setup_isolated_xdg_state();
-
-        // Set test environment variables
-        std::env::set_var("TEST_API_TOKEN", "secret123");
-        std::env::set_var("TEST_SAFE_VAR", "public_value");
-
-        let input = r#"{
-            "session_id": "test-session",
-            "transcript_path": "/tmp/transcript.json",
-            "cwd": "/tmp/project",
-            "permission_mode": "default",
-            "hook_event_name": "Stop"
-        }"#;
-
-        let cursor = Cursor::new(input);
-        let result = exec_hook_impl(cursor).await;
-        result.unwrap();
-
-        // Force flush by dropping the guard (it's in result's scope which ended)
-        // Give async file writes time to complete
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-        // Read the log file and verify redaction
-        let log_path = tracing::get_current_log_path().await.unwrap();
-        let log_dir = log_path.parent().unwrap();
-        let entries: Vec<_> = std::fs::read_dir(log_dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().starts_with("hooks.log"))
-            .collect();
-
-        assert!(!entries.is_empty(), "Should have at least one log file");
-
-        let log_file = &entries[0];
-        let content = std::fs::read_to_string(log_file.path()).unwrap();
-
-        // Verify sensitive var is redacted
-        assert!(
-            content.contains("TEST_API_TOKEN"),
-            "Should log the variable name"
-        );
-        assert!(content.contains("[REDACTED]"), "Should redact the value");
-        assert!(
-            !content.contains("secret123"),
-            "Should NOT log the secret value. Log content:\n{}",
-            content
-        );
-
-        // Verify safe var is logged
-        assert!(
-            content.contains("TEST_SAFE_VAR"),
-            "Should log safe variable name"
-        );
-        assert!(
-            content.contains("public_value"),
-            "Should log safe variable value"
-        );
-
-        // Clean up
-        std::env::remove_var("TEST_API_TOKEN");
-        std::env::remove_var("TEST_SAFE_VAR");
-    }
-
-    #[tokio::test]
     async fn test_exec_hook_exactly_at_size_limit() {
         let _xdg_dir = setup_isolated_xdg_state();
 
@@ -379,64 +283,5 @@ mod tests {
             "Error should mention size or parsing: {}",
             err
         );
-    }
-
-    #[test]
-    fn test_is_sensitive_env_var_matches_sensitive_patterns() {
-        // Should match - these contain sensitive data
-        assert!(is_sensitive_env_var("API_TOKEN"));
-        assert!(is_sensitive_env_var("SECRET_KEY"));
-        assert!(is_sensitive_env_var("PASSWORD"));
-        assert!(is_sensitive_env_var("DB_PASSWORD"));
-        assert!(is_sensitive_env_var("WEBHOOK_URL"));
-        assert!(is_sensitive_env_var("AWS_ACCESS_KEY"));
-        assert!(is_sensitive_env_var("STRIPE_SECRET_KEY"));
-        assert!(is_sensitive_env_var("MY_API_KEY"));
-        assert!(is_sensitive_env_var("GITHUB_TOKEN"));
-        assert!(is_sensitive_env_var("AUTH_TOKEN"));
-        assert!(is_sensitive_env_var("APIKEY"));
-        assert!(is_sensitive_env_var("PRIVATE_KEY"));
-        assert!(is_sensitive_env_var("SESSION_SECRET"));
-        assert!(is_sensitive_env_var("DB_PASS"));
-        assert!(is_sensitive_env_var("PASSWD"));
-        assert!(is_sensitive_env_var("CREDENTIAL"));
-    }
-
-    #[test]
-    fn test_is_sensitive_env_var_case_insensitive() {
-        // Case insensitive matching
-        assert!(is_sensitive_env_var("api_token"));
-        assert!(is_sensitive_env_var("SeCrEt"));
-        assert!(is_sensitive_env_var("PaSsWoRd"));
-        assert!(is_sensitive_env_var("AUTH"));
-    }
-
-    #[test]
-    fn test_is_sensitive_env_var_does_not_match_safe_vars() {
-        // Should NOT match - these are safe to log
-        assert!(!is_sensitive_env_var("PATH"));
-        assert!(!is_sensitive_env_var("HOME"));
-        assert!(!is_sensitive_env_var("RUST_LOG"));
-        assert!(!is_sensitive_env_var("CARGO_HOME"));
-        assert!(!is_sensitive_env_var("USER"));
-        assert!(!is_sensitive_env_var("SHELL"));
-        assert!(!is_sensitive_env_var("TERM"));
-        assert!(!is_sensitive_env_var("LANG"));
-
-        // KEYBOARD should not match even though it contains "key"
-        assert!(!is_sensitive_env_var("KEYBOARD"));
-        assert!(!is_sensitive_env_var("MONKEY_MODE"));
-        assert!(!is_sensitive_env_var("DEPLOYMENT"));
-    }
-
-    #[test]
-    fn test_is_sensitive_env_var_edge_cases() {
-        // Empty string
-        assert!(!is_sensitive_env_var(""));
-
-        // Patterns at boundaries
-        assert!(is_sensitive_env_var("_KEY"));
-        assert!(is_sensitive_env_var("MY_KEY"));
-        assert!(is_sensitive_env_var("SOMETHING_KEY_ELSE"));
     }
 }
