@@ -85,7 +85,8 @@ pub struct HookDefinition {
     pub hook_type: HookType,
     /// Supports $CLAUDE_PROJECT_DIR variable substitution
     pub command: String,
-    /// Defaults to 60 seconds if not specified
+    /// 60-second default balances responsiveness for quick checks while allowing
+    /// compilation/analysis tools that may take tens of seconds
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u64>,
 }

@@ -74,9 +74,9 @@ pub async fn init_tracing() -> Result<WorkerGuard> {
         .with_file(true)
         .with_line_number(true);
 
-    // Tracing subscriber is a global singleton - try_init returns an error if already set
-    // rather than panicking. This allows callers (especially tests) to handle initialization
-    // races gracefully when multiple code paths attempt initialization.
+    // Global singleton with try_init (vs panic-on-reinit) chosen because multiple
+    // initialization attempts are expected in test scenarios where test isolation doesn't extend
+    // to global state. Production code always initializes once, making this a test-only concern.
     match tracing_subscriber::registry()
         .with(filter)
         .with(file_layer)

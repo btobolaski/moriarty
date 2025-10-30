@@ -13,6 +13,24 @@
 //! - **Environment variables are logged**: During development, understanding the complete
 //!   environment context helps debug hook execution issues. Sensitive patterns (TOKEN, SECRET,
 //!   KEY, PASSWORD, etc.) are automatically redacted.
+//!
+//! ## Security Model: Fail-Open Design
+//!
+//! The Stop hook handler implements a **fail-open** approach, returning `Allow` when:
+//! - `$CLAUDE_PROJECT_DIR` environment variable is not set
+//! - Project directory doesn't exist or cannot be canonicalized
+//! - `.config/tools.toml` cannot be loaded or parsed
+//! - No checks are defined in the configuration
+//!
+//! **Rationale**: This design prioritizes developer experience and avoids breaking workflows
+//! when projects don't use the checks feature. Since checks are opt-in security validations,
+//! their absence or misconfiguration should not block execution.
+//!
+//! **Trade-offs**: An attacker who can manipulate the environment or filesystem to cause
+//! config loading failures could bypass checks. However, this requires the same level of
+//! access needed to modify approved binaries directly, so it doesn't meaningfully weaken
+//! the security model. Once checks are configured and approved, the handler fails **closed**
+//! on all verification failures (unapproved checks, hash mismatches, check failures).
 
 pub mod parser;
 pub mod tracing;
@@ -45,9 +63,9 @@ async fn exec_hook() -> Result<()> {
 
 /// Internal implementation of exec_hook that accepts any Read source for testability
 async fn exec_hook_impl<R: Read>(reader: R) -> Result<()> {
-    // In tests, the global tracing subscriber may already be initialized by a prior test,
-    // causing init failures. This is safe because logging still works via the existing
-    // subscriber, and nextest's process isolation prevents cross-contamination.
+    // Global tracing subscriber initialization races are acceptable in tests because nextest's
+    // process isolation guarantees no cross-contamination, and failed initialization doesn't
+    // affect correctness.
     let _guard = match tracing::init_tracing().await {
         Ok(guard) => Some(guard),
         Err(_) if cfg!(test) => None,
@@ -92,7 +110,6 @@ async fn exec_hook_impl<R: Read>(reader: R) -> Result<()> {
     let hook_input = parser::parse_hook_input(&input).map_err(|e| {
         // Truncate and sanitize input for logging to prevent log injection and bloat
         let sanitized_input = if input.len() > LOG_TRUNCATE_SIZE {
-            // Find the byte index of the Nth character to avoid splitting multi-byte UTF-8
             let safe_truncate = input
                 .char_indices()
                 .nth(LOG_TRUNCATE_SIZE)
@@ -339,7 +356,9 @@ async fn handle_stop_hook() -> Result<HookOutput> {
         let canonical_dir = canonical_dir_clone.clone();
         async move {
             // Split command into executable and arguments
-            // Empty commands are validated at line 240, but we handle the edge case gracefully
+            // Defensive handling despite line 240 validation because async timing allows config
+            // modification between validation and execution, and graceful degradation is safer
+            // than panicking in production.
             let Some((cmd, args)) = check.command.split_first() else {
                 return (
                     check.name,

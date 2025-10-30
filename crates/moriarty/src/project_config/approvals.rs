@@ -19,6 +19,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+// Unix-specific permission checking. Windows code uses different APIs (see is_writable implementation).
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
@@ -222,8 +223,6 @@ impl ProjectApprovals {
             .into_diagnostic()
             .with_context(|| format!("Failed to parse {}", tools_config_path.display()))?;
 
-        // Get the appropriate approval map and command array based on item type.
-        //
         // ARCHITECTURAL NOTE: Commands and checks are handled asymmetrically BY DESIGN:
         //
         // Commands use a fixed struct with 4 predefined fields (lint, test, build, format) because
@@ -423,7 +422,9 @@ pub async fn is_writable(path: &Path) -> Result<bool> {
     let permissions = metadata.permissions();
     let mode = permissions.mode();
 
-    // Check if owner write bit is set (0o200)
+    // Check only owner write bit (0o200) for security: if the current user can modify the binary,
+    // an attacker with access to this user account can inject malicious code before execution,
+    // bypassing our hash-based approval system. Group/other write bits are irrelevant to this threat.
     Ok(mode & 0o200 != 0)
 }
 
