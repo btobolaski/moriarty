@@ -994,6 +994,7 @@ dependencies = [
  "hex",
  "miette",
  "ratatui",
+ "regex",
  "rmcp",
  "schemars",
  "serde",

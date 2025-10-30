@@ -92,6 +92,7 @@ pub struct HookDefinition {
 
 impl HookDefinition {
     /// Get the timeout value, defaulting to 60 seconds
+    #[cfg(test)]
     pub fn timeout_secs(&self) -> u64 {
         self.timeout.unwrap_or(60)
     }
@@ -184,6 +185,7 @@ pub struct HookOutput {
 }
 
 /// Determines how hook script output and errors are handled
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookExitCode {
     /// 0: stdout shown in transcript
@@ -194,6 +196,7 @@ pub enum HookExitCode {
     NonBlockingError(i32),
 }
 
+#[cfg(test)]
 impl HookExitCode {
     pub fn from_code(code: i32) -> Self {
         match code {
@@ -213,11 +216,13 @@ impl HookExitCode {
 }
 
 /// Parse hooks configuration from JSON string
+#[cfg(test)]
 pub fn parse_hooks_config(json: &str) -> Result<HooksConfig, serde_json::Error> {
     serde_json::from_str(json)
 }
 
 /// Serialize hooks configuration to JSON string
+#[cfg(test)]
 pub fn serialize_hooks_config(config: &HooksConfig) -> Result<String, serde_json::Error> {
     serde_json::to_string_pretty(config)
 }
@@ -228,6 +233,7 @@ pub fn parse_hook_input(json: &str) -> Result<HookInput, serde_json::Error> {
 }
 
 /// Parse hook output from JSON string (stdout from hook script)
+#[cfg(test)]
 pub fn parse_hook_output(json: &str) -> Result<HookOutput, serde_json::Error> {
     serde_json::from_str(json)
 }

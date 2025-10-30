@@ -83,6 +83,9 @@ async fn main() -> miette::Result<()> {
                 Err(e) => Err(e),
             }?;
         }
+        Command::Hooks { subcommand } => {
+            hooks::exec_hooks(subcommand).await?;
+        }
     }
 
     Ok(())
@@ -126,4 +129,15 @@ pub enum Command {
         /// The project directory containing .config/tools.toml
         project_dir: PathBuf,
     },
+    /// Execute and test hooks
+    Hooks {
+        #[command(subcommand)]
+        subcommand: HooksCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum HooksCommand {
+    /// Execute hook with input and log the results
+    Exec,
 }
