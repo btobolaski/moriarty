@@ -126,7 +126,7 @@ pub enum HookEventData {
     PostToolUse {
         tool_name: String,
         tool_input: serde_json::Value,
-        tool_output: serde_json::Value,
+        tool_response: serde_json::Value,
     },
     #[serde(rename = "UserPromptSubmit")]
     UserPromptSubmit { user_prompt: String },
@@ -630,7 +630,7 @@ mod tests {
             "hook_event_name": "PostToolUse",
             "tool_name": "Read",
             "tool_input": {"file_path": "test.txt"},
-            "tool_output": {"content": "file contents"}
+            "tool_response": {"content": "file contents"}
         }"#;
 
         let input = parse_hook_input(json).expect("Failed to parse");
@@ -638,11 +638,11 @@ mod tests {
             HookEventData::PostToolUse {
                 tool_name,
                 tool_input,
-                tool_output,
+                tool_response,
             } => {
                 assert_eq!(tool_name, "Read");
                 assert_eq!(tool_input["file_path"], "test.txt");
-                assert_eq!(tool_output["content"], "file contents");
+                assert_eq!(tool_response["content"], "file contents");
             }
             _ => panic!("Expected PostToolUse"),
         }
