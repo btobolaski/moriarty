@@ -157,7 +157,7 @@ fn allow_hook() -> HookOutput {
         continue_execution: None,
         stop_reason: None,
         suppress_output: None,
-        decision: Some(HookDecision::Allow),
+        decision: Some(HookDecision::Approve),
         reason: None,
     }
 }
@@ -168,7 +168,7 @@ fn deny_hook(reason: impl Into<String>) -> HookOutput {
         continue_execution: None,
         stop_reason: None,
         suppress_output: None,
-        decision: Some(HookDecision::Deny),
+        decision: Some(HookDecision::Block),
         reason: Some(reason.into()),
     }
 }
@@ -440,7 +440,7 @@ async fn handle_stop_hook() -> Result<HookOutput> {
                         continue_execution: None,
                         stop_reason: None,
                         suppress_output: None,
-                        decision: Some(HookDecision::Deny),
+                        decision: Some(HookDecision::Block),
                         reason: Some(format!(
                             "Total check output exceeded {} MB limit. Checks produced too much output.",
                             MAX_TOTAL_OUTPUT / (1024 * 1024)

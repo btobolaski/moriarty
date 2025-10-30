@@ -163,10 +163,8 @@ pub struct HookInput {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HookDecision {
-    Allow,
-    Deny,
+    Approve,
     Block,
-    Ask,
 }
 
 /// Advanced control via JSON output from hook scripts
