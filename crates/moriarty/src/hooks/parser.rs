@@ -403,7 +403,7 @@ mod tests {
             continue_execution: Some(true),
             stop_reason: Some("reason".to_string()),
             suppress_output: None,
-            decision: Some(HookDecision::Allow),
+            decision: Some(HookDecision::Approve),
             reason: Some("allowed".to_string()),
         };
 
@@ -531,10 +531,8 @@ mod tests {
     #[test]
     fn test_hook_decision_serialization() {
         let cases = vec![
-            (HookDecision::Allow, r#""allow""#),
-            (HookDecision::Deny, r#""deny""#),
+            (HookDecision::Approve, r#""approve""#),
             (HookDecision::Block, r#""block""#),
-            (HookDecision::Ask, r#""ask""#),
         ];
 
         for (decision, expected_json) in cases {
@@ -544,6 +542,23 @@ mod tests {
             let parsed: HookDecision = serde_json::from_str(&json).expect("Failed to deserialize");
             assert_eq!(parsed, decision);
         }
+    }
+
+    #[test]
+    fn test_hook_decision_rejects_old_enum_values() {
+        // Test that old variant names are no longer accepted
+        assert!(
+            serde_json::from_str::<HookDecision>(r#""allow""#).is_err(),
+            "HookDecision::Allow has been renamed to Approve"
+        );
+        assert!(
+            serde_json::from_str::<HookDecision>(r#""deny""#).is_err(),
+            "HookDecision::Deny has been renamed to Block"
+        );
+        assert!(
+            serde_json::from_str::<HookDecision>(r#""ask""#).is_err(),
+            "HookDecision::Ask variant has been removed"
+        );
     }
 
     #[test]
@@ -569,7 +584,7 @@ mod tests {
             continue_execution: Some(true),
             stop_reason: None,
             suppress_output: None,
-            decision: Some(HookDecision::Allow),
+            decision: Some(HookDecision::Approve),
             reason: None,
         };
 

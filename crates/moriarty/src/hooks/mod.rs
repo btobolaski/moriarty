@@ -612,6 +612,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_hook_output_rejects_old_decision_values() {
+        // Verify that hook output with old decision values fails to parse
+        let old_allow = r#"{"decision": "allow"}"#;
+        assert!(serde_json::from_str::<HookOutput>(old_allow).is_err());
+
+        let old_deny = r#"{"decision": "deny"}"#;
+        assert!(serde_json::from_str::<HookOutput>(old_deny).is_err());
+
+        let old_ask = r#"{"decision": "ask"}"#;
+        assert!(serde_json::from_str::<HookOutput>(old_ask).is_err());
+    }
+
     #[tokio::test]
     async fn test_stop_hook_no_env_var() {
         let _xdg_dir = setup_isolated_xdg_state();
@@ -621,7 +634,7 @@ mod tests {
 
         let result = handle_stop_hook().await.expect("Should succeed");
 
-        assert_eq!(result.decision, Some(HookDecision::Allow));
+        assert_eq!(result.decision, Some(HookDecision::Approve));
         assert_eq!(result.reason, None);
     }
 
@@ -635,7 +648,7 @@ mod tests {
 
         let result = handle_stop_hook().await.expect("Should succeed");
 
-        assert_eq!(result.decision, Some(HookDecision::Allow));
+        assert_eq!(result.decision, Some(HookDecision::Approve));
         assert_eq!(result.reason, None);
     }
 
@@ -660,7 +673,7 @@ lint = ["echo", "lint"]
 
         let result = handle_stop_hook().await.expect("Should succeed");
 
-        assert_eq!(result.decision, Some(HookDecision::Allow));
+        assert_eq!(result.decision, Some(HookDecision::Approve));
         assert_eq!(result.reason, None);
     }
 
@@ -688,7 +701,7 @@ lint = ["echo", "lint"]
         // TOML parse fails on incomplete table arrays (`[[checks]]` with no fields).
         // This tests fail-open behavior documented in the security model (lines 145-161).
         let result = handle_stop_hook().await.expect("Should succeed");
-        assert_eq!(result.decision, Some(HookDecision::Allow));
+        assert_eq!(result.decision, Some(HookDecision::Approve));
     }
 
     #[tokio::test]
@@ -716,7 +729,7 @@ command = []
 
         let result = handle_stop_hook().await.expect("Should succeed");
 
-        assert_eq!(result.decision, Some(HookDecision::Deny));
+        assert_eq!(result.decision, Some(HookDecision::Block));
         let reason = result.reason.unwrap();
         assert!(
             reason.contains("empty-command"),
@@ -760,7 +773,7 @@ command = ["echo", "test"]
         // Don't approve the project, so it should be denied
         let result = handle_stop_hook().await.expect("Should succeed");
 
-        assert_eq!(result.decision, Some(HookDecision::Deny));
+        assert_eq!(result.decision, Some(HookDecision::Block));
         assert!(result
             .reason
             .unwrap()
@@ -785,7 +798,7 @@ command = ["echo", "test"]
 
         let result = handle_stop_hook().await.expect("Should succeed");
 
-        assert_eq!(result.decision, Some(HookDecision::Allow));
+        assert_eq!(result.decision, Some(HookDecision::Approve));
         assert_eq!(result.reason, None);
     }
 
@@ -807,7 +820,7 @@ command = ["echo", "test"]
 
         let result = handle_stop_hook().await.expect("Should succeed");
 
-        assert_eq!(result.decision, Some(HookDecision::Deny));
+        assert_eq!(result.decision, Some(HookDecision::Block));
         let reason = result.reason.unwrap();
         assert!(reason.contains("Checks failed"), "Reason: {}", reason);
         assert!(
@@ -837,7 +850,7 @@ command = ["echo", "test"]
 
         let result = handle_stop_hook().await.expect("Should succeed");
 
-        assert_eq!(result.decision, Some(HookDecision::Allow));
+        assert_eq!(result.decision, Some(HookDecision::Approve));
         assert_eq!(result.reason, None);
     }
 
@@ -884,7 +897,7 @@ command = ["echo", "test"]
 
         let result = handle_stop_hook().await.expect("Should succeed");
 
-        assert_eq!(result.decision, Some(HookDecision::Deny));
+        assert_eq!(result.decision, Some(HookDecision::Block));
         let reason = result.reason.unwrap();
         assert!(
             reason.contains("binary changed"),
