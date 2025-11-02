@@ -232,6 +232,22 @@ pub enum LogMessageTaggedContent {
         input: HashMap<String, serde_json::Value>,
     },
     ToolResult(ToolResult),
+    Document {
+        source: DocumentSource,
+    },
+}
+
+/// Represents a document attached to a message (e.g., PDF, image, text file)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DocumentSource {
+    /// Type of data encoding (currently only "base64" is used by Claude Code)
+    pub r#type: String,
+    /// MIME type of the document (e.g., "application/pdf", "image/png", "text/plain")
+    pub media_type: String,
+    /// The document data as a string. When `type` is "base64", this contains base64-encoded
+    /// binary data. The parser accepts any string without validation.
+    pub data: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -492,5 +508,126 @@ mod tests {
         });
         let line: AssistantLogLine = serde_json::from_value(json).unwrap();
         assert_eq!(line.agent_id, None);
+    }
+
+    #[test]
+    fn test_parse_document_content() {
+        let json = serde_json::json!({
+            "type": "document",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+            }
+        });
+        let content: LogMessageTaggedContent = serde_json::from_value(json).unwrap();
+
+        match content {
+            LogMessageTaggedContent::Document { source } => {
+                assert_eq!(source.r#type, "base64");
+                assert_eq!(source.media_type, "image/png");
+                assert!(!source.data.is_empty());
+            }
+            _ => panic!("Expected Document variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_user_message_with_document() {
+        let json = serde_json::json!({
+            "parentUuid": null,
+            "isSidechain": false,
+            "userType": "test",
+            "cwd": "/test",
+            "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+            "version": "1.0",
+            "gitBranch": "main",
+            "message": {
+                "role": "user",
+                "content": [{
+                    "type": "document",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "application/pdf",
+                        "data": "JVBERi0xLjQK"
+                    }
+                }]
+            },
+            "uuid": "550e8400-e29b-41d4-a716-446655440001",
+            "timestamp": "2025-01-01T00:00:00Z"
+        });
+
+        let line: UserLogLine = serde_json::from_value(json).unwrap();
+
+        if let LogMessageContent::Vec(items) = &line.message.content {
+            assert_eq!(items.len(), 1);
+            if let LogMessageTaggedContent::Document { source } = &items[0] {
+                assert_eq!(source.r#type, "base64");
+                assert_eq!(source.media_type, "application/pdf");
+                assert_eq!(source.data, "JVBERi0xLjQK");
+            } else {
+                panic!("Expected Document variant");
+            }
+        } else {
+            panic!("Expected Vec content");
+        }
+    }
+
+    #[test]
+    fn test_parse_document_rejects_unknown_fields() {
+        let json = serde_json::json!({
+            "type": "document",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": "abc123",
+                "unknown_field": "should fail"
+            }
+        });
+
+        let result = serde_json::from_value::<LogMessageTaggedContent>(json);
+        assert!(
+            result.is_err(),
+            "Should reject unknown fields due to deny_unknown_fields"
+        );
+    }
+
+    #[test]
+    fn test_parse_document_with_empty_data() {
+        let json = serde_json::json!({
+            "type": "document",
+            "source": {
+                "type": "base64",
+                "media_type": "text/plain",
+                "data": ""
+            }
+        });
+
+        let content: LogMessageTaggedContent = serde_json::from_value(json).unwrap();
+        match content {
+            LogMessageTaggedContent::Document { source } => {
+                assert_eq!(source.data, "");
+            }
+            _ => panic!("Expected Document variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_document_variant_rejects_unknown_fields() {
+        let json = serde_json::json!({
+            "type": "document",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": "abc123"
+            },
+            "extra_field": "should be rejected"
+        });
+
+        let result = serde_json::from_value::<LogMessageTaggedContent>(json);
+        assert!(
+            result.is_err(),
+            "Should reject unknown fields at Document variant level"
+        );
     }
 }

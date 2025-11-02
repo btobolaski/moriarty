@@ -73,6 +73,16 @@ fn format_message_content(content: &LogMessageContent) -> String {
                         }
                         output.push('\n');
                     }
+                    LogMessageTaggedContent::Document { source } => {
+                        output.push_str("📄 Document:\n");
+                        output.push_str(&format!("   Type: {}\n", source.r#type));
+                        output.push_str(&format!("   Media Type: {}\n", source.media_type));
+                        output.push_str(&format!(
+                            "   Data Length: {} characters\n",
+                            source.data.len()
+                        ));
+                        output.push('\n');
+                    }
                 }
             }
             output
@@ -215,9 +225,10 @@ mod tests {
     use super::*;
     use crate::logs::parser::{
         AssistantCacheCreation, AssistantLogLine, AssistantLogMessage, AssistantUsage,
-        CompactBoundary, CompactMetadata, FileHistorySnapshot, FileHistorySnapshotSnapshot,
-        LocalCommandLog, LogMessage, LogMessageContent, LogMessageTaggedContent, Summary,
-        SystemLogError, SystemLogErrorError, SystemLogInformational, SystemLogLine, ToolResult,
+        CompactBoundary, CompactMetadata, DocumentSource, FileHistorySnapshot,
+        FileHistorySnapshotSnapshot, LocalCommandLog, LogMessage, LogMessageContent,
+        LogMessageTaggedContent, Summary, SystemLogError, SystemLogErrorError,
+        SystemLogInformational, SystemLogLine, ToolResult,
     };
     use chrono::Utc;
     use std::collections::HashMap;
@@ -556,5 +567,114 @@ mod tests {
         let content = LogMessageContent::Vec(vec![]);
         let result = format_message_content(&content);
         assert!(!result.is_empty() || result.is_empty()); // Just verify it doesn't panic
+    }
+
+    #[test]
+    fn test_format_user_document_content() {
+        let user = create_test_user(LogMessageContent::Vec(vec![
+            LogMessageTaggedContent::Document {
+                source: DocumentSource {
+                    r#type: "base64".to_string(),
+                    media_type: "image/png".to_string(),
+                    data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ".to_string(),
+                },
+            },
+        ]));
+
+        let result = format_user_message(&user);
+        assert!(!result.is_empty());
+        assert!(result.contains("📄 Document:"));
+        assert!(result.contains("Type: base64"));
+        assert!(result.contains("Media Type: image/png"));
+        assert!(result.contains("Data Length: 44 characters"));
+    }
+
+    #[test]
+    fn test_format_document_with_empty_data() {
+        let user = create_test_user(LogMessageContent::Vec(vec![
+            LogMessageTaggedContent::Document {
+                source: DocumentSource {
+                    r#type: "base64".to_string(),
+                    media_type: "text/plain".to_string(),
+                    data: String::new(),
+                },
+            },
+        ]));
+
+        let result = format_user_message(&user);
+        assert!(result.contains("Data Length: 0 characters"));
+    }
+
+    #[test]
+    fn test_format_message_with_mixed_content_including_document() {
+        let user = create_test_user(LogMessageContent::Vec(vec![
+            LogMessageTaggedContent::Text {
+                text: "Here is the document:".to_string(),
+            },
+            LogMessageTaggedContent::Document {
+                source: DocumentSource {
+                    r#type: "base64".to_string(),
+                    media_type: "application/pdf".to_string(),
+                    data: "JVBERi0xLjQK".to_string(),
+                },
+            },
+            LogMessageTaggedContent::Text {
+                text: "Please review it.".to_string(),
+            },
+        ]));
+
+        let result = format_user_message(&user);
+        assert!(result.contains("Here is the document:"));
+        assert!(result.contains("📄 Document:"));
+        assert!(result.contains("application/pdf"));
+        assert!(result.contains("Please review it."));
+    }
+
+    #[test]
+    fn test_format_document_special_media_types() {
+        let test_cases = vec![
+            ("image/jpeg", "photo.jpg"),
+            ("application/json", "{}"),
+            ("text/html", "<html></html>"),
+        ];
+
+        for (media_type, data) in test_cases {
+            let user = create_test_user(LogMessageContent::Vec(vec![
+                LogMessageTaggedContent::Document {
+                    source: DocumentSource {
+                        r#type: "base64".to_string(),
+                        media_type: media_type.to_string(),
+                        data: data.to_string(),
+                    },
+                },
+            ]));
+
+            let result = format_user_message(&user);
+            assert!(
+                result.contains(&format!("Media Type: {}", media_type)),
+                "Failed to format media_type: {}",
+                media_type
+            );
+        }
+    }
+
+    #[test]
+    fn test_format_log_line_user_with_document() {
+        let user = create_test_user(LogMessageContent::Vec(vec![
+            LogMessageTaggedContent::Document {
+                source: DocumentSource {
+                    r#type: "base64".to_string(),
+                    media_type: "image/png".to_string(),
+                    data: "abc123".to_string(),
+                },
+            },
+        ]));
+
+        let log_line = LogLine::User(user);
+        let result = format_log_line(&log_line);
+
+        assert!(!result.is_empty());
+        assert!(result.contains("📄 Document:"));
+        assert!(result.contains("Type: base64"));
     }
 }
