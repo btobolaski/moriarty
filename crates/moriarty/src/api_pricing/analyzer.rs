@@ -813,9 +813,7 @@ fn parse_lines_changed_content_by_session(
 /// Reads files asynchronously with concurrency limit to prevent file descriptor exhaustion.
 ///
 /// The limit of 10 concurrent operations balances throughput with system resource constraints.
-async fn read_files_parallel(
-    jsonl_files: Vec<PathBuf>,
-) -> (Vec<(PathBuf, String)>, usize) {
+async fn read_files_parallel(jsonl_files: Vec<PathBuf>) -> (Vec<(PathBuf, String)>, usize) {
     let file_stream = stream::iter(jsonl_files.into_iter());
     let read_futures = file_stream.map(|path| async move {
         let contents = tokio::fs::read_to_string(&path).await;

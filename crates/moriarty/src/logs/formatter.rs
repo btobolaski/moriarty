@@ -217,6 +217,15 @@ pub fn format_log_line(log_line: &LogLine) -> String {
         LogLine::System(system) => format_system_message(system),
         LogLine::Summary(summary) => format_summary(summary),
         LogLine::FileHistorySnapshot(snapshot) => format_file_history_snapshot(snapshot),
+        LogLine::QueueOperation(queue_op) => {
+            format!(
+                "📋 Queue Operation: {} ({})\n   Session: {}\n   Content: {}\n",
+                queue_op.operation,
+                format_timestamp(&queue_op.timestamp),
+                queue_op.session_id,
+                queue_op.content
+            )
+        }
     }
 }
 
@@ -676,5 +685,46 @@ mod tests {
         assert!(!result.is_empty());
         assert!(result.contains("📄 Document:"));
         assert!(result.contains("Type: base64"));
+    }
+
+    #[test]
+    fn test_format_queue_operation() {
+        use crate::logs::parser::QueueOperation;
+        use chrono::Utc;
+
+        let queue_op = QueueOperation {
+            operation: "enqueue".to_string(),
+            timestamp: Utc::now(),
+            content: "Test operation content".to_string(),
+            session_id: "75c1a8c9-5842-4fd4-a816-74109bf09cba".to_string(),
+        };
+        let log_line = LogLine::QueueOperation(queue_op.clone());
+        let result = format_log_line(&log_line);
+
+        assert!(!result.is_empty());
+        assert!(result.contains("Queue Operation"));
+        assert!(result.contains("enqueue"));
+        assert!(result.contains("75c1a8c9-5842-4fd4-a816-74109bf09cba"));
+        assert!(result.contains("Test operation content"));
+    }
+
+    #[test]
+    fn test_format_log_line_queue_operation() {
+        use crate::logs::parser::QueueOperation;
+        use chrono::Utc;
+
+        let queue_op = QueueOperation {
+            operation: "dequeue".to_string(),
+            timestamp: Utc::now(),
+            content: "Another test".to_string(),
+            session_id: "test-session-id".to_string(),
+        };
+        let log_line = LogLine::QueueOperation(queue_op);
+        let result = format_log_line(&log_line);
+
+        assert!(!result.is_empty());
+        assert!(result.contains("dequeue"));
+        assert!(result.contains("test-session-id"));
+        assert!(result.contains("Another test"));
     }
 }

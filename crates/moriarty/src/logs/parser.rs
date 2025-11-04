@@ -6,6 +6,16 @@ use serde::{Deserialize, Serialize};
 use tokio::fs::read_to_string;
 use uuid::Uuid;
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct QueueOperation {
+    pub operation: String,
+    pub timestamp: DateTime<Utc>,
+    pub content: String,
+    pub session_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum LogLine {
@@ -19,6 +29,8 @@ pub enum LogLine {
     Summary(Summary),
     #[serde(rename = "system")]
     System(SystemLogLine),
+    #[serde(rename = "queue-operation")]
+    QueueOperation(QueueOperation),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -632,5 +644,110 @@ mod tests {
             "Error should mention unknown field, got: {}",
             err_msg
         );
+    }
+
+    #[test]
+    fn test_parse_queue_operation() {
+        let json = serde_json::json!({
+            "type": "queue-operation",
+            "operation": "enqueue",
+            "timestamp": "2025-11-04T21:54:38.826Z",
+            "content": "Use the rustdoc agent, as you've been instructed to do in order to find the definition for AudioFrame.",
+            "sessionId": "75c1a8c9-5842-4fd4-a816-74109bf09cba"
+        });
+
+        let line: LogLine = serde_json::from_value(json)
+            .expect("Failed to parse valid queue-operation JSON");
+        match line {
+            LogLine::QueueOperation(op) => {
+                assert_eq!(op.operation, "enqueue");
+                assert_eq!(op.session_id, "75c1a8c9-5842-4fd4-a816-74109bf09cba");
+                assert_eq!(op.content, "Use the rustdoc agent, as you've been instructed to do in order to find the definition for AudioFrame.");
+                assert_eq!(op.timestamp.to_rfc3339(), "2025-11-04T21:54:38.826+00:00");
+            }
+            _ => panic!("Expected QueueOperation variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_queue_operation_rejects_unknown_fields() {
+        let json = serde_json::json!({
+            "type": "queue-operation",
+            "operation": "enqueue",
+            "timestamp": "2025-11-04T21:54:38.826Z",
+            "content": "Test",
+            "sessionId": "test-session",
+            "extraField": "should be rejected"
+        });
+
+        let result = serde_json::from_value::<LogLine>(json);
+        let err = result.expect_err("Should reject unknown fields due to deny_unknown_fields");
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("unknown field") || err_msg.contains("extraField"),
+            "Error should mention unknown field, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_parse_queue_operation_missing_field() {
+        let json = serde_json::json!({
+            "type": "queue-operation",
+            "operation": "enqueue",
+            "timestamp": "2025-11-04T21:54:38.826Z",
+            "content": "Test content"
+            // Missing sessionId
+        });
+
+        let result = serde_json::from_value::<LogLine>(json);
+        assert!(
+            result.is_err(),
+            "Should fail when required field is missing"
+        );
+    }
+
+    #[test]
+    fn test_parse_queue_operation_with_empty_fields() {
+        let json = serde_json::json!({
+            "type": "queue-operation",
+            "operation": "",
+            "timestamp": "2025-11-04T21:54:38.826Z",
+            "content": "",
+            "sessionId": ""
+        });
+
+        let line: LogLine = serde_json::from_value(json)
+            .expect("Should parse with empty strings");
+
+        if let LogLine::QueueOperation(op) = line {
+            assert_eq!(op.operation, "");
+            assert_eq!(op.content, "");
+            assert_eq!(op.session_id, "");
+        } else {
+            panic!("Expected QueueOperation variant");
+        }
+    }
+
+    #[test]
+    fn test_parse_queue_operation_dequeue() {
+        let json = serde_json::json!({
+            "type": "queue-operation",
+            "operation": "dequeue",
+            "timestamp": "2025-11-04T20:14:25.650Z",
+            "content": "Maybe you should fetch the page that is linked?",
+            "sessionId": "6282703f-30e7-4990-b1dd-3482afa261a5"
+        });
+
+        let line: LogLine = serde_json::from_value(json)
+            .expect("Failed to parse dequeue operation");
+
+        if let LogLine::QueueOperation(op) = line {
+            assert_eq!(op.operation, "dequeue");
+            assert_eq!(op.content, "Maybe you should fetch the page that is linked?");
+            assert_eq!(op.session_id, "6282703f-30e7-4990-b1dd-3482afa261a5");
+        } else {
+            panic!("Expected QueueOperation variant");
+        }
     }
 }
