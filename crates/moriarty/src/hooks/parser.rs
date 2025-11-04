@@ -165,6 +165,7 @@ pub struct HookInput {
 pub enum HookDecision {
     Approve,
     Block,
+    Ask,
 }
 
 /// Advanced control via JSON output from hook scripts
@@ -181,6 +182,9 @@ pub struct HookOutput {
     pub decision: Option<HookDecision>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Updated tool input (for Modify actions on PreToolUse)
+    #[serde(rename = "updatedInput", skip_serializing_if = "Option::is_none")]
+    pub updated_input: Option<serde_json::Value>,
 }
 
 /// Determines how hook script output and errors are handled
@@ -405,6 +409,7 @@ mod tests {
             suppress_output: None,
             decision: Some(HookDecision::Approve),
             reason: Some("allowed".to_string()),
+            updated_input: None,
         };
 
         let json = serde_json::to_string(&output).expect("Failed to serialize");
@@ -540,6 +545,7 @@ mod tests {
         let cases = vec![
             (HookDecision::Approve, r#""approve""#),
             (HookDecision::Block, r#""block""#),
+            (HookDecision::Ask, r#""ask""#),
         ];
 
         for (decision, expected_json) in cases {
@@ -561,10 +567,6 @@ mod tests {
         assert!(
             serde_json::from_str::<HookDecision>(r#""deny""#).is_err(),
             "HookDecision::Deny has been renamed to Block"
-        );
-        assert!(
-            serde_json::from_str::<HookDecision>(r#""ask""#).is_err(),
-            "HookDecision::Ask variant has been removed"
         );
     }
 
@@ -646,6 +648,7 @@ mod tests {
             suppress_output: None,
             decision: Some(HookDecision::Approve),
             reason: None,
+            updated_input: None,
         };
 
         let json = serde_json::to_string(&output).expect("Failed to serialize");

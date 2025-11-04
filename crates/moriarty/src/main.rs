@@ -12,6 +12,7 @@ mod mcp;
 mod persistence;
 mod project_config;
 mod tui;
+mod user_config;
 
 #[tokio::main]
 async fn main() -> miette::Result<()> {

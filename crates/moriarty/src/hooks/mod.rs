@@ -32,12 +32,14 @@
 //! the security model. Once checks are configured and approved, the handler fails **closed**
 //! on all verification failures (unapproved checks, hash mismatches, check failures).
 
+pub mod bash_rules;
 pub mod parser;
 pub mod tracing;
 
 use crate::project_config::{approvals::ProjectApprovals, config::load_project_settings};
+use crate::user_config::load_user_config;
 use crate::HooksCommand;
-use ::tracing::{error, info};
+use ::tracing::{debug, error, info, warn};
 use futures::stream::StreamExt;
 use miette::Result;
 use parser::{HookDecision, HookEventData, HookOutput};
@@ -135,6 +137,24 @@ async fn exec_hook_impl<R: Read>(reader: R) -> Result<()> {
 
     info!(?hook_input, "Successfully parsed hook input");
 
+    if let HookEventData::PreToolUse {
+        ref tool_name,
+        ref tool_input,
+    } = hook_input.event_data
+    {
+        if tool_name == "Bash" {
+            let hook_output = handle_bash_pretool_hook(tool_input).await?;
+
+            let json_output = serde_json::to_string(&hook_output)
+                .map_err(|e| miette::miette!("Failed to serialize HookOutput: {}", e))?;
+
+            println!("{}", json_output);
+
+            info!(?hook_output, "Bash PreToolUse hook completed");
+            return Ok(());
+        }
+    }
+
     // Handle Stop hook
     if matches!(hook_input.event_data, HookEventData::Stop) {
         let hook_output = handle_stop_hook().await?;
@@ -159,6 +179,7 @@ fn allow_hook() -> HookOutput {
         suppress_output: None,
         decision: Some(HookDecision::Approve),
         reason: None,
+        updated_input: None,
     }
 }
 
@@ -170,6 +191,98 @@ fn deny_hook(reason: impl Into<String>) -> HookOutput {
         suppress_output: None,
         decision: Some(HookDecision::Block),
         reason: Some(reason.into()),
+        updated_input: None,
+    }
+}
+
+fn ask_hook() -> HookOutput {
+    HookOutput {
+        continue_execution: None,
+        stop_reason: None,
+        suppress_output: None,
+        decision: Some(HookDecision::Ask),
+        reason: None,
+        updated_input: None,
+    }
+}
+
+/// Apply user-level bash_rules from ~/.config/moriarty/tool_rules.toml to validate Bash commands.
+///
+/// Uses fail-open design: returns Ask when rules are missing or unconfigured, ensuring bash_rules
+/// remain opt-in without breaking workflows.
+async fn handle_bash_pretool_hook(tool_input: &serde_json::Value) -> Result<HookOutput> {
+    use bash_rules::{BashRuleEngine, RuleResult};
+
+    let command = tool_input
+        .get("command")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| miette::miette!("Missing 'command' field in Bash tool_input"))?;
+
+    info!(command = %command, "Processing Bash PreToolUse hook");
+
+    let config = match load_user_config().await {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            warn!(error = %e, "Failed to load user config, defaulting to Ask");
+            return Ok(ask_hook());
+        }
+    };
+
+    let bash_rules = match config.bash_rules {
+        Some(rules) if !rules.is_empty() => rules,
+        _ => {
+            info!("No bash_rules configured, defaulting to Ask");
+            return Ok(ask_hook());
+        }
+    };
+
+    let engine = BashRuleEngine::from_config(bash_rules)?;
+    let result = engine.apply_rules(command);
+
+    match result {
+        RuleResult::Allowed { rule_name } => {
+            info!(
+                command = %command,
+                rule = %rule_name,
+                "Bash command allowed by rule"
+            );
+            Ok(allow_hook())
+        }
+        RuleResult::Denied { rule_name, reason } => {
+            info!(
+                command = %command,
+                rule = %rule_name,
+                reason = %reason,
+                "Bash command denied by rule"
+            );
+            Ok(deny_hook(reason))
+        }
+        RuleResult::Modified {
+            rule_name,
+            new_command,
+        } => {
+            info!(
+                original = %command,
+                modified = %new_command,
+                rule = %rule_name,
+                "Bash command modified by rule"
+            );
+            let mut updated_tool_input = tool_input.clone();
+            updated_tool_input["command"] = serde_json::Value::String(new_command);
+
+            Ok(HookOutput {
+                continue_execution: None,
+                stop_reason: None,
+                suppress_output: None,
+                decision: Some(HookDecision::Approve),
+                reason: Some(format!("Command modified by rule '{}'", rule_name)),
+                updated_input: Some(updated_tool_input),
+            })
+        }
+        RuleResult::NoMatch => {
+            debug!(command = %command, "No bash rules matched, prompting user");
+            Ok(ask_hook())
+        }
     }
 }
 
@@ -445,6 +558,7 @@ async fn handle_stop_hook() -> Result<HookOutput> {
                             "Total check output exceeded {} MB limit. Checks produced too much output.",
                             MAX_TOTAL_OUTPUT / (1024 * 1024)
                         )),
+                        updated_input: None,
                     });
                 }
 
@@ -510,6 +624,24 @@ mod tests {
     fn setup_isolated_xdg_state() -> TempDir {
         let temp_dir = tempfile::tempdir().unwrap();
         std::env::set_var("XDG_STATE_HOME", temp_dir.path());
+        temp_dir
+    }
+
+    fn setup_isolated_xdg_config() -> TempDir {
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+        temp_dir
+    }
+
+    async fn setup_user_bash_rules(rules_toml: &str) -> TempDir {
+        let temp_dir = setup_isolated_xdg_config();
+
+        let moriarty_dir = temp_dir.path().join("moriarty");
+        tokio::fs::create_dir_all(&moriarty_dir).await.unwrap();
+        tokio::fs::write(moriarty_dir.join("tool_rules.toml"), rules_toml)
+            .await
+            .unwrap();
+
         temp_dir
     }
 
@@ -595,7 +727,7 @@ mod tests {
         let _xdg_dir = setup_isolated_xdg_state();
 
         let test_cases = vec![
-            r#"{"session_id":"s","transcript_path":"/t","cwd":"/c","permission_mode":"default","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{}}"#,
+            r#"{"session_id":"s","transcript_path":"/t","cwd":"/c","permission_mode":"default","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"ls"}}"#,
             r#"{"session_id":"s","transcript_path":"/t","cwd":"/c","permission_mode":"default","hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{},"tool_response":""}"#,
             r#"{"session_id":"s","transcript_path":"/t","cwd":"/c","permission_mode":"default","hook_event_name":"SessionStart","matcher":"startup"}"#,
             r#"{"session_id":"s","transcript_path":"/t","cwd":"/c","permission_mode":"default","hook_event_name":"SessionEnd","reason":"logout"}"#,
@@ -632,15 +764,11 @@ mod tests {
             err_msg
         );
 
-        let old_ask = r#"{"decision": "ask"}"#;
-        let err = serde_json::from_str::<HookOutput>(old_ask)
-            .expect_err("Should reject old 'ask' decision value");
-        let err_msg = err.to_string();
-        assert!(
-            err_msg.contains("unknown variant") || err_msg.contains("ask"),
-            "Error should mention unknown variant, got: {}",
-            err_msg
-        );
+        // 'ask' is now a valid decision value
+        let ask_decision = r#"{"decision": "ask"}"#;
+        let output = serde_json::from_str::<HookOutput>(ask_decision)
+            .expect("Should accept 'ask' decision value");
+        assert_eq!(output.decision, Some(HookDecision::Ask));
     }
 
     #[tokio::test]
@@ -929,13 +1057,6 @@ command = ["echo", "test"]
         );
     }
 
-    /// Helper to set up isolated XDG_CONFIG_HOME
-    fn setup_isolated_xdg_config() -> TempDir {
-        let temp_dir = tempfile::tempdir().unwrap();
-        std::env::set_var("XDG_CONFIG_HOME", temp_dir.path());
-        temp_dir
-    }
-
     /// Helper to set up an approved project with checks
     ///
     /// Creates a project directory with `.config/tools.toml` containing the specified checks,
@@ -1001,5 +1122,176 @@ command = ["echo", "test"]
         approvals.save().await.expect("Failed to save approvals");
 
         temp_dir
+    }
+
+    #[tokio::test]
+    async fn test_bash_hook_no_user_config() {
+        let _xdg_config = setup_isolated_xdg_config();
+
+        let tool_input = serde_json::json!({"command": "ls -la"});
+        let result = handle_bash_pretool_hook(&tool_input)
+            .await
+            .expect("Should succeed");
+
+        assert_eq!(result.decision, Some(HookDecision::Ask));
+        assert_eq!(result.updated_input, None);
+    }
+
+    #[tokio::test]
+    async fn test_bash_hook_missing_command_field() {
+        let _xdg_config = setup_isolated_xdg_config();
+
+        let tool_input = serde_json::json!({});
+        let result = handle_bash_pretool_hook(&tool_input).await;
+
+        let err = result.expect_err("Should fail with missing command field");
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("Missing 'command' field"),
+            "Error should mention missing field, got: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bash_hook_no_config_file() {
+        let _xdg_config = setup_isolated_xdg_config();
+
+        let tool_input = serde_json::json!({"command": "ls -la"});
+        let result = handle_bash_pretool_hook(&tool_input)
+            .await
+            .expect("Should succeed");
+
+        assert_eq!(result.decision, Some(HookDecision::Ask));
+        assert_eq!(result.updated_input, None);
+    }
+
+    #[tokio::test]
+    async fn test_bash_hook_no_rules_configured() {
+        let _xdg_config = setup_user_bash_rules("# Empty config file\n").await;
+
+        let tool_input = serde_json::json!({"command": "ls -la"});
+        let result = handle_bash_pretool_hook(&tool_input)
+            .await
+            .expect("Should succeed");
+
+        assert_eq!(result.decision, Some(HookDecision::Ask));
+        assert_eq!(result.updated_input, None);
+    }
+
+    #[tokio::test]
+    async fn test_bash_hook_rule_denies() {
+        let config = r#"
+[[bash_rules]]
+name = "deny-rm-rf"
+pattern = "^rm\\s+-rf\\s+/"
+action = { type = "Deny", value = "Dangerous recursive delete" }
+"#;
+        let _xdg_config = setup_user_bash_rules(config).await;
+
+        let tool_input = serde_json::json!({"command": "rm -rf /"});
+        let result = handle_bash_pretool_hook(&tool_input)
+            .await
+            .expect("Should succeed");
+
+        assert_eq!(result.decision, Some(HookDecision::Block));
+        assert!(result
+            .reason
+            .unwrap()
+            .contains("Dangerous recursive delete"));
+        assert_eq!(result.updated_input, None);
+    }
+
+    #[tokio::test]
+    async fn test_bash_hook_rule_modifies() {
+        let config = r#"
+[[bash_rules]]
+name = "add-dry-run"
+pattern = "^(docker\\s+system\\s+prune)"
+action = { type = "Modify", value = "$1 --dry-run" }
+"#;
+        let _xdg_config = setup_user_bash_rules(config).await;
+
+        let tool_input = serde_json::json!({"command": "docker system prune"});
+        let result = handle_bash_pretool_hook(&tool_input)
+            .await
+            .expect("Should succeed");
+
+        assert_eq!(result.decision, Some(HookDecision::Approve));
+        assert!(result.reason.unwrap().contains("modified by rule"));
+        let updated = result.updated_input.expect("Should have updated input");
+        assert_eq!(
+            updated["command"],
+            serde_json::Value::String("docker system prune --dry-run".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bash_hook_rule_allows() {
+        let config = r#"
+[[bash_rules]]
+name = "allow-ls"
+pattern = "^ls($|\\s)"
+action = { type = "Allow" }
+"#;
+        let _xdg_config = setup_user_bash_rules(config).await;
+
+        let tool_input = serde_json::json!({"command": "ls -la"});
+        let result = handle_bash_pretool_hook(&tool_input)
+            .await
+            .expect("Should succeed");
+
+        assert_eq!(result.decision, Some(HookDecision::Approve));
+        assert_eq!(result.updated_input, None);
+    }
+
+    #[tokio::test]
+    async fn test_bash_hook_no_rules_match() {
+        let config = r#"
+[[bash_rules]]
+name = "deny-rm"
+pattern = "^rm\\s"
+action = { type = "Deny", value = "rm denied" }
+"#;
+        let _xdg_config = setup_user_bash_rules(config).await;
+
+        let tool_input = serde_json::json!({"command": "ls -la"});
+        let result = handle_bash_pretool_hook(&tool_input)
+            .await
+            .expect("Should succeed");
+
+        assert_eq!(result.decision, Some(HookDecision::Ask));
+        assert_eq!(result.updated_input, None);
+    }
+
+    #[tokio::test]
+    async fn test_bash_hook_first_match_wins_with_multiple_rules() {
+        let config = r#"
+[[bash_rules]]
+name = "specific-deny-rm-rf"
+pattern = "^rm\\s+-rf"
+action = { type = "Deny", value = "Dangerous rm -rf" }
+
+[[bash_rules]]
+name = "generic-allow-rm"
+pattern = "^rm"
+action = { type = "Allow" }
+"#;
+        let _xdg_config = setup_user_bash_rules(config).await;
+
+        let tool_input = serde_json::json!({"command": "rm -rf /"});
+        let result = handle_bash_pretool_hook(&tool_input)
+            .await
+            .expect("Should succeed");
+
+        assert_eq!(result.decision, Some(HookDecision::Block));
+        assert!(result.reason.as_ref().unwrap().contains("Dangerous rm -rf"));
+
+        let tool_input = serde_json::json!({"command": "rm file.txt"});
+        let result = handle_bash_pretool_hook(&tool_input)
+            .await
+            .expect("Should succeed");
+
+        assert_eq!(result.decision, Some(HookDecision::Approve));
     }
 }
