@@ -1,0 +1,33 @@
+rules:
+  - id: bad-assert
+    message: "asserting on result status"
+    languages:
+      - rust
+    severity: ERROR
+    patterns:
+      - pattern-either:
+        - pattern: assert!($EXPR.is_ok())
+        - pattern: assert!($EXPR.is_ok(), ...)
+        - pattern: assert!($EXPR.is_err())
+        - pattern: assert!($EXPR.is_err(), ...)
+        - pattern: assert_eq!($EXPR.is_ok(), ...)
+        - pattern: assert_eq!($EXPR.is_err(), ...)
+  - id: bad-assert-2
+    message: "asserting on var unwrap"
+    languages:
+      - rust
+    severity: ERROR
+    patterns:
+      - pattern-either:
+        - pattern: assert_eq!($EXPR.unwrap(), $OTHER);
+        - pattern: assert_eq!($OTHER, $EXPR.unwrap());
+        - pattern: assert!($EXPR.unwrap())
+        - pattern: assert_ne!($EXPR.unwrap(), $OTHER)
+        - pattern: assert_ne!($OTHER, $EXPR.unwrap())
+  - id: contains-todos
+    message: "the code is incomplete, contains todo!"
+    languages:
+      - rust
+    severity: ERROR
+    patterns:
+      - pattern: todo!(...)

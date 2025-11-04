@@ -8,3 +8,7 @@ format = ["cargo", "fmt"]
 [[checks]]
 name = "check"
 command = ["cargo", "check"]
+
+[[checks]]
+name = "semgrep"
+command = ["semgrep", "scan", "--config=./.config/semgrep_rules.yaml", "--strict"]
