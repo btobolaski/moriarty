@@ -307,8 +307,8 @@ mod tests {
             },
         ];
 
-        let engine = BashRuleEngine::from_config(rules)
-            .expect("Should succeed, skipping invalid rules");
+        let engine =
+            BashRuleEngine::from_config(rules).expect("Should succeed, skipping invalid rules");
 
         // The invalid rule should be skipped, but the valid rule should work
         let result = engine.apply_rules("ls -la");
