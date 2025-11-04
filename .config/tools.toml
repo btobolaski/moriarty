@@ -1,7 +1,7 @@
 
 [commands]
 lint = ["cargo", "clippy", "--all-targets", "--", "--deny", "warnings"]
-test = ["cargo", "nextest", "run", "--no-fail-fast"]
+test = ["cargo", "nextest", "run", "--no-fail-fast", "--hide-progress-bar", "--success-output", "never", "--status-level", "fail", "--final-status-level", "flaky"]
 build = ["cargo", "build"]
 format = ["cargo", "fmt"]
 
@@ -11,4 +11,12 @@ command = ["cargo", "check"]
 
 [[checks]]
 name = "semgrep"
-command = ["semgrep", "scan", "--config=./.config/semgrep_rules.yaml", "--strict"]
+command = ["semgrep", "scan", "--config=./.config/semgrep_rules.yaml", "--strict", "--error", "."]
+
+[[checks]]
+name = "clippy"
+command = ["cargo", "clippy"]
+
+[[checks]]
+name = "tests"
+command = ["cargo", "nextest", "run", "--no-fail-fast", "--hide-progress-bar", "--success-output", "never", "--status-level", "fail", "--final-status-level", "flaky"]

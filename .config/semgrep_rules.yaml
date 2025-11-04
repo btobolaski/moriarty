@@ -31,3 +31,20 @@ rules:
     severity: ERROR
     patterns:
       - pattern: todo!(...)
+  - id: uncaptured-expect-err
+    message: "expect_err() called without capturing error for validation - error value should be captured and validated to ensure correct error type"
+    languages:
+      - rust
+    severity: ERROR
+    patterns:
+      - pattern: $EXPR.expect_err(...)
+      - pattern-not-inside: let $_ = ...
+      - pattern-not-inside: let $_ = $EXPR.expect_err(...)
+      - pattern-not-inside: |
+          let $VAR = format!(..., $EXPR.expect_err(...), ...)
+      - pattern-not-inside: |
+          let $VAR = format!(..., $EXPR.expect_err(...))
+      - pattern-not-inside: |
+          format!(..., $EXPR.expect_err(...), ...)
+      - pattern-not-inside: |
+          format!(..., $EXPR.expect_err(...))
