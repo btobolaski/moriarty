@@ -326,21 +326,18 @@ pub struct AssistantCacheCreation {
 pub async fn read_file(file: impl AsRef<Path>) -> miette::Result<Vec<LogLine>> {
     let string_contents = read_to_string(file).await.into_diagnostic()?;
 
-    let mut log_lines = Vec::new();
+    // Parse lines sequentially (each file is processed in parallel via rayon at a higher level)
+    let log_lines: Result<Vec<LogLine>, _> = string_contents
+        .split('\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            serde_json::from_str::<LogLine>(line).inspect_err(|_| {
+                println!("{line}");
+            })
+        })
+        .collect();
 
-    for line in string_contents.split('\n') {
-        if !line.is_empty() {
-            let log_line: LogLine =
-                serde_json::from_str(line)
-                    .into_diagnostic()
-                    .inspect_err(|_| {
-                        println!("{line}");
-                    })?;
-            log_lines.push(log_line);
-        }
-    }
-
-    Ok(log_lines)
+    log_lines.into_diagnostic()
 }
 
 #[cfg(test)]

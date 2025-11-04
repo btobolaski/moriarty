@@ -1,4 +1,6 @@
 mod analyzer;
+#[cfg(test)]
+mod analyzer_tests;
 mod line_counter;
 mod pricing;
 
