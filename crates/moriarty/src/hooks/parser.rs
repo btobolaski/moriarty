@@ -460,8 +460,14 @@ mod tests {
         }
 
         // Test case sensitivity - "Startup" should fail
-        serde_json::from_str::<SessionStartMatcher>(r#""Startup""#)
+        let err = serde_json::from_str::<SessionStartMatcher>(r#""Startup""#)
             .expect_err("Should reject case-variant 'Startup' (expected 'startup')");
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("unknown variant") || err_msg.contains("Startup"),
+            "Error should mention unknown variant, got: {}",
+            err_msg
+        );
     }
 
     #[test]
@@ -565,25 +571,71 @@ mod tests {
     #[test]
     fn test_parse_errors() {
         // Invalid JSON
-        parse_hooks_config("not valid json {")
+        let err = parse_hooks_config("not valid json {")
             .expect_err("Should reject malformed JSON in hooks config");
-        parse_hook_input("not valid json {")
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("expected") || err_msg.contains("EOF") || err_msg.contains("invalid"),
+            "Error should mention parsing failure, got: {}",
+            err_msg
+        );
+
+        let err = parse_hook_input("not valid json {")
             .expect_err("Should reject malformed JSON in hook input");
-        parse_hook_output("not valid json {")
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("expected") || err_msg.contains("EOF") || err_msg.contains("invalid"),
+            "Error should mention parsing failure, got: {}",
+            err_msg
+        );
+
+        let err = parse_hook_output("not valid json {")
             .expect_err("Should reject malformed JSON in hook output");
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("expected") || err_msg.contains("EOF") || err_msg.contains("invalid"),
+            "Error should mention parsing failure, got: {}",
+            err_msg
+        );
 
         // Invalid enum values
-        serde_json::from_str::<HookDecision>(r#""invalid""#)
+        let err = serde_json::from_str::<HookDecision>(r#""invalid""#)
             .expect_err("Should reject invalid HookDecision value");
-        serde_json::from_str::<HookType>(r#""invalid""#)
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("unknown variant") || err_msg.contains("invalid"),
+            "Error should mention unknown variant, got: {}",
+            err_msg
+        );
+
+        let err = serde_json::from_str::<HookType>(r#""invalid""#)
             .expect_err("Should reject invalid HookType value");
-        serde_json::from_str::<PermissionMode>(r#""invalid""#)
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("unknown variant") || err_msg.contains("invalid"),
+            "Error should mention unknown variant, got: {}",
+            err_msg
+        );
+
+        let err = serde_json::from_str::<PermissionMode>(r#""invalid""#)
             .expect_err("Should reject invalid PermissionMode value");
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("unknown variant") || err_msg.contains("invalid"),
+            "Error should mention unknown variant, got: {}",
+            err_msg
+        );
 
         // Missing required fields
         let incomplete_input = r#"{"session_id": "abc"}"#;
-        parse_hook_input(incomplete_input)
+        let err = parse_hook_input(incomplete_input)
             .expect_err("Should reject hook input missing required 'event' field");
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("missing field") || err_msg.contains("event"),
+            "Error should mention missing field, got: {}",
+            err_msg
+        );
     }
 
     #[test]

@@ -104,7 +104,9 @@ mod tests {
         let err = result.expect_err("Should fail for nonexistent file");
         let err_msg = err.to_string();
         assert!(
-            err_msg.contains("Failed to canonicalize path") || err_msg.contains("No such file") || err_msg.contains("not found"),
+            err_msg.contains("Failed to canonicalize path")
+                || err_msg.contains("No such file")
+                || err_msg.contains("not found"),
             "Error should mention file access failure, got: {}",
             err_msg
         );

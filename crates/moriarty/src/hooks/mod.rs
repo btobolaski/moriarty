@@ -613,16 +613,34 @@ mod tests {
     fn test_hook_output_rejects_old_decision_values() {
         // Verify that hook output with old decision values fails to parse
         let old_allow = r#"{"decision": "allow"}"#;
-        serde_json::from_str::<HookOutput>(old_allow)
+        let err = serde_json::from_str::<HookOutput>(old_allow)
             .expect_err("Should reject old 'allow' decision value");
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("unknown variant") || err_msg.contains("allow"),
+            "Error should mention unknown variant, got: {}",
+            err_msg
+        );
 
         let old_deny = r#"{"decision": "deny"}"#;
-        serde_json::from_str::<HookOutput>(old_deny)
+        let err = serde_json::from_str::<HookOutput>(old_deny)
             .expect_err("Should reject old 'deny' decision value");
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("unknown variant") || err_msg.contains("deny"),
+            "Error should mention unknown variant, got: {}",
+            err_msg
+        );
 
         let old_ask = r#"{"decision": "ask"}"#;
-        serde_json::from_str::<HookOutput>(old_ask)
+        let err = serde_json::from_str::<HookOutput>(old_ask)
             .expect_err("Should reject old 'ask' decision value");
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("unknown variant") || err_msg.contains("ask"),
+            "Error should mention unknown variant, got: {}",
+            err_msg
+        );
     }
 
     #[tokio::test]
