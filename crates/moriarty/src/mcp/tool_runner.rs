@@ -436,8 +436,7 @@ lint = ["cargo", "clippy"]
 
         let result = load_project_settings(temp_dir.path().to_path_buf()).await;
 
-        assert!(result.is_err());
-        let error_msg = format!("{:?}", result.unwrap_err());
+        let error_msg = format!("{:?}", result.expect_err("Should fail with missing file"));
         assert!(error_msg.contains("failed to read project settings"));
     }
 
@@ -447,8 +446,7 @@ lint = ["cargo", "clippy"]
 
         let result = load_project_settings(temp_dir.path().to_path_buf()).await;
 
-        assert!(result.is_err());
-        let error_msg = format!("{:?}", result.unwrap_err());
+        let error_msg = format!("{:?}", result.expect_err("Should fail with malformed TOML"));
         assert!(error_msg.contains("failed to parse project settings"));
     }
 
@@ -931,10 +929,7 @@ test = ["{}"]
         };
 
         let result = ToolRunner::run_command(ProjectCommand::Test, args.clone()).await;
-        if let Err(ref e) = result {
-            panic!("Initial execution should succeed, but got error: {:?}", e);
-        }
-        assert!(result.is_ok());
+        result.expect("Initial execution should succeed");
 
         // Step 3: Modify tools.toml
         let config_content_v2 = format!(
@@ -970,7 +965,7 @@ build = ["echo", "build"]
 
         // Step 6: Execute command again - should succeed with new approval
         let result = ToolRunner::run_command(ProjectCommand::Test, args).await;
-        assert!(result.is_ok(), "Execution should succeed after re-approval");
+        result.expect("Execution should succeed after re-approval");
 
         // Keep xdg_dir alive
         drop(xdg_dir);
@@ -1021,10 +1016,7 @@ build = ["{}"]
             project_dir: temp_dir.path().to_path_buf(),
         };
         let result = ToolRunner::run_command(ProjectCommand::Build, args.clone()).await;
-        if let Err(ref e) = result {
-            panic!("Initial execution should succeed, but got error: {:?}", e);
-        }
-        assert!(result.is_ok());
+        result.expect("Initial execution should succeed");
 
         // Modify the binary
         let mut script = std::fs::File::create(&script_path).unwrap();
@@ -1053,7 +1045,7 @@ build = ["{}"]
 
         // Execute again - should succeed with new approval
         let result = ToolRunner::run_command(ProjectCommand::Build, args).await;
-        assert!(result.is_ok(), "Execution should succeed after re-approval");
+        result.expect("Execution should succeed after re-approval");
 
         // Keep xdg_dir alive
         drop(xdg_dir);

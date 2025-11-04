@@ -460,7 +460,8 @@ mod tests {
         }
 
         // Test case sensitivity - "Startup" should fail
-        assert!(serde_json::from_str::<SessionStartMatcher>(r#""Startup""#).is_err());
+        serde_json::from_str::<SessionStartMatcher>(r#""Startup""#)
+            .expect_err("Should reject case-variant 'Startup' (expected 'startup')");
     }
 
     #[test]
@@ -564,18 +565,25 @@ mod tests {
     #[test]
     fn test_parse_errors() {
         // Invalid JSON
-        assert!(parse_hooks_config("not valid json {").is_err());
-        assert!(parse_hook_input("not valid json {").is_err());
-        assert!(parse_hook_output("not valid json {").is_err());
+        parse_hooks_config("not valid json {")
+            .expect_err("Should reject malformed JSON in hooks config");
+        parse_hook_input("not valid json {")
+            .expect_err("Should reject malformed JSON in hook input");
+        parse_hook_output("not valid json {")
+            .expect_err("Should reject malformed JSON in hook output");
 
         // Invalid enum values
-        assert!(serde_json::from_str::<HookDecision>(r#""invalid""#).is_err());
-        assert!(serde_json::from_str::<HookType>(r#""invalid""#).is_err());
-        assert!(serde_json::from_str::<PermissionMode>(r#""invalid""#).is_err());
+        serde_json::from_str::<HookDecision>(r#""invalid""#)
+            .expect_err("Should reject invalid HookDecision value");
+        serde_json::from_str::<HookType>(r#""invalid""#)
+            .expect_err("Should reject invalid HookType value");
+        serde_json::from_str::<PermissionMode>(r#""invalid""#)
+            .expect_err("Should reject invalid PermissionMode value");
 
         // Missing required fields
         let incomplete_input = r#"{"session_id": "abc"}"#;
-        assert!(parse_hook_input(incomplete_input).is_err());
+        parse_hook_input(incomplete_input)
+            .expect_err("Should reject hook input missing required 'event' field");
     }
 
     #[test]

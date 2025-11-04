@@ -441,6 +441,63 @@ pub async fn read_script_contents(path: &Path) -> Result<String> {
         .with_context(|| format!("Failed to read script: {}", path.display()))
 }
 
+/// Test helper to pre-approve a project with the given config content.
+/// This bypasses the approval TUI for integration tests.
+/// Returns the canonical project path for use in assertions.
+#[cfg(test)]
+pub async fn approve_project_config(project_dir: &Path, config_content: &str) -> PathBuf {
+    let canonical_path = project_dir.canonicalize().unwrap();
+    let config: ProjectConfig = toml::from_str(config_content).unwrap();
+    let tools_config_hash = crate::hashing::hash_string(config_content);
+
+    // Process commands
+    let mut commands = HashMap::new();
+    for (name, cmd_array) in config.commands.all() {
+        let binary_name = &cmd_array[0];
+        let (original_path, resolved_path) =
+            resolve_binary_path_with_original(binary_name, &canonical_path).unwrap();
+        let binary_hash = crate::hashing::hash_file(&resolved_path).await.unwrap();
+
+        commands.insert(
+            name,
+            CommandApproval {
+                original_path: original_path.to_string_lossy().to_string(),
+                canonical_path: resolved_path.to_string_lossy().to_string(),
+                binary_hash,
+            },
+        );
+    }
+
+    // Process checks
+    let mut checks = HashMap::new();
+    if let Some(check_configs) = config.checks {
+        for check in check_configs {
+            let binary_name = &check.command[0];
+            let (original_path, resolved_path) =
+                resolve_binary_path_with_original(binary_name, &canonical_path).unwrap();
+            let binary_hash = crate::hashing::hash_file(&resolved_path).await.unwrap();
+
+            checks.insert(
+                check.name,
+                CommandApproval {
+                    original_path: original_path.to_string_lossy().to_string(),
+                    canonical_path: resolved_path.to_string_lossy().to_string(),
+                    binary_hash,
+                },
+            );
+        }
+    }
+
+    let canonical_path_clone = canonical_path.clone();
+    ProjectApprovals::update(move |approvals| {
+        approvals.approve_project(canonical_path_clone, tools_config_hash, commands, checks);
+    })
+    .await
+    .unwrap();
+
+    canonical_path
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1022,8 +1079,10 @@ command = ["echo", "test"]
             &project_dir,
         );
 
-        assert!(result.is_err());
-        let err_msg = format!("{:?}", result.unwrap_err());
+        let err_msg = format!(
+            "{:?}",
+            result.expect_err("Should fail with nonexistent binary")
+        );
         assert!(err_msg.contains("Failed to find binary") || err_msg.contains("not found"));
     }
 
@@ -1411,61 +1470,4 @@ binary_hash = "abc123"
         );
         assert_eq!(approval.tools_config_hash, "hash123");
     }
-}
-
-/// Test helper to pre-approve a project with the given config content.
-/// This bypasses the approval TUI for integration tests.
-/// Returns the canonical project path for use in assertions.
-#[cfg(test)]
-pub async fn approve_project_config(project_dir: &Path, config_content: &str) -> PathBuf {
-    let canonical_path = project_dir.canonicalize().unwrap();
-    let config: ProjectConfig = toml::from_str(config_content).unwrap();
-    let tools_config_hash = crate::hashing::hash_string(config_content);
-
-    // Process commands
-    let mut commands = HashMap::new();
-    for (name, cmd_array) in config.commands.all() {
-        let binary_name = &cmd_array[0];
-        let (original_path, resolved_path) =
-            resolve_binary_path_with_original(binary_name, &canonical_path).unwrap();
-        let binary_hash = crate::hashing::hash_file(&resolved_path).await.unwrap();
-
-        commands.insert(
-            name,
-            CommandApproval {
-                original_path: original_path.to_string_lossy().to_string(),
-                canonical_path: resolved_path.to_string_lossy().to_string(),
-                binary_hash,
-            },
-        );
-    }
-
-    // Process checks
-    let mut checks = HashMap::new();
-    if let Some(check_configs) = config.checks {
-        for check in check_configs {
-            let binary_name = &check.command[0];
-            let (original_path, resolved_path) =
-                resolve_binary_path_with_original(binary_name, &canonical_path).unwrap();
-            let binary_hash = crate::hashing::hash_file(&resolved_path).await.unwrap();
-
-            checks.insert(
-                check.name,
-                CommandApproval {
-                    original_path: original_path.to_string_lossy().to_string(),
-                    canonical_path: resolved_path.to_string_lossy().to_string(),
-                    binary_hash,
-                },
-            );
-        }
-    }
-
-    let canonical_path_clone = canonical_path.clone();
-    ProjectApprovals::update(move |approvals| {
-        approvals.approve_project(canonical_path_clone, tools_config_hash, commands, checks);
-    })
-    .await
-    .unwrap();
-
-    canonical_path
 }

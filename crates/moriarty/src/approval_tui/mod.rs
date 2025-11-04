@@ -484,8 +484,7 @@ lint = ["echo", "lint"]
 
         let result = ApprovalApp::new(temp_dir.path().to_path_buf()).await;
 
-        assert!(result.is_err(), "Empty config should return error");
-        let err = result.unwrap_err();
+        let err = result.expect_err("Empty config should return error");
         let err_msg = format!("{:?}", err);
         assert!(
             err_msg.contains("No commands or checks configured"),
@@ -500,7 +499,13 @@ lint = ["echo", "lint"]
 
         let result = ApprovalApp::new(temp_dir.path().to_path_buf()).await;
 
-        assert!(result.is_err(), "Missing config should return error");
+        let err = result.expect_err("Missing config should return error");
+        let err_msg = format!("{:?}", err);
+        assert!(
+            err_msg.contains("failed to read project settings") || err_msg.contains("No such file"),
+            "Error should mention missing file, got: {}",
+            err_msg
+        );
     }
 
     #[tokio::test]
@@ -560,9 +565,11 @@ lint = ["echo", "lint"]
 
         // Try to save with unapproved commands
         let result = app.save_approvals().await;
-        assert!(result.is_err(), "Should fail with unapproved commands");
 
-        let err_msg = format!("{:?}", result.unwrap_err());
+        let err_msg = format!(
+            "{:?}",
+            result.expect_err("Should fail with unapproved commands")
+        );
         assert!(
             err_msg.contains("not approved"),
             "Error should mention unapproved commands"
@@ -575,7 +582,7 @@ lint = ["echo", "lint"]
 
         // Now save should succeed
         let result = app.save_approvals().await;
-        assert!(result.is_ok(), "Should succeed with all commands approved");
+        result.expect("Should succeed with all commands approved");
 
         // Verify approvals were saved
         let approvals = ProjectApprovals::load().await.unwrap();
@@ -843,8 +850,10 @@ command = ["echo", "security"]
 
         // Should fail because checks not approved
         let result = app.save_approvals().await;
-        assert!(result.is_err(), "Should fail when checks not approved");
-        let err_msg = format!("{:?}", result.unwrap_err());
+        let err_msg = format!(
+            "{:?}",
+            result.expect_err("Should fail when checks not approved")
+        );
         assert!(
             err_msg.contains("security"),
             "Error should mention unapproved check"

@@ -521,8 +521,7 @@ mod tests {
         let cursor = Cursor::new(input);
         let result = exec_hook_impl(cursor).await;
 
-        assert!(result.is_err());
-        let err = result.unwrap_err();
+        let err = result.expect_err("Should fail with empty input");
         assert!(err.to_string().contains("No input received"));
     }
 
@@ -534,8 +533,7 @@ mod tests {
         let cursor = Cursor::new(input);
         let result = exec_hook_impl(cursor).await;
 
-        assert!(result.is_err());
-        let err = result.unwrap_err();
+        let err = result.expect_err("Should fail with malformed JSON");
         assert!(err.to_string().contains("Failed to parse hook input"));
     }
 
@@ -588,8 +586,7 @@ mod tests {
         let result = exec_hook_impl(cursor).await;
 
         // Should return error without panicking
-        assert!(result.is_err());
-        let err = result.unwrap_err();
+        let err = result.expect_err("Should fail with large invalid JSON");
         assert!(err.to_string().contains("Failed to parse hook input"));
     }
 
@@ -616,13 +613,16 @@ mod tests {
     fn test_hook_output_rejects_old_decision_values() {
         // Verify that hook output with old decision values fails to parse
         let old_allow = r#"{"decision": "allow"}"#;
-        assert!(serde_json::from_str::<HookOutput>(old_allow).is_err());
+        serde_json::from_str::<HookOutput>(old_allow)
+            .expect_err("Should reject old 'allow' decision value");
 
         let old_deny = r#"{"decision": "deny"}"#;
-        assert!(serde_json::from_str::<HookOutput>(old_deny).is_err());
+        serde_json::from_str::<HookOutput>(old_deny)
+            .expect_err("Should reject old 'deny' decision value");
 
         let old_ask = r#"{"decision": "ask"}"#;
-        assert!(serde_json::from_str::<HookOutput>(old_ask).is_err());
+        serde_json::from_str::<HookOutput>(old_ask)
+            .expect_err("Should reject old 'ask' decision value");
     }
 
     #[tokio::test]

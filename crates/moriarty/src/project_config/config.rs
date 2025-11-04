@@ -251,8 +251,7 @@ lint = ["cargo", "clippy"]
 
         let result = load_project_settings(temp_dir.path().to_path_buf()).await;
 
-        assert!(result.is_err(), "Should fail when file doesn't exist");
-        let err = result.unwrap_err();
+        let err = result.expect_err("Should fail when file doesn't exist");
         let err_msg = format!("{:?}", err);
         assert!(
             err_msg.contains("failed to read project settings") || err_msg.contains("No such file"),
@@ -271,8 +270,7 @@ lint = ["cargo", "clippy"]
 
         let result = load_project_settings(temp_dir.path().to_path_buf()).await;
 
-        assert!(result.is_err(), "Should fail with invalid TOML");
-        let err = result.unwrap_err();
+        let err = result.expect_err("Should fail with invalid TOML");
         let err_msg = format!("{:?}", err);
         assert!(
             err_msg.contains("failed to parse project settings") || err_msg.contains("TOML"),
@@ -503,8 +501,7 @@ command = ["cargo", "audit"]
         );
 
         let result = load_project_settings(temp_dir.path().to_path_buf()).await;
-        assert!(result.is_err(), "Should fail when check is missing name");
-        let err = result.unwrap_err();
+        let err = result.expect_err("Should fail when check is missing name");
         let err_msg = format!("{:?}", err);
         assert!(
             err_msg.contains("failed to parse project settings")
@@ -526,8 +523,7 @@ name = "security-audit"
         );
 
         let result = load_project_settings(temp_dir.path().to_path_buf()).await;
-        assert!(result.is_err(), "Should fail when check is missing command");
-        let err = result.unwrap_err();
+        let err = result.expect_err("Should fail when check is missing command");
         let err_msg = format!("{:?}", err);
         assert!(
             err_msg.contains("failed to parse project settings")
@@ -550,8 +546,7 @@ command = "not an array"
         );
 
         let result = load_project_settings(temp_dir.path().to_path_buf()).await;
-        assert!(result.is_err(), "Should fail with invalid checks TOML");
-        let err = result.unwrap_err();
+        let err = result.expect_err("Should fail with invalid checks TOML");
         let err_msg = format!("{:?}", err);
         assert!(
             err_msg.contains("failed to parse project settings")
@@ -582,7 +577,7 @@ command = "not an array"
         assert!(check_m < check_z, "mmm should be less than zzz");
 
         // Test with a vector to ensure sorting works correctly
-        let mut checks = vec![check_z.clone(), check_a.clone(), check_m.clone()];
+        let mut checks = [check_z.clone(), check_a.clone(), check_m.clone()];
         checks.sort();
 
         assert_eq!(checks[0].name, "aaa-first");

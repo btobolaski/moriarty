@@ -586,9 +586,12 @@ mod tests {
         });
 
         let result = serde_json::from_value::<LogMessageTaggedContent>(json);
+        let err = result.expect_err("Should reject unknown fields due to deny_unknown_fields");
+        let err_msg = err.to_string();
         assert!(
-            result.is_err(),
-            "Should reject unknown fields due to deny_unknown_fields"
+            err_msg.contains("unknown field") || err_msg.contains("unknown_field"),
+            "Error should mention unknown field, got: {}",
+            err_msg
         );
     }
 
@@ -625,9 +628,12 @@ mod tests {
         });
 
         let result = serde_json::from_value::<LogMessageTaggedContent>(json);
+        let err = result.expect_err("Should reject unknown fields at Document variant level");
+        let err_msg = err.to_string();
         assert!(
-            result.is_err(),
-            "Should reject unknown fields at Document variant level"
+            err_msg.contains("unknown field") || err_msg.contains("extra_field"),
+            "Error should mention unknown field, got: {}",
+            err_msg
         );
     }
 }

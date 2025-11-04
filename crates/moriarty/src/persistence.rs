@@ -336,8 +336,7 @@ mod tests {
 
         let result: miette::Result<TestConfig> = FileType::Config.load("nonexistent.toml").await;
 
-        assert!(result.is_err());
-        let err = result.unwrap_err();
+        let err = result.expect_err("Should fail with nonexistent file");
         assert!(err.to_string().contains("failed to read from file"));
     }
 
@@ -350,8 +349,7 @@ mod tests {
 
         let result: miette::Result<TestConfig> = FileType::Config.load("bad.toml").await;
 
-        assert!(result.is_err());
-        let err = result.unwrap_err();
+        let err = result.expect_err("Should fail with malformed TOML");
         assert!(err.to_string().contains("failed to parse file contents"));
     }
 
