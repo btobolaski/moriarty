@@ -514,8 +514,13 @@ async fn test_bash_hook_no_user_config() {
         .await
         .expect("Should succeed");
 
-    assert_eq!(result.decision, Some(HookDecision::Ask));
-    assert_eq!(result.updated_input, None);
+    match result.hook_specific_output {
+        Some(HookSpecificOutput::PreToolUse(output)) => {
+            assert_eq!(output.permission_decision, Some(PermissionDecision::Ask));
+            assert_eq!(output.updated_input, None);
+        }
+        _ => panic!("Expected PreToolUse hook specific output"),
+    }
 }
 
 #[tokio::test]
@@ -543,8 +548,13 @@ async fn test_bash_hook_no_config_file() {
         .await
         .expect("Should succeed");
 
-    assert_eq!(result.decision, Some(HookDecision::Ask));
-    assert_eq!(result.updated_input, None);
+    match result.hook_specific_output {
+        Some(HookSpecificOutput::PreToolUse(output)) => {
+            assert_eq!(output.permission_decision, Some(PermissionDecision::Ask));
+            assert_eq!(output.updated_input, None);
+        }
+        _ => panic!("Expected PreToolUse hook specific output"),
+    }
 }
 
 #[tokio::test]
@@ -556,8 +566,13 @@ async fn test_bash_hook_no_rules_configured() {
         .await
         .expect("Should succeed");
 
-    assert_eq!(result.decision, Some(HookDecision::Ask));
-    assert_eq!(result.updated_input, None);
+    match result.hook_specific_output {
+        Some(HookSpecificOutput::PreToolUse(output)) => {
+            assert_eq!(output.permission_decision, Some(PermissionDecision::Ask));
+            assert_eq!(output.updated_input, None);
+        }
+        _ => panic!("Expected PreToolUse hook specific output"),
+    }
 }
 
 #[tokio::test]
@@ -575,12 +590,17 @@ action = { type = "Deny", value = "Dangerous recursive delete" }
         .await
         .expect("Should succeed");
 
-    assert_eq!(result.decision, Some(HookDecision::Block));
-    assert!(result
-        .reason
-        .unwrap()
-        .contains("Dangerous recursive delete"));
-    assert_eq!(result.updated_input, None);
+    match result.hook_specific_output {
+        Some(HookSpecificOutput::PreToolUse(output)) => {
+            assert_eq!(output.permission_decision, Some(PermissionDecision::Deny));
+            assert!(output
+                .permission_decision_reason
+                .unwrap()
+                .contains("Dangerous recursive delete"));
+            assert_eq!(output.updated_input, None);
+        }
+        _ => panic!("Expected PreToolUse hook specific output"),
+    }
 }
 
 #[tokio::test]
@@ -598,13 +618,21 @@ action = { type = "Modify", value = "$1 --dry-run" }
         .await
         .expect("Should succeed");
 
-    assert_eq!(result.decision, Some(HookDecision::Approve));
-    assert!(result.reason.unwrap().contains("modified by rule"));
-    let updated = result.updated_input.expect("Should have updated input");
-    assert_eq!(
-        updated["command"],
-        serde_json::Value::String("docker system prune --dry-run".to_string())
-    );
+    match result.hook_specific_output {
+        Some(HookSpecificOutput::PreToolUse(output)) => {
+            assert_eq!(output.permission_decision, Some(PermissionDecision::Allow));
+            assert!(output
+                .permission_decision_reason
+                .unwrap()
+                .contains("modified by rule"));
+            let updated = output.updated_input.expect("Should have updated input");
+            assert_eq!(
+                updated["command"],
+                serde_json::Value::String("docker system prune --dry-run".to_string())
+            );
+        }
+        _ => panic!("Expected PreToolUse hook specific output"),
+    }
 }
 
 #[tokio::test]
@@ -622,8 +650,13 @@ action = { type = "Allow" }
         .await
         .expect("Should succeed");
 
-    assert_eq!(result.decision, Some(HookDecision::Approve));
-    assert_eq!(result.updated_input, None);
+    match result.hook_specific_output {
+        Some(HookSpecificOutput::PreToolUse(output)) => {
+            assert_eq!(output.permission_decision, Some(PermissionDecision::Allow));
+            assert_eq!(output.updated_input, None);
+        }
+        _ => panic!("Expected PreToolUse hook specific output"),
+    }
 }
 
 #[tokio::test]
@@ -641,8 +674,13 @@ action = { type = "Deny", value = "rm denied" }
         .await
         .expect("Should succeed");
 
-    assert_eq!(result.decision, Some(HookDecision::Ask));
-    assert_eq!(result.updated_input, None);
+    match result.hook_specific_output {
+        Some(HookSpecificOutput::PreToolUse(output)) => {
+            assert_eq!(output.permission_decision, Some(PermissionDecision::Ask));
+            assert_eq!(output.updated_input, None);
+        }
+        _ => panic!("Expected PreToolUse hook specific output"),
+    }
 }
 
 #[tokio::test]
@@ -665,13 +703,27 @@ action = { type = "Allow" }
         .await
         .expect("Should succeed");
 
-    assert_eq!(result.decision, Some(HookDecision::Block));
-    assert!(result.reason.as_ref().unwrap().contains("Dangerous rm -rf"));
+    match result.hook_specific_output {
+        Some(HookSpecificOutput::PreToolUse(output)) => {
+            assert_eq!(output.permission_decision, Some(PermissionDecision::Deny));
+            assert!(output
+                .permission_decision_reason
+                .as_ref()
+                .unwrap()
+                .contains("Dangerous rm -rf"));
+        }
+        _ => panic!("Expected PreToolUse hook specific output"),
+    }
 
     let tool_input = serde_json::json!({"command": "rm file.txt"});
     let result = handle_bash_pretool_hook(&tool_input)
         .await
         .expect("Should succeed");
 
-    assert_eq!(result.decision, Some(HookDecision::Approve));
+    match result.hook_specific_output {
+        Some(HookSpecificOutput::PreToolUse(output)) => {
+            assert_eq!(output.permission_decision, Some(PermissionDecision::Allow));
+        }
+        _ => panic!("Expected PreToolUse hook specific output"),
+    }
 }

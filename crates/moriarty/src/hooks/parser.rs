@@ -168,13 +168,54 @@ pub enum HookDecision {
     Ask,
 }
 
+/// Permission decision for tool execution
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PermissionDecision {
+    Allow,
+    Deny,
+    Ask,
+}
+
+/// Hook-specific output for PreToolUse hooks
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreToolUseOutput {
+    pub hook_event_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permission_decision: Option<PermissionDecision>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permission_decision_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_input: Option<serde_json::Value>,
+}
+
+/// Hook-specific output for UserPromptSubmit hooks
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserPromptSubmitOutput {
+    pub hook_event_name: String,
+    pub additional_context: String,
+}
+
+/// Hook-specific output that varies by hook type
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum HookSpecificOutput {
+    // Order matters for untagged enums: UserPromptSubmit has required fields,
+    // so it should be checked first to avoid PreToolUse matching everything
+    UserPromptSubmit(UserPromptSubmitOutput),
+    PreToolUse(PreToolUseOutput),
+}
+
 /// Advanced control via JSON output from hook scripts
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HookOutput {
     #[serde(rename = "continue", skip_serializing_if = "Option::is_none")]
     pub continue_execution: Option<bool>,
     /// Required if continue_execution is false
-    #[serde(rename = "stopReason", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suppress_output: Option<bool>,
@@ -182,9 +223,12 @@ pub struct HookOutput {
     pub decision: Option<HookDecision>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
-    /// Updated tool input (for Modify actions on PreToolUse)
-    #[serde(rename = "updatedInput", skip_serializing_if = "Option::is_none")]
-    pub updated_input: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permission_decision: Option<PermissionDecision>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hook_specific_output: Option<HookSpecificOutput>,
 }
 
 /// Determines how hook script output and errors are handled
@@ -409,7 +453,9 @@ mod tests {
             suppress_output: None,
             decision: Some(HookDecision::Approve),
             reason: Some("allowed".to_string()),
-            updated_input: None,
+            system_message: None,
+            permission_decision: None,
+            hook_specific_output: None,
         };
 
         let json = serde_json::to_string(&output).expect("Failed to serialize");
@@ -648,14 +694,16 @@ mod tests {
             suppress_output: None,
             decision: Some(HookDecision::Approve),
             reason: None,
-            updated_input: None,
+            system_message: None,
+            permission_decision: None,
+            hook_specific_output: None,
         };
 
         let json = serde_json::to_string(&output).expect("Failed to serialize");
         assert!(json.contains(r#""continue""#));
         assert!(json.contains(r#""decision""#));
         assert!(!json.contains(r#""stopReason""#));
-        assert!(!json.contains(r#""suppress_output""#));
+        assert!(!json.contains(r#""suppressOutput""#));
         assert!(!json.contains(r#""reason""#));
     }
 
@@ -839,6 +887,249 @@ mod tests {
                 assert_eq!(matcher, PreCompactMatcher::Manual);
             }
             _ => panic!("Expected PreCompact"),
+        }
+    }
+
+    #[test]
+    fn test_permission_decision_serialization() {
+        let cases = vec![
+            (PermissionDecision::Allow, r#""allow""#),
+            (PermissionDecision::Deny, r#""deny""#),
+            (PermissionDecision::Ask, r#""ask""#),
+        ];
+
+        for (decision, expected_json) in cases {
+            let json = serde_json::to_string(&decision).expect("Failed to serialize");
+            assert_eq!(
+                json, expected_json,
+                "Serialization mismatch for {:?}",
+                decision
+            );
+
+            let parsed: PermissionDecision =
+                serde_json::from_str(&json).expect("Failed to deserialize");
+            assert_eq!(parsed, decision, "Round-trip failed for {:?}", decision);
+        }
+    }
+
+    #[test]
+    fn test_pretool_use_output_serialization() {
+        // Test "ask" decision
+        let ask_output = PreToolUseOutput {
+            hook_event_name: "PreToolUse".to_string(),
+            permission_decision: Some(PermissionDecision::Ask),
+            permission_decision_reason: None,
+            updated_input: None,
+        };
+        let json = serde_json::to_string(&ask_output).expect("Failed to serialize");
+        assert!(json.contains(r#""hookEventName":"PreToolUse""#));
+        assert!(json.contains(r#""permissionDecision":"ask""#));
+        assert!(!json.contains(r#""permissionDecisionReason""#));
+        assert!(!json.contains(r#""updatedInput""#));
+
+        // Test "allow" decision
+        let allow_output = PreToolUseOutput {
+            hook_event_name: "PreToolUse".to_string(),
+            permission_decision: Some(PermissionDecision::Allow),
+            permission_decision_reason: None,
+            updated_input: None,
+        };
+        let json = serde_json::to_string(&allow_output).expect("Failed to serialize");
+        assert!(json.contains(r#""permissionDecision":"allow""#));
+
+        // Test "deny" decision with reason
+        let deny_output = PreToolUseOutput {
+            hook_event_name: "PreToolUse".to_string(),
+            permission_decision: Some(PermissionDecision::Deny),
+            permission_decision_reason: Some("Dangerous command".to_string()),
+            updated_input: None,
+        };
+        let json = serde_json::to_string(&deny_output).expect("Failed to serialize");
+        assert!(json.contains(r#""permissionDecision":"deny""#));
+        assert!(json.contains(r#""permissionDecisionReason":"Dangerous command""#));
+
+        // Test with modified input
+        let modified_output = PreToolUseOutput {
+            hook_event_name: "PreToolUse".to_string(),
+            permission_decision: Some(PermissionDecision::Allow),
+            permission_decision_reason: Some("Modified".to_string()),
+            updated_input: Some(serde_json::json!({"command": "ls -la"})),
+        };
+        let json = serde_json::to_string(&modified_output).expect("Failed to serialize");
+        assert!(json.contains(r#""updatedInput":{"command":"ls -la"}"#));
+    }
+
+    #[test]
+    fn test_pretool_use_output_edge_cases() {
+        // Test Ask with reason
+        let ask_with_reason = PreToolUseOutput {
+            hook_event_name: "PreToolUse".to_string(),
+            permission_decision: Some(PermissionDecision::Ask),
+            permission_decision_reason: Some("Command not in whitelist".to_string()),
+            updated_input: None,
+        };
+        let json = serde_json::to_string(&ask_with_reason).expect("Failed to serialize");
+        assert!(json.contains(r#""permissionDecision":"ask""#));
+        assert!(json.contains(r#""permissionDecisionReason":"Command not in whitelist""#));
+
+        // Test Deny with updated_input (semantically odd but should serialize)
+        let deny_with_input = PreToolUseOutput {
+            hook_event_name: "PreToolUse".to_string(),
+            permission_decision: Some(PermissionDecision::Deny),
+            permission_decision_reason: Some("Blocked".to_string()),
+            updated_input: Some(serde_json::json!({"command": "ls"})),
+        };
+        let json = serde_json::to_string(&deny_with_input).expect("Failed to serialize");
+        assert!(json.contains(r#""permissionDecision":"deny""#));
+        assert!(json.contains(r#""updatedInput""#));
+
+        // Test with complex updated_input
+        let complex_input = serde_json::json!({
+            "command": "docker run",
+            "env": {
+                "KEY1": "value1",
+                "KEY2": "value2"
+            },
+            "volumes": ["/host:/container", "/data:/data"]
+        });
+        let complex_output = PreToolUseOutput {
+            hook_event_name: "PreToolUse".to_string(),
+            permission_decision: Some(PermissionDecision::Allow),
+            permission_decision_reason: Some("Modified".to_string()),
+            updated_input: Some(complex_input.clone()),
+        };
+        let json = serde_json::to_string(&complex_output).expect("Failed to serialize");
+        let parsed: PreToolUseOutput = serde_json::from_str(&json).expect("Failed to deserialize");
+        assert_eq!(parsed.updated_input, Some(complex_input));
+    }
+
+    #[test]
+    fn test_pretool_use_output_roundtrip() {
+        // Test round-trip for Deny with reason
+        let json = r#"{
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": "Dangerous command"
+        }"#;
+
+        let output: PreToolUseOutput = serde_json::from_str(json).expect("Failed to parse");
+        assert_eq!(output.hook_event_name, "PreToolUse");
+        assert_eq!(output.permission_decision, Some(PermissionDecision::Deny));
+        assert_eq!(
+            output.permission_decision_reason,
+            Some("Dangerous command".to_string())
+        );
+
+        let reserialized = serde_json::to_string(&output).expect("Failed to serialize");
+        let reparsed: PreToolUseOutput =
+            serde_json::from_str(&reserialized).expect("Failed to parse");
+        assert_eq!(reparsed.permission_decision, output.permission_decision);
+        assert_eq!(
+            reparsed.permission_decision_reason,
+            output.permission_decision_reason
+        );
+
+        // Test round-trip for Allow with modified input
+        let json_with_input = r#"{
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "permissionDecisionReason": "Modified command",
+            "updatedInput": {"command": "ls -la"}
+        }"#;
+
+        let output: PreToolUseOutput =
+            serde_json::from_str(json_with_input).expect("Failed to parse");
+        assert_eq!(output.permission_decision, Some(PermissionDecision::Allow));
+        assert_eq!(output.updated_input.as_ref().unwrap()["command"], "ls -la");
+
+        let reserialized = serde_json::to_string(&output).expect("Failed to serialize");
+        let reparsed: PreToolUseOutput =
+            serde_json::from_str(&reserialized).expect("Failed to parse");
+        assert_eq!(reparsed.updated_input, output.updated_input);
+    }
+
+    #[test]
+    fn test_user_prompt_submit_output_serialization() {
+        let output = UserPromptSubmitOutput {
+            hook_event_name: "UserPromptSubmit".to_string(),
+            additional_context: "Project uses TypeScript 5.0".to_string(),
+        };
+
+        let json = serde_json::to_string(&output).expect("Failed to serialize");
+        assert!(json.contains(r#""hookEventName":"UserPromptSubmit""#));
+        assert!(json.contains(r#""additionalContext":"Project uses TypeScript 5.0""#));
+
+        // Test deserialization
+        let parsed: UserPromptSubmitOutput = serde_json::from_str(&json).expect("Failed to parse");
+        assert_eq!(parsed.hook_event_name, output.hook_event_name);
+        assert_eq!(parsed.additional_context, output.additional_context);
+    }
+
+    #[test]
+    fn test_hook_output_with_user_prompt_submit_output() {
+        let output = HookOutput {
+            continue_execution: None,
+            stop_reason: None,
+            suppress_output: None,
+            decision: None,
+            reason: None,
+            system_message: None,
+            permission_decision: None,
+            hook_specific_output: Some(HookSpecificOutput::UserPromptSubmit(
+                UserPromptSubmitOutput {
+                    hook_event_name: "UserPromptSubmit".to_string(),
+                    additional_context: "Test context".to_string(),
+                },
+            )),
+        };
+
+        let json = serde_json::to_string(&output).expect("Failed to serialize");
+        assert!(json.contains(r#""hookSpecificOutput""#));
+        assert!(json.contains(r#""additionalContext":"Test context""#));
+
+        // Verify round-trip
+        let parsed: HookOutput = serde_json::from_str(&json).expect("Failed to parse");
+        match parsed.hook_specific_output {
+            Some(HookSpecificOutput::UserPromptSubmit(ref submit_output)) => {
+                assert_eq!(submit_output.additional_context, "Test context");
+            }
+            _ => panic!("Expected UserPromptSubmit hook specific output"),
+        }
+    }
+
+    #[test]
+    fn test_hook_output_with_hook_specific_output_serialization() {
+        let output = HookOutput {
+            continue_execution: None,
+            stop_reason: None,
+            suppress_output: None,
+            decision: None,
+            reason: None,
+            system_message: None,
+            permission_decision: None,
+            hook_specific_output: Some(HookSpecificOutput::PreToolUse(PreToolUseOutput {
+                hook_event_name: "PreToolUse".to_string(),
+                permission_decision: Some(PermissionDecision::Ask),
+                permission_decision_reason: None,
+                updated_input: None,
+            })),
+        };
+
+        let json = serde_json::to_string(&output).expect("Failed to serialize");
+        assert!(json.contains(r#""hookSpecificOutput""#));
+        assert!(json.contains(r#""hookEventName":"PreToolUse""#));
+        assert!(json.contains(r#""permissionDecision":"ask""#));
+
+        // Verify round-trip
+        let parsed: HookOutput = serde_json::from_str(&json).expect("Failed to parse");
+        match parsed.hook_specific_output {
+            Some(HookSpecificOutput::PreToolUse(ref pretool_output)) => {
+                assert_eq!(
+                    pretool_output.permission_decision,
+                    Some(PermissionDecision::Ask)
+                );
+            }
+            _ => panic!("Expected PreToolUse hook specific output"),
         }
     }
 

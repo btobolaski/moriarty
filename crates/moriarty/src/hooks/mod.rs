@@ -42,7 +42,10 @@ use crate::HooksCommand;
 use ::tracing::{debug, error, info, warn};
 use futures::stream::StreamExt;
 use miette::Result;
-use parser::{HookDecision, HookEventData, HookOutput};
+use parser::{
+    HookDecision, HookEventData, HookOutput, HookSpecificOutput, PermissionDecision,
+    PreToolUseOutput,
+};
 use std::io::Read;
 use std::path::PathBuf;
 
@@ -179,7 +182,9 @@ fn allow_hook() -> HookOutput {
         suppress_output: None,
         decision: Some(HookDecision::Approve),
         reason: None,
-        updated_input: None,
+        system_message: None,
+        permission_decision: None,
+        hook_specific_output: None,
     }
 }
 
@@ -191,18 +196,85 @@ fn deny_hook(reason: impl Into<String>) -> HookOutput {
         suppress_output: None,
         decision: Some(HookDecision::Block),
         reason: Some(reason.into()),
-        updated_input: None,
+        system_message: None,
+        permission_decision: None,
+        hook_specific_output: None,
     }
 }
 
-fn ask_hook() -> HookOutput {
+/// Helper to create a PreToolUse HookOutput that allows execution
+fn pretool_allow_hook(reason: Option<String>) -> HookOutput {
     HookOutput {
         continue_execution: None,
         stop_reason: None,
         suppress_output: None,
-        decision: Some(HookDecision::Ask),
+        decision: None,
         reason: None,
-        updated_input: None,
+        system_message: None,
+        permission_decision: None,
+        hook_specific_output: Some(HookSpecificOutput::PreToolUse(PreToolUseOutput {
+            hook_event_name: "PreToolUse".to_string(),
+            permission_decision: Some(PermissionDecision::Allow),
+            permission_decision_reason: reason,
+            updated_input: None,
+        })),
+    }
+}
+
+/// Helper to create a PreToolUse HookOutput that denies execution
+fn pretool_deny_hook(reason: String) -> HookOutput {
+    HookOutput {
+        continue_execution: None,
+        stop_reason: None,
+        suppress_output: None,
+        decision: None,
+        reason: None,
+        system_message: None,
+        permission_decision: None,
+        hook_specific_output: Some(HookSpecificOutput::PreToolUse(PreToolUseOutput {
+            hook_event_name: "PreToolUse".to_string(),
+            permission_decision: Some(PermissionDecision::Deny),
+            permission_decision_reason: Some(reason),
+            updated_input: None,
+        })),
+    }
+}
+
+/// Helper to create a PreToolUse HookOutput that asks the user
+fn pretool_ask_hook() -> HookOutput {
+    HookOutput {
+        continue_execution: None,
+        stop_reason: None,
+        suppress_output: None,
+        decision: None,
+        reason: None,
+        system_message: None,
+        permission_decision: None,
+        hook_specific_output: Some(HookSpecificOutput::PreToolUse(PreToolUseOutput {
+            hook_event_name: "PreToolUse".to_string(),
+            permission_decision: Some(PermissionDecision::Ask),
+            permission_decision_reason: None,
+            updated_input: None,
+        })),
+    }
+}
+
+/// Helper to create a PreToolUse HookOutput that modifies the command
+fn pretool_modify_hook(new_input: serde_json::Value, reason: Option<String>) -> HookOutput {
+    HookOutput {
+        continue_execution: None,
+        stop_reason: None,
+        suppress_output: None,
+        decision: None,
+        reason: None,
+        system_message: None,
+        permission_decision: None,
+        hook_specific_output: Some(HookSpecificOutput::PreToolUse(PreToolUseOutput {
+            hook_event_name: "PreToolUse".to_string(),
+            permission_decision: Some(PermissionDecision::Allow),
+            permission_decision_reason: reason,
+            updated_input: Some(new_input),
+        })),
     }
 }
 
@@ -224,7 +296,7 @@ async fn handle_bash_pretool_hook(tool_input: &serde_json::Value) -> Result<Hook
         Ok(cfg) => cfg,
         Err(e) => {
             warn!(error = %e, "Failed to load user config, defaulting to Ask");
-            return Ok(ask_hook());
+            return Ok(pretool_ask_hook());
         }
     };
 
@@ -232,7 +304,7 @@ async fn handle_bash_pretool_hook(tool_input: &serde_json::Value) -> Result<Hook
         Some(rules) if !rules.is_empty() => rules,
         _ => {
             info!("No bash_rules configured, defaulting to Ask");
-            return Ok(ask_hook());
+            return Ok(pretool_ask_hook());
         }
     };
 
@@ -246,7 +318,7 @@ async fn handle_bash_pretool_hook(tool_input: &serde_json::Value) -> Result<Hook
                 rule = %rule_name,
                 "Bash command allowed by rule"
             );
-            Ok(allow_hook())
+            Ok(pretool_allow_hook(None))
         }
         RuleResult::Denied { rule_name, reason } => {
             info!(
@@ -255,7 +327,7 @@ async fn handle_bash_pretool_hook(tool_input: &serde_json::Value) -> Result<Hook
                 reason = %reason,
                 "Bash command denied by rule"
             );
-            Ok(deny_hook(reason))
+            Ok(pretool_deny_hook(reason))
         }
         RuleResult::Modified {
             rule_name,
@@ -270,18 +342,14 @@ async fn handle_bash_pretool_hook(tool_input: &serde_json::Value) -> Result<Hook
             let mut updated_tool_input = tool_input.clone();
             updated_tool_input["command"] = serde_json::Value::String(new_command);
 
-            Ok(HookOutput {
-                continue_execution: None,
-                stop_reason: None,
-                suppress_output: None,
-                decision: Some(HookDecision::Approve),
-                reason: Some(format!("Command modified by rule '{}'", rule_name)),
-                updated_input: Some(updated_tool_input),
-            })
+            Ok(pretool_modify_hook(
+                updated_tool_input,
+                Some(format!("Command modified by rule '{}'", rule_name)),
+            ))
         }
         RuleResult::NoMatch => {
             debug!(command = %command, "No bash rules matched, prompting user");
-            Ok(ask_hook())
+            Ok(pretool_ask_hook())
         }
     }
 }
@@ -558,7 +626,9 @@ async fn handle_stop_hook() -> Result<HookOutput> {
                             "Total check output exceeded {} MB limit. Checks produced too much output.",
                             MAX_TOTAL_OUTPUT / (1024 * 1024)
                         )),
-                        updated_input: None,
+                        system_message: None,
+                        permission_decision: None,
+                        hook_specific_output: None,
                     });
                 }
 

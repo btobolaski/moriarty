@@ -604,9 +604,13 @@ command = ["./scripts/custom-check.sh"]
     assert_eq!(check.name, "custom-check");
 
     // Verify paths were resolved relative to project directory
+    // Canonicalize temp_dir to handle symlinks (e.g., /var -> /private/var on macOS)
+    let canonical_temp_dir = temp_dir.path().canonicalize().unwrap();
     assert!(
-        check.canonical_path.starts_with(temp_dir.path()),
-        "Canonical path should be within project directory"
+        check.canonical_path.starts_with(&canonical_temp_dir),
+        "Canonical path should be within project directory. Expected prefix: {:?}, Got: {:?}",
+        canonical_temp_dir,
+        check.canonical_path
     );
     assert!(
         check.canonical_path.ends_with("scripts/custom-check.sh"),
