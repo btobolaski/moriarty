@@ -17,6 +17,7 @@ use crate::logs::parser::{LogLine, LogMessageContent, LogMessageTaggedContent};
 use super::{
     line_counter,
     pricing::{ModelType, TokenCosts, TokenCounts},
+    time_filter::TimeRangeFilter,
 };
 
 /// Timezone to use when extracting dates from timestamps
@@ -398,6 +399,7 @@ fn deduplicate_by_request_id<T>(
 pub async fn parse_log_file(
     file: &Path,
     timezone: DateTimezone,
+    filter: &TimeRangeFilter,
 ) -> miette::Result<Vec<DateBasedMessage>> {
     let log_lines = parser::read_file(file).await?;
 
@@ -406,6 +408,11 @@ pub async fn parse_log_file(
 
     for line in log_lines {
         if let LogLine::Assistant(assistant_line) = line {
+            // Skip if timestamp is outside filter range
+            if !filter.contains(&assistant_line.timestamp) {
+                continue;
+            }
+
             if is_synthetic_model(&assistant_line.message.model) {
                 continue;
             }
@@ -454,7 +461,10 @@ pub async fn parse_log_file(
 /// NOTE: This async function is only used in tests. Production code uses the synchronous
 /// `parse_log_content_by_session` function with rayon for file-level parallelism.
 #[cfg(test)]
-pub async fn parse_log_file_by_session(file: &Path) -> miette::Result<Vec<SessionBasedMessage>> {
+pub async fn parse_log_file_by_session(
+    file: &Path,
+    filter: &TimeRangeFilter,
+) -> miette::Result<Vec<SessionBasedMessage>> {
     let log_lines = parser::read_file(file).await?;
 
     // Temporary structure to hold all messages with their requestId
@@ -462,6 +472,11 @@ pub async fn parse_log_file_by_session(file: &Path) -> miette::Result<Vec<Sessio
 
     for line in log_lines {
         if let LogLine::Assistant(assistant_line) = line {
+            // Skip if timestamp is outside filter range
+            if !filter.contains(&assistant_line.timestamp) {
+                continue;
+            }
+
             if is_synthetic_model(&assistant_line.message.model) {
                 continue;
             }
@@ -511,12 +526,18 @@ pub async fn parse_log_file_by_session(file: &Path) -> miette::Result<Vec<Sessio
 pub async fn parse_lines_changed(
     file: &Path,
     timezone: DateTimezone,
+    filter: &TimeRangeFilter,
 ) -> miette::Result<Vec<(NaiveDate, usize)>> {
     let log_lines = parser::read_file(file).await?;
     let mut results = Vec::new();
 
     for line in log_lines {
         if let LogLine::Assistant(assistant_line) = line {
+            // Skip if timestamp is outside filter range
+            if !filter.contains(&assistant_line.timestamp) {
+                continue;
+            }
+
             if is_synthetic_model(&assistant_line.message.model) {
                 continue;
             }
@@ -616,6 +637,7 @@ pub fn aggregate_by_session(
 fn parse_log_content(
     contents: &str,
     timezone: DateTimezone,
+    filter: &TimeRangeFilter,
 ) -> miette::Result<Vec<DateBasedMessage>> {
     // Parse lines sequentially from the string contents
     let log_lines: Vec<LogLine> = contents
@@ -630,6 +652,11 @@ fn parse_log_content(
 
     for line in log_lines {
         if let LogLine::Assistant(assistant_line) = line {
+            // Skip if timestamp is outside filter range
+            if !filter.contains(&assistant_line.timestamp) {
+                continue;
+            }
+
             if is_synthetic_model(&assistant_line.message.model) {
                 continue;
             }
@@ -673,6 +700,7 @@ fn parse_log_content(
 fn parse_lines_changed_content(
     contents: &str,
     timezone: DateTimezone,
+    filter: &TimeRangeFilter,
 ) -> miette::Result<Vec<(NaiveDate, usize)>> {
     // Parse lines sequentially from the string contents
     let log_lines: Vec<LogLine> = contents
@@ -686,6 +714,11 @@ fn parse_lines_changed_content(
 
     for line in log_lines {
         if let LogLine::Assistant(assistant_line) = line {
+            // Skip if timestamp is outside filter range
+            if !filter.contains(&assistant_line.timestamp) {
+                continue;
+            }
+
             if is_synthetic_model(&assistant_line.message.model) {
                 continue;
             }
@@ -714,7 +747,10 @@ fn parse_lines_changed_content(
 ///
 /// Synchronous version of parse_log_file_by_session that works with pre-loaded file contents.
 /// Used for parallel file processing with rayon.
-fn parse_log_content_by_session(contents: &str) -> miette::Result<Vec<SessionBasedMessage>> {
+fn parse_log_content_by_session(
+    contents: &str,
+    filter: &TimeRangeFilter,
+) -> miette::Result<Vec<SessionBasedMessage>> {
     // Parse lines sequentially from the string contents
     let log_lines: Vec<LogLine> = contents
         .split('\n')
@@ -728,6 +764,11 @@ fn parse_log_content_by_session(contents: &str) -> miette::Result<Vec<SessionBas
 
     for line in log_lines {
         if let LogLine::Assistant(assistant_line) = line {
+            // Skip if timestamp is outside filter range
+            if !filter.contains(&assistant_line.timestamp) {
+                continue;
+            }
+
             if is_synthetic_model(&assistant_line.message.model) {
                 continue;
             }
@@ -772,6 +813,7 @@ fn parse_log_content_by_session(contents: &str) -> miette::Result<Vec<SessionBas
 /// Used for parallel file processing with rayon.
 fn parse_lines_changed_content_by_session(
     contents: &str,
+    filter: &TimeRangeFilter,
 ) -> miette::Result<Vec<(String, DateTime<Utc>, usize)>> {
     // Parse lines sequentially from the string contents
     let log_lines: Vec<LogLine> = contents
@@ -785,6 +827,11 @@ fn parse_lines_changed_content_by_session(
 
     for line in log_lines {
         if let LogLine::Assistant(assistant_line) = line {
+            // Skip if timestamp is outside filter range
+            if !filter.contains(&assistant_line.timestamp) {
+                continue;
+            }
+
             if is_synthetic_model(&assistant_line.message.model) {
                 continue;
             }
@@ -894,6 +941,7 @@ where
 pub async fn analyze_directory(
     dir: &Path,
     timezone: DateTimezone,
+    filter: &TimeRangeFilter,
 ) -> miette::Result<AnalysisResult> {
     let jsonl_files = find_jsonl_files(dir).await?;
 
@@ -910,8 +958,8 @@ pub async fn analyze_directory(
     // Step 2: Parse files in parallel using rayon
     let (all_usages, all_lines_changed, files_parsed, parse_failed) = parse_files_parallel(
         file_contents,
-        |contents| parse_log_content(contents, timezone),
-        |contents| parse_lines_changed_content(contents, timezone),
+        |contents| parse_log_content(contents, timezone, filter),
+        |contents| parse_lines_changed_content(contents, timezone, filter),
     );
 
     files_failed += parse_failed;
@@ -941,7 +989,10 @@ pub async fn analyze_directory(
 }
 
 /// Analyze all log files in a directory and return session costs
-pub async fn analyze_directory_by_session(dir: &Path) -> miette::Result<SessionAnalysisResult> {
+pub async fn analyze_directory_by_session(
+    dir: &Path,
+    filter: &TimeRangeFilter,
+) -> miette::Result<SessionAnalysisResult> {
     let jsonl_files = find_jsonl_files(dir).await?;
 
     if jsonl_files.is_empty() {
@@ -957,8 +1008,8 @@ pub async fn analyze_directory_by_session(dir: &Path) -> miette::Result<SessionA
     // Step 2: Parse files in parallel using rayon
     let (all_usages, all_lines_changed, files_parsed, parse_failed) = parse_files_parallel(
         file_contents,
-        parse_log_content_by_session,
-        parse_lines_changed_content_by_session,
+        |contents| parse_log_content_by_session(contents, filter),
+        |contents| parse_lines_changed_content_by_session(contents, filter),
     );
 
     files_failed += parse_failed;

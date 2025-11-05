@@ -1,7 +1,18 @@
 use super::analyzer::*;
 use super::pricing::{ModelType, TokenCosts, TokenCounts};
+use super::time_filter::TimeRangeFilter;
 use chrono::NaiveDate;
 use std::collections::HashSet;
+
+/// Helper function to create an empty time range filter for tests
+fn empty_filter() -> TimeRangeFilter {
+    TimeRangeFilter::new(None, None).expect("Empty filter should always be valid")
+}
+
+/// Helper function to create a time range filter from date strings
+fn date_filter(start: Option<&str>, end: Option<&str>) -> TimeRangeFilter {
+    TimeRangeFilter::new(start.map(|s| s.to_string()), end.map(|s| s.to_string())).unwrap()
+}
 
 #[test]
 fn test_daily_usage_new() {
@@ -462,7 +473,9 @@ async fn test_parse_log_file_empty_file() {
     let file_path = temp_dir.path().join("empty.jsonl");
     tokio::fs::write(&file_path, "").await.unwrap();
 
-    let result = parse_log_file(&file_path, DateTimezone::Utc).await.unwrap();
+    let result = parse_log_file(&file_path, DateTimezone::Utc, &empty_filter())
+        .await
+        .unwrap();
     assert!(result.is_empty());
 }
 
@@ -474,7 +487,9 @@ async fn test_parse_log_file_extracts_usage_correctly() {
     let log_content = r#"{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"00000000-0000-0000-0000-000000000000","version":"1.0.0","gitBranch":"main","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4-20250514","container":null,"content":"test","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1000,"cache_creation_input_tokens":100,"cache_read_input_tokens":50,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":500,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000001","timestamp":"2025-10-23T12:00:00Z","isApiErrorMessage":null}"#;
     tokio::fs::write(&file_path, log_content).await.unwrap();
 
-    let result = parse_log_file(&file_path, DateTimezone::Utc).await.unwrap();
+    let result = parse_log_file(&file_path, DateTimezone::Utc, &empty_filter())
+        .await
+        .unwrap();
 
     assert_eq!(result.len(), 1);
     let msg = &result[0];
@@ -497,7 +512,9 @@ async fn test_parse_log_file_handles_multiple_assistant_messages() {
 {"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"00000000-0000-0000-0000-000000000000","version":"1.0.0","gitBranch":"main","message":{"id":"msg_2","type":"message","role":"assistant","model":"claude-haiku-3","container":null,"content":"test","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":2000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":1000,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000002","timestamp":"2025-10-24T12:00:00Z","isApiErrorMessage":null}"#;
     tokio::fs::write(&file_path, log_content).await.unwrap();
 
-    let result = parse_log_file(&file_path, DateTimezone::Utc).await.unwrap();
+    let result = parse_log_file(&file_path, DateTimezone::Utc, &empty_filter())
+        .await
+        .unwrap();
 
     assert_eq!(result.len(), 2);
 
@@ -517,7 +534,9 @@ async fn test_parse_log_file_ignores_non_assistant_messages() {
 {"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"00000000-0000-0000-0000-000000000000","version":"1.0.0","gitBranch":"main","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":"test","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":500,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000002","timestamp":"2025-10-23T12:00:00Z","isApiErrorMessage":null}"#;
     tokio::fs::write(&file_path, log_content).await.unwrap();
 
-    let result = parse_log_file(&file_path, DateTimezone::Utc).await.unwrap();
+    let result = parse_log_file(&file_path, DateTimezone::Utc, &empty_filter())
+        .await
+        .unwrap();
 
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].model_type, ModelType::Sonnet);
@@ -526,7 +545,7 @@ async fn test_parse_log_file_ignores_non_assistant_messages() {
 #[tokio::test]
 async fn test_analyze_directory_empty() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let result = analyze_directory(temp_dir.path(), DateTimezone::Utc)
+    let result = analyze_directory(temp_dir.path(), DateTimezone::Utc, &empty_filter())
         .await
         .unwrap();
 
@@ -542,7 +561,7 @@ async fn test_analyze_directory_with_invalid_jsonl() {
         .await
         .unwrap();
 
-    let result = analyze_directory(temp_dir.path(), DateTimezone::Utc)
+    let result = analyze_directory(temp_dir.path(), DateTimezone::Utc, &empty_filter())
         .await
         .unwrap();
     assert!(result.daily_costs.is_empty());
@@ -617,7 +636,7 @@ async fn test_parse_lines_changed_with_edit_tool() {
     let log_content = r#"{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"00000000-0000-0000-0000-000000000000","version":"1.0.0","gitBranch":"main","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":[{"type":"tool_use","id":"tool_1","name":"Edit","input":{"file_path":"/test.rs","old_string":"line1\nline2","new_string":"line1\nmodified\nline3"}}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":500,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000001","timestamp":"2025-10-23T12:00:00Z","isApiErrorMessage":null}"#;
     tokio::fs::write(&file_path, log_content).await.unwrap();
 
-    let result = parse_lines_changed(&file_path, DateTimezone::Utc)
+    let result = parse_lines_changed(&file_path, DateTimezone::Utc, &empty_filter())
         .await
         .unwrap();
 
@@ -634,7 +653,7 @@ async fn test_parse_lines_changed_with_write_tool() {
     let log_content = r#"{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"00000000-0000-0000-0000-000000000000","version":"1.0.0","gitBranch":"main","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":[{"type":"tool_use","id":"tool_1","name":"Write","input":{"file_path":"/test.rs","content":"line1\nline2\nline3\nline4"}}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":500,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000001","timestamp":"2025-10-23T12:00:00Z","isApiErrorMessage":null}"#;
     tokio::fs::write(&file_path, log_content).await.unwrap();
 
-    let result = parse_lines_changed(&file_path, DateTimezone::Utc)
+    let result = parse_lines_changed(&file_path, DateTimezone::Utc, &empty_filter())
         .await
         .unwrap();
 
@@ -651,7 +670,7 @@ async fn test_parse_lines_changed_with_notebook_edit_tool() {
     let log_content = r#"{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"00000000-0000-0000-0000-000000000000","version":"1.0.0","gitBranch":"main","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":[{"type":"tool_use","id":"tool_1","name":"NotebookEdit","input":{"notebook_path":"/test.ipynb","new_source":"print('hello')\nprint('world')"}}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":500,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000001","timestamp":"2025-10-23T12:00:00Z","isApiErrorMessage":null}"#;
     tokio::fs::write(&file_path, log_content).await.unwrap();
 
-    let result = parse_lines_changed(&file_path, DateTimezone::Utc)
+    let result = parse_lines_changed(&file_path, DateTimezone::Utc, &empty_filter())
         .await
         .unwrap();
 
@@ -668,7 +687,7 @@ async fn test_parse_lines_changed_multiple_tools_same_message() {
     let log_content = r#"{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"00000000-0000-0000-0000-000000000000","version":"1.0.0","gitBranch":"main","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":[{"type":"tool_use","id":"tool_1","name":"Edit","input":{"file_path":"/test.rs","old_string":"old","new_string":"new"}},{"type":"tool_use","id":"tool_2","name":"Write","input":{"file_path":"/test2.rs","content":"line1\nline2"}}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":500,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000001","timestamp":"2025-10-23T12:00:00Z","isApiErrorMessage":null}"#;
     tokio::fs::write(&file_path, log_content).await.unwrap();
 
-    let result = parse_lines_changed(&file_path, DateTimezone::Utc)
+    let result = parse_lines_changed(&file_path, DateTimezone::Utc, &empty_filter())
         .await
         .unwrap();
 
@@ -683,7 +702,7 @@ async fn test_parse_lines_changed_empty_file() {
     let file_path = temp_dir.path().join("empty.jsonl");
     tokio::fs::write(&file_path, "").await.unwrap();
 
-    let result = parse_lines_changed(&file_path, DateTimezone::Utc)
+    let result = parse_lines_changed(&file_path, DateTimezone::Utc, &empty_filter())
         .await
         .unwrap();
     assert!(result.is_empty());
@@ -697,7 +716,7 @@ async fn test_parse_lines_changed_no_tool_uses() {
     let log_content = r#"{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"00000000-0000-0000-0000-000000000000","version":"1.0.0","gitBranch":"main","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":"just text, no tools","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":500,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000001","timestamp":"2025-10-23T12:00:00Z","isApiErrorMessage":null}"#;
     tokio::fs::write(&file_path, log_content).await.unwrap();
 
-    let result = parse_lines_changed(&file_path, DateTimezone::Utc)
+    let result = parse_lines_changed(&file_path, DateTimezone::Utc, &empty_filter())
         .await
         .unwrap();
     assert!(result.is_empty());
@@ -711,7 +730,7 @@ async fn test_parse_lines_changed_ignores_non_modifying_tools() {
     let log_content = r#"{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"00000000-0000-0000-0000-000000000000","version":"1.0.0","gitBranch":"main","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":[{"type":"tool_use","id":"tool_1","name":"Read","input":{"file_path":"/test.rs"}}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":500,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000001","timestamp":"2025-10-23T12:00:00Z","isApiErrorMessage":null}"#;
     tokio::fs::write(&file_path, log_content).await.unwrap();
 
-    let result = parse_lines_changed(&file_path, DateTimezone::Utc)
+    let result = parse_lines_changed(&file_path, DateTimezone::Utc, &empty_filter())
         .await
         .unwrap();
     assert!(result.is_empty());
@@ -726,7 +745,9 @@ async fn test_parse_log_file_filters_synthetic_model() {
 {"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"00000000-0000-0000-0000-000000000000","version":"1.0.0","gitBranch":"main","message":{"id":"msg_2","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":"test","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":2000,"cache_creation_input_tokens":100,"cache_read_input_tokens":50,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":1000,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000002","timestamp":"2025-10-23T12:00:00Z","isApiErrorMessage":null}"#;
     tokio::fs::write(&file_path, log_content).await.unwrap();
 
-    let result = parse_log_file(&file_path, DateTimezone::Utc).await.unwrap();
+    let result = parse_log_file(&file_path, DateTimezone::Utc, &empty_filter())
+        .await
+        .unwrap();
 
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].model_string, "claude-sonnet-4");
@@ -742,7 +763,9 @@ async fn test_parse_log_file_filters_synthetic_model_case_insensitive() {
 {"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"00000000-0000-0000-0000-000000000000","version":"1.0.0","gitBranch":"main","message":{"id":"msg_2","type":"message","role":"assistant","model":"<Synthetic>","container":null,"content":"test","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1500,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":750,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000002","timestamp":"2025-10-23T12:00:00Z","isApiErrorMessage":null}"#;
     tokio::fs::write(&file_path, log_content).await.unwrap();
 
-    let result = parse_log_file(&file_path, DateTimezone::Utc).await.unwrap();
+    let result = parse_log_file(&file_path, DateTimezone::Utc, &empty_filter())
+        .await
+        .unwrap();
 
     assert!(result.is_empty());
 }
@@ -756,7 +779,7 @@ async fn test_parse_lines_changed_filters_synthetic_model() {
 {"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"00000000-0000-0000-0000-000000000000","version":"1.0.0","gitBranch":"main","message":{"id":"msg_2","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":[{"type":"tool_use","id":"tool_2","name":"Edit","input":{"file_path":"/test2.rs","old_string":"a","new_string":"b\nc"}}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":2000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":1000,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000002","timestamp":"2025-10-23T12:00:00Z","isApiErrorMessage":null}"#;
     tokio::fs::write(&file_path, log_content).await.unwrap();
 
-    let result = parse_lines_changed(&file_path, DateTimezone::Utc)
+    let result = parse_lines_changed(&file_path, DateTimezone::Utc, &empty_filter())
         .await
         .unwrap();
 
@@ -774,7 +797,7 @@ async fn test_parse_lines_changed_filters_synthetic_model_case_insensitive() {
 {"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"00000000-0000-0000-0000-000000000000","version":"1.0.0","gitBranch":"main","message":{"id":"msg_2","type":"message","role":"assistant","model":"<Synthetic>","container":null,"content":[{"type":"tool_use","id":"tool_2","name":"Write","input":{"file_path":"/test2.rs","content":"line1\nline2"}}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":2000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":1000,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000002","timestamp":"2025-10-23T12:00:00Z","isApiErrorMessage":null}"#;
     tokio::fs::write(&file_path, log_content).await.unwrap();
 
-    let result = parse_lines_changed(&file_path, DateTimezone::Utc)
+    let result = parse_lines_changed(&file_path, DateTimezone::Utc, &empty_filter())
         .await
         .unwrap();
 
@@ -790,7 +813,9 @@ async fn test_parse_log_file_all_synthetic_entries() {
 {"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"00000000-0000-0000-0000-000000000000","version":"1.0.0","gitBranch":"main","message":{"id":"msg_2","type":"message","role":"assistant","model":"<synthetic>","container":null,"content":"test","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":2000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":1000,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000002","timestamp":"2025-10-23T12:00:00Z","isApiErrorMessage":null}"#;
     tokio::fs::write(&file_path, log_content).await.unwrap();
 
-    let result = parse_log_file(&file_path, DateTimezone::Utc).await.unwrap();
+    let result = parse_log_file(&file_path, DateTimezone::Utc, &empty_filter())
+        .await
+        .unwrap();
 
     assert!(result.is_empty());
 }
@@ -804,7 +829,7 @@ async fn test_parse_lines_changed_all_synthetic_entries() {
 {"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"00000000-0000-0000-0000-000000000000","version":"1.0.0","gitBranch":"main","message":{"id":"msg_2","type":"message","role":"assistant","model":"<synthetic>","container":null,"content":[{"type":"tool_use","id":"tool_2","name":"Write","input":{"file_path":"/test2.rs","content":"test"}}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":2000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":1000,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000002","timestamp":"2025-10-23T12:00:00Z","isApiErrorMessage":null}"#;
     tokio::fs::write(&file_path, log_content).await.unwrap();
 
-    let result = parse_lines_changed(&file_path, DateTimezone::Utc)
+    let result = parse_lines_changed(&file_path, DateTimezone::Utc, &empty_filter())
         .await
         .unwrap();
 
@@ -829,7 +854,9 @@ async fn test_parse_log_file_deduplicates_streaming_messages_by_request_id() {
 {"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"session-1","version":"1.0.0","gitBranch":"main","message":{"id":"msg_4","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":"final complete response","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":8,"cache_creation_input_tokens":17932,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":835,"service_tier":null,"server_tool_use":null}},"requestId":"req-123","uuid":"00000000-0000-0000-0000-000000000004","timestamp":"2025-10-23T12:00:03Z","isApiErrorMessage":null}"#;
     tokio::fs::write(&file_path, log_content).await.unwrap();
 
-    let result = parse_log_file(&file_path, DateTimezone::Utc).await.unwrap();
+    let result = parse_log_file(&file_path, DateTimezone::Utc, &empty_filter())
+        .await
+        .unwrap();
 
     assert_eq!(
         result.len(),
@@ -863,7 +890,9 @@ async fn test_parse_log_file_by_session_deduplicates_streaming_messages() {
 {"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"session-1","version":"1.0.0","gitBranch":"main","message":{"id":"msg_4","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":"final","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":8,"cache_creation_input_tokens":17932,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":835,"service_tier":null,"server_tool_use":null}},"requestId":"req-123","uuid":"00000000-0000-0000-0000-000000000004","timestamp":"2025-10-23T12:00:03Z","isApiErrorMessage":null}"#;
     tokio::fs::write(&file_path, log_content).await.unwrap();
 
-    let result = parse_log_file_by_session(&file_path).await.unwrap();
+    let result = parse_log_file_by_session(&file_path, &empty_filter())
+        .await
+        .unwrap();
 
     assert_eq!(
         result.len(),
@@ -890,7 +919,9 @@ async fn test_parse_log_file_handles_multiple_streaming_groups() {
 {"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"session-1","version":"1.0.0","gitBranch":"main","message":{"id":"msg_5","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":"","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":12,"cache_creation_input_tokens":5361,"cache_read_input_tokens":17932,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":867,"service_tier":null,"server_tool_use":null}},"requestId":"req-456","uuid":"00000000-0000-0000-0000-000000000005","timestamp":"2025-10-23T12:01:01Z","isApiErrorMessage":null}"#;
     tokio::fs::write(&file_path, log_content).await.unwrap();
 
-    let result = parse_log_file(&file_path, DateTimezone::Utc).await.unwrap();
+    let result = parse_log_file(&file_path, DateTimezone::Utc, &empty_filter())
+        .await
+        .unwrap();
 
     assert_eq!(
         result.len(),
@@ -918,7 +949,9 @@ async fn test_parse_log_file_preserves_non_streaming_messages() {
     let log_content = r#"{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"session-1","version":"1.0.0","gitBranch":"main","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":"test","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":500,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000001","timestamp":"2025-10-23T12:00:00Z","isApiErrorMessage":null}"#;
     tokio::fs::write(&file_path, log_content).await.unwrap();
 
-    let result = parse_log_file(&file_path, DateTimezone::Utc).await.unwrap();
+    let result = parse_log_file(&file_path, DateTimezone::Utc, &empty_filter())
+        .await
+        .unwrap();
 
     // Messages without requestId should be kept as-is
     assert_eq!(result.len(), 1);
@@ -1065,7 +1098,9 @@ async fn test_parse_log_file_handles_zero_output_tokens() {
 
     tokio::fs::write(&log_file, log_content).await.unwrap();
 
-    let result = parse_log_file(&log_file, DateTimezone::Utc).await.unwrap();
+    let result = parse_log_file(&log_file, DateTimezone::Utc, &empty_filter())
+        .await
+        .unwrap();
 
     // Should have exactly 1 message (deduplicated from 3)
     assert_eq!(result.len(), 1);
@@ -1075,4 +1110,199 @@ async fn test_parse_log_file_handles_zero_output_tokens() {
     assert_eq!(msg.token_counts.output_tokens, 0);
     assert_eq!(msg.token_counts.input_tokens, 10);
     assert_eq!(msg.token_counts.cache_write_tokens, 100);
+}
+
+// ============================================================================
+// TIME FILTERING INTEGRATION TESTS
+// ============================================================================
+
+#[tokio::test]
+async fn test_parse_log_file_filters_by_start_time() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let file_path = temp_dir.path().join("test.jsonl");
+
+    // Create log with messages at different times
+    let log_content = r#"{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"session-1","version":"1.0.0","gitBranch":"main","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":"test","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":100,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000001","timestamp":"2025-01-01T10:00:00Z","isApiErrorMessage":null}
+{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"session-1","version":"1.0.0","gitBranch":"main","message":{"id":"msg_2","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":"test","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":2000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":200,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000002","timestamp":"2025-01-01T12:00:00Z","isApiErrorMessage":null}
+{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"session-1","version":"1.0.0","gitBranch":"main","message":{"id":"msg_3","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":"test","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":3000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":300,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000003","timestamp":"2025-01-01T14:00:00Z","isApiErrorMessage":null}"#;
+    tokio::fs::write(&file_path, log_content).await.unwrap();
+
+    // Filter: only messages after 11:00
+    let filter = date_filter(Some("2025-01-01T11:00:00Z"), None);
+    let result = parse_log_file(&file_path, DateTimezone::Utc, &filter)
+        .await
+        .unwrap();
+
+    // Should only include messages at 12:00 and 14:00
+    assert_eq!(result.len(), 2);
+    assert_eq!(result[0].token_counts.input_tokens, 2000);
+    assert_eq!(result[1].token_counts.input_tokens, 3000);
+}
+
+#[tokio::test]
+async fn test_parse_log_file_filters_by_end_time() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let file_path = temp_dir.path().join("test.jsonl");
+
+    let log_content = r#"{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"session-1","version":"1.0.0","gitBranch":"main","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":"test","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":100,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000001","timestamp":"2025-01-01T10:00:00Z","isApiErrorMessage":null}
+{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"session-1","version":"1.0.0","gitBranch":"main","message":{"id":"msg_2","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":"test","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":2000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":200,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000002","timestamp":"2025-01-01T12:00:00Z","isApiErrorMessage":null}
+{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"session-1","version":"1.0.0","gitBranch":"main","message":{"id":"msg_3","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":"test","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":3000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":300,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000003","timestamp":"2025-01-01T14:00:00Z","isApiErrorMessage":null}"#;
+    tokio::fs::write(&file_path, log_content).await.unwrap();
+
+    // Filter: only messages before 12:00 (exclusive end)
+    let filter = date_filter(None, Some("2025-01-01T12:00:00Z"));
+    let result = parse_log_file(&file_path, DateTimezone::Utc, &filter)
+        .await
+        .unwrap();
+
+    // Should only include message at 10:00 (12:00 is excluded)
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].token_counts.input_tokens, 1000);
+}
+
+#[tokio::test]
+async fn test_parse_log_file_filters_by_time_range() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let file_path = temp_dir.path().join("test.jsonl");
+
+    let log_content = r#"{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"session-1","version":"1.0.0","gitBranch":"main","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":"test","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":100,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000001","timestamp":"2025-01-01T10:00:00Z","isApiErrorMessage":null}
+{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"session-1","version":"1.0.0","gitBranch":"main","message":{"id":"msg_2","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":"test","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":2000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":200,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000002","timestamp":"2025-01-01T12:00:00Z","isApiErrorMessage":null}
+{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"session-1","version":"1.0.0","gitBranch":"main","message":{"id":"msg_3","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":"test","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":3000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":300,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000003","timestamp":"2025-01-01T14:00:00Z","isApiErrorMessage":null}"#;
+    tokio::fs::write(&file_path, log_content).await.unwrap();
+
+    // Filter: messages between 11:00 and 13:00
+    let filter = date_filter(Some("2025-01-01T11:00:00Z"), Some("2025-01-01T13:00:00Z"));
+    let result = parse_log_file(&file_path, DateTimezone::Utc, &filter)
+        .await
+        .unwrap();
+
+    // Should only include message at 12:00
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].token_counts.input_tokens, 2000);
+}
+
+#[tokio::test]
+async fn test_parse_log_file_filter_excludes_all_messages() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let file_path = temp_dir.path().join("test.jsonl");
+
+    let log_content = r#"{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"session-1","version":"1.0.0","gitBranch":"main","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":"test","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":100,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000001","timestamp":"2025-01-01T12:00:00Z","isApiErrorMessage":null}"#;
+    tokio::fs::write(&file_path, log_content).await.unwrap();
+
+    // Filter that excludes all messages (time range in 2024)
+    let filter = date_filter(Some("2024-01-01"), Some("2024-12-31"));
+    let result = parse_log_file(&file_path, DateTimezone::Utc, &filter)
+        .await
+        .unwrap();
+
+    // Should return empty vec
+    assert!(result.is_empty());
+}
+
+#[tokio::test]
+async fn test_parse_log_file_filter_with_date_only() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let file_path = temp_dir.path().join("test.jsonl");
+
+    // Messages throughout Jan 31
+    let log_content = r#"{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"session-1","version":"1.0.0","gitBranch":"main","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":"test","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":100,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000001","timestamp":"2025-01-31T00:00:00Z","isApiErrorMessage":null}
+{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"session-1","version":"1.0.0","gitBranch":"main","message":{"id":"msg_2","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":"test","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":2000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":200,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000002","timestamp":"2025-01-31T12:00:00Z","isApiErrorMessage":null}
+{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"session-1","version":"1.0.0","gitBranch":"main","message":{"id":"msg_3","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":"test","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":3000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":300,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000003","timestamp":"2025-01-31T23:59:59Z","isApiErrorMessage":null}
+{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"session-1","version":"1.0.0","gitBranch":"main","message":{"id":"msg_4","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":"test","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":4000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":400,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000004","timestamp":"2025-02-01T00:00:00Z","isApiErrorMessage":null}"#;
+    tokio::fs::write(&file_path, log_content).await.unwrap();
+
+    // Filter: --end-time "2025-01-31" should include all of Jan 31 but not Feb 1
+    let filter = date_filter(Some("2025-01-31"), Some("2025-01-31"));
+    let result = parse_log_file(&file_path, DateTimezone::Utc, &filter)
+        .await
+        .unwrap();
+
+    // Should include all 3 messages from Jan 31, but not Feb 1
+    assert_eq!(result.len(), 3);
+}
+
+#[tokio::test]
+async fn test_parse_log_file_includes_message_at_start_boundary() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let file_path = temp_dir.path().join("test.jsonl");
+
+    // Messages at 11:00, 12:00, and 13:00
+    let log_content = r#"{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"session-1","version":"1.0.0","gitBranch":"main","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":"test","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":100,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000001","timestamp":"2025-01-01T11:00:00Z","isApiErrorMessage":null}
+{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"session-1","version":"1.0.0","gitBranch":"main","message":{"id":"msg_2","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":"test","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":2000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":200,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000002","timestamp":"2025-01-01T12:00:00Z","isApiErrorMessage":null}
+{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"session-1","version":"1.0.0","gitBranch":"main","message":{"id":"msg_3","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":"test","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":3000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":300,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000003","timestamp":"2025-01-01T13:00:00Z","isApiErrorMessage":null}"#;
+    tokio::fs::write(&file_path, log_content).await.unwrap();
+
+    // Filter: start at exactly 12:00 (should be inclusive)
+    let filter = date_filter(Some("2025-01-01T12:00:00Z"), None);
+    let result = parse_log_file(&file_path, DateTimezone::Utc, &filter)
+        .await
+        .unwrap();
+
+    // Should include messages at 12:00 and 13:00 (start is inclusive)
+    assert_eq!(result.len(), 2);
+    assert_eq!(result[0].token_counts.input_tokens, 2000);
+    assert_eq!(result[1].token_counts.input_tokens, 3000);
+}
+
+#[tokio::test]
+async fn test_parse_log_file_excludes_message_at_end_boundary() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let file_path = temp_dir.path().join("test.jsonl");
+
+    // Messages at 11:00, 12:00, and 13:00
+    let log_content = r#"{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"session-1","version":"1.0.0","gitBranch":"main","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":"test","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":100,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000001","timestamp":"2025-01-01T11:00:00Z","isApiErrorMessage":null}
+{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"session-1","version":"1.0.0","gitBranch":"main","message":{"id":"msg_2","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":"test","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":2000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":200,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000002","timestamp":"2025-01-01T12:00:00Z","isApiErrorMessage":null}
+{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"session-1","version":"1.0.0","gitBranch":"main","message":{"id":"msg_3","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":"test","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":3000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":300,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000003","timestamp":"2025-01-01T13:00:00Z","isApiErrorMessage":null}"#;
+    tokio::fs::write(&file_path, log_content).await.unwrap();
+
+    // Filter: end at exactly 12:00 (should be exclusive)
+    let filter = date_filter(None, Some("2025-01-01T12:00:00Z"));
+    let result = parse_log_file(&file_path, DateTimezone::Utc, &filter)
+        .await
+        .unwrap();
+
+    // Should include only message at 11:00 (end is exclusive)
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].token_counts.input_tokens, 1000);
+}
+
+#[tokio::test]
+async fn test_parse_log_file_by_session_respects_filter() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let file_path = temp_dir.path().join("test.jsonl");
+
+    let log_content = r#"{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"session-1","version":"1.0.0","gitBranch":"main","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":"test","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":100,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000001","timestamp":"2025-01-01T10:00:00Z","isApiErrorMessage":null}
+{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"session-1","version":"1.0.0","gitBranch":"main","message":{"id":"msg_2","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":"test","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":2000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":200,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000002","timestamp":"2025-01-01T12:00:00Z","isApiErrorMessage":null}"#;
+    tokio::fs::write(&file_path, log_content).await.unwrap();
+
+    // Filter: only messages after 11:00
+    let filter = date_filter(Some("2025-01-01T11:00:00Z"), None);
+    let result = parse_log_file_by_session(&file_path, &filter)
+        .await
+        .unwrap();
+
+    // Should only include message at 12:00
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].token_counts.input_tokens, 2000);
+}
+
+#[tokio::test]
+async fn test_parse_lines_changed_respects_time_filter() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let file_path = temp_dir.path().join("test.jsonl");
+
+    // Messages with tool uses at different times
+    let log_content = r#"{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"session-1","version":"1.0.0","gitBranch":"main","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":[{"type":"tool_use","id":"tool_1","name":"Write","input":{"file_path":"/test/file1.txt","content":"line1\nline2\n"}}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":100,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":10,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000001","timestamp":"2025-01-01T10:00:00Z","isApiErrorMessage":null}
+{"type":"assistant","parentUuid":null,"isSidechain":false,"userType":"user","cwd":"/test","sessionId":"session-1","version":"1.0.0","gitBranch":"main","message":{"id":"msg_2","type":"message","role":"assistant","model":"claude-sonnet-4","container":null,"content":[{"type":"tool_use","id":"tool_2","name":"Write","input":{"file_path":"/test/file2.txt","content":"line1\nline2\nline3\n"}}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":100,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":10,"service_tier":null,"server_tool_use":null}},"requestId":null,"uuid":"00000000-0000-0000-0000-000000000002","timestamp":"2025-01-01T12:00:00Z","isApiErrorMessage":null}"#;
+    tokio::fs::write(&file_path, log_content).await.unwrap();
+
+    // Filter: only messages after 11:00
+    let filter = date_filter(Some("2025-01-01T11:00:00Z"), None);
+    let result = parse_lines_changed(&file_path, DateTimezone::Utc, &filter)
+        .await
+        .unwrap();
+
+    // Should only include lines from 12:00 message (3 lines)
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].1, 3); // 3 lines changed
 }

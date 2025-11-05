@@ -656,8 +656,8 @@ mod tests {
             "sessionId": "75c1a8c9-5842-4fd4-a816-74109bf09cba"
         });
 
-        let line: LogLine = serde_json::from_value(json)
-            .expect("Failed to parse valid queue-operation JSON");
+        let line: LogLine =
+            serde_json::from_value(json).expect("Failed to parse valid queue-operation JSON");
         match line {
             LogLine::QueueOperation(op) => {
                 assert_eq!(op.operation, "enqueue");
@@ -717,8 +717,7 @@ mod tests {
             "sessionId": ""
         });
 
-        let line: LogLine = serde_json::from_value(json)
-            .expect("Should parse with empty strings");
+        let line: LogLine = serde_json::from_value(json).expect("Should parse with empty strings");
 
         if let LogLine::QueueOperation(op) = line {
             assert_eq!(op.operation, "");
@@ -739,12 +738,15 @@ mod tests {
             "sessionId": "6282703f-30e7-4990-b1dd-3482afa261a5"
         });
 
-        let line: LogLine = serde_json::from_value(json)
-            .expect("Failed to parse dequeue operation");
+        let line: LogLine =
+            serde_json::from_value(json).expect("Failed to parse dequeue operation");
 
         if let LogLine::QueueOperation(op) = line {
             assert_eq!(op.operation, "dequeue");
-            assert_eq!(op.content, "Maybe you should fetch the page that is linked?");
+            assert_eq!(
+                op.content,
+                "Maybe you should fetch the page that is linked?"
+            );
             assert_eq!(op.session_id, "6282703f-30e7-4990-b1dd-3482afa261a5");
         } else {
             panic!("Expected QueueOperation variant");

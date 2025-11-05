@@ -3,6 +3,7 @@ mod analyzer;
 mod analyzer_tests;
 mod line_counter;
 mod pricing;
+mod time_filter;
 
 use std::path::Path;
 
@@ -10,8 +11,9 @@ use analyzer::{AnalysisResult, DailyCosts, SessionAnalysisResult, SessionCosts};
 use chrono::{DateTime, Local, Utc};
 use pricing::TokenCosts;
 
-// Re-export DateTimezone for use in main.rs
+// Re-export DateTimezone and TimeRangeFilter for use in main.rs
 pub use analyzer::DateTimezone;
+pub use time_filter::TimeRangeFilter;
 
 // Type alias for cost components tuple
 type CostComponents = (f64, f64, f64, f64); // (input, output, cache_write, cache_read)
@@ -472,8 +474,8 @@ fn display_session_warnings(result: &SessionAnalysisResult) {
 }
 
 /// Run the API pricing analysis by session
-pub async fn run_by_session(dir: &Path) -> miette::Result<()> {
-    let result = analyzer::analyze_directory_by_session(dir).await?;
+pub async fn run_by_session(dir: &Path, filter: &TimeRangeFilter) -> miette::Result<()> {
+    let result = analyzer::analyze_directory_by_session(dir, filter).await?;
 
     display_session_analysis_summary(&result);
 
@@ -489,12 +491,17 @@ pub async fn run_by_session(dir: &Path) -> miette::Result<()> {
 }
 
 /// Run the API pricing analysis on a directory
-pub async fn run(dir: &Path, timezone: DateTimezone, by_conversation: bool) -> miette::Result<()> {
+pub async fn run(
+    dir: &Path,
+    timezone: DateTimezone,
+    by_conversation: bool,
+    filter: &TimeRangeFilter,
+) -> miette::Result<()> {
     if by_conversation {
-        return run_by_session(dir).await;
+        return run_by_session(dir, filter).await;
     }
 
-    let result = analyzer::analyze_directory(dir, timezone).await?;
+    let result = analyzer::analyze_directory(dir, timezone, filter).await?;
 
     display_analysis_summary(&result);
 

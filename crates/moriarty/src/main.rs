@@ -41,6 +41,8 @@ async fn main() -> miette::Result<()> {
             dir,
             timezone,
             conversations,
+            start_time,
+            end_time,
         } => {
             // Parse timezone argument
             let tz = match timezone.to_lowercase().as_str() {
@@ -55,8 +57,23 @@ async fn main() -> miette::Result<()> {
                 }
             };
 
+            // Parse time range filter
+            let filter = api_pricing::TimeRangeFilter::new(start_time, end_time)?;
+
+            // Display filter info if set
+            if !filter.is_unrestricted() {
+                println!("Applying time range filter:");
+                if let Some(start) = filter.start {
+                    println!("  Start: {}", start.to_rfc3339());
+                }
+                if let Some(end) = filter.end {
+                    println!("  End:   {}", end.to_rfc3339());
+                }
+                println!();
+            }
+
             // Run the API pricing analysis
-            api_pricing::run(&dir, tz, conversations).await?;
+            api_pricing::run(&dir, tz, conversations, &filter).await?;
         }
         Command::Mcp { server } => {
             server.run().await?;
@@ -120,6 +137,14 @@ pub enum Command {
         /// Aggregate by conversation/session instead of by date
         #[arg(long)]
         conversations: bool,
+        /// Start time for filtering messages (ISO 8601 format, e.g., "2025-01-01T00:00:00Z" or "2025-01-01")
+        /// If no timezone specified, UTC is assumed
+        #[arg(long, value_name = "DATETIME")]
+        start_time: Option<String>,
+        /// End time for filtering messages (ISO 8601 format, e.g., "2025-01-01T23:59:59Z" or "2025-01-01")
+        /// If no timezone specified, UTC is assumed
+        #[arg(long, value_name = "DATETIME")]
+        end_time: Option<String>,
     },
     /// Runs one of the mcp servers
     Mcp {
