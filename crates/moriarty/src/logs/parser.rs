@@ -308,6 +308,7 @@ pub struct AssistantLogMessage {
     pub stop_reason: Option<String>,
     pub stop_sequence: Option<String>,
     pub usage: AssistantUsage,
+    pub context_management: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -326,6 +327,7 @@ pub struct AssistantUsage {
 #[serde(deny_unknown_fields)]
 pub struct ServerToolUse {
     pub web_search_requests: usize,
+    pub web_fetch_requests: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -747,6 +749,134 @@ mod tests {
             assert_eq!(op.session_id, "6282703f-30e7-4990-b1dd-3482afa261a5");
         } else {
             panic!("Expected QueueOperation variant");
+        }
+    }
+
+    #[test]
+    fn test_parse_assistant_with_web_fetch_and_context_management() {
+        // Test new format with web_fetch_requests and context_management
+        let json = serde_json::json!({
+            "parentUuid": "47f0c699-1f24-49a0-889a-39fd30eabfdf",
+            "isSidechain": false,
+            "userType": "external",
+            "cwd": "/test",
+            "sessionId": "test-session",
+            "version": "2.0.32",
+            "gitBranch": "main",
+            "type": "assistant",
+            "uuid": "61cbef9e-8788-420f-acce-c2c0e921ddbc",
+            "timestamp": "2025-11-06T16:44:40.009Z",
+            "message": {
+                "id": "001c3926-2728-4847-a14c-baf326b78196",
+                "container": null,
+                "model": "<synthetic>",
+                "role": "assistant",
+                "stop_reason": "stop_sequence",
+                "stop_sequence": "",
+                "type": "message",
+                "usage": {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "server_tool_use": {
+                        "web_search_requests": 0,
+                        "web_fetch_requests": 0
+                    },
+                    "service_tier": null,
+                    "cache_creation": {
+                        "ephemeral_1h_input_tokens": 0,
+                        "ephemeral_5m_input_tokens": 0
+                    }
+                },
+                "content": [{"type": "text", "text": "No response requested."}],
+                "context_management": null
+            },
+            "isApiErrorMessage": false
+        });
+
+        let line: LogLine = serde_json::from_value(json).expect("Should parse new format");
+        if let LogLine::Assistant(assistant) = line {
+            assert_eq!(assistant.message.model, "<synthetic>");
+            assert_eq!(assistant.message.context_management, None);
+            assert_eq!(
+                assistant
+                    .message
+                    .usage
+                    .server_tool_use
+                    .as_ref()
+                    .unwrap()
+                    .web_fetch_requests,
+                Some(0)
+            );
+        } else {
+            panic!("Expected Assistant variant");
+        }
+    }
+
+    #[test]
+    fn test_parse_assistant_without_web_fetch_requests() {
+        // Test backward compatibility with old format (no web_fetch_requests)
+        let json = serde_json::json!({
+            "parentUuid": null,
+            "isSidechain": false,
+            "userType": "test",
+            "cwd": "/test",
+            "sessionId": "test-session",
+            "version": "1.0",
+            "gitBranch": "main",
+            "type": "assistant",
+            "uuid": "550e8400-e29b-41d4-a716-446655440002",
+            "timestamp": "2025-01-01T00:00:00Z",
+            "message": {
+                "id": "msg-1",
+                "type": "message",
+                "role": "assistant",
+                "content": "response",
+                "model": "claude-3-5-sonnet",
+                "stop_reason": "end_turn",
+                "stop_sequence": null,
+                "usage": {
+                    "input_tokens": 100,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation": {
+                        "ephemeral_5m_input_tokens": 0,
+                        "ephemeral_1h_input_tokens": 0
+                    },
+                    "output_tokens": 50,
+                    "server_tool_use": {
+                        "web_search_requests": 5
+                    }
+                }
+            }
+        });
+
+        let line: LogLine = serde_json::from_value(json).expect("Should parse old format");
+        if let LogLine::Assistant(assistant) = line {
+            assert_eq!(assistant.message.model, "claude-3-5-sonnet");
+            assert_eq!(
+                assistant
+                    .message
+                    .usage
+                    .server_tool_use
+                    .as_ref()
+                    .unwrap()
+                    .web_search_requests,
+                5
+            );
+            assert_eq!(
+                assistant
+                    .message
+                    .usage
+                    .server_tool_use
+                    .as_ref()
+                    .unwrap()
+                    .web_fetch_requests,
+                None
+            );
+        } else {
+            panic!("Expected Assistant variant");
         }
     }
 }

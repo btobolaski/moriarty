@@ -299,6 +299,7 @@ mod tests {
                     service_tier: None,
                     server_tool_use: None,
                 },
+                context_management: None,
             },
             request_id: None,
             uuid: Uuid::new_v4(),
