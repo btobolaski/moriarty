@@ -9,7 +9,7 @@
 //! Logs are written in JSON format to XDG_STATE_HOME/moriarty/hooks/hooks.log with daily rotation.
 
 use crate::persistence::FileType;
-use miette::{IntoDiagnostic, Result};
+use miette::Result;
 #[cfg(test)]
 use std::path::PathBuf;
 use tracing_appender::non_blocking::WorkerGuard;
@@ -31,7 +31,7 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Env
 ///
 /// # Environment Variables
 ///
-/// - `MORIARTY_HOOKS_LOG`: Override default log level filter (default: "info")
+/// - `RUST_LOG`: Override default log level filter (default: "info")
 ///   Examples: "debug", "trace", "moriarty::hooks=trace"
 ///
 /// # Examples
@@ -61,9 +61,7 @@ pub async fn init_tracing() -> Result<WorkerGuard> {
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
     // Configure filter from environment or default to "info"
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"))
-        .add_directive("moriarty::hooks=debug".parse().into_diagnostic()?);
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     // Build subscriber with JSON file output
     let file_layer = fmt::layer()
@@ -189,11 +187,6 @@ mod tests {
             "Log file should contain test message. Content:\n{}",
             content
         );
-        assert!(
-            content.contains("Hooks tracing initialized"),
-            "Log file should contain initialization message. Content:\n{}",
-            content
-        );
     }
 
     #[tokio::test]
@@ -235,6 +228,79 @@ mod tests {
         assert!(
             content.contains("Info level message"),
             "Info message should appear when RUST_LOG=debug. Content:\n{}",
+            content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_debug_messages_filtered_by_default() {
+        let _xdg_dir = setup_isolated_xdg_state();
+
+        // Don't set RUST_LOG - use default "info" level
+        std::env::remove_var("RUST_LOG");
+
+        let _guard = init_tracing().await.unwrap();
+
+        // Write both debug and info messages
+        tracing::debug!("Debug message that should not appear");
+        tracing::info!("Info message that should appear");
+
+        drop(_guard);
+
+        let log_path = get_current_log_path().await.unwrap();
+        let log_dir = log_path.parent().expect("Log path should have parent");
+
+        let entries: Vec<_> = std::fs::read_dir(log_dir)
+            .expect("Failed to read log directory")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("hooks.log"))
+            .collect();
+
+        assert!(!entries.is_empty(), "Should have at least one log file");
+
+        let log_file = &entries[0];
+        let content = std::fs::read_to_string(log_file.path())
+            .expect("Failed to read log file");
+
+        assert!(
+            !content.contains("Debug message that should not appear"),
+            "Debug message should be filtered at default info level. Content:\n{}",
+            content
+        );
+        assert!(
+            content.contains("Info message that should appear"),
+            "Info message should appear at default level. Content:\n{}",
+            content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_initialization_message_at_debug_level() {
+        let _xdg_dir = setup_isolated_xdg_state();
+        std::env::set_var("RUST_LOG", "debug");
+
+        let _guard = init_tracing().await.unwrap();
+
+        drop(_guard);
+
+        let log_path = get_current_log_path().await.unwrap();
+        let log_dir = log_path.parent().expect("Log path should have parent");
+
+        let entries: Vec<_> = std::fs::read_dir(log_dir)
+            .expect("Failed to read log directory")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("hooks.log"))
+            .collect();
+
+        assert!(!entries.is_empty(), "Should have at least one log file");
+
+        let log_file = &entries[0];
+        let content = std::fs::read_to_string(log_file.path())
+            .expect("Failed to read log file");
+
+        assert!(
+            content.contains("Hooks tracing initialized"),
+            "Initialization message should appear at debug level. Content:\n{}",
             content
         );
     }
