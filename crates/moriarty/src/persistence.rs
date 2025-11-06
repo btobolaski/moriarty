@@ -334,9 +334,10 @@ mod tests {
     async fn test_load_nonexistent_file_returns_error() {
         let _xdg_dir = setup_isolated_xdg_config();
 
-        let result: miette::Result<TestConfig> = FileType::Config.load("nonexistent.toml").await;
-
-        let err = result.expect_err("Should fail with nonexistent file");
+        let err = FileType::Config
+            .load::<TestConfig>("nonexistent.toml")
+            .await
+            .expect_err("Should fail with nonexistent file");
         assert!(err.to_string().contains("failed to read from file"));
     }
 
@@ -347,9 +348,10 @@ mod tests {
         let path = FileType::Config.build_path("bad.toml").await.unwrap();
         tokio::fs::write(&path, "not valid toml {[}").await.unwrap();
 
-        let result: miette::Result<TestConfig> = FileType::Config.load("bad.toml").await;
-
-        let err = result.expect_err("Should fail with malformed TOML");
+        let err = FileType::Config
+            .load::<TestConfig>("bad.toml")
+            .await
+            .expect_err("Should fail with malformed TOML");
         assert!(err.to_string().contains("failed to parse file contents"));
     }
 

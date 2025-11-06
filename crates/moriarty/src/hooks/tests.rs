@@ -35,9 +35,9 @@ async fn test_exec_hook_empty_input_returns_error() {
 
     let input = "";
     let cursor = Cursor::new(input);
-    let result = exec_hook_impl(cursor).await;
-
-    let err = result.expect_err("Should fail with empty input");
+    let err = exec_hook_impl(cursor)
+        .await
+        .expect_err("Should fail with empty input");
     assert!(err.to_string().contains("No input received"));
 }
 
@@ -47,9 +47,9 @@ async fn test_exec_hook_malformed_json_returns_error() {
 
     let input = "{invalid json";
     let cursor = Cursor::new(input);
-    let result = exec_hook_impl(cursor).await;
-
-    let err = result.expect_err("Should fail with malformed JSON");
+    let err = exec_hook_impl(cursor)
+        .await
+        .expect_err("Should fail with malformed JSON");
     assert!(err.to_string().contains("Failed to parse hook input"));
 }
 
@@ -99,10 +99,11 @@ async fn test_exec_hook_truncates_long_invalid_input() {
     let input = format!("{{\"invalid\": \"{}", "x".repeat(1000));
 
     let cursor = Cursor::new(input);
-    let result = exec_hook_impl(cursor).await;
 
     // Should return error without panicking
-    let err = result.expect_err("Should fail with large invalid JSON");
+    let err = exec_hook_impl(cursor)
+        .await
+        .expect_err("Should fail with large invalid JSON");
     assert!(err.to_string().contains("Failed to parse hook input"));
 }
 
@@ -528,10 +529,10 @@ async fn test_bash_hook_missing_command_field() {
     let _xdg_config = setup_isolated_xdg_config();
 
     let tool_input = serde_json::json!({});
-    let result = handle_bash_pretool_hook(&tool_input).await;
-
-    let err = result.expect_err("Should fail with missing command field");
-    let err_msg = err.to_string();
+    let err_msg = handle_bash_pretool_hook(&tool_input)
+        .await
+        .expect_err("Should fail with missing command field")
+        .to_string();
     assert!(
         err_msg.contains("Missing 'command' field"),
         "Error should mention missing field, got: {}",

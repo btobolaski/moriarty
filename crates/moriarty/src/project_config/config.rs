@@ -249,10 +249,12 @@ lint = ["cargo", "clippy"]
     async fn test_load_project_settings_missing_file() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
 
-        let result = load_project_settings(temp_dir.path().to_path_buf()).await;
-
-        let err = result.expect_err("Should fail when file doesn't exist");
-        let err_msg = format!("{:?}", err);
+        let err_msg = format!(
+            "{:?}",
+            load_project_settings(temp_dir.path().to_path_buf())
+                .await
+                .expect_err("Should fail when file doesn't exist")
+        );
         assert!(
             err_msg.contains("failed to read project settings") || err_msg.contains("No such file"),
             "Error should mention missing file: {}",
@@ -268,10 +270,12 @@ lint = ["cargo", "clippy"]
         std::fs::write(config_dir.join("tools.toml"), "this is not valid toml [[[[")
             .expect("Failed to write invalid toml");
 
-        let result = load_project_settings(temp_dir.path().to_path_buf()).await;
-
-        let err = result.expect_err("Should fail with invalid TOML");
-        let err_msg = format!("{:?}", err);
+        let err_msg = format!(
+            "{:?}",
+            load_project_settings(temp_dir.path().to_path_buf())
+                .await
+                .expect_err("Should fail with invalid TOML")
+        );
         assert!(
             err_msg.contains("failed to parse project settings") || err_msg.contains("TOML"),
             "Error should mention parsing failure: {}",
@@ -500,9 +504,12 @@ command = ["cargo", "audit"]
 "#,
         );
 
-        let result = load_project_settings(temp_dir.path().to_path_buf()).await;
-        let err = result.expect_err("Should fail when check is missing name");
-        let err_msg = format!("{:?}", err);
+        let err_msg = format!(
+            "{:?}",
+            load_project_settings(temp_dir.path().to_path_buf())
+                .await
+                .expect_err("Should fail when check is missing name")
+        );
         assert!(
             err_msg.contains("failed to parse project settings")
                 || err_msg.contains("missing field"),
@@ -522,9 +529,12 @@ name = "security-audit"
 "#,
         );
 
-        let result = load_project_settings(temp_dir.path().to_path_buf()).await;
-        let err = result.expect_err("Should fail when check is missing command");
-        let err_msg = format!("{:?}", err);
+        let err_msg = format!(
+            "{:?}",
+            load_project_settings(temp_dir.path().to_path_buf())
+                .await
+                .expect_err("Should fail when check is missing command")
+        );
         assert!(
             err_msg.contains("failed to parse project settings")
                 || err_msg.contains("missing field"),
@@ -545,9 +555,12 @@ command = "not an array"
 "#,
         );
 
-        let result = load_project_settings(temp_dir.path().to_path_buf()).await;
-        let err = result.expect_err("Should fail with invalid checks TOML");
-        let err_msg = format!("{:?}", err);
+        let err_msg = format!(
+            "{:?}",
+            load_project_settings(temp_dir.path().to_path_buf())
+                .await
+                .expect_err("Should fail with invalid checks TOML")
+        );
         assert!(
             err_msg.contains("failed to parse project settings")
                 || err_msg.contains("invalid type"),

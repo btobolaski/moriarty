@@ -155,8 +155,8 @@ mod tests {
 
     #[test]
     fn test_parse_datetime_invalid() {
-        let result = parse_datetime_for_start("invalid");
-        assert!(result.is_err());
+        let _err =
+            parse_datetime_for_start("invalid").expect_err("Should fail with invalid datetime");
     }
 
     #[test]
@@ -251,28 +251,22 @@ mod tests {
 
     #[test]
     fn test_time_range_filter_new_validation() {
-        let result = TimeRangeFilter::new(
+        let err = TimeRangeFilter::new(
             Some("2025-02-01".to_string()),
             Some("2025-01-01".to_string()),
-        );
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("must be before end time"));
+        )
+        .expect_err("Should fail when start is after end");
+        assert!(err.to_string().contains("must be before end time"));
     }
 
     #[test]
     fn test_time_range_filter_rejects_equal_start_end() {
-        let result = TimeRangeFilter::new(
+        let err = TimeRangeFilter::new(
             Some("2025-01-01T12:00:00Z".to_string()),
             Some("2025-01-01T12:00:00Z".to_string()),
-        );
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("must be before end time"));
+        )
+        .expect_err("Should fail when start equals end");
+        assert!(err.to_string().contains("must be before end time"));
     }
 
     #[test]

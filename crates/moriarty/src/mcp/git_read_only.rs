@@ -424,9 +424,9 @@ mod tests {
             args: vec!["--short".to_string()],
         };
 
-        let result = GitReadOnly::run_git_command("status", args.project_dir, args.args).await;
-
-        let cmd_result = result.unwrap();
+        let cmd_result = GitReadOnly::run_git_command("status", args.project_dir, args.args)
+            .await
+            .unwrap();
         assert_eq!(cmd_result.0.exit_code, 0);
     }
 
@@ -485,8 +485,7 @@ mod tests {
             args: vec!["--cached".to_string()],
         };
 
-        let result = server.diff(Parameters(args)).await;
-        let cmd_result = result.unwrap();
+        let cmd_result = server.diff(Parameters(args)).await.unwrap();
         assert_eq!(cmd_result.0.exit_code, 0);
     }
 
@@ -513,8 +512,7 @@ mod tests {
             args: vec!["--oneline".to_string(), "-1".to_string()],
         };
 
-        let result = server.log(Parameters(args)).await;
-        let cmd_result = result.unwrap();
+        let cmd_result = server.log(Parameters(args)).await.unwrap();
         assert_eq!(cmd_result.0.exit_code, 0);
         assert!(cmd_result.0.stdout.contains("Test commit"));
     }
@@ -529,8 +527,7 @@ mod tests {
             args: vec!["HEAD".to_string()],
         };
 
-        let result = server.show(Parameters(args)).await;
-        result.unwrap();
+        server.show(Parameters(args)).await.unwrap();
     }
 
     #[tokio::test]
@@ -543,8 +540,7 @@ mod tests {
             args: vec![],
         };
 
-        let result = server.status_prompt(Parameters(args)).await;
-        let prompt = result.unwrap();
+        let prompt = server.status_prompt(Parameters(args)).await.unwrap();
         assert!(prompt.description.is_some());
         assert!(prompt
             .description
@@ -565,8 +561,7 @@ mod tests {
             args: vec![],
         };
 
-        let result = server.diff_prompt(Parameters(args)).await;
-        let prompt = result.unwrap();
+        let prompt = server.diff_prompt(Parameters(args)).await.unwrap();
         assert!(prompt.description.is_some());
         assert_eq!(prompt.messages.len(), 2);
         assert_eq!(prompt.messages[0].role, PromptMessageRole::Assistant);
@@ -583,8 +578,7 @@ mod tests {
             args: vec![],
         };
 
-        let result = server.log_prompt(Parameters(args)).await;
-        let prompt = result.unwrap();
+        let prompt = server.log_prompt(Parameters(args)).await.unwrap();
         assert!(prompt.description.is_some());
         assert!(prompt
             .description
@@ -605,8 +599,7 @@ mod tests {
             args: vec![],
         };
 
-        let result = server.show_prompt(Parameters(args)).await;
-        let prompt = result.unwrap();
+        let prompt = server.show_prompt(Parameters(args)).await.unwrap();
         assert!(prompt.description.is_some());
         assert!(prompt
             .description
@@ -633,10 +626,10 @@ mod tests {
             args: vec![],
         };
 
-        let result = GitReadOnly::run_git_command("status", args.project_dir, args.args).await;
-
         // Should return a result (not crash), but the command will fail with non-zero exit
-        let cmd_result = result.unwrap();
+        let cmd_result = GitReadOnly::run_git_command("status", args.project_dir, args.args)
+            .await
+            .unwrap();
         assert_ne!(cmd_result.0.exit_code, 0);
         assert!(
             cmd_result.0.stderr.contains("not a git repository")
@@ -689,10 +682,10 @@ mod tests {
             args: vec!["--short".to_string()],
         };
 
-        let result = GitReadOnly::run_git_command("status", args.project_dir, args.args).await;
-
         // Should succeed - canonicalize resolves the symlink
-        let cmd_result = result.unwrap();
+        let cmd_result = GitReadOnly::run_git_command("status", args.project_dir, args.args)
+            .await
+            .unwrap();
         assert_eq!(cmd_result.0.exit_code, 0);
     }
 }

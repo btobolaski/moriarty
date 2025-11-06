@@ -79,10 +79,12 @@ async fn test_approval_app_initialization_with_empty_config() {
 
     std::fs::write(config_dir.join("tools.toml"), "[commands]\n").unwrap();
 
-    let result = ApprovalApp::new(temp_dir.path().to_path_buf()).await;
-
-    let err = result.expect_err("Empty config should return error");
-    let err_msg = format!("{:?}", err);
+    let err_msg = format!(
+        "{:?}",
+        ApprovalApp::new(temp_dir.path().to_path_buf())
+            .await
+            .expect_err("Empty config should return error")
+    );
     assert!(
         err_msg.contains("No commands or checks configured"),
         "Error should mention no commands or checks configured"
@@ -94,10 +96,12 @@ async fn test_approval_app_initialization_with_missing_config() {
     // Test that missing tools.toml returns an error
     let temp_dir = TempDir::new().unwrap();
 
-    let result = ApprovalApp::new(temp_dir.path().to_path_buf()).await;
-
-    let err = result.expect_err("Missing config should return error");
-    let err_msg = format!("{:?}", err);
+    let err_msg = format!(
+        "{:?}",
+        ApprovalApp::new(temp_dir.path().to_path_buf())
+            .await
+            .expect_err("Missing config should return error")
+    );
     assert!(
         err_msg.contains("failed to read project settings") || err_msg.contains("No such file"),
         "Error should mention missing file, got: {}",

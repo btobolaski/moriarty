@@ -231,13 +231,10 @@ mod tests {
         .await
         .unwrap();
 
-        let result = load_user_config().await;
-        assert!(
-            result.is_err(),
-            "Invalid TOML should return an error, not fail-open"
-        );
-
-        let err_msg = result.unwrap_err().to_string();
+        let err_msg = load_user_config()
+            .await
+            .expect_err("Invalid TOML should return an error, not fail-open")
+            .to_string();
         assert!(
             err_msg.contains("Failed to load user configuration") || err_msg.contains("TOML"),
             "Error message should mention configuration failure or TOML, got: {}",

@@ -305,11 +305,13 @@ lint = ["echo", "lint"]
         );
 
         // This will fail verification since it's not approved, but we're just testing canonicalization
-        let result = verify_and_load_project(temp_dir.path().to_path_buf()).await;
-
         // Should fail at verification stage, not canonicalization
-        assert!(result.is_err());
-        let err_msg = format!("{:?}", result.unwrap_err());
+        let err_msg = format!(
+            "{:?}",
+            verify_and_load_project(temp_dir.path().to_path_buf())
+                .await
+                .expect_err("Should fail on approval check")
+        );
         assert!(
             err_msg.contains("not approved"),
             "Should fail on approval check, not path canonicalization"
@@ -318,10 +320,12 @@ lint = ["echo", "lint"]
 
     #[tokio::test]
     async fn test_invalid_path() {
-        let result = verify_and_load_project(PathBuf::from("/nonexistent/path/to/project")).await;
-
-        assert!(result.is_err());
-        let err_msg = format!("{:?}", result.unwrap_err());
+        let err_msg = format!(
+            "{:?}",
+            verify_and_load_project(PathBuf::from("/nonexistent/path/to/project"))
+                .await
+                .expect_err("Should fail on path canonicalization")
+        );
         assert!(
             err_msg.contains("canonicalize") || err_msg.contains("No such file"),
             "Should fail on path canonicalization: {}",
@@ -340,9 +344,12 @@ test = ["echo", "test output"]
 
         // For now, this will fail at verification - we need approval mocking for full test
         // This test documents the expected behavior once approvals are mocked
-        let result = verify_and_load_project(temp_dir.path().to_path_buf()).await;
-        assert!(result.is_err());
-        let err_msg = format!("{:?}", result.unwrap_err());
+        let err_msg = format!(
+            "{:?}",
+            verify_and_load_project(temp_dir.path().to_path_buf())
+                .await
+                .expect_err("Should fail on approval check")
+        );
         assert!(err_msg.contains("not approved"));
     }
 
@@ -357,8 +364,9 @@ lint = ["echo", "lint"]
 
         // This test documents the expected error for unknown commands
         // Would need approval mocking to test fully
-        let result = verify_and_load_project(temp_dir.path().to_path_buf()).await;
-        assert!(result.is_err());
+        let _err = verify_and_load_project(temp_dir.path().to_path_buf())
+            .await
+            .expect_err("Should fail on approval check");
     }
 
     #[tokio::test]
@@ -386,9 +394,12 @@ format = ["echo", "format"]
         );
 
         // Would need approval mocking to test the full parallel execution and ordering
-        let result = verify_and_load_project(temp_dir.path().to_path_buf()).await;
-        assert!(result.is_err());
-        let err_msg = format!("{:?}", result.unwrap_err());
+        let err_msg = format!(
+            "{:?}",
+            verify_and_load_project(temp_dir.path().to_path_buf())
+                .await
+                .expect_err("Should fail on approval check")
+        );
         assert!(err_msg.contains("not approved"));
     }
 }

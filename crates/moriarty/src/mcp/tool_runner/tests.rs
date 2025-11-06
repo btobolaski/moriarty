@@ -119,9 +119,9 @@ test = ["echo", "test output"]
         project_dir: temp_dir.path().to_path_buf(),
     };
 
-    let result = ToolRunner::run_command(ProjectCommand::Test, args).await;
-
-    let tool_result = result.unwrap();
+    let tool_result = ToolRunner::run_command(ProjectCommand::Test, args)
+        .await
+        .unwrap();
     assert_eq!(tool_result.is_error, Some(false));
     assert_eq!(tool_result.content.len(), 2);
 }
@@ -192,9 +192,9 @@ test = ["sh", "-c", "exit 1"]
         project_dir: temp_dir.path().to_path_buf(),
     };
 
-    let result = ToolRunner::run_command(ProjectCommand::Test, args).await;
-
-    let tool_result = result.unwrap();
+    let tool_result = ToolRunner::run_command(ProjectCommand::Test, args)
+        .await
+        .unwrap();
     assert_eq!(tool_result.is_error, Some(true));
 }
 
@@ -257,8 +257,7 @@ lint = ["echo", "Running lint"]
         project_dir: temp_dir.path().to_path_buf(),
     };
 
-    let result = server.run_lint(Parameters(args)).await;
-    let tool_result = result.unwrap();
+    let tool_result = server.run_lint(Parameters(args)).await.unwrap();
     assert_eq!(tool_result.is_error, Some(false));
     assert_eq!(tool_result.content.len(), 2);
 }
@@ -278,8 +277,7 @@ build = ["echo", "Building project"]
         project_dir: temp_dir.path().to_path_buf(),
     };
 
-    let result = server.run_build(Parameters(args)).await;
-    let tool_result = result.unwrap();
+    let tool_result = server.run_build(Parameters(args)).await.unwrap();
     assert_eq!(tool_result.is_error, Some(false));
     assert_eq!(tool_result.content.len(), 2);
 }
@@ -299,8 +297,7 @@ format = ["echo", "Formatting code"]
         project_dir: temp_dir.path().to_path_buf(),
     };
 
-    let result = server.run_formatter(Parameters(args)).await;
-    let tool_result = result.unwrap();
+    let tool_result = server.run_formatter(Parameters(args)).await.unwrap();
     assert_eq!(tool_result.is_error, Some(false));
     assert_eq!(tool_result.content.len(), 2);
 }
@@ -320,8 +317,7 @@ test = ["echo", "Running tests"]
         project_dir: temp_dir.path().to_path_buf(),
     };
 
-    let result = server.run_tests(Parameters(args)).await;
-    let tool_result = result.unwrap();
+    let tool_result = server.run_tests(Parameters(args)).await.unwrap();
     assert_eq!(tool_result.is_error, Some(false));
     assert_eq!(tool_result.content.len(), 2);
 }
@@ -376,10 +372,10 @@ test = ["echo", "hello"]
         project_dir: link_path,
     };
 
-    let result = ToolRunner::run_command(ProjectCommand::Test, args).await;
-
     // Should succeed - canonicalize resolves the symlink
-    let tool_result = result.unwrap();
+    let tool_result = ToolRunner::run_command(ProjectCommand::Test, args)
+        .await
+        .unwrap();
     assert_eq!(tool_result.is_error, Some(false));
 }
 

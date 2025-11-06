@@ -594,9 +594,9 @@ mod tests {
             }
         });
 
-        let result = serde_json::from_value::<LogMessageTaggedContent>(json);
-        let err = result.expect_err("Should reject unknown fields due to deny_unknown_fields");
-        let err_msg = err.to_string();
+        let err_msg = serde_json::from_value::<LogMessageTaggedContent>(json)
+            .expect_err("Should reject unknown fields due to deny_unknown_fields")
+            .to_string();
         assert!(
             err_msg.contains("unknown field") || err_msg.contains("unknown_field"),
             "Error should mention unknown field, got: {}",
@@ -636,9 +636,9 @@ mod tests {
             "extra_field": "should be rejected"
         });
 
-        let result = serde_json::from_value::<LogMessageTaggedContent>(json);
-        let err = result.expect_err("Should reject unknown fields at Document variant level");
-        let err_msg = err.to_string();
+        let err_msg = serde_json::from_value::<LogMessageTaggedContent>(json)
+            .expect_err("Should reject unknown fields at Document variant level")
+            .to_string();
         assert!(
             err_msg.contains("unknown field") || err_msg.contains("extra_field"),
             "Error should mention unknown field, got: {}",
@@ -680,9 +680,9 @@ mod tests {
             "extraField": "should be rejected"
         });
 
-        let result = serde_json::from_value::<LogLine>(json);
-        let err = result.expect_err("Should reject unknown fields due to deny_unknown_fields");
-        let err_msg = err.to_string();
+        let err_msg = serde_json::from_value::<LogLine>(json)
+            .expect_err("Should reject unknown fields due to deny_unknown_fields")
+            .to_string();
         assert!(
             err_msg.contains("unknown field") || err_msg.contains("extraField"),
             "Error should mention unknown field, got: {}",
@@ -700,11 +700,8 @@ mod tests {
             // Missing sessionId
         });
 
-        let result = serde_json::from_value::<LogLine>(json);
-        assert!(
-            result.is_err(),
-            "Should fail when required field is missing"
-        );
+        let _err = serde_json::from_value::<LogLine>(json)
+            .expect_err("Should fail when required field is missing");
     }
 
     #[test]
