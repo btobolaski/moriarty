@@ -349,12 +349,13 @@ async fn handle_bash_pretool_hook(tool_input: &serde_json::Value) -> Result<Hook
                 "Bash command modified by rule"
             );
             let mut updated_tool_input = tool_input.clone();
+            let reason = format!(
+                "Command modified by rule '{}' to: {}",
+                rule_name, new_command
+            );
             updated_tool_input["command"] = serde_json::Value::String(new_command);
 
-            Ok(pretool_modify_hook(
-                updated_tool_input,
-                Some(format!("Command modified by rule '{}'", rule_name)),
-            ))
+            Ok(pretool_modify_hook(updated_tool_input, Some(reason)))
         }
         RuleResult::Asked { rule_name } => {
             info!(

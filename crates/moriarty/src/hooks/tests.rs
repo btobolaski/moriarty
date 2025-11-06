@@ -669,10 +669,19 @@ action = { type = "Modify", value = "$1 --dry-run" }
     match result.hook_specific_output {
         Some(HookSpecificOutput::PreToolUse(output)) => {
             assert_eq!(output.permission_decision, Some(PermissionDecision::Allow));
-            assert!(output
+            let reason = output
                 .permission_decision_reason
-                .unwrap()
-                .contains("modified by rule"));
+                .expect("Should have permission decision reason");
+            assert!(
+                reason.contains("modified by rule 'add-dry-run'"),
+                "Reason should include rule name: {}",
+                reason
+            );
+            assert!(
+                reason.contains("to: docker system prune --dry-run"),
+                "Reason should include modified command: {}",
+                reason
+            );
             let updated = output.updated_input.expect("Should have updated input");
             assert_eq!(
                 updated["command"],
