@@ -31,6 +31,17 @@ rules:
     severity: ERROR
     patterns:
       - pattern: todo!(...)
+  - id: let-unwrap-pattern
+    message: "Avoid creating intermediate vars in order to unwrap."
+    languages:
+      - rust
+    severity: ERROR
+    patterns:
+      - pattern-either:
+        - pattern: let $VAR = result.unwrap();
+        - pattern: let $VAR = result.expect(...);
+        - pattern: let $VAR = result.unwrap_err();
+        - pattern: let $VAR = result.expect_err(...);
   - id: uncaptured-expect-err
     message: "expect_err() called without capturing error for validation - error value should be captured and validated to ensure correct error type"
     languages:
