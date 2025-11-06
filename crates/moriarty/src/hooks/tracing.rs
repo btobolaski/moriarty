@@ -83,7 +83,7 @@ pub async fn init_tracing() -> Result<WorkerGuard> {
         .try_init()
     {
         Ok(_) => {
-            tracing::info!(
+            tracing::debug!(
                 log_dir = %log_dir.display(),
                 "Hooks tracing initialized"
             );

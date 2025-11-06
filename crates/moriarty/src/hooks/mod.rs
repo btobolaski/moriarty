@@ -110,7 +110,7 @@ async fn exec_hook_impl<R: Read>(reader: R) -> Result<()> {
         ));
     }
 
-    info!(bytes = bytes_read, "Received hook input from stdin");
+    debug!(bytes = bytes_read, "Received hook input from stdin");
 
     let hook_input = parser::parse_hook_input(&input).map_err(|e| {
         // Truncate and sanitize input for logging to prevent log injection and bloat
@@ -138,7 +138,16 @@ async fn exec_hook_impl<R: Read>(reader: R) -> Result<()> {
         miette::miette!("Failed to parse hook input: {}", e)
     })?;
 
-    info!(?hook_input, "Successfully parsed hook input");
+    // Log hook_input as JSON for better structured logging. The fallback to Debug format
+    // is defensive - HookInput derives Serialize and should always serialize successfully.
+    if let Ok(json) = serde_json::to_string(&hook_input) {
+        info!(hook_input = %json, "Successfully parsed hook input");
+    } else {
+        info!(
+            ?hook_input,
+            "Successfully parsed hook input (JSON serialization failed)"
+        );
+    }
 
     if let HookEventData::PreToolUse {
         ref tool_name,
