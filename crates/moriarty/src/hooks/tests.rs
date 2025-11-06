@@ -108,8 +108,30 @@ async fn test_exec_hook_truncates_long_invalid_input() {
 }
 
 #[tokio::test]
+async fn test_xdg_isolation_verification() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    std::env::set_var("XDG_STATE_HOME", temp_dir.path());
+
+    // Verify the xdg crate sees our isolated directory
+    use crate::persistence::FileType;
+    let log_path = FileType::State.build_path("hooks/hooks.log").await.unwrap();
+
+    assert!(
+        log_path.starts_with(temp_dir.path()),
+        "Log path {:?} should be under temp dir {:?}",
+        log_path,
+        temp_dir.path()
+    );
+}
+
+#[tokio::test]
 async fn test_exec_hook_all_event_types() {
     let _xdg_dir = setup_isolated_xdg_state();
+
+    // Prevent infinite recursion: if this test is running inside a hook's test check,
+    // the Stop event would try to run checks again, including this test, causing deadlock.
+    // Clear CLAUDE_PROJECT_DIR to disable check execution in the Stop hook.
+    std::env::remove_var("CLAUDE_PROJECT_DIR");
 
     let test_cases = vec![
         r#"{"session_id":"s","transcript_path":"/t","cwd":"/c","permission_mode":"default","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"ls"}}"#,

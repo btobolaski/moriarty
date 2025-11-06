@@ -461,39 +461,39 @@ format = ["echo", "format"]
 
     #[tokio::test]
     async fn test_handle_verification_result_approved() {
-        let result = handle_verification_result(
+        handle_verification_result(
             VerificationResult::Approved,
             "tools",
             Path::new("/test/path"),
-        );
-        assert!(result.is_ok());
+        )
+        .expect("Should succeed for Approved result");
     }
 
     #[tokio::test]
     async fn test_handle_verification_result_not_approved() {
-        let result = handle_verification_result(
+        let err = handle_verification_result(
             VerificationResult::NotApproved,
             "tools",
             Path::new("/test/path"),
-        );
-        assert!(result.is_err());
-        let err_msg = format!("{:?}", result.unwrap_err());
+        )
+        .expect_err("Should fail for NotApproved result");
+        let err_msg = format!("{:?}", err);
         assert!(err_msg.contains("Project tools not approved"));
         assert!(err_msg.contains("moriarty approve-project"));
     }
 
     #[tokio::test]
     async fn test_handle_verification_result_config_hash_mismatch() {
-        let result = handle_verification_result(
+        let err = handle_verification_result(
             VerificationResult::ConfigHashMismatch {
                 expected: "abc123".to_string(),
                 actual: "def456".to_string(),
             },
             "checks",
             Path::new("/test/path"),
-        );
-        assert!(result.is_err());
-        let err_msg = format!("{:?}", result.unwrap_err());
+        )
+        .expect_err("Should fail for ConfigHashMismatch result");
+        let err_msg = format!("{:?}", err);
         assert!(err_msg.contains("tools.toml has been modified"));
         assert!(err_msg.contains("abc123"));
         assert!(err_msg.contains("def456"));
@@ -501,7 +501,7 @@ format = ["echo", "format"]
 
     #[tokio::test]
     async fn test_handle_verification_result_binary_hash_mismatch() {
-        let result = handle_verification_result(
+        let err = handle_verification_result(
             VerificationResult::BinaryHashMismatch {
                 item: "mycheck".to_string(),
                 expected: "hash1".to_string(),
@@ -509,9 +509,9 @@ format = ["echo", "format"]
             },
             "checks",
             Path::new("/test/path"),
-        );
-        assert!(result.is_err());
-        let err_msg = format!("{:?}", result.unwrap_err());
+        )
+        .expect_err("Should fail for BinaryHashMismatch result");
+        let err_msg = format!("{:?}", err);
         assert!(err_msg.contains("Binary for 'mycheck' has been modified"));
         assert!(err_msg.contains("hash1"));
         assert!(err_msg.contains("hash2"));
@@ -519,15 +519,15 @@ format = ["echo", "format"]
 
     #[tokio::test]
     async fn test_handle_verification_result_item_not_approved() {
-        let result = handle_verification_result(
+        let err = handle_verification_result(
             VerificationResult::ItemNotApproved {
                 item: "mycheck".to_string(),
             },
             "checks",
             Path::new("/test/path"),
-        );
-        assert!(result.is_err());
-        let err_msg = format!("{:?}", result.unwrap_err());
+        )
+        .expect_err("Should fail for ItemNotApproved result");
+        let err_msg = format!("{:?}", err);
         assert!(err_msg.contains("Item 'mycheck' not approved"));
     }
 
@@ -549,7 +549,10 @@ command = ["echo", "check"]
             .await
             .expect("Should succeed with approved checks");
 
-        assert_eq!(project.settings.commands.lint, Some(vec!["echo".to_string(), "lint".to_string()]));
+        assert_eq!(
+            project.settings.commands.lint,
+            Some(vec!["echo".to_string(), "lint".to_string()])
+        );
         assert!(project.settings.checks.is_some());
         let checks = project.settings.checks.unwrap();
         assert_eq!(checks.len(), 1);
@@ -570,9 +573,10 @@ command = ["echo", "check"]
 "#,
         );
 
-        let result = verify_and_load_project(temp_dir.path().to_path_buf()).await;
-        assert!(result.is_err());
-        let err_msg = format!("{:?}", result.unwrap_err());
+        let err = verify_and_load_project(temp_dir.path().to_path_buf())
+            .await
+            .expect_err("Should fail for unapproved check");
+        let err_msg = format!("{:?}", err);
         assert!(err_msg.contains("not approved"));
     }
 
@@ -623,7 +627,10 @@ lint = ["echo", "lint"]
             .await
             .expect("Should load approved project");
 
-        let outputs = project.run_all_checks().await.expect("Should handle no checks");
+        let outputs = project
+            .run_all_checks()
+            .await
+            .expect("Should handle no checks");
         assert_eq!(outputs.len(), 0);
     }
 
@@ -703,7 +710,10 @@ lint = ["echo", "lint"]
             .await
             .expect("Should load approved project");
 
-        let outputs = project.run_all_commands().await.expect("Should run commands");
+        let outputs = project
+            .run_all_commands()
+            .await
+            .expect("Should run commands");
 
         assert_eq!(outputs.len(), 4);
         // Fixed order: lint, test, build, format
