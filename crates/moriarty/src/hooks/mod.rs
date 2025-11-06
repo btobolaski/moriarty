@@ -356,6 +356,14 @@ async fn handle_bash_pretool_hook(tool_input: &serde_json::Value) -> Result<Hook
                 Some(format!("Command modified by rule '{}'", rule_name)),
             ))
         }
+        RuleResult::Asked { rule_name } => {
+            info!(
+                command = %command,
+                rule = %rule_name,
+                "Bash rule requests user permission"
+            );
+            Ok(pretool_ask_hook())
+        }
         RuleResult::NoMatch => {
             debug!(command = %command, "No bash rules matched, prompting user");
             Ok(pretool_ask_hook())

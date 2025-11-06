@@ -76,6 +76,9 @@ pub enum BashRuleAction {
     Modify(String),
     /// Explicitly allow the command to execute.
     Allow,
+    /// Defer to the user when a command requires explicit authorization but shouldn't be auto-approved.
+    /// Use this for potentially dangerous operations that need case-by-case evaluation.
+    Ask,
 }
 
 /// Load user-level configuration from `~/.config/moriarty/tool_rules.toml`.
@@ -147,6 +150,7 @@ mod tests {
             BashRuleAction::Deny("reason".to_string()),
             BashRuleAction::Modify("$1 --flag".to_string()),
             BashRuleAction::Allow,
+            BashRuleAction::Ask,
         ];
 
         for action in actions {

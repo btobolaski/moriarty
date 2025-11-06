@@ -35,6 +35,9 @@ pub enum RuleResult {
         rule_name: String,
         new_command: String,
     },
+    Asked {
+        rule_name: String,
+    },
     NoMatch,
 }
 
@@ -126,6 +129,16 @@ impl BashRuleEngine {
                         rule_name: rule.name.clone(),
                     }
                 }
+                BashRuleAction::Ask => {
+                    debug!(
+                        rule_name = %rule.name,
+                        command = %command,
+                        "Deferring to user for case-by-case authorization decision"
+                    );
+                    RuleResult::Asked {
+                        rule_name: rule.name.clone(),
+                    }
+                }
             };
         }
 
@@ -193,6 +206,24 @@ mod tests {
             result,
             RuleResult::Allowed {
                 rule_name: "allow-ls".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_ask_rule() {
+        let rules = vec![BashRule {
+            name: "ask-docker".to_string(),
+            pattern: r"^docker".to_string(),
+            action: BashRuleAction::Ask,
+        }];
+
+        let engine = BashRuleEngine::from_config(rules).unwrap();
+        let result = engine.apply_rules("docker build");
+        assert_eq!(
+            result,
+            RuleResult::Asked {
+                rule_name: "ask-docker".to_string()
             }
         );
     }
@@ -276,6 +307,145 @@ mod tests {
                 assert_eq!(rule_name, "deny-all");
             }
             _ => panic!("Expected Denied result"),
+        }
+    }
+
+    #[test]
+    fn test_ask_overrides_allow_with_ordering() {
+        let rules = vec![
+            BashRule {
+                name: "ask-specific-docker".to_string(),
+                pattern: r"^docker\s+system\s+prune".to_string(),
+                action: BashRuleAction::Ask,
+            },
+            BashRule {
+                name: "allow-all-docker".to_string(),
+                pattern: r"^docker".to_string(),
+                action: BashRuleAction::Allow,
+            },
+        ];
+
+        let engine = BashRuleEngine::from_config(rules).unwrap();
+
+        // Specific pattern matches first (ask)
+        let result = engine.apply_rules("docker system prune");
+        assert_eq!(
+            result,
+            RuleResult::Asked {
+                rule_name: "ask-specific-docker".to_string()
+            }
+        );
+
+        // Generic pattern matches second (allow)
+        let result = engine.apply_rules("docker build");
+        assert_eq!(
+            result,
+            RuleResult::Allowed {
+                rule_name: "allow-all-docker".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_ask_vs_deny_ordering() {
+        // Test 1: Ask before Deny - Ask wins
+        let rules = vec![
+            BashRule {
+                name: "ask-specific".to_string(),
+                pattern: r"^docker\s+system\s+prune".to_string(),
+                action: BashRuleAction::Ask,
+            },
+            BashRule {
+                name: "deny-all-docker".to_string(),
+                pattern: r"^docker".to_string(),
+                action: BashRuleAction::Deny("Docker denied".to_string()),
+            },
+        ];
+
+        let engine = BashRuleEngine::from_config(rules).unwrap();
+        let result = engine.apply_rules("docker system prune");
+        assert_eq!(
+            result,
+            RuleResult::Asked {
+                rule_name: "ask-specific".to_string()
+            }
+        );
+
+        // Test 2: Deny before Ask - Deny wins
+        let rules = vec![
+            BashRule {
+                name: "deny-all-docker".to_string(),
+                pattern: r"^docker".to_string(),
+                action: BashRuleAction::Deny("Docker denied".to_string()),
+            },
+            BashRule {
+                name: "ask-specific".to_string(),
+                pattern: r"^docker\s+system\s+prune".to_string(),
+                action: BashRuleAction::Ask,
+            },
+        ];
+
+        let engine = BashRuleEngine::from_config(rules).unwrap();
+        let result = engine.apply_rules("docker system prune");
+        match result {
+            RuleResult::Denied { rule_name, reason } => {
+                assert_eq!(rule_name, "deny-all-docker");
+                assert_eq!(reason, "Docker denied");
+            }
+            _ => panic!("Expected Denied result"),
+        }
+    }
+
+    #[test]
+    fn test_ask_vs_modify_ordering() {
+        // Test 1: Ask before Modify - Ask wins
+        let rules = vec![
+            BashRule {
+                name: "ask-specific".to_string(),
+                pattern: r"^docker\s+system\s+prune".to_string(),
+                action: BashRuleAction::Ask,
+            },
+            BashRule {
+                name: "modify-all-docker".to_string(),
+                pattern: r"^(docker\s+.*)".to_string(),
+                action: BashRuleAction::Modify("$1 --dry-run".to_string()),
+            },
+        ];
+
+        let engine = BashRuleEngine::from_config(rules).unwrap();
+        let result = engine.apply_rules("docker system prune");
+        assert_eq!(
+            result,
+            RuleResult::Asked {
+                rule_name: "ask-specific".to_string()
+            }
+        );
+
+        // Test 2: Modify before Ask - Modify wins
+        let rules = vec![
+            BashRule {
+                name: "modify-all-docker".to_string(),
+                pattern: r"^(docker\s+.*)".to_string(),
+                action: BashRuleAction::Modify("$1 --dry-run".to_string()),
+            },
+            BashRule {
+                name: "ask-specific".to_string(),
+                pattern: r"^docker\s+system\s+prune".to_string(),
+                action: BashRuleAction::Ask,
+            },
+        ];
+
+        let engine = BashRuleEngine::from_config(rules).unwrap();
+        let result = engine.apply_rules("docker system prune");
+        match result {
+            RuleResult::Modified {
+                rule_name,
+                new_command,
+            } => {
+                assert_eq!(rule_name, "modify-all-docker");
+                assert_eq!(new_command, "docker system prune --dry-run");
+            }
+            _ => panic!("Expected Modified result"),
         }
     }
 

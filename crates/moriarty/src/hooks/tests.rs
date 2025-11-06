@@ -599,6 +599,31 @@ async fn test_bash_hook_no_rules_configured() {
 }
 
 #[tokio::test]
+async fn test_bash_hook_rule_asks() {
+    let config = r#"
+[[bash_rules]]
+name = "ask-docker"
+pattern = "^docker"
+action = { type = "Ask" }
+"#;
+    let _xdg_config = setup_user_bash_rules(config).await;
+
+    let tool_input = serde_json::json!({"command": "docker build ."});
+    let result = handle_bash_pretool_hook(&tool_input)
+        .await
+        .expect("Should succeed");
+
+    match result.hook_specific_output {
+        Some(HookSpecificOutput::PreToolUse(output)) => {
+            assert_eq!(output.permission_decision, Some(PermissionDecision::Ask));
+            assert_eq!(output.permission_decision_reason, None);
+            assert_eq!(output.updated_input, None);
+        }
+        _ => panic!("Expected PreToolUse hook specific output"),
+    }
+}
+
+#[tokio::test]
 async fn test_bash_hook_rule_denies() {
     let config = r#"
 [[bash_rules]]
