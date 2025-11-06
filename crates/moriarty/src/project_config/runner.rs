@@ -67,21 +67,17 @@ pub struct CommandOutput {
 /// that ALL configured commands have been explicitly approved before any execution
 /// can occur, preventing unauthorized command execution.
 pub async fn verify_and_load_project(project_dir: PathBuf) -> Result<VerifiedProject> {
-    // Canonicalize path to prevent traversal attacks
     let canonical_dir = project_dir
         .canonicalize()
         .into_diagnostic()
         .with_context(|| format!("Failed to canonicalize path: {}", project_dir.display()))?;
 
-    // Load project settings
     let settings = load_project_settings(canonical_dir.clone()).await?;
 
-    // Load approvals
     let approvals = ProjectApprovals::load()
         .await
         .context("Failed to load project approvals")?;
 
-    // Verify all configured commands
     verify_all_commands(&approvals, &canonical_dir, &settings).await?;
 
     Ok(VerifiedProject {
@@ -90,67 +86,73 @@ pub async fn verify_and_load_project(project_dir: PathBuf) -> Result<VerifiedPro
     })
 }
 
-/// Verifies that all configured commands in the project are approved.
+fn handle_verification_result(
+    result: VerificationResult,
+    item_type_plural: &str,
+    canonical_dir: &Path,
+) -> Result<()> {
+    match result {
+        VerificationResult::Approved => Ok(()),
+        VerificationResult::NotApproved => Err(miette::miette!(
+            "Project {} not approved. Run: moriarty approve-project {}",
+            item_type_plural,
+            canonical_dir.display()
+        )),
+        VerificationResult::ConfigHashMismatch { expected, actual } => Err(miette::miette!(
+            "tools.toml has been modified since approval. \
+             Run: moriarty approve-project {} \
+             (expected: {}, actual: {})",
+            canonical_dir.display(),
+            expected,
+            actual
+        )),
+        VerificationResult::BinaryHashMismatch {
+            item,
+            expected,
+            actual,
+        } => Err(miette::miette!(
+            "Binary for '{}' has been modified since approval. \
+             Run: moriarty approve-project {} \
+             (expected: {}, actual: {})",
+            item,
+            canonical_dir.display(),
+            expected,
+            actual
+        )),
+        VerificationResult::ItemNotApproved { item } => Err(miette::miette!(
+            "Item '{}' not approved. Run: moriarty approve-project {}",
+            item,
+            canonical_dir.display()
+        )),
+    }
+}
+
+/// Verifies that all configured commands and checks in the project are approved.
 ///
 /// Fails fast on the first verification failure to prevent partial execution
-/// of commands where some are approved and others are not.
+/// of items where some are approved and others are not.
 async fn verify_all_commands(
     approvals: &ProjectApprovals,
     canonical_dir: &Path,
     settings: &ProjectConfig,
 ) -> Result<()> {
-    // Get all configured commands
-    let all_commands = settings.commands.all();
-
-    // Verify each command
-    for (command_name, _) in &all_commands {
+    for (command_name, _) in &settings.commands.all() {
         let verification_result = approvals
             .verify_project(canonical_dir, command_name)
             .await
             .with_context(|| format!("Failed to verify command '{}'", command_name))?;
 
-        match verification_result {
-            VerificationResult::Approved => {
-                // Continue to next command
-            }
-            VerificationResult::NotApproved => {
-                return Err(miette::miette!(
-                    "Project tools not approved. Run: moriarty approve-project {}",
-                    canonical_dir.display()
-                ));
-            }
-            VerificationResult::ConfigHashMismatch { expected, actual } => {
-                return Err(miette::miette!(
-                    "tools.toml has been modified since approval. \
-                     Run: moriarty approve-project {} \
-                     (expected: {}, actual: {})",
-                    canonical_dir.display(),
-                    expected,
-                    actual
-                ));
-            }
-            VerificationResult::BinaryHashMismatch {
-                item,
-                expected,
-                actual,
-            } => {
-                return Err(miette::miette!(
-                    "Binary for '{}' has been modified since approval. \
-                     Run: moriarty approve-project {} \
-                     (expected: {}, actual: {})",
-                    item,
-                    canonical_dir.display(),
-                    expected,
-                    actual
-                ));
-            }
-            VerificationResult::ItemNotApproved { item } => {
-                return Err(miette::miette!(
-                    "Tool '{}' not approved. Run: moriarty approve-project {}",
-                    item,
-                    canonical_dir.display()
-                ));
-            }
+        handle_verification_result(verification_result, "tools", canonical_dir)?;
+    }
+
+    if let Some(checks) = &settings.checks {
+        for check in checks {
+            let verification_result = approvals
+                .verify_check(canonical_dir, &check.name)
+                .await
+                .with_context(|| format!("Failed to verify check '{}'", check.name))?;
+
+            handle_verification_result(verification_result, "checks", canonical_dir)?;
         }
     }
 
@@ -159,7 +161,6 @@ async fn verify_all_commands(
 
 impl VerifiedProject {
     pub async fn run_command(&self, command_name: &str) -> Result<CommandOutput> {
-        // Get the command from settings
         let maybe_command = match command_name {
             "lint" => &self.settings.commands.lint,
             "test" => &self.settings.commands.test,
@@ -187,7 +188,6 @@ impl VerifiedProject {
             ));
         }
 
-        // Execute the command
         self.execute_command(command_name, command).await
     }
 
@@ -202,10 +202,60 @@ impl VerifiedProject {
             return Ok(Vec::new());
         }
 
-        // Create futures for all commands
-        let command_futures = stream::iter(all_commands.into_iter().map(|(name, command)| {
-            // Must clone PathBuf because async closure captures by move and multiple
-            // closures need access to canonical_dir. Can't share reference across threads.
+        let items: Vec<_> = all_commands.into_iter().collect();
+
+        // Sort to match Commands::all() order (lint→test→build→format).
+        // This provides consistent output ordering despite parallel execution,
+        // matching user expectations from the MCP protocol's standardized tool order.
+        let sort_fn = |output: &CommandOutput| match output.name.as_str() {
+            "lint" => 0,
+            "test" => 1,
+            "build" => 2,
+            "format" => 3,
+            _ => 999,
+        };
+
+        self.run_items_parallel(items, "command", sort_fn).await
+    }
+
+    /// Runs all configured checks in parallel with concurrency limit.
+    ///
+    /// Checks that exit with non-zero status are captured in the output,
+    /// not treated as errors. Only execution failures (binary not found, etc) error out.
+    pub async fn run_all_checks(&self) -> Result<Vec<CommandOutput>> {
+        let checks = match &self.settings.checks {
+            Some(checks) => checks,
+            None => return Ok(Vec::new()),
+        };
+
+        if checks.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let items: Vec<_> = checks
+            .iter()
+            .map(|check| (check.name.clone(), check.command.clone()))
+            .collect();
+
+        // Sort alphabetically by check name for consistent output
+        let sort_fn = |output: &CommandOutput| output.name.clone();
+
+        self.run_items_parallel(items, "check", sort_fn).await
+    }
+
+    /// Preserves different sorting strategies: commands use fixed ordering (MCP protocol)
+    /// while checks use alphabetical ordering.
+    async fn run_items_parallel<K>(
+        &self,
+        items: Vec<(String, Vec<String>)>,
+        item_type: &str,
+        sort_fn: impl Fn(&CommandOutput) -> K,
+    ) -> Result<Vec<CommandOutput>>
+    where
+        K: Ord,
+    {
+        let item_futures = stream::iter(items.into_iter().map(|(name, command)| {
+            // buffer_unordered requires owned values in closures, cannot share &self across tasks.
             let canonical_dir = self.canonical_dir.clone();
             async move {
                 let result = Self::execute_command_static(&canonical_dir, &name, &command).await;
@@ -215,29 +265,19 @@ impl VerifiedProject {
         .buffer_unordered(MAX_CONCURRENT_COMMANDS)
         .collect::<Vec<_>>();
 
-        let results = command_futures.await;
+        let results = item_futures.await;
 
-        // Convert results, propagating any errors
         let mut outputs = Vec::new();
         for (name, _command, result) in results {
             match result {
                 Ok(output) => outputs.push(output),
                 Err(e) => {
-                    return Err(e.context(format!("Failed to execute command '{}'", name)));
+                    return Err(e.context(format!("Failed to execute {} '{}'", item_type, name)));
                 }
             }
         }
 
-        // Sort to match Commands::all() order (lint→test→build→format).
-        // This provides consistent output ordering despite parallel execution,
-        // matching user expectations from the MCP protocol's standardized tool order.
-        outputs.sort_by_key(|output| match output.name.as_str() {
-            "lint" => 0,
-            "test" => 1,
-            "build" => 2,
-            "format" => 3,
-            _ => 999,
-        });
+        outputs.sort_by_key(sort_fn);
 
         Ok(outputs)
     }
@@ -257,7 +297,9 @@ impl VerifiedProject {
         name: &str,
         command: &[String],
     ) -> Result<CommandOutput> {
-        let (cmd, args) = command.split_first().expect("command is not empty");
+        let (cmd, args) = command
+            .split_first()
+            .expect("invariant: verify_all_commands ensures non-empty before execution");
 
         let output = Command::new(cmd)
             .args(args)
@@ -284,6 +326,7 @@ impl VerifiedProject {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::project_config::approvals;
     use tempfile::TempDir;
 
     fn setup_test_project(config_content: &str) -> TempDir {
@@ -293,6 +336,19 @@ mod tests {
         std::fs::write(config_dir.join("tools.toml"), config_content)
             .expect("Failed to write tools.toml");
         temp_dir
+    }
+
+    fn setup_isolated_xdg_config() -> TempDir {
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+        temp_dir
+    }
+
+    async fn setup_test_project_with_approvals(config_content: &str) -> (TempDir, TempDir) {
+        let xdg_dir = setup_isolated_xdg_config();
+        let temp_dir = setup_test_project(config_content);
+        approvals::approve_project_config(temp_dir.path(), config_content).await;
+        (temp_dir, xdg_dir)
     }
 
     #[tokio::test]
@@ -401,5 +457,259 @@ format = ["echo", "format"]
                 .expect_err("Should fail on approval check")
         );
         assert!(err_msg.contains("not approved"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_verification_result_approved() {
+        let result = handle_verification_result(
+            VerificationResult::Approved,
+            "tools",
+            Path::new("/test/path"),
+        );
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_handle_verification_result_not_approved() {
+        let result = handle_verification_result(
+            VerificationResult::NotApproved,
+            "tools",
+            Path::new("/test/path"),
+        );
+        assert!(result.is_err());
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(err_msg.contains("Project tools not approved"));
+        assert!(err_msg.contains("moriarty approve-project"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_verification_result_config_hash_mismatch() {
+        let result = handle_verification_result(
+            VerificationResult::ConfigHashMismatch {
+                expected: "abc123".to_string(),
+                actual: "def456".to_string(),
+            },
+            "checks",
+            Path::new("/test/path"),
+        );
+        assert!(result.is_err());
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(err_msg.contains("tools.toml has been modified"));
+        assert!(err_msg.contains("abc123"));
+        assert!(err_msg.contains("def456"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_verification_result_binary_hash_mismatch() {
+        let result = handle_verification_result(
+            VerificationResult::BinaryHashMismatch {
+                item: "mycheck".to_string(),
+                expected: "hash1".to_string(),
+                actual: "hash2".to_string(),
+            },
+            "checks",
+            Path::new("/test/path"),
+        );
+        assert!(result.is_err());
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(err_msg.contains("Binary for 'mycheck' has been modified"));
+        assert!(err_msg.contains("hash1"));
+        assert!(err_msg.contains("hash2"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_verification_result_item_not_approved() {
+        let result = handle_verification_result(
+            VerificationResult::ItemNotApproved {
+                item: "mycheck".to_string(),
+            },
+            "checks",
+            Path::new("/test/path"),
+        );
+        assert!(result.is_err());
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(err_msg.contains("Item 'mycheck' not approved"));
+    }
+
+    #[tokio::test]
+    async fn test_verify_all_commands_with_checks() {
+        let (temp_dir, _xdg_dir) = setup_test_project_with_approvals(
+            r#"
+[commands]
+lint = ["echo", "lint"]
+
+[[checks]]
+name = "mycheck"
+command = ["echo", "check"]
+"#,
+        )
+        .await;
+
+        let project = verify_and_load_project(temp_dir.path().to_path_buf())
+            .await
+            .expect("Should succeed with approved checks");
+
+        assert_eq!(project.settings.commands.lint, Some(vec!["echo".to_string(), "lint".to_string()]));
+        assert!(project.settings.checks.is_some());
+        let checks = project.settings.checks.unwrap();
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].name, "mycheck");
+    }
+
+    #[tokio::test]
+    async fn test_verify_all_commands_checks_not_approved() {
+        let _xdg_dir = setup_isolated_xdg_config();
+        let temp_dir = setup_test_project(
+            r#"
+[commands]
+lint = ["echo", "lint"]
+
+[[checks]]
+name = "unapproved_check"
+command = ["echo", "check"]
+"#,
+        );
+
+        let result = verify_and_load_project(temp_dir.path().to_path_buf()).await;
+        assert!(result.is_err());
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(err_msg.contains("not approved"));
+    }
+
+    #[tokio::test]
+    async fn test_run_all_checks_success() {
+        let (temp_dir, _xdg_dir) = setup_test_project_with_approvals(
+            r#"
+[commands]
+
+[[checks]]
+name = "check1"
+command = ["echo", "first"]
+
+[[checks]]
+name = "check2"
+command = ["echo", "second"]
+"#,
+        )
+        .await;
+
+        let project = verify_and_load_project(temp_dir.path().to_path_buf())
+            .await
+            .expect("Should load approved project");
+
+        let outputs = project.run_all_checks().await.expect("Should run checks");
+
+        assert_eq!(outputs.len(), 2);
+        // Checks are sorted alphabetically
+        assert_eq!(outputs[0].name, "check1");
+        assert_eq!(outputs[1].name, "check2");
+        assert!(outputs[0].stdout.contains("first"));
+        assert!(outputs[1].stdout.contains("second"));
+        assert_eq!(outputs[0].exit_code, Some(0));
+        assert_eq!(outputs[1].exit_code, Some(0));
+    }
+
+    #[tokio::test]
+    async fn test_run_all_checks_empty() {
+        let (temp_dir, _xdg_dir) = setup_test_project_with_approvals(
+            r#"
+[commands]
+lint = ["echo", "lint"]
+"#,
+        )
+        .await;
+
+        let project = verify_and_load_project(temp_dir.path().to_path_buf())
+            .await
+            .expect("Should load approved project");
+
+        let outputs = project.run_all_checks().await.expect("Should handle no checks");
+        assert_eq!(outputs.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_run_all_checks_nonzero_exit() {
+        let (temp_dir, _xdg_dir) = setup_test_project_with_approvals(
+            r#"
+[commands]
+
+[[checks]]
+name = "failing_check"
+command = ["sh", "-c", "exit 1"]
+"#,
+        )
+        .await;
+
+        let project = verify_and_load_project(temp_dir.path().to_path_buf())
+            .await
+            .expect("Should load approved project");
+
+        let outputs = project
+            .run_all_checks()
+            .await
+            .expect("Non-zero exit should not error");
+
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].exit_code, Some(1));
+    }
+
+    #[tokio::test]
+    async fn test_run_all_checks_alphabetical_sorting() {
+        let (temp_dir, _xdg_dir) = setup_test_project_with_approvals(
+            r#"
+[commands]
+
+[[checks]]
+name = "zebra"
+command = ["echo", "z"]
+
+[[checks]]
+name = "alpha"
+command = ["echo", "a"]
+
+[[checks]]
+name = "beta"
+command = ["echo", "b"]
+"#,
+        )
+        .await;
+
+        let project = verify_and_load_project(temp_dir.path().to_path_buf())
+            .await
+            .expect("Should load approved project");
+
+        let outputs = project.run_all_checks().await.expect("Should run checks");
+
+        assert_eq!(outputs.len(), 3);
+        assert_eq!(outputs[0].name, "alpha");
+        assert_eq!(outputs[1].name, "beta");
+        assert_eq!(outputs[2].name, "zebra");
+    }
+
+    #[tokio::test]
+    async fn test_run_all_commands_fixed_sorting() {
+        let (temp_dir, _xdg_dir) = setup_test_project_with_approvals(
+            r#"
+[commands]
+format = ["echo", "format"]
+build = ["echo", "build"]
+test = ["echo", "test"]
+lint = ["echo", "lint"]
+"#,
+        )
+        .await;
+
+        let project = verify_and_load_project(temp_dir.path().to_path_buf())
+            .await
+            .expect("Should load approved project");
+
+        let outputs = project.run_all_commands().await.expect("Should run commands");
+
+        assert_eq!(outputs.len(), 4);
+        // Fixed order: lint, test, build, format
+        assert_eq!(outputs[0].name, "lint");
+        assert_eq!(outputs[1].name, "test");
+        assert_eq!(outputs[2].name, "build");
+        assert_eq!(outputs[3].name, "format");
     }
 }

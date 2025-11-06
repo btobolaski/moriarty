@@ -186,4 +186,10 @@ pub enum TestCommand {
         #[arg(default_value = ".")]
         project_dir: PathBuf,
     },
+    /// Run all configured project checks in parallel
+    Checks {
+        /// The project directory containing .config/tools.toml
+        #[arg(default_value = ".")]
+        project_dir: PathBuf,
+    },
 }
