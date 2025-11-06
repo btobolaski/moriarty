@@ -11,6 +11,7 @@ mod logs;
 mod mcp;
 mod persistence;
 mod project_config;
+mod test_runner;
 mod tui;
 mod user_config;
 
@@ -105,6 +106,9 @@ async fn main() -> miette::Result<()> {
         Command::Hooks { subcommand } => {
             hooks::exec_hooks(subcommand).await?;
         }
+        Command::Test { subcommand } => {
+            test_runner::exec_test(subcommand).await?;
+        }
     }
 
     Ok(())
@@ -161,10 +165,25 @@ pub enum Command {
         #[command(subcommand)]
         subcommand: HooksCommand,
     },
+    /// Run project tests and tools
+    Test {
+        #[command(subcommand)]
+        subcommand: TestCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 pub enum HooksCommand {
     /// Execute hook with input and log the results
     Exec,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TestCommand {
+    /// Run all configured project tools in parallel
+    ProjectTools {
+        /// The project directory containing .config/tools.toml
+        #[arg(default_value = ".")]
+        project_dir: PathBuf,
+    },
 }

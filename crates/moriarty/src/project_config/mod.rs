@@ -1,6 +1,6 @@
 //! Project configuration and approval system.
 //!
-//! This module combines two related concerns:
+//! This module combines three related concerns:
 //!
 //! - **[`config`]**: Loading and parsing `.config/tools.toml` files into typed structures.
 //!   Provides [`ProjectConfig`] and [`Commands`] types, along with the [`load_project_settings`]
@@ -10,33 +10,37 @@
 //!   Tracks SHA-256 hashes of configuration files and binaries, provides verification logic,
 //!   and manages approval persistence with file locking.
 //!
+//! - **[`runner`]**: Verified command execution for project tools. Combines configuration loading
+//!   and approval verification into a safe execution model. Provides [`verify_and_load_project`]
+//!   for loading verified projects and [`VerifiedProject`] for running commands.
+//!
 //! ## Usage
 //!
 //! Most consumers should use the re-exported types from the module root, which provides a
 //! convenient flat namespace. For example:
 //!
 //! ```no_run
-//! use moriarty::project_config::{load_project_settings, ProjectApprovals};
+//! use moriarty::project_config::{verify_and_load_project};
 //!
 //! # async fn example() -> miette::Result<()> {
-//! // Load configuration
-//! let config = load_project_settings("/path/to/project".into()).await?;
+//! // Verify and load project (combines config + approval verification)
+//! let project = verify_and_load_project("/path/to/project".into()).await?;
 //!
-//! // Verify approvals
-//! let approvals = ProjectApprovals::load().await?;
-//! let result = approvals.verify_project(
-//!     std::path::Path::new("/path/to/project"),
-//!     "lint"
-//! ).await?;
+//! // Run a single command
+//! let output = project.run_command("lint").await?;
+//!
+//! // Or run all commands in parallel
+//! let results = project.run_all_commands().await?;
 //! # Ok(())
 //! # }
 //! ```
 //!
-//! Direct access to submodules ([`config`] and [`approvals`]) is provided for advanced use cases
-//! where you need access to non-re-exported functionality.
+//! Direct access to submodules ([`config`], [`approvals`], and [`runner`]) is provided for
+//! advanced use cases where you need access to non-re-exported functionality.
 
 pub mod approvals;
 pub mod config;
+pub mod runner;
 
 // Re-export commonly used types and functions
 pub use approvals::{
@@ -44,3 +48,7 @@ pub use approvals::{
     resolve_binary_path_with_original, CommandApproval, ProjectApprovals, VerificationResult,
 };
 pub use config::{load_project_settings, ProjectConfig};
+// Allow unused imports warning for re-exports that are part of the public API
+// but not used within this crate
+#[allow(unused_imports)]
+pub use runner::{verify_and_load_project, CommandOutput, VerifiedProject};

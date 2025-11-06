@@ -1,5 +1,5 @@
 use super::*;
-use crate::project_config::approvals;
+use crate::project_config::{approvals, load_project_settings};
 use tempfile::TempDir;
 
 // IMPORTANT: Tests use `_xdg_dir` variables to keep TempDir instances alive.
@@ -128,7 +128,7 @@ test = ["echo", "test output"]
 
 #[tokio::test]
 async fn test_run_command_not_configured() {
-    // Verify that commands not in tools.toml are rejected even if approved
+    // Verify that commands not in tools.toml are rejected with appropriate error
     let (temp_dir, _xdg_dir) = setup_project_dir_with_approvals(
         r#"
 [commands]
@@ -145,8 +145,8 @@ lint = ["cargo", "clippy"]
 
     match result {
         Err(error) => {
-            assert_eq!(error.code, ErrorCode::INVALID_REQUEST);
-            assert!(error.message.contains("not approved"));
+            assert_eq!(error.code, ErrorCode::RESOURCE_NOT_FOUND);
+            assert!(error.message.contains("not configured"));
         }
         Ok(_) => panic!("Expected error for unconfigured command"),
     }
@@ -346,7 +346,7 @@ test = ["echo", "hello"]
 
     match result {
         Err(error) => {
-            assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
+            assert_eq!(error.code, ErrorCode::INVALID_REQUEST);
         }
         Ok(_) => panic!("Expected error for path traversal attempt"),
     }

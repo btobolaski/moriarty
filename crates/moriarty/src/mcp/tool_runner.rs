@@ -74,9 +74,8 @@ use rmcp::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use tokio::process::Command;
 
-use crate::project_config::{load_project_settings, ProjectApprovals, VerificationResult};
+use crate::project_config::runner::verify_and_load_project;
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RunArgs {
@@ -134,156 +133,43 @@ pub struct ToolRunner {
 
 impl ToolRunner {
     async fn run_command(cmd: ProjectCommand, args: RunArgs) -> Result<CallToolResult, McpError> {
-        // Canonicalize path to prevent traversal attacks
-        let canonical_dir = args.project_dir.canonicalize().map_err(|e| McpError {
-            code: ErrorCode::INVALID_PARAMS,
-            message: format!(
-                "Invalid project directory: {} ({})",
-                args.project_dir.display(),
-                e
-            )
-            .into(),
-            data: None,
-        })?;
-
-        let settings = match load_project_settings(canonical_dir.clone()).await {
-            Ok(settings) => settings,
-            Err(error) => {
-                return Err(McpError {
-                    code: ErrorCode::INTERNAL_ERROR,
-                    message: format!("{error:?}").into(),
-                    data: None,
-                });
-            }
-        };
-
-        // Verify approval before executing
-        let command_name = cmd.as_str();
-        let approvals = ProjectApprovals::load().await.map_err(|e| McpError {
-            code: ErrorCode::INTERNAL_ERROR,
-            message: format!("Failed to load approvals: {}", e).into(),
-            data: None,
-        })?;
-
-        let verification_result = approvals
-            .verify_project(&canonical_dir, command_name)
+        let project = verify_and_load_project(args.project_dir)
             .await
             .map_err(|e| McpError {
-                code: ErrorCode::INTERNAL_ERROR,
-                message: format!("Failed to verify approvals: {}", e).into(),
+                code: ErrorCode::INVALID_REQUEST,
+                message: format!("{:?}", e).into(),
                 data: None,
             })?;
 
-        match verification_result {
-            VerificationResult::Approved => {
-                // Continue with execution
-            }
-            VerificationResult::NotApproved => {
-                return Err(McpError {
-                    code: ErrorCode::INVALID_REQUEST,
-                    message: format!(
-                        "Project tools not approved. Run: moriarty approve-project {}",
-                        canonical_dir.display()
-                    )
-                    .into(),
+        // Run the specific command
+        let command_name = cmd.as_str();
+        let output = project.run_command(command_name).await.map_err(|e| {
+            let error_msg = format!("{:?}", e);
+            if error_msg.contains("not configured") {
+                McpError {
+                    code: ErrorCode::RESOURCE_NOT_FOUND,
+                    message: format!("The {} command was not configured for the project", cmd)
+                        .into(),
                     data: None,
-                });
-            }
-            VerificationResult::ConfigHashMismatch { expected, actual } => {
-                return Err(McpError {
-                    code: ErrorCode::INVALID_REQUEST,
-                    message: format!(
-                        "tools.toml has been modified since approval. \
-                        Run: moriarty approve-project {} \
-                        (expected: {}, actual: {})",
-                        canonical_dir.display(),
-                        expected,
-                        actual
-                    )
-                    .into(),
+                }
+            } else {
+                McpError {
+                    code: ErrorCode::INTERNAL_ERROR,
+                    message: error_msg.into(),
                     data: None,
-                });
-            }
-            VerificationResult::BinaryHashMismatch {
-                item,
-                expected,
-                actual,
-            } => {
-                return Err(McpError {
-                    code: ErrorCode::INVALID_REQUEST,
-                    message: format!(
-                        "Binary for '{}' has been modified since approval. \
-                        Run: moriarty approve-project {} \
-                        (expected: {}, actual: {})",
-                        item,
-                        canonical_dir.display(),
-                        expected,
-                        actual
-                    )
-                    .into(),
-                    data: None,
-                });
-            }
-            VerificationResult::ItemNotApproved { item } => {
-                return Err(McpError {
-                    code: ErrorCode::INVALID_REQUEST,
-                    message: format!(
-                        "Tool '{}' not approved. Run: moriarty approve-project {}",
-                        item,
-                        canonical_dir.display()
-                    )
-                    .into(),
-                    data: None,
-                });
-            }
-        }
-
-        let maybe_command = match cmd {
-            ProjectCommand::Build => settings.commands.build,
-            ProjectCommand::Format => settings.commands.format,
-            ProjectCommand::Lint => settings.commands.lint,
-            ProjectCommand::Test => settings.commands.test,
-        };
-
-        match maybe_command {
-            Some(command) if !command.is_empty() => {
-                let (cmd, args_slice) = command.split_first().expect("command is not empty");
-
-                let mut command_runner = Command::new(cmd);
-                command_runner.current_dir(canonical_dir);
-                command_runner.args(args_slice);
-
-                match command_runner.output().await {
-                    Ok(result) => {
-                        // Use lossy UTF-8 conversion to handle potentially invalid encodings
-                        // in command output. This prevents server crashes while allowing
-                        // output to be displayed with replacement characters (�).
-                        let stderr = String::from_utf8_lossy(&result.stderr).to_string();
-                        let stdout = String::from_utf8_lossy(&result.stdout).to_string();
-
-                        Ok(CallToolResult {
-                            content: vec![
-                                Content::text(format!("stdout: \n\n {stdout}")),
-                                Content::text(format!("stderr: \n\n {stderr}")),
-                            ],
-                            is_error: Some(!matches!(result.status.code(), Some(0))),
-                            meta: None,
-                            structured_content: None,
-                        })
-                    }
-                    Err(error) => Err(McpError {
-                        code: ErrorCode::INTERNAL_ERROR,
-                        message: format!("failed to run {cmd} command due to {error:?}").into(),
-                        data: None,
-                    }),
                 }
             }
-            Some(_) | None => Err(McpError {
-                code: ErrorCode::RESOURCE_NOT_FOUND,
-                message: format!("The {} command was not configured for the project", cmd).into(),
-                data: None,
-            }),
-        }
+        })?;
+
+        Ok(CallToolResult {
+            content: vec![
+                Content::text(format!("stdout: \n\n {}", output.stdout)),
+                Content::text(format!("stderr: \n\n {}", output.stderr)),
+            ],
+            is_error: Some(!matches!(output.exit_code, Some(0))),
+            meta: None,
+            structured_content: None,
+        })
     }
 }
 
