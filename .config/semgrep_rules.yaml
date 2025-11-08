@@ -32,7 +32,7 @@ rules:
     patterns:
       - pattern: todo!(...)
   - id: let-unwrap-pattern
-    message: "Avoid creating intermediate vars in order to unwrap."
+    message: "Avoid using let with panic-prone methods. Use pattern matching instead: if let Ok/Err or match."
     languages:
       - rust
     severity: ERROR
@@ -59,3 +59,13 @@ rules:
           format!(..., $EXPR.expect_err(...), ...)
       - pattern-not-inside: |
           format!(..., $EXPR.expect_err(...))
+  - id: match-with-panic-ok-branch
+    message: "Use unwrap_err() instead of matching with a panic on Ok branch. Example: let err = result.unwrap_err(); or assert!(result.unwrap_err().contains(...))"
+    languages:
+      - rust
+    severity: ERROR
+    pattern: |
+      match $RESULT {
+          Err($ERR) => $BODY,
+          Ok($OK) => panic!(...),
+      }

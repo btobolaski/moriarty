@@ -6,6 +6,10 @@ build = ["cargo", "build"]
 format = ["cargo", "fmt"]
 
 [[checks]]
+name = "fmt"
+command = ["cargo", "fmt"]
+
+[[checks]]
 name = "check"
 command = ["cargo", "check"]
 
