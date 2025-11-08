@@ -446,16 +446,14 @@ mod tests {
             args: vec![],
         };
 
-        let result = GitReadOnly::run_git_command("status", args.project_dir, args.args).await;
+        let Err(error) = GitReadOnly::run_git_command("status", args.project_dir, args.args).await
+        else {
+            panic!("Expected error for directory without .config/tools.toml");
+        };
 
-        match result {
-            Err(error) => {
-                assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
-                assert!(error.message.contains("Invalid project directory"));
-                assert!(error.message.contains("missing .config/tools.toml"));
-            }
-            Ok(_) => panic!("Expected error for directory without .config/tools.toml"),
-        }
+        assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
+        assert!(error.message.contains("Invalid project directory"));
+        assert!(error.message.contains("missing .config/tools.toml"));
     }
 
     #[tokio::test]
@@ -465,14 +463,12 @@ mod tests {
             args: vec![],
         };
 
-        let result = GitReadOnly::run_git_command("status", args.project_dir, args.args).await;
+        let Err(error) = GitReadOnly::run_git_command("status", args.project_dir, args.args).await
+        else {
+            panic!("Expected error for nonexistent directory");
+        };
 
-        match result {
-            Err(error) => {
-                assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
-            }
-            Ok(_) => panic!("Expected error for nonexistent directory"),
-        }
+        assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
     }
 
     #[tokio::test]
@@ -650,17 +646,15 @@ mod tests {
             args: vec![],
         };
 
-        let result = GitReadOnly::run_git_command("status", args.project_dir, args.args).await;
+        // Should reject with INVALID_PARAMS - either from canonicalize failing
+        // or from missing .config/tools.toml
+        let Err(error) = GitReadOnly::run_git_command("status", args.project_dir, args.args).await
+        else {
+            panic!("Expected error for path traversal attempt");
+        };
 
-        match result {
-            Err(error) => {
-                // Should reject with INVALID_PARAMS - either from canonicalize failing
-                // or from missing .config/tools.toml
-                assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
-                assert!(error.message.contains("Invalid project directory"));
-            }
-            Ok(_) => panic!("Expected error for path traversal attempt"),
-        }
+        assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
+        assert!(error.message.contains("Invalid project directory"));
     }
 
     #[tokio::test]

@@ -141,15 +141,12 @@ lint = ["cargo", "clippy"]
         project_dir: temp_dir.path().to_path_buf(),
     };
 
-    let result = ToolRunner::run_command(ProjectCommand::Test, args).await;
+    let Err(error) = ToolRunner::run_command(ProjectCommand::Test, args).await else {
+        panic!("Expected error for unconfigured command");
+    };
 
-    match result {
-        Err(error) => {
-            assert_eq!(error.code, ErrorCode::RESOURCE_NOT_FOUND);
-            assert!(error.message.contains("not configured"));
-        }
-        Ok(_) => panic!("Expected error for unconfigured command"),
-    }
+    assert_eq!(error.code, ErrorCode::RESOURCE_NOT_FOUND);
+    assert!(error.message.contains("not configured"));
 }
 
 #[tokio::test]
@@ -167,15 +164,12 @@ test = ["echo", "hello"]
         project_dir: temp_dir.path().to_path_buf(),
     };
 
-    let result = ToolRunner::run_command(ProjectCommand::Test, args).await;
+    let Err(error) = ToolRunner::run_command(ProjectCommand::Test, args).await else {
+        panic!("Expected error for unapproved project");
+    };
 
-    match result {
-        Err(error) => {
-            assert_eq!(error.code, ErrorCode::INVALID_REQUEST);
-            assert!(error.message.contains("not approved"));
-        }
-        Ok(_) => panic!("Expected error for unapproved project"),
-    }
+    assert_eq!(error.code, ErrorCode::INVALID_REQUEST);
+    assert!(error.message.contains("not approved"));
 }
 
 #[tokio::test]
@@ -223,15 +217,12 @@ test = ["echo", "modified"]
         project_dir: temp_dir.path().to_path_buf(),
     };
 
-    let result = ToolRunner::run_command(ProjectCommand::Test, args).await;
+    let Err(error) = ToolRunner::run_command(ProjectCommand::Test, args).await else {
+        panic!("Expected error for modified config");
+    };
 
-    match result {
-        Err(error) => {
-            assert_eq!(error.code, ErrorCode::INVALID_REQUEST);
-            assert!(error.message.contains("tools.toml has been modified"));
-        }
-        Ok(_) => panic!("Expected error for modified config"),
-    }
+    assert_eq!(error.code, ErrorCode::INVALID_REQUEST);
+    assert!(error.message.contains("tools.toml has been modified"));
 }
 
 #[tokio::test]
@@ -338,14 +329,11 @@ test = ["echo", "hello"]
         project_dir: malicious_path,
     };
 
-    let result = ToolRunner::run_command(ProjectCommand::Test, args).await;
+    let Err(error) = ToolRunner::run_command(ProjectCommand::Test, args).await else {
+        panic!("Expected error for path traversal attempt");
+    };
 
-    match result {
-        Err(error) => {
-            assert_eq!(error.code, ErrorCode::INVALID_REQUEST);
-        }
-        Ok(_) => panic!("Expected error for path traversal attempt"),
-    }
+    assert_eq!(error.code, ErrorCode::INVALID_REQUEST);
 }
 
 #[tokio::test]
@@ -431,21 +419,18 @@ test = ["{}"]
         project_dir: temp_dir.path().to_path_buf(),
     };
 
-    let result = ToolRunner::run_command(ProjectCommand::Test, args).await;
+    let Err(error) = ToolRunner::run_command(ProjectCommand::Test, args).await else {
+        panic!("TOCTOU attack should be detected - binary was swapped after approval");
+    };
 
-    match result {
-        Err(error) => {
-            assert_eq!(error.code, ErrorCode::INVALID_REQUEST);
-            let msg_lower = error.message.to_lowercase();
-            assert!(
-                (msg_lower.contains("binary") || msg_lower.contains("modified"))
-                    && (msg_lower.contains("hash") || msg_lower.contains("sha256")),
-                "Error should indicate binary hash mismatch. Got: {}",
-                error.message
-            );
-        }
-        Ok(_) => panic!("TOCTOU attack should be detected - binary was swapped after approval"),
-    }
+    assert_eq!(error.code, ErrorCode::INVALID_REQUEST);
+    let msg_lower = error.message.to_lowercase();
+    assert!(
+        (msg_lower.contains("binary") || msg_lower.contains("modified"))
+            && (msg_lower.contains("hash") || msg_lower.contains("sha256")),
+        "Error should indicate binary hash mismatch. Got: {}",
+        error.message
+    );
 }
 
 #[tokio::test]
@@ -512,25 +497,20 @@ test = ["{}"]
             project_dir: temp_dir.path().to_path_buf(),
         };
 
-        let result = ToolRunner::run_command(ProjectCommand::Test, args).await;
+        let Err(error) = ToolRunner::run_command(ProjectCommand::Test, args).await else {
+            panic!("Symlink TOCTOU attack should be detected - target was changed");
+        };
 
-        match result {
-            Err(error) => {
-                assert_eq!(error.code, ErrorCode::INVALID_REQUEST);
-                let msg_lower = error.message.to_lowercase();
-                assert!(
-                    (msg_lower.contains("canonical path")
-                        || msg_lower.contains("binary")
-                        || msg_lower.contains("modified"))
-                        && (msg_lower.contains("hash") || msg_lower.contains("sha256")),
-                    "Error should indicate path or hash mismatch. Got: {}",
-                    error.message
-                );
-            }
-            Ok(_) => {
-                panic!("Symlink TOCTOU attack should be detected - target was changed")
-            }
-        }
+        assert_eq!(error.code, ErrorCode::INVALID_REQUEST);
+        let msg_lower = error.message.to_lowercase();
+        assert!(
+            (msg_lower.contains("canonical path")
+                || msg_lower.contains("binary")
+                || msg_lower.contains("modified"))
+                && (msg_lower.contains("hash") || msg_lower.contains("sha256")),
+            "Error should indicate path or hash mismatch. Got: {}",
+            error.message
+        );
     }
 }
 
@@ -595,21 +575,19 @@ build = ["echo", "build"]
     std::fs::write(config_dir.join("tools.toml"), &config_content_v2).unwrap();
 
     // Step 4: Attempt execution - should fail due to config hash mismatch
-    let result = ToolRunner::run_command(ProjectCommand::Test, args.clone()).await;
-    match result {
-        Err(error) => {
-            assert_eq!(error.code, ErrorCode::INVALID_REQUEST);
-            let msg_lower = error.message.to_lowercase();
-            assert!(
-                msg_lower.contains("modified")
-                    || msg_lower.contains("hash")
-                    || msg_lower.contains("sha256"),
-                "Error should indicate config modification. Got: {}",
-                error.message
-            );
-        }
-        Ok(_) => panic!("Execution should fail after config modification"),
-    }
+    let Err(error) = ToolRunner::run_command(ProjectCommand::Test, args.clone()).await else {
+        panic!("Execution should fail after config modification");
+    };
+
+    assert_eq!(error.code, ErrorCode::INVALID_REQUEST);
+    let msg_lower = error.message.to_lowercase();
+    assert!(
+        msg_lower.contains("modified")
+            || msg_lower.contains("hash")
+            || msg_lower.contains("sha256"),
+        "Error should indicate config modification. Got: {}",
+        error.message
+    );
 
     // Step 5: Re-approve with new config
     approvals::approve_project_config(temp_dir.path(), &config_content_v2).await;
@@ -676,20 +654,18 @@ build = ["{}"]
     drop(script);
 
     // Attempt execution - should fail due to binary hash mismatch
-    let result = ToolRunner::run_command(ProjectCommand::Build, args.clone()).await;
-    match result {
-        Err(error) => {
-            assert_eq!(error.code, ErrorCode::INVALID_REQUEST);
-            let msg_lower = error.message.to_lowercase();
-            assert!(
-                (msg_lower.contains("binary") || msg_lower.contains("modified"))
-                    && (msg_lower.contains("hash") || msg_lower.contains("sha256")),
-                "Error should indicate binary modification. Got: {}",
-                error.message
-            );
-        }
-        Ok(_) => panic!("Execution should fail after binary modification"),
-    }
+    let Err(error) = ToolRunner::run_command(ProjectCommand::Build, args.clone()).await else {
+        panic!("Execution should fail after binary modification");
+    };
+
+    assert_eq!(error.code, ErrorCode::INVALID_REQUEST);
+    let msg_lower = error.message.to_lowercase();
+    assert!(
+        (msg_lower.contains("binary") || msg_lower.contains("modified"))
+            && (msg_lower.contains("hash") || msg_lower.contains("sha256")),
+        "Error should indicate binary modification. Got: {}",
+        error.message
+    );
 
     // Re-approve with modified binary
     approvals::approve_project_config(temp_dir.path(), &config_content).await;
