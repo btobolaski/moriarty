@@ -259,8 +259,7 @@ mod tests {
         assert!(!entries.is_empty(), "Should have at least one log file");
 
         let log_file = &entries[0];
-        let content = std::fs::read_to_string(log_file.path())
-            .expect("Failed to read log file");
+        let content = std::fs::read_to_string(log_file.path()).expect("Failed to read log file");
 
         assert!(
             !content.contains("Debug message that should not appear"),
@@ -295,8 +294,7 @@ mod tests {
         assert!(!entries.is_empty(), "Should have at least one log file");
 
         let log_file = &entries[0];
-        let content = std::fs::read_to_string(log_file.path())
-            .expect("Failed to read log file");
+        let content = std::fs::read_to_string(log_file.path()).expect("Failed to read log file");
 
         assert!(
             content.contains("Hooks tracing initialized"),
