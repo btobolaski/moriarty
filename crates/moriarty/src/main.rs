@@ -192,4 +192,17 @@ pub enum TestCommand {
         #[arg(default_value = ".")]
         project_dir: PathBuf,
     },
+    /// Test bash command against configured rules
+    BashRules {
+        /// Command to test (if not provided, reads from stdin)
+        command: Option<String>,
+
+        /// Custom config file path (defaults to ~/.config/moriarty/tool_rules.toml)
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+
+        /// Output as JSON instead of pretty-printed
+        #[arg(long)]
+        json: bool,
+    },
 }
