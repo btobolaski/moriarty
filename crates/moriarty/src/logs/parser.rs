@@ -6,13 +6,14 @@ use serde::{Deserialize, Serialize};
 use tokio::fs::read_to_string;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct QueueOperation {
     pub operation: String,
     pub timestamp: DateTime<Utc>,
-    pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<serde_json::Value>,
     pub session_id: String,
 }
 
@@ -74,6 +75,8 @@ pub struct SystemLogError {
     pub version: String,
     pub git_branch: String,
     pub level: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cause: Option<serde_json::Value>,
     pub error: SystemLogErrorError,
     pub retry_in_ms: f64,
     pub retry_attempt: usize,
@@ -86,10 +89,14 @@ pub struct SystemLogError {
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct SystemLogErrorError {
-    pub status: u16,
-    pub headers: HashMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub headers: Option<HashMap<String, String>>,
     #[serde(rename = "requestID")]
     pub request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cause: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -664,7 +671,10 @@ mod tests {
             LogLine::QueueOperation(op) => {
                 assert_eq!(op.operation, "enqueue");
                 assert_eq!(op.session_id, "75c1a8c9-5842-4fd4-a816-74109bf09cba");
-                assert_eq!(op.content, "Use the rustdoc agent, as you've been instructed to do in order to find the definition for AudioFrame.");
+                assert_eq!(
+                    op.content,
+                    Some(serde_json::Value::String("Use the rustdoc agent, as you've been instructed to do in order to find the definition for AudioFrame.".to_string()))
+                );
                 assert_eq!(op.timestamp.to_rfc3339(), "2025-11-04T21:54:38.826+00:00");
             }
             _ => panic!("Expected QueueOperation variant"),
@@ -720,7 +730,7 @@ mod tests {
 
         if let LogLine::QueueOperation(op) = line {
             assert_eq!(op.operation, "");
-            assert_eq!(op.content, "");
+            assert_eq!(op.content, Some(serde_json::Value::String("".to_string())));
             assert_eq!(op.session_id, "");
         } else {
             panic!("Expected QueueOperation variant");
@@ -744,7 +754,9 @@ mod tests {
             assert_eq!(op.operation, "dequeue");
             assert_eq!(
                 op.content,
-                "Maybe you should fetch the page that is linked?"
+                Some(serde_json::Value::String(
+                    "Maybe you should fetch the page that is linked?".to_string()
+                ))
             );
             assert_eq!(op.session_id, "6282703f-30e7-4990-b1dd-3482afa261a5");
         } else {

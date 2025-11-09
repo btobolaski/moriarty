@@ -1,7 +1,7 @@
 use super::analyzer::*;
 use super::pricing::{ModelType, TokenCosts, TokenCounts};
 use super::time_filter::TimeRangeFilter;
-use chrono::NaiveDate;
+use chrono::{Datelike, NaiveDate, TimeZone, Utc};
 use std::collections::HashSet;
 
 /// Helper function to create an empty time range filter for tests
@@ -12,6 +12,25 @@ fn empty_filter() -> TimeRangeFilter {
 /// Helper function to create a time range filter from date strings
 fn date_filter(start: Option<&str>, end: Option<&str>) -> TimeRangeFilter {
     TimeRangeFilter::new(start.map(|s| s.to_string()), end.map(|s| s.to_string())).unwrap()
+}
+
+/// Helper function to create a DateBasedMessage for tests
+fn create_date_based_message(
+    date: NaiveDate,
+    model_type: ModelType,
+    model_string: String,
+    token_counts: TokenCounts,
+) -> DateBasedMessage {
+    DateBasedMessage {
+        date,
+        model_type,
+        model_string,
+        token_counts,
+        request_id: None,
+        timestamp: Utc
+            .with_ymd_and_hms(date.year(), date.month(), date.day(), 0, 0, 0)
+            .unwrap(),
+    }
 }
 
 #[test]
@@ -206,12 +225,12 @@ fn test_aggregate_by_date_single_entry() {
         cache_read_tokens: 0,
     };
 
-    let usages = vec![DateBasedMessage {
+    let usages = vec![create_date_based_message(
         date,
-        model_type: ModelType::Sonnet,
-        model_string: "claude-sonnet-4".to_string(),
-        token_counts: counts,
-    }];
+        ModelType::Sonnet,
+        "claude-sonnet-4".to_string(),
+        counts,
+    )];
     let mut unknown_models = HashSet::new();
     let mut total_unknown_tokens = TokenCounts::default();
 
@@ -233,28 +252,28 @@ fn test_aggregate_by_date_multiple_dates() {
     let date2 = NaiveDate::from_ymd_opt(2025, 10, 24).unwrap();
 
     let usages = vec![
-        DateBasedMessage {
-            date: date1,
-            model_type: ModelType::Sonnet,
-            model_string: "claude-sonnet-4".to_string(),
-            token_counts: TokenCounts {
+        create_date_based_message(
+            date1,
+            ModelType::Sonnet,
+            "claude-sonnet-4".to_string(),
+            TokenCounts {
                 input_tokens: 1000,
                 output_tokens: 500,
                 cache_write_tokens: 0,
                 cache_read_tokens: 0,
             },
-        },
-        DateBasedMessage {
-            date: date2,
-            model_type: ModelType::Haiku,
-            model_string: "claude-haiku-3".to_string(),
-            token_counts: TokenCounts {
+        ),
+        create_date_based_message(
+            date2,
+            ModelType::Haiku,
+            "claude-haiku-3".to_string(),
+            TokenCounts {
                 input_tokens: 2000,
                 output_tokens: 1000,
                 cache_write_tokens: 0,
                 cache_read_tokens: 0,
             },
-        },
+        ),
     ];
     let mut unknown_models = HashSet::new();
     let mut total_unknown_tokens = TokenCounts::default();
@@ -276,28 +295,28 @@ fn test_aggregate_by_date_same_date_accumulates() {
     let date = NaiveDate::from_ymd_opt(2025, 10, 23).unwrap();
 
     let usages = vec![
-        DateBasedMessage {
+        create_date_based_message(
             date,
-            model_type: ModelType::Sonnet,
-            model_string: "claude-sonnet-4".to_string(),
-            token_counts: TokenCounts {
+            ModelType::Sonnet,
+            "claude-sonnet-4".to_string(),
+            TokenCounts {
                 input_tokens: 1000,
                 output_tokens: 500,
                 cache_write_tokens: 0,
                 cache_read_tokens: 0,
             },
-        },
-        DateBasedMessage {
+        ),
+        create_date_based_message(
             date,
-            model_type: ModelType::Sonnet,
-            model_string: "claude-sonnet-4".to_string(),
-            token_counts: TokenCounts {
+            ModelType::Sonnet,
+            "claude-sonnet-4".to_string(),
+            TokenCounts {
                 input_tokens: 500,
                 output_tokens: 250,
                 cache_write_tokens: 0,
                 cache_read_tokens: 0,
             },
-        },
+        ),
     ];
     let mut unknown_models = HashSet::new();
     let mut total_unknown_tokens = TokenCounts::default();
@@ -319,28 +338,28 @@ fn test_aggregate_by_date_tracks_unknown_models() {
     let date = NaiveDate::from_ymd_opt(2025, 10, 23).unwrap();
 
     let usages = vec![
-        DateBasedMessage {
+        create_date_based_message(
             date,
-            model_type: ModelType::Unknown,
-            model_string: "claude-opus-4".to_string(),
-            token_counts: TokenCounts {
+            ModelType::Unknown,
+            "claude-opus-4".to_string(),
+            TokenCounts {
                 input_tokens: 1000,
                 output_tokens: 500,
                 cache_write_tokens: 100,
                 cache_read_tokens: 50,
             },
-        },
-        DateBasedMessage {
+        ),
+        create_date_based_message(
             date,
-            model_type: ModelType::Unknown,
-            model_string: "gpt-4".to_string(),
-            token_counts: TokenCounts {
+            ModelType::Unknown,
+            "gpt-4".to_string(),
+            TokenCounts {
                 input_tokens: 500,
                 output_tokens: 250,
                 cache_write_tokens: 0,
                 cache_read_tokens: 0,
             },
-        },
+        ),
     ];
     let mut unknown_models = HashSet::new();
     let mut total_unknown_tokens = TokenCounts::default();
@@ -369,24 +388,24 @@ fn test_aggregate_by_date_sorted_by_date() {
     let date3 = NaiveDate::from_ymd_opt(2025, 10, 25).unwrap();
 
     let usages = vec![
-        DateBasedMessage {
-            date: date1,
-            model_type: ModelType::Sonnet,
-            model_string: "claude-sonnet-4".to_string(),
-            token_counts: TokenCounts::default(),
-        },
-        DateBasedMessage {
-            date: date2,
-            model_type: ModelType::Sonnet,
-            model_string: "claude-sonnet-4".to_string(),
-            token_counts: TokenCounts::default(),
-        },
-        DateBasedMessage {
-            date: date3,
-            model_type: ModelType::Sonnet,
-            model_string: "claude-sonnet-4".to_string(),
-            token_counts: TokenCounts::default(),
-        },
+        create_date_based_message(
+            date1,
+            ModelType::Sonnet,
+            "claude-sonnet-4".to_string(),
+            TokenCounts::default(),
+        ),
+        create_date_based_message(
+            date2,
+            ModelType::Sonnet,
+            "claude-sonnet-4".to_string(),
+            TokenCounts::default(),
+        ),
+        create_date_based_message(
+            date3,
+            ModelType::Sonnet,
+            "claude-sonnet-4".to_string(),
+            TokenCounts::default(),
+        ),
     ];
     let mut unknown_models = HashSet::new();
     let mut total_unknown_tokens = TokenCounts::default();
@@ -585,12 +604,12 @@ fn test_daily_usage_add_lines_changed() {
 fn test_aggregate_by_date_with_lines_changed() {
     let date = NaiveDate::from_ymd_opt(2025, 10, 23).unwrap();
 
-    let usages = vec![DateBasedMessage {
+    let usages = vec![create_date_based_message(
         date,
-        model_type: ModelType::Sonnet,
-        model_string: "claude-sonnet-4".to_string(),
-        token_counts: TokenCounts::default(),
-    }];
+        ModelType::Sonnet,
+        "claude-sonnet-4".to_string(),
+        TokenCounts::default(),
+    )];
 
     let lines_changed = vec![(date, 100), (date, 50)];
 
@@ -965,17 +984,17 @@ fn test_aggregate_by_date_with_deduplicated_streaming_data() {
     let date = NaiveDate::from_ymd_opt(2025, 10, 23).unwrap();
 
     // Only the final message from a 4-message streaming group
-    let usages = vec![DateBasedMessage {
+    let usages = vec![create_date_based_message(
         date,
-        model_type: ModelType::Sonnet,
-        model_string: "claude-sonnet-4".to_string(),
-        token_counts: TokenCounts {
+        ModelType::Sonnet,
+        "claude-sonnet-4".to_string(),
+        TokenCounts {
             input_tokens: 8,
             output_tokens: 835,
             cache_write_tokens: 17932,
             cache_read_tokens: 0,
         },
-    }];
+    )];
 
     let mut unknown_models = HashSet::new();
     let mut total_unknown_tokens = TokenCounts::default();
@@ -1009,50 +1028,50 @@ fn test_aggregate_by_date_with_buggy_non_deduplicated_data() {
 
     // All 4 messages from streaming group (buggy behavior)
     let usages = vec![
-        DateBasedMessage {
+        create_date_based_message(
             date,
-            model_type: ModelType::Sonnet,
-            model_string: "claude-sonnet-4".to_string(),
-            token_counts: TokenCounts {
+            ModelType::Sonnet,
+            "claude-sonnet-4".to_string(),
+            TokenCounts {
                 input_tokens: 8,
                 output_tokens: 2,
                 cache_write_tokens: 17932,
                 cache_read_tokens: 0,
             },
-        },
-        DateBasedMessage {
+        ),
+        create_date_based_message(
             date,
-            model_type: ModelType::Sonnet,
-            model_string: "claude-sonnet-4".to_string(),
-            token_counts: TokenCounts {
+            ModelType::Sonnet,
+            "claude-sonnet-4".to_string(),
+            TokenCounts {
                 input_tokens: 8,
                 output_tokens: 2,
                 cache_write_tokens: 17932,
                 cache_read_tokens: 0,
             },
-        },
-        DateBasedMessage {
+        ),
+        create_date_based_message(
             date,
-            model_type: ModelType::Sonnet,
-            model_string: "claude-sonnet-4".to_string(),
-            token_counts: TokenCounts {
+            ModelType::Sonnet,
+            "claude-sonnet-4".to_string(),
+            TokenCounts {
                 input_tokens: 8,
                 output_tokens: 2,
                 cache_write_tokens: 17932,
                 cache_read_tokens: 0,
             },
-        },
-        DateBasedMessage {
+        ),
+        create_date_based_message(
             date,
-            model_type: ModelType::Sonnet,
-            model_string: "claude-sonnet-4".to_string(),
-            token_counts: TokenCounts {
+            ModelType::Sonnet,
+            "claude-sonnet-4".to_string(),
+            TokenCounts {
                 input_tokens: 8,
                 output_tokens: 835,
                 cache_write_tokens: 17932,
                 cache_read_tokens: 0,
             },
-        },
+        ),
     ];
 
     let mut unknown_models = HashSet::new();
@@ -1305,4 +1324,227 @@ async fn test_parse_lines_changed_respects_time_filter() {
     // Should only include lines from 12:00 message (3 lines)
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].1, 3); // 3 lines changed
+}
+
+// ============================================================================
+// CROSS-FILE DEDUPLICATION TESTS
+// ============================================================================
+// When conversations are forked in Claude Code, all messages are copied to
+// the new session file, resulting in duplicate messages with the same
+// requestId and message.id appearing in multiple .jsonl files.
+//
+// This test verifies that analyze_directory properly deduplicates these
+// cross-file duplicates to prevent inflating cost calculations.
+
+#[tokio::test]
+async fn test_analyze_directory_deduplicates_forked_conversation() {
+    let temp_dir = tempfile::tempdir().unwrap();
+
+    // Simulate a conversation fork where the same message appears in two session files
+    // This mirrors the real-world scenario from the grep output where msg_01GRWfK8FJtwwQVzS6LypbBp
+    // appears in both a3933ed9-1121-4630-b197-3f2ddcaa8810.jsonl and
+    // a4b1a3a4-f5e4-479a-9b96-26b4b57f04fd.jsonl
+
+    // The exact same message (same requestId, message.id, uuid, and usage) in both files
+    let shared_message = r#"{"type":"assistant","parentUuid":"bb0252ce-8926-4f5c-b616-fa5743f365de","isSidechain":false,"userType":"external","cwd":"/test","sessionId":"session-original","version":"2.0.32","gitBranch":"main","message":{"model":"claude-sonnet-4","id":"msg_01GRWfK8FJtwwQVzS6LypbBp","type":"message","role":"assistant","content":[{"type":"text","text":"I'll list the directories"}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":100,"cache_creation_input_tokens":5000,"cache_read_input_tokens":2000,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":500,"service_tier":"standard"}},"requestId":"req_011CUwGzDJueepzBaSgFrpQA","uuid":"70cd1811-0ecc-45b0-9f53-75bcb0758246","timestamp":"2025-11-08T23:18:07.276Z","isApiErrorMessage":null}"#;
+
+    // Original session file
+    let file1_path = temp_dir.path().join("session-original.jsonl");
+    tokio::fs::write(&file1_path, shared_message).await.unwrap();
+
+    // Forked session file - contains the exact same message
+    // (in reality, sessionId might differ but all other fields including requestId are the same)
+    let file2_path = temp_dir.path().join("session-forked.jsonl");
+    tokio::fs::write(&file2_path, shared_message).await.unwrap();
+
+    // Analyze the directory containing both files
+    let result = analyze_directory(temp_dir.path(), DateTimezone::Utc, &empty_filter())
+        .await
+        .unwrap();
+
+    assert_eq!(result.files_parsed, 2, "Should have parsed both files");
+
+    // The critical assertion: tokens should be counted ONCE, not twice
+    // If cross-file deduplication works correctly, we should see:
+    //   input_tokens: 100 (not 200)
+    //   output_tokens: 500 (not 1000)
+    //   cache_write_tokens: 5000 (not 10000)
+    //   cache_read_tokens: 2000 (not 4000)
+
+    assert_eq!(result.daily_costs.len(), 1, "Should have one day of usage");
+    let daily = &result.daily_costs[0];
+
+    // If this test FAILS (values are doubled), there is NO cross-file deduplication
+    // If this test PASSES (values are single), there IS cross-file deduplication
+    // Use approximate equality for floating point comparisons
+    let expected_input = 100.0 * 3.0 / 1_000_000.0; // $3.00 per MTok
+    assert!(
+        (daily.sonnet_costs.input - expected_input).abs() < 1e-10,
+        "Input tokens should be counted once, not doubled. Expected ~{}, got {}",
+        expected_input,
+        daily.sonnet_costs.input
+    );
+    let expected_output = 500.0 * 15.0 / 1_000_000.0; // $15.00 per MTok
+    assert!(
+        (daily.sonnet_costs.output - expected_output).abs() < 1e-10,
+        "Output tokens should be counted once, not doubled. Expected ~{}, got {}",
+        expected_output,
+        daily.sonnet_costs.output
+    );
+    let expected_cache_write = 5000.0 * 3.75 / 1_000_000.0; // $3.75 per MTok
+    assert!(
+        (daily.sonnet_costs.cache_write - expected_cache_write).abs() < 1e-10,
+        "Cache write tokens should be counted once, not doubled. Expected ~{}, got {}",
+        expected_cache_write,
+        daily.sonnet_costs.cache_write
+    );
+    let expected_cache_read = 2000.0 * 0.30 / 1_000_000.0; // $0.30 per MTok
+    assert!(
+        (daily.sonnet_costs.cache_read - expected_cache_read).abs() < 1e-10,
+        "Cache read tokens should be counted once, not doubled. Expected ~{}, got {}",
+        expected_cache_read,
+        daily.sonnet_costs.cache_read
+    );
+}
+
+#[tokio::test]
+async fn test_analyze_directory_keeps_message_with_more_tokens() {
+    let temp_dir = tempfile::tempdir().unwrap();
+
+    // Simulate a forked conversation where the same requestId appears in two files
+    // but with different output_tokens (one has partial streaming response, other has complete)
+
+    // File 1: Partial streaming response (100 output tokens)
+    let partial_message = r#"{"type":"assistant","parentUuid":"bb0252ce-8926-4f5c-b616-fa5743f365de","isSidechain":false,"userType":"external","cwd":"/test","sessionId":"session-1","version":"2.0.32","gitBranch":"main","message":{"model":"claude-sonnet-4","id":"msg_test","type":"message","role":"assistant","content":[{"type":"text","text":"Partial response"}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":50,"cache_creation_input_tokens":1000,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":100,"service_tier":"standard"}},"requestId":"req_test_different_tokens","uuid":"70cd1811-0ecc-45b0-9f53-75bcb0758246","timestamp":"2025-11-08T10:00:00.000Z","isApiErrorMessage":null}"#;
+
+    // File 2: Complete streaming response (500 output tokens)
+    let complete_message = r#"{"type":"assistant","parentUuid":"bb0252ce-8926-4f5c-b616-fa5743f365de","isSidechain":false,"userType":"external","cwd":"/test","sessionId":"session-2","version":"2.0.32","gitBranch":"main","message":{"model":"claude-sonnet-4","id":"msg_test","type":"message","role":"assistant","content":[{"type":"text","text":"Complete response"}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":50,"cache_creation_input_tokens":1000,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":500,"service_tier":"standard"}},"requestId":"req_test_different_tokens","uuid":"a1b2c3d4-e5f6-7890-abcd-ef1234567890","timestamp":"2025-11-08T10:00:00.000Z","isApiErrorMessage":null}"#;
+
+    let file1_path = temp_dir.path().join("session-1.jsonl");
+    tokio::fs::write(&file1_path, partial_message)
+        .await
+        .unwrap();
+
+    let file2_path = temp_dir.path().join("session-2.jsonl");
+    tokio::fs::write(&file2_path, complete_message)
+        .await
+        .unwrap();
+
+    // Analyze the directory
+    let result = analyze_directory(temp_dir.path(), DateTimezone::Utc, &empty_filter())
+        .await
+        .unwrap();
+
+    assert_eq!(result.files_parsed, 2);
+    assert_eq!(result.daily_costs.len(), 1);
+    let daily = &result.daily_costs[0];
+
+    // The critical assertion: Should keep the message with 500 tokens, not sum to 600
+    // Expected cost based on 500 output tokens, not 600
+    let expected_output = 500.0 * 15.0 / 1_000_000.0; // $15.00 per MTok
+    assert!(
+        (daily.sonnet_costs.output - expected_output).abs() < 1e-10,
+        "Should keep message with MORE tokens (500), not sum both (600). Expected ~{}, got {}",
+        expected_output,
+        daily.sonnet_costs.output
+    );
+
+    // Input tokens should also be counted once (50 not 100)
+    let expected_input = 50.0 * 3.0 / 1_000_000.0; // $3.00 per MTok
+    assert!(
+        (daily.sonnet_costs.input - expected_input).abs() < 1e-10,
+        "Input tokens should be counted once. Expected ~{}, got {}",
+        expected_input,
+        daily.sonnet_costs.input
+    );
+}
+
+#[tokio::test]
+async fn test_analyze_directory_keeps_oldest_when_tokens_equal() {
+    let temp_dir = tempfile::tempdir().unwrap();
+
+    // Simulate the rare case where the same requestId appears with equal tokens
+    // but different timestamps (file modification, reprocessing, or clock skew)
+
+    // File 1: Earlier timestamp (10:00)
+    let earlier_message = r#"{"type":"assistant","parentUuid":"bb0252ce-8926-4f5c-b616-fa5743f365de","isSidechain":false,"userType":"external","cwd":"/test","sessionId":"session-1","version":"2.0.32","gitBranch":"main","message":{"model":"claude-sonnet-4","id":"msg_test","type":"message","role":"assistant","content":[{"type":"text","text":"Earlier message"}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":100,"cache_creation_input_tokens":2000,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":500,"service_tier":"standard"}},"requestId":"req_test_timestamp_tiebreak","uuid":"11111111-0ecc-45b0-9f53-75bcb0758246","timestamp":"2025-11-08T10:00:00.000Z","isApiErrorMessage":null}"#;
+
+    // File 2: Later timestamp (12:00) with same tokens
+    let later_message = r#"{"type":"assistant","parentUuid":"bb0252ce-8926-4f5c-b616-fa5743f365de","isSidechain":false,"userType":"external","cwd":"/test","sessionId":"session-2","version":"2.0.32","gitBranch":"main","message":{"model":"claude-sonnet-4","id":"msg_test","type":"message","role":"assistant","content":[{"type":"text","text":"Later message"}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":100,"cache_creation_input_tokens":2000,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":500,"service_tier":"standard"}},"requestId":"req_test_timestamp_tiebreak","uuid":"22222222-0ecc-45b0-9f53-75bcb0758246","timestamp":"2025-11-08T12:00:00.000Z","isApiErrorMessage":null}"#;
+
+    let file1_path = temp_dir.path().join("session-1.jsonl");
+    tokio::fs::write(&file1_path, earlier_message)
+        .await
+        .unwrap();
+
+    let file2_path = temp_dir.path().join("session-2.jsonl");
+    tokio::fs::write(&file2_path, later_message).await.unwrap();
+
+    // Analyze the directory
+    let result = analyze_directory(temp_dir.path(), DateTimezone::Utc, &empty_filter())
+        .await
+        .unwrap();
+
+    assert_eq!(result.files_parsed, 2);
+    assert_eq!(result.daily_costs.len(), 1);
+    let daily = &result.daily_costs[0];
+
+    // Verify tokens are counted once (not doubled)
+    let expected_output = 500.0 * 15.0 / 1_000_000.0;
+    assert!(
+        (daily.sonnet_costs.output - expected_output).abs() < 1e-10,
+        "With equal tokens, should keep OLDEST timestamp. Expected ~{}, got {}",
+        expected_output,
+        daily.sonnet_costs.output
+    );
+
+    // This test verifies the tie-breaking logic works correctly
+    // We can't directly verify which timestamp was kept, but we verify
+    // that deduplication occurred (tokens counted once, not twice)
+}
+
+#[tokio::test]
+async fn test_analyze_directory_by_session_deduplicates_forked_conversation() {
+    let temp_dir = tempfile::tempdir().unwrap();
+
+    // Test that analyze_directory_by_session also handles cross-file deduplication
+    // This mirrors the test for analyze_directory but uses session-based aggregation
+
+    let shared_message = r#"{"type":"assistant","parentUuid":"bb0252ce-8926-4f5c-b616-fa5743f365de","isSidechain":false,"userType":"external","cwd":"/test","sessionId":"session-original","version":"2.0.32","gitBranch":"main","message":{"model":"claude-sonnet-4","id":"msg_test_session","type":"message","role":"assistant","content":[{"type":"text","text":"Test message"}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":200,"cache_creation_input_tokens":3000,"cache_read_input_tokens":1000,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":400,"service_tier":"standard"}},"requestId":"req_test_session","uuid":"33333333-0ecc-45b0-9f53-75bcb0758246","timestamp":"2025-11-08T15:00:00.000Z","isApiErrorMessage":null}"#;
+
+    let file1_path = temp_dir.path().join("session-original.jsonl");
+    tokio::fs::write(&file1_path, shared_message).await.unwrap();
+
+    let file2_path = temp_dir.path().join("session-forked.jsonl");
+    tokio::fs::write(&file2_path, shared_message).await.unwrap();
+
+    // Analyze by session
+    let result = analyze_directory_by_session(temp_dir.path(), &empty_filter())
+        .await
+        .unwrap();
+
+    assert_eq!(result.files_parsed, 2);
+
+    // Should have TWO sessions (session-original and session-forked)
+    // But the duplicate message should be deduplicated across both files
+    // Each session will show the message once, but globally it's counted once
+
+    // Total tokens across all sessions should reflect single counting
+    // We expect 2 sessions, each might have the message, but deduplication
+    // should have occurred before session aggregation
+
+    // The total cost should reflect the tokens being counted once globally
+    let total_output_cost: f64 = result
+        .session_costs
+        .iter()
+        .map(|s| s.sonnet_costs.output)
+        .sum();
+
+    let expected_output = 400.0 * 15.0 / 1_000_000.0; // $15.00 per MTok
+    assert!(
+        (total_output_cost - expected_output).abs() < 1e-10,
+        "Session-based analysis should also deduplicate cross-file. Expected ~{}, got {}",
+        expected_output,
+        total_output_cost
+    );
 }

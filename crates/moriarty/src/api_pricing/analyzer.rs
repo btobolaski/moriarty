@@ -285,6 +285,8 @@ pub(crate) struct DateBasedMessage {
     pub(crate) model_type: ModelType,
     pub(crate) model_string: String,
     pub(crate) token_counts: TokenCounts,
+    pub(crate) request_id: Option<String>,
+    pub(crate) timestamp: DateTime<Utc>,
 }
 
 /// Message containing token usage aggregated by session
@@ -295,6 +297,7 @@ pub(crate) struct SessionBasedMessage {
     pub(crate) model_type: ModelType,
     pub(crate) model_string: String,
     pub(crate) token_counts: TokenCounts,
+    pub(crate) request_id: Option<String>,
 }
 
 /// Deduplicates messages by requestId, keeping only the final message per streaming group.
@@ -384,6 +387,116 @@ fn deduplicate_by_request_id<T>(
     result
 }
 
+/// Deduplicates messages across files by requestId to handle forked conversations.
+///
+/// # Why This Is Needed
+///
+/// When conversations are forked in Claude Code, all messages from the parent
+/// conversation are copied to the new session file. This results in the same
+/// message (same requestId, message.id, uuid) appearing in multiple .jsonl files.
+/// Without cross-file deduplication, cost calculations would be inflated by counting
+/// the same API call multiple times.
+///
+/// # Deduplication Strategy
+///
+/// This function performs global deduplication after per-file deduplication:
+///
+/// **Messages without requestId**: Always kept without deduplication. These are
+/// non-streaming messages that don't appear in multiple files in normal operation.
+///
+/// **Messages with the same requestId**:
+/// 1. **If output_tokens differ**: Keep the message with higher token count
+///    - Rationale: During streaming responses, the Claude API sends multiple messages
+///      with the same requestId but increasing output_tokens as the response generates.
+///      The message with the highest token count represents the complete response.
+///    - In forked conversations, one file may have captured a partial streaming
+///      response while another has the complete response.
+///
+/// 2. **If output_tokens are equal**: Keep the message with the oldest timestamp
+///    - Rationale: In forked conversations, identical messages typically have identical
+///      timestamps since they're exact copies. When timestamps differ despite equal
+///      tokens, preferring the oldest provides consistent behavior.
+///    - Note: If messages are truly identical (same tokens, same timestamp), the
+///      result depends on file processing order, but this doesn't matter since
+///      the messages are equivalent.
+///    - This case should be rare in practice; most forked messages are exact copies.
+fn deduplicate_across_files<T>(
+    messages: Vec<T>,
+    get_request_id: impl Fn(&T) -> &Option<String>,
+    get_output_tokens: impl Fn(&T) -> u64,
+    get_timestamp: impl Fn(&T) -> DateTime<Utc>,
+) -> Vec<T> {
+    let total_messages = messages.len();
+    let mut result: Vec<T> = Vec::new();
+    let mut request_id_to_index: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut duplicates_found = 0;
+    let mut duplicate_request_ids: HashSet<String> = HashSet::new();
+
+    debug!(
+        "deduplicate_across_files: Processing {} messages",
+        total_messages
+    );
+
+    for msg in messages {
+        if let Some(req_id) = get_request_id(&msg) {
+            if let Some(&existing_idx) = request_id_to_index.get(req_id) {
+                duplicates_found += 1;
+                duplicate_request_ids.insert(req_id.clone());
+
+                let old_tokens = get_output_tokens(&result[existing_idx]);
+                let new_tokens = get_output_tokens(&msg);
+                let old_timestamp = get_timestamp(&result[existing_idx]);
+                let new_timestamp = get_timestamp(&msg);
+
+                trace!(
+                    "Found duplicate requestId='{}': old_tokens={}, new_tokens={}, old_ts={}, new_ts={}",
+                    req_id,
+                    old_tokens,
+                    new_tokens,
+                    old_timestamp,
+                    new_timestamp
+                );
+
+                let should_replace = if new_tokens != old_tokens {
+                    new_tokens > old_tokens
+                } else {
+                    new_timestamp < old_timestamp
+                };
+
+                if should_replace {
+                    trace!("  -> Replacing with new message");
+                    result[existing_idx] = msg;
+                } else {
+                    trace!("  -> Keeping existing message");
+                }
+            } else {
+                trace!(
+                    "First occurrence of requestId='{}' with {} output tokens at {}",
+                    req_id,
+                    get_output_tokens(&msg),
+                    get_timestamp(&msg)
+                );
+                request_id_to_index.insert(req_id.clone(), result.len());
+                result.push(msg);
+            }
+        } else {
+            trace!("Non-streaming message (no requestId)");
+            result.push(msg);
+        }
+    }
+
+    debug!(
+        "deduplicate_across_files: {} messages -> {} after deduplication ({} duplicates removed, {} unique request_ids had duplicates)",
+        total_messages,
+        result.len(),
+        duplicates_found,
+        duplicate_request_ids.len()
+    );
+
+    result
+}
+
 /// Parse a log file and extract token usage
 ///
 /// Filters out entries with model `<synthetic>` (case-insensitive), as these represent
@@ -436,6 +549,8 @@ pub async fn parse_log_file(
                     model_type,
                     model_string,
                     token_counts: counts,
+                    request_id: assistant_line.request_id.clone(),
+                    timestamp: assistant_line.timestamp,
                 },
             ));
         }
@@ -502,6 +617,7 @@ pub async fn parse_log_file_by_session(
                     model_type,
                     model_string,
                     token_counts: counts,
+                    request_id: assistant_line.request_id.clone(),
                 },
             ));
         }
@@ -680,6 +796,8 @@ fn parse_log_content(
                     model_type,
                     model_string,
                     token_counts: counts,
+                    request_id: assistant_line.request_id.clone(),
+                    timestamp: assistant_line.timestamp,
                 },
             ));
         }
@@ -794,6 +912,7 @@ fn parse_log_content_by_session(
                     model_type,
                     model_string,
                     token_counts: counts,
+                    request_id: assistant_line.request_id.clone(),
                 },
             ));
         }
@@ -964,6 +1083,14 @@ pub async fn analyze_directory(
 
     files_failed += parse_failed;
 
+    // Step 2.5: Deduplicate across files (handles forked conversations)
+    let all_usages = deduplicate_across_files(
+        all_usages,
+        |msg| &msg.request_id,
+        |msg| msg.token_counts.output_tokens as u64,
+        |msg| msg.timestamp,
+    );
+
     // Step 3: Aggregate results
     let mut unknown_models = HashSet::new();
     let mut total_unknown_tokens = TokenCounts::default();
@@ -1013,6 +1140,14 @@ pub async fn analyze_directory_by_session(
     );
 
     files_failed += parse_failed;
+
+    // Step 2.5: Deduplicate across files (handles forked conversations)
+    let all_usages = deduplicate_across_files(
+        all_usages,
+        |msg| &msg.request_id,
+        |msg| msg.token_counts.output_tokens as u64,
+        |msg| msg.timestamp,
+    );
 
     // Step 3: Aggregate results
     let mut unknown_models = HashSet::new();
