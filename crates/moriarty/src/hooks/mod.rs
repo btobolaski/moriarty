@@ -317,7 +317,7 @@ async fn handle_bash_pretool_hook(tool_input: &serde_json::Value) -> Result<Hook
         }
     };
 
-    let engine = BashRuleEngine::from_config(bash_rules)?;
+    let engine = BashRuleEngine::from_config(bash_rules, config.pattern_fragments)?;
     let result = engine.apply_rules(command);
 
     match result {

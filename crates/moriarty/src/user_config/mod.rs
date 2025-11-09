@@ -8,6 +8,8 @@
 //! the approval/hashing system since it represents the user's personal preferences
 //! rather than untrusted project settings.
 
+use std::collections::HashMap;
+
 use miette::{Context, Result};
 use serde::{Deserialize, Serialize};
 
@@ -37,18 +39,26 @@ fn is_not_found_error(error: &miette::Report) -> bool {
 /// # Example
 ///
 /// ```toml
+/// [pattern_fragments]
+/// safe_chars = "[^|&;$`]"
+///
 /// [[bash_rules]]
 /// name = "deny-rm-rf"
 /// pattern = "^rm\\s+-rf\\s+/"
 /// action = { type = "Deny", value = "Dangerous recursive delete detected" }
 ///
 /// [[bash_rules]]
-/// name = "add-dry-run-to-docker-prune"
-/// pattern = "^(docker\\s+system\\s+prune)"
-/// action = { type = "Modify", value = "$1 --dry-run" }
+/// name = "allow-ls"
+/// pattern = "^ls{{safe_chars}}*$"
+/// action = { type = "Allow" }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
 pub struct UserConfig {
+    /// Reusable regex fragments that can be referenced in patterns using {{fragment_name}} syntax.
+    /// Fragments are expanded at configuration load time, providing zero runtime overhead.
+    #[serde(default)]
+    pub pattern_fragments: Option<HashMap<String, String>>,
+
     #[serde(default)]
     pub bash_rules: Option<Vec<BashRule>>,
 }
@@ -129,6 +139,7 @@ mod tests {
     fn test_user_config_default() {
         let config = UserConfig::default();
         assert_eq!(config.bash_rules, None);
+        assert_eq!(config.pattern_fragments, None);
     }
 
     #[test]
@@ -178,6 +189,7 @@ mod tests {
         std::env::set_var("XDG_CONFIG_HOME", temp_dir.path());
 
         let test_config = UserConfig {
+            pattern_fragments: None,
             bash_rules: Some(vec![
                 BashRule {
                     name: "test-deny".to_string(),
@@ -208,7 +220,10 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         std::env::set_var("XDG_CONFIG_HOME", temp_dir.path());
 
-        let test_config = UserConfig { bash_rules: None };
+        let test_config = UserConfig {
+            pattern_fragments: None,
+            bash_rules: None,
+        };
 
         FileType::Config
             .persist("tool_rules.toml", &test_config)

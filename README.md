@@ -1,12 +1,14 @@
 # Moriarty, an assistant for an assistant
 
-A Rust CLI tool for analyzing Claude Code logs and API usage.
+A Rust CLI tool for analyzing Claude Code logs and API usage, with security hooks for command validation.
 
 ## Features
 
 - **Logs viewer**: An interactive TUI for viewing and navigating Claude Code conversation logs
 - **API pricing analyzer**: Analyzes Claude API usage from log directories and generates detailed cost reports
 - **MCP servers**: Provides Model Context Protocol servers for git operations and project tools
+- **Bash command validation**: Security hooks that allow you to control which commands Claude Code can execute
+  - See [BASH_RULES.md](./BASH_RULES.md) for complete configuration guide
 
 ## Requirements
 
