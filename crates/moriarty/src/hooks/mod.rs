@@ -365,6 +365,94 @@ async fn handle_bash_pretool_hook(tool_input: &serde_json::Value) -> Result<Hook
             );
             Ok(pretool_ask_hook())
         }
+        RuleResult::ArgumentFiltered {
+            rule_name,
+            new_command,
+            reason,
+        } => {
+            info!(
+                original = %command,
+                filtered = %new_command,
+                rule = %rule_name,
+                "Command arguments filtered, re-validating"
+            );
+
+            // CRITICAL: Re-validate filtered command for security
+            let recheck_result = engine.apply_rules(&new_command);
+
+            match recheck_result {
+                RuleResult::Allowed {
+                    rule_name: allow_rule,
+                } => {
+                    // Filtered command is explicitly allowed, safe to execute
+                    info!(
+                        filtered_command = %new_command,
+                        allowed_by = %allow_rule,
+                        "Filtered command validated and allowed"
+                    );
+
+                    let mut updated_tool_input = tool_input.clone();
+                    updated_tool_input["command"] = serde_json::Value::String(new_command);
+
+                    let final_reason = reason
+                        .unwrap_or_else(|| format!("Arguments filtered by rule '{}'", rule_name));
+
+                    Ok(pretool_modify_hook(updated_tool_input, Some(final_reason)))
+                }
+                RuleResult::Denied {
+                    reason: deny_reason,
+                    ..
+                } => {
+                    // Filtered command matched a deny rule
+                    warn!(
+                        filtered_command = %new_command,
+                        reason = %deny_reason,
+                        "Filtered command was denied by rules"
+                    );
+                    Ok(pretool_deny_hook(deny_reason))
+                }
+                RuleResult::NoMatch => {
+                    // Filtered command doesn't match any rule, ask user
+                    info!(
+                        filtered_command = %new_command,
+                        "Filtered command doesn't match any allow rule, asking user"
+                    );
+                    Ok(pretool_ask_hook())
+                }
+                RuleResult::Asked { .. } => {
+                    // Filtered command matched an Ask rule
+                    info!(
+                        filtered_command = %new_command,
+                        "Filtered command requires user confirmation"
+                    );
+                    Ok(pretool_ask_hook())
+                }
+                RuleResult::Modified {
+                    new_command: further_modified,
+                    ..
+                } => {
+                    // Filtered command was modified again (chained modifications)
+                    info!(
+                        filtered_command = %new_command,
+                        further_modified = %further_modified,
+                        "Filtered command was modified again by another rule"
+                    );
+
+                    let mut updated_tool_input = tool_input.clone();
+                    updated_tool_input["command"] = serde_json::Value::String(further_modified);
+
+                    Ok(pretool_modify_hook(updated_tool_input, reason))
+                }
+                RuleResult::ArgumentFiltered { .. } => {
+                    // Prevent infinite loops - don't allow chained argument filtering
+                    warn!(
+                        filtered_command = %new_command,
+                        "Filtered command matched another ArgumentFilter rule, asking user to prevent loops"
+                    );
+                    Ok(pretool_ask_hook())
+                }
+            }
+        }
         RuleResult::NoMatch => {
             debug!(command = %command, "No bash rules matched, prompting user");
             Ok(pretool_ask_hook())

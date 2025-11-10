@@ -78,17 +78,48 @@ pub struct BashRule {
 
 /// Action to take when a Bash rule matches a command.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(tag = "type", content = "value")]
+#[serde(tag = "type")]
 pub enum BashRuleAction {
     /// Deny execution of the command with the specified reason.
-    Deny(String),
+    Deny { value: String },
     /// Modify the command using the template string. Supports regex capture groups ($0, $1, $2, etc.).
-    Modify(String),
+    Modify { value: String },
     /// Explicitly allow the command to execute.
     Allow,
     /// Defer to the user when a command requires explicit authorization but shouldn't be auto-approved.
     /// Use this for potentially dangerous operations that need case-by-case evaluation.
     Ask,
+    /// Filter command arguments by removing, adding, or replacing them.
+    ///
+    /// After filtering, the command is re-validated against all rules to ensure it's still safe.
+    /// If the filtered command doesn't match an Allow rule or matches a Deny rule, it will be rejected.
+    ///
+    /// # Example
+    /// ```toml
+    /// [[bash_rules]]
+    /// name = "cargo doc - strip browser flag"
+    /// pattern = "^cargo doc\\b"
+    /// action = {
+    ///   type = "ArgumentFilter",
+    ///   remove = ["--open", "-o"],
+    ///   reason = "Browser flags removed"
+    /// }
+    /// ```
+    ArgumentFilter {
+        /// Arguments to remove from the command.
+        /// Matches exact argument or argument prefix for --flag=value syntax.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        remove: Option<Vec<String>>,
+        /// Arguments to add to the end of the command.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        add: Option<Vec<String>>,
+        /// Map of arguments to replace (old -> new).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        replace: Option<HashMap<String, String>>,
+        /// Explanation of why arguments were filtered.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
 }
 
 /// Load user-level configuration from `~/.config/moriarty/tool_rules.toml`.
@@ -147,7 +178,9 @@ mod tests {
         let rule = BashRule {
             name: "test-rule".to_string(),
             pattern: "^test".to_string(),
-            action: BashRuleAction::Deny("test reason".to_string()),
+            action: BashRuleAction::Deny {
+                value: "test reason".to_string(),
+            },
         };
 
         let toml = toml::to_string(&rule).unwrap();
@@ -158,8 +191,12 @@ mod tests {
     #[test]
     fn test_bash_rule_action_serialization() {
         let actions = vec![
-            BashRuleAction::Deny("reason".to_string()),
-            BashRuleAction::Modify("$1 --flag".to_string()),
+            BashRuleAction::Deny {
+                value: "reason".to_string(),
+            },
+            BashRuleAction::Modify {
+                value: "$1 --flag".to_string(),
+            },
             BashRuleAction::Allow,
             BashRuleAction::Ask,
         ];
@@ -169,6 +206,109 @@ mod tests {
             let deserialized: BashRuleAction = toml::from_str(&toml).unwrap();
             assert_eq!(action, deserialized);
         }
+    }
+
+    #[test]
+    fn test_bash_rule_action_argument_filter_serialization() {
+        let mut replace_map = HashMap::new();
+        replace_map.insert("-f".to_string(), "-i".to_string());
+
+        let action = BashRuleAction::ArgumentFilter {
+            remove: Some(vec!["--open".to_string(), "-o".to_string()]),
+            add: Some(vec!["--offline".to_string()]),
+            replace: Some(replace_map),
+            reason: Some("Security".to_string()),
+        };
+
+        let toml = toml::to_string(&action).unwrap();
+        assert!(toml.contains("ArgumentFilter"));
+        assert!(toml.contains("--open"));
+        assert!(toml.contains("--offline"));
+        assert!(toml.contains("Security"));
+
+        let deserialized: BashRuleAction = toml::from_str(&toml).unwrap();
+        assert_eq!(deserialized, action);
+    }
+
+    #[test]
+    fn test_bash_rule_action_argument_filter_partial_fields() {
+        // Test with only remove field
+        let action = BashRuleAction::ArgumentFilter {
+            remove: Some(vec!["--open".to_string()]),
+            add: None,
+            replace: None,
+            reason: None,
+        };
+
+        let toml = toml::to_string(&action).unwrap();
+        let deserialized: BashRuleAction = toml::from_str(&toml).unwrap();
+        assert_eq!(deserialized, action);
+
+        // Test with only add field
+        let action = BashRuleAction::ArgumentFilter {
+            remove: None,
+            add: Some(vec!["--offline".to_string()]),
+            replace: None,
+            reason: Some("Added offline flag".to_string()),
+        };
+
+        let toml = toml::to_string(&action).unwrap();
+        let deserialized: BashRuleAction = toml::from_str(&toml).unwrap();
+        assert_eq!(deserialized, action);
+    }
+
+    #[test]
+    fn test_bash_rule_action_toml_format_compatibility() {
+        // Verify that the TOML format matches what users would write in their config files.
+        // This ensures the change from tuple variants to struct variants didn't break
+        // the user-facing configuration format.
+
+        // Test Deny action
+        let toml_deny = r#"type = "Deny"
+value = "reason for denial""#;
+        let action: BashRuleAction = toml::from_str(toml_deny).unwrap();
+        assert_eq!(
+            action,
+            BashRuleAction::Deny {
+                value: "reason for denial".to_string()
+            }
+        );
+
+        // Test Modify action
+        let toml_modify = r#"type = "Modify"
+value = "$1 --flag""#;
+        let action: BashRuleAction = toml::from_str(toml_modify).unwrap();
+        assert_eq!(
+            action,
+            BashRuleAction::Modify {
+                value: "$1 --flag".to_string()
+            }
+        );
+
+        // Test Allow action
+        let toml_allow = r#"type = "Allow""#;
+        let action: BashRuleAction = toml::from_str(toml_allow).unwrap();
+        assert_eq!(action, BashRuleAction::Allow);
+
+        // Test Ask action
+        let toml_ask = r#"type = "Ask""#;
+        let action: BashRuleAction = toml::from_str(toml_ask).unwrap();
+        assert_eq!(action, BashRuleAction::Ask);
+
+        // Test ArgumentFilter action
+        let toml_filter = r#"type = "ArgumentFilter"
+remove = ["--open", "-o"]
+reason = "Browser not needed""#;
+        let action: BashRuleAction = toml::from_str(toml_filter).unwrap();
+        assert_eq!(
+            action,
+            BashRuleAction::ArgumentFilter {
+                remove: Some(vec!["--open".to_string(), "-o".to_string()]),
+                add: None,
+                replace: None,
+                reason: Some("Browser not needed".to_string()),
+            }
+        );
     }
 
     #[tokio::test]
@@ -194,7 +334,9 @@ mod tests {
                 BashRule {
                     name: "test-deny".to_string(),
                     pattern: "^rm".to_string(),
-                    action: BashRuleAction::Deny("rm not allowed".to_string()),
+                    action: BashRuleAction::Deny {
+                        value: "rm not allowed".to_string(),
+                    },
                 },
                 BashRule {
                     name: "test-allow".to_string(),

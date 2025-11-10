@@ -1,8 +1,10 @@
 //! Tests for hooks module
 
-use super::*;
 use std::io::Cursor;
+
 use tempfile::TempDir;
+
+use super::*;
 
 /// Safe to use std::env::set_var because cargo nextest isolates each test in a separate process.
 fn setup_isolated_xdg_state() -> TempDir {
@@ -780,6 +782,286 @@ action = { type = "Allow" }
     match result.hook_specific_output {
         Some(HookSpecificOutput::PreToolUse(output)) => {
             assert_eq!(output.permission_decision, Some(PermissionDecision::Allow));
+        }
+        _ => panic!("Expected PreToolUse hook specific output"),
+    }
+}
+
+#[tokio::test]
+async fn test_argument_filter_with_allow() {
+    let config = r#"
+[[bash_rules]]
+name = "filter-cargo-doc"
+pattern = "^cargo doc.*--open"
+action = { type = "ArgumentFilter", remove = ["--open"], reason = "Browser flag removed" }
+
+[[bash_rules]]
+name = "allow-cargo-doc"
+pattern = "^cargo doc"
+action = { type = "Allow" }
+"#;
+    let _xdg_config = setup_user_bash_rules(config).await;
+
+    let tool_input = serde_json::json!({"command": "cargo doc --open --no-deps"});
+    let result = handle_bash_pretool_hook(&tool_input)
+        .await
+        .expect("Should succeed");
+
+    match result.hook_specific_output {
+        Some(HookSpecificOutput::PreToolUse(output)) => {
+            assert_eq!(output.permission_decision, Some(PermissionDecision::Allow));
+            // Check that command was filtered
+            if let Some(serde_json::Value::Object(modified)) = &output.updated_input {
+                assert_eq!(
+                    modified.get("command"),
+                    Some(&serde_json::Value::String(
+                        "cargo doc --no-deps".to_string()
+                    ))
+                );
+            } else {
+                panic!("Expected updated_input");
+            }
+        }
+        _ => panic!("Expected PreToolUse hook specific output"),
+    }
+}
+
+#[tokio::test]
+async fn test_argument_filter_with_deny() {
+    let config = r#"
+[[bash_rules]]
+name = "filter-dangerous-rm"
+pattern = "^rm .*-rf"
+action = { type = "ArgumentFilter", remove = ["-rf"], reason = "Removed dangerous flag" }
+
+[[bash_rules]]
+name = "deny-rm-root"
+pattern = "^rm.*/"
+action = { type = "Deny", value = "Cannot delete root paths" }
+"#;
+    let _xdg_config = setup_user_bash_rules(config).await;
+
+    // Command with -rf and / - filter removes -rf, but / still matches deny rule
+    let tool_input = serde_json::json!({"command": "rm -rf /"});
+    let result = handle_bash_pretool_hook(&tool_input)
+        .await
+        .expect("Should succeed");
+
+    match result.hook_specific_output {
+        Some(HookSpecificOutput::PreToolUse(output)) => {
+            assert_eq!(output.permission_decision, Some(PermissionDecision::Deny));
+            assert!(output
+                .permission_decision_reason
+                .as_ref()
+                .unwrap()
+                .contains("Cannot delete root paths"));
+        }
+        _ => panic!("Expected PreToolUse hook specific output"),
+    }
+}
+
+#[tokio::test]
+async fn test_argument_filter_with_no_match() {
+    let config = r#"
+[[bash_rules]]
+name = "filter-cargo-doc"
+pattern = "^cargo doc\\b"
+action = { type = "ArgumentFilter", remove = ["--open"], reason = "Browser flag removed" }
+
+[[bash_rules]]
+name = "allow-cargo-build"
+pattern = "^cargo build"
+action = { type = "Allow" }
+"#;
+    let _xdg_config = setup_user_bash_rules(config).await;
+
+    // cargo doc --open gets filtered to "cargo doc", but no rule allows "cargo doc"
+    let tool_input = serde_json::json!({"command": "cargo doc --open"});
+    let result = handle_bash_pretool_hook(&tool_input)
+        .await
+        .expect("Should succeed");
+
+    match result.hook_specific_output {
+        Some(HookSpecificOutput::PreToolUse(output)) => {
+            // Should ask user because filtered command doesn't match any allow rule
+            assert_eq!(output.permission_decision, Some(PermissionDecision::Ask));
+        }
+        _ => panic!("Expected PreToolUse hook specific output"),
+    }
+}
+
+#[tokio::test]
+async fn test_argument_filter_loop_prevention() {
+    let config = r#"
+[[bash_rules]]
+name = "filter-1"
+pattern = "^cargo doc\\b"
+action = { type = "ArgumentFilter", remove = ["--open"], reason = "First filter" }
+
+[[bash_rules]]
+name = "filter-2"
+pattern = "^cargo doc\\b"
+action = { type = "ArgumentFilter", add = ["--offline"], reason = "Second filter" }
+"#;
+    let _xdg_config = setup_user_bash_rules(config).await;
+
+    // First filter matches and removes --open, but result matches second filter
+    // Should ask user to prevent infinite loops
+    let tool_input = serde_json::json!({"command": "cargo doc --open"});
+    let result = handle_bash_pretool_hook(&tool_input)
+        .await
+        .expect("Should succeed");
+
+    match result.hook_specific_output {
+        Some(HookSpecificOutput::PreToolUse(output)) => {
+            // Should ask user to prevent chained argument filtering
+            assert_eq!(output.permission_decision, Some(PermissionDecision::Ask));
+        }
+        _ => panic!("Expected PreToolUse hook specific output"),
+    }
+}
+
+#[tokio::test]
+async fn test_argument_filter_add_arguments() {
+    let config = r#"
+[[bash_rules]]
+name = "allow-docker-run-safe"
+pattern = "^docker run .* --read-only"
+action = { type = "Allow" }
+
+[[bash_rules]]
+name = "add-safety-flags"
+pattern = "^docker run ubuntu$"
+action = { type = "ArgumentFilter", add = ["--read-only", "--security-opt=no-new-privileges"], reason = "Added security flags" }
+"#;
+    let _xdg_config = setup_user_bash_rules(config).await;
+
+    let tool_input = serde_json::json!({"command": "docker run ubuntu"});
+    let result = handle_bash_pretool_hook(&tool_input)
+        .await
+        .expect("Should succeed");
+
+    match result.hook_specific_output {
+        Some(HookSpecificOutput::PreToolUse(output)) => {
+            assert_eq!(output.permission_decision, Some(PermissionDecision::Allow));
+            if let Some(serde_json::Value::Object(modified)) = &output.updated_input {
+                let command_str = modified
+                    .get("command")
+                    .and_then(|v| v.as_str())
+                    .expect("Expected command string");
+                assert!(command_str.contains("--read-only"));
+                assert!(command_str.contains("--security-opt=no-new-privileges"));
+            } else {
+                panic!("Expected updated_input");
+            }
+        }
+        _ => panic!("Expected PreToolUse hook specific output"),
+    }
+}
+
+#[tokio::test]
+async fn test_argument_filter_replace_arguments() {
+    let config = r#"
+[[bash_rules]]
+name = "allow-rm-interactive"
+pattern = "^rm .* -i$"
+action = { type = "Allow" }
+
+[[bash_rules]]
+name = "force-interactive-rm"
+pattern = "^rm -f file\\.txt$"
+action = { type = "ArgumentFilter", remove = ["-f", "--force"], add = ["-i"], reason = "Replaced force mode with interactive" }
+"#;
+    let _xdg_config = setup_user_bash_rules(config).await;
+
+    let tool_input = serde_json::json!({"command": "rm -f file.txt"});
+    let result = handle_bash_pretool_hook(&tool_input)
+        .await
+        .expect("Should succeed");
+
+    match result.hook_specific_output {
+        Some(HookSpecificOutput::PreToolUse(output)) => {
+            assert_eq!(output.permission_decision, Some(PermissionDecision::Allow));
+            if let Some(serde_json::Value::Object(modified)) = &output.updated_input {
+                assert_eq!(
+                    modified.get("command"),
+                    Some(&serde_json::Value::String("rm file.txt -i".to_string()))
+                );
+            } else {
+                panic!("Expected updated_input");
+            }
+        }
+        _ => panic!("Expected PreToolUse hook specific output"),
+    }
+}
+
+#[tokio::test]
+async fn test_argument_filter_revalidation_to_modify() {
+    let config = r#"
+[[bash_rules]]
+name = "filter-docker-safety"
+pattern = "^docker run.*--privileged"
+action = { type = "ArgumentFilter", remove = ["--privileged"], reason = "Removed privileged mode" }
+
+[[bash_rules]]
+name = "modify-docker-add-limits"
+pattern = "^docker run"
+action = { type = "Modify", value = "$0 --memory=1g" }
+"#;
+    let _xdg_config = setup_user_bash_rules(config).await;
+
+    let tool_input = serde_json::json!({"command": "docker run --privileged ubuntu"});
+    let result = handle_bash_pretool_hook(&tool_input)
+        .await
+        .expect("Should succeed");
+
+    match result.hook_specific_output {
+        Some(HookSpecificOutput::PreToolUse(output)) => {
+            // After filtering removes --privileged, the command matches Modify rule
+            // which transforms it further
+            assert_eq!(output.permission_decision, Some(PermissionDecision::Allow));
+            if let Some(serde_json::Value::Object(modified)) = &output.updated_input {
+                // The Modify rule matches "^docker run" and replaces with "$0 --memory=1g"
+                // After ArgumentFilter removes --privileged, we have "docker run ubuntu"
+                // But $0 only captures "docker run" (the matched part), so we get "docker run --memory=1g"
+                // The "ubuntu" argument is not included because it wasn't part of the regex match
+                assert_eq!(
+                    modified.get("command"),
+                    Some(&serde_json::Value::String(
+                        "docker run --memory=1g".to_string()
+                    ))
+                );
+            } else {
+                panic!("Expected updated_input");
+            }
+        }
+        _ => panic!("Expected PreToolUse hook specific output"),
+    }
+}
+
+#[tokio::test]
+async fn test_argument_filter_revalidation_to_ask() {
+    let config = r#"
+[[bash_rules]]
+name = "filter-sudo-flags"
+pattern = "^sudo.*--non-interactive"
+action = { type = "ArgumentFilter", remove = ["--non-interactive"], reason = "Removed automation flag" }
+
+[[bash_rules]]
+name = "ask-for-sudo"
+pattern = "^sudo"
+action = { type = "Ask" }
+"#;
+    let _xdg_config = setup_user_bash_rules(config).await;
+
+    let tool_input = serde_json::json!({"command": "sudo --non-interactive apt install vim"});
+    let result = handle_bash_pretool_hook(&tool_input)
+        .await
+        .expect("Should succeed");
+
+    match result.hook_specific_output {
+        Some(HookSpecificOutput::PreToolUse(output)) => {
+            assert_eq!(output.permission_decision, Some(PermissionDecision::Ask));
         }
         _ => panic!("Expected PreToolUse hook specific output"),
     }

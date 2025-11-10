@@ -295,6 +295,17 @@ fn output_json(command: &str, result: &RuleResult) -> Result<()> {
             "result": "ask",
             "rule_name": rule_name,
         }),
+        RuleResult::ArgumentFiltered {
+            rule_name,
+            new_command,
+            reason,
+        } => json!({
+            "command": command,
+            "result": "argument_filtered",
+            "rule_name": rule_name,
+            "new_command": new_command,
+            "reason": reason,
+        }),
         RuleResult::NoMatch => json!({
             "command": command,
             "result": "no_match",
@@ -328,6 +339,18 @@ fn output_pretty(command: &str, result: &RuleResult) {
         RuleResult::Asked { rule_name } => {
             println!("? ASK by rule: {}", rule_name);
             println!("  This command requires user approval");
+        }
+        RuleResult::ArgumentFiltered {
+            rule_name,
+            new_command,
+            reason,
+        } => {
+            println!("⚙ ARGUMENT FILTERED by rule: {}", rule_name);
+            println!("  Original: {}", command);
+            println!("  Filtered: {}", new_command);
+            if let Some(r) = reason {
+                println!("  Reason: {}", r);
+            }
         }
         RuleResult::NoMatch => {
             println!("○ NO MATCH");
@@ -387,7 +410,9 @@ mod tests {
         let rules = vec![BashRule {
             name: "deny-rm".to_string(),
             pattern: r"^rm\s+-rf\s+/".to_string(),
-            action: BashRuleAction::Deny("Dangerous recursive delete".to_string()),
+            action: BashRuleAction::Deny {
+                value: "Dangerous recursive delete".to_string(),
+            },
         }];
 
         let config_path = create_test_config(&temp_dir, rules).await;
@@ -403,7 +428,9 @@ mod tests {
         let rules = vec![BashRule {
             name: "modify-docker".to_string(),
             pattern: r"^(docker\s+system\s+prune)$".to_string(),
-            action: BashRuleAction::Modify("$1 --dry-run".to_string()),
+            action: BashRuleAction::Modify {
+                value: "$1 --dry-run".to_string(),
+            },
         }];
 
         let config_path = create_test_config(&temp_dir, rules).await;
@@ -562,7 +589,9 @@ mod tests {
         let rules = vec![BashRule {
             name: "bad-regex".to_string(),
             pattern: r"[invalid(".to_string(),
-            action: BashRuleAction::Deny("test".to_string()),
+            action: BashRuleAction::Deny {
+                value: "test".to_string(),
+            },
         }];
 
         let config_path = create_test_config(&temp_dir, rules).await;
@@ -627,7 +656,9 @@ mod tests {
         let rules = vec![BashRule {
             name: "deny-whitespace".to_string(),
             pattern: r"^\s+$".to_string(),
-            action: BashRuleAction::Deny("Whitespace only".to_string()),
+            action: BashRuleAction::Deny {
+                value: "Whitespace only".to_string(),
+            },
         }];
 
         let config_path = create_test_config(&temp_dir, rules).await;
@@ -665,7 +696,9 @@ mod tests {
         let rules = vec![BashRule {
             name: "deny-rm".to_string(),
             pattern: r"^rm".to_string(),
-            action: BashRuleAction::Deny("Dangerous command".to_string()),
+            action: BashRuleAction::Deny {
+                value: "Dangerous command".to_string(),
+            },
         }];
 
         let config_path = create_test_config(&temp_dir, rules).await;
@@ -681,7 +714,9 @@ mod tests {
         let rules = vec![BashRule {
             name: "add-flag".to_string(),
             pattern: r"^(ls)$".to_string(),
-            action: BashRuleAction::Modify("$1 -la".to_string()),
+            action: BashRuleAction::Modify {
+                value: "$1 -la".to_string(),
+            },
         }];
 
         let config_path = create_test_config(&temp_dir, rules).await;
@@ -698,7 +733,9 @@ mod tests {
             BashRule {
                 name: "deny-ls".to_string(),
                 pattern: r"^ls".to_string(),
-                action: BashRuleAction::Deny("First rule denies".to_string()),
+                action: BashRuleAction::Deny {
+                    value: "First rule denies".to_string(),
+                },
             },
             BashRule {
                 name: "allow-ls".to_string(),

@@ -113,6 +113,124 @@ pattern = "^sudo\\b"
 action = { type = "Ask" }
 ```
 
+### ArgumentFilter
+
+Structurally remove, add, or replace command arguments before execution. Unlike `Modify` which uses regex capture groups, `ArgumentFilter` manipulates arguments as discrete tokens, making it easier to handle flags regardless of their position in the command.
+
+**Important**: After filtering, the modified command is automatically re-validated against all rules. The filtered command must match an `Allow` rule (or be manually approved via an `Ask` rule) to execute.
+
+#### Removing Arguments
+
+Remove specific flags from commands:
+
+```toml
+[[bash_rules]]
+name = "cargo-doc-no-browser"
+pattern = "^cargo doc.*--open"
+action = { type = "ArgumentFilter", remove = ["--open", "-o"], reason = "Browser flags removed" }
+
+[[bash_rules]]
+name = "allow-cargo-doc"
+pattern = "^cargo doc"
+action = { type = "Allow" }
+```
+
+The `remove` field supports:
+- **Exact matches**: `--open` removes `--open`
+- **Prefix matches**: `--open` removes both `--open` and `--open=browser`
+- **Position independence**: Removes the argument regardless of where it appears
+
+#### Adding Arguments
+
+Add security flags or default options:
+
+```toml
+[[bash_rules]]
+name = "docker-run-add-safety"
+pattern = "^docker run(?!.* --read-only)"
+action = {
+  type = "ArgumentFilter",
+  add = ["--read-only", "--security-opt=no-new-privileges"],
+  reason = "Added security restrictions"
+}
+
+[[bash_rules]]
+name = "allow-docker-run"
+pattern = "^docker run .* --read-only"
+action = { type = "Allow" }
+```
+
+Arguments are appended to the end of the command.
+
+#### Replacing Arguments
+
+Replace dangerous flags with safer alternatives:
+
+```toml
+[[bash_rules]]
+name = "rm-force-interactive"
+pattern = "^rm .*-f"
+action = {
+  type = "ArgumentFilter",
+  remove = ["-f", "--force"],
+  add = ["-i"],
+  reason = "Replaced force mode with interactive"
+}
+
+[[bash_rules]]
+name = "allow-rm-interactive"
+pattern = "^rm .* -i$"
+action = { type = "Allow" }
+```
+
+#### Operation Order
+
+ArgumentFilter operations are applied in this order:
+1. **Remove** specified arguments
+2. **Replace** specified arguments (if the `replace` field is used)
+3. **Add** new arguments
+
+```toml
+[[bash_rules]]
+name = "combined-operations"
+pattern = "^npm start"
+action = {
+  type = "ArgumentFilter",
+  remove = ["--open"],           # First: remove --open
+  add = ["--no-browser"],        # Third: add --no-browser
+  reason = "Prevent browser from opening"
+}
+```
+
+#### Re-validation and Security
+
+The filtered command is always re-validated for security:
+
+```toml
+# This filter runs first
+[[bash_rules]]
+name = "filter-cargo-open"
+pattern = "^cargo doc.*--open"
+action = { type = "ArgumentFilter", remove = ["--open"] }
+
+# The filtered command must match an Allow rule
+[[bash_rules]]
+name = "allow-cargo-doc"
+pattern = "^cargo doc"
+action = { type = "Allow" }
+```
+
+**What happens**:
+1. `cargo doc --open --no-deps` matches the first rule
+2. Command is filtered to `cargo doc --no-deps`
+3. Filtered command is re-validated
+4. Matches the Allow rule → execution allowed
+
+**Security guarantees**:
+- If the filtered command doesn't match any Allow rule, it's rejected or requires user approval
+- If the filtered command matches a Deny rule, execution is blocked
+- Chained ArgumentFilter rules (filter → filter) are prevented to avoid infinite loops
+
 ## Pattern Fragments
 
 Pattern fragments allow you to define reusable regex snippets that can be referenced in rule patterns using `{{fragment_name}}` syntax. This eliminates duplication and makes rules easier to maintain.
@@ -263,15 +381,17 @@ action = { type = "Allow" }
 [pattern_fragments]
 safe_chars = "[^|&;$`()<>{}]"
 
-[[bash_rules]]
-name = "cargo-safe-commands"
-pattern = "^cargo (build|check|test|clippy|fmt)( {{safe_chars}}+)*$"
-action = { type = "Allow" }
-
+# Filter annoying --open flag from cargo doc
 [[bash_rules]]
 name = "cargo-doc-no-browser"
-pattern = "^(cargo\\s+doc)( --open| -o)"
-action = { type = "Modify", value = "$1" }
+pattern = "^cargo doc.*--open"
+action = { type = "ArgumentFilter", remove = ["--open", "-o"], reason = "Browser not useful for Claude" }
+
+# Allow cargo commands after filtering
+[[bash_rules]]
+name = "cargo-safe-commands"
+pattern = "^cargo (build|check|test|clippy|fmt|doc)( {{safe_chars}}+)*$"
+action = { type = "Allow" }
 ```
 
 ### Example 2: Git Operations
