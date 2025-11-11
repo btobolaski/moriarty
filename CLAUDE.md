@@ -158,9 +158,9 @@ fn example() -> miette::Result<()> {
 
 #### Import grouping
 
-This project has a particular convention for imports. There should be 3 groups of imports: 
-- std library, 
-- 3rd party crates, 
+This project has a particular convention for imports. There should be 3 groups of imports:
+- std library,
+- 3rd party crates,
 - local and workspace crates
 
 You should always use the compact import form.
@@ -169,7 +169,7 @@ This looks something like this:
 
 ```rust
 // standard library imports
-use std::collections::HashSet;
+use std::{collections::{HashSet, HashMap}, fmt::Display};
 
 // 3rd party crates
 use chrono::{Datelike, NaiveDate, TimeZone, Utc};
