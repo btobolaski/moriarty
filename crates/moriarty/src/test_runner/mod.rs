@@ -19,15 +19,17 @@
 //! # }
 //! ```
 
-use std::io::Read;
-use std::path::PathBuf;
+use std::{io::Read, path::PathBuf};
 
 use miette::{IntoDiagnostic, Result, WrapErr};
 use serde_json::json;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-use crate::hooks::bash_rules::{BashRuleEngine, RuleResult};
-use crate::project_config::runner::{verify_and_load_project, CommandOutput, VerifiedProject};
-use crate::user_config::{load_user_config, UserConfig};
+use crate::{
+    hooks::bash_rules::{BashRuleEngine, RuleResult},
+    project_config::runner::{verify_and_load_project, CommandOutput, VerifiedProject},
+    user_config::{load_user_config, UserConfig},
+};
 
 pub async fn exec_test(cmd: crate::TestCommand) -> Result<()> {
     match cmd {
@@ -199,6 +201,13 @@ async fn test_bash_rules(
     config_path: Option<PathBuf>,
     json: bool,
 ) -> Result<()> {
+    // Initialize tracing to stderr for debug output (RUST_LOG env var controls level)
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+        .try_init();
+
     // Read command from argument or stdin
     let command = match command {
         Some(cmd) => cmd,

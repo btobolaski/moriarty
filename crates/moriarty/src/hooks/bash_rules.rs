@@ -243,6 +243,12 @@ impl BashRuleEngine {
             // Compile expanded pattern to regex
             match Regex::new(&expanded_pattern) {
                 Ok(regex) => {
+                    tracing::debug!(
+                        rule_name = %rule.name,
+                        original_pattern = %rule.pattern,
+                        expanded_pattern = %expanded_pattern,
+                        "Compiled bash rule successfully"
+                    );
                     patterns.push(expanded_pattern.clone());
                     compiled_rules.push(CompiledRule {
                         name: rule.name,
