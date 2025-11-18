@@ -43,6 +43,7 @@ pub enum SystemLogLine {
     Informational(SystemLogInformational),
     ApiError(SystemLogError),
     LocalCommand(LocalCommandLog),
+    StopHookSummary(StopHookSummary),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -61,6 +62,48 @@ pub struct LocalCommandLog {
     pub timestamp: DateTime<Utc>,
     pub uuid: Uuid,
     pub is_meta: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct StopHookSummary {
+    pub parent_uuid: Uuid,
+    pub is_sidechain: bool,
+    pub user_type: String,
+    pub cwd: String,
+    pub session_id: Uuid,
+    pub version: String,
+    pub git_branch: String,
+    pub hook_count: usize,
+    pub hook_infos: Vec<HookInfo>,
+    pub hook_errors: Vec<HookError>,
+    pub prevented_continuation: bool,
+    pub stop_reason: String,
+    pub has_output: bool,
+    pub level: String,
+    pub timestamp: DateTime<Utc>,
+    pub uuid: Uuid,
+    #[serde(rename = "toolUseID")]
+    pub tool_use_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct HookInfo {
+    pub command: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct HookError {
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -889,6 +932,239 @@ mod tests {
             );
         } else {
             panic!("Expected Assistant variant");
+        }
+    }
+
+    #[test]
+    fn test_parse_stop_hook_summary() {
+        let json = serde_json::json!({
+            "parentUuid": "5445927e-82b0-4164-91f3-782fafd2a49e",
+            "isSidechain": false,
+            "userType": "external",
+            "cwd": "/home/brendan/src/moriarty",
+            "sessionId": "1a55057c-6af4-4c76-83a1-70b738990294",
+            "version": "2.0.42",
+            "gitBranch": "main",
+            "type": "system",
+            "subtype": "stop_hook_summary",
+            "hookCount": 1,
+            "hookInfos": [{"command": "moriarty hooks exec"}],
+            "hookErrors": [],
+            "preventedContinuation": false,
+            "stopReason": "",
+            "hasOutput": false,
+            "level": "suggestion",
+            "timestamp": "2025-11-18T05:27:44.883Z",
+            "uuid": "35c84fed-bf99-42dc-a7bb-eae460cd23ab",
+            "toolUseID": "8f3746a9-caa9-4d2d-8e6e-e7a7b005d5d4"
+        });
+
+        let line: LogLine =
+            serde_json::from_value(json).expect("Failed to parse stop_hook_summary system message");
+
+        match line {
+            LogLine::System(SystemLogLine::StopHookSummary(summary)) => {
+                assert_eq!(summary.hook_count, 1);
+                assert_eq!(summary.hook_infos.len(), 1);
+                assert_eq!(summary.hook_infos[0].command, "moriarty hooks exec");
+                assert_eq!(summary.hook_errors.len(), 0);
+                assert_eq!(summary.prevented_continuation, false);
+                assert_eq!(summary.stop_reason, "");
+                assert_eq!(summary.has_output, false);
+                assert_eq!(summary.level, "suggestion");
+                assert_eq!(summary.tool_use_id, "8f3746a9-caa9-4d2d-8e6e-e7a7b005d5d4");
+            }
+            _ => panic!("Expected System(StopHookSummary) variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_stop_hook_summary_rejects_unknown_fields() {
+        let json = serde_json::json!({
+            "parentUuid": "5445927e-82b0-4164-91f3-782fafd2a49e",
+            "isSidechain": false,
+            "userType": "external",
+            "cwd": "/home/brendan/src/moriarty",
+            "sessionId": "1a55057c-6af4-4c76-83a1-70b738990294",
+            "version": "2.0.42",
+            "gitBranch": "main",
+            "type": "system",
+            "subtype": "stop_hook_summary",
+            "hookCount": 1,
+            "hookInfos": [{"command": "moriarty hooks exec"}],
+            "hookErrors": [],
+            "preventedContinuation": false,
+            "stopReason": "",
+            "hasOutput": false,
+            "level": "suggestion",
+            "timestamp": "2025-11-18T05:27:44.883Z",
+            "uuid": "35c84fed-bf99-42dc-a7bb-eae460cd23ab",
+            "toolUseID": "8f3746a9-caa9-4d2d-8e6e-e7a7b005d5d4",
+            "unknownField": "should be rejected"
+        });
+
+        let err_msg = serde_json::from_value::<LogLine>(json)
+            .expect_err("Should reject unknown fields due to deny_unknown_fields")
+            .to_string();
+        assert!(
+            err_msg.contains("unknown field") || err_msg.contains("unknownField"),
+            "Error should mention unknown field, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_parse_hook_error_with_all_fields() {
+        let json = serde_json::json!({
+            "message": "Command failed",
+            "command": "test-hook",
+            "exitCode": 1
+        });
+
+        let error: HookError = serde_json::from_value(json).expect("Failed to parse HookError");
+        assert_eq!(error.message, "Command failed");
+        assert_eq!(error.command, Some("test-hook".to_string()));
+        assert_eq!(error.exit_code, Some(1));
+    }
+
+    #[test]
+    fn test_parse_hook_error_minimal() {
+        let json = serde_json::json!({
+            "message": "Error occurred"
+        });
+
+        let error: HookError = serde_json::from_value(json).expect("Failed to parse HookError");
+        assert_eq!(error.message, "Error occurred");
+        assert_eq!(error.command, None);
+        assert_eq!(error.exit_code, None);
+    }
+
+    #[test]
+    fn test_parse_hook_error_rejects_unknown_fields() {
+        let json = serde_json::json!({
+            "message": "Error",
+            "unknownField": "value"
+        });
+
+        let err_msg = serde_json::from_value::<HookError>(json)
+            .expect_err("Should reject unknown fields due to deny_unknown_fields")
+            .to_string();
+        assert!(
+            err_msg.contains("unknown field") || err_msg.contains("unknownField"),
+            "Error should mention unknown field, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_parse_hook_info_rejects_unknown_fields() {
+        let json = serde_json::json!({
+            "command": "test-command",
+            "extraField": "bad"
+        });
+
+        let err_msg = serde_json::from_value::<HookInfo>(json)
+            .expect_err("Should reject unknown fields due to deny_unknown_fields")
+            .to_string();
+        assert!(
+            err_msg.contains("unknown field") || err_msg.contains("extraField"),
+            "Error should mention unknown field, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_parse_stop_hook_summary_with_multiple_hooks_and_errors() {
+        let json = serde_json::json!({
+            "parentUuid": "5445927e-82b0-4164-91f3-782fafd2a49e",
+            "isSidechain": false,
+            "userType": "external",
+            "cwd": "/home/brendan/src/moriarty",
+            "sessionId": "1a55057c-6af4-4c76-83a1-70b738990294",
+            "version": "2.0.42",
+            "gitBranch": "main",
+            "type": "system",
+            "subtype": "stop_hook_summary",
+            "hookCount": 3,
+            "hookInfos": [
+                {"command": "hook1"},
+                {"command": "hook2"},
+                {"command": "hook3"}
+            ],
+            "hookErrors": [
+                {"message": "Error 1", "command": "hook1", "exitCode": 1},
+                {"message": "Error 2"}
+            ],
+            "preventedContinuation": true,
+            "stopReason": "Multiple hooks failed",
+            "hasOutput": true,
+            "level": "error",
+            "timestamp": "2025-11-18T05:27:44.883Z",
+            "uuid": "35c84fed-bf99-42dc-a7bb-eae460cd23ab",
+            "toolUseID": "8f3746a9-caa9-4d2d-8e6e-e7a7b005d5d4"
+        });
+
+        let line: LogLine = serde_json::from_value(json)
+            .expect("Failed to parse stop_hook_summary with multiple hooks");
+
+        match line {
+            LogLine::System(SystemLogLine::StopHookSummary(summary)) => {
+                assert_eq!(summary.hook_count, 3);
+                assert_eq!(summary.hook_infos.len(), 3);
+                assert_eq!(summary.hook_infos[0].command, "hook1");
+                assert_eq!(summary.hook_infos[1].command, "hook2");
+                assert_eq!(summary.hook_infos[2].command, "hook3");
+                assert_eq!(summary.hook_errors.len(), 2);
+                assert_eq!(summary.hook_errors[0].message, "Error 1");
+                assert_eq!(summary.hook_errors[0].command, Some("hook1".to_string()));
+                assert_eq!(summary.hook_errors[0].exit_code, Some(1));
+                assert_eq!(summary.hook_errors[1].message, "Error 2");
+                assert_eq!(summary.hook_errors[1].command, None);
+                assert_eq!(summary.prevented_continuation, true);
+                assert_eq!(summary.stop_reason, "Multiple hooks failed");
+                assert_eq!(summary.has_output, true);
+                assert_eq!(summary.level, "error");
+            }
+            _ => panic!("Expected System(StopHookSummary) variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_stop_hook_summary_with_empty_arrays() {
+        let json = serde_json::json!({
+            "parentUuid": "5445927e-82b0-4164-91f3-782fafd2a49e",
+            "isSidechain": false,
+            "userType": "external",
+            "cwd": "/home/brendan/src/moriarty",
+            "sessionId": "1a55057c-6af4-4c76-83a1-70b738990294",
+            "version": "2.0.42",
+            "gitBranch": "main",
+            "type": "system",
+            "subtype": "stop_hook_summary",
+            "hookCount": 0,
+            "hookInfos": [],
+            "hookErrors": [],
+            "preventedContinuation": false,
+            "stopReason": "",
+            "hasOutput": false,
+            "level": "info",
+            "timestamp": "2025-11-18T05:27:44.883Z",
+            "uuid": "35c84fed-bf99-42dc-a7bb-eae460cd23ab",
+            "toolUseID": "test-id"
+        });
+
+        let line: LogLine = serde_json::from_value(json)
+            .expect("Failed to parse stop_hook_summary with empty arrays");
+
+        match line {
+            LogLine::System(SystemLogLine::StopHookSummary(summary)) => {
+                assert_eq!(summary.hook_count, 0);
+                assert_eq!(summary.hook_infos.len(), 0);
+                assert_eq!(summary.hook_errors.len(), 0);
+                assert_eq!(summary.prevented_continuation, false);
+                assert_eq!(summary.has_output, false);
+            }
+            _ => panic!("Expected System(StopHookSummary) variant"),
         }
     }
 }

@@ -196,6 +196,24 @@ fn format_system_message(system: &SystemLogLine) -> String {
         SystemLogLine::LocalCommand(cmd) => {
             format!("💻 Local Command [{}]\n   {}\n", cmd.level, cmd.content)
         }
+        SystemLogLine::StopHookSummary(summary) => {
+            let mut output = format!("🪝 Hook Summary ({} hook(s))\n", summary.hook_count);
+            for hook_info in &summary.hook_infos {
+                output.push_str(&format!("   Command: {}\n", hook_info.command));
+            }
+            if !summary.hook_errors.is_empty() {
+                output.push_str(&format!("   Errors: {}\n", summary.hook_errors.len()));
+            }
+            if summary.prevented_continuation {
+                let reason = if summary.stop_reason.is_empty() {
+                    "no reason provided"
+                } else {
+                    &summary.stop_reason
+                };
+                output.push_str(&format!("   ⚠️  Prevented continuation: {}\n", reason));
+            }
+            output
+        }
     }
 }
 
@@ -748,5 +766,179 @@ mod tests {
         assert!(result.contains("dequeue"));
         assert!(result.contains("test-session-id"));
         assert!(result.contains("Another test"));
+    }
+
+    #[test]
+    fn test_format_system_stop_hook_summary_basic() {
+        use crate::logs::parser::{HookInfo, StopHookSummary};
+
+        let system = SystemLogLine::StopHookSummary(StopHookSummary {
+            parent_uuid: Uuid::new_v4(),
+            is_sidechain: false,
+            user_type: "test".to_string(),
+            cwd: "/test".to_string(),
+            session_id: Uuid::new_v4(),
+            version: "1.0.0".to_string(),
+            git_branch: "main".to_string(),
+            hook_count: 1,
+            hook_infos: vec![HookInfo {
+                command: "test-hook".to_string(),
+            }],
+            hook_errors: vec![],
+            prevented_continuation: false,
+            stop_reason: String::new(),
+            has_output: false,
+            level: "info".to_string(),
+            timestamp: Utc::now(),
+            uuid: Uuid::new_v4(),
+            tool_use_id: "test-id".to_string(),
+        });
+        let result = format_system_message(&system);
+        assert!(!result.is_empty());
+        assert!(result.contains("Hook Summary"));
+        assert!(result.contains("1 hook(s)"));
+        assert!(result.contains("test-hook"));
+        assert!(!result.contains("Errors:"));
+        assert!(!result.contains("Prevented continuation"));
+    }
+
+    #[test]
+    fn test_format_system_stop_hook_summary_multiple_hooks() {
+        use crate::logs::parser::{HookInfo, StopHookSummary};
+
+        let system = SystemLogLine::StopHookSummary(StopHookSummary {
+            parent_uuid: Uuid::new_v4(),
+            is_sidechain: false,
+            user_type: "test".to_string(),
+            cwd: "/test".to_string(),
+            session_id: Uuid::new_v4(),
+            version: "1.0.0".to_string(),
+            git_branch: "main".to_string(),
+            hook_count: 3,
+            hook_infos: vec![
+                HookInfo {
+                    command: "hook1".to_string(),
+                },
+                HookInfo {
+                    command: "hook2".to_string(),
+                },
+                HookInfo {
+                    command: "hook3".to_string(),
+                },
+            ],
+            hook_errors: vec![],
+            prevented_continuation: false,
+            stop_reason: String::new(),
+            has_output: false,
+            level: "info".to_string(),
+            timestamp: Utc::now(),
+            uuid: Uuid::new_v4(),
+            tool_use_id: "test-id".to_string(),
+        });
+        let result = format_system_message(&system);
+        assert!(result.contains("3 hook(s)"));
+        assert!(result.contains("hook1"));
+        assert!(result.contains("hook2"));
+        assert!(result.contains("hook3"));
+    }
+
+    #[test]
+    fn test_format_system_stop_hook_summary_with_errors() {
+        use crate::logs::parser::{HookError, HookInfo, StopHookSummary};
+
+        let system = SystemLogLine::StopHookSummary(StopHookSummary {
+            parent_uuid: Uuid::new_v4(),
+            is_sidechain: false,
+            user_type: "test".to_string(),
+            cwd: "/test".to_string(),
+            session_id: Uuid::new_v4(),
+            version: "1.0.0".to_string(),
+            git_branch: "main".to_string(),
+            hook_count: 1,
+            hook_infos: vec![HookInfo {
+                command: "failing-hook".to_string(),
+            }],
+            hook_errors: vec![
+                HookError {
+                    message: "Error 1".to_string(),
+                    command: Some("failing-hook".to_string()),
+                    exit_code: Some(1),
+                },
+                HookError {
+                    message: "Error 2".to_string(),
+                    command: None,
+                    exit_code: None,
+                },
+            ],
+            prevented_continuation: false,
+            stop_reason: String::new(),
+            has_output: false,
+            level: "error".to_string(),
+            timestamp: Utc::now(),
+            uuid: Uuid::new_v4(),
+            tool_use_id: "test-id".to_string(),
+        });
+        let result = format_system_message(&system);
+        assert!(result.contains("Errors: 2"));
+    }
+
+    #[test]
+    fn test_format_system_stop_hook_summary_prevented_continuation() {
+        use crate::logs::parser::{HookInfo, StopHookSummary};
+
+        let system = SystemLogLine::StopHookSummary(StopHookSummary {
+            parent_uuid: Uuid::new_v4(),
+            is_sidechain: false,
+            user_type: "test".to_string(),
+            cwd: "/test".to_string(),
+            session_id: Uuid::new_v4(),
+            version: "1.0.0".to_string(),
+            git_branch: "main".to_string(),
+            hook_count: 1,
+            hook_infos: vec![HookInfo {
+                command: "blocking-hook".to_string(),
+            }],
+            hook_errors: vec![],
+            prevented_continuation: true,
+            stop_reason: "Security policy violation".to_string(),
+            has_output: true,
+            level: "warning".to_string(),
+            timestamp: Utc::now(),
+            uuid: Uuid::new_v4(),
+            tool_use_id: "test-id".to_string(),
+        });
+        let result = format_system_message(&system);
+        assert!(result.contains("Prevented continuation"));
+        assert!(result.contains("Security policy violation"));
+    }
+
+    #[test]
+    fn test_format_system_stop_hook_summary_prevented_continuation_empty_reason() {
+        use crate::logs::parser::{HookInfo, StopHookSummary};
+
+        let system = SystemLogLine::StopHookSummary(StopHookSummary {
+            parent_uuid: Uuid::new_v4(),
+            is_sidechain: false,
+            user_type: "test".to_string(),
+            cwd: "/test".to_string(),
+            session_id: Uuid::new_v4(),
+            version: "1.0.0".to_string(),
+            git_branch: "main".to_string(),
+            hook_count: 1,
+            hook_infos: vec![HookInfo {
+                command: "hook".to_string(),
+            }],
+            hook_errors: vec![],
+            prevented_continuation: true,
+            stop_reason: String::new(),
+            has_output: false,
+            level: "warning".to_string(),
+            timestamp: Utc::now(),
+            uuid: Uuid::new_v4(),
+            tool_use_id: "test-id".to_string(),
+        });
+        let result = format_system_message(&system);
+        assert!(result.contains("Prevented continuation"));
+        assert!(result.contains("no reason provided"));
     }
 }
