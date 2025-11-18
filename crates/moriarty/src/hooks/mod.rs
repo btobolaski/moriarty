@@ -31,6 +31,26 @@
 //! access needed to modify approved binaries directly, so it doesn't meaningfully weaken
 //! the security model. Once checks are configured and approved, the handler fails **closed**
 //! on all verification failures (unapproved checks, hash mismatches, check failures).
+//!
+//! ## Hook Output Fields: `reason` vs `system_message`
+//!
+//! Hook outputs populate multiple message fields to support different Claude Code UI modes:
+//!
+//! - **`reason`** / **`permission_decision_reason`**: Detailed message for logs and verbose mode
+//!   (Ctrl+O). May include technical details, command output, or debugging information.
+//!
+//! - **`system_message`**: User-facing message shown in Claude Code UI without verbose mode.
+//!   Should be concise and actionable (e.g., "Check 'semgrep' binary changed. Run: moriarty
+//!   approve-project /path").
+//!
+//! **Why both fields?** The duplication ensures users receive feedback regardless of Claude Code's
+//! verbosity settings:
+//! - Without verbose mode: Only `system_message` is shown to the user
+//! - With verbose mode (Ctrl+O): Both `reason` and `system_message` appear in logs
+//!
+//! While this duplicates content in the JSON payload, it's required by Claude Code's protocol
+//! to provide consistent user feedback. The alternative (showing only verbose output) would
+//! require users to enable verbose mode to understand why hooks blocked their commands.
 
 pub mod bash_rules;
 pub mod parser;
@@ -183,35 +203,56 @@ async fn exec_hook_impl<R: Read>(reader: R) -> Result<()> {
     Ok(())
 }
 
-/// Helper to create a HookOutput that allows execution with an optional reason
-fn allow_hook() -> HookOutput {
+/// Allows execution with optional user-facing feedback.
+///
+/// When `message` is provided, it's sent as both `reason` (for verbose mode/logs)
+/// and `system_message` (for immediate user feedback without verbose mode).
+///
+/// Use `system_message` when you want to provide user-facing feedback even without
+/// verbose mode enabled, such as informing users that checks passed or explaining
+/// why their command was allowed despite appearing potentially dangerous.
+fn allow_hook(message: Option<String>) -> HookOutput {
     HookOutput {
         continue_execution: None,
         stop_reason: None,
         suppress_output: None,
         decision: Some(HookDecision::Approve),
-        reason: None,
-        system_message: None,
+        reason: message.clone(),
+        system_message: message,
         permission_decision: None,
         hook_specific_output: None,
     }
 }
 
-/// Helper to create a HookOutput that denies execution with a reason
+/// Denies execution with user-facing feedback.
+///
+/// The message is sent as both `reason` (for verbose mode/logs) and `system_message`
+/// (for immediate user feedback without verbose mode).
+///
+/// Use this when denying commands that users might legitimately attempt, to explain
+/// why the command was blocked (e.g., "Check 'semgrep' binary changed").
 fn deny_hook(reason: impl Into<String>) -> HookOutput {
+    let message = reason.into();
     HookOutput {
         continue_execution: None,
         stop_reason: None,
         suppress_output: None,
         decision: Some(HookDecision::Block),
-        reason: Some(reason.into()),
-        system_message: None,
+        reason: Some(message.clone()),
+        system_message: Some(message),
         permission_decision: None,
         hook_specific_output: None,
     }
 }
 
-/// Helper to create a PreToolUse HookOutput that allows execution
+/// Allows PreToolUse execution with optional user-facing feedback.
+///
+/// If a reason is provided, it's sent as both `permission_decision_reason` (for hook-specific output)
+/// and `system_message` (for immediate user feedback without verbose mode).
+///
+/// Use the reason parameter when you want to explain why a command was allowed, especially
+/// when a bash rule explicitly permits something that might look suspicious (e.g., "Allowed
+/// by whitelist rule 'safe-rm'").
 fn pretool_allow_hook(reason: Option<String>) -> HookOutput {
     HookOutput {
         continue_execution: None,
@@ -219,7 +260,7 @@ fn pretool_allow_hook(reason: Option<String>) -> HookOutput {
         suppress_output: None,
         decision: None,
         reason: None,
-        system_message: None,
+        system_message: reason.clone(),
         permission_decision: None,
         hook_specific_output: Some(HookSpecificOutput::PreToolUse(PreToolUseOutput {
             hook_event_name: "PreToolUse".to_string(),
@@ -230,7 +271,14 @@ fn pretool_allow_hook(reason: Option<String>) -> HookOutput {
     }
 }
 
-/// Helper to create a PreToolUse HookOutput that denies execution
+/// Denies PreToolUse execution with user-facing feedback.
+///
+/// The reason is sent as both `permission_decision_reason` (for hook-specific output)
+/// and `system_message` (for immediate user feedback without verbose mode).
+///
+/// Use this when bash rules deny a command, providing clear feedback about why the
+/// command was blocked (e.g., "Dangerous recursive delete" or "Command blocked by
+/// security rule 'deny-rm-rf'").
 fn pretool_deny_hook(reason: String) -> HookOutput {
     HookOutput {
         continue_execution: None,
@@ -238,7 +286,7 @@ fn pretool_deny_hook(reason: String) -> HookOutput {
         suppress_output: None,
         decision: None,
         reason: None,
-        system_message: None,
+        system_message: Some(reason.clone()),
         permission_decision: None,
         hook_specific_output: Some(HookSpecificOutput::PreToolUse(PreToolUseOutput {
             hook_event_name: "PreToolUse".to_string(),
@@ -249,7 +297,10 @@ fn pretool_deny_hook(reason: String) -> HookOutput {
     }
 }
 
-/// Helper to create a PreToolUse HookOutput that asks the user
+/// Asks the user for permission to execute a command.
+///
+/// Use this when bash rules don't have enough information to make a decision
+/// (e.g., command doesn't match any allow/deny rules, or an Ask rule matched).
 fn pretool_ask_hook() -> HookOutput {
     HookOutput {
         continue_execution: None,
@@ -268,7 +319,14 @@ fn pretool_ask_hook() -> HookOutput {
     }
 }
 
-/// Helper to create a PreToolUse HookOutput that modifies the command
+/// Modifies a command and allows execution with optional user-facing feedback.
+///
+/// If a reason is provided, it's sent as both `permission_decision_reason` (for hook-specific output)
+/// and `system_message` (for immediate user feedback without verbose mode).
+///
+/// Use this when bash rules modify a command to make it safer (e.g., adding safety flags
+/// or filtering dangerous arguments). The reason should explain what was changed and why
+/// (e.g., "Command modified by rule 'add-dry-run': added --dry-run flag").
 fn pretool_modify_hook(new_input: serde_json::Value, reason: Option<String>) -> HookOutput {
     HookOutput {
         continue_execution: None,
@@ -276,7 +334,7 @@ fn pretool_modify_hook(new_input: serde_json::Value, reason: Option<String>) -> 
         suppress_output: None,
         decision: None,
         reason: None,
-        system_message: None,
+        system_message: reason.clone(),
         permission_decision: None,
         hook_specific_output: Some(HookSpecificOutput::PreToolUse(PreToolUseOutput {
             hook_event_name: "PreToolUse".to_string(),
@@ -495,7 +553,7 @@ async fn handle_stop_hook() -> Result<HookOutput> {
         }
         Err(_) => {
             info!("No CLAUDE_PROJECT_DIR set, allowing without checks");
-            return Ok(allow_hook());
+            return Ok(allow_hook(None));
         }
     };
 
@@ -508,7 +566,7 @@ async fn handle_stop_hook() -> Result<HookOutput> {
                 error = %e,
                 "Failed to canonicalize project directory"
             );
-            return Ok(allow_hook());
+            return Ok(allow_hook(None));
         }
     };
 
@@ -520,7 +578,7 @@ async fn handle_stop_hook() -> Result<HookOutput> {
                 error = %e,
                 "No .config/tools.toml found, allowing without checks"
             );
-            return Ok(allow_hook());
+            return Ok(allow_hook(None));
         }
     };
 
@@ -529,7 +587,7 @@ async fn handle_stop_hook() -> Result<HookOutput> {
         Some(checks) if !checks.is_empty() => checks,
         _ => {
             info!("No checks defined in config, allowing");
-            return Ok(allow_hook());
+            return Ok(allow_hook(None));
         }
     };
 
@@ -780,7 +838,7 @@ async fn handle_stop_hook() -> Result<HookOutput> {
 
     if failures.is_empty() {
         info!("All checks passed");
-        Ok(allow_hook())
+        Ok(allow_hook(None))
     } else {
         error!(failure_count = failures.len(), "Some checks failed");
         Ok(deny_hook(format!(

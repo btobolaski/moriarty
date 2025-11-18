@@ -705,6 +705,122 @@ mod tests {
         assert!(!json.contains(r#""stopReason""#));
         assert!(!json.contains(r#""suppressOutput""#));
         assert!(!json.contains(r#""reason""#));
+        assert!(!json.contains(r#""systemMessage""#));
+    }
+
+    #[test]
+    fn test_hook_output_serializes_system_message() {
+        let output = HookOutput {
+            continue_execution: None,
+            stop_reason: None,
+            suppress_output: None,
+            decision: Some(HookDecision::Block),
+            reason: Some("Detailed log message".to_string()),
+            system_message: Some("User-facing error".to_string()),
+            permission_decision: None,
+            hook_specific_output: None,
+        };
+
+        let json = serde_json::to_string(&output).expect("Failed to serialize");
+
+        // Verify camelCase field name
+        assert!(
+            json.contains(r#""systemMessage":"User-facing error""#),
+            "Expected systemMessage in JSON, got: {}",
+            json
+        );
+        assert!(
+            json.contains(r#""reason":"Detailed log message""#),
+            "Expected reason in JSON, got: {}",
+            json
+        );
+    }
+
+    #[test]
+    fn test_hook_output_omits_none_system_message() {
+        let output = HookOutput {
+            continue_execution: Some(true),
+            stop_reason: None,
+            suppress_output: None,
+            decision: Some(HookDecision::Approve),
+            reason: None,
+            system_message: None, // Explicitly None
+            permission_decision: None,
+            hook_specific_output: None,
+        };
+
+        let json = serde_json::to_string(&output).expect("Failed to serialize");
+        assert!(
+            !json.contains("systemMessage"),
+            "Should not include systemMessage when None, got: {}",
+            json
+        );
+    }
+
+    #[test]
+    fn test_pretool_output_with_system_message_serialization() {
+        let output = HookOutput {
+            continue_execution: None,
+            stop_reason: None,
+            suppress_output: None,
+            decision: None,
+            reason: None,
+            system_message: Some("Modified: added safety flags".to_string()),
+            permission_decision: None,
+            hook_specific_output: Some(HookSpecificOutput::PreToolUse(PreToolUseOutput {
+                hook_event_name: "PreToolUse".to_string(),
+                permission_decision: Some(PermissionDecision::Allow),
+                permission_decision_reason: Some("Modified: added safety flags".to_string()),
+                updated_input: Some(serde_json::json!({"command": "safe-cmd"})),
+            })),
+        };
+
+        let json = serde_json::to_string(&output).expect("Failed to serialize");
+
+        // Verify system_message appears at top level
+        assert!(json.contains(r#""systemMessage":"Modified: added safety flags""#));
+
+        // Verify hook_specific_output also has the reason
+        assert!(json.contains(r#""permissionDecisionReason":"Modified: added safety flags""#));
+    }
+
+    #[test]
+    fn test_system_message_with_special_characters() {
+        let message = r#"Error: "quoted" & <tags> and \backslashes"#;
+        let output = HookOutput {
+            continue_execution: None,
+            stop_reason: None,
+            suppress_output: None,
+            decision: Some(HookDecision::Block),
+            reason: Some(message.to_string()),
+            system_message: Some(message.to_string()),
+            permission_decision: None,
+            hook_specific_output: None,
+        };
+
+        // Verify JSON escaping works correctly
+        let json = serde_json::to_string(&output).expect("Failed to serialize");
+        let deserialized: HookOutput = serde_json::from_str(&json).expect("Failed to deserialize");
+
+        assert_eq!(deserialized.system_message, Some(message.to_string()));
+    }
+
+    #[test]
+    fn test_system_message_empty_string() {
+        let output = HookOutput {
+            continue_execution: None,
+            stop_reason: None,
+            suppress_output: None,
+            decision: Some(HookDecision::Approve),
+            reason: Some(String::new()),
+            system_message: Some(String::new()),
+            permission_decision: None,
+            hook_specific_output: None,
+        };
+
+        // Empty string should still be included (not omitted like None)
+        let json = serde_json::to_string(&output).expect("Failed to serialize");
+        assert!(json.contains(r#""systemMessage":"""#));
     }
 
     #[test]

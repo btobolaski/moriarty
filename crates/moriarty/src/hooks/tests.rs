@@ -329,10 +329,15 @@ command = ["echo", "test"]
     let result = handle_stop_hook().await.expect("Should succeed");
 
     assert_eq!(result.decision, Some(HookDecision::Block));
-    assert!(result
-        .reason
-        .unwrap()
-        .contains("Check 'test-check' is not approved"));
+
+    // Verify both reason and system_message contain the error
+    let message = result.reason.as_ref().expect("reason should be set");
+    assert!(message.contains("Check 'test-check' is not approved"));
+
+    assert_eq!(
+        result.system_message, result.reason,
+        "system_message should match reason for user feedback"
+    );
 }
 
 #[tokio::test]
@@ -376,12 +381,19 @@ async fn test_stop_hook_check_fails() {
     let result = handle_stop_hook().await.expect("Should succeed");
 
     assert_eq!(result.decision, Some(HookDecision::Block));
-    let reason = result.reason.unwrap();
+
+    let reason = result.reason.as_ref().expect("reason should be set");
     assert!(reason.contains("Checks failed"), "Reason: {}", reason);
     assert!(
         reason.contains("failing-check"),
         "Should mention check name: {}",
         reason
+    );
+
+    // Verify system_message matches reason for user feedback
+    assert_eq!(
+        result.system_message, result.reason,
+        "system_message should match reason for user feedback"
     );
 }
 
@@ -452,7 +464,8 @@ async fn test_stop_hook_check_binary_hash_mismatch() {
     let result = handle_stop_hook().await.expect("Should succeed");
 
     assert_eq!(result.decision, Some(HookDecision::Block));
-    let reason = result.reason.unwrap();
+
+    let reason = result.reason.as_ref().expect("reason should be set");
     assert!(
         reason.contains("binary changed"),
         "Expected binary changed error. Reason: {}",
@@ -462,6 +475,12 @@ async fn test_stop_hook_check_binary_hash_mismatch() {
         reason.contains("test-check"),
         "Expected check name in error. Reason: {}",
         reason
+    );
+
+    // Verify system_message matches reason for user feedback
+    assert_eq!(
+        result.system_message, result.reason,
+        "system_message should match reason for user feedback"
     );
 }
 
@@ -639,6 +658,13 @@ action = { type = "Deny", value = "Dangerous recursive delete" }
     let result = handle_bash_pretool_hook(&tool_input)
         .await
         .expect("Should succeed");
+
+    // Verify system_message is populated for user feedback
+    assert_eq!(
+        result.system_message,
+        Some("Dangerous recursive delete".to_string()),
+        "system_message should be populated at top level for deny decisions"
+    );
 
     match result.hook_specific_output {
         Some(HookSpecificOutput::PreToolUse(output)) => {
@@ -1064,5 +1090,195 @@ action = { type = "Ask" }
             assert_eq!(output.permission_decision, Some(PermissionDecision::Ask));
         }
         _ => panic!("Expected PreToolUse hook specific output"),
+    }
+}
+
+// Tests for system_message field population
+
+#[test]
+fn test_deny_hook_serialization_format() {
+    let output = deny_hook("Check failed");
+    let json = serde_json::to_string(&output).expect("Failed to serialize");
+
+    // Verify JSON structure matches Claude Code protocol
+    assert!(
+        json.contains(r#""decision":"block""#),
+        "JSON should contain decision:block, got: {}",
+        json
+    );
+    assert!(
+        json.contains(r#""reason":"Check failed""#),
+        "JSON should contain reason, got: {}",
+        json
+    );
+    assert!(
+        json.contains(r#""systemMessage":"Check failed""#),
+        "JSON should contain systemMessage, got: {}",
+        json
+    );
+
+    // Verify it round-trips correctly
+    let parsed: HookOutput = serde_json::from_str(&json).expect("Failed to parse");
+    assert_eq!(parsed.decision, Some(HookDecision::Block));
+    assert_eq!(parsed.reason, Some("Check failed".to_string()));
+    assert_eq!(parsed.system_message, Some("Check failed".to_string()));
+}
+
+#[test]
+fn test_pretool_deny_hook_serialization_format() {
+    let output = pretool_deny_hook("Command blocked".to_string());
+    let json = serde_json::to_string(&output).expect("Failed to serialize");
+
+    // Verify JSON structure for PreToolUse hooks
+    assert!(
+        json.contains(r#""systemMessage":"Command blocked""#),
+        "JSON should contain systemMessage at top level, got: {}",
+        json
+    );
+    assert!(
+        json.contains(r#""permissionDecisionReason":"Command blocked""#),
+        "JSON should contain permissionDecisionReason in hookSpecificOutput, got: {}",
+        json
+    );
+    assert!(
+        json.contains(r#""permissionDecision":"deny""#),
+        "JSON should contain permissionDecision:deny, got: {}",
+        json
+    );
+
+    // Verify it round-trips correctly
+    let parsed: HookOutput = serde_json::from_str(&json).expect("Failed to parse");
+    assert_eq!(parsed.system_message, Some("Command blocked".to_string()));
+
+    if let Some(HookSpecificOutput::PreToolUse(pretool)) = parsed.hook_specific_output {
+        assert_eq!(pretool.permission_decision, Some(PermissionDecision::Deny));
+        assert_eq!(
+            pretool.permission_decision_reason,
+            Some("Command blocked".to_string())
+        );
+    } else {
+        panic!("Expected PreToolUse hook specific output");
+    }
+}
+
+#[test]
+fn test_deny_hook_sets_system_message() {
+    let reason = "Access denied: insufficient permissions";
+    let output = deny_hook(reason);
+
+    // Verify both reason and system_message are set to the same value
+    assert_eq!(output.reason, Some(reason.to_string()));
+    assert_eq!(output.system_message, Some(reason.to_string()));
+    assert_eq!(output.decision, Some(HookDecision::Block));
+}
+
+#[test]
+fn test_allow_hook_with_message_sets_system_message() {
+    let message = "Approved by security rule";
+    let output = allow_hook(Some(message.to_string()));
+
+    assert_eq!(output.reason, Some(message.to_string()));
+    assert_eq!(output.system_message, Some(message.to_string()));
+    assert_eq!(output.decision, Some(HookDecision::Approve));
+}
+
+#[test]
+fn test_allow_hook_without_message_omits_system_message() {
+    let output = allow_hook(None);
+
+    assert_eq!(output.reason, None);
+    assert_eq!(output.system_message, None);
+    assert_eq!(output.decision, Some(HookDecision::Approve));
+}
+
+#[test]
+fn test_pretool_deny_hook_sets_system_message() {
+    let reason = "Command blocked by bash rules";
+    let output = pretool_deny_hook(reason.to_string());
+
+    // PreToolUse hooks use permission_decision_reason, not reason
+    assert_eq!(output.reason, None);
+    assert_eq!(output.system_message, Some(reason.to_string()));
+
+    if let Some(HookSpecificOutput::PreToolUse(pretool)) = output.hook_specific_output {
+        assert_eq!(pretool.permission_decision_reason, Some(reason.to_string()));
+        assert_eq!(pretool.permission_decision, Some(PermissionDecision::Deny));
+    } else {
+        panic!("Expected PreToolUse hook output");
+    }
+}
+
+#[test]
+fn test_pretool_allow_hook_with_reason_sets_system_message() {
+    let reason = "Allowed by whitelist rule";
+    let output = pretool_allow_hook(Some(reason.to_string()));
+
+    assert_eq!(output.system_message, Some(reason.to_string()));
+
+    if let Some(HookSpecificOutput::PreToolUse(pretool)) = output.hook_specific_output {
+        assert_eq!(pretool.permission_decision_reason, Some(reason.to_string()));
+        assert_eq!(pretool.permission_decision, Some(PermissionDecision::Allow));
+    } else {
+        panic!("Expected PreToolUse hook output");
+    }
+}
+
+#[test]
+fn test_pretool_allow_hook_without_reason_omits_system_message() {
+    let output = pretool_allow_hook(None);
+
+    assert_eq!(output.system_message, None);
+
+    if let Some(HookSpecificOutput::PreToolUse(pretool)) = output.hook_specific_output {
+        assert_eq!(pretool.permission_decision_reason, None);
+        assert_eq!(pretool.permission_decision, Some(PermissionDecision::Allow));
+    } else {
+        panic!("Expected PreToolUse hook output");
+    }
+}
+
+#[test]
+fn test_pretool_modify_hook_sets_system_message() {
+    let reason = "Command modified by security rule";
+    let new_input = serde_json::json!({"command": "ls -la"});
+    let output = pretool_modify_hook(new_input.clone(), Some(reason.to_string()));
+
+    assert_eq!(output.system_message, Some(reason.to_string()));
+
+    if let Some(HookSpecificOutput::PreToolUse(pretool)) = output.hook_specific_output {
+        assert_eq!(pretool.permission_decision_reason, Some(reason.to_string()));
+        assert_eq!(pretool.updated_input, Some(new_input));
+    } else {
+        panic!("Expected PreToolUse hook output");
+    }
+}
+
+#[test]
+fn test_pretool_modify_hook_without_reason_omits_system_message() {
+    let new_input = serde_json::json!({"command": "ls -la"});
+    let output = pretool_modify_hook(new_input.clone(), None);
+
+    assert_eq!(output.system_message, None);
+
+    if let Some(HookSpecificOutput::PreToolUse(pretool)) = output.hook_specific_output {
+        assert_eq!(pretool.permission_decision_reason, None);
+        assert_eq!(pretool.updated_input, Some(new_input));
+    } else {
+        panic!("Expected PreToolUse hook output");
+    }
+}
+
+#[test]
+fn test_pretool_ask_hook_omits_system_message() {
+    let output = pretool_ask_hook();
+
+    // Ask hooks don't provide feedback, so no system_message
+    assert_eq!(output.system_message, None);
+    assert_eq!(output.reason, None);
+
+    if let Some(HookSpecificOutput::PreToolUse(pretool)) = output.hook_specific_output {
+        assert_eq!(pretool.permission_decision, Some(PermissionDecision::Ask));
+    } else {
+        panic!("Expected PreToolUse hook output");
     }
 }
