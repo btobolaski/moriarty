@@ -1,8 +1,9 @@
 //! MCP (Model Context Protocol) servers for Moriarty.
 //!
-//! This module provides two MCP servers:
+//! This module provides three MCP servers:
 //!
 //! - [`git_read_only`]: Read-only git operations (status, diff, log, show)
+//! - [`jj_read_only`]: Read-only jj (jujutsu) operations (status, diff, log, show, op log)
 //! - [`tool_runner`]: Project-configured tool execution (lint, test, build, format)
 //!
 //! # Usage
@@ -11,27 +12,32 @@
 //!
 //! ```bash
 //! moriarty mcp git-read-only
+//! moriarty mcp jj-read-only
 //! moriarty mcp project-tools
-//! moriarty mcp install  # Install both servers to Claude Code
+//! moriarty mcp install  # Install all servers to Claude Code
 //! ```
 
 use clap::Subcommand;
 
 use git_read_only::GitReadOnly;
+use jj_read_only::JjReadOnly;
 use miette::IntoDiagnostic;
 use rmcp::{transport::stdio, ServiceExt};
 use tool_runner::ToolRunner;
 
 pub mod git_read_only;
+pub mod jj_read_only;
 pub mod tool_runner;
 
 #[derive(Debug, Subcommand)]
 pub enum McpServers {
     /// runs the git read only server as stdin / stdout server
     GitReadOnly,
+    /// runs the jj read only server as stdin / stdout server
+    JjReadOnly,
     /// runs the project tools server as stdin / stdout server
     ProjectTools,
-    /// installs the MCP server into Claude Code
+    /// installs the MCP servers into Claude Code
     Install,
 }
 
@@ -40,6 +46,12 @@ impl McpServers {
         match self {
             Self::GitReadOnly => {
                 let server = GitReadOnly::default();
+                let service = server.serve(stdio()).await.into_diagnostic()?;
+                service.waiting().await.into_diagnostic()?;
+                Ok(())
+            }
+            Self::JjReadOnly => {
+                let server = JjReadOnly::default();
                 let service = server.serve(stdio()).await.into_diagnostic()?;
                 service.waiting().await.into_diagnostic()?;
                 Ok(())
@@ -58,8 +70,8 @@ impl McpServers {
 }
 
 async fn install_mcp_server() -> miette::Result<()> {
-    // Install both MCP servers, tracking results
-    let servers = ["git-read-only", "project-tools"];
+    // Install all MCP servers, tracking results
+    let servers = ["git-read-only", "jj-read-only", "project-tools"];
     let mut errors = Vec::new();
 
     for server in &servers {

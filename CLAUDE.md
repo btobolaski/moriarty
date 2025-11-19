@@ -31,8 +31,9 @@ cargo run -- api-pricing -d <directory> --timezone local|utc
 
 # Run MCP servers
 cargo run -- mcp git-read-only
+cargo run -- mcp jj-read-only
 cargo run -- mcp project-tools
-cargo run -- mcp install  # Install both servers to Claude Code
+cargo run -- mcp install  # Install all servers to Claude Code
 
 # Run project approval TUI
 cargo run -- approve-project <project-dir>
@@ -79,10 +80,11 @@ cargo nextest run --no-fail-fast --hide-progress-bar --success-output never --st
 - Async event stream combining keyboard input and other UI events
 
 **`mcp/`** - Model Context Protocol servers:
-- Two MCP servers: `git_read_only` (status, diff, log, show) and `tool_runner` (lint, test, build, format)
+- Three MCP servers: `git_read_only` (status, diff, log, show), `jj_read_only` (status, diff, log, show, op log), and `tool_runner` (lint, test, build, format)
 - Uses rmcp library with stdio transport for Claude Code integration
-- Both servers run as stdin/stdout servers that Claude Code can invoke
-- `install` command configures both servers in Claude Code's MCP registry
+- All servers run as stdin/stdout servers that Claude Code can invoke
+- `install` command configures all servers in Claude Code's MCP registry
+- **Architectural patterns**: git_read_only uses separate MCP tools per command; jj_read_only uses enum-based single tool (see MCP Command Patterns below)
 
 **`hooks/`** - Security hook system for Claude Code integration:
 - **PreToolUse hook**: Validates Bash commands using user-configured rules from `~/.config/moriarty/tool_rules.toml`
@@ -120,6 +122,15 @@ cargo nextest run --no-fail-fast --hide-progress-bar --success-output never --st
 - All TUI apps follow same pattern: event loop with async event stream, state machine for screens, ScrollViewState for scrolling
 - Event handlers are async to support I/O operations (file reads, approval saves)
 - State machines use enums for screens with explicit transitions
+
+**MCP Command Patterns**:
+- Two architectural approaches for exposing commands via MCP tools:
+  - **Separate tools per command** (git_read_only): Each command (status, diff, log, show) is a separate MCP tool with its own parameter struct. Better discoverability in Claude Code's tool picker, matches rmcp examples, more boilerplate.
+  - **Enum-based single tool** (jj_read_only): Single MCP tool with `JjCommand` enum parameter to select the command. Less boilerplate, cleaner code, single handler, but Claude Code sees only one tool.
+- Trade-offs:
+  - **Separate tools**: More verbose but each tool is independently discoverable and documented in MCP's tool list
+  - **Enum-based**: More concise and maintainable, but requires understanding the enum variants (still type-safe via JSON schema)
+- Choice depends on: number of commands, similarity of parameter structures, and whether command discoverability is critical
 
 **Configuration** (XDG-compliant):
 - `~/.config/moriarty/tool_rules.toml` - Bash validation rules
