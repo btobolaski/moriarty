@@ -94,7 +94,8 @@ impl ApprovalApp {
 
     /// Create a new approval app for the given project directory
     pub async fn new(project_dir: PathBuf) -> Result<Self> {
-        // Canonicalize the project directory
+        // Canonicalize for config loading and binary resolution
+        // (repository root detection will be done during approval save)
         let canonical_dir = project_dir
             .canonicalize()
             .into_diagnostic()
@@ -124,7 +125,7 @@ impl ApprovalApp {
             ));
         }
 
-        // Load command and check information
+        // Load command and check information using canonical_dir for binary resolution
         let command_infos = Self::load_items_info(commands, &canonical_dir).await?;
 
         let check_items: Vec<(String, Vec<String>)> = checks
@@ -137,6 +138,7 @@ impl ApprovalApp {
 
         Ok(Self {
             state: ApprovalState {
+                // Store canonical_dir - repository root detection will happen in approve_project
                 project_dir: canonical_dir,
                 tools_config_hash,
                 commands: command_infos,
@@ -396,7 +398,7 @@ impl ApprovalApp {
 
         // Atomically update approvals with file locking
         ProjectApprovals::update(move |approvals| {
-            approvals.approve_project(project_dir, tools_config_hash, commands, checks);
+            approvals.approve_project(project_dir, tools_config_hash, commands, checks)
         })
         .await
     }

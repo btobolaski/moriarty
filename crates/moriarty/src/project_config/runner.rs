@@ -347,7 +347,9 @@ mod tests {
     async fn setup_test_project_with_approvals(config_content: &str) -> (TempDir, TempDir) {
         let xdg_dir = setup_isolated_xdg_config();
         let temp_dir = setup_test_project(config_content);
-        approvals::approve_project_config(temp_dir.path(), config_content).await;
+        approvals::approve_project_config(temp_dir.path(), config_content)
+            .await
+            .unwrap();
         (temp_dir, xdg_dir)
     }
 

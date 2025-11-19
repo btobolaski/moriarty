@@ -30,7 +30,7 @@ use miette::{Context, IntoDiagnostic, Result};
 use serde::{Deserialize, Serialize};
 use tokio::fs::read_to_string;
 
-use crate::{hashing, persistence::FileType};
+use crate::{hashing, persistence::FileType, repository};
 
 use super::config::ProjectConfig;
 
@@ -125,7 +125,7 @@ impl ProjectApprovals {
     /// don't race by using file locking to make the load-modify-save cycle atomic.
     pub async fn update<F>(f: F) -> Result<()>
     where
-        F: FnOnce(&mut Self),
+        F: FnOnce(&mut Self) -> Result<()>,
     {
         let approvals_path = FileType::Config.build_path(APPROVALS_FILE).await?;
         let lock_path = approvals_path.with_extension("lock");
@@ -152,7 +152,7 @@ impl ProjectApprovals {
             .with_context(|| "Failed to acquire exclusive lock on approvals file")?;
 
         let mut approvals = Self::load().await?;
-        f(&mut approvals);
+        f(&mut approvals)?;
         approvals.save().await
     }
 
@@ -183,26 +183,18 @@ impl ProjectApprovals {
         item_name: &str,
         item_type: ItemType,
     ) -> Result<VerificationResult> {
-        // Canonicalize the project directory
-        let canonical_dir = project_dir
-            .canonicalize()
-            .into_diagnostic()
-            .with_context(|| {
-                format!(
-                    "Failed to canonicalize project directory: {}",
-                    project_dir.display()
-                )
-            })?;
+        // Detect repository root (jj workspace root, git root, or canonicalized path)
+        let repository_root = repository::detect_repository_root(project_dir)?;
 
-        let project_key = canonical_dir.to_string_lossy().to_string();
+        let project_key = repository_root.to_string_lossy().to_string();
 
         // Check if project exists in approvals
         let Some(approval) = self.projects.get(&project_key) else {
             return Ok(VerificationResult::NotApproved);
         };
 
-        // Load and hash the current tools.toml
-        let tools_config_path = canonical_dir.join(".config/tools.toml");
+        // Load and hash the current tools.toml from repository root
+        let tools_config_path = repository_root.join(".config/tools.toml");
         let tools_config_content = read_to_string(&tools_config_path)
             .await
             .into_diagnostic()
@@ -245,7 +237,6 @@ impl ProjectApprovals {
                     });
                 };
 
-                // Get the command array for verification
                 let command_array = match item_name {
                     "lint" => config.commands.lint,
                     "test" => config.commands.test,
@@ -287,7 +278,7 @@ impl ProjectApprovals {
 
         let binary_name = &command_array[0];
         let (original_path, canonical_path) =
-            resolve_binary_path_with_original(binary_name, &canonical_dir)?;
+            resolve_binary_path_with_original(binary_name, &repository_root)?;
 
         // Hash immediately after resolution to prevent TOCTOU attacks
         let current_binary_hash = hashing::hash_file(&canonical_path).await?;
@@ -335,8 +326,11 @@ impl ProjectApprovals {
         tools_config_hash: String,
         commands: HashMap<String, CommandApproval>,
         checks: HashMap<String, CommandApproval>,
-    ) {
-        let project_key = project_dir.to_string_lossy().to_string();
+    ) -> Result<()> {
+        // Detect repository root (jj workspace root, git root, or canonicalized path)
+        let repository_root = repository::detect_repository_root(&project_dir)?;
+        let project_key = repository_root.to_string_lossy().to_string();
+
         self.projects.insert(
             project_key,
             ProjectApproval {
@@ -346,6 +340,7 @@ impl ProjectApprovals {
                 checks,
             },
         );
+        Ok(())
     }
 }
 

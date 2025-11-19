@@ -11,6 +11,7 @@ mod logs;
 mod mcp;
 mod persistence;
 mod project_config;
+mod repository;
 mod test_runner;
 mod tui;
 mod user_config;

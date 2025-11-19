@@ -127,6 +127,14 @@ cargo nextest run --no-fail-fast --hide-progress-bar --success-output never --st
 - `~/.config/moriarty/project_approvals.toml` - SHA-256 approval hashes
 - `~/.local/state/moriarty/logs/` - Structured logs
 
+**Repository Root Detection**:
+- Approvals are keyed by repository root, not workspace directory
+- Detection order: reading `.jj/repo` file → `git rev-parse --git-common-dir` → canonicalized path
+- This allows approval sharing across jujutsu workspaces and git worktrees
+- For jj: reads `.jj/repo` file and resolves both absolute and relative paths
+- For git: uses `--git-common-dir` which returns the shared `.git` directory for all worktrees
+- Module: `repository.rs` provides `detect_repository_root()` function
+
 ## Development Notes
 
 **Workspace Optimization**: The `my-workspace-hack` crate is managed by cargo-hakari to unify dependencies.

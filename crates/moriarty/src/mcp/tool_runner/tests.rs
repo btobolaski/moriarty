@@ -25,7 +25,9 @@ fn setup_isolated_xdg_config() -> tempfile::TempDir {
 async fn setup_project_dir_with_approvals(config_content: &str) -> (TempDir, TempDir) {
     let xdg_dir = setup_isolated_xdg_config();
     let temp_dir = setup_project_dir_with_config(config_content);
-    approvals::approve_project_config(temp_dir.path(), config_content).await;
+    approvals::approve_project_config(temp_dir.path(), config_content)
+        .await
+        .unwrap();
     (temp_dir, xdg_dir)
 }
 
@@ -405,7 +407,9 @@ test = ["{}"]
     std::fs::write(config_dir.join("tools.toml"), &config_content).unwrap();
 
     // Approve the legitimate binary
-    approvals::approve_project_config(temp_dir.path(), &config_content).await;
+    approvals::approve_project_config(temp_dir.path(), &config_content)
+        .await
+        .unwrap();
 
     // TOCTOU attack: Swap the binary with malicious content after approval
     let mut malicious_script = std::fs::File::create(&script_path).unwrap();
@@ -486,7 +490,9 @@ test = ["{}"]
         std::fs::write(config_dir.join("tools.toml"), &config_content).unwrap();
 
         // Approve via symlink (resolves to legitimate binary)
-        approvals::approve_project_config(temp_dir.path(), &config_content).await;
+        approvals::approve_project_config(temp_dir.path(), &config_content)
+            .await
+            .unwrap();
 
         // TOCTOU attack: Change symlink to point to malicious binary
         std::fs::remove_file(&symlink_path).unwrap();
@@ -552,7 +558,9 @@ test = ["{}"]
     std::fs::write(config_dir.join("tools.toml"), &config_content_v1).unwrap();
 
     // Step 1: Initial approval
-    approvals::approve_project_config(temp_dir.path(), &config_content_v1).await;
+    approvals::approve_project_config(temp_dir.path(), &config_content_v1)
+        .await
+        .unwrap();
 
     // Step 2: Execute command - should succeed
     let args = RunArgs {
@@ -590,7 +598,9 @@ build = ["echo", "build"]
     );
 
     // Step 5: Re-approve with new config
-    approvals::approve_project_config(temp_dir.path(), &config_content_v2).await;
+    approvals::approve_project_config(temp_dir.path(), &config_content_v2)
+        .await
+        .unwrap();
 
     // Step 6: Execute command again - should succeed with new approval
     let result = ToolRunner::run_command(ProjectCommand::Test, args).await;
@@ -638,7 +648,9 @@ build = ["{}"]
     std::fs::write(config_dir.join("tools.toml"), &config_content).unwrap();
 
     // Approve version 1
-    approvals::approve_project_config(temp_dir.path(), &config_content).await;
+    approvals::approve_project_config(temp_dir.path(), &config_content)
+        .await
+        .unwrap();
 
     // Execute - should succeed
     let args = RunArgs {
@@ -668,7 +680,9 @@ build = ["{}"]
     );
 
     // Re-approve with modified binary
-    approvals::approve_project_config(temp_dir.path(), &config_content).await;
+    approvals::approve_project_config(temp_dir.path(), &config_content)
+        .await
+        .unwrap();
 
     // Execute again - should succeed with new approval
     let result = ToolRunner::run_command(ProjectCommand::Build, args).await;

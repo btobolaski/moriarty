@@ -557,21 +557,27 @@ async fn handle_stop_hook() -> Result<HookOutput> {
         }
     };
 
-    // Canonicalize the project directory path
-    let canonical_dir = match project_dir.canonicalize() {
-        Ok(dir) => dir,
+    let repository_root = match crate::repository::detect_repository_root(&project_dir) {
+        Ok(root) => {
+            info!(
+                project_dir = %project_dir.display(),
+                repository_root = %root.display(),
+                "Detected repository root"
+            );
+            root
+        }
         Err(e) => {
             error!(
                 project_dir = %project_dir.display(),
                 error = %e,
-                "Failed to canonicalize project directory"
+                "Failed to detect repository root"
             );
             return Ok(allow_hook(None));
         }
     };
 
-    // Try to load project config
-    let config = match load_project_settings(canonical_dir.clone()).await {
+    // Use repository root for config loading and approval verification
+    let config = match load_project_settings(repository_root.clone()).await {
         Ok(config) => config,
         Err(e) => {
             info!(
@@ -601,7 +607,7 @@ async fn handle_stop_hook() -> Result<HookOutput> {
                 "Check '{}' has empty command array in {}/.config/tools.toml\n\
                  Expected format: command = [\"binary\", \"arg1\", \"arg2\"]",
                 check.name,
-                canonical_dir.display()
+                repository_root.display()
             )));
         }
     }
@@ -611,7 +617,9 @@ async fn handle_stop_hook() -> Result<HookOutput> {
 
     // Verify all checks are approved
     for check in &checks {
-        let verification = approvals.verify_check(&canonical_dir, &check.name).await?;
+        let verification = approvals
+            .verify_check(&repository_root, &check.name)
+            .await?;
 
         use crate::project_config::approvals::VerificationResult;
         match verification {
@@ -623,7 +631,7 @@ async fn handle_stop_hook() -> Result<HookOutput> {
                 return Ok(deny_hook(format!(
                     "Check '{}' is not approved. Run: moriarty approve-project {}",
                     check.name,
-                    canonical_dir.display()
+                    repository_root.display()
                 )));
             }
             VerificationResult::ConfigHashMismatch { expected, actual } => {
@@ -635,7 +643,7 @@ async fn handle_stop_hook() -> Result<HookOutput> {
                 );
                 return Ok(deny_hook(format!(
                     "Project configuration changed. Run: moriarty approve-project {}",
-                    canonical_dir.display()
+                    repository_root.display()
                 )));
             }
             VerificationResult::BinaryHashMismatch {
@@ -653,7 +661,7 @@ async fn handle_stop_hook() -> Result<HookOutput> {
                 return Ok(deny_hook(format!(
                     "Check '{}' binary changed. Run: moriarty approve-project {}",
                     check.name,
-                    canonical_dir.display()
+                    repository_root.display()
                 )));
             }
             VerificationResult::ItemNotApproved { item } => {
@@ -661,7 +669,7 @@ async fn handle_stop_hook() -> Result<HookOutput> {
                 return Ok(deny_hook(format!(
                     "Check '{}' not in approvals. Run: moriarty approve-project {}",
                     item,
-                    canonical_dir.display()
+                    repository_root.display()
                 )));
             }
         }
@@ -692,10 +700,10 @@ async fn handle_stop_hook() -> Result<HookOutput> {
 
     // Execute checks with concurrency limits
     let timeout_duration = std::time::Duration::from_secs(CHECK_TIMEOUT_SECS);
-    let canonical_dir_clone = canonical_dir.clone();
+    let repository_root_clone = repository_root.clone();
 
     let check_futures = futures::stream::iter(checks.into_iter().map(move |check| {
-        let canonical_dir = canonical_dir_clone.clone();
+        let repository_root = repository_root_clone.clone();
         async move {
             // Split command into executable and arguments
             // Defensive handling despite line 240 validation because async timing allows config
@@ -714,7 +722,7 @@ async fn handle_stop_hook() -> Result<HookOutput> {
 
             let output = tokio::process::Command::new(cmd)
                 .args(args)
-                .current_dir(&canonical_dir)
+                .current_dir(&repository_root)
                 .output()
                 .await;
 

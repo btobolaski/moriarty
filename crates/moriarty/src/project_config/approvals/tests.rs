@@ -2,8 +2,19 @@
 
 use std::{
     collections::HashMap,
+    io::Write,
     path::{Path, PathBuf},
+    process::Command,
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
+use miette::{IntoDiagnostic, Result, WrapErr};
+use tempfile::{NamedTempFile, TempDir};
+use tokio::time::{sleep, Duration};
+
+use crate::{hashing, project_config::config::ProjectConfig, repository};
 
 use super::super::{
     is_script, is_within_project, is_writable, resolve_binary_path_with_original, CommandApproval,
@@ -12,21 +23,30 @@ use super::super::{
 
 /// Test helper to pre-approve a project with the given config content.
 /// This bypasses the approval TUI for integration tests.
-/// Returns the canonical project path for use in assertions.
-pub async fn approve_project_config(project_dir: &Path, config_content: &str) -> PathBuf {
-    use crate::project_config::config::ProjectConfig;
+/// Returns the repository root path for use in assertions.
+///
+/// # Errors
+/// Returns an error if:
+/// - Repository root detection fails (path doesn't exist, permission denied, etc.)
+/// - Config parsing fails (invalid TOML)
+/// - Binary resolution fails (binary not found)
+/// - File hashing fails (I/O error)
+/// - Approval update fails (filesystem error)
+pub async fn approve_project_config(project_dir: &Path, config_content: &str) -> Result<PathBuf> {
+    // Detect repository root (jj workspace root, git root, or canonicalized path)
+    let repository_root = repository::detect_repository_root(project_dir)?;
+    let config: ProjectConfig = toml::from_str(config_content)
+        .into_diagnostic()
+        .wrap_err("Failed to parse test config")?;
+    let tools_config_hash = hashing::hash_string(config_content);
 
-    let canonical_path = project_dir.canonicalize().unwrap();
-    let config: ProjectConfig = toml::from_str(config_content).unwrap();
-    let tools_config_hash = crate::hashing::hash_string(config_content);
-
-    // Process commands
+    // Process commands (use repository_root for binary resolution)
     let mut commands = HashMap::new();
     for (name, cmd_array) in config.commands.all() {
         let binary_name = &cmd_array[0];
         let (original_path, resolved_path) =
-            resolve_binary_path_with_original(binary_name, &canonical_path).unwrap();
-        let binary_hash = crate::hashing::hash_file(&resolved_path).await.unwrap();
+            resolve_binary_path_with_original(binary_name, &repository_root)?;
+        let binary_hash = hashing::hash_file(&resolved_path).await?;
 
         commands.insert(
             name,
@@ -44,8 +64,8 @@ pub async fn approve_project_config(project_dir: &Path, config_content: &str) ->
         for check in check_configs {
             let binary_name = &check.command[0];
             let (original_path, resolved_path) =
-                resolve_binary_path_with_original(binary_name, &canonical_path).unwrap();
-            let binary_hash = crate::hashing::hash_file(&resolved_path).await.unwrap();
+                resolve_binary_path_with_original(binary_name, &repository_root)?;
+            let binary_hash = hashing::hash_file(&resolved_path).await?;
 
             checks.insert(
                 check.name,
@@ -58,14 +78,68 @@ pub async fn approve_project_config(project_dir: &Path, config_content: &str) ->
         }
     }
 
-    let canonical_path_clone = canonical_path.clone();
+    let repository_root_clone = repository_root.clone();
     ProjectApprovals::update(move |approvals| {
-        approvals.approve_project(canonical_path_clone, tools_config_hash, commands, checks);
+        approvals.approve_project(repository_root_clone, tools_config_hash, commands, checks)
     })
-    .await
-    .unwrap();
+    .await?;
 
-    canonical_path
+    Ok(repository_root)
+}
+
+/// Helper to run a git command and assert success
+fn run_git_command(args: &[&str], current_dir: &Path) {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(current_dir)
+        .output()
+        .expect("Failed to execute git command");
+
+    assert!(
+        output.status.success(),
+        "git {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Helper to run a jj command and assert success
+fn run_jj_command(args: &[&str], current_dir: &Path) {
+    let output = Command::new("jj")
+        .args(args)
+        .current_dir(current_dir)
+        .output()
+        .expect("Failed to execute jj command");
+
+    assert!(
+        output.status.success(),
+        "jj {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Helper to create a git repository with an initial commit
+fn setup_git_repo_with_commit(repo_path: &Path) {
+    run_git_command(&["init"], repo_path);
+    std::fs::write(repo_path.join("README.md"), "test").unwrap();
+    run_git_command(&["add", "."], repo_path);
+    run_git_command(&["commit", "-m", "initial"], repo_path);
+}
+
+/// Helper to create a jj repository
+fn setup_jj_repo(repo_path: &Path) {
+    run_jj_command(
+        &["git", "init", repo_path.to_str().unwrap()],
+        repo_path.parent().unwrap_or(repo_path),
+    );
+}
+
+/// Helper to create .config/tools.toml with standard test content
+fn create_tools_config(repo_path: &Path, config_content: &str) {
+    let config_dir = repo_path.join(".config");
+    std::fs::create_dir(&config_dir).unwrap();
+    std::fs::write(config_dir.join("tools.toml"), config_content).unwrap();
 }
 
 #[test]
@@ -77,7 +151,7 @@ fn test_project_approvals_default() {
 #[test]
 fn test_approve_project() {
     let mut approvals = ProjectApprovals::default();
-    let project_dir = PathBuf::from("/test/project");
+    let temp_dir = TempDir::new().unwrap();
     let tools_hash = "sha256:abc123".to_string();
 
     let mut commands = HashMap::new();
@@ -92,14 +166,22 @@ fn test_approve_project() {
 
     let checks = HashMap::new();
 
-    approvals.approve_project(
-        project_dir.clone(),
-        tools_hash.clone(),
-        commands.clone(),
-        checks,
-    );
+    approvals
+        .approve_project(
+            temp_dir.path().to_path_buf(),
+            tools_hash.clone(),
+            commands.clone(),
+            checks,
+        )
+        .unwrap();
 
-    let project_key = project_dir.to_string_lossy().to_string();
+    // Project key is now the repository root (canonicalized temp dir in this case)
+    let project_key = temp_dir
+        .path()
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
     assert!(approvals.projects.contains_key(&project_key));
 
     let approval = &approvals.projects[&project_key];
@@ -111,7 +193,7 @@ fn test_approve_project() {
 #[test]
 fn test_approve_project_with_checks() {
     let mut approvals = ProjectApprovals::default();
-    let project_dir = PathBuf::from("/test/project");
+    let temp_dir = TempDir::new().unwrap();
     let tools_hash = "sha256:abc123".to_string();
 
     let mut commands = HashMap::new();
@@ -134,14 +216,21 @@ fn test_approve_project_with_checks() {
         },
     );
 
-    approvals.approve_project(
-        project_dir.clone(),
-        tools_hash.clone(),
-        commands.clone(),
-        checks.clone(),
-    );
+    approvals
+        .approve_project(
+            temp_dir.path().to_path_buf(),
+            tools_hash.clone(),
+            commands.clone(),
+            checks.clone(),
+        )
+        .unwrap();
 
-    let project_key = project_dir.to_string_lossy().to_string();
+    let project_key = temp_dir
+        .path()
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
     assert!(approvals.projects.contains_key(&project_key));
 
     let approval = &approvals.projects[&project_key];
@@ -155,7 +244,6 @@ fn test_approve_project_with_checks() {
 #[tokio::test]
 async fn test_verify_check_approved() {
     // Test that verify_check correctly verifies an approved check
-    use tempfile::TempDir;
 
     let _xdg_dir = TempDir::new().unwrap();
     std::env::set_var("XDG_CONFIG_HOME", _xdg_dir.path());
@@ -175,7 +263,9 @@ command = ["echo", "test"]
     std::fs::write(config_dir.join("tools.toml"), config_content).unwrap();
 
     // Use the helper to approve the project with checks
-    approve_project_config(temp_dir.path(), config_content).await;
+    approve_project_config(temp_dir.path(), config_content)
+        .await
+        .unwrap();
 
     // Load approvals and verify the check
     let approvals = ProjectApprovals::load().await.unwrap();
@@ -194,7 +284,6 @@ command = ["echo", "test"]
 #[tokio::test]
 async fn test_verify_check_not_approved() {
     // Test that verify_check returns NotApproved for unapproved checks
-    use tempfile::TempDir;
 
     let _xdg_dir = TempDir::new().unwrap();
     std::env::set_var("XDG_CONFIG_HOME", _xdg_dir.path());
@@ -229,8 +318,6 @@ command = ["echo", "test"]
 
 #[tokio::test]
 async fn test_verify_check_config_hash_mismatch() {
-    use tempfile::TempDir;
-
     let _xdg_dir = TempDir::new().unwrap();
     std::env::set_var("XDG_CONFIG_HOME", _xdg_dir.path());
 
@@ -249,7 +336,9 @@ command = ["echo", "test"]
     std::fs::write(config_dir.join("tools.toml"), config_content).unwrap();
 
     // Approve the project
-    approve_project_config(temp_dir.path(), config_content).await;
+    approve_project_config(temp_dir.path(), config_content)
+        .await
+        .unwrap();
 
     // Modify the config
     let new_config_content = r#"
@@ -281,8 +370,6 @@ command = ["echo", "modified"]
 
 #[tokio::test]
 async fn test_verify_check_binary_hash_mismatch() {
-    use tempfile::TempDir;
-
     let _xdg_dir = TempDir::new().unwrap();
     std::env::set_var("XDG_CONFIG_HOME", _xdg_dir.path());
 
@@ -297,7 +384,6 @@ async fn test_verify_check_binary_hash_mismatch() {
     std::fs::write(&script_path, "#!/bin/bash\necho 'original'\n").unwrap();
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
         let permissions = std::fs::Permissions::from_mode(0o755);
         std::fs::set_permissions(&script_path, permissions).unwrap();
     }
@@ -316,7 +402,9 @@ command = ["{}"]
     std::fs::write(config_dir.join("tools.toml"), &config_content).unwrap();
 
     // Approve the project
-    approve_project_config(temp_dir.path(), &config_content).await;
+    approve_project_config(temp_dir.path(), &config_content)
+        .await
+        .unwrap();
 
     // Modify the script (change the hash)
     std::fs::write(&script_path, "#!/bin/bash\necho 'modified'\n").unwrap();
@@ -341,8 +429,6 @@ command = ["{}"]
 
 #[tokio::test]
 async fn test_verify_check_not_in_config() {
-    use tempfile::TempDir;
-
     let _xdg_dir = TempDir::new().unwrap();
     std::env::set_var("XDG_CONFIG_HOME", _xdg_dir.path());
 
@@ -361,7 +447,9 @@ command = ["echo", "test"]
     std::fs::write(config_dir.join("tools.toml"), config_content).unwrap();
 
     // Approve the project
-    approve_project_config(temp_dir.path(), config_content).await;
+    approve_project_config(temp_dir.path(), config_content)
+        .await
+        .unwrap();
 
     // Try to verify a check that wasn't in the config
     let approvals = ProjectApprovals::load().await.unwrap();
@@ -393,9 +481,6 @@ fn test_is_within_project() {
 
 #[tokio::test]
 async fn test_is_script_with_shebang() {
-    use std::io::Write;
-    use tempfile::NamedTempFile;
-
     let mut temp_file = NamedTempFile::new().unwrap();
     writeln!(temp_file, "#!/bin/bash").unwrap();
     writeln!(temp_file, "echo hello").unwrap();
@@ -407,9 +492,6 @@ async fn test_is_script_with_shebang() {
 
 #[tokio::test]
 async fn test_is_script_without_shebang() {
-    use std::io::Write;
-    use tempfile::NamedTempFile;
-
     let mut temp_file = NamedTempFile::new().unwrap();
     writeln!(temp_file, "fn main() {{}}").unwrap();
     temp_file.flush().unwrap();
@@ -421,10 +503,6 @@ async fn test_is_script_without_shebang() {
 #[cfg(unix)]
 #[tokio::test]
 async fn test_is_writable_with_writable_file() {
-    use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
-    use tempfile::NamedTempFile;
-
     let mut temp_file = NamedTempFile::new().unwrap();
     writeln!(temp_file, "#!/bin/bash").unwrap();
     temp_file.flush().unwrap();
@@ -441,10 +519,6 @@ async fn test_is_writable_with_writable_file() {
 #[cfg(unix)]
 #[tokio::test]
 async fn test_is_writable_with_readonly_file() {
-    use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
-    use tempfile::NamedTempFile;
-
     let mut temp_file = NamedTempFile::new().unwrap();
     writeln!(temp_file, "#!/bin/bash").unwrap();
     temp_file.flush().unwrap();
@@ -464,10 +538,6 @@ async fn test_is_writable_with_readonly_file() {
 #[cfg(unix)]
 #[tokio::test]
 async fn test_is_writable_with_executable_only() {
-    use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
-    use tempfile::NamedTempFile;
-
     let mut temp_file = NamedTempFile::new().unwrap();
     writeln!(temp_file, "#!/bin/bash").unwrap();
     temp_file.flush().unwrap();
@@ -487,10 +557,6 @@ async fn test_is_writable_with_executable_only() {
 #[cfg(unix)]
 #[tokio::test]
 async fn test_is_writable_with_full_permissions() {
-    use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
-    use tempfile::NamedTempFile;
-
     let mut temp_file = NamedTempFile::new().unwrap();
     writeln!(temp_file, "#!/bin/bash").unwrap();
     temp_file.flush().unwrap();
@@ -513,9 +579,6 @@ async fn test_is_writable_checks_owner_bit_only() {
     // Security: We check only owner write bit because if the current user can modify
     // the binary, an attacker with access to this user account can inject malicious code
     // before execution, bypassing our hash-based approval system
-    use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
-    use tempfile::NamedTempFile;
 
     let mut temp_file = NamedTempFile::new().unwrap();
     writeln!(temp_file, "#!/bin/bash").unwrap();
@@ -537,9 +600,6 @@ async fn test_is_writable_checks_owner_bit_only() {
 #[cfg(unix)]
 #[tokio::test]
 async fn test_is_writable_with_directory() {
-    use std::os::unix::fs::PermissionsExt;
-    use tempfile::TempDir;
-
     let temp_dir = TempDir::new().unwrap();
 
     // Set writable directory
@@ -588,8 +648,6 @@ fn test_resolve_binary_in_path() {
 #[test]
 fn test_resolve_binary_relative_path() {
     // Relative paths with path separators should be resolved relative to project directory
-    use std::io::Write;
-    use tempfile::TempDir;
 
     let project_dir = TempDir::new().unwrap();
 
@@ -616,8 +674,6 @@ fn test_resolve_binary_relative_path() {
 #[test]
 fn test_resolve_binary_with_dot_slash() {
     // Paths starting with ./ should be relative to project dir
-    use std::io::Write;
-    use tempfile::TempDir;
 
     let project_dir = TempDir::new().unwrap();
     let script_path = project_dir.path().join("test.sh");
@@ -654,8 +710,6 @@ fn test_resolve_binary_not_found() {
 #[test]
 fn test_resolve_binary_with_subdirectory() {
     // Relative paths with subdirectories should work
-    use std::io::Write;
-    use tempfile::TempDir;
 
     let project_dir = TempDir::new().unwrap();
     let scripts_dir = project_dir.path().join("scripts");
@@ -679,8 +733,6 @@ fn test_resolve_binary_with_subdirectory() {
 #[test]
 fn test_resolve_binary_follows_symlinks() {
     // Canonical path should resolve all symlinks
-    use std::io::Write;
-    use tempfile::TempDir;
 
     let temp_dir = TempDir::new().unwrap();
 
@@ -709,8 +761,6 @@ fn test_resolve_binary_follows_symlinks() {
 #[test]
 fn test_resolve_binary_multilevel_symlinks() {
     // Test that multiple levels of symlinks are fully resolved
-    use std::io::Write;
-    use tempfile::TempDir;
 
     let temp_dir = TempDir::new().unwrap();
 
@@ -743,7 +793,6 @@ fn test_resolve_binary_multilevel_symlinks() {
 async fn test_concurrent_approvals_use_file_locking() {
     // Test that concurrent approval updates don't corrupt the file due to file locking
     // This validates that ProjectApprovals::update() properly serializes concurrent writes
-    use tempfile::TempDir;
 
     let _xdg_dir = TempDir::new().unwrap();
     std::env::set_var("XDG_CONFIG_HOME", _xdg_dir.path());
@@ -767,7 +816,7 @@ async fn test_concurrent_approvals_use_file_locking() {
             );
 
             ProjectApprovals::update(move |approvals| {
-                approvals.approve_project(project_dir, tools_hash, commands, HashMap::new());
+                approvals.approve_project(project_dir, tools_hash, commands, HashMap::new())
             })
             .await
             .expect("Concurrent approval should succeed");
@@ -810,7 +859,6 @@ async fn test_concurrent_approvals_use_file_locking() {
 async fn test_concurrent_updates_to_same_project() {
     // Test that concurrent updates to the same project are properly serialized
     // Last write should win, and file should not be corrupted
-    use tempfile::TempDir;
 
     let _xdg_dir = TempDir::new().unwrap();
     std::env::set_var("XDG_CONFIG_HOME", _xdg_dir.path());
@@ -836,7 +884,7 @@ async fn test_concurrent_updates_to_same_project() {
             );
 
             ProjectApprovals::update(move |approvals| {
-                approvals.approve_project(project_dir, tools_hash, commands, HashMap::new());
+                approvals.approve_project(project_dir, tools_hash, commands, HashMap::new())
             })
             .await
             .expect("Concurrent update should succeed");
@@ -872,16 +920,22 @@ async fn test_concurrent_updates_to_same_project() {
 async fn test_file_locking_prevents_read_during_write() {
     // Test that file locking prevents reading partially-written approval files
     // This ensures atomicity of the load-modify-save cycle
-    use tempfile::TempDir;
-    use tokio::time::{sleep, Duration};
-
     let _xdg_dir = TempDir::new().unwrap();
     std::env::set_var("XDG_CONFIG_HOME", _xdg_dir.path());
 
+    // Create a real temp directory for the project
+    let _project_temp_dir = TempDir::new().unwrap();
+    let project_dir = _project_temp_dir.path().to_path_buf();
+    let project_key = project_dir
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let project_key_clone = project_key.clone();
+
     // Start a long-running update operation
-    let write_handle = tokio::spawn(async {
+    let write_handle = tokio::spawn(async move {
         ProjectApprovals::update(|approvals| {
-            let project_dir = PathBuf::from("/test/project");
             let tools_hash = "sha256:hash1".to_string();
             let mut commands = HashMap::new();
 
@@ -894,10 +948,13 @@ async fn test_file_locking_prevents_read_during_write() {
                 },
             );
 
-            approvals.approve_project(project_dir, tools_hash, commands, HashMap::new());
+            approvals
+                .approve_project(project_dir, tools_hash, commands, HashMap::new())
+                .unwrap();
 
             // Simulate slow operation
             std::thread::sleep(Duration::from_millis(100));
+            Ok(())
         })
         .await
     });
@@ -906,11 +963,11 @@ async fn test_file_locking_prevents_read_during_write() {
     sleep(Duration::from_millis(10)).await;
 
     // Attempt concurrent read - should either see old state or new state, never partial
-    let read_handle = tokio::spawn(async {
+    let read_handle = tokio::spawn(async move {
         match ProjectApprovals::load().await {
             Ok(approvals) => {
                 // If we read successfully, data should be consistent
-                if let Some(approval) = approvals.projects.get("/test/project") {
+                if let Some(approval) = approvals.projects.get(&project_key_clone) {
                     assert_eq!(approval.tools_config_hash, "sha256:hash1");
                     assert_eq!(approval.commands.len(), 1);
                 }
@@ -927,7 +984,7 @@ async fn test_file_locking_prevents_read_during_write() {
 
     // Verify final state is consistent
     let final_approvals = ProjectApprovals::load().await.unwrap();
-    if let Some(approval) = final_approvals.projects.get("/test/project") {
+    if let Some(approval) = final_approvals.projects.get(&project_key) {
         assert_eq!(approval.tools_config_hash, "sha256:hash1");
         assert_eq!(approval.commands.len(), 1);
     }
@@ -935,8 +992,6 @@ async fn test_file_locking_prevents_read_during_write() {
 
 #[tokio::test]
 async fn test_save_approvals_persists_checks() {
-    use tempfile::TempDir;
-
     let _xdg_dir = TempDir::new().unwrap();
     std::env::set_var("XDG_CONFIG_HOME", _xdg_dir.path());
 
@@ -960,7 +1015,9 @@ command = ["echo", "check"]
     std::fs::write(config_dir.join("tools.toml"), config_content).unwrap();
 
     // Approve the project using the helper
-    approve_project_config(temp_dir.path(), config_content).await;
+    approve_project_config(temp_dir.path(), config_content)
+        .await
+        .unwrap();
 
     // Load approvals and verify checks were persisted
     let approvals = ProjectApprovals::load().await.unwrap();
@@ -992,9 +1049,121 @@ command = ["echo", "check"]
 }
 
 #[tokio::test]
-async fn test_load_approvals_without_checks_field() {
-    use tempfile::TempDir;
+async fn test_jj_workspaces_share_approvals() {
+    let _xdg_dir = TempDir::new().unwrap();
+    std::env::set_var("XDG_CONFIG_HOME", _xdg_dir.path());
 
+    let repo_dir = TempDir::new().unwrap();
+    let repo_path = repo_dir.path();
+
+    setup_jj_repo(repo_path);
+
+    let config_content = r#"
+[commands]
+lint = ["echo", "lint"]
+"#;
+    create_tools_config(repo_path, config_content);
+
+    let repo_root = approve_project_config(repo_path, config_content)
+        .await
+        .unwrap();
+
+    // Create a second workspace (jj requires destination to NOT exist)
+    let workspace2_parent = TempDir::new().unwrap();
+    let workspace2_path = workspace2_parent.path().join("workspace2");
+    run_jj_command(
+        &["workspace", "add", workspace2_path.to_str().unwrap()],
+        repo_path,
+    );
+
+    // Verify both workspaces resolve to the same repository root
+    let workspace2_root = repository::detect_repository_root(&workspace2_path).unwrap();
+    assert_eq!(
+        repo_root, workspace2_root,
+        "Both workspaces should resolve to the same repository root"
+    );
+
+    // Verify approval works in the second workspace
+    let approvals = ProjectApprovals::load().await.unwrap();
+    let result = approvals
+        .verify_project(&workspace2_path, "lint")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        result,
+        VerificationResult::Approved,
+        "Approval from workspace1 should work in workspace2"
+    );
+
+    // Verify the approval key is the repository root
+    let approval_key = repo_root.to_string_lossy().to_string();
+    assert!(
+        approvals.projects.contains_key(&approval_key),
+        "Approval should be keyed by repository root: {}",
+        approval_key
+    );
+}
+
+#[tokio::test]
+async fn test_git_worktrees_share_approvals() {
+    let _xdg_dir = TempDir::new().unwrap();
+    std::env::set_var("XDG_CONFIG_HOME", _xdg_dir.path());
+
+    let repo_dir = TempDir::new().unwrap();
+    let repo_path = repo_dir.path();
+
+    setup_git_repo_with_commit(repo_path);
+
+    let config_content = r#"
+[commands]
+lint = ["echo", "lint"]
+"#;
+    create_tools_config(repo_path, config_content);
+
+    let repo_root = approve_project_config(repo_path, config_content)
+        .await
+        .unwrap();
+
+    // Create a worktree (git requires destination to NOT exist)
+    let worktree_parent = TempDir::new().unwrap();
+    let worktree_path = worktree_parent.path().join("worktree2");
+    run_git_command(
+        &["worktree", "add", worktree_path.to_str().unwrap(), "HEAD"],
+        repo_path,
+    );
+
+    // Verify both worktrees resolve to the same repository root
+    let worktree_root = repository::detect_repository_root(&worktree_path).unwrap();
+    assert_eq!(
+        repo_root, worktree_root,
+        "Both worktrees should resolve to the same repository root"
+    );
+
+    // Verify approval works in the worktree
+    let approvals = ProjectApprovals::load().await.unwrap();
+    let result = approvals
+        .verify_project(&worktree_path, "lint")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        result,
+        VerificationResult::Approved,
+        "Approval from main worktree should work in worktree2"
+    );
+
+    // Verify the approval key is the repository root
+    let approval_key = repo_root.to_string_lossy().to_string();
+    assert!(
+        approvals.projects.contains_key(&approval_key),
+        "Approval should be keyed by repository root: {}",
+        approval_key
+    );
+}
+
+#[tokio::test]
+async fn test_load_approvals_without_checks_field() {
     let xdg_dir = TempDir::new().unwrap();
     std::env::set_var("XDG_CONFIG_HOME", xdg_dir.path());
 
