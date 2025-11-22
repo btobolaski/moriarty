@@ -122,6 +122,10 @@ fn run_jj_command(args: &[&str], current_dir: &Path) {
 /// Helper to create a git repository with an initial commit
 fn setup_git_repo_with_commit(repo_path: &Path) {
     run_git_command(&["init"], repo_path);
+    // Configure local user identity rather than relying on global config,
+    // which may be absent in CI environments or isolated test setups.
+    run_git_command(&["config", "user.email", "test@example.com"], repo_path);
+    run_git_command(&["config", "user.name", "Test User"], repo_path);
     std::fs::write(repo_path.join("README.md"), "test").unwrap();
     run_git_command(&["add", "."], repo_path);
     run_git_command(&["commit", "-m", "initial"], repo_path);
