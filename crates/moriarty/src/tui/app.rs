@@ -240,6 +240,7 @@ mod tests {
             thinking_metadata: None,
             is_visible_in_transcript_only: None,
             is_compact_summary: None,
+            todos: None,
         })
     }
 

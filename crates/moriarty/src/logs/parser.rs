@@ -95,10 +95,47 @@ pub struct HookInfo {
     pub command: String,
 }
 
+/// Hook errors from Claude Code, supporting both legacy and current formats to maintain
+/// backward compatibility when parsing logs from different Claude Code versions. Uses untagged
+/// serde to automatically deserialize either format without requiring version detection logic.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum HookError {
+    /// String-only format introduced in Claude Code 2.0.47 to simplify error reporting
+    /// when command and exit_code details aren't available or relevant
+    String(String),
+    /// Structured format used in earlier versions to provide additional debugging context
+    /// about which hook failed and how
+    Structured(HookErrorDetails),
+}
+
+impl HookError {
+    pub fn message(&self) -> &str {
+        match self {
+            HookError::String(s) => s,
+            HookError::Structured(details) => &details.message,
+        }
+    }
+
+    pub fn command(&self) -> Option<&str> {
+        match self {
+            HookError::String(_) => None,
+            HookError::Structured(details) => details.command.as_deref(),
+        }
+    }
+
+    pub fn exit_code(&self) -> Option<i32> {
+        match self {
+            HookError::String(_) => None,
+            HookError::Structured(details) => details.exit_code,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
-pub struct HookError {
+pub struct HookErrorDetails {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
@@ -214,6 +251,34 @@ pub struct FileHistorySnapshotSnapshot {
     pub timestamp: DateTime<Utc>,
 }
 
+/// Task execution state tracked in Claude Code's todo system. These states enable Claude Code
+/// to persist task progress across session restarts and provide status visibility in the UI.
+/// The linear progression (Pending → InProgress → Completed) ensures only one task is active
+/// at a time, preventing execution chaos from parallel task attempts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TodoStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+/// Task item from Claude Code's todo tracking system. Todos are persisted in log files to enable
+/// session recovery after crashes or disconnections - Claude Code can resume incomplete work by
+/// reading the last todo state from logs. Storing both imperative and continuous forms avoids
+/// complex string transformations and ensures consistent UI messaging across different task states.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+pub struct Todo {
+    /// Task description in imperative form (e.g., "Run tests")
+    pub content: String,
+    /// Task status
+    pub status: TodoStatus,
+    /// Present continuous form for display during execution (e.g., "Running tests")
+    pub active_form: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
@@ -235,6 +300,8 @@ pub struct UserLogLine {
     pub thinking_metadata: Option<ThinkingMetadata>,
     pub is_visible_in_transcript_only: Option<bool>,
     pub is_compact_summary: Option<bool>,
+    /// Todo list from Claude Code 2.0.47+. Contains tasks being tracked in the conversation.
+    pub todos: Option<Vec<Todo>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -462,6 +529,176 @@ mod tests {
         });
         let line: UserLogLine = serde_json::from_value(json).unwrap();
         assert_eq!(line.agent_id, None);
+    }
+
+    #[test]
+    fn test_parse_user_log_line_with_todos() {
+        let json = serde_json::json!({
+            "parentUuid": null,
+            "isSidechain": false,
+            "userType": "test",
+            "cwd": "/test",
+            "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+            "version": "1.0",
+            "gitBranch": "main",
+            "message": {"role": "user", "content": "test"},
+            "uuid": "550e8400-e29b-41d4-a716-446655440001",
+            "timestamp": "2025-01-01T00:00:00Z",
+            "todos": [
+                {"content": "Task 1", "status": "pending", "activeForm": "Working on Task 1"},
+                {"content": "Task 2", "status": "completed", "activeForm": "Working on Task 2"}
+            ]
+        });
+        let line: UserLogLine = serde_json::from_value(json).unwrap();
+        assert!(line.todos.is_some());
+        let todos = line.todos.unwrap();
+        assert_eq!(todos.len(), 2);
+        assert_eq!(todos[0].content, "Task 1");
+        assert_eq!(todos[0].status, TodoStatus::Pending);
+        assert_eq!(todos[0].active_form, "Working on Task 1");
+        assert_eq!(todos[1].content, "Task 2");
+        assert_eq!(todos[1].status, TodoStatus::Completed);
+        assert_eq!(todos[1].active_form, "Working on Task 2");
+    }
+
+    #[test]
+    fn test_parse_user_log_line_with_in_progress_todo() {
+        let json = serde_json::json!({
+            "parentUuid": null,
+            "isSidechain": false,
+            "userType": "test",
+            "cwd": "/test",
+            "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+            "version": "1.0",
+            "gitBranch": "main",
+            "message": {"role": "user", "content": "test"},
+            "uuid": "550e8400-e29b-41d4-a716-446655440001",
+            "timestamp": "2025-01-01T00:00:00Z",
+            "todos": [
+                {"content": "Task 1", "status": "in_progress", "activeForm": "Working on Task 1"}
+            ]
+        });
+        let line: UserLogLine = serde_json::from_value(json).unwrap();
+        let todos = line.todos.unwrap();
+        assert_eq!(todos.len(), 1);
+        assert_eq!(todos[0].content, "Task 1");
+        assert_eq!(todos[0].status, TodoStatus::InProgress);
+        assert_eq!(todos[0].active_form, "Working on Task 1");
+    }
+
+    #[test]
+    fn test_parse_user_log_line_with_null_todos() {
+        let json = serde_json::json!({
+            "parentUuid": null,
+            "isSidechain": false,
+            "userType": "test",
+            "cwd": "/test",
+            "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+            "version": "1.0",
+            "gitBranch": "main",
+            "message": {"role": "user", "content": "test"},
+            "uuid": "550e8400-e29b-41d4-a716-446655440001",
+            "timestamp": "2025-01-01T00:00:00Z",
+            "todos": null
+        });
+        let line: UserLogLine = serde_json::from_value(json).unwrap();
+        assert_eq!(line.todos, None);
+    }
+
+    #[test]
+    fn test_parse_user_log_line_without_todos() {
+        let json = serde_json::json!({
+            "parentUuid": null,
+            "isSidechain": false,
+            "userType": "test",
+            "cwd": "/test",
+            "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+            "version": "1.0",
+            "gitBranch": "main",
+            "message": {"role": "user", "content": "test"},
+            "uuid": "550e8400-e29b-41d4-a716-446655440001",
+            "timestamp": "2025-01-01T00:00:00Z"
+        });
+        let line: UserLogLine = serde_json::from_value(json).unwrap();
+        assert_eq!(line.todos, None);
+    }
+
+    #[test]
+    fn test_parse_user_log_line_with_empty_todos() {
+        let json = serde_json::json!({
+            "parentUuid": null,
+            "isSidechain": false,
+            "userType": "test",
+            "cwd": "/test",
+            "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+            "version": "1.0",
+            "gitBranch": "main",
+            "message": {"role": "user", "content": "test"},
+            "uuid": "550e8400-e29b-41d4-a716-446655440001",
+            "timestamp": "2025-01-01T00:00:00Z",
+            "todos": []
+        });
+        let line: UserLogLine = serde_json::from_value(json).unwrap();
+        assert_eq!(line.todos, Some(vec![]));
+    }
+
+    #[test]
+    fn test_parse_user_log_line_rejects_unknown_fields() {
+        let json = serde_json::json!({
+            "parentUuid": null,
+            "isSidechain": false,
+            "userType": "test",
+            "cwd": "/test",
+            "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+            "version": "1.0",
+            "gitBranch": "main",
+            "message": {"role": "user", "content": "test"},
+            "uuid": "550e8400-e29b-41d4-a716-446655440001",
+            "timestamp": "2025-01-01T00:00:00Z",
+            "unknownField": "should be rejected"
+        });
+
+        let err_msg = serde_json::from_value::<UserLogLine>(json)
+            .expect_err("Should reject unknown fields due to deny_unknown_fields")
+            .to_string();
+        assert!(
+            err_msg.contains("unknown field") || err_msg.contains("unknownField"),
+            "Error should mention unknown field, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_parse_todo_rejects_unknown_fields() {
+        let json = serde_json::json!({
+            "parentUuid": null,
+            "isSidechain": false,
+            "userType": "test",
+            "cwd": "/test",
+            "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+            "version": "1.0",
+            "gitBranch": "main",
+            "message": {"role": "user", "content": "test"},
+            "uuid": "550e8400-e29b-41d4-a716-446655440001",
+            "timestamp": "2025-01-01T00:00:00Z",
+            "todos": [
+                {
+                    "content": "Task 1",
+                    "status": "pending",
+                    "activeForm": "Working on Task 1",
+                    "unknownField": "should be rejected"
+                }
+            ]
+        });
+
+        let err_msg = serde_json::from_value::<UserLogLine>(json)
+            .expect_err("Should reject unknown fields in Todo struct")
+            .to_string();
+        assert!(
+            err_msg.contains("unknown field") || err_msg.contains("unknownField"),
+            "Error should mention unknown field, got: {}",
+            err_msg
+        );
     }
 
     #[test]
@@ -1022,9 +1259,9 @@ mod tests {
         });
 
         let error: HookError = serde_json::from_value(json).expect("Failed to parse HookError");
-        assert_eq!(error.message, "Command failed");
-        assert_eq!(error.command, Some("test-hook".to_string()));
-        assert_eq!(error.exit_code, Some(1));
+        assert_eq!(error.message(), "Command failed");
+        assert_eq!(error.command(), Some("test-hook"));
+        assert_eq!(error.exit_code(), Some(1));
     }
 
     #[test]
@@ -1034,9 +1271,18 @@ mod tests {
         });
 
         let error: HookError = serde_json::from_value(json).expect("Failed to parse HookError");
-        assert_eq!(error.message, "Error occurred");
-        assert_eq!(error.command, None);
-        assert_eq!(error.exit_code, None);
+        assert_eq!(error.message(), "Error occurred");
+        assert_eq!(error.command(), None);
+        assert_eq!(error.exit_code(), None);
+    }
+
+    #[test]
+    fn test_parse_hook_error_from_string() {
+        let error: HookError =
+            serde_json::from_value(serde_json::json!("Error message")).unwrap();
+        assert_eq!(error.message(), "Error message");
+        assert_eq!(error.command(), None);
+        assert_eq!(error.exit_code(), None);
     }
 
     #[test]
@@ -1050,8 +1296,10 @@ mod tests {
             .expect_err("Should reject unknown fields due to deny_unknown_fields")
             .to_string();
         assert!(
-            err_msg.contains("unknown field") || err_msg.contains("unknownField"),
-            "Error should mention unknown field, got: {}",
+            err_msg.contains("unknown field")
+                || err_msg.contains("unknownField")
+                || err_msg.contains("did not match any variant"),
+            "Error should mention unknown field or variant mismatch, got: {}",
             err_msg
         );
     }
@@ -1115,11 +1363,11 @@ mod tests {
                 assert_eq!(summary.hook_infos[1].command, "hook2");
                 assert_eq!(summary.hook_infos[2].command, "hook3");
                 assert_eq!(summary.hook_errors.len(), 2);
-                assert_eq!(summary.hook_errors[0].message, "Error 1");
-                assert_eq!(summary.hook_errors[0].command, Some("hook1".to_string()));
-                assert_eq!(summary.hook_errors[0].exit_code, Some(1));
-                assert_eq!(summary.hook_errors[1].message, "Error 2");
-                assert_eq!(summary.hook_errors[1].command, None);
+                assert_eq!(summary.hook_errors[0].message(), "Error 1");
+                assert_eq!(summary.hook_errors[0].command(), Some("hook1"));
+                assert_eq!(summary.hook_errors[0].exit_code(), Some(1));
+                assert_eq!(summary.hook_errors[1].message(), "Error 2");
+                assert_eq!(summary.hook_errors[1].command(), None);
                 assert_eq!(summary.prevented_continuation, true);
                 assert_eq!(summary.stop_reason, "Multiple hooks failed");
                 assert_eq!(summary.has_output, true);
@@ -1163,6 +1411,98 @@ mod tests {
                 assert_eq!(summary.hook_errors.len(), 0);
                 assert_eq!(summary.prevented_continuation, false);
                 assert_eq!(summary.has_output, false);
+            }
+            _ => panic!("Expected System(StopHookSummary) variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_stop_hook_summary_with_string_errors() {
+        let json = serde_json::json!({
+            "parentUuid": "a2c16202-b7fb-446c-86e4-7dc55db7f24f",
+            "isSidechain": false,
+            "userType": "external",
+            "cwd": "/test",
+            "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+            "version": "2.0.47",
+            "gitBranch": "main",
+            "type": "system",
+            "subtype": "stop_hook_summary",
+            "hookCount": 1,
+            "hookInfos": [{"command": "test-hook"}],
+            "hookErrors": ["Error 1", "Error 2"],
+            "preventedContinuation": false,
+            "stopReason": "",
+            "hasOutput": true,
+            "level": "suggestion",
+            "timestamp": "2025-11-22T19:55:01.863Z",
+            "uuid": "49bbbff9-1b81-4c32-bc20-4ae8c41a40d6",
+            "toolUseID": "65d059ca-f330-4ffc-8c15-a606cb13bc56"
+        });
+
+        let line: LogLine = serde_json::from_value(json)
+            .expect("Failed to parse stop_hook_summary with string errors");
+
+        match line {
+            LogLine::System(SystemLogLine::StopHookSummary(summary)) => {
+                assert_eq!(summary.hook_errors.len(), 2);
+                assert_eq!(summary.hook_errors[0].message(), "Error 1");
+                assert_eq!(summary.hook_errors[0].command(), None);
+                assert_eq!(summary.hook_errors[0].exit_code(), None);
+                assert_eq!(summary.hook_errors[1].message(), "Error 2");
+                assert_eq!(summary.hook_errors[1].command(), None);
+                assert_eq!(summary.hook_errors[1].exit_code(), None);
+            }
+            _ => panic!("Expected System(StopHookSummary) variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_stop_hook_summary_with_mixed_error_formats() {
+        let json = serde_json::json!({
+            "parentUuid": "a2c16202-b7fb-446c-86e4-7dc55db7f24f",
+            "isSidechain": false,
+            "userType": "external",
+            "cwd": "/test",
+            "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+            "version": "2.0.47",
+            "gitBranch": "main",
+            "type": "system",
+            "subtype": "stop_hook_summary",
+            "hookCount": 2,
+            "hookInfos": [{"command": "hook1"}, {"command": "hook2"}],
+            "hookErrors": [
+                "Simple error message",
+                {"message": "Detailed error", "command": "hook1", "exitCode": 1},
+                "Another simple error"
+            ],
+            "preventedContinuation": true,
+            "stopReason": "Multiple hooks failed",
+            "hasOutput": true,
+            "level": "error",
+            "timestamp": "2025-11-22T19:55:01.863Z",
+            "uuid": "49bbbff9-1b81-4c32-bc20-4ae8c41a40d6",
+            "toolUseID": "65d059ca-f330-4ffc-8c15-a606cb13bc56"
+        });
+
+        let line: LogLine = serde_json::from_value(json)
+            .expect("Failed to parse stop_hook_summary with mixed error formats");
+
+        match line {
+            LogLine::System(SystemLogLine::StopHookSummary(summary)) => {
+                assert_eq!(summary.hook_errors.len(), 3);
+                // First error: string format
+                assert_eq!(summary.hook_errors[0].message(), "Simple error message");
+                assert_eq!(summary.hook_errors[0].command(), None);
+                assert_eq!(summary.hook_errors[0].exit_code(), None);
+                // Second error: structured format
+                assert_eq!(summary.hook_errors[1].message(), "Detailed error");
+                assert_eq!(summary.hook_errors[1].command(), Some("hook1"));
+                assert_eq!(summary.hook_errors[1].exit_code(), Some(1));
+                // Third error: string format
+                assert_eq!(summary.hook_errors[2].message(), "Another simple error");
+                assert_eq!(summary.hook_errors[2].command(), None);
+                assert_eq!(summary.hook_errors[2].exit_code(), None);
             }
             _ => panic!("Expected System(StopHookSummary) variant"),
         }

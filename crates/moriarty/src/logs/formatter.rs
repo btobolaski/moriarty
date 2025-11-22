@@ -297,6 +297,7 @@ mod tests {
             thinking_metadata: None,
             is_visible_in_transcript_only: None,
             is_compact_summary: None,
+            todos: None,
         }
     }
 
@@ -844,7 +845,7 @@ mod tests {
 
     #[test]
     fn test_format_system_stop_hook_summary_with_errors() {
-        use crate::logs::parser::{HookError, HookInfo, StopHookSummary};
+        use crate::logs::parser::{HookError, HookErrorDetails, HookInfo, StopHookSummary};
 
         let system = SystemLogLine::StopHookSummary(StopHookSummary {
             parent_uuid: Uuid::new_v4(),
@@ -859,16 +860,16 @@ mod tests {
                 command: "failing-hook".to_string(),
             }],
             hook_errors: vec![
-                HookError {
+                HookError::Structured(HookErrorDetails {
                     message: "Error 1".to_string(),
                     command: Some("failing-hook".to_string()),
                     exit_code: Some(1),
-                },
-                HookError {
+                }),
+                HookError::Structured(HookErrorDetails {
                     message: "Error 2".to_string(),
                     command: None,
                     exit_code: None,
-                },
+                }),
             ],
             prevented_continuation: false,
             stop_reason: String::new(),
