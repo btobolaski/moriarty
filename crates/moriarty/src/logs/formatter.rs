@@ -286,6 +286,7 @@ mod tests {
             session_id: Uuid::new_v4(),
             version: "1.0.0".to_string(),
             git_branch: "main".to_string(),
+            slug: None,
             message: LogMessage {
                 role: "user".to_string(),
                 content,
@@ -311,6 +312,7 @@ mod tests {
             session_id: "session".to_string(),
             version: "1.0.0".to_string(),
             git_branch: "main".to_string(),
+            slug: None,
             message: AssistantLogMessage {
                 id: "msg".to_string(),
                 r#type: "message".to_string(),
@@ -434,6 +436,7 @@ mod tests {
             session_id: "session".to_string(),
             version: "1.0.0".to_string(),
             git_branch: "main".to_string(),
+            slug: None,
             level: "error".to_string(),
             cause: None,
             error: SystemLogErrorError {
@@ -463,6 +466,7 @@ mod tests {
             session_id: "session".to_string(),
             version: "1.0.0".to_string(),
             git_branch: "main".to_string(),
+            slug: None,
             level: "error".to_string(),
             cause: None,
             error: SystemLogErrorError {
@@ -488,6 +492,7 @@ mod tests {
             parent_uuid: Uuid::new_v4(),
             is_sidechain: false,
             git_branch: Some("main".to_string()),
+            slug: None,
             user_type: "test".to_string(),
             cwd: "/test".to_string(),
             session_id: Uuid::new_v4(),
@@ -513,6 +518,7 @@ mod tests {
             session_id: Uuid::new_v4(),
             version: "1.0.0".to_string(),
             git_branch: "main".to_string(),
+            slug: None,
             content: "ls -la".to_string(),
             level: "debug".to_string(),
             timestamp: Utc::now(),
@@ -535,6 +541,7 @@ mod tests {
             session_id: Uuid::new_v4(),
             version: "1.0.0".to_string(),
             git_branch: "main".to_string(),
+            slug: None,
             content: "Compacting".to_string(),
             is_meta: false,
             timestamp: Utc::now(),
@@ -781,6 +788,7 @@ mod tests {
             session_id: Uuid::new_v4(),
             version: "1.0.0".to_string(),
             git_branch: "main".to_string(),
+            slug: None,
             hook_count: 1,
             hook_infos: vec![HookInfo {
                 command: "test-hook".to_string(),
@@ -815,6 +823,7 @@ mod tests {
             session_id: Uuid::new_v4(),
             version: "1.0.0".to_string(),
             git_branch: "main".to_string(),
+            slug: None,
             hook_count: 3,
             hook_infos: vec![
                 HookInfo {
@@ -855,6 +864,7 @@ mod tests {
             session_id: Uuid::new_v4(),
             version: "1.0.0".to_string(),
             git_branch: "main".to_string(),
+            slug: None,
             hook_count: 1,
             hook_infos: vec![HookInfo {
                 command: "failing-hook".to_string(),
@@ -895,6 +905,7 @@ mod tests {
             session_id: Uuid::new_v4(),
             version: "1.0.0".to_string(),
             git_branch: "main".to_string(),
+            slug: None,
             hook_count: 1,
             hook_infos: vec![HookInfo {
                 command: "blocking-hook".to_string(),
@@ -925,6 +936,7 @@ mod tests {
             session_id: Uuid::new_v4(),
             version: "1.0.0".to_string(),
             git_branch: "main".to_string(),
+            slug: None,
             hook_count: 1,
             hook_infos: vec![HookInfo {
                 command: "hook".to_string(),

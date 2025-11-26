@@ -253,6 +253,7 @@ mod tests {
             session_id: Uuid::new_v4(),
             version: "1.0.0".to_string(),
             git_branch: "main".to_string(),
+            slug: None,
             message: LogMessage {
                 role: "user".to_string(),
                 content: LogMessageContent::String(text.to_string()),
@@ -279,6 +280,7 @@ mod tests {
             session_id: "test-session".to_string(),
             version: "1.0.0".to_string(),
             git_branch: "main".to_string(),
+            slug: None,
             message: AssistantLogMessage {
                 id: "msg_test".to_string(),
                 r#type: "message".to_string(),

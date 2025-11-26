@@ -60,6 +60,8 @@ pub struct LocalCommandLog {
     pub session_id: Uuid,
     pub version: String,
     pub git_branch: String,
+    /// Session slug identifier (e.g., "noble-floating-lemon"). Added in Claude Code 2.0.51.
+    pub slug: Option<String>,
     pub content: String,
     pub level: String,
     pub timestamp: DateTime<Utc>,
@@ -78,6 +80,8 @@ pub struct StopHookSummary {
     pub session_id: Uuid,
     pub version: String,
     pub git_branch: String,
+    /// Session slug identifier (e.g., "noble-floating-lemon"). Added in Claude Code 2.0.51.
+    pub slug: Option<String>,
     pub hook_count: usize,
     pub hook_infos: Vec<HookInfo>,
     pub hook_errors: Vec<HookError>,
@@ -157,6 +161,8 @@ pub struct SystemLogError {
     pub session_id: String,
     pub version: String,
     pub git_branch: String,
+    /// Session slug identifier (e.g., "noble-floating-lemon"). Added in Claude Code 2.0.51.
+    pub slug: Option<String>,
     pub level: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cause: Option<serde_json::Value>,
@@ -194,6 +200,8 @@ pub struct CompactBoundary {
     pub session_id: Uuid,
     pub version: String,
     pub git_branch: String,
+    /// Session slug identifier (e.g., "noble-floating-lemon"). Added in Claude Code 2.0.51.
+    pub slug: Option<String>,
     pub content: String,
     pub is_meta: bool,
     pub timestamp: DateTime<Utc>,
@@ -209,6 +217,8 @@ pub struct SystemLogInformational {
     pub parent_uuid: Uuid,
     pub is_sidechain: bool,
     pub git_branch: Option<String>,
+    /// Session slug identifier (e.g., "noble-floating-lemon"). Added in Claude Code 2.0.51.
+    pub slug: Option<String>,
     pub user_type: String,
     pub cwd: String,
     pub session_id: Uuid,
@@ -295,6 +305,8 @@ pub struct UserLogLine {
     pub session_id: Uuid,
     pub version: String,
     pub git_branch: String,
+    /// Session slug identifier (e.g., "noble-floating-lemon"). Added in Claude Code 2.0.51.
+    pub slug: Option<String>,
     pub message: LogMessage,
     pub is_meta: Option<bool>,
     pub uuid: Uuid,
@@ -409,6 +421,8 @@ pub struct AssistantLogLine {
     pub session_id: String,
     pub version: String,
     pub git_branch: String,
+    /// Session slug identifier (e.g., "noble-floating-lemon"). Added in Claude Code 2.0.51.
+    pub slug: Option<String>,
     pub message: AssistantLogMessage,
     pub request_id: Option<String>,
     pub uuid: Uuid,
