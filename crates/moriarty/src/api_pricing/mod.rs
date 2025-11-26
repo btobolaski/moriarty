@@ -206,9 +206,10 @@ fn apply_width_config(table: &mut Table, term_width: usize) {
     }
 }
 
-/// Returns model costs in display order: Opus, Sonnet, Haiku
+/// Returns model costs in display order: Opus 4, Opus, Sonnet, Haiku
 fn iter_model_costs(costs: &DailyCosts) -> impl Iterator<Item = (&'static str, &TokenCosts)> {
     [
+        ("Opus 4", &costs.opus4_costs),
         ("Opus", &costs.opus_costs),
         ("Sonnet", &costs.sonnet_costs),
         ("Haiku", &costs.haiku_costs),
@@ -308,11 +309,12 @@ fn format_duration(minutes: i64) -> String {
     }
 }
 
-/// Returns model costs in display order: Opus, Sonnet, Haiku
+/// Returns model costs in display order: Opus 4, Opus, Sonnet, Haiku
 fn iter_session_model_costs(
     costs: &SessionCosts,
 ) -> impl Iterator<Item = (&'static str, &TokenCosts)> {
     [
+        ("Opus 4", &costs.opus4_costs),
         ("Opus", &costs.opus_costs),
         ("Sonnet", &costs.sonnet_costs),
         ("Haiku", &costs.haiku_costs),

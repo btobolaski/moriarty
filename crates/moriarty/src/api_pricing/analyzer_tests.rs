@@ -42,6 +42,7 @@ fn test_daily_usage_new() {
     assert_eq!(usage.sonnet_usage.input_tokens, 0);
     assert_eq!(usage.haiku_usage.input_tokens, 0);
     assert_eq!(usage.opus_usage.input_tokens, 0);
+    assert_eq!(usage.opus4_usage.input_tokens, 0);
     assert_eq!(usage.unknown_usage.input_tokens, 0);
     assert_eq!(usage.lines_changed, 0);
 }
@@ -82,6 +83,27 @@ fn test_daily_usage_add_opus() {
 
     assert_eq!(usage.opus_usage.input_tokens, 1000);
     assert_eq!(usage.opus_usage.output_tokens, 500);
+    assert_eq!(usage.sonnet_usage.input_tokens, 0);
+    assert_eq!(usage.haiku_usage.input_tokens, 0);
+}
+
+#[test]
+fn test_daily_usage_add_opus4() {
+    let date = NaiveDate::from_ymd_opt(2025, 10, 23).unwrap();
+    let mut usage = DailyUsage::new(date);
+
+    let counts = TokenCounts {
+        input_tokens: 1000,
+        output_tokens: 500,
+        cache_write_tokens: 100,
+        cache_read_tokens: 50,
+    };
+
+    usage.add_usage(ModelType::Opus4, counts);
+
+    assert_eq!(usage.opus4_usage.input_tokens, 1000);
+    assert_eq!(usage.opus4_usage.output_tokens, 500);
+    assert_eq!(usage.opus_usage.input_tokens, 0);
     assert_eq!(usage.sonnet_usage.input_tokens, 0);
     assert_eq!(usage.haiku_usage.input_tokens, 0);
 }
@@ -170,6 +192,30 @@ fn test_daily_usage_calculate_costs() {
 }
 
 #[test]
+fn test_daily_usage_calculate_costs_opus4() {
+    let date = NaiveDate::from_ymd_opt(2025, 10, 23).unwrap();
+    let mut usage = DailyUsage::new(date);
+
+    usage.add_usage(
+        ModelType::Opus4,
+        TokenCounts {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            cache_write_tokens: 0,
+            cache_read_tokens: 0,
+        },
+    );
+
+    let costs = usage.calculate_costs();
+
+    assert_eq!(costs.date, date);
+    assert_eq!(costs.opus4_costs.input, 5.0);
+    assert_eq!(costs.opus4_costs.output, 25.0);
+    assert_eq!(costs.opus4_costs.total(), 30.0);
+    assert_eq!(costs.lines_changed, 0);
+}
+
+#[test]
 fn test_daily_costs_total() {
     let date = NaiveDate::from_ymd_opt(2025, 10, 23).unwrap();
     let costs = DailyCosts {
@@ -187,6 +233,12 @@ fn test_daily_costs_total() {
             cache_read: 0.1,
         },
         opus_costs: TokenCosts {
+            input: 0.0,
+            output: 0.0,
+            cache_read: 0.0,
+            cache_write: 0.0,
+        },
+        opus4_costs: TokenCosts {
             input: 0.0,
             output: 0.0,
             cache_read: 0.0,
@@ -341,7 +393,7 @@ fn test_aggregate_by_date_tracks_unknown_models() {
         create_date_based_message(
             date,
             ModelType::Unknown,
-            "claude-opus-4".to_string(),
+            "gemini-pro".to_string(),
             TokenCounts {
                 input_tokens: 1000,
                 output_tokens: 500,
@@ -372,7 +424,7 @@ fn test_aggregate_by_date_tracks_unknown_models() {
     );
 
     assert_eq!(unknown_models.len(), 2);
-    assert!(unknown_models.contains("claude-opus-4"));
+    assert!(unknown_models.contains("gemini-pro"));
     assert!(unknown_models.contains("gpt-4"));
     assert_eq!(total_unknown_tokens.input_tokens, 1500);
     assert_eq!(total_unknown_tokens.output_tokens, 750);

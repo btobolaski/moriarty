@@ -51,6 +51,7 @@ fn test_display_costs_single_day_sonnet_only() {
         },
         haiku_costs: TokenCosts::default(),
         opus_costs: TokenCosts::default(),
+        opus4_costs: TokenCosts::default(),
         lines_changed: 145,
     }];
 
@@ -70,6 +71,7 @@ fn test_display_costs_single_day_opus_only() {
         },
         sonnet_costs: TokenCosts::default(),
         haiku_costs: TokenCosts::default(),
+        opus4_costs: TokenCosts::default(),
         lines_changed: 0,
     }];
 
@@ -94,6 +96,7 @@ fn test_display_costs_single_day_both_models() {
             cache_read: 0.1,
         },
         opus_costs: TokenCosts::default(),
+        opus4_costs: TokenCosts::default(),
         lines_changed: 0,
     }];
 
@@ -113,6 +116,7 @@ fn test_display_costs_multiple_days() {
             },
             haiku_costs: TokenCosts::default(),
             opus_costs: TokenCosts::default(),
+            opus4_costs: TokenCosts::default(),
             lines_changed: 100,
         },
         DailyCosts {
@@ -125,6 +129,7 @@ fn test_display_costs_multiple_days() {
                 cache_read: 0.1,
             },
             opus_costs: TokenCosts::default(),
+            opus4_costs: TokenCosts::default(),
             lines_changed: 50,
         },
     ];
@@ -146,6 +151,7 @@ fn test_display_costs_three_days() {
             },
             haiku_costs: TokenCosts::default(),
             opus_costs: TokenCosts::default(),
+            opus4_costs: TokenCosts::default(),
             lines_changed: 100,
         },
         DailyCosts {
@@ -158,6 +164,7 @@ fn test_display_costs_three_days() {
             },
             sonnet_costs: TokenCosts::default(),
             opus_costs: TokenCosts::default(),
+            opus4_costs: TokenCosts::default(),
             lines_changed: 50,
         },
         DailyCosts {
@@ -170,6 +177,7 @@ fn test_display_costs_three_days() {
             },
             sonnet_costs: TokenCosts::default(),
             haiku_costs: TokenCosts::default(),
+            opus4_costs: TokenCosts::default(),
             lines_changed: 75,
         },
     ];
@@ -201,6 +209,7 @@ fn test_display_costs_day_with_all_three_models() {
                 cache_write: 0.0,
                 cache_read: 0.0,
             },
+            opus4_costs: TokenCosts::default(),
             lines_changed: 100,
         },
         DailyCosts {
@@ -213,6 +222,7 @@ fn test_display_costs_day_with_all_three_models() {
             },
             haiku_costs: TokenCosts::default(),
             opus_costs: TokenCosts::default(),
+            opus4_costs: TokenCosts::default(),
             lines_changed: 50,
         },
     ];
@@ -234,6 +244,7 @@ fn test_display_costs_ten_days() {
             },
             haiku_costs: TokenCosts::default(),
             opus_costs: TokenCosts::default(),
+            opus4_costs: TokenCosts::default(),
             lines_changed: 10,
         })
         .collect();
@@ -255,6 +266,7 @@ fn test_display_costs_thirty_one_days() {
             },
             haiku_costs: TokenCosts::default(),
             opus_costs: TokenCosts::default(),
+            opus4_costs: TokenCosts::default(),
             lines_changed: 10,
         })
         .collect();
@@ -277,6 +289,7 @@ fn test_display_costs_thirty_two_days_uses_fallback() {
             },
             haiku_costs: TokenCosts::default(),
             opus_costs: TokenCosts::default(),
+            opus4_costs: TokenCosts::default(),
             lines_changed: 10,
         })
         .collect();
@@ -292,6 +305,7 @@ fn test_display_costs_thirty_two_days_uses_fallback() {
         },
         haiku_costs: TokenCosts::default(),
         opus_costs: TokenCosts::default(),
+        opus4_costs: TokenCosts::default(),
         lines_changed: 10,
     });
 
@@ -314,8 +328,8 @@ fn test_display_warnings_no_unknown_models() {
 #[test]
 fn test_display_warnings_with_unknown_models() {
     let mut unknown_models = HashSet::new();
-    unknown_models.insert("claude-opus-4".to_string());
     unknown_models.insert("gpt-4".to_string());
+    unknown_models.insert("gemini-pro".to_string());
 
     let result = AnalysisResult {
         daily_costs: vec![],
@@ -461,6 +475,7 @@ fn test_build_cost_rows_single_model_per_day() {
         },
         haiku_costs: TokenCosts::default(),
         opus_costs: TokenCosts::default(),
+        opus4_costs: TokenCosts::default(),
         lines_changed: 100,
     }];
 
@@ -496,6 +511,7 @@ fn test_build_cost_rows_multiple_models_same_day() {
             cache_write: 0.0,
             cache_read: 0.0,
         },
+        opus4_costs: TokenCosts::default(),
         lines_changed: 200,
     }];
 
@@ -520,6 +536,7 @@ fn test_build_cost_rows_only_zero_cost_models() {
         opus_costs: TokenCosts::default(),
         sonnet_costs: TokenCosts::default(),
         haiku_costs: TokenCosts::default(),
+        opus4_costs: TokenCosts::default(),
         lines_changed: 0,
     }];
 
@@ -544,6 +561,7 @@ fn test_build_cost_rows_multiple_days() {
             },
             opus_costs: TokenCosts::default(),
             haiku_costs: TokenCosts::default(),
+            opus4_costs: TokenCosts::default(),
             lines_changed: 50,
         },
         DailyCosts {
@@ -556,6 +574,7 @@ fn test_build_cost_rows_multiple_days() {
             },
             sonnet_costs: TokenCosts::default(),
             opus_costs: TokenCosts::default(),
+            opus4_costs: TokenCosts::default(),
             lines_changed: 25,
         },
     ];
@@ -595,6 +614,7 @@ fn test_build_cost_rows_filters_zero_cost_models() {
             cache_write: 0.0,
             cache_read: 0.0,
         },
+        opus4_costs: TokenCosts::default(),
         lines_changed: 100,
     }];
 
@@ -625,6 +645,7 @@ fn test_build_cost_rows_date_only_on_first_nonzero_model() {
             cache_write: 0.0,
             cache_read: 0.0,
         },
+        opus4_costs: TokenCosts::default(),
         lines_changed: 100,
     }];
 
@@ -804,12 +825,18 @@ fn test_iter_model_costs_returns_correct_order() {
             cache_write: 0.0,
             cache_read: 0.0,
         },
+        opus4_costs: TokenCosts {
+            input: 0.0,
+            output: 0.0,
+            cache_write: 0.0,
+            cache_read: 0.0,
+        },
         lines_changed: 100,
     };
 
     let models: Vec<&str> = iter_model_costs(&costs).map(|(name, _)| name).collect();
 
-    assert_eq!(models, vec!["Opus", "Sonnet", "Haiku"]);
+    assert_eq!(models, vec!["Opus 4", "Opus", "Sonnet", "Haiku"]);
 }
 
 #[test]
@@ -834,10 +861,20 @@ fn test_iter_model_costs_returns_correct_references() {
             cache_write: 0.0,
             cache_read: 0.0,
         },
+        opus4_costs: TokenCosts {
+            input: 5.0,
+            output: 25.0,
+            cache_write: 0.0,
+            cache_read: 0.0,
+        },
         lines_changed: 100,
     };
 
     let mut iter = iter_model_costs(&costs);
+
+    let (name, token_costs) = iter.next().unwrap();
+    assert_eq!(name, "Opus 4");
+    assert_eq!(token_costs.input, 5.0);
 
     let (name, token_costs) = iter.next().unwrap();
     assert_eq!(name, "Opus");

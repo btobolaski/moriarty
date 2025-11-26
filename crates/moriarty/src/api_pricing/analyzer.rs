@@ -75,6 +75,7 @@ pub struct DailyUsage {
     pub sonnet_usage: TokenCounts,
     pub haiku_usage: TokenCounts,
     pub opus_usage: TokenCounts,
+    pub opus4_usage: TokenCounts,
     pub unknown_usage: TokenCounts,
     pub lines_changed: usize,
 }
@@ -86,6 +87,7 @@ impl DailyUsage {
             sonnet_usage: TokenCounts::default(),
             haiku_usage: TokenCounts::default(),
             opus_usage: TokenCounts::default(),
+            opus4_usage: TokenCounts::default(),
             unknown_usage: TokenCounts::default(),
             lines_changed: 0,
         }
@@ -96,6 +98,7 @@ impl DailyUsage {
             ModelType::Sonnet => self.sonnet_usage.add(&counts),
             ModelType::Haiku => self.haiku_usage.add(&counts),
             ModelType::Opus => self.opus_usage.add(&counts),
+            ModelType::Opus4 => self.opus4_usage.add(&counts),
             ModelType::Unknown => self.unknown_usage.add(&counts),
         }
     }
@@ -120,11 +123,17 @@ impl DailyUsage {
             .map(|p| p.calculate_cost(&self.opus_usage))
             .unwrap_or_default();
 
+        let opus4_costs = ModelType::Opus4
+            .pricing()
+            .map(|p| p.calculate_cost(&self.opus4_usage))
+            .unwrap_or_default();
+
         DailyCosts {
             date: self.date,
             sonnet_costs,
             haiku_costs,
             opus_costs,
+            opus4_costs,
             lines_changed: self.lines_changed,
         }
     }
@@ -136,12 +145,16 @@ pub struct DailyCosts {
     pub sonnet_costs: TokenCosts,
     pub haiku_costs: TokenCosts,
     pub opus_costs: TokenCosts,
+    pub opus4_costs: TokenCosts,
     pub lines_changed: usize,
 }
 
 impl DailyCosts {
     pub fn total(&self) -> f64 {
-        self.sonnet_costs.total() + self.haiku_costs.total() + self.opus_costs.total()
+        self.sonnet_costs.total()
+            + self.haiku_costs.total()
+            + self.opus_costs.total()
+            + self.opus4_costs.total()
     }
 }
 
@@ -157,6 +170,7 @@ pub struct SessionUsage {
     pub sonnet_usage: TokenCounts,
     pub haiku_usage: TokenCounts,
     pub opus_usage: TokenCounts,
+    pub opus4_usage: TokenCounts,
     pub unknown_usage: TokenCounts,
     pub lines_changed: usize,
 }
@@ -170,6 +184,7 @@ impl SessionUsage {
             sonnet_usage: TokenCounts::default(),
             haiku_usage: TokenCounts::default(),
             opus_usage: TokenCounts::default(),
+            opus4_usage: TokenCounts::default(),
             unknown_usage: TokenCounts::default(),
             lines_changed: 0,
         }
@@ -194,6 +209,7 @@ impl SessionUsage {
             ModelType::Sonnet => self.sonnet_usage.add(&counts),
             ModelType::Haiku => self.haiku_usage.add(&counts),
             ModelType::Opus => self.opus_usage.add(&counts),
+            ModelType::Opus4 => self.opus4_usage.add(&counts),
             ModelType::Unknown => self.unknown_usage.add(&counts),
         }
         self.update_time_range(timestamp);
@@ -220,6 +236,11 @@ impl SessionUsage {
             .map(|p| p.calculate_cost(&self.opus_usage))
             .unwrap_or_default();
 
+        let opus4_costs = ModelType::Opus4
+            .pricing()
+            .map(|p| p.calculate_cost(&self.opus4_usage))
+            .unwrap_or_default();
+
         SessionCosts {
             session_id: self.session_id.clone(),
             start_time: self.start_time,
@@ -227,6 +248,7 @@ impl SessionUsage {
             sonnet_costs,
             haiku_costs,
             opus_costs,
+            opus4_costs,
             lines_changed: self.lines_changed,
         }
     }
@@ -245,12 +267,16 @@ pub struct SessionCosts {
     pub sonnet_costs: TokenCosts,
     pub haiku_costs: TokenCosts,
     pub opus_costs: TokenCosts,
+    pub opus4_costs: TokenCosts,
     pub lines_changed: usize,
 }
 
 impl SessionCosts {
     pub fn total(&self) -> f64 {
-        self.sonnet_costs.total() + self.haiku_costs.total() + self.opus_costs.total()
+        self.sonnet_costs.total()
+            + self.haiku_costs.total()
+            + self.opus_costs.total()
+            + self.opus4_costs.total()
     }
 
     pub fn duration_minutes(&self) -> i64 {

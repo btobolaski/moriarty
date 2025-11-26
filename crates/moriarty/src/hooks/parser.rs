@@ -11,6 +11,7 @@ use std::collections::HashMap;
 /// Hook event types that can trigger scripts
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
+#[allow(dead_code)]
 pub enum HookEvent {
     /// Executes after Claude creates tool parameters but before processing
     PreToolUse,
@@ -63,6 +64,7 @@ pub enum PreCompactMatcher {
 /// Hook type (currently only command is supported)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[allow(dead_code)]
 pub enum HookType {
     Command,
 }
@@ -79,6 +81,7 @@ pub enum PermissionMode {
 
 /// Hook definition with command and execution parameters
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct HookDefinition {
     /// Currently only "command" is supported
     #[serde(rename = "type")]
@@ -101,6 +104,7 @@ impl HookDefinition {
 
 /// Hook matcher configuration
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct HookMatcher {
     /// Case-sensitive, supports regex and * for all tools
     pub matcher: String,
@@ -109,6 +113,7 @@ pub struct HookMatcher {
 
 /// Top-level hooks configuration
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct HooksConfig {
     #[serde(flatten)]
     pub hooks: HashMap<HookEvent, Vec<HookMatcher>>,
