@@ -266,6 +266,7 @@ mod tests {
             is_visible_in_transcript_only: None,
             is_compact_summary: None,
             todos: None,
+            source_tool_assistant_uuid: None,
         })
     }
 

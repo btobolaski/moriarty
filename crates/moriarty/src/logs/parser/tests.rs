@@ -1030,3 +1030,154 @@ fn test_parse_stop_hook_summary_with_mixed_error_formats() {
         _ => panic!("Expected System(StopHookSummary) variant"),
     }
 }
+
+#[test]
+fn test_parse_turn_duration() {
+    let json = serde_json::json!({
+        "type": "system",
+        "subtype": "turn_duration",
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.0.51",
+        "gitBranch": "main",
+        "slug": "noble-floating-lemon",
+        "durationMs": 1234,
+        "timestamp": "2025-01-16T00:00:00Z",
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "isMeta": false
+    });
+
+    let line: LogLine =
+        serde_json::from_value(json).expect("Failed to parse turn_duration system message");
+
+    match line {
+        LogLine::System(SystemLogLine::TurnDuration(duration)) => {
+            assert_eq!(duration.duration_ms, 1234);
+            assert_eq!(duration.slug, Some("noble-floating-lemon".to_string()));
+            assert_eq!(duration.version, "2.0.51");
+            assert!(!duration.is_meta);
+        }
+        _ => panic!("Expected System(TurnDuration) variant"),
+    }
+}
+
+#[test]
+fn test_parse_turn_duration_without_slug() {
+    let json = serde_json::json!({
+        "type": "system",
+        "subtype": "turn_duration",
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.0.50",
+        "gitBranch": "main",
+        "durationMs": 5678,
+        "timestamp": "2025-01-16T00:00:00Z",
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "isMeta": true
+    });
+
+    let line: LogLine =
+        serde_json::from_value(json).expect("Should parse turn_duration without slug field");
+
+    match line {
+        LogLine::System(SystemLogLine::TurnDuration(duration)) => {
+            assert_eq!(duration.duration_ms, 5678);
+            assert_eq!(duration.slug, None);
+        }
+        _ => panic!("Expected System(TurnDuration) variant"),
+    }
+}
+
+#[test]
+fn test_parse_turn_duration_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "type": "system",
+        "subtype": "turn_duration",
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.0.51",
+        "gitBranch": "main",
+        "durationMs": 1234,
+        "timestamp": "2025-01-16T00:00:00Z",
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "isMeta": false,
+        "unknownField": "should be rejected"
+    });
+
+    let err_msg = serde_json::from_value::<LogLine>(json)
+        .expect_err("Should reject unknown fields due to deny_unknown_fields")
+        .to_string();
+    assert!(
+        err_msg.contains("unknown field") || err_msg.contains("unknownField"),
+        "Error should mention unknown field, got: {}",
+        err_msg
+    );
+}
+
+#[test]
+fn test_parse_user_log_line_with_source_tool_assistant_uuid() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "version": "2.0.51",
+        "gitBranch": "main",
+        "message": {"role": "user", "content": "test"},
+        "uuid": "550e8400-e29b-41d4-a716-446655440001",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "sourceToolAssistantUUID": "550e8400-e29b-41d4-a716-446655440099"
+    });
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(
+        line.source_tool_assistant_uuid,
+        Some(Uuid::parse_str("550e8400-e29b-41d4-a716-446655440099").unwrap())
+    );
+}
+
+#[test]
+fn test_parse_user_log_line_with_null_source_tool_assistant_uuid() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "version": "2.0.51",
+        "gitBranch": "main",
+        "message": {"role": "user", "content": "test"},
+        "uuid": "550e8400-e29b-41d4-a716-446655440001",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "sourceToolAssistantUUID": null
+    });
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(line.source_tool_assistant_uuid, None);
+}
+
+#[test]
+fn test_parse_user_log_line_without_source_tool_assistant_uuid() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "version": "2.0.50",
+        "gitBranch": "main",
+        "message": {"role": "user", "content": "test"},
+        "uuid": "550e8400-e29b-41d4-a716-446655440001",
+        "timestamp": "2025-01-01T00:00:00Z"
+    });
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(line.source_tool_assistant_uuid, None);
+}

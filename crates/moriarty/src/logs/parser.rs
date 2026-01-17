@@ -47,6 +47,7 @@ pub enum SystemLogLine {
     ApiError(SystemLogError),
     LocalCommand(LocalCommandLog),
     StopHookSummary(StopHookSummary),
+    TurnDuration(TurnDuration),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -238,6 +239,27 @@ pub struct CompactMetadata {
     pub pre_tokens: usize,
 }
 
+/// Duration of a single turn (user message → assistant response cycle).
+/// Added in Claude Code 2.0.51+ for performance tracking.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct TurnDuration {
+    pub parent_uuid: Uuid,
+    pub is_sidechain: bool,
+    pub user_type: String,
+    pub cwd: String,
+    pub session_id: Uuid,
+    pub version: String,
+    pub git_branch: String,
+    /// Session slug identifier (e.g., "noble-floating-lemon"). Added in Claude Code 2.0.51.
+    pub slug: Option<String>,
+    pub duration_ms: u64,
+    pub timestamp: DateTime<Utc>,
+    pub uuid: Uuid,
+    pub is_meta: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
@@ -317,6 +339,9 @@ pub struct UserLogLine {
     pub is_compact_summary: Option<bool>,
     /// Todo list from Claude Code 2.0.47+. Contains tasks being tracked in the conversation.
     pub todos: Option<Vec<Todo>>,
+    /// UUID of the assistant message that triggered the tool use. Added in Claude Code 2.0.51+.
+    #[serde(rename = "sourceToolAssistantUUID")]
+    pub source_tool_assistant_uuid: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]

@@ -214,6 +214,9 @@ fn format_system_message(system: &SystemLogLine) -> String {
             }
             output
         }
+        SystemLogLine::TurnDuration(duration) => {
+            format!("⏱️  Turn Duration: {}ms\n", duration.duration_ms)
+        }
     }
 }
 
@@ -299,6 +302,7 @@ mod tests {
             is_visible_in_transcript_only: None,
             is_compact_summary: None,
             todos: None,
+            source_tool_assistant_uuid: None,
         }
     }
 
