@@ -309,6 +309,7 @@ mod tests {
             uuid: Uuid::new_v4(),
             timestamp: Utc::now(),
             is_api_error_message: None,
+            error: None,
         })
     }
 

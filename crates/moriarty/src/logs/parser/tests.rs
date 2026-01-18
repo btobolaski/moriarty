@@ -1181,3 +1181,1148 @@ fn test_parse_user_log_line_without_source_tool_assistant_uuid() {
     let line: UserLogLine = serde_json::from_value(json).unwrap();
     assert_eq!(line.source_tool_assistant_uuid, None);
 }
+
+#[test]
+fn test_parse_progress_hook_progress() {
+    let json = serde_json::json!({
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.12",
+        "gitBranch": "main",
+        "slug": "test-slug",
+        "type": "progress",
+        "data": {
+            "type": "hook_progress",
+            "hookEvent": "PreToolUse",
+            "hookName": "PreToolUse:Bash",
+            "command": "moriarty hooks exec"
+        },
+        "toolUseID": "toolu_test",
+        "parentToolUseID": "toolu_parent",
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2026-01-18T21:54:19.450Z"
+    });
+
+    let line: LogLine = serde_json::from_value(json).expect("Failed to parse hook_progress");
+
+    match line {
+        LogLine::Progress(progress) => {
+            assert_eq!(progress.tool_use_id, "toolu_test");
+            match progress.data {
+                ProgressData::HookProgress(data) => {
+                    assert_eq!(data.hook_event, "PreToolUse");
+                    assert_eq!(data.hook_name, "PreToolUse:Bash");
+                }
+                _ => panic!("Expected HookProgress variant"),
+            }
+        }
+        _ => panic!("Expected Progress variant"),
+    }
+}
+
+#[test]
+fn test_parse_progress_mcp_progress() {
+    let json = serde_json::json!({
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.12",
+        "gitBranch": "main",
+        "type": "progress",
+        "data": {
+            "type": "mcp_progress",
+            "status": "completed",
+            "serverName": "git-read-only",
+            "toolName": "show",
+            "elapsedTimeMs": 9
+        },
+        "toolUseID": "toolu_test",
+        "parentToolUseID": "toolu_parent",
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2026-01-18T21:55:09.748Z"
+    });
+
+    let line: LogLine = serde_json::from_value(json).expect("Failed to parse mcp_progress");
+
+    match line {
+        LogLine::Progress(progress) => match progress.data {
+            ProgressData::McpProgress(data) => {
+                assert_eq!(data.status, "completed");
+                assert_eq!(data.server_name, "git-read-only");
+                assert_eq!(data.elapsed_time_ms, Some(9));
+            }
+            _ => panic!("Expected McpProgress variant"),
+        },
+        _ => panic!("Expected Progress variant"),
+    }
+}
+
+#[test]
+fn test_parse_progress_agent_progress_with_assistant_message() {
+    let json = serde_json::json!({
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.12",
+        "gitBranch": "main",
+        "slug": "test-slug",
+        "type": "progress",
+        "data": {
+            "type": "agent_progress",
+            "message": {
+                "type": "user",
+                "timestamp": "2026-01-18T21:43:02.787Z",
+                "message": {"role": "user", "content": "test"},
+                "uuid": "550e8400-e29b-41d4-a716-446655440004"
+            },
+            "normalizedMessages": [
+                {
+                    "type": "assistant",
+                    "timestamp": "2026-01-18T21:54:47.639Z",
+                    "message": {
+                        "model": "claude-opus-4-5-20251101",
+                        "id": "msg_test",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "test"}],
+                        "stop_reason": null,
+                        "stop_sequence": null,
+                        "usage": {
+                            "input_tokens": 3,
+                            "cache_creation_input_tokens": 100,
+                            "cache_read_input_tokens": 0,
+                            "cache_creation": {
+                                "ephemeral_5m_input_tokens": 100,
+                                "ephemeral_1h_input_tokens": 0
+                            },
+                            "output_tokens": 1,
+                            "service_tier": "standard"
+                        },
+                        "context_management": null
+                    },
+                    "requestId": "req_test",
+                    "uuid": "550e8400-e29b-41d4-a716-446655440003"
+                },
+                {
+                    "type": "progress",
+                    "data": {
+                        "type": "hook_progress",
+                        "hookEvent": "PreToolUse",
+                        "hookName": "PreToolUse:Bash",
+                        "command": "moriarty hooks exec"
+                    },
+                    "toolUseID": "toolu_test",
+                    "parentToolUseID": "toolu_parent",
+                    "uuid": "550e8400-e29b-41d4-a716-446655440005",
+                    "timestamp": "2026-01-18T21:43:02.698Z"
+                },
+                {
+                    "type": "attachment",
+                    "attachment": {"type": "hook_success", "hookName": "test"},
+                    "uuid": "550e8400-e29b-41d4-a716-446655440006",
+                    "timestamp": "2026-01-18T21:43:02.724Z"
+                },
+                {
+                    "type": "user",
+                    "message": {"role": "user", "content": [{"tool_use_id": "test", "type": "tool_result", "content": "No files found"}]},
+                    "uuid": "550e8400-e29b-41d4-a716-446655440007",
+                    "timestamp": "2026-01-18T21:43:02.787Z",
+                    "toolUseResult": {"filenames": [], "durationMs": 38}
+                }
+            ],
+            "prompt": "test prompt",
+            "agentId": "abc123"
+        },
+        "toolUseID": "agent_msg_test",
+        "parentToolUseID": "toolu_parent",
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2026-01-18T21:54:47.655Z"
+    });
+
+    let line: LogLine =
+        serde_json::from_value(json).expect("Failed to parse agent_progress with assistant");
+
+    match line {
+        LogLine::Progress(progress) => match progress.data {
+            ProgressData::AgentProgress(data) => {
+                assert_eq!(data.agent_id, "abc123");
+                assert_eq!(data.prompt, "test prompt");
+                assert_eq!(data.normalized_messages.len(), 4);
+            }
+            _ => panic!("Expected AgentProgress variant"),
+        },
+        _ => panic!("Expected Progress variant"),
+    }
+}
+
+#[test]
+fn test_parse_progress_bash_progress() {
+    let json = serde_json::json!({
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.12",
+        "gitBranch": "main",
+        "type": "progress",
+        "data": {
+            "type": "bash_progress",
+            "output": "Running command...",
+            "fullOutput": "Running command...\nProcessing...",
+            "elapsedTimeSeconds": 5,
+            "totalLines": 2
+        },
+        "toolUseID": "bash-progress-0",
+        "parentToolUseID": "toolu_parent",
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2026-01-18T21:55:09.748Z"
+    });
+
+    let line: LogLine = serde_json::from_value(json).expect("Failed to parse bash_progress");
+
+    match line {
+        LogLine::Progress(progress) => match progress.data {
+            ProgressData::BashProgress(data) => {
+                assert_eq!(data.output, "Running command...");
+                assert_eq!(data.full_output, "Running command...\nProcessing...");
+                assert_eq!(data.elapsed_time_seconds, 5);
+                assert_eq!(data.total_lines, 2);
+            }
+            _ => panic!("Expected BashProgress variant"),
+        },
+        _ => panic!("Expected Progress variant"),
+    }
+}
+
+#[test]
+fn test_parse_progress_waiting_for_task() {
+    let json = serde_json::json!({
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.12",
+        "gitBranch": "main",
+        "type": "progress",
+        "data": {
+            "type": "waiting_for_task",
+            "taskDescription": "Check if all files parse correctly now",
+            "taskType": "local_bash"
+        },
+        "toolUseID": "task-output-waiting",
+        "parentToolUseID": "toolu_parent",
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2026-01-18T22:17:23.813Z"
+    });
+
+    let line: LogLine = serde_json::from_value(json).expect("Failed to parse waiting_for_task");
+
+    match line {
+        LogLine::Progress(progress) => match progress.data {
+            ProgressData::WaitingForTask(data) => {
+                assert_eq!(
+                    data.task_description,
+                    "Check if all files parse correctly now"
+                );
+                assert_eq!(data.task_type, "local_bash");
+            }
+            _ => panic!("Expected WaitingForTask variant"),
+        },
+        _ => panic!("Expected Progress variant"),
+    }
+}
+
+#[test]
+fn test_parse_progress_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.12",
+        "gitBranch": "main",
+        "type": "progress",
+        "data": {
+            "type": "hook_progress",
+            "hookEvent": "PreToolUse",
+            "hookName": "PreToolUse:Bash",
+            "command": "moriarty hooks exec"
+        },
+        "toolUseID": "toolu_test",
+        "parentToolUseID": "toolu_parent",
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2026-01-18T21:54:19.450Z",
+        "unknownField": "should be rejected"
+    });
+
+    let err_msg = serde_json::from_value::<LogLine>(json)
+        .expect_err("Should reject unknown fields due to deny_unknown_fields")
+        .to_string();
+    assert!(
+        err_msg.contains("unknown field") || err_msg.contains("unknownField"),
+        "Error should mention unknown field, got: {}",
+        err_msg
+    );
+}
+
+#[test]
+fn test_parse_hook_progress_data_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.12",
+        "gitBranch": "main",
+        "type": "progress",
+        "data": {
+            "type": "hook_progress",
+            "hookEvent": "PreToolUse",
+            "hookName": "PreToolUse:Bash",
+            "command": "moriarty hooks exec",
+            "extraField": "should be rejected"
+        },
+        "toolUseID": "toolu_test",
+        "parentToolUseID": "toolu_parent",
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2026-01-18T21:54:19.450Z"
+    });
+
+    let err_msg = serde_json::from_value::<LogLine>(json)
+        .expect_err("Should reject unknown fields in HookProgressData")
+        .to_string();
+    assert!(
+        err_msg.contains("unknown field") || err_msg.contains("extraField"),
+        "Error should mention unknown field, got: {}",
+        err_msg
+    );
+}
+
+#[test]
+fn test_parse_mcp_progress_data_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.12",
+        "gitBranch": "main",
+        "type": "progress",
+        "data": {
+            "type": "mcp_progress",
+            "status": "completed",
+            "serverName": "test-server",
+            "toolName": "test-tool",
+            "elapsedTimeMs": 10,
+            "extraField": "should be rejected"
+        },
+        "toolUseID": "toolu_test",
+        "parentToolUseID": "toolu_parent",
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2026-01-18T21:55:09.748Z"
+    });
+
+    let err_msg = serde_json::from_value::<LogLine>(json)
+        .expect_err("Should reject unknown fields in McpProgressData")
+        .to_string();
+    assert!(
+        err_msg.contains("unknown field") || err_msg.contains("extraField"),
+        "Error should mention unknown field, got: {}",
+        err_msg
+    );
+}
+
+#[test]
+fn test_parse_bash_progress_data_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.12",
+        "gitBranch": "main",
+        "type": "progress",
+        "data": {
+            "type": "bash_progress",
+            "output": "test output",
+            "fullOutput": "test full output",
+            "elapsedTimeSeconds": 5,
+            "totalLines": 1,
+            "extraField": "should be rejected"
+        },
+        "toolUseID": "toolu_test",
+        "parentToolUseID": "toolu_parent",
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2026-01-18T21:55:09.748Z"
+    });
+
+    let err_msg = serde_json::from_value::<LogLine>(json)
+        .expect_err("Should reject unknown fields in BashProgressData")
+        .to_string();
+    assert!(
+        err_msg.contains("unknown field") || err_msg.contains("extraField"),
+        "Error should mention unknown field, got: {}",
+        err_msg
+    );
+}
+
+#[test]
+fn test_parse_waiting_for_task_data_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.12",
+        "gitBranch": "main",
+        "type": "progress",
+        "data": {
+            "type": "waiting_for_task",
+            "taskDescription": "test task",
+            "taskType": "local_bash",
+            "extraField": "should be rejected"
+        },
+        "toolUseID": "toolu_test",
+        "parentToolUseID": "toolu_parent",
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2026-01-18T22:17:23.813Z"
+    });
+
+    let err_msg = serde_json::from_value::<LogLine>(json)
+        .expect_err("Should reject unknown fields in WaitingForTaskData")
+        .to_string();
+    assert!(
+        err_msg.contains("unknown field") || err_msg.contains("extraField"),
+        "Error should mention unknown field, got: {}",
+        err_msg
+    );
+}
+
+#[test]
+fn test_parse_agent_progress_data_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.12",
+        "gitBranch": "main",
+        "type": "progress",
+        "data": {
+            "type": "agent_progress",
+            "message": {
+                "type": "user",
+                "timestamp": "2026-01-18T21:43:02.787Z",
+                "message": {"role": "user", "content": "test"},
+                "uuid": "550e8400-e29b-41d4-a716-446655440004"
+            },
+            "normalizedMessages": [],
+            "prompt": "test prompt",
+            "agentId": "abc123",
+            "extraField": "should be rejected"
+        },
+        "toolUseID": "toolu_test",
+        "parentToolUseID": "toolu_parent",
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2026-01-18T21:54:47.655Z"
+    });
+
+    let err_msg = serde_json::from_value::<LogLine>(json)
+        .expect_err("Should reject unknown fields in AgentProgressData")
+        .to_string();
+    assert!(
+        err_msg.contains("unknown field") || err_msg.contains("extraField"),
+        "Error should mention unknown field, got: {}",
+        err_msg
+    );
+}
+
+#[test]
+fn test_parse_agent_progress_message_user_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.12",
+        "gitBranch": "main",
+        "type": "progress",
+        "data": {
+            "type": "agent_progress",
+            "message": {
+                "type": "user",
+                "timestamp": "2026-01-18T21:43:02.787Z",
+                "message": {"role": "user", "content": "test"},
+                "uuid": "550e8400-e29b-41d4-a716-446655440004",
+                "extraField": "should be rejected"
+            },
+            "normalizedMessages": [],
+            "prompt": "test prompt",
+            "agentId": "abc123"
+        },
+        "toolUseID": "toolu_test",
+        "parentToolUseID": "toolu_parent",
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2026-01-18T21:54:47.655Z"
+    });
+
+    let err_msg = serde_json::from_value::<LogLine>(json)
+        .expect_err("Should reject unknown fields in AgentProgressMessage::User")
+        .to_string();
+    assert!(
+        err_msg.contains("unknown field") || err_msg.contains("extraField"),
+        "Error should mention unknown field, got: {}",
+        err_msg
+    );
+}
+
+#[test]
+fn test_parse_agent_progress_message_assistant_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.12",
+        "gitBranch": "main",
+        "type": "progress",
+        "data": {
+            "type": "agent_progress",
+            "message": {
+                "type": "assistant",
+                "timestamp": "2026-01-18T21:54:47.639Z",
+                "message": {
+                    "model": "claude-opus-4-5-20251101",
+                    "id": "msg_test",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": "test",
+                    "stop_reason": null,
+                    "stop_sequence": null,
+                    "usage": {
+                        "input_tokens": 3,
+                        "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": 0,
+                        "cache_creation": {
+                            "ephemeral_5m_input_tokens": 0,
+                            "ephemeral_1h_input_tokens": 0
+                        },
+                        "output_tokens": 1
+                    }
+                },
+                "requestId": "req_test",
+                "uuid": "550e8400-e29b-41d4-a716-446655440003",
+                "extraField": "should be rejected"
+            },
+            "normalizedMessages": [],
+            "prompt": "test prompt",
+            "agentId": "abc123"
+        },
+        "toolUseID": "toolu_test",
+        "parentToolUseID": "toolu_parent",
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2026-01-18T21:54:47.655Z"
+    });
+
+    let err_msg = serde_json::from_value::<LogLine>(json)
+        .expect_err("Should reject unknown fields in AgentProgressMessage::Assistant")
+        .to_string();
+    assert!(
+        err_msg.contains("unknown field") || err_msg.contains("extraField"),
+        "Error should mention unknown field, got: {}",
+        err_msg
+    );
+}
+
+#[test]
+fn test_parse_agent_progress_message_progress_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.12",
+        "gitBranch": "main",
+        "type": "progress",
+        "data": {
+            "type": "agent_progress",
+            "message": {
+                "type": "user",
+                "timestamp": "2026-01-18T21:43:02.787Z",
+                "message": {"role": "user", "content": "test"},
+                "uuid": "550e8400-e29b-41d4-a716-446655440004"
+            },
+            "normalizedMessages": [
+                {
+                    "type": "progress",
+                    "data": {
+                        "type": "hook_progress",
+                        "hookEvent": "PreToolUse",
+                        "hookName": "PreToolUse:Bash",
+                        "command": "test"
+                    },
+                    "toolUseID": "toolu_test",
+                    "parentToolUseID": "toolu_parent",
+                    "uuid": "550e8400-e29b-41d4-a716-446655440005",
+                    "timestamp": "2026-01-18T21:43:02.698Z",
+                    "extraField": "should be rejected"
+                }
+            ],
+            "prompt": "test prompt",
+            "agentId": "abc123"
+        },
+        "toolUseID": "toolu_test",
+        "parentToolUseID": "toolu_parent",
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2026-01-18T21:54:47.655Z"
+    });
+
+    let err_msg = serde_json::from_value::<LogLine>(json)
+        .expect_err("Should reject unknown fields in AgentProgressMessage::Progress")
+        .to_string();
+    assert!(
+        err_msg.contains("unknown field") || err_msg.contains("extraField"),
+        "Error should mention unknown field, got: {}",
+        err_msg
+    );
+}
+
+#[test]
+fn test_parse_agent_progress_message_attachment_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.12",
+        "gitBranch": "main",
+        "type": "progress",
+        "data": {
+            "type": "agent_progress",
+            "message": {
+                "type": "user",
+                "timestamp": "2026-01-18T21:43:02.787Z",
+                "message": {"role": "user", "content": "test"},
+                "uuid": "550e8400-e29b-41d4-a716-446655440004"
+            },
+            "normalizedMessages": [
+                {
+                    "type": "attachment",
+                    "attachment": {"type": "hook_success"},
+                    "uuid": "550e8400-e29b-41d4-a716-446655440006",
+                    "timestamp": "2026-01-18T21:43:02.724Z",
+                    "extraField": "should be rejected"
+                }
+            ],
+            "prompt": "test prompt",
+            "agentId": "abc123"
+        },
+        "toolUseID": "toolu_test",
+        "parentToolUseID": "toolu_parent",
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2026-01-18T21:54:47.655Z"
+    });
+
+    let err_msg = serde_json::from_value::<LogLine>(json)
+        .expect_err("Should reject unknown fields in AgentProgressMessage::Attachment")
+        .to_string();
+    assert!(
+        err_msg.contains("unknown field") || err_msg.contains("extraField"),
+        "Error should mention unknown field, got: {}",
+        err_msg
+    );
+}
+
+#[test]
+fn test_parse_nested_progress_data_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.12",
+        "gitBranch": "main",
+        "type": "progress",
+        "data": {
+            "type": "agent_progress",
+            "message": {
+                "type": "user",
+                "timestamp": "2026-01-18T21:43:02.787Z",
+                "message": {"role": "user", "content": "test"},
+                "uuid": "550e8400-e29b-41d4-a716-446655440004"
+            },
+            "normalizedMessages": [
+                {
+                    "type": "progress",
+                    "data": {
+                        "type": "hook_progress",
+                        "hookEvent": "PreToolUse",
+                        "hookName": "PreToolUse:Bash",
+                        "command": "test",
+                        "extraField": "should be rejected"
+                    },
+                    "toolUseID": "toolu_test",
+                    "parentToolUseID": "toolu_parent",
+                    "uuid": "550e8400-e29b-41d4-a716-446655440005",
+                    "timestamp": "2026-01-18T21:43:02.698Z"
+                }
+            ],
+            "prompt": "test prompt",
+            "agentId": "abc123"
+        },
+        "toolUseID": "toolu_test",
+        "parentToolUseID": "toolu_parent",
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2026-01-18T21:54:47.655Z"
+    });
+
+    let err_msg = serde_json::from_value::<LogLine>(json)
+        .expect_err("Should reject unknown fields in NestedProgressData")
+        .to_string();
+    assert!(
+        err_msg.contains("unknown field") || err_msg.contains("extraField"),
+        "Error should mention unknown field, got: {}",
+        err_msg
+    );
+}
+
+#[test]
+fn test_parse_mcp_progress_without_elapsed_time() {
+    let json = serde_json::json!({
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.12",
+        "gitBranch": "main",
+        "type": "progress",
+        "data": {
+            "type": "mcp_progress",
+            "status": "started",
+            "serverName": "git-read-only",
+            "toolName": "show"
+        },
+        "toolUseID": "toolu_test",
+        "parentToolUseID": "toolu_parent",
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2026-01-18T21:55:09.748Z"
+    });
+
+    let line: LogLine =
+        serde_json::from_value(json).expect("Should parse mcp_progress without elapsed_time");
+
+    match line {
+        LogLine::Progress(progress) => match progress.data {
+            ProgressData::McpProgress(data) => {
+                assert_eq!(data.status, "started");
+                assert_eq!(data.elapsed_time_ms, None);
+            }
+            _ => panic!("Expected McpProgress variant"),
+        },
+        _ => panic!("Expected Progress variant"),
+    }
+}
+
+#[test]
+fn test_parse_progress_with_agent_id() {
+    let json = serde_json::json!({
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.12",
+        "gitBranch": "main",
+        "agentId": "agent-123",
+        "slug": "test-slug",
+        "type": "progress",
+        "data": {
+            "type": "hook_progress",
+            "hookEvent": "PreToolUse",
+            "hookName": "PreToolUse:Bash",
+            "command": "test"
+        },
+        "toolUseID": "toolu_test",
+        "parentToolUseID": "toolu_parent",
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2026-01-18T21:54:19.450Z"
+    });
+
+    let line: LogLine =
+        serde_json::from_value(json).expect("Should parse progress with agent_id and slug");
+
+    match line {
+        LogLine::Progress(progress) => {
+            assert_eq!(progress.agent_id, Some("agent-123".to_string()));
+            assert_eq!(progress.slug, Some("test-slug".to_string()));
+        }
+        _ => panic!("Expected Progress variant"),
+    }
+}
+
+#[test]
+fn test_parse_progress_without_agent_id() {
+    let json = serde_json::json!({
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.12",
+        "gitBranch": "main",
+        "type": "progress",
+        "data": {
+            "type": "hook_progress",
+            "hookEvent": "PreToolUse",
+            "hookName": "PreToolUse:Bash",
+            "command": "test"
+        },
+        "toolUseID": "toolu_test",
+        "parentToolUseID": "toolu_parent",
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2026-01-18T21:54:19.450Z"
+    });
+
+    let line: LogLine =
+        serde_json::from_value(json).expect("Should parse progress without agent_id and slug");
+
+    match line {
+        LogLine::Progress(progress) => {
+            assert_eq!(progress.agent_id, None);
+            assert_eq!(progress.slug, None);
+        }
+        _ => panic!("Expected Progress variant"),
+    }
+}
+
+#[test]
+fn test_parse_nested_mcp_progress_in_agent() {
+    let json = serde_json::json!({
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.12",
+        "gitBranch": "main",
+        "type": "progress",
+        "data": {
+            "type": "agent_progress",
+            "message": {
+                "type": "user",
+                "timestamp": "2026-01-18T21:43:02.787Z",
+                "message": {"role": "user", "content": "test"},
+                "uuid": "550e8400-e29b-41d4-a716-446655440004"
+            },
+            "normalizedMessages": [
+                {
+                    "type": "progress",
+                    "data": {
+                        "type": "mcp_progress",
+                        "status": "completed",
+                        "serverName": "git-read-only",
+                        "toolName": "show",
+                        "elapsedTimeMs": 15
+                    },
+                    "toolUseID": "toolu_mcp",
+                    "parentToolUseID": "toolu_parent",
+                    "uuid": "550e8400-e29b-41d4-a716-446655440005",
+                    "timestamp": "2026-01-18T21:43:02.698Z"
+                }
+            ],
+            "prompt": "test prompt",
+            "agentId": "abc123"
+        },
+        "toolUseID": "toolu_test",
+        "parentToolUseID": "toolu_parent",
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2026-01-18T21:54:47.655Z"
+    });
+
+    let line: LogLine =
+        serde_json::from_value(json).expect("Should parse nested mcp_progress in agent");
+
+    match line {
+        LogLine::Progress(progress) => match progress.data {
+            ProgressData::AgentProgress(data) => {
+                assert_eq!(data.normalized_messages.len(), 1);
+                match &data.normalized_messages[0] {
+                    AgentProgressMessage::Progress { data, .. } => match data {
+                        NestedProgressData::McpProgress(mcp) => {
+                            assert_eq!(mcp.server_name, "git-read-only");
+                            assert_eq!(mcp.tool_name, "show");
+                            assert_eq!(mcp.elapsed_time_ms, Some(15));
+                        }
+                        _ => panic!("Expected McpProgress variant in NestedProgressData"),
+                    },
+                    _ => panic!("Expected Progress variant in AgentProgressMessage"),
+                }
+            }
+            _ => panic!("Expected AgentProgress variant"),
+        },
+        _ => panic!("Expected Progress variant"),
+    }
+}
+
+#[test]
+fn test_parse_microcompact_boundary() {
+    let json = serde_json::json!({
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.12",
+        "gitBranch": "HEAD",
+        "slug": "test-slug",
+        "type": "system",
+        "subtype": "microcompact_boundary",
+        "content": "Context microcompacted",
+        "isMeta": false,
+        "timestamp": "2026-01-18T23:44:09.153Z",
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "level": "info",
+        "microcompactMetadata": {
+            "trigger": "auto",
+            "preTokens": 58482,
+            "tokensSaved": 20010,
+            "compactedToolIds": ["toolu_01", "toolu_02"],
+            "clearedAttachmentUUIDs": []
+        }
+    });
+
+    let line: LogLine =
+        serde_json::from_value(json).expect("Failed to parse microcompact_boundary system message");
+
+    match line {
+        LogLine::System(SystemLogLine::MicrocompactBoundary(boundary)) => {
+            assert_eq!(boundary.content, "Context microcompacted");
+            assert_eq!(boundary.level, "info");
+            assert_eq!(boundary.microcompact_metadata.trigger, "auto");
+            assert_eq!(boundary.microcompact_metadata.pre_tokens, 58482);
+            assert_eq!(boundary.microcompact_metadata.tokens_saved, 20010);
+            assert_eq!(boundary.microcompact_metadata.compacted_tool_ids.len(), 2);
+            assert!(boundary
+                .microcompact_metadata
+                .cleared_attachment_uuids
+                .is_empty());
+        }
+        _ => panic!("Expected System(MicrocompactBoundary) variant"),
+    }
+}
+
+#[test]
+fn test_parse_microcompact_boundary_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.12",
+        "gitBranch": "HEAD",
+        "type": "system",
+        "subtype": "microcompact_boundary",
+        "content": "Context microcompacted",
+        "isMeta": false,
+        "timestamp": "2026-01-18T23:44:09.153Z",
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "level": "info",
+        "microcompactMetadata": {
+            "trigger": "auto",
+            "preTokens": 58482,
+            "tokensSaved": 20010,
+            "compactedToolIds": [],
+            "clearedAttachmentUUIDs": []
+        },
+        "extraField": "should be rejected"
+    });
+
+    let err_msg = serde_json::from_value::<LogLine>(json)
+        .expect_err("Should reject unknown fields in MicrocompactBoundary")
+        .to_string();
+    assert!(
+        err_msg.contains("unknown field") || err_msg.contains("extraField"),
+        "Error should mention unknown field, got: {}",
+        err_msg
+    );
+}
+
+#[test]
+fn test_parse_microcompact_metadata_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.12",
+        "gitBranch": "HEAD",
+        "type": "system",
+        "subtype": "microcompact_boundary",
+        "content": "Context microcompacted",
+        "isMeta": false,
+        "timestamp": "2026-01-18T23:44:09.153Z",
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "level": "info",
+        "microcompactMetadata": {
+            "trigger": "auto",
+            "preTokens": 58482,
+            "tokensSaved": 20010,
+            "compactedToolIds": [],
+            "clearedAttachmentUUIDs": [],
+            "extraField": "should be rejected"
+        }
+    });
+
+    let err_msg = serde_json::from_value::<LogLine>(json)
+        .expect_err("Should reject unknown fields in MicrocompactMetadata")
+        .to_string();
+    assert!(
+        err_msg.contains("unknown field") || err_msg.contains("extraField"),
+        "Error should mention unknown field, got: {}",
+        err_msg
+    );
+}
+
+#[test]
+fn test_parse_nested_hook_progress_in_agent() {
+    let json = serde_json::json!({
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.12",
+        "gitBranch": "main",
+        "type": "progress",
+        "data": {
+            "type": "agent_progress",
+            "message": {
+                "type": "user",
+                "message": {"role": "user", "content": "test"},
+                "uuid": "550e8400-e29b-41d4-a716-446655440003",
+                "timestamp": "2026-01-18T21:43:02.787Z"
+            },
+            "normalizedMessages": [{
+                "type": "progress",
+                "data": {
+                    "type": "hook_progress",
+                    "hookEvent": "PreToolUse",
+                    "hookName": "PreToolUse:Bash",
+                    "command": "moriarty hooks exec"
+                },
+                "toolUseID": "toolu_test",
+                "parentToolUseID": "toolu_parent",
+                "uuid": "550e8400-e29b-41d4-a716-446655440005",
+                "timestamp": "2026-01-18T21:43:02.698Z"
+            }],
+            "prompt": "test",
+            "agentId": "test"
+        },
+        "toolUseID": "agent_test",
+        "parentToolUseID": "toolu_parent",
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2026-01-18T21:54:47.655Z"
+    });
+
+    let line: LogLine =
+        serde_json::from_value(json).expect("Should parse nested hook_progress in agent");
+
+    match line {
+        LogLine::Progress(progress) => match progress.data {
+            ProgressData::AgentProgress(data) => {
+                assert_eq!(data.normalized_messages.len(), 1);
+                match &data.normalized_messages[0] {
+                    AgentProgressMessage::Progress { data, .. } => match data {
+                        NestedProgressData::HookProgress(hook) => {
+                            assert_eq!(hook.hook_event, "PreToolUse");
+                            assert_eq!(hook.hook_name, "PreToolUse:Bash");
+                            assert_eq!(hook.command, "moriarty hooks exec");
+                        }
+                        _ => panic!("Expected HookProgress variant in NestedProgressData"),
+                    },
+                    _ => panic!("Expected Progress variant in AgentProgressMessage"),
+                }
+            }
+            _ => panic!("Expected AgentProgress variant"),
+        },
+        _ => panic!("Expected Progress variant"),
+    }
+}
+
+#[test]
+fn test_parse_log_line_rejects_unknown_type() {
+    let json = serde_json::json!({
+        "type": "unknown_type",
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "1.0",
+        "gitBranch": "main",
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2025-01-01T00:00:00Z"
+    });
+
+    let err_msg = serde_json::from_value::<LogLine>(json)
+        .expect_err("Should reject unknown log line type")
+        .to_string();
+    assert!(
+        err_msg.contains("unknown variant")
+            || err_msg.contains("unknown_type")
+            || err_msg.contains("did not match any variant"),
+        "Error should mention unknown variant, got: {}",
+        err_msg
+    );
+}
+
+#[test]
+fn test_parse_system_log_line_rejects_unknown_subtype() {
+    let json = serde_json::json!({
+        "type": "system",
+        "subtype": "unknown_subtype",
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "1.0",
+        "gitBranch": "main",
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2025-01-01T00:00:00Z"
+    });
+
+    let err_msg = serde_json::from_value::<LogLine>(json)
+        .expect_err("Should reject unknown system log subtype")
+        .to_string();
+    assert!(
+        err_msg.contains("unknown variant")
+            || err_msg.contains("unknown_subtype")
+            || err_msg.contains("did not match any variant"),
+        "Error should mention unknown variant, got: {}",
+        err_msg
+    );
+}

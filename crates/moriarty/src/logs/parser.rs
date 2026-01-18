@@ -20,7 +20,156 @@ pub struct QueueOperation {
     pub session_id: String,
 }
 
+/// Progress events from Claude Code 2.1+.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct ProgressLogLine {
+    pub parent_uuid: Uuid,
+    pub is_sidechain: bool,
+    pub user_type: String,
+    pub cwd: String,
+    pub session_id: Uuid,
+    pub version: String,
+    pub git_branch: String,
+    /// Identifier for the agent/task that created this message. None for main conversation messages.
+    pub agent_id: Option<String>,
+    /// Session slug identifier (e.g., "noble-floating-lemon"). Added in Claude Code 2.0.51.
+    pub slug: Option<String>,
+    pub data: ProgressData,
+    #[serde(rename = "toolUseID")]
+    pub tool_use_id: String,
+    #[serde(rename = "parentToolUseID")]
+    pub parent_tool_use_id: String,
+    pub uuid: Uuid,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// Progress event data types.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(tag = "type")]
+#[serde(rename_all = "snake_case")]
+pub enum ProgressData {
+    HookProgress(HookProgressData),
+    McpProgress(McpProgressData),
+    BashProgress(BashProgressData),
+    AgentProgress(Box<AgentProgressData>),
+    WaitingForTask(WaitingForTaskData),
+}
+
+/// Hook progress event data for tracking hook execution.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct HookProgressData {
+    pub hook_event: String,
+    pub hook_name: String,
+    pub command: String,
+}
+
+/// MCP progress event data for tracking MCP tool execution.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct McpProgressData {
+    pub status: String,
+    pub server_name: String,
+    pub tool_name: String,
+    /// Elapsed time in milliseconds (present when status is "completed").
+    pub elapsed_time_ms: Option<u64>,
+}
+
+/// Bash command progress event data for tracking long-running shell commands.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct BashProgressData {
+    pub output: String,
+    pub full_output: String,
+    pub elapsed_time_seconds: u64,
+    pub total_lines: usize,
+}
+
+/// Agent progress event data for tracking sub-agent execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct AgentProgressData {
+    pub message: AgentProgressMessage,
+    pub normalized_messages: Vec<AgentProgressMessage>,
+    pub prompt: String,
+    pub agent_id: String,
+    /// Agent ID to resume from a previous execution.
+    pub resume: Option<String>,
+}
+
+/// Message wrapper used in agent progress events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(tag = "type")]
+pub enum AgentProgressMessage {
+    #[serde(rename = "user")]
+    #[serde(rename_all = "camelCase")]
+    User {
+        message: LogMessage,
+        uuid: Uuid,
+        timestamp: DateTime<Utc>,
+        /// Tool use result data, present when this is a tool result message.
+        tool_use_result: Option<serde_json::Value>,
+    },
+    #[serde(rename = "assistant")]
+    #[serde(rename_all = "camelCase")]
+    Assistant {
+        message: Box<AssistantLogMessage>,
+        request_id: String,
+        uuid: Uuid,
+        timestamp: DateTime<Utc>,
+    },
+    /// Progress message nested within agent progress.
+    #[serde(rename = "progress")]
+    #[serde(rename_all = "camelCase")]
+    Progress {
+        data: NestedProgressData,
+        #[serde(rename = "toolUseID")]
+        tool_use_id: String,
+        #[serde(rename = "parentToolUseID")]
+        parent_tool_use_id: String,
+        uuid: Uuid,
+        timestamp: DateTime<Utc>,
+    },
+    /// Attachment message containing hook execution results or failure details.
+    /// Uses serde_json::Value because attachment schemas vary by hook type.
+    #[serde(rename = "attachment")]
+    #[serde(rename_all = "camelCase")]
+    Attachment {
+        attachment: serde_json::Value,
+        uuid: Uuid,
+        timestamp: DateTime<Utc>,
+    },
+}
+
+/// Nested progress data within agent progress normalizedMessages.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(tag = "type")]
+#[serde(rename_all = "snake_case")]
+pub enum NestedProgressData {
+    HookProgress(HookProgressData),
+    McpProgress(McpProgressData),
+}
+
+/// Waiting for task progress data for tracking background task status.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct WaitingForTaskData {
+    pub task_description: String,
+    pub task_type: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[serde(tag = "type")]
 pub enum LogLine {
     #[serde(rename = "user")]
@@ -35,14 +184,18 @@ pub enum LogLine {
     System(SystemLogLine),
     #[serde(rename = "queue-operation")]
     QueueOperation(QueueOperation),
+    #[serde(rename = "progress")]
+    Progress(ProgressLogLine),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[serde(tag = "subtype")]
 #[serde(rename_all = "snake_case")]
 pub enum SystemLogLine {
     Error(SystemLogError),
     CompactBoundary(CompactBoundary),
+    MicrocompactBoundary(MicrocompactBoundary),
     Informational(SystemLogInformational),
     ApiError(SystemLogError),
     LocalCommand(LocalCommandLog),
@@ -239,6 +392,41 @@ pub struct CompactMetadata {
     pub pre_tokens: usize,
 }
 
+/// Microcompact boundary event from Claude Code 2.1.12+. Unlike full compaction, microcompaction
+/// selectively removes tool use content to reduce context size while preserving conversation flow.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct MicrocompactBoundary {
+    pub parent_uuid: Uuid,
+    pub is_sidechain: bool,
+    pub user_type: String,
+    pub cwd: String,
+    pub session_id: Uuid,
+    pub version: String,
+    pub git_branch: String,
+    /// Session slug identifier (e.g., "noble-floating-lemon"). Added in Claude Code 2.0.51.
+    pub slug: Option<String>,
+    pub content: String,
+    pub is_meta: bool,
+    pub timestamp: DateTime<Utc>,
+    pub uuid: Uuid,
+    pub level: String,
+    pub microcompact_metadata: MicrocompactMetadata,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct MicrocompactMetadata {
+    pub trigger: String,
+    pub pre_tokens: usize,
+    pub tokens_saved: usize,
+    pub compacted_tool_ids: Vec<String>,
+    #[serde(rename = "clearedAttachmentUUIDs")]
+    pub cleared_attachment_uuids: Vec<Uuid>,
+}
+
 /// Duration of a single turn (user message → assistant response cycle).
 /// Added in Claude Code 2.0.51+ for performance tracking.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -353,6 +541,7 @@ pub struct ThinkingMetadata {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ThinkingTrigger {
     pub start: usize,
     pub end: usize,
@@ -453,6 +642,8 @@ pub struct AssistantLogLine {
     pub uuid: Uuid,
     pub timestamp: DateTime<Utc>,
     pub is_api_error_message: Option<bool>,
+    /// Error type when this is an API error message (e.g., "invalid_request").
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

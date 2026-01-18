@@ -1,6 +1,6 @@
 use super::parser::{
-    AssistantLogLine, LogLine, LogMessageContent, LogMessageTaggedContent, SystemLogLine,
-    ToolResult, UserLogLine,
+    AssistantLogLine, LogLine, LogMessageContent, LogMessageTaggedContent, ProgressData,
+    ProgressLogLine, SystemLogLine, ToolResult, UserLogLine,
 };
 use chrono::{DateTime, Utc};
 
@@ -179,6 +179,15 @@ fn format_system_message(system: &SystemLogLine) -> String {
                 boundary.content
             )
         }
+        SystemLogLine::MicrocompactBoundary(boundary) => {
+            format!(
+                "📦 Microcompact Boundary\n   Trigger: {}\n   Pre-tokens: {}\n   Tokens saved: {}\n   {}\n",
+                boundary.microcompact_metadata.trigger,
+                boundary.microcompact_metadata.pre_tokens,
+                boundary.microcompact_metadata.tokens_saved,
+                boundary.content
+            )
+        }
         SystemLogLine::Informational(info) => {
             format!("ℹ️  System: {}\n", info.content)
         }
@@ -260,6 +269,46 @@ pub fn format_log_line(log_line: &LogLine) -> String {
                 format_timestamp(&queue_op.timestamp),
                 queue_op.session_id,
                 content
+            )
+        }
+        LogLine::Progress(progress) => format_progress(progress),
+    }
+}
+
+fn format_progress(progress: &ProgressLogLine) -> String {
+    match &progress.data {
+        ProgressData::HookProgress(data) => {
+            format!(
+                "⏳ Hook Progress: {} - {}\n   Command: {}\n",
+                data.hook_event, data.hook_name, data.command
+            )
+        }
+        ProgressData::McpProgress(data) => {
+            let elapsed = data
+                .elapsed_time_ms
+                .map(|ms| format!(" ({}ms)", ms))
+                .unwrap_or_default();
+            format!(
+                "⏳ MCP Progress: {} - {}/{}{}\n",
+                data.status, data.server_name, data.tool_name, elapsed
+            )
+        }
+        ProgressData::BashProgress(data) => {
+            format!(
+                "⏳ Bash Progress: {}s elapsed, {} lines\n   Output: {}\n",
+                data.elapsed_time_seconds, data.total_lines, data.output
+            )
+        }
+        ProgressData::AgentProgress(data) => {
+            format!(
+                "⏳ Agent Progress: {}\n   Prompt: {}\n",
+                data.agent_id, data.prompt
+            )
+        }
+        ProgressData::WaitingForTask(data) => {
+            format!(
+                "⏳ Waiting for Task: {} ({})\n",
+                data.task_description, data.task_type
             )
         }
     }
@@ -344,6 +393,7 @@ mod tests {
             uuid: Uuid::new_v4(),
             timestamp: Utc::now(),
             is_api_error_message: None,
+            error: None,
         }
     }
 
