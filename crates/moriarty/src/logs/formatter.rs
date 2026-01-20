@@ -311,6 +311,15 @@ fn format_progress(progress: &ProgressLogLine) -> String {
                 data.task_description, data.task_type
             )
         }
+        ProgressData::QueryUpdate(data) => {
+            format!("⏳ Query Update: {}\n", data.query)
+        }
+        ProgressData::SearchResultsReceived(data) => {
+            format!(
+                "⏳ Search Results Received: {} ({} results)\n",
+                data.query, data.result_count
+            )
+        }
     }
 }
 
@@ -321,8 +330,8 @@ mod tests {
         AssistantCacheCreation, AssistantLogLine, AssistantLogMessage, AssistantUsage,
         CompactBoundary, CompactMetadata, DocumentSource, FileHistorySnapshot,
         FileHistorySnapshotSnapshot, LocalCommandLog, LogMessage, LogMessageContent,
-        LogMessageTaggedContent, Summary, SystemLogError, SystemLogErrorError,
-        SystemLogInformational, SystemLogLine, ToolResult,
+        LogMessageTaggedContent, QueryUpdateData, SearchResultsReceivedData, Summary,
+        SystemLogError, SystemLogErrorError, SystemLogInformational, SystemLogLine, ToolResult,
     };
     use chrono::Utc;
     use std::collections::HashMap;
@@ -1007,5 +1016,59 @@ mod tests {
         let result = format_system_message(&system);
         assert!(result.contains("Prevented continuation"));
         assert!(result.contains("no reason provided"));
+    }
+
+    #[test]
+    fn test_format_progress_query_update() {
+        let progress = ProgressLogLine {
+            parent_uuid: Uuid::new_v4(),
+            is_sidechain: false,
+            user_type: "test".to_string(),
+            cwd: "/test".to_string(),
+            session_id: Uuid::new_v4(),
+            version: "1.0.0".to_string(),
+            git_branch: "main".to_string(),
+            agent_id: None,
+            slug: None,
+            data: ProgressData::QueryUpdate(QueryUpdateData {
+                query: "test search query".to_string(),
+            }),
+            tool_use_id: "toolu_test".to_string(),
+            parent_tool_use_id: "toolu_parent".to_string(),
+            uuid: Uuid::new_v4(),
+            timestamp: Utc::now(),
+        };
+
+        let result = format_progress(&progress);
+        assert!(result.contains("Query Update"));
+        assert!(result.contains("test search query"));
+    }
+
+    #[test]
+    fn test_format_progress_search_results_received() {
+        let progress = ProgressLogLine {
+            parent_uuid: Uuid::new_v4(),
+            is_sidechain: false,
+            user_type: "test".to_string(),
+            cwd: "/test".to_string(),
+            session_id: Uuid::new_v4(),
+            version: "1.0.0".to_string(),
+            git_branch: "main".to_string(),
+            agent_id: None,
+            slug: None,
+            data: ProgressData::SearchResultsReceived(SearchResultsReceivedData {
+                result_count: 7,
+                query: "rust async await".to_string(),
+            }),
+            tool_use_id: "toolu_test".to_string(),
+            parent_tool_use_id: "toolu_parent".to_string(),
+            uuid: Uuid::new_v4(),
+            timestamp: Utc::now(),
+        };
+
+        let result = format_progress(&progress);
+        assert!(result.contains("Search Results Received"));
+        assert!(result.contains("rust async await"));
+        assert!(result.contains("7 results"));
     }
 }

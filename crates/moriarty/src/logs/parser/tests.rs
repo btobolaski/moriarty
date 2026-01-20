@@ -1442,6 +1442,43 @@ fn test_parse_progress_waiting_for_task() {
 }
 
 #[test]
+fn test_parse_progress_query_update() {
+    let json = serde_json::json!({
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.12",
+        "gitBranch": "main",
+        "type": "progress",
+        "data": {
+            "type": "query_update",
+            "query": "rust fs-err crate lock unlock file documentation 2026"
+        },
+        "toolUseID": "query-update-id",
+        "parentToolUseID": "toolu_parent",
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2026-01-18T22:17:23.813Z"
+    });
+
+    let line: LogLine = serde_json::from_value(json).expect("Failed to parse query_update");
+
+    match line {
+        LogLine::Progress(progress) => match progress.data {
+            ProgressData::QueryUpdate(data) => {
+                assert_eq!(
+                    data.query,
+                    "rust fs-err crate lock unlock file documentation 2026"
+                );
+            }
+            _ => panic!("Expected QueryUpdate variant"),
+        },
+        _ => panic!("Expected Progress variant"),
+    }
+}
+
+#[test]
 fn test_parse_progress_rejects_unknown_fields() {
     let json = serde_json::json!({
         "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
@@ -1604,6 +1641,38 @@ fn test_parse_waiting_for_task_data_rejects_unknown_fields() {
 
     let err_msg = serde_json::from_value::<LogLine>(json)
         .expect_err("Should reject unknown fields in WaitingForTaskData")
+        .to_string();
+    assert!(
+        err_msg.contains("unknown field") || err_msg.contains("extraField"),
+        "Error should mention unknown field, got: {}",
+        err_msg
+    );
+}
+
+#[test]
+fn test_parse_query_update_data_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.12",
+        "gitBranch": "main",
+        "type": "progress",
+        "data": {
+            "type": "query_update",
+            "query": "test query",
+            "extraField": "should be rejected"
+        },
+        "toolUseID": "toolu_test",
+        "parentToolUseID": "toolu_parent",
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2026-01-18T22:17:23.813Z"
+    });
+
+    let err_msg = serde_json::from_value::<LogLine>(json)
+        .expect_err("Should reject unknown fields in QueryUpdateData")
         .to_string();
     assert!(
         err_msg.contains("unknown field") || err_msg.contains("extraField"),
@@ -2273,6 +2342,76 @@ fn test_parse_nested_hook_progress_in_agent() {
 }
 
 #[test]
+fn test_parse_nested_bash_progress_in_agent() {
+    let json = serde_json::json!({
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.12",
+        "gitBranch": "main",
+        "agentId": "agent-123",
+        "slug": "test-slug",
+        "type": "progress",
+        "data": {
+            "type": "agent_progress",
+            "message": {
+                "type": "user",
+                "message": {"role": "user", "content": "test"},
+                "uuid": "550e8400-e29b-41d4-a716-446655440001",
+                "timestamp": "2026-01-18T21:43:02.787Z"
+            },
+            "normalizedMessages": [{
+                "type": "progress",
+                "data": {
+                    "type": "bash_progress",
+                    "output": "Running command...",
+                    "fullOutput": "Running command...\nDone!",
+                    "elapsedTimeSeconds": 5,
+                    "totalLines": 2
+                },
+                "toolUseID": "toolu_test",
+                "parentToolUseID": "toolu_parent",
+                "uuid": "550e8400-e29b-41d4-a716-446655440003",
+                "timestamp": "2026-01-18T21:43:10.123Z"
+            }],
+            "prompt": "test prompt",
+            "agentId": "agent-123"
+        },
+        "toolUseID": "agent_test",
+        "parentToolUseID": "toolu_parent",
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2026-01-18T21:54:47.655Z"
+    });
+
+    let line: LogLine =
+        serde_json::from_value(json).expect("Should parse nested bash_progress in agent");
+
+    match line {
+        LogLine::Progress(progress) => match progress.data {
+            ProgressData::AgentProgress(data) => {
+                assert_eq!(data.normalized_messages.len(), 1);
+                match &data.normalized_messages[0] {
+                    AgentProgressMessage::Progress { data, .. } => match data {
+                        NestedProgressData::BashProgress(bash) => {
+                            assert_eq!(bash.output, "Running command...");
+                            assert_eq!(bash.full_output, "Running command...\nDone!");
+                            assert_eq!(bash.elapsed_time_seconds, 5);
+                            assert_eq!(bash.total_lines, 2);
+                        }
+                        _ => panic!("Expected BashProgress variant in NestedProgressData"),
+                    },
+                    _ => panic!("Expected Progress variant in AgentProgressMessage"),
+                }
+            }
+            _ => panic!("Expected AgentProgress variant"),
+        },
+        _ => panic!("Expected Progress variant"),
+    }
+}
+
+#[test]
 fn test_parse_log_line_rejects_unknown_type() {
     let json = serde_json::json!({
         "type": "unknown_type",
@@ -2325,4 +2464,238 @@ fn test_parse_system_log_line_rejects_unknown_subtype() {
         "Error should mention unknown variant, got: {}",
         err_msg
     );
+}
+
+#[test]
+fn test_parse_progress_search_results_received() {
+    let json = serde_json::json!({
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.12",
+        "gitBranch": "main",
+        "type": "progress",
+        "data": {
+            "type": "search_results_received",
+            "resultCount": 5,
+            "query": "rust testing best practices"
+        },
+        "toolUseID": "search-results-id",
+        "parentToolUseID": "toolu_parent",
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2026-01-18T22:17:23.813Z"
+    });
+
+    let line: LogLine =
+        serde_json::from_value(json).expect("Failed to parse search_results_received");
+
+    match line {
+        LogLine::Progress(progress) => match progress.data {
+            ProgressData::SearchResultsReceived(data) => {
+                assert_eq!(data.result_count, 5);
+                assert_eq!(data.query, "rust testing best practices");
+            }
+            _ => panic!("Expected SearchResultsReceived variant"),
+        },
+        _ => panic!("Expected Progress variant"),
+    }
+}
+
+#[test]
+fn test_parse_search_results_received_data_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.12",
+        "gitBranch": "main",
+        "type": "progress",
+        "data": {
+            "type": "search_results_received",
+            "resultCount": 3,
+            "query": "test query",
+            "extraField": "should be rejected"
+        },
+        "toolUseID": "toolu_test",
+        "parentToolUseID": "toolu_parent",
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2026-01-18T22:17:23.813Z"
+    });
+
+    let err_msg = serde_json::from_value::<LogLine>(json)
+        .expect_err("Should reject unknown fields in SearchResultsReceivedData")
+        .to_string();
+    assert!(
+        err_msg.contains("unknown field") || err_msg.contains("extraField"),
+        "Error should mention unknown field, got: {}",
+        err_msg
+    );
+}
+
+#[test]
+fn test_parse_search_results_received_zero_results() {
+    let json = serde_json::json!({
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.12",
+        "gitBranch": "main",
+        "type": "progress",
+        "data": {
+            "type": "search_results_received",
+            "resultCount": 0,
+            "query": "nonexistent topic xyz123"
+        },
+        "toolUseID": "search-id",
+        "parentToolUseID": "toolu_parent",
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2026-01-18T22:17:23.813Z"
+    });
+
+    let line: LogLine = serde_json::from_value(json).unwrap();
+    match line {
+        LogLine::Progress(progress) => match progress.data {
+            ProgressData::SearchResultsReceived(data) => {
+                assert_eq!(data.result_count, 0);
+            }
+            _ => panic!("Expected SearchResultsReceived variant"),
+        },
+        _ => panic!("Expected Progress variant"),
+    }
+}
+
+#[test]
+fn test_parse_nested_query_update_in_agent() {
+    let json = serde_json::json!({
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.12",
+        "gitBranch": "main",
+        "agentId": "agent-123",
+        "slug": "test-slug",
+        "type": "progress",
+        "data": {
+            "type": "agent_progress",
+            "message": {
+                "type": "user",
+                "message": {"role": "user", "content": "test"},
+                "uuid": "550e8400-e29b-41d4-a716-446655440001",
+                "timestamp": "2026-01-18T21:43:02.787Z"
+            },
+            "normalizedMessages": [{
+                "type": "progress",
+                "data": {
+                    "type": "query_update",
+                    "query": "rust async patterns 2026"
+                },
+                "toolUseID": "toolu_query",
+                "parentToolUseID": "toolu_parent",
+                "uuid": "550e8400-e29b-41d4-a716-446655440003",
+                "timestamp": "2026-01-18T21:43:10.123Z"
+            }],
+            "prompt": "test prompt",
+            "agentId": "agent-123"
+        },
+        "toolUseID": "agent_test",
+        "parentToolUseID": "toolu_parent",
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2026-01-18T21:54:47.655Z"
+    });
+
+    let line: LogLine =
+        serde_json::from_value(json).expect("Should parse nested query_update in agent");
+
+    match line {
+        LogLine::Progress(progress) => match progress.data {
+            ProgressData::AgentProgress(data) => {
+                assert_eq!(data.normalized_messages.len(), 1);
+                match &data.normalized_messages[0] {
+                    AgentProgressMessage::Progress { data, .. } => match data {
+                        NestedProgressData::QueryUpdate(query) => {
+                            assert_eq!(query.query, "rust async patterns 2026");
+                        }
+                        _ => panic!("Expected QueryUpdate variant in NestedProgressData"),
+                    },
+                    _ => panic!("Expected Progress variant in AgentProgressMessage"),
+                }
+            }
+            _ => panic!("Expected AgentProgress variant"),
+        },
+        _ => panic!("Expected Progress variant"),
+    }
+}
+
+#[test]
+fn test_parse_nested_search_results_received_in_agent() {
+    let json = serde_json::json!({
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.12",
+        "gitBranch": "main",
+        "agentId": "agent-123",
+        "slug": "test-slug",
+        "type": "progress",
+        "data": {
+            "type": "agent_progress",
+            "message": {
+                "type": "user",
+                "message": {"role": "user", "content": "test"},
+                "uuid": "550e8400-e29b-41d4-a716-446655440001",
+                "timestamp": "2026-01-18T21:43:02.787Z"
+            },
+            "normalizedMessages": [{
+                "type": "progress",
+                "data": {
+                    "type": "search_results_received",
+                    "resultCount": 8,
+                    "query": "rust testing frameworks"
+                },
+                "toolUseID": "toolu_search",
+                "parentToolUseID": "toolu_parent",
+                "uuid": "550e8400-e29b-41d4-a716-446655440003",
+                "timestamp": "2026-01-18T21:43:15.456Z"
+            }],
+            "prompt": "test prompt",
+            "agentId": "agent-123"
+        },
+        "toolUseID": "agent_test",
+        "parentToolUseID": "toolu_parent",
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2026-01-18T21:54:47.655Z"
+    });
+
+    let line: LogLine =
+        serde_json::from_value(json).expect("Should parse nested search_results_received in agent");
+
+    match line {
+        LogLine::Progress(progress) => match progress.data {
+            ProgressData::AgentProgress(data) => {
+                assert_eq!(data.normalized_messages.len(), 1);
+                match &data.normalized_messages[0] {
+                    AgentProgressMessage::Progress { data, .. } => match data {
+                        NestedProgressData::SearchResultsReceived(search) => {
+                            assert_eq!(search.result_count, 8);
+                            assert_eq!(search.query, "rust testing frameworks");
+                        }
+                        _ => panic!("Expected SearchResultsReceived variant in NestedProgressData"),
+                    },
+                    _ => panic!("Expected Progress variant in AgentProgressMessage"),
+                }
+            }
+            _ => panic!("Expected AgentProgress variant"),
+        },
+        _ => panic!("Expected Progress variant"),
+    }
 }

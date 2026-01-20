@@ -56,6 +56,8 @@ pub enum ProgressData {
     BashProgress(BashProgressData),
     AgentProgress(Box<AgentProgressData>),
     WaitingForTask(WaitingForTaskData),
+    QueryUpdate(QueryUpdateData),
+    SearchResultsReceived(SearchResultsReceivedData),
 }
 
 /// Hook progress event data for tracking hook execution.
@@ -157,6 +159,9 @@ pub enum AgentProgressMessage {
 pub enum NestedProgressData {
     HookProgress(HookProgressData),
     McpProgress(McpProgressData),
+    BashProgress(BashProgressData),
+    QueryUpdate(QueryUpdateData),
+    SearchResultsReceived(SearchResultsReceivedData),
 }
 
 /// Waiting for task progress data for tracking background task status.
@@ -166,6 +171,25 @@ pub enum NestedProgressData {
 pub struct WaitingForTaskData {
     pub task_description: String,
     pub task_type: String,
+}
+
+/// Emitted by Claude Code during web searches when the search query is refined or updated.
+/// Allows tracking query evolution during agent research phases.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct QueryUpdateData {
+    pub query: String,
+}
+
+/// Emitted by Claude Code when web search results are received from the search backend.
+/// Includes result count to track search effectiveness and query quality.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct SearchResultsReceivedData {
+    pub result_count: u32,
+    pub query: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
