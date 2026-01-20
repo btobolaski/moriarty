@@ -772,12 +772,11 @@ pub fn aggregate_by_session(
     session_usage
 }
 
-/// Parse log file contents (from string) and extract token usage
-///
-/// Synchronous version of parse_log_file that works with pre-loaded file contents.
-/// Used for parallel file processing with rayon.
+/// Accepts pre-loaded contents to avoid file I/O within rayon parallel contexts,
+/// preventing worker thread starvation.
 fn parse_log_content(
     contents: &str,
+    file_path: &Path,
     timezone: DateTimezone,
     filter: &TimeRangeFilter,
 ) -> miette::Result<Vec<DateBasedMessage>> {
@@ -785,7 +784,15 @@ fn parse_log_content(
     let log_lines: Vec<LogLine> = contents
         .split('\n')
         .filter(|line| !line.is_empty())
-        .map(|line| serde_json::from_str::<LogLine>(line).inspect_err(|_| println!("{line}")))
+        .map(|line| {
+            serde_json::from_str::<LogLine>(line).inspect_err(|e| {
+                eprintln!(
+                    "Error parsing file {}: {}\nLine: {line}",
+                    file_path.display(),
+                    e
+                )
+            })
+        })
         .collect::<Result<Vec<_>, _>>()
         .into_diagnostic()?;
 
@@ -837,12 +844,11 @@ fn parse_log_content(
     Ok(usages)
 }
 
-/// Parse log file contents (from string) and extract lines changed
-///
-/// Synchronous version of parse_lines_changed that works with pre-loaded file contents.
-/// Used for parallel file processing with rayon.
+/// Accepts pre-loaded contents to avoid file I/O within rayon parallel contexts,
+/// preventing worker thread starvation.
 fn parse_lines_changed_content(
     contents: &str,
+    file_path: &Path,
     timezone: DateTimezone,
     filter: &TimeRangeFilter,
 ) -> miette::Result<Vec<(NaiveDate, usize)>> {
@@ -850,7 +856,15 @@ fn parse_lines_changed_content(
     let log_lines: Vec<LogLine> = contents
         .split('\n')
         .filter(|line| !line.is_empty())
-        .map(|line| serde_json::from_str::<LogLine>(line).inspect_err(|_| println!("{line}")))
+        .map(|line| {
+            serde_json::from_str::<LogLine>(line).inspect_err(|e| {
+                eprintln!(
+                    "Error parsing file {}: {}\nLine: {line}",
+                    file_path.display(),
+                    e
+                )
+            })
+        })
         .collect::<Result<Vec<_>, _>>()
         .into_diagnostic()?;
 
@@ -887,19 +901,26 @@ fn parse_lines_changed_content(
     Ok(results)
 }
 
-/// Parse log file contents (from string) and extract token usage by session
-///
-/// Synchronous version of parse_log_file_by_session that works with pre-loaded file contents.
-/// Used for parallel file processing with rayon.
+/// Accepts pre-loaded contents to avoid file I/O within rayon parallel contexts,
+/// preventing worker thread starvation.
 fn parse_log_content_by_session(
     contents: &str,
+    file_path: &Path,
     filter: &TimeRangeFilter,
 ) -> miette::Result<Vec<SessionBasedMessage>> {
     // Parse lines sequentially from the string contents
     let log_lines: Vec<LogLine> = contents
         .split('\n')
         .filter(|line| !line.is_empty())
-        .map(|line| serde_json::from_str::<LogLine>(line).inspect_err(|_| println!("{line}")))
+        .map(|line| {
+            serde_json::from_str::<LogLine>(line).inspect_err(|e| {
+                eprintln!(
+                    "Error parsing file {}: {}\nLine: {line}",
+                    file_path.display(),
+                    e
+                )
+            })
+        })
         .collect::<Result<Vec<_>, _>>()
         .into_diagnostic()?;
 
@@ -952,19 +973,26 @@ fn parse_log_content_by_session(
     Ok(usages)
 }
 
-/// Parse log file contents (from string) and extract lines changed by session
-///
-/// Synchronous version of parse_lines_changed_by_session that works with pre-loaded file contents.
-/// Used for parallel file processing with rayon.
+/// Accepts pre-loaded contents to avoid file I/O within rayon parallel contexts,
+/// preventing worker thread starvation.
 fn parse_lines_changed_content_by_session(
     contents: &str,
+    file_path: &Path,
     filter: &TimeRangeFilter,
 ) -> miette::Result<Vec<(String, DateTime<Utc>, usize)>> {
     // Parse lines sequentially from the string contents
     let log_lines: Vec<LogLine> = contents
         .split('\n')
         .filter(|line| !line.is_empty())
-        .map(|line| serde_json::from_str::<LogLine>(line).inspect_err(|_| println!("{line}")))
+        .map(|line| {
+            serde_json::from_str::<LogLine>(line).inspect_err(|e| {
+                eprintln!(
+                    "Error parsing file {}: {}\nLine: {line}",
+                    file_path.display(),
+                    e
+                )
+            })
+        })
         .collect::<Result<Vec<_>, _>>()
         .into_diagnostic()?;
 
@@ -1041,14 +1069,14 @@ fn parse_files_parallel<UsageType, LinesType, FUsage, FLines>(
 where
     UsageType: Send,
     LinesType: Send,
-    FUsage: Fn(&str) -> miette::Result<Vec<UsageType>> + Sync,
-    FLines: Fn(&str) -> miette::Result<Vec<LinesType>> + Sync,
+    FUsage: Fn(&str, &Path) -> miette::Result<Vec<UsageType>> + Sync,
+    FLines: Fn(&str, &Path) -> miette::Result<Vec<LinesType>> + Sync,
 {
     let parse_results: Vec<_> = file_contents
         .par_iter()
         .map(|(path, contents)| {
-            let usage_result = parse_usage(contents);
-            let lines_result = parse_lines(contents);
+            let usage_result = parse_usage(contents, path);
+            let lines_result = parse_lines(contents, path);
             (path.clone(), usage_result, lines_result)
         })
         .collect();
@@ -1103,8 +1131,8 @@ pub async fn analyze_directory(
     // Step 2: Parse files in parallel using rayon
     let (all_usages, all_lines_changed, files_parsed, parse_failed) = parse_files_parallel(
         file_contents,
-        |contents| parse_log_content(contents, timezone, filter),
-        |contents| parse_lines_changed_content(contents, timezone, filter),
+        |contents, path| parse_log_content(contents, path, timezone, filter),
+        |contents, path| parse_lines_changed_content(contents, path, timezone, filter),
     );
 
     files_failed += parse_failed;
@@ -1161,8 +1189,8 @@ pub async fn analyze_directory_by_session(
     // Step 2: Parse files in parallel using rayon
     let (all_usages, all_lines_changed, files_parsed, parse_failed) = parse_files_parallel(
         file_contents,
-        |contents| parse_log_content_by_session(contents, filter),
-        |contents| parse_lines_changed_content_by_session(contents, filter),
+        |contents, path| parse_log_content_by_session(contents, path, filter),
+        |contents, path| parse_lines_changed_content_by_session(contents, path, filter),
     );
 
     files_failed += parse_failed;
