@@ -302,6 +302,7 @@ mod tests {
                     output_tokens: 0,
                     service_tier: None,
                     server_tool_use: None,
+                    inference_geo: None,
                 },
                 context_management: None,
             },

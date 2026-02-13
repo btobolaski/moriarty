@@ -2699,3 +2699,232 @@ fn test_parse_nested_search_results_received_in_agent() {
         _ => panic!("Expected Progress variant"),
     }
 }
+
+#[test]
+fn test_parse_assistant_usage_with_inference_geo() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "test-session",
+        "version": "2.1.12",
+        "gitBranch": "main",
+        "message": {
+            "id": "msg-1",
+            "type": "message",
+            "role": "assistant",
+            "content": "response",
+            "model": "claude-3-5-sonnet",
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 100,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": 0,
+                    "ephemeral_1h_input_tokens": 0
+                },
+                "output_tokens": 50,
+                "inference_geo": "us-east-1"
+            }
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2025-01-01T00:00:00Z"
+    });
+    let line: AssistantLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(
+        line.message.usage.inference_geo,
+        Some("us-east-1".to_string())
+    );
+}
+
+#[test]
+fn test_parse_assistant_usage_with_null_inference_geo() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "test-session",
+        "version": "2.1.12",
+        "gitBranch": "main",
+        "message": {
+            "id": "msg-1",
+            "type": "message",
+            "role": "assistant",
+            "content": "response",
+            "model": "claude-3-5-sonnet",
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 100,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": 0,
+                    "ephemeral_1h_input_tokens": 0
+                },
+                "output_tokens": 50,
+                "inference_geo": null
+            }
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2025-01-01T00:00:00Z"
+    });
+    let line: AssistantLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(line.message.usage.inference_geo, None);
+}
+
+#[test]
+fn test_parse_assistant_usage_without_inference_geo() {
+    // Documents backward compatibility - older logs won't have this field
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "test-session",
+        "version": "1.0",
+        "gitBranch": "main",
+        "message": {
+            "id": "msg-1",
+            "type": "message",
+            "role": "assistant",
+            "content": "response",
+            "model": "claude-3-5-sonnet",
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 100,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": 0,
+                    "ephemeral_1h_input_tokens": 0
+                },
+                "output_tokens": 50
+            }
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2025-01-01T00:00:00Z"
+    });
+    let line: AssistantLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(line.message.usage.inference_geo, None);
+}
+
+#[test]
+fn test_parse_assistant_usage_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "test-session",
+        "version": "1.0",
+        "gitBranch": "main",
+        "message": {
+            "id": "msg-1",
+            "type": "message",
+            "role": "assistant",
+            "content": "response",
+            "model": "claude-3-5-sonnet",
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 100,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": 0,
+                    "ephemeral_1h_input_tokens": 0
+                },
+                "output_tokens": 50,
+                "unknown_field": "should fail"
+            }
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2025-01-01T00:00:00Z"
+    });
+
+    let err_msg = serde_json::from_value::<AssistantLogLine>(json)
+        .expect_err("Should reject unknown fields due to deny_unknown_fields")
+        .to_string();
+    assert!(
+        err_msg.contains("unknown field") || err_msg.contains("unknown_field"),
+        "Error should mention unknown field, got: {}",
+        err_msg
+    );
+}
+
+#[test]
+fn test_parse_tool_use_with_caller() {
+    let json = serde_json::json!({
+        "type": "tool_use",
+        "id": "toolu_123",
+        "name": "Bash",
+        "input": {"command": "ls -la"},
+        "caller": {"type": "direct"}
+    });
+    let content: LogMessageTaggedContent = serde_json::from_value(json).unwrap();
+
+    match content {
+        LogMessageTaggedContent::ToolUse {
+            id,
+            name,
+            input,
+            caller,
+        } => {
+            assert_eq!(id, "toolu_123");
+            assert_eq!(name, "Bash");
+            assert_eq!(input.get("command").unwrap(), "ls -la");
+            let caller = caller.expect("caller should be present");
+            assert_eq!(caller.r#type, "direct");
+        }
+        _ => panic!("Expected ToolUse variant"),
+    }
+}
+
+#[test]
+fn test_parse_tool_use_without_caller() {
+    // Documents backward compatibility - older logs won't have this field
+    let json = serde_json::json!({
+        "type": "tool_use",
+        "id": "toolu_456",
+        "name": "Read",
+        "input": {"file_path": "/tmp/test.txt"}
+    });
+    let content: LogMessageTaggedContent = serde_json::from_value(json).unwrap();
+
+    match content {
+        LogMessageTaggedContent::ToolUse {
+            id,
+            name,
+            input,
+            caller,
+        } => {
+            assert_eq!(id, "toolu_456");
+            assert_eq!(name, "Read");
+            assert_eq!(input.get("file_path").unwrap(), "/tmp/test.txt");
+            assert!(caller.is_none(), "caller should be None for older logs");
+        }
+        _ => panic!("Expected ToolUse variant"),
+    }
+}
+
+#[test]
+fn test_parse_tool_use_caller_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "type": "tool_use",
+        "id": "toolu_789",
+        "name": "Bash",
+        "input": {},
+        "caller": {"type": "direct", "unknown_field": "should fail"}
+    });
+
+    let err_msg = serde_json::from_value::<LogMessageTaggedContent>(json)
+        .expect_err("Should reject unknown fields due to deny_unknown_fields")
+        .to_string();
+    assert!(
+        err_msg.contains("unknown field") || err_msg.contains("unknown_field"),
+        "Error should mention unknown field, got: {}",
+        err_msg
+    );
+}

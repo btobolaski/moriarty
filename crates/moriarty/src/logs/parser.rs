@@ -612,11 +612,21 @@ pub enum LogMessageTaggedContent {
         id: String,
         name: String,
         input: HashMap<String, serde_json::Value>,
+        /// Caller information for tool invocation tracking. Added in Claude Code 2.1.12+.
+        caller: Option<ToolUseCaller>,
     },
     ToolResult(ToolResult),
     Document {
         source: DocumentSource,
     },
+}
+
+/// Caller information for tool use tracking. Added in Claude Code 2.1.12+.
+/// Indicates how the tool was invoked (directly by the agent or through another mechanism).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolUseCaller {
+    pub r#type: String,
 }
 
 /// Represents a document attached to a message (e.g., PDF, image, text file)
@@ -695,6 +705,8 @@ pub struct AssistantUsage {
     pub output_tokens: usize,
     pub service_tier: Option<String>,
     pub server_tool_use: Option<ServerToolUse>,
+    /// Geographic region where inference was performed. Added in Claude Code 2.1.12+.
+    pub inference_geo: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]

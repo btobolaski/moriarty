@@ -26,7 +26,7 @@ fn format_message_content(content: &LogMessageContent) -> String {
                         output.push_str(thinking);
                         output.push_str("\n\n");
                     }
-                    LogMessageTaggedContent::ToolUse { id, name, input } => {
+                    LogMessageTaggedContent::ToolUse { id, name, input, .. } => {
                         output.push_str(&format!("🔧 Tool Use: {}\n", name));
                         output.push_str(&format!("   ID: {}\n", id));
                         if !input.is_empty() {
@@ -395,6 +395,7 @@ mod tests {
                     output_tokens: 20,
                     service_tier: None,
                     server_tool_use: None,
+                    inference_geo: None,
                 },
                 context_management: None,
             },
@@ -448,6 +449,7 @@ mod tests {
                 id: "tool_1".to_string(),
                 name: "TestTool".to_string(),
                 input,
+                caller: None,
             },
         ]));
         let result = format_user_message(&user);
