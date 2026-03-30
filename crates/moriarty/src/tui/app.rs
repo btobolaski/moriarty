@@ -243,6 +243,9 @@ mod tests {
             is_compact_summary: None,
             todos: None,
             source_tool_assistant_uuid: None,
+            prompt_id: None,
+            permission_mode: None,
+            plan_content: None,
         })
     }
 

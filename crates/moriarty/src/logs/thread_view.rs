@@ -267,12 +267,15 @@ mod tests {
             is_compact_summary: None,
             todos: None,
             source_tool_assistant_uuid: None,
+            prompt_id: None,
+            permission_mode: None,
+            plan_content: None,
         })
     }
 
     /// Helper to create a minimal AssistantLogLine for testing
     fn create_test_assistant_message(text: &str) -> LogLine {
-        LogLine::Assistant(AssistantLogLine {
+        LogLine::Assistant(Box::new(AssistantLogLine {
             parent_uuid: None,
             is_sidechain: false,
             agent_id: None,
@@ -291,6 +294,7 @@ mod tests {
                 content: LogMessageContent::String(text.to_string()),
                 stop_reason: None,
                 stop_sequence: None,
+                stop_details: None,
                 usage: AssistantUsage {
                     input_tokens: 0,
                     cache_creation_input_tokens: 0,
@@ -303,6 +307,8 @@ mod tests {
                     service_tier: None,
                     server_tool_use: None,
                     inference_geo: None,
+                    iterations: None,
+                    speed: None,
                 },
                 context_management: None,
             },
@@ -311,7 +317,7 @@ mod tests {
             timestamp: Utc::now(),
             is_api_error_message: None,
             error: None,
-        })
+        }))
     }
 
     #[test]

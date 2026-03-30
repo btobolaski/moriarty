@@ -99,7 +99,7 @@ pub struct BashProgressData {
 #[serde(deny_unknown_fields)]
 pub struct AgentProgressData {
     pub message: AgentProgressMessage,
-    pub normalized_messages: Vec<AgentProgressMessage>,
+    pub normalized_messages: Option<Vec<AgentProgressMessage>>,
     pub prompt: String,
     pub agent_id: String,
     /// Agent ID to resume from a previous execution.
@@ -199,7 +199,7 @@ pub enum LogLine {
     #[serde(rename = "user")]
     User(UserLogLine),
     #[serde(rename = "assistant")]
-    Assistant(AssistantLogLine),
+    Assistant(Box<AssistantLogLine>),
     #[serde(rename = "file-history-snapshot")]
     FileHistorySnapshot(FileHistorySnapshot),
     #[serde(rename = "summary")]
@@ -210,6 +210,36 @@ pub enum LogLine {
     QueueOperation(QueueOperation),
     #[serde(rename = "progress")]
     Progress(ProgressLogLine),
+    #[serde(rename = "custom-title")]
+    CustomTitle(CustomTitle),
+    #[serde(rename = "agent-name")]
+    AgentName(AgentName),
+    #[serde(rename = "last-prompt")]
+    LastPrompt(LastPrompt),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct CustomTitle {
+    pub custom_title: String,
+    pub session_id: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct AgentName {
+    pub agent_name: String,
+    pub session_id: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct LastPrompt {
+    pub last_prompt: String,
+    pub session_id: Uuid,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -278,6 +308,7 @@ pub struct StopHookSummary {
 #[serde(deny_unknown_fields)]
 pub struct HookInfo {
     pub command: String,
+    pub duration_ms: Option<u64>,
 }
 
 /// Hook errors from Claude Code, supporting both legacy and current formats to maintain
@@ -554,6 +585,22 @@ pub struct UserLogLine {
     /// UUID of the assistant message that triggered the tool use. Added in Claude Code 2.0.51+.
     #[serde(rename = "sourceToolAssistantUUID")]
     pub source_tool_assistant_uuid: Option<Uuid>,
+    /// Prompt identifier for tracking prompt lineage. Added in Claude Code 2.1.77+.
+    pub prompt_id: Option<Uuid>,
+    /// Current permission mode. Added in Claude Code 2.1.77+.
+    pub permission_mode: Option<PermissionMode>,
+    /// Plan content when in plan mode. Added in Claude Code 2.1.77+.
+    pub plan_content: Option<String>,
+}
+
+/// Permission mode for the conversation. Added in Claude Code 2.1.77+.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+pub enum PermissionMode {
+    Default,
+    Plan,
+    AcceptEdits,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -618,6 +665,9 @@ pub enum LogMessageTaggedContent {
     ToolResult(ToolResult),
     Document {
         source: DocumentSource,
+    },
+    ToolReference {
+        tool_name: String,
     },
 }
 
@@ -691,8 +741,27 @@ pub struct AssistantLogMessage {
     pub content: LogMessageContent,
     pub stop_reason: Option<String>,
     pub stop_sequence: Option<String>,
+    pub stop_details: Option<StopDetails>,
     pub usage: AssistantUsage,
     pub context_management: Option<serde_json::Value>,
+}
+
+/// Stop details from the Anthropic Messages API. Added in Claude Code 2.1.77+.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StopDetails {
+    pub r#type: StopType,
+    pub stop_sequence: Option<String>,
+}
+
+/// The reason the model stopped generating tokens.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
+pub enum StopType {
+    EndTurn,
+    StopSequence,
+    MaxTokens,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -707,6 +776,25 @@ pub struct AssistantUsage {
     pub server_tool_use: Option<ServerToolUse>,
     /// Geographic region where inference was performed. Added in Claude Code 2.1.12+.
     pub inference_geo: Option<String>,
+    /// Iteration data for responses. Added in Claude Code 2.1.77+.
+    pub iterations: Option<Vec<Iteration>>,
+    /// Speed setting for the response. Added in Claude Code 2.1.77+.
+    pub speed: Option<Speed>,
+}
+
+/// Iteration data from Claude Code's response. Claude Code 2.1.77+ emits these as
+/// empty objects; `deny_unknown_fields` will surface any future additions.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Iteration {}
+
+/// Speed setting for inference. Added in Claude Code 2.1.77+.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+pub enum Speed {
+    Standard,
+    Fast,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]

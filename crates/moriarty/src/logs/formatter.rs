@@ -26,7 +26,9 @@ fn format_message_content(content: &LogMessageContent) -> String {
                         output.push_str(thinking);
                         output.push_str("\n\n");
                     }
-                    LogMessageTaggedContent::ToolUse { id, name, input, .. } => {
+                    LogMessageTaggedContent::ToolUse {
+                        id, name, input, ..
+                    } => {
                         output.push_str(&format!("🔧 Tool Use: {}\n", name));
                         output.push_str(&format!("   ID: {}\n", id));
                         if !input.is_empty() {
@@ -82,6 +84,9 @@ fn format_message_content(content: &LogMessageContent) -> String {
                             source.data.len()
                         ));
                         output.push('\n');
+                    }
+                    LogMessageTaggedContent::ToolReference { tool_name } => {
+                        output.push_str(&format!("🔗 Tool Reference: {}\n", tool_name));
                     }
                 }
             }
@@ -272,6 +277,9 @@ pub fn format_log_line(log_line: &LogLine) -> String {
             )
         }
         LogLine::Progress(progress) => format_progress(progress),
+        LogLine::CustomTitle(ct) => format!("📝 Custom Title: {}\n", ct.custom_title),
+        LogLine::AgentName(an) => format!("🤖 Agent: {}\n", an.agent_name),
+        LogLine::LastPrompt(lp) => format!("💬 Last Prompt: {}\n", lp.last_prompt),
     }
 }
 
@@ -327,9 +335,9 @@ fn format_progress(progress: &ProgressLogLine) -> String {
 mod tests {
     use super::*;
     use crate::logs::parser::{
-        AssistantCacheCreation, AssistantLogLine, AssistantLogMessage, AssistantUsage,
-        CompactBoundary, CompactMetadata, DocumentSource, FileHistorySnapshot,
-        FileHistorySnapshotSnapshot, LocalCommandLog, LogMessage, LogMessageContent,
+        AgentName, AssistantCacheCreation, AssistantLogLine, AssistantLogMessage, AssistantUsage,
+        CompactBoundary, CompactMetadata, CustomTitle, DocumentSource, FileHistorySnapshot,
+        FileHistorySnapshotSnapshot, LastPrompt, LocalCommandLog, LogMessage, LogMessageContent,
         LogMessageTaggedContent, QueryUpdateData, SearchResultsReceivedData, Summary,
         SystemLogError, SystemLogErrorError, SystemLogInformational, SystemLogLine, ToolResult,
     };
@@ -361,6 +369,9 @@ mod tests {
             is_compact_summary: None,
             todos: None,
             source_tool_assistant_uuid: None,
+            prompt_id: None,
+            permission_mode: None,
+            plan_content: None,
         }
     }
 
@@ -384,6 +395,7 @@ mod tests {
                 content,
                 stop_reason: None,
                 stop_sequence: None,
+                stop_details: None,
                 usage: AssistantUsage {
                     input_tokens: 10,
                     cache_creation_input_tokens: 0,
@@ -396,6 +408,8 @@ mod tests {
                     service_tier: None,
                     server_tool_use: None,
                     inference_geo: None,
+                    iterations: None,
+                    speed: None,
                 },
                 context_management: None,
             },
@@ -659,7 +673,7 @@ mod tests {
     #[test]
     fn test_format_log_line_assistant() {
         let assistant = create_test_assistant(LogMessageContent::String("Test".to_string()));
-        let log_line = LogLine::Assistant(assistant);
+        let log_line = LogLine::Assistant(Box::new(assistant));
         let result = format_log_line(&log_line);
         assert!(!result.is_empty());
     }
@@ -686,7 +700,7 @@ mod tests {
     fn test_format_message_content_empty_vec() {
         let content = LogMessageContent::Vec(vec![]);
         let result = format_message_content(&content);
-        assert!(!result.is_empty() || result.is_empty()); // Just verify it doesn't panic
+        assert_eq!(result, "");
     }
 
     #[test]
@@ -857,6 +871,7 @@ mod tests {
             hook_count: 1,
             hook_infos: vec![HookInfo {
                 command: "test-hook".to_string(),
+                duration_ms: None,
             }],
             hook_errors: vec![],
             prevented_continuation: false,
@@ -893,12 +908,15 @@ mod tests {
             hook_infos: vec![
                 HookInfo {
                     command: "hook1".to_string(),
+                    duration_ms: None,
                 },
                 HookInfo {
                     command: "hook2".to_string(),
+                    duration_ms: None,
                 },
                 HookInfo {
                     command: "hook3".to_string(),
+                    duration_ms: None,
                 },
             ],
             hook_errors: vec![],
@@ -933,6 +951,7 @@ mod tests {
             hook_count: 1,
             hook_infos: vec![HookInfo {
                 command: "failing-hook".to_string(),
+                duration_ms: None,
             }],
             hook_errors: vec![
                 HookError::Structured(HookErrorDetails {
@@ -974,6 +993,7 @@ mod tests {
             hook_count: 1,
             hook_infos: vec![HookInfo {
                 command: "blocking-hook".to_string(),
+                duration_ms: None,
             }],
             hook_errors: vec![],
             prevented_continuation: true,
@@ -1005,6 +1025,7 @@ mod tests {
             hook_count: 1,
             hook_infos: vec![HookInfo {
                 command: "hook".to_string(),
+                duration_ms: None,
             }],
             hook_errors: vec![],
             prevented_continuation: true,
@@ -1072,5 +1093,45 @@ mod tests {
         assert!(result.contains("Search Results Received"));
         assert!(result.contains("rust async await"));
         assert!(result.contains("7 results"));
+    }
+
+    #[test]
+    fn test_format_log_line_custom_title() {
+        let ct = CustomTitle {
+            custom_title: "My Session Title".to_string(),
+            session_id: Uuid::new_v4(),
+        };
+        let result = format_log_line(&LogLine::CustomTitle(ct));
+        assert!(result.contains("My Session Title"));
+    }
+
+    #[test]
+    fn test_format_log_line_agent_name() {
+        let an = AgentName {
+            agent_name: "task-agent".to_string(),
+            session_id: Uuid::new_v4(),
+        };
+        let result = format_log_line(&LogLine::AgentName(an));
+        assert!(result.contains("task-agent"));
+    }
+
+    #[test]
+    fn test_format_log_line_last_prompt() {
+        let lp = LastPrompt {
+            last_prompt: "Fix the bug".to_string(),
+            session_id: Uuid::new_v4(),
+        };
+        let result = format_log_line(&LogLine::LastPrompt(lp));
+        assert!(result.contains("Fix the bug"));
+    }
+
+    #[test]
+    fn test_format_message_content_tool_reference() {
+        let content = LogMessageContent::Vec(vec![LogMessageTaggedContent::ToolReference {
+            tool_name: "WebFetch".to_string(),
+        }]);
+        let result = format_message_content(&content);
+        assert!(result.contains("Tool Reference"));
+        assert!(result.contains("WebFetch"));
     }
 }

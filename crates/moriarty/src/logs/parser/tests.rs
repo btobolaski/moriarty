@@ -845,6 +845,27 @@ fn test_parse_hook_info_rejects_unknown_fields() {
 }
 
 #[test]
+fn test_parse_hook_info_with_duration_ms() {
+    let json = serde_json::json!({
+        "command": "test-hook",
+        "durationMs": 1500
+    });
+    let info: HookInfo = serde_json::from_value(json).unwrap();
+    assert_eq!(info.command, "test-hook");
+    assert_eq!(info.duration_ms, Some(1500));
+}
+
+#[test]
+fn test_parse_hook_info_without_duration_ms() {
+    let json = serde_json::json!({
+        "command": "test-hook"
+    });
+    let info: HookInfo = serde_json::from_value(json).unwrap();
+    assert_eq!(info.command, "test-hook");
+    assert_eq!(info.duration_ms, None);
+}
+
+#[test]
 fn test_parse_stop_hook_summary_with_multiple_hooks_and_errors() {
     let json = serde_json::json!({
         "parentUuid": "5445927e-82b0-4164-91f3-782fafd2a49e",
@@ -1354,7 +1375,7 @@ fn test_parse_progress_agent_progress_with_assistant_message() {
             ProgressData::AgentProgress(data) => {
                 assert_eq!(data.agent_id, "abc123");
                 assert_eq!(data.prompt, "test prompt");
-                assert_eq!(data.normalized_messages.len(), 4);
+                assert_eq!(data.normalized_messages.as_ref().unwrap().len(), 4);
             }
             _ => panic!("Expected AgentProgress variant"),
         },
@@ -2135,8 +2156,9 @@ fn test_parse_nested_mcp_progress_in_agent() {
     match line {
         LogLine::Progress(progress) => match progress.data {
             ProgressData::AgentProgress(data) => {
-                assert_eq!(data.normalized_messages.len(), 1);
-                match &data.normalized_messages[0] {
+                let msgs = data.normalized_messages.as_ref().unwrap();
+                assert_eq!(msgs.len(), 1);
+                match &msgs[0] {
                     AgentProgressMessage::Progress { data, .. } => match data {
                         NestedProgressData::McpProgress(mcp) => {
                             assert_eq!(mcp.server_name, "git-read-only");
@@ -2322,8 +2344,9 @@ fn test_parse_nested_hook_progress_in_agent() {
     match line {
         LogLine::Progress(progress) => match progress.data {
             ProgressData::AgentProgress(data) => {
-                assert_eq!(data.normalized_messages.len(), 1);
-                match &data.normalized_messages[0] {
+                let msgs = data.normalized_messages.as_ref().unwrap();
+                assert_eq!(msgs.len(), 1);
+                match &msgs[0] {
                     AgentProgressMessage::Progress { data, .. } => match data {
                         NestedProgressData::HookProgress(hook) => {
                             assert_eq!(hook.hook_event, "PreToolUse");
@@ -2391,8 +2414,9 @@ fn test_parse_nested_bash_progress_in_agent() {
     match line {
         LogLine::Progress(progress) => match progress.data {
             ProgressData::AgentProgress(data) => {
-                assert_eq!(data.normalized_messages.len(), 1);
-                match &data.normalized_messages[0] {
+                let msgs = data.normalized_messages.as_ref().unwrap();
+                assert_eq!(msgs.len(), 1);
+                match &msgs[0] {
                     AgentProgressMessage::Progress { data, .. } => match data {
                         NestedProgressData::BashProgress(bash) => {
                             assert_eq!(bash.output, "Running command...");
@@ -2617,8 +2641,9 @@ fn test_parse_nested_query_update_in_agent() {
     match line {
         LogLine::Progress(progress) => match progress.data {
             ProgressData::AgentProgress(data) => {
-                assert_eq!(data.normalized_messages.len(), 1);
-                match &data.normalized_messages[0] {
+                let msgs = data.normalized_messages.as_ref().unwrap();
+                assert_eq!(msgs.len(), 1);
+                match &msgs[0] {
                     AgentProgressMessage::Progress { data, .. } => match data {
                         NestedProgressData::QueryUpdate(query) => {
                             assert_eq!(query.query, "rust async patterns 2026");
@@ -2682,8 +2707,9 @@ fn test_parse_nested_search_results_received_in_agent() {
     match line {
         LogLine::Progress(progress) => match progress.data {
             ProgressData::AgentProgress(data) => {
-                assert_eq!(data.normalized_messages.len(), 1);
-                match &data.normalized_messages[0] {
+                let msgs = data.normalized_messages.as_ref().unwrap();
+                assert_eq!(msgs.len(), 1);
+                match &msgs[0] {
                     AgentProgressMessage::Progress { data, .. } => match data {
                         NestedProgressData::SearchResultsReceived(search) => {
                             assert_eq!(search.result_count, 8);
@@ -2926,5 +2952,802 @@ fn test_parse_tool_use_caller_rejects_unknown_fields() {
         err_msg.contains("unknown field") || err_msg.contains("unknown_field"),
         "Error should mention unknown field, got: {}",
         err_msg
+    );
+}
+
+#[test]
+fn test_parse_user_log_line_with_prompt_id() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "version": "2.1.77",
+        "gitBranch": "main",
+        "message": {"role": "user", "content": "test"},
+        "uuid": "550e8400-e29b-41d4-a716-446655440001",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "promptId": "550e8400-e29b-41d4-a716-446655440088"
+    });
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(
+        line.prompt_id,
+        Some(Uuid::parse_str("550e8400-e29b-41d4-a716-446655440088").unwrap())
+    );
+}
+
+#[test]
+fn test_parse_user_log_line_with_null_prompt_id() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "version": "2.1.77",
+        "gitBranch": "main",
+        "message": {"role": "user", "content": "test"},
+        "uuid": "550e8400-e29b-41d4-a716-446655440001",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "promptId": null
+    });
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(line.prompt_id, None);
+}
+
+#[test]
+fn test_parse_user_log_line_without_prompt_id() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "version": "2.0.50",
+        "gitBranch": "main",
+        "message": {"role": "user", "content": "test"},
+        "uuid": "550e8400-e29b-41d4-a716-446655440001",
+        "timestamp": "2025-01-01T00:00:00Z"
+    });
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(line.prompt_id, None);
+}
+
+#[test]
+fn test_parse_user_log_line_with_permission_mode_plan() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "version": "2.1.77",
+        "gitBranch": "main",
+        "message": {"role": "user", "content": "test"},
+        "uuid": "550e8400-e29b-41d4-a716-446655440001",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "permissionMode": "plan"
+    });
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(line.permission_mode, Some(PermissionMode::Plan));
+}
+
+#[test]
+fn test_parse_user_log_line_with_permission_mode_accept_edits() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "version": "2.1.77",
+        "gitBranch": "main",
+        "message": {"role": "user", "content": "test"},
+        "uuid": "550e8400-e29b-41d4-a716-446655440001",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "permissionMode": "acceptEdits"
+    });
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(line.permission_mode, Some(PermissionMode::AcceptEdits));
+}
+
+#[test]
+fn test_parse_user_log_line_with_permission_mode_default() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "version": "2.1.77",
+        "gitBranch": "main",
+        "message": {"role": "user", "content": "test"},
+        "uuid": "550e8400-e29b-41d4-a716-446655440001",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "permissionMode": "default"
+    });
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(line.permission_mode, Some(PermissionMode::Default));
+}
+
+#[test]
+fn test_parse_user_log_line_without_permission_mode() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "version": "2.0.50",
+        "gitBranch": "main",
+        "message": {"role": "user", "content": "test"},
+        "uuid": "550e8400-e29b-41d4-a716-446655440001",
+        "timestamp": "2025-01-01T00:00:00Z"
+    });
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(line.permission_mode, None);
+}
+
+#[test]
+fn test_parse_user_log_line_with_plan_content() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "version": "2.1.77",
+        "gitBranch": "main",
+        "message": {"role": "user", "content": "test"},
+        "uuid": "550e8400-e29b-41d4-a716-446655440001",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "planContent": "# My Plan\n\n## Steps\n1. Do the thing"
+    });
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(
+        line.plan_content,
+        Some("# My Plan\n\n## Steps\n1. Do the thing".to_string())
+    );
+}
+
+#[test]
+fn test_parse_user_log_line_with_null_plan_content() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "version": "2.1.77",
+        "gitBranch": "main",
+        "message": {"role": "user", "content": "test"},
+        "uuid": "550e8400-e29b-41d4-a716-446655440001",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "planContent": null
+    });
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(line.plan_content, None);
+}
+
+#[test]
+fn test_parse_user_log_line_without_plan_content() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "version": "2.0.50",
+        "gitBranch": "main",
+        "message": {"role": "user", "content": "test"},
+        "uuid": "550e8400-e29b-41d4-a716-446655440001",
+        "timestamp": "2025-01-01T00:00:00Z"
+    });
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(line.plan_content, None);
+}
+
+#[test]
+fn test_parse_assistant_usage_with_iterations_and_speed() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "test-session",
+        "version": "2.1.77",
+        "gitBranch": "main",
+        "message": {
+            "id": "msg-1",
+            "type": "message",
+            "role": "assistant",
+            "content": "response",
+            "model": "claude-3-5-sonnet",
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 100,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": 0,
+                    "ephemeral_1h_input_tokens": 0
+                },
+                "output_tokens": 50,
+                "iterations": [],
+                "speed": "standard"
+            }
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2025-01-01T00:00:00Z"
+    });
+    let line: AssistantLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(line.message.usage.iterations, Some(vec![]));
+    assert_eq!(line.message.usage.speed, Some(Speed::Standard));
+}
+
+#[test]
+fn test_parse_assistant_usage_with_speed_fast() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "test-session",
+        "version": "2.1.77",
+        "gitBranch": "main",
+        "message": {
+            "id": "msg-1",
+            "type": "message",
+            "role": "assistant",
+            "content": "response",
+            "model": "claude-3-5-sonnet",
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 100,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": 0,
+                    "ephemeral_1h_input_tokens": 0
+                },
+                "output_tokens": 50,
+                "speed": "fast"
+            }
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2025-01-01T00:00:00Z"
+    });
+    let line: AssistantLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(line.message.usage.iterations, None);
+    assert_eq!(line.message.usage.speed, Some(Speed::Fast));
+}
+
+#[test]
+fn test_parse_assistant_usage_with_null_iterations_and_speed() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "test-session",
+        "version": "2.1.77",
+        "gitBranch": "main",
+        "message": {
+            "id": "msg-1",
+            "type": "message",
+            "role": "assistant",
+            "content": "response",
+            "model": "claude-3-5-sonnet",
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 100,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": 0,
+                    "ephemeral_1h_input_tokens": 0
+                },
+                "output_tokens": 50,
+                "iterations": null,
+                "speed": null
+            }
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2025-01-01T00:00:00Z"
+    });
+    let line: AssistantLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(line.message.usage.iterations, None);
+    assert_eq!(line.message.usage.speed, None);
+}
+
+#[test]
+fn test_parse_assistant_usage_without_iterations_and_speed() {
+    // Backward compatibility - older logs won't have these fields
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "test-session",
+        "version": "1.0",
+        "gitBranch": "main",
+        "message": {
+            "id": "msg-1",
+            "type": "message",
+            "role": "assistant",
+            "content": "response",
+            "model": "claude-3-5-sonnet",
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 100,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": 0,
+                    "ephemeral_1h_input_tokens": 0
+                },
+                "output_tokens": 50
+            }
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2025-01-01T00:00:00Z"
+    });
+    let line: AssistantLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(line.message.usage.iterations, None);
+    assert_eq!(line.message.usage.speed, None);
+}
+
+#[test]
+fn test_parse_user_log_line_rejects_unknown_permission_mode() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "version": "2.1.77",
+        "gitBranch": "main",
+        "message": {"role": "user", "content": "test"},
+        "uuid": "550e8400-e29b-41d4-a716-446655440001",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "permissionMode": "bypassPermissions"
+    });
+    let err_msg = serde_json::from_value::<UserLogLine>(json)
+        .expect_err("Should reject unknown permissionMode variant")
+        .to_string();
+    assert!(
+        err_msg.contains("unknown variant") || err_msg.contains("bypassPermissions"),
+        "Error should mention unknown variant, got: {}",
+        err_msg
+    );
+}
+
+#[test]
+fn test_parse_assistant_usage_rejects_unknown_speed() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "test-session",
+        "version": "2.1.77",
+        "gitBranch": "main",
+        "message": {
+            "id": "msg-1",
+            "type": "message",
+            "role": "assistant",
+            "content": "response",
+            "model": "claude-3-5-sonnet",
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 100,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": 0,
+                    "ephemeral_1h_input_tokens": 0
+                },
+                "output_tokens": 50,
+                "speed": "turbo"
+            }
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2025-01-01T00:00:00Z"
+    });
+    let err_msg = serde_json::from_value::<AssistantLogLine>(json)
+        .expect_err("Should reject unknown speed variant")
+        .to_string();
+    assert!(
+        err_msg.contains("unknown variant") || err_msg.contains("turbo"),
+        "Error should mention unknown variant, got: {}",
+        err_msg
+    );
+}
+
+#[test]
+fn test_parse_assistant_message_with_stop_details_end_turn() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "test-session",
+        "version": "2.1.77",
+        "gitBranch": "main",
+        "message": {
+            "id": "msg-1",
+            "type": "message",
+            "role": "assistant",
+            "content": "response",
+            "model": "claude-opus-4-5",
+            "stop_reason": "end_turn",
+            "stop_details": {"type": "end_turn", "stop_sequence": null},
+            "usage": {
+                "input_tokens": 100,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": 0,
+                    "ephemeral_1h_input_tokens": 0
+                },
+                "output_tokens": 50
+            }
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2025-01-01T00:00:00Z"
+    });
+    let line: AssistantLogLine = serde_json::from_value(json).unwrap();
+    let stop_details = line.message.stop_details.unwrap();
+    assert_eq!(stop_details.r#type, StopType::EndTurn);
+    assert_eq!(stop_details.stop_sequence, None);
+}
+
+#[test]
+fn test_parse_assistant_message_with_stop_details_stop_sequence() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "test-session",
+        "version": "2.1.77",
+        "gitBranch": "main",
+        "message": {
+            "id": "msg-1",
+            "type": "message",
+            "role": "assistant",
+            "content": "response",
+            "model": "claude-opus-4-5",
+            "stop_reason": "stop_sequence",
+            "stop_details": {"type": "stop_sequence", "stop_sequence": "</result>"},
+            "usage": {
+                "input_tokens": 100,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": 0,
+                    "ephemeral_1h_input_tokens": 0
+                },
+                "output_tokens": 50
+            }
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2025-01-01T00:00:00Z"
+    });
+    let line: AssistantLogLine = serde_json::from_value(json).unwrap();
+    let stop_details = line.message.stop_details.unwrap();
+    assert_eq!(stop_details.r#type, StopType::StopSequence);
+    assert_eq!(stop_details.stop_sequence, Some("</result>".to_string()));
+}
+
+#[test]
+fn test_parse_assistant_message_without_stop_details() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "test-session",
+        "version": "1.0",
+        "gitBranch": "main",
+        "message": {
+            "id": "msg-1",
+            "type": "message",
+            "role": "assistant",
+            "content": "response",
+            "model": "claude-3-5-sonnet",
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 100,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": 0,
+                    "ephemeral_1h_input_tokens": 0
+                },
+                "output_tokens": 50
+            }
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2025-01-01T00:00:00Z"
+    });
+    let line: AssistantLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(line.message.stop_details, None);
+}
+
+#[test]
+fn test_parse_stop_details_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "type": "end_turn",
+        "stop_sequence": null,
+        "extra_field": "should fail"
+    });
+    let err = serde_json::from_value::<StopDetails>(json)
+        .expect_err("Should reject unknown fields in StopDetails");
+    assert!(
+        err.to_string().contains("unknown field"),
+        "Error should mention unknown field, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_parse_stop_details_rejects_unknown_stop_type() {
+    let json = serde_json::json!({
+        "type": "tool_use",
+        "stop_sequence": null
+    });
+    let err_msg = serde_json::from_value::<StopDetails>(json)
+        .expect_err("Should reject unknown stop type variant")
+        .to_string();
+    assert!(
+        err_msg.contains("unknown variant") || err_msg.contains("tool_use"),
+        "Error should mention unknown variant, got: {}",
+        err_msg
+    );
+}
+
+#[test]
+fn test_parse_custom_title_log_line() {
+    let json = serde_json::json!({
+        "type": "custom-title",
+        "customTitle": "My Custom Session Title",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000"
+    });
+    let line: LogLine = serde_json::from_value(json).expect("Should parse custom-title");
+    match line {
+        LogLine::CustomTitle(ct) => {
+            assert_eq!(ct.custom_title, "My Custom Session Title");
+            assert_eq!(
+                ct.session_id,
+                "550e8400-e29b-41d4-a716-446655440000"
+                    .parse::<Uuid>()
+                    .unwrap()
+            );
+        }
+        _ => panic!("Expected CustomTitle variant"),
+    }
+}
+
+#[test]
+fn test_parse_custom_title_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "type": "custom-title",
+        "customTitle": "Title",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "extraField": "should fail"
+    });
+    let err = serde_json::from_value::<LogLine>(json).expect_err("Should reject unknown fields");
+    assert!(
+        err.to_string().contains("unknown field"),
+        "Error should mention unknown field, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_parse_agent_progress_without_normalized_messages() {
+    let json = serde_json::json!({
+        "type": "progress",
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "human",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "version": "2.1.0",
+        "gitBranch": "main",
+        "data": {
+            "type": "agent_progress",
+            "message": {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": "test"
+                },
+                "uuid": "550e8400-e29b-41d4-a716-446655440000",
+                "timestamp": "2025-01-01T00:00:00Z",
+                "toolUseResult": null
+            },
+            "prompt": "do something",
+            "agentId": "agent-1"
+        },
+        "toolUseID": "tool-1",
+        "parentToolUseID": "parent-1",
+        "uuid": "550e8400-e29b-41d4-a716-446655440000",
+        "timestamp": "2025-01-01T00:00:00Z"
+    });
+    let line: LogLine = serde_json::from_value(json)
+        .expect("Should parse agent_progress without normalizedMessages");
+    match line {
+        LogLine::Progress(progress) => match progress.data {
+            ProgressData::AgentProgress(data) => {
+                assert!(data.normalized_messages.is_none());
+                assert_eq!(data.agent_id, "agent-1");
+                assert_eq!(data.prompt, "do something");
+            }
+            _ => panic!("Expected AgentProgress variant"),
+        },
+        _ => panic!("Expected Progress variant"),
+    }
+}
+
+#[test]
+fn test_parse_agent_progress_with_null_normalized_messages() {
+    let json = serde_json::json!({
+        "type": "progress",
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "human",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "version": "2.1.0",
+        "gitBranch": "main",
+        "data": {
+            "type": "agent_progress",
+            "message": {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": "test"
+                },
+                "uuid": "550e8400-e29b-41d4-a716-446655440000",
+                "timestamp": "2025-01-01T00:00:00Z",
+                "toolUseResult": null
+            },
+            "normalizedMessages": null,
+            "prompt": "do something",
+            "agentId": "agent-1"
+        },
+        "toolUseID": "tool-1",
+        "parentToolUseID": "parent-1",
+        "uuid": "550e8400-e29b-41d4-a716-446655440000",
+        "timestamp": "2025-01-01T00:00:00Z"
+    });
+    let line: LogLine = serde_json::from_value(json)
+        .expect("Should parse agent_progress with null normalizedMessages");
+    match line {
+        LogLine::Progress(progress) => match progress.data {
+            ProgressData::AgentProgress(data) => {
+                assert!(data.normalized_messages.is_none());
+            }
+            _ => panic!("Expected AgentProgress variant"),
+        },
+        _ => panic!("Expected Progress variant"),
+    }
+}
+
+#[test]
+fn test_parse_tool_reference_content() {
+    let json = serde_json::json!({
+        "type": "tool_reference",
+        "tool_name": "WebFetch"
+    });
+    let content: LogMessageTaggedContent =
+        serde_json::from_value(json).expect("Should parse tool_reference");
+    match content {
+        LogMessageTaggedContent::ToolReference { tool_name } => {
+            assert_eq!(tool_name, "WebFetch");
+        }
+        _ => panic!("Expected ToolReference variant"),
+    }
+}
+
+#[test]
+fn test_parse_tool_reference_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "type": "tool_reference",
+        "tool_name": "WebFetch",
+        "extra": "should fail"
+    });
+    let err = serde_json::from_value::<LogMessageTaggedContent>(json)
+        .expect_err("Should reject unknown fields");
+    assert!(
+        err.to_string().contains("unknown field"),
+        "Error should mention unknown field, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_parse_tool_result_with_tool_reference_content() {
+    let json = serde_json::json!([
+        {"type": "text", "text": "Result text"},
+        {"type": "tool_reference", "tool_name": "WebFetch"}
+    ]);
+    let content: Vec<LogMessageTaggedContent> =
+        serde_json::from_value(json).expect("Should parse content vec with tool_reference");
+    assert_eq!(content.len(), 2);
+    assert!(matches!(&content[0], LogMessageTaggedContent::Text { text } if text == "Result text"));
+    assert!(
+        matches!(&content[1], LogMessageTaggedContent::ToolReference { tool_name } if tool_name == "WebFetch")
+    );
+}
+
+#[test]
+fn test_parse_agent_name_log_line() {
+    let json = r#"{"type":"agent-name","agentName":"task-agent","sessionId":"550e8400-e29b-41d4-a716-446655440000"}"#;
+    let log_line: LogLine = serde_json::from_str(json).unwrap();
+    match log_line {
+        LogLine::AgentName(an) => {
+            assert_eq!(an.agent_name, "task-agent");
+            assert_eq!(
+                an.session_id,
+                "550e8400-e29b-41d4-a716-446655440000"
+                    .parse::<Uuid>()
+                    .unwrap()
+            );
+        }
+        other => panic!("Expected AgentName, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_agent_name_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "type": "agent-name",
+        "agentName": "task-agent",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "extraField": "should fail"
+    });
+    let err = serde_json::from_value::<LogLine>(json).expect_err("Should reject unknown fields");
+    assert!(
+        err.to_string().contains("unknown field"),
+        "Error should mention unknown field, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_parse_last_prompt_log_line() {
+    let json = r#"{"type":"last-prompt","lastPrompt":"Fix the bug","sessionId":"550e8400-e29b-41d4-a716-446655440000"}"#;
+    let log_line: LogLine = serde_json::from_str(json).unwrap();
+    match log_line {
+        LogLine::LastPrompt(lp) => {
+            assert_eq!(lp.last_prompt, "Fix the bug");
+            assert_eq!(
+                lp.session_id,
+                "550e8400-e29b-41d4-a716-446655440000"
+                    .parse::<Uuid>()
+                    .unwrap()
+            );
+        }
+        other => panic!("Expected LastPrompt, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_last_prompt_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "type": "last-prompt",
+        "lastPrompt": "Fix the bug",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "extraField": "should fail"
+    });
+    let err = serde_json::from_value::<LogLine>(json).expect_err("Should reject unknown fields");
+    assert!(
+        err.to_string().contains("unknown field"),
+        "Error should mention unknown field, got: {}",
+        err
     );
 }
