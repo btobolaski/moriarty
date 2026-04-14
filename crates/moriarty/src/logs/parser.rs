@@ -43,6 +43,8 @@ pub struct ProgressLogLine {
     pub parent_tool_use_id: String,
     pub uuid: Uuid,
     pub timestamp: DateTime<Utc>,
+    /// Entry point that started the session (e.g., "cli"). Added in Claude Code 2.1.104+.
+    pub entrypoint: Option<String>,
 }
 
 /// Progress event data types.
@@ -216,6 +218,10 @@ pub enum LogLine {
     AgentName(AgentName),
     #[serde(rename = "last-prompt")]
     LastPrompt(LastPrompt),
+    #[serde(rename = "permission-mode")]
+    PermissionModeChange(PermissionModeChange),
+    #[serde(rename = "attachment")]
+    Attachment(Box<AttachmentLogLine>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -240,6 +246,140 @@ pub struct AgentName {
 pub struct LastPrompt {
     pub last_prompt: String,
     pub session_id: Uuid,
+}
+
+/// Permission mode change event. Added in Claude Code 2.1.104+.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct PermissionModeChange {
+    pub permission_mode: PermissionMode,
+    pub session_id: Uuid,
+}
+
+/// Attachment log line for deferred tools, hooks, and other metadata. Added in Claude Code 2.1.104+.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct AttachmentLogLine {
+    pub parent_uuid: Option<Uuid>,
+    pub is_sidechain: bool,
+    pub attachment: AttachmentData,
+    pub uuid: Uuid,
+    pub timestamp: DateTime<Utc>,
+    pub user_type: String,
+    pub entrypoint: Option<String>,
+    pub cwd: String,
+    pub session_id: Uuid,
+    pub version: String,
+    pub git_branch: String,
+    pub slug: Option<String>,
+}
+
+/// Attachment payload types. Added in Claude Code 2.1.104+.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(tag = "type")]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentData {
+    DeferredToolsDelta(DeferredToolsDelta),
+    HookSuccess(HookSuccess),
+    McpInstructionsDelta(McpInstructionsDelta),
+    PlanMode(PlanModeAttachment),
+    PlanModeExit(PlanModeExitAttachment),
+    QueuedCommand(QueuedCommand),
+    SkillListing(SkillListing),
+    TaskReminder(TaskReminder),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct DeferredToolsDelta {
+    pub added_names: Vec<String>,
+    pub added_lines: Vec<String>,
+    pub removed_names: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct HookSuccess {
+    pub hook_name: String,
+    #[serde(rename = "toolUseID")]
+    pub tool_use_id: String,
+    pub hook_event: String,
+    pub content: String,
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: i32,
+    pub command: String,
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct McpInstructionsDelta {
+    pub added_names: Vec<String>,
+    pub added_blocks: Vec<String>,
+    pub removed_names: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct PlanModeAttachment {
+    pub reminder_type: String,
+    pub is_sub_agent: bool,
+    pub plan_file_path: String,
+    pub plan_exists: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct PlanModeExitAttachment {
+    pub plan_file_path: String,
+    pub plan_exists: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct QueuedCommand {
+    pub prompt: String,
+    pub command_mode: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct SkillListing {
+    pub content: String,
+    pub skill_count: u32,
+    pub is_initial: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct TaskReminder {
+    pub content: Vec<TaskReminderItem>,
+    pub item_count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct TaskReminderItem {
+    pub id: String,
+    pub subject: String,
+    pub description: String,
+    pub active_form: String,
+    pub status: String,
+    pub blocks: Vec<String>,
+    pub blocked_by: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -275,6 +415,8 @@ pub struct LocalCommandLog {
     pub timestamp: DateTime<Utc>,
     pub uuid: Uuid,
     pub is_meta: bool,
+    /// Entry point that started the session (e.g., "cli"). Added in Claude Code 2.1.104+.
+    pub entrypoint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -301,6 +443,8 @@ pub struct StopHookSummary {
     pub uuid: Uuid,
     #[serde(rename = "toolUseID")]
     pub tool_use_id: String,
+    /// Entry point that started the session (e.g., "cli"). Added in Claude Code 2.1.104+.
+    pub entrypoint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -381,6 +525,8 @@ pub struct SystemLogError {
     pub max_retries: usize,
     pub timestamp: DateTime<Utc>,
     pub uuid: Uuid,
+    /// Entry point that started the session (e.g., "cli"). Added in Claude Code 2.1.104+.
+    pub entrypoint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -417,6 +563,8 @@ pub struct CompactBoundary {
     pub uuid: Uuid,
     pub level: String,
     pub compact_metadata: CompactMetadata,
+    /// Entry point that started the session (e.g., "cli"). Added in Claude Code 2.1.104+.
+    pub entrypoint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -437,6 +585,8 @@ pub struct SystemLogInformational {
     pub timestamp: DateTime<Utc>,
     pub uuid: Uuid,
     pub level: String,
+    /// Entry point that started the session (e.g., "cli"). Added in Claude Code 2.1.104+.
+    pub entrypoint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -468,6 +618,8 @@ pub struct MicrocompactBoundary {
     pub uuid: Uuid,
     pub level: String,
     pub microcompact_metadata: MicrocompactMetadata,
+    /// Entry point that started the session (e.g., "cli"). Added in Claude Code 2.1.104+.
+    pub entrypoint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -501,6 +653,10 @@ pub struct TurnDuration {
     pub timestamp: DateTime<Utc>,
     pub uuid: Uuid,
     pub is_meta: bool,
+    /// Entry point that started the session (e.g., "cli"). Added in Claude Code 2.1.104+.
+    pub entrypoint: Option<String>,
+    /// Number of messages in the turn. Added in Claude Code 2.1.104+.
+    pub message_count: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -591,6 +747,18 @@ pub struct UserLogLine {
     pub permission_mode: Option<PermissionMode>,
     /// Plan content when in plan mode. Added in Claude Code 2.1.77+.
     pub plan_content: Option<String>,
+    /// Entry point that started the session (e.g., "cli"). Added in Claude Code 2.1.104+.
+    pub entrypoint: Option<String>,
+    /// Origin of the message (e.g., task-notification). Added in Claude Code 2.1.104+.
+    pub origin: Option<MessageOrigin>,
+}
+
+/// Origin metadata for a message. Added in Claude Code 2.1.104+.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct MessageOrigin {
+    pub kind: String,
 }
 
 /// Permission mode for the conversation. Added in Claude Code 2.1.77+.
@@ -728,6 +896,8 @@ pub struct AssistantLogLine {
     pub is_api_error_message: Option<bool>,
     /// Error type when this is an API error message (e.g., "invalid_request").
     pub error: Option<String>,
+    /// Entry point that started the session (e.g., "cli"). Added in Claude Code 2.1.104+.
+    pub entrypoint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -782,11 +952,18 @@ pub struct AssistantUsage {
     pub speed: Option<Speed>,
 }
 
-/// Iteration data from Claude Code's response. Claude Code 2.1.77+ emits these as
-/// empty objects; `deny_unknown_fields` will surface any future additions.
+/// Iteration data from Claude Code's response. Added in Claude Code 2.1.77+ as empty objects,
+/// populated with token counts in 2.1.104+.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Iteration {}
+pub struct Iteration {
+    pub input_tokens: Option<usize>,
+    pub output_tokens: Option<usize>,
+    pub cache_read_input_tokens: Option<usize>,
+    pub cache_creation_input_tokens: Option<usize>,
+    pub cache_creation: Option<AssistantCacheCreation>,
+    pub r#type: Option<String>,
+}
 
 /// Speed setting for inference. Added in Claude Code 2.1.77+.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]

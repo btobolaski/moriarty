@@ -270,6 +270,8 @@ mod tests {
             prompt_id: None,
             permission_mode: None,
             plan_content: None,
+            entrypoint: None,
+            origin: None,
         })
     }
 
@@ -317,6 +319,7 @@ mod tests {
             timestamp: Utc::now(),
             is_api_error_message: None,
             error: None,
+            entrypoint: None,
         }))
     }
 

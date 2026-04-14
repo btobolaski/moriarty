@@ -3751,3 +3751,678 @@ fn test_parse_last_prompt_rejects_unknown_fields() {
         err
     );
 }
+
+#[test]
+fn test_parse_permission_mode_change_default() {
+    let json = r#"{"type":"permission-mode","permissionMode":"default","sessionId":"550e8400-e29b-41d4-a716-446655440000"}"#;
+    let log_line: LogLine = serde_json::from_str(json).unwrap();
+    match log_line {
+        LogLine::PermissionModeChange(pm) => {
+            assert_eq!(pm.permission_mode, PermissionMode::Default);
+            assert_eq!(
+                pm.session_id,
+                "550e8400-e29b-41d4-a716-446655440000"
+                    .parse::<Uuid>()
+                    .unwrap()
+            );
+        }
+        other => panic!("Expected PermissionModeChange, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_permission_mode_change_plan() {
+    let json = r#"{"type":"permission-mode","permissionMode":"plan","sessionId":"550e8400-e29b-41d4-a716-446655440000"}"#;
+    let log_line: LogLine = serde_json::from_str(json).unwrap();
+    match log_line {
+        LogLine::PermissionModeChange(pm) => {
+            assert_eq!(pm.permission_mode, PermissionMode::Plan);
+        }
+        other => panic!("Expected PermissionModeChange, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_permission_mode_change_accept_edits() {
+    let json = r#"{"type":"permission-mode","permissionMode":"acceptEdits","sessionId":"550e8400-e29b-41d4-a716-446655440000"}"#;
+    let log_line: LogLine = serde_json::from_str(json).unwrap();
+    match log_line {
+        LogLine::PermissionModeChange(pm) => {
+            assert_eq!(pm.permission_mode, PermissionMode::AcceptEdits);
+        }
+        other => panic!("Expected PermissionModeChange, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_permission_mode_change_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "type": "permission-mode",
+        "permissionMode": "default",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "extraField": "should fail"
+    });
+    let err = serde_json::from_value::<LogLine>(json).expect_err("Should reject unknown fields");
+    assert!(
+        err.to_string().contains("unknown field"),
+        "Error should mention unknown field, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_parse_user_log_line_with_entrypoint() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "version": "2.1.104",
+        "gitBranch": "main",
+        "message": {"role": "user", "content": "test"},
+        "uuid": "550e8400-e29b-41d4-a716-446655440001",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "entrypoint": "cli"
+    });
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(line.entrypoint, Some("cli".to_string()));
+}
+
+#[test]
+fn test_parse_user_log_line_with_null_entrypoint() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "version": "2.1.104",
+        "gitBranch": "main",
+        "message": {"role": "user", "content": "test"},
+        "uuid": "550e8400-e29b-41d4-a716-446655440001",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "entrypoint": null
+    });
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(line.entrypoint, None);
+}
+
+#[test]
+fn test_parse_user_log_line_without_entrypoint() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "version": "2.0.50",
+        "gitBranch": "main",
+        "message": {"role": "user", "content": "test"},
+        "uuid": "550e8400-e29b-41d4-a716-446655440001",
+        "timestamp": "2025-01-01T00:00:00Z"
+    });
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(line.entrypoint, None);
+}
+
+#[test]
+fn test_parse_attachment_deferred_tools_delta() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": null,
+        "isSidechain": false,
+        "attachment": {
+            "type": "deferred_tools_delta",
+            "addedNames": ["WebFetch", "WebSearch"],
+            "addedLines": ["WebFetch", "WebSearch"],
+            "removedNames": []
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440000",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.104",
+        "gitBranch": "main",
+        "slug": "test-slug"
+    });
+    let log_line: LogLine = serde_json::from_value(json).unwrap();
+    match log_line {
+        LogLine::Attachment(att) => {
+            assert!(matches!(
+                att.attachment,
+                AttachmentData::DeferredToolsDelta(_)
+            ));
+            assert_eq!(att.entrypoint, Some("cli".to_string()));
+        }
+        other => panic!("Expected Attachment, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_attachment_hook_success() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": null,
+        "isSidechain": false,
+        "attachment": {
+            "type": "hook_success",
+            "hookName": "PreToolUse:Bash",
+            "toolUseID": "toolu_123",
+            "hookEvent": "PreToolUse",
+            "content": "",
+            "stdout": "{}\n",
+            "stderr": "",
+            "exitCode": 0,
+            "command": "moriarty hooks exec",
+            "durationMs": 30
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440000",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.104",
+        "gitBranch": "main"
+    });
+    let log_line: LogLine = serde_json::from_value(json).unwrap();
+    match log_line {
+        LogLine::Attachment(att) => {
+            if let AttachmentData::HookSuccess(hook) = &att.attachment {
+                assert_eq!(hook.hook_name, "PreToolUse:Bash");
+                assert_eq!(hook.exit_code, 0);
+                assert_eq!(hook.duration_ms, 30);
+            } else {
+                panic!("Expected HookSuccess, got {:?}", att.attachment);
+            }
+        }
+        other => panic!("Expected Attachment, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_attachment_plan_mode() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": null,
+        "isSidechain": false,
+        "attachment": {
+            "type": "plan_mode",
+            "reminderType": "full",
+            "isSubAgent": false,
+            "planFilePath": "/tmp/plan.md",
+            "planExists": true
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440000",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.104",
+        "gitBranch": "main"
+    });
+    let log_line: LogLine = serde_json::from_value(json).unwrap();
+    match log_line {
+        LogLine::Attachment(att) => {
+            assert!(matches!(att.attachment, AttachmentData::PlanMode(_)));
+        }
+        other => panic!("Expected Attachment, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_attachment_task_reminder() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": null,
+        "isSidechain": false,
+        "attachment": {
+            "type": "task_reminder",
+            "content": [{
+                "id": "1",
+                "subject": "Fix bug",
+                "description": "Fix the parsing bug",
+                "activeForm": "Fixing bug",
+                "status": "in_progress",
+                "blocks": [],
+                "blockedBy": []
+            }],
+            "itemCount": 1
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440000",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.104",
+        "gitBranch": "main"
+    });
+    let log_line: LogLine = serde_json::from_value(json).unwrap();
+    match log_line {
+        LogLine::Attachment(att) => {
+            if let AttachmentData::TaskReminder(reminder) = &att.attachment {
+                assert_eq!(reminder.item_count, 1);
+                assert_eq!(reminder.content[0].subject, "Fix bug");
+            } else {
+                panic!("Expected TaskReminder, got {:?}", att.attachment);
+            }
+        }
+        other => panic!("Expected Attachment, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_attachment_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": null,
+        "isSidechain": false,
+        "attachment": {
+            "type": "deferred_tools_delta",
+            "addedNames": [],
+            "addedLines": [],
+            "removedNames": []
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440000",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.104",
+        "gitBranch": "main",
+        "extraField": "should fail"
+    });
+    let err = serde_json::from_value::<LogLine>(json).expect_err("Should reject unknown fields");
+    assert!(
+        err.to_string().contains("unknown field"),
+        "Error should mention unknown field, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_parse_assistant_log_line_with_entrypoint() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "test-session",
+        "version": "2.1.104",
+        "gitBranch": "main",
+        "message": {
+            "id": "msg-1",
+            "type": "message",
+            "role": "assistant",
+            "content": "response",
+            "model": "claude-sonnet-4-6",
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 100,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": 0,
+                    "ephemeral_1h_input_tokens": 0
+                },
+                "output_tokens": 50
+            }
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "entrypoint": "cli"
+    });
+    let line: AssistantLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(line.entrypoint, Some("cli".to_string()));
+}
+
+#[test]
+fn test_parse_assistant_log_line_without_entrypoint() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "test-session",
+        "version": "1.0",
+        "gitBranch": "main",
+        "message": {
+            "id": "msg-1",
+            "type": "message",
+            "role": "assistant",
+            "content": "response",
+            "model": "claude-3-5-sonnet",
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 100,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": 0,
+                    "ephemeral_1h_input_tokens": 0
+                },
+                "output_tokens": 50
+            }
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2025-01-01T00:00:00Z"
+    });
+    let line: AssistantLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(line.entrypoint, None);
+}
+
+#[test]
+fn test_parse_iteration_with_fields() {
+    let json = serde_json::json!({
+        "input_tokens": 3,
+        "output_tokens": 131,
+        "cache_read_input_tokens": 7407,
+        "cache_creation_input_tokens": 1841,
+        "cache_creation": {
+            "ephemeral_5m_input_tokens": 1841,
+            "ephemeral_1h_input_tokens": 0
+        },
+        "type": "message"
+    });
+    let iteration: Iteration = serde_json::from_value(json).unwrap();
+    assert_eq!(iteration.input_tokens, Some(3));
+    assert_eq!(iteration.output_tokens, Some(131));
+    assert_eq!(iteration.cache_read_input_tokens, Some(7407));
+    assert_eq!(iteration.cache_creation_input_tokens, Some(1841));
+    assert_eq!(iteration.r#type, Some("message".to_string()));
+    assert!(iteration.cache_creation.is_some());
+}
+
+#[test]
+fn test_parse_iteration_empty() {
+    let json = serde_json::json!({});
+    let iteration: Iteration = serde_json::from_value(json).unwrap();
+    assert_eq!(iteration.input_tokens, None);
+    assert_eq!(iteration.output_tokens, None);
+    assert_eq!(iteration.r#type, None);
+}
+
+#[test]
+fn test_parse_attachment_mcp_instructions_delta() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": null,
+        "isSidechain": false,
+        "attachment": {
+            "type": "mcp_instructions_delta",
+            "addedNames": ["git-read-only"],
+            "addedBlocks": ["## git-read-only\nServer instructions"],
+            "removedNames": []
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440000",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.104",
+        "gitBranch": "main"
+    });
+    let log_line: LogLine = serde_json::from_value(json).unwrap();
+    match log_line {
+        LogLine::Attachment(att) => {
+            if let AttachmentData::McpInstructionsDelta(delta) = &att.attachment {
+                assert_eq!(delta.added_names, vec!["git-read-only"]);
+                assert_eq!(delta.removed_names.len(), 0);
+            } else {
+                panic!("Expected McpInstructionsDelta, got {:?}", att.attachment);
+            }
+        }
+        other => panic!("Expected Attachment, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_attachment_plan_mode_exit() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": null,
+        "isSidechain": false,
+        "attachment": {
+            "type": "plan_mode_exit",
+            "planFilePath": "/tmp/plan.md",
+            "planExists": true
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440000",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.104",
+        "gitBranch": "main"
+    });
+    let log_line: LogLine = serde_json::from_value(json).unwrap();
+    match log_line {
+        LogLine::Attachment(att) => {
+            if let AttachmentData::PlanModeExit(exit) = &att.attachment {
+                assert_eq!(exit.plan_file_path, "/tmp/plan.md");
+                assert!(exit.plan_exists);
+            } else {
+                panic!("Expected PlanModeExit, got {:?}", att.attachment);
+            }
+        }
+        other => panic!("Expected Attachment, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_attachment_queued_command() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": null,
+        "isSidechain": false,
+        "attachment": {
+            "type": "queued_command",
+            "prompt": "Run the tests",
+            "commandMode": "prompt"
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440000",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.104",
+        "gitBranch": "main"
+    });
+    let log_line: LogLine = serde_json::from_value(json).unwrap();
+    match log_line {
+        LogLine::Attachment(att) => {
+            if let AttachmentData::QueuedCommand(cmd) = &att.attachment {
+                assert_eq!(cmd.prompt, "Run the tests");
+                assert_eq!(cmd.command_mode, "prompt");
+            } else {
+                panic!("Expected QueuedCommand, got {:?}", att.attachment);
+            }
+        }
+        other => panic!("Expected Attachment, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_attachment_skill_listing() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": null,
+        "isSidechain": false,
+        "attachment": {
+            "type": "skill_listing",
+            "content": "- commit: Create commits\n- review: Review PRs",
+            "skillCount": 2,
+            "isInitial": true
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440000",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.104",
+        "gitBranch": "main"
+    });
+    let log_line: LogLine = serde_json::from_value(json).unwrap();
+    match log_line {
+        LogLine::Attachment(att) => {
+            if let AttachmentData::SkillListing(listing) = &att.attachment {
+                assert_eq!(listing.skill_count, 2);
+                assert!(listing.is_initial);
+            } else {
+                panic!("Expected SkillListing, got {:?}", att.attachment);
+            }
+        }
+        other => panic!("Expected Attachment, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_turn_duration_with_message_count() {
+    let json = serde_json::json!({
+        "type": "system",
+        "subtype": "turn_duration",
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.104",
+        "gitBranch": "main",
+        "slug": "test-slug",
+        "durationMs": 5678,
+        "timestamp": "2025-01-16T00:00:00Z",
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "isMeta": false,
+        "entrypoint": "cli",
+        "messageCount": 4
+    });
+    let line: LogLine =
+        serde_json::from_value(json).expect("Failed to parse turn_duration with messageCount");
+    match line {
+        LogLine::System(SystemLogLine::TurnDuration(duration)) => {
+            assert_eq!(duration.duration_ms, 5678);
+            assert_eq!(duration.message_count, Some(4));
+            assert_eq!(duration.entrypoint, Some("cli".to_string()));
+        }
+        _ => panic!("Expected System(TurnDuration) variant"),
+    }
+}
+
+#[test]
+fn test_parse_user_log_line_with_origin() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "version": "2.1.104",
+        "gitBranch": "main",
+        "message": {"role": "user", "content": "test"},
+        "uuid": "550e8400-e29b-41d4-a716-446655440001",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "origin": {"kind": "task-notification"}
+    });
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    let origin = line.origin.unwrap();
+    assert_eq!(origin.kind, "task-notification");
+}
+
+#[test]
+fn test_parse_user_log_line_with_null_origin() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "version": "2.1.104",
+        "gitBranch": "main",
+        "message": {"role": "user", "content": "test"},
+        "uuid": "550e8400-e29b-41d4-a716-446655440001",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "origin": null
+    });
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(line.origin, None);
+}
+
+#[test]
+fn test_parse_user_log_line_without_origin() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "version": "2.0.50",
+        "gitBranch": "main",
+        "message": {"role": "user", "content": "test"},
+        "uuid": "550e8400-e29b-41d4-a716-446655440001",
+        "timestamp": "2025-01-01T00:00:00Z"
+    });
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(line.origin, None);
+}
+
+#[test]
+fn test_parse_message_origin_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "version": "2.1.104",
+        "gitBranch": "main",
+        "message": {"role": "user", "content": "test"},
+        "uuid": "550e8400-e29b-41d4-a716-446655440001",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "origin": {"kind": "task-notification", "extraField": "should fail"}
+    });
+    let err =
+        serde_json::from_value::<UserLogLine>(json).expect_err("Should reject unknown fields");
+    assert!(
+        err.to_string().contains("unknown field"),
+        "Error should mention unknown field, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_parse_assistant_log_line_with_null_entrypoint() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "test-session",
+        "version": "2.1.104",
+        "gitBranch": "main",
+        "message": {
+            "id": "msg-1",
+            "type": "message",
+            "role": "assistant",
+            "content": "response",
+            "model": "claude-sonnet-4-6",
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 100,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": 0,
+                    "ephemeral_1h_input_tokens": 0
+                },
+                "output_tokens": 50
+            }
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "entrypoint": null
+    });
+    let line: AssistantLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(line.entrypoint, None);
+}

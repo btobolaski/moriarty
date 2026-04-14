@@ -280,6 +280,12 @@ pub fn format_log_line(log_line: &LogLine) -> String {
         LogLine::CustomTitle(ct) => format!("📝 Custom Title: {}\n", ct.custom_title),
         LogLine::AgentName(an) => format!("🤖 Agent: {}\n", an.agent_name),
         LogLine::LastPrompt(lp) => format!("💬 Last Prompt: {}\n", lp.last_prompt),
+        LogLine::PermissionModeChange(pm) => {
+            format!("🔒 Permission Mode: {:?}\n", pm.permission_mode)
+        }
+        LogLine::Attachment(att) => {
+            format!("📎 Attachment: {:?}\n", att.attachment)
+        }
     }
 }
 
@@ -372,6 +378,8 @@ mod tests {
             prompt_id: None,
             permission_mode: None,
             plan_content: None,
+            entrypoint: None,
+            origin: None,
         }
     }
 
@@ -418,6 +426,7 @@ mod tests {
             timestamp: Utc::now(),
             is_api_error_message: None,
             error: None,
+            entrypoint: None,
         }
     }
 
@@ -529,6 +538,7 @@ mod tests {
             max_retries: 3,
             timestamp: Utc::now(),
             uuid: Uuid::new_v4(),
+            entrypoint: None,
         });
         let result = format_system_message(&system);
         assert!(!result.is_empty());
@@ -559,6 +569,7 @@ mod tests {
             max_retries: 5,
             timestamp: Utc::now(),
             uuid: Uuid::new_v4(),
+            entrypoint: None,
         });
         let result = format_system_message(&system);
         assert!(!result.is_empty());
@@ -581,6 +592,7 @@ mod tests {
             timestamp: Utc::now(),
             uuid: Uuid::new_v4(),
             level: "info".to_string(),
+            entrypoint: None,
         });
         let result = format_system_message(&system);
         assert!(!result.is_empty());
@@ -603,6 +615,7 @@ mod tests {
             timestamp: Utc::now(),
             uuid: Uuid::new_v4(),
             is_meta: false,
+            entrypoint: None,
         });
         let result = format_system_message(&system);
         assert!(!result.is_empty());
@@ -630,6 +643,7 @@ mod tests {
                 trigger: "auto".to_string(),
                 pre_tokens: 1000,
             },
+            entrypoint: None,
         });
         let result = format_system_message(&system);
         assert!(!result.is_empty());
@@ -881,6 +895,7 @@ mod tests {
             timestamp: Utc::now(),
             uuid: Uuid::new_v4(),
             tool_use_id: "test-id".to_string(),
+            entrypoint: None,
         });
         let result = format_system_message(&system);
         assert!(!result.is_empty());
@@ -927,6 +942,7 @@ mod tests {
             timestamp: Utc::now(),
             uuid: Uuid::new_v4(),
             tool_use_id: "test-id".to_string(),
+            entrypoint: None,
         });
         let result = format_system_message(&system);
         assert!(result.contains("3 hook(s)"));
@@ -972,6 +988,7 @@ mod tests {
             timestamp: Utc::now(),
             uuid: Uuid::new_v4(),
             tool_use_id: "test-id".to_string(),
+            entrypoint: None,
         });
         let result = format_system_message(&system);
         assert!(result.contains("Errors: 2"));
@@ -1003,6 +1020,7 @@ mod tests {
             timestamp: Utc::now(),
             uuid: Uuid::new_v4(),
             tool_use_id: "test-id".to_string(),
+            entrypoint: None,
         });
         let result = format_system_message(&system);
         assert!(result.contains("Prevented continuation"));
@@ -1035,6 +1053,7 @@ mod tests {
             timestamp: Utc::now(),
             uuid: Uuid::new_v4(),
             tool_use_id: "test-id".to_string(),
+            entrypoint: None,
         });
         let result = format_system_message(&system);
         assert!(result.contains("Prevented continuation"));
@@ -1060,6 +1079,7 @@ mod tests {
             parent_tool_use_id: "toolu_parent".to_string(),
             uuid: Uuid::new_v4(),
             timestamp: Utc::now(),
+            entrypoint: None,
         };
 
         let result = format_progress(&progress);
@@ -1087,6 +1107,7 @@ mod tests {
             parent_tool_use_id: "toolu_parent".to_string(),
             uuid: Uuid::new_v4(),
             timestamp: Utc::now(),
+            entrypoint: None,
         };
 
         let result = format_progress(&progress);

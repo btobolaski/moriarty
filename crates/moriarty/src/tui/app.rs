@@ -246,6 +246,8 @@ mod tests {
             prompt_id: None,
             permission_mode: None,
             plan_content: None,
+            entrypoint: None,
+            origin: None,
         })
     }
 
