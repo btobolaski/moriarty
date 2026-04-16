@@ -4014,6 +4014,45 @@ fn test_parse_attachment_task_reminder() {
 }
 
 #[test]
+fn test_parse_attachment_task_reminder_without_active_form() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": null,
+        "isSidechain": false,
+        "attachment": {
+            "type": "task_reminder",
+            "content": [{
+                "id": "1",
+                "subject": "Fix bug",
+                "description": "Fix the parsing bug",
+                "status": "in_progress",
+                "blocks": [],
+                "blockedBy": []
+            }],
+            "itemCount": 1
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440000",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.104",
+        "gitBranch": "main"
+    });
+    let log_line: LogLine = serde_json::from_value(json).unwrap();
+    match log_line {
+        LogLine::Attachment(att) => {
+            if let AttachmentData::TaskReminder(reminder) = &att.attachment {
+                assert_eq!(reminder.content[0].active_form, None);
+            } else {
+                panic!("Expected TaskReminder, got {:?}", att.attachment);
+            }
+        }
+        other => panic!("Expected Attachment, got {:?}", other),
+    }
+}
+
+#[test]
 fn test_parse_attachment_rejects_unknown_fields() {
     let json = serde_json::json!({
         "type": "attachment",
@@ -4272,6 +4311,376 @@ fn test_parse_attachment_skill_listing() {
                 assert!(listing.is_initial);
             } else {
                 panic!("Expected SkillListing, got {:?}", att.attachment);
+            }
+        }
+        other => panic!("Expected Attachment, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_attachment_auto_mode() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": null,
+        "isSidechain": false,
+        "attachment": {
+            "type": "auto_mode",
+            "reminderType": "full"
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.104",
+        "gitBranch": "main",
+        "slug": "test-slug"
+    });
+    let log_line: LogLine = serde_json::from_value(json).unwrap();
+    match log_line {
+        LogLine::Attachment(att) => {
+            if let AttachmentData::AutoMode(auto) = &att.attachment {
+                assert_eq!(auto.reminder_type, "full");
+            } else {
+                panic!("Expected AutoMode, got {:?}", att.attachment);
+            }
+        }
+        other => panic!("Expected Attachment, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_attachment_auto_mode_exit() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": null,
+        "isSidechain": false,
+        "attachment": {
+            "type": "auto_mode_exit"
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.104",
+        "gitBranch": "main",
+        "slug": "test-slug"
+    });
+    let log_line: LogLine = serde_json::from_value(json).unwrap();
+    match log_line {
+        LogLine::Attachment(att) => {
+            assert!(matches!(att.attachment, AttachmentData::AutoModeExit(_)));
+        }
+        other => panic!("Expected Attachment, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_attachment_command_permissions() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": null,
+        "isSidechain": false,
+        "attachment": {
+            "type": "command_permissions",
+            "allowedTools": ["Bash", "Read"]
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.104",
+        "gitBranch": "main",
+        "slug": "test-slug"
+    });
+    let log_line: LogLine = serde_json::from_value(json).unwrap();
+    match log_line {
+        LogLine::Attachment(att) => {
+            if let AttachmentData::CommandPermissions(perms) = &att.attachment {
+                assert_eq!(perms.allowed_tools, vec!["Bash", "Read"]);
+            } else {
+                panic!("Expected CommandPermissions, got {:?}", att.attachment);
+            }
+        }
+        other => panic!("Expected Attachment, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_attachment_edited_text_file() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": null,
+        "isSidechain": false,
+        "attachment": {
+            "type": "edited_text_file",
+            "filename": "/src/main.rs",
+            "snippet": "fn main() {\n    println!(\"hello\");\n}"
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.104",
+        "gitBranch": "main",
+        "slug": "test-slug"
+    });
+    let log_line: LogLine = serde_json::from_value(json).unwrap();
+    match log_line {
+        LogLine::Attachment(att) => {
+            if let AttachmentData::EditedTextFile(edited) = &att.attachment {
+                assert_eq!(edited.filename, "/src/main.rs");
+                assert_eq!(edited.snippet, "fn main() {\n    println!(\"hello\");\n}");
+            } else {
+                panic!("Expected EditedTextFile, got {:?}", att.attachment);
+            }
+        }
+        other => panic!("Expected Attachment, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_attachment_plan_mode_reentry() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": null,
+        "isSidechain": false,
+        "attachment": {
+            "type": "plan_mode_reentry",
+            "planFilePath": "/Users/test/.claude/plans/my-plan.md"
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.104",
+        "gitBranch": "main",
+        "slug": "test-slug"
+    });
+    let log_line: LogLine = serde_json::from_value(json).unwrap();
+    match log_line {
+        LogLine::Attachment(att) => {
+            if let AttachmentData::PlanModeReentry(reentry) = &att.attachment {
+                assert_eq!(
+                    reentry.plan_file_path,
+                    "/Users/test/.claude/plans/my-plan.md"
+                );
+            } else {
+                panic!("Expected PlanModeReentry, got {:?}", att.attachment);
+            }
+        }
+        other => panic!("Expected Attachment, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_attachment_hook_non_blocking_error() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": null,
+        "isSidechain": false,
+        "attachment": {
+            "type": "hook_non_blocking_error",
+            "hookName": "PostToolUse:ExitPlanMode",
+            "toolUseID": "toolu_01MpjtQCRgkG3zhy3rWBNGfx",
+            "hookEvent": "PostToolUse",
+            "stderr": "hook failed",
+            "stdout": "",
+            "exitCode": 1,
+            "command": "moriarty hooks exec",
+            "durationMs": 107
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.104",
+        "gitBranch": "main",
+        "slug": "test-slug"
+    });
+    let log_line: LogLine = serde_json::from_value(json).unwrap();
+    match log_line {
+        LogLine::Attachment(att) => {
+            if let AttachmentData::HookNonBlockingError(err) = &att.attachment {
+                assert_eq!(err.hook_name, "PostToolUse:ExitPlanMode");
+                assert_eq!(err.tool_use_id, "toolu_01MpjtQCRgkG3zhy3rWBNGfx");
+                assert_eq!(err.exit_code, 1);
+                assert_eq!(err.duration_ms, 107);
+            } else {
+                panic!("Expected HookNonBlockingError, got {:?}", att.attachment);
+            }
+        }
+        other => panic!("Expected Attachment, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_attachment_hook_blocking_error() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "attachment": {
+            "type": "hook_blocking_error",
+            "hookName": "Stop",
+            "toolUseID": "25ac3468-1b14-498d-b231-f6a80674f20d",
+            "hookEvent": "Stop",
+            "blockingError": {
+                "blockingError": "Checks failed:\n\nCheck 'semgrep' failed with exit code 2",
+                "command": "moriarty hooks exec"
+            }
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.104",
+        "gitBranch": "main",
+        "slug": "test-slug"
+    });
+    let log_line: LogLine = serde_json::from_value(json).unwrap();
+    match log_line {
+        LogLine::Attachment(att) => {
+            if let AttachmentData::HookBlockingError(err) = &att.attachment {
+                assert_eq!(err.hook_name, "Stop");
+                assert_eq!(err.tool_use_id, "25ac3468-1b14-498d-b231-f6a80674f20d");
+                assert_eq!(err.hook_event, "Stop");
+                assert_eq!(err.blocking_error.command, "moriarty hooks exec");
+                assert_eq!(
+                    err.blocking_error.blocking_error,
+                    "Checks failed:\n\nCheck 'semgrep' failed with exit code 2"
+                );
+            } else {
+                panic!("Expected HookBlockingError, got {:?}", att.attachment);
+            }
+        }
+        other => panic!("Expected Attachment, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_attachment_hook_blocking_error_rejects_unknown_nested_fields() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": null,
+        "isSidechain": false,
+        "attachment": {
+            "type": "hook_blocking_error",
+            "hookName": "Stop",
+            "toolUseID": "25ac3468-1b14-498d-b231-f6a80674f20d",
+            "hookEvent": "Stop",
+            "blockingError": {
+                "blockingError": "some error",
+                "command": "moriarty hooks exec",
+                "unexpectedField": true
+            }
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.104",
+        "gitBranch": "main"
+    });
+    let err = serde_json::from_value::<LogLine>(json)
+        .expect_err("Should reject unknown fields in BlockingErrorDetails");
+    assert!(err.to_string().contains("unknown field"), "{err}");
+}
+
+#[test]
+fn test_parse_attachment_hook_cancelled() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "attachment": {
+            "type": "hook_cancelled",
+            "hookName": "Stop",
+            "toolUseID": "21ef6391-1417-40ab-b9ba-e55f5684c31a",
+            "hookEvent": "Stop",
+            "command": "moriarty hooks exec",
+            "durationMs": 3184
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.104",
+        "gitBranch": "main",
+        "slug": "test-slug"
+    });
+    let log_line: LogLine = serde_json::from_value(json).unwrap();
+    match log_line {
+        LogLine::Attachment(att) => {
+            if let AttachmentData::HookCancelled(cancelled) = &att.attachment {
+                assert_eq!(cancelled.hook_name, "Stop");
+                assert_eq!(
+                    cancelled.tool_use_id,
+                    "21ef6391-1417-40ab-b9ba-e55f5684c31a"
+                );
+                assert_eq!(cancelled.hook_event, "Stop");
+                assert_eq!(cancelled.command, "moriarty hooks exec");
+                assert_eq!(cancelled.duration_ms, 3184);
+            } else {
+                panic!("Expected HookCancelled, got {:?}", att.attachment);
+            }
+        }
+        other => panic!("Expected Attachment, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_attachment_hook_system_message() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "attachment": {
+            "type": "hook_system_message",
+            "content": "Checks failed:\n\nCheck 'semgrep' failed with exit code 2",
+            "hookName": "Stop",
+            "toolUseID": "25ac3468-1b14-498d-b231-f6a80674f20d",
+            "hookEvent": "Stop"
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.104",
+        "gitBranch": "main",
+        "slug": "test-slug"
+    });
+    let log_line: LogLine = serde_json::from_value(json).unwrap();
+    match log_line {
+        LogLine::Attachment(att) => {
+            if let AttachmentData::HookSystemMessage(msg) = &att.attachment {
+                assert_eq!(msg.hook_name, "Stop");
+                assert_eq!(msg.tool_use_id, "25ac3468-1b14-498d-b231-f6a80674f20d");
+                assert_eq!(msg.hook_event, "Stop");
+                assert_eq!(
+                    msg.content,
+                    "Checks failed:\n\nCheck 'semgrep' failed with exit code 2"
+                );
+            } else {
+                panic!("Expected HookSystemMessage, got {:?}", att.attachment);
             }
         }
         other => panic!("Expected Attachment, got {:?}", other),

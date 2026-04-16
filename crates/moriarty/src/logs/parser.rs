@@ -282,14 +282,41 @@ pub struct AttachmentLogLine {
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
 pub enum AttachmentData {
+    AutoMode(AutoMode),
+    AutoModeExit(AutoModeExit),
+    CommandPermissions(CommandPermissions),
     DeferredToolsDelta(DeferredToolsDelta),
+    EditedTextFile(EditedTextFile),
+    HookBlockingError(HookBlockingError),
+    HookCancelled(HookCancelled),
+    HookNonBlockingError(HookNonBlockingError),
     HookSuccess(HookSuccess),
+    HookSystemMessage(HookSystemMessage),
     McpInstructionsDelta(McpInstructionsDelta),
     PlanMode(PlanModeAttachment),
     PlanModeExit(PlanModeExitAttachment),
+    PlanModeReentry(PlanModeReentryAttachment),
     QueuedCommand(QueuedCommand),
     SkillListing(SkillListing),
     TaskReminder(TaskReminder),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct AutoMode {
+    pub reminder_type: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutoModeExit {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct CommandPermissions {
+    pub allowed_tools: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -299,6 +326,60 @@ pub struct DeferredToolsDelta {
     pub added_names: Vec<String>,
     pub added_lines: Vec<String>,
     pub removed_names: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct EditedTextFile {
+    pub filename: String,
+    pub snippet: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct HookBlockingError {
+    pub hook_name: String,
+    #[serde(rename = "toolUseID")]
+    pub tool_use_id: String,
+    pub hook_event: String,
+    pub blocking_error: BlockingErrorDetails,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct BlockingErrorDetails {
+    pub blocking_error: String,
+    pub command: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct HookCancelled {
+    pub hook_name: String,
+    #[serde(rename = "toolUseID")]
+    pub tool_use_id: String,
+    pub hook_event: String,
+    pub command: String,
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct HookNonBlockingError {
+    pub hook_name: String,
+    #[serde(rename = "toolUseID")]
+    pub tool_use_id: String,
+    pub hook_event: String,
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: i32,
+    pub command: String,
+    pub duration_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -315,6 +396,17 @@ pub struct HookSuccess {
     pub exit_code: i32,
     pub command: String,
     pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct HookSystemMessage {
+    pub content: String,
+    pub hook_name: String,
+    #[serde(rename = "toolUseID")]
+    pub tool_use_id: String,
+    pub hook_event: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -342,6 +434,13 @@ pub struct PlanModeAttachment {
 pub struct PlanModeExitAttachment {
     pub plan_file_path: String,
     pub plan_exists: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct PlanModeReentryAttachment {
+    pub plan_file_path: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -376,7 +475,7 @@ pub struct TaskReminderItem {
     pub id: String,
     pub subject: String,
     pub description: String,
-    pub active_form: String,
+    pub active_form: Option<String>,
     pub status: String,
     pub blocks: Vec<String>,
     pub blocked_by: Vec<String>,
