@@ -175,7 +175,7 @@ async fn exec_hook_impl<R: Read>(reader: R) -> Result<()> {
         ref tool_input,
     } = hook_input.event_data
     {
-        let hook_output = handle_pretool_hook(tool_name, tool_input).await?;
+        let hook_output = handle_pretool_hook(tool_name, tool_input, &hook_input.cwd).await?;
 
         let json_output = serde_json::to_string(&hook_output)
             .map_err(|e| miette::miette!("Failed to serialize HookOutput: {}", e))?;
@@ -350,9 +350,14 @@ fn pretool_modify_hook(new_input: serde_json::Value, reason: Option<String>) -> 
 /// 1. tool_rules engine (first-match-wins) — if match, return Allow/Deny/Ask
 /// 2. If NoMatch and tool is Bash — bash_rules engine (existing behavior)
 /// 3. If NoMatch and tool is not Bash — default to Ask
+///
+/// `cwd` is the current working directory from the hook input. It is used to strip absolute path
+/// prefixes from field values before matching against tool rule patterns, allowing rules to be
+/// written with relative paths.
 async fn handle_pretool_hook(
     tool_name: &str,
     tool_input: &serde_json::Value,
+    cwd: &str,
 ) -> Result<HookOutput> {
     let config = match load_user_config().await {
         Ok(cfg) => cfg,
@@ -368,7 +373,7 @@ async fn handle_pretool_hook(
                 rules.clone(),
                 config.pattern_fragments.clone(),
             );
-            let result = engine.apply_rules(tool_name, tool_input);
+            let result = engine.apply_rules(tool_name, tool_input, cwd);
 
             match result {
                 tool_rules::ToolRuleResult::Allowed { rule_name } => {

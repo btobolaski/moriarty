@@ -3,7 +3,8 @@
 //! This module provides a rule engine for permissioning arbitrary tool calls (Read, Write, Edit,
 //! Bash, etc.) before they are executed by Claude Code. Unlike `bash_rules` which operates on
 //! command strings, tool rules match on tool name and optionally on a specific field in the
-//! tool input using regex patterns.
+//! tool input using regex patterns. Field values that start with the hook input's `cwd` have
+//! that prefix stripped before matching, so rules can use relative paths.
 
 use std::collections::HashMap;
 
@@ -137,11 +138,16 @@ impl ToolRuleEngine {
     /// schema, so no single typed struct can represent them all. The upstream `HookEventData`
     /// parser already delivers `tool_input` as `serde_json::Value`.
     ///
-    /// Field value extraction: strings use `as_str()`, numbers/bools use `to_string()`,
-    /// arrays/objects/null are skipped (field won't match).
-    pub fn apply_rules(&self, tool_name: &str, tool_input: &serde_json::Value) -> ToolRuleResult {
+    /// When a field value starts with `cwd/`, the prefix is stripped before regex matching so
+    /// that rules can be written with relative paths (e.g., `^src/` instead of
+    /// `^/home/user/project/src/`).
+    pub fn apply_rules(
+        &self,
+        tool_name: &str,
+        tool_input: &serde_json::Value,
+        cwd: &str,
+    ) -> ToolRuleResult {
         for rule in &self.rules {
-            // Check tool name: exact match or wildcard
             if rule.tool != "*" && rule.tool != tool_name {
                 continue;
             }
@@ -157,11 +163,12 @@ impl ToolRuleEngine {
                 };
 
                 let Some(value_str) = field_value else {
-                    // Field is an array/object/null, can't match
                     continue;
                 };
 
-                if !regex.is_match(&value_str) {
+                let value_for_matching = strip_cwd_prefix(&value_str, cwd);
+
+                if !regex.is_match(value_for_matching) {
                     continue;
                 }
             }
@@ -204,6 +211,30 @@ fn extract_field_value(value: &serde_json::Value) -> Option<String> {
     }
 }
 
+/// Strip the cwd prefix from a value to produce a relative path for matching.
+///
+/// Guards against partial directory name matches (e.g., cwd `/foo` does not strip from
+/// `/foobar/baz`) by requiring a `/` boundary or exact equality after the prefix.
+fn strip_cwd_prefix<'a>(value: &'a str, cwd: &str) -> &'a str {
+    let cwd = cwd.strip_suffix('/').unwrap_or(cwd);
+
+    if cwd.is_empty() {
+        return value;
+    }
+
+    if let Some(rest) = value.strip_prefix(cwd) {
+        if rest.is_empty() {
+            ""
+        } else if let Some(relative) = rest.strip_prefix('/') {
+            relative
+        } else {
+            value
+        }
+    } else {
+        value
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,7 +258,7 @@ mod tests {
     #[test]
     fn test_empty_rules() {
         let engine = ToolRuleEngine::from_config(vec![], None);
-        let result = engine.apply_rules("Read", &serde_json::json!({"file_path": "/tmp/foo"}));
+        let result = engine.apply_rules("Read", &serde_json::json!({"file_path": "/tmp/foo"}), "");
         assert_eq!(result, ToolRuleResult::NoMatch);
     }
 
@@ -242,7 +273,7 @@ mod tests {
         )];
         let engine = ToolRuleEngine::from_config(rules, None);
 
-        let result = engine.apply_rules("Read", &serde_json::json!({"file_path": "/tmp/foo"}));
+        let result = engine.apply_rules("Read", &serde_json::json!({"file_path": "/tmp/foo"}), "");
         assert_eq!(
             result,
             ToolRuleResult::Allowed {
@@ -251,7 +282,7 @@ mod tests {
         );
 
         // Doesn't match other tools
-        let result = engine.apply_rules("Write", &serde_json::json!({}));
+        let result = engine.apply_rules("Write", &serde_json::json!({}), "");
         assert_eq!(result, ToolRuleResult::NoMatch);
     }
 
@@ -268,7 +299,7 @@ mod tests {
         )];
         let engine = ToolRuleEngine::from_config(rules, None);
 
-        let result = engine.apply_rules("Write", &serde_json::json!({}));
+        let result = engine.apply_rules("Write", &serde_json::json!({}), "");
         assert_eq!(
             result,
             ToolRuleResult::Denied {
@@ -289,7 +320,7 @@ mod tests {
         )];
         let engine = ToolRuleEngine::from_config(rules, None);
 
-        let result = engine.apply_rules("Edit", &serde_json::json!({}));
+        let result = engine.apply_rules("Edit", &serde_json::json!({}), "");
         assert_eq!(
             result,
             ToolRuleResult::Asked {
@@ -304,19 +335,19 @@ mod tests {
         let engine = ToolRuleEngine::from_config(rules, None);
 
         assert_eq!(
-            engine.apply_rules("Read", &serde_json::json!({})),
+            engine.apply_rules("Read", &serde_json::json!({}), ""),
             ToolRuleResult::Asked {
                 rule_name: "catch-all".to_string()
             }
         );
         assert_eq!(
-            engine.apply_rules("Write", &serde_json::json!({})),
+            engine.apply_rules("Write", &serde_json::json!({}), ""),
             ToolRuleResult::Asked {
                 rule_name: "catch-all".to_string()
             }
         );
         assert_eq!(
-            engine.apply_rules("Bash", &serde_json::json!({})),
+            engine.apply_rules("Bash", &serde_json::json!({}), ""),
             ToolRuleResult::Asked {
                 rule_name: "catch-all".to_string()
             }
@@ -340,6 +371,7 @@ mod tests {
         let result = engine.apply_rules(
             "Write",
             &serde_json::json!({"file_path": "/home/user/.env"}),
+            "",
         );
         assert_eq!(
             result,
@@ -353,6 +385,7 @@ mod tests {
         let result = engine.apply_rules(
             "Write",
             &serde_json::json!({"file_path": "/home/user/main.rs"}),
+            "",
         );
         assert_eq!(result, ToolRuleResult::NoMatch);
     }
@@ -371,7 +404,7 @@ mod tests {
         let engine = ToolRuleEngine::from_config(rules, None);
 
         // Field doesn't exist in input
-        let result = engine.apply_rules("Write", &serde_json::json!({"content": "hello"}));
+        let result = engine.apply_rules("Write", &serde_json::json!({"content": "hello"}), "");
         assert_eq!(result, ToolRuleResult::NoMatch);
     }
 
@@ -387,7 +420,7 @@ mod tests {
         let engine = ToolRuleEngine::from_config(rules, None);
 
         // Number field
-        let result = engine.apply_rules("Test", &serde_json::json!({"count": 42}));
+        let result = engine.apply_rules("Test", &serde_json::json!({"count": 42}), "");
         assert_eq!(
             result,
             ToolRuleResult::Allowed {
@@ -396,14 +429,14 @@ mod tests {
         );
 
         // Bool field (doesn't match "42")
-        let result = engine.apply_rules("Test", &serde_json::json!({"count": true}));
+        let result = engine.apply_rules("Test", &serde_json::json!({"count": true}), "");
         assert_eq!(result, ToolRuleResult::NoMatch);
 
         // Array/object/null fields can't be matched
-        let result = engine.apply_rules("Test", &serde_json::json!({"count": [42]}));
+        let result = engine.apply_rules("Test", &serde_json::json!({"count": [42]}), "");
         assert_eq!(result, ToolRuleResult::NoMatch);
 
-        let result = engine.apply_rules("Test", &serde_json::json!({"count": null}));
+        let result = engine.apply_rules("Test", &serde_json::json!({"count": null}), "");
         assert_eq!(result, ToolRuleResult::NoMatch);
 
         // Bool positive match (bools are converted to "true"/"false" strings)
@@ -416,7 +449,7 @@ mod tests {
         )];
         let bool_engine = ToolRuleEngine::from_config(bool_rules, None);
 
-        let result = bool_engine.apply_rules("Test", &serde_json::json!({"flag": true}));
+        let result = bool_engine.apply_rules("Test", &serde_json::json!({"flag": true}), "");
         assert_eq!(
             result,
             ToolRuleResult::Allowed {
@@ -424,7 +457,7 @@ mod tests {
             }
         );
 
-        let result = bool_engine.apply_rules("Test", &serde_json::json!({"flag": false}));
+        let result = bool_engine.apply_rules("Test", &serde_json::json!({"flag": false}), "");
         assert_eq!(result, ToolRuleResult::NoMatch);
     }
 
@@ -451,7 +484,7 @@ mod tests {
         let engine = ToolRuleEngine::from_config(rules, None);
 
         // .rs file matches first rule
-        let result = engine.apply_rules("Write", &serde_json::json!({"file_path": "main.rs"}));
+        let result = engine.apply_rules("Write", &serde_json::json!({"file_path": "main.rs"}), "");
         assert_eq!(
             result,
             ToolRuleResult::Allowed {
@@ -460,7 +493,7 @@ mod tests {
         );
 
         // Other file matches second rule
-        let result = engine.apply_rules("Write", &serde_json::json!({"file_path": "data.csv"}));
+        let result = engine.apply_rules("Write", &serde_json::json!({"file_path": "data.csv"}), "");
         assert_eq!(
             result,
             ToolRuleResult::Denied {
@@ -499,7 +532,8 @@ mod tests {
         let engine = ToolRuleEngine::from_config(rules, None);
 
         // Both bad rules should be skipped, fallback should match
-        let result = engine.apply_rules("Write", &serde_json::json!({"file_path": "/home/.env"}));
+        let result =
+            engine.apply_rules("Write", &serde_json::json!({"file_path": "/home/.env"}), "");
         assert_eq!(
             result,
             ToolRuleResult::Asked {
@@ -524,7 +558,8 @@ mod tests {
         ];
         let engine = ToolRuleEngine::from_config(rules, None);
 
-        let result = engine.apply_rules("Write", &serde_json::json!({"file_path": "/home/.env"}));
+        let result =
+            engine.apply_rules("Write", &serde_json::json!({"file_path": "/home/.env"}), "");
         assert_eq!(
             result,
             ToolRuleResult::Allowed {
@@ -550,6 +585,7 @@ mod tests {
         let result = engine.apply_rules(
             "Read",
             &serde_json::json!({"file_path": "/home/user/project/src/main.rs"}),
+            "",
         );
         assert_eq!(
             result,
@@ -558,7 +594,8 @@ mod tests {
             }
         );
 
-        let result = engine.apply_rules("Read", &serde_json::json!({"file_path": "/other/path"}));
+        let result =
+            engine.apply_rules("Read", &serde_json::json!({"file_path": "/other/path"}), "");
         assert_eq!(result, ToolRuleResult::NoMatch);
     }
 
@@ -571,7 +608,7 @@ mod tests {
         let engine = ToolRuleEngine::from_config(rules, None);
 
         // Read matches specific rule
-        let result = engine.apply_rules("Read", &serde_json::json!({}));
+        let result = engine.apply_rules("Read", &serde_json::json!({}), "");
         assert_eq!(
             result,
             ToolRuleResult::Allowed {
@@ -580,11 +617,223 @@ mod tests {
         );
 
         // Write falls through to wildcard
-        let result = engine.apply_rules("Write", &serde_json::json!({}));
+        let result = engine.apply_rules("Write", &serde_json::json!({}), "");
         assert_eq!(
             result,
             ToolRuleResult::Asked {
                 rule_name: "ask-all".to_string()
+            }
+        );
+    }
+
+    // ===== strip_cwd_prefix tests =====
+
+    #[test]
+    fn test_strip_cwd_prefix_basic() {
+        assert_eq!(
+            strip_cwd_prefix("/home/user/project/src/main.rs", "/home/user/project"),
+            "src/main.rs"
+        );
+    }
+
+    #[test]
+    fn test_strip_cwd_prefix_trailing_slash_on_cwd() {
+        assert_eq!(
+            strip_cwd_prefix("/home/user/project/src/main.rs", "/home/user/project/"),
+            "src/main.rs"
+        );
+    }
+
+    #[test]
+    fn test_strip_cwd_prefix_value_equals_cwd() {
+        assert_eq!(
+            strip_cwd_prefix("/home/user/project", "/home/user/project"),
+            ""
+        );
+    }
+
+    #[test]
+    fn test_strip_cwd_prefix_value_equals_cwd_trailing_slash() {
+        assert_eq!(
+            strip_cwd_prefix("/home/user/project", "/home/user/project/"),
+            ""
+        );
+    }
+
+    #[test]
+    fn test_strip_cwd_prefix_no_match() {
+        assert_eq!(
+            strip_cwd_prefix("/other/path/file.rs", "/home/user/project"),
+            "/other/path/file.rs"
+        );
+    }
+
+    #[test]
+    fn test_strip_cwd_prefix_partial_dir_name() {
+        assert_eq!(strip_cwd_prefix("/foobar/baz", "/foo"), "/foobar/baz");
+    }
+
+    #[test]
+    fn test_strip_cwd_prefix_already_relative() {
+        assert_eq!(
+            strip_cwd_prefix("src/main.rs", "/home/user/project"),
+            "src/main.rs"
+        );
+    }
+
+    #[test]
+    fn test_strip_cwd_prefix_empty_cwd() {
+        assert_eq!(
+            strip_cwd_prefix("/home/user/file.rs", ""),
+            "/home/user/file.rs"
+        );
+    }
+
+    #[test]
+    fn test_strip_cwd_prefix_root_cwd() {
+        // Root cwd "/" normalizes to empty after trailing-slash strip, so no stripping occurs
+        assert_eq!(strip_cwd_prefix("/foo", "/"), "/foo");
+    }
+
+    // ===== cwd stripping in apply_rules =====
+
+    #[test]
+    fn test_cwd_stripping_matches_relative_pattern() {
+        let rules = vec![make_rule(
+            "allow-flake",
+            "Read",
+            Some("path"),
+            Some(r"^flake\.nix$"),
+            ToolRuleAction::Allow,
+        )];
+        let engine = ToolRuleEngine::from_config(rules, None);
+
+        let result = engine.apply_rules(
+            "Read",
+            &serde_json::json!({"path": "/tmp/project/flake.nix"}),
+            "/tmp/project",
+        );
+        assert_eq!(
+            result,
+            ToolRuleResult::Allowed {
+                rule_name: "allow-flake".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_cwd_stripping_no_match_different_cwd() {
+        let rules = vec![make_rule(
+            "allow-flake",
+            "Read",
+            Some("path"),
+            Some(r"^flake\.nix$"),
+            ToolRuleAction::Allow,
+        )];
+        let engine = ToolRuleEngine::from_config(rules, None);
+
+        // Path doesn't start with cwd, so no stripping — absolute path won't match "^flake\.nix$"
+        let result = engine.apply_rules(
+            "Read",
+            &serde_json::json!({"path": "/tmp/project/flake.nix"}),
+            "/other/dir",
+        );
+        assert_eq!(result, ToolRuleResult::NoMatch);
+    }
+
+    #[test]
+    fn test_cwd_stripping_absolute_pattern_still_works_without_cwd() {
+        let rules = vec![make_rule(
+            "allow-absolute",
+            "Read",
+            Some("path"),
+            Some(r"^/tmp/project/"),
+            ToolRuleAction::Allow,
+        )];
+        let engine = ToolRuleEngine::from_config(rules, None);
+
+        let result = engine.apply_rules(
+            "Read",
+            &serde_json::json!({"path": "/tmp/project/flake.nix"}),
+            "",
+        );
+        assert_eq!(
+            result,
+            ToolRuleResult::Allowed {
+                rule_name: "allow-absolute".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_cwd_stripping_subdirectory_path() {
+        let rules = vec![make_rule(
+            "allow-src",
+            "Write",
+            Some("file_path"),
+            Some(r"^src/"),
+            ToolRuleAction::Allow,
+        )];
+        let engine = ToolRuleEngine::from_config(rules, None);
+
+        let result = engine.apply_rules(
+            "Write",
+            &serde_json::json!({"file_path": "/home/user/project/src/lib.rs"}),
+            "/home/user/project",
+        );
+        assert_eq!(
+            result,
+            ToolRuleResult::Allowed {
+                rule_name: "allow-src".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_cwd_stripping_trailing_slash_on_cwd() {
+        let rules = vec![make_rule(
+            "allow-src",
+            "Read",
+            Some("file_path"),
+            Some(r"^src/"),
+            ToolRuleAction::Allow,
+        )];
+        let engine = ToolRuleEngine::from_config(rules, None);
+
+        let result = engine.apply_rules(
+            "Read",
+            &serde_json::json!({"file_path": "/home/user/project/src/main.rs"}),
+            "/home/user/project/",
+        );
+        assert_eq!(
+            result,
+            ToolRuleResult::Allowed {
+                rule_name: "allow-src".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_cwd_stripping_value_equals_cwd() {
+        // When value equals cwd, stripping produces "" — pattern "^$" matches empty string
+        let rules = vec![make_rule(
+            "match-empty",
+            "Read",
+            Some("path"),
+            Some(r"^$"),
+            ToolRuleAction::Allow,
+        )];
+        let engine = ToolRuleEngine::from_config(rules, None);
+
+        let result = engine.apply_rules(
+            "Read",
+            &serde_json::json!({"path": "/home/user/project"}),
+            "/home/user/project",
+        );
+        assert_eq!(
+            result,
+            ToolRuleResult::Allowed {
+                rule_name: "match-empty".to_string()
             }
         );
     }

@@ -1296,7 +1296,7 @@ action = { type = "Allow" }
     let _xdg_config = setup_user_bash_rules(config).await;
 
     let tool_input = serde_json::json!({"file_path": "/tmp/foo.rs"});
-    let result = handle_pretool_hook("Read", &tool_input)
+    let result = handle_pretool_hook("Read", &tool_input, "")
         .await
         .expect("Should succeed");
 
@@ -1319,7 +1319,7 @@ action = { type = "Deny", value = "Writes are blocked" }
     let _xdg_config = setup_user_bash_rules(config).await;
 
     let tool_input = serde_json::json!({"file_path": "/tmp/foo.rs", "content": "hello"});
-    let result = handle_pretool_hook("Write", &tool_input)
+    let result = handle_pretool_hook("Write", &tool_input, "")
         .await
         .expect("Should succeed");
 
@@ -1351,7 +1351,7 @@ action = { type = "Ask" }
     let _xdg_config = setup_user_bash_rules(config).await;
 
     let tool_input = serde_json::json!({"file_path": "/tmp/foo.rs"});
-    let result = handle_pretool_hook("Edit", &tool_input)
+    let result = handle_pretool_hook("Edit", &tool_input, "")
         .await
         .expect("Should succeed");
 
@@ -1382,7 +1382,7 @@ action = { type = "Allow" }
 
     // .env file should be denied
     let tool_input = serde_json::json!({"file_path": "/home/user/.env", "content": "SECRET=x"});
-    let result = handle_pretool_hook("Write", &tool_input)
+    let result = handle_pretool_hook("Write", &tool_input, "")
         .await
         .expect("Should succeed");
 
@@ -1396,7 +1396,7 @@ action = { type = "Allow" }
     // Non-.env file should be allowed
     let tool_input =
         serde_json::json!({"file_path": "/home/user/main.rs", "content": "fn main() {}"});
-    let result = handle_pretool_hook("Write", &tool_input)
+    let result = handle_pretool_hook("Write", &tool_input, "")
         .await
         .expect("Should succeed");
 
@@ -1425,7 +1425,7 @@ action = { type = "Deny", value = "Everything denied" }
 
     // tool_rules should match first and Allow, even though bash_rules would deny
     let tool_input = serde_json::json!({"command": "rm -rf /"});
-    let result = handle_pretool_hook("Bash", &tool_input)
+    let result = handle_pretool_hook("Bash", &tool_input, "")
         .await
         .expect("Should succeed");
 
@@ -1463,7 +1463,7 @@ action = { type = "Deny", value = "rm not allowed" }
 
     // Bash tool: tool_rules don't match (only Read matches), falls through to bash_rules
     let tool_input = serde_json::json!({"command": "ls -la"});
-    let result = handle_pretool_hook("Bash", &tool_input)
+    let result = handle_pretool_hook("Bash", &tool_input, "")
         .await
         .expect("Should succeed");
 
@@ -1476,7 +1476,7 @@ action = { type = "Deny", value = "rm not allowed" }
 
     // rm should be denied by bash_rules
     let tool_input = serde_json::json!({"command": "rm file.txt"});
-    let result = handle_pretool_hook("Bash", &tool_input)
+    let result = handle_pretool_hook("Bash", &tool_input, "")
         .await
         .expect("Should succeed");
 
@@ -1493,7 +1493,7 @@ async fn test_non_bash_tool_no_rules_defaults_to_ask() {
     let _xdg_config = setup_isolated_xdg_config();
 
     let tool_input = serde_json::json!({"file_path": "/tmp/foo"});
-    let result = handle_pretool_hook("Read", &tool_input)
+    let result = handle_pretool_hook("Read", &tool_input, "")
         .await
         .expect("Should succeed");
 
@@ -1525,7 +1525,7 @@ action = { type = "Ask" }
     let _xdg_config = setup_user_bash_rules(config).await;
 
     // Read matches specific rule
-    let result = handle_pretool_hook("Read", &serde_json::json!({}))
+    let result = handle_pretool_hook("Read", &serde_json::json!({}), "")
         .await
         .expect("Should succeed");
 
@@ -1537,7 +1537,7 @@ action = { type = "Ask" }
     }
 
     // Write matches wildcard
-    let result = handle_pretool_hook("Write", &serde_json::json!({}))
+    let result = handle_pretool_hook("Write", &serde_json::json!({}), "")
         .await
         .expect("Should succeed");
 
@@ -1550,7 +1550,7 @@ action = { type = "Ask" }
 
     // Bash also matches wildcard (before bash_rules run)
     let tool_input = serde_json::json!({"command": "echo hi"});
-    let result = handle_pretool_hook("Bash", &tool_input)
+    let result = handle_pretool_hook("Bash", &tool_input, "")
         .await
         .expect("Should succeed");
 
@@ -1628,7 +1628,7 @@ async fn test_pretool_hook_invalid_config_defaults_to_ask() {
     .unwrap();
 
     let tool_input = serde_json::json!({"file_path": "/tmp/foo.rs"});
-    let result = handle_pretool_hook("Read", &tool_input)
+    let result = handle_pretool_hook("Read", &tool_input, "")
         .await
         .expect("Should succeed with Ask fallback");
 
@@ -1638,6 +1638,68 @@ async fn test_pretool_hook_invalid_config_defaults_to_ask() {
                 output.permission_decision,
                 Some(PermissionDecision::Ask),
                 "Invalid config should fail-open to Ask"
+            );
+        }
+        _ => panic!("Expected PreToolUse hook specific output"),
+    }
+}
+
+// ===== cwd stripping integration tests =====
+
+#[tokio::test]
+async fn test_tool_rule_cwd_stripping_matches_relative_pattern() {
+    let config = r#"
+[[tool_rules]]
+name = "allow-flake"
+tool = "Read"
+field = "path"
+pattern = "^flake\\.nix$"
+action = { type = "Allow" }
+"#;
+    let _xdg_config = setup_user_bash_rules(config).await;
+
+    // Absolute path with matching cwd should be stripped to "flake.nix" and match
+    let tool_input = serde_json::json!({"path": "/tmp/project/flake.nix"});
+    let result = handle_pretool_hook("Read", &tool_input, "/tmp/project")
+        .await
+        .expect("Should succeed");
+
+    match result.hook_specific_output {
+        Some(HookSpecificOutput::PreToolUse(output)) => {
+            assert_eq!(
+                output.permission_decision,
+                Some(PermissionDecision::Allow),
+                "Relative pattern should match after cwd stripping"
+            );
+        }
+        _ => panic!("Expected PreToolUse hook specific output"),
+    }
+}
+
+#[tokio::test]
+async fn test_tool_rule_cwd_stripping_no_match_different_cwd() {
+    let config = r#"
+[[tool_rules]]
+name = "allow-flake"
+tool = "Read"
+field = "path"
+pattern = "^flake\\.nix$"
+action = { type = "Allow" }
+"#;
+    let _xdg_config = setup_user_bash_rules(config).await;
+
+    // Different cwd means path is not stripped, so "^flake\.nix$" won't match the absolute path
+    let tool_input = serde_json::json!({"path": "/tmp/project/flake.nix"});
+    let result = handle_pretool_hook("Read", &tool_input, "/other/dir")
+        .await
+        .expect("Should succeed");
+
+    match result.hook_specific_output {
+        Some(HookSpecificOutput::PreToolUse(output)) => {
+            assert_eq!(
+                output.permission_decision,
+                Some(PermissionDecision::Ask),
+                "Should not match when cwd doesn't match path prefix"
             );
         }
         _ => panic!("Expected PreToolUse hook specific output"),

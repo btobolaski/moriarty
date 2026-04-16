@@ -79,6 +79,8 @@ When `field` and `pattern` are specified, Moriarty extracts the field value from
 - **Booleans**: converted to string (`true`/`false`)
 - **Arrays/Objects/Null**: cannot be matched (rule doesn't match)
 
+**CWD prefix stripping**: Claude Code sends absolute paths in tool inputs (e.g., `/home/user/project/src/main.rs`). Before regex matching, Moriarty strips the hook input's `cwd` prefix from field values, so rules can use relative paths. For example, with `cwd = "/home/user/project"`, a field value of `/home/user/project/src/main.rs` becomes `src/main.rs` for matching purposes. If the value doesn't start with `cwd`, it's matched as-is.
+
 ### Evaluation Order
 
 ```

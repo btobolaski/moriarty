@@ -88,7 +88,7 @@ cargo nextest run --no-fail-fast --hide-progress-bar --success-output never --st
 
 **`hooks/`** - Security hook system for Claude Code integration:
 - **PreToolUse hook**: Two-tier permission system from `~/.config/moriarty/tool_rules.toml`:
-  - `tool_rules`: Permission any tool call (Read, Write, Edit, Bash, etc.) with optional field-level regex matching. Actions: Allow, Deny, Ask. Checked first.
+  - `tool_rules`: Permission any tool call (Read, Write, Edit, Bash, etc.) with optional field-level regex matching. Actions: Allow, Deny, Ask. Checked first. Field values that start with the hook input's `cwd` have that prefix stripped before regex matching, so rules can use relative paths (e.g., `^src/` instead of absolute paths).
   - `bash_rules`: Bash-specific command validation with regex patterns. Actions: Allow, Deny, Modify, Ask, ArgumentFilter. Checked when no tool_rule matches a Bash call.
   - Evaluation order: tool_rules → bash_rules (for Bash) → default Ask (for non-Bash)
 - **Stop hook**: Runs project checks before allowing execution
@@ -135,7 +135,7 @@ cargo nextest run --no-fail-fast --hide-progress-bar --success-output never --st
 - Choice depends on: number of commands, similarity of parameter structures, and whether command discoverability is critical
 
 **Configuration** (XDG-compliant):
-- `~/.config/moriarty/tool_rules.toml` - Bash validation rules
+- `~/.config/moriarty/tool_rules.toml` - Tool and Bash validation rules
 - `<project>/.config/tools.toml` - Project commands and checks
 - `~/.config/moriarty/project_approvals.toml` - SHA-256 approval hashes
 - `~/.local/state/moriarty/logs/` - Structured logs
