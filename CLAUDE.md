@@ -87,9 +87,11 @@ cargo nextest run --no-fail-fast --hide-progress-bar --success-output never --st
 - **Architectural patterns**: git_read_only uses separate MCP tools per command; jj_read_only uses enum-based single tool (see MCP Command Patterns below)
 
 **`hooks/`** - Security hook system for Claude Code integration:
-- **PreToolUse hook**: Validates Bash commands using user-configured rules from `~/.config/moriarty/tool_rules.toml`
+- **PreToolUse hook**: Two-tier permission system from `~/.config/moriarty/tool_rules.toml`:
+  - `tool_rules`: Permission any tool call (Read, Write, Edit, Bash, etc.) with optional field-level regex matching. Actions: Allow, Deny, Ask. Checked first.
+  - `bash_rules`: Bash-specific command validation with regex patterns. Actions: Allow, Deny, Modify, Ask, ArgumentFilter. Checked when no tool_rule matches a Bash call.
+  - Evaluation order: tool_rules → bash_rules (for Bash) → default Ask (for non-Bash)
 - **Stop hook**: Runs project checks before allowing execution
-- Rule engine supports Allow, Deny, Modify, and Ask decisions
 - Structured logging with tracing crate for debugging hook execution
 - Security model: Defaults to "Ask" when unconfigured, fail-closed once configured (verification failures block execution)
 

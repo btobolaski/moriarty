@@ -1282,3 +1282,364 @@ fn test_pretool_ask_hook_omits_system_message() {
         panic!("Expected PreToolUse hook output");
     }
 }
+
+// ===== Tool Rules integration tests =====
+
+#[tokio::test]
+async fn test_tool_rule_allow_non_bash() {
+    let config = r#"
+[[tool_rules]]
+name = "allow-read"
+tool = "Read"
+action = { type = "Allow" }
+"#;
+    let _xdg_config = setup_user_bash_rules(config).await;
+
+    let tool_input = serde_json::json!({"file_path": "/tmp/foo.rs"});
+    let result = handle_pretool_hook("Read", &tool_input)
+        .await
+        .expect("Should succeed");
+
+    match result.hook_specific_output {
+        Some(HookSpecificOutput::PreToolUse(output)) => {
+            assert_eq!(output.permission_decision, Some(PermissionDecision::Allow));
+        }
+        _ => panic!("Expected PreToolUse hook specific output"),
+    }
+}
+
+#[tokio::test]
+async fn test_tool_rule_deny_non_bash() {
+    let config = r#"
+[[tool_rules]]
+name = "deny-write"
+tool = "Write"
+action = { type = "Deny", value = "Writes are blocked" }
+"#;
+    let _xdg_config = setup_user_bash_rules(config).await;
+
+    let tool_input = serde_json::json!({"file_path": "/tmp/foo.rs", "content": "hello"});
+    let result = handle_pretool_hook("Write", &tool_input)
+        .await
+        .expect("Should succeed");
+
+    assert_eq!(
+        result.system_message,
+        Some("Writes are blocked".to_string())
+    );
+
+    match result.hook_specific_output {
+        Some(HookSpecificOutput::PreToolUse(output)) => {
+            assert_eq!(output.permission_decision, Some(PermissionDecision::Deny));
+            assert!(output
+                .permission_decision_reason
+                .unwrap()
+                .contains("Writes are blocked"));
+        }
+        _ => panic!("Expected PreToolUse hook specific output"),
+    }
+}
+
+#[tokio::test]
+async fn test_tool_rule_ask_non_bash() {
+    let config = r#"
+[[tool_rules]]
+name = "ask-edit"
+tool = "Edit"
+action = { type = "Ask" }
+"#;
+    let _xdg_config = setup_user_bash_rules(config).await;
+
+    let tool_input = serde_json::json!({"file_path": "/tmp/foo.rs"});
+    let result = handle_pretool_hook("Edit", &tool_input)
+        .await
+        .expect("Should succeed");
+
+    match result.hook_specific_output {
+        Some(HookSpecificOutput::PreToolUse(output)) => {
+            assert_eq!(output.permission_decision, Some(PermissionDecision::Ask));
+        }
+        _ => panic!("Expected PreToolUse hook specific output"),
+    }
+}
+
+#[tokio::test]
+async fn test_tool_rule_with_field_pattern() {
+    let config = r#"
+[[tool_rules]]
+name = "deny-env-write"
+tool = "Write"
+field = "file_path"
+pattern = "\\.env$"
+action = { type = "Deny", value = "Cannot write to .env files" }
+
+[[tool_rules]]
+name = "allow-write"
+tool = "Write"
+action = { type = "Allow" }
+"#;
+    let _xdg_config = setup_user_bash_rules(config).await;
+
+    // .env file should be denied
+    let tool_input = serde_json::json!({"file_path": "/home/user/.env", "content": "SECRET=x"});
+    let result = handle_pretool_hook("Write", &tool_input)
+        .await
+        .expect("Should succeed");
+
+    match result.hook_specific_output {
+        Some(HookSpecificOutput::PreToolUse(output)) => {
+            assert_eq!(output.permission_decision, Some(PermissionDecision::Deny));
+        }
+        _ => panic!("Expected PreToolUse hook specific output"),
+    }
+
+    // Non-.env file should be allowed
+    let tool_input =
+        serde_json::json!({"file_path": "/home/user/main.rs", "content": "fn main() {}"});
+    let result = handle_pretool_hook("Write", &tool_input)
+        .await
+        .expect("Should succeed");
+
+    match result.hook_specific_output {
+        Some(HookSpecificOutput::PreToolUse(output)) => {
+            assert_eq!(output.permission_decision, Some(PermissionDecision::Allow));
+        }
+        _ => panic!("Expected PreToolUse hook specific output"),
+    }
+}
+
+#[tokio::test]
+async fn test_tool_rules_checked_before_bash_rules_for_bash() {
+    let config = r#"
+[[tool_rules]]
+name = "tool-rule-allows-bash"
+tool = "Bash"
+action = { type = "Allow" }
+
+[[bash_rules]]
+name = "deny-everything"
+pattern = ".*"
+action = { type = "Deny", value = "Everything denied" }
+"#;
+    let _xdg_config = setup_user_bash_rules(config).await;
+
+    // tool_rules should match first and Allow, even though bash_rules would deny
+    let tool_input = serde_json::json!({"command": "rm -rf /"});
+    let result = handle_pretool_hook("Bash", &tool_input)
+        .await
+        .expect("Should succeed");
+
+    match result.hook_specific_output {
+        Some(HookSpecificOutput::PreToolUse(output)) => {
+            assert_eq!(
+                output.permission_decision,
+                Some(PermissionDecision::Allow),
+                "tool_rules should take precedence over bash_rules"
+            );
+        }
+        _ => panic!("Expected PreToolUse hook specific output"),
+    }
+}
+
+#[tokio::test]
+async fn test_bash_rules_still_work_when_tool_rules_dont_match() {
+    let config = r#"
+[[tool_rules]]
+name = "allow-read"
+tool = "Read"
+action = { type = "Allow" }
+
+[[bash_rules]]
+name = "allow-ls"
+pattern = "^ls($|\\s)"
+action = { type = "Allow" }
+
+[[bash_rules]]
+name = "deny-rm"
+pattern = "^rm"
+action = { type = "Deny", value = "rm not allowed" }
+"#;
+    let _xdg_config = setup_user_bash_rules(config).await;
+
+    // Bash tool: tool_rules don't match (only Read matches), falls through to bash_rules
+    let tool_input = serde_json::json!({"command": "ls -la"});
+    let result = handle_pretool_hook("Bash", &tool_input)
+        .await
+        .expect("Should succeed");
+
+    match result.hook_specific_output {
+        Some(HookSpecificOutput::PreToolUse(output)) => {
+            assert_eq!(output.permission_decision, Some(PermissionDecision::Allow));
+        }
+        _ => panic!("Expected PreToolUse hook specific output"),
+    }
+
+    // rm should be denied by bash_rules
+    let tool_input = serde_json::json!({"command": "rm file.txt"});
+    let result = handle_pretool_hook("Bash", &tool_input)
+        .await
+        .expect("Should succeed");
+
+    match result.hook_specific_output {
+        Some(HookSpecificOutput::PreToolUse(output)) => {
+            assert_eq!(output.permission_decision, Some(PermissionDecision::Deny));
+        }
+        _ => panic!("Expected PreToolUse hook specific output"),
+    }
+}
+
+#[tokio::test]
+async fn test_non_bash_tool_no_rules_defaults_to_ask() {
+    let _xdg_config = setup_isolated_xdg_config();
+
+    let tool_input = serde_json::json!({"file_path": "/tmp/foo"});
+    let result = handle_pretool_hook("Read", &tool_input)
+        .await
+        .expect("Should succeed");
+
+    match result.hook_specific_output {
+        Some(HookSpecificOutput::PreToolUse(output)) => {
+            assert_eq!(
+                output.permission_decision,
+                Some(PermissionDecision::Ask),
+                "Non-Bash tools with no rules should default to Ask"
+            );
+        }
+        _ => panic!("Expected PreToolUse hook specific output"),
+    }
+}
+
+#[tokio::test]
+async fn test_tool_rule_wildcard_matching() {
+    let config = r#"
+[[tool_rules]]
+name = "allow-read"
+tool = "Read"
+action = { type = "Allow" }
+
+[[tool_rules]]
+name = "ask-everything-else"
+tool = "*"
+action = { type = "Ask" }
+"#;
+    let _xdg_config = setup_user_bash_rules(config).await;
+
+    // Read matches specific rule
+    let result = handle_pretool_hook("Read", &serde_json::json!({}))
+        .await
+        .expect("Should succeed");
+
+    match result.hook_specific_output {
+        Some(HookSpecificOutput::PreToolUse(output)) => {
+            assert_eq!(output.permission_decision, Some(PermissionDecision::Allow));
+        }
+        _ => panic!("Expected PreToolUse hook specific output"),
+    }
+
+    // Write matches wildcard
+    let result = handle_pretool_hook("Write", &serde_json::json!({}))
+        .await
+        .expect("Should succeed");
+
+    match result.hook_specific_output {
+        Some(HookSpecificOutput::PreToolUse(output)) => {
+            assert_eq!(output.permission_decision, Some(PermissionDecision::Ask));
+        }
+        _ => panic!("Expected PreToolUse hook specific output"),
+    }
+
+    // Bash also matches wildcard (before bash_rules run)
+    let tool_input = serde_json::json!({"command": "echo hi"});
+    let result = handle_pretool_hook("Bash", &tool_input)
+        .await
+        .expect("Should succeed");
+
+    match result.hook_specific_output {
+        Some(HookSpecificOutput::PreToolUse(output)) => {
+            assert_eq!(
+                output.permission_decision,
+                Some(PermissionDecision::Ask),
+                "Wildcard should match Bash too"
+            );
+        }
+        _ => panic!("Expected PreToolUse hook specific output"),
+    }
+}
+
+#[tokio::test]
+async fn test_exec_hook_impl_non_bash_pretool_produces_output() {
+    let _xdg_dir = setup_isolated_xdg_state();
+    let _xdg_config = setup_isolated_xdg_config();
+
+    // Non-Bash PreToolUse event should now produce JSON output (Ask by default)
+    let input = r#"{
+        "session_id": "test-session",
+        "transcript_path": "/tmp/transcript.json",
+        "cwd": "/tmp/project",
+        "permission_mode": "default",
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Read",
+        "tool_input": {"file_path": "/tmp/foo.rs"}
+    }"#;
+
+    let cursor = Cursor::new(input);
+    let result = exec_hook_impl(cursor).await;
+    result.expect("Non-Bash PreToolUse should succeed and produce output");
+}
+
+#[tokio::test]
+async fn test_exec_hook_impl_non_bash_pretool_with_tool_rules() {
+    let _xdg_dir = setup_isolated_xdg_state();
+
+    let config = r#"
+[[tool_rules]]
+name = "allow-read"
+tool = "Read"
+action = { type = "Allow" }
+"#;
+    let _xdg_config = setup_user_bash_rules(config).await;
+
+    let input = r#"{
+        "session_id": "test-session",
+        "transcript_path": "/tmp/transcript.json",
+        "cwd": "/tmp/project",
+        "permission_mode": "default",
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Read",
+        "tool_input": {"file_path": "/tmp/foo.rs"}
+    }"#;
+
+    let cursor = Cursor::new(input);
+    let result = exec_hook_impl(cursor).await;
+    result.expect("Non-Bash PreToolUse with tool_rules should succeed");
+}
+
+#[tokio::test]
+async fn test_pretool_hook_invalid_config_defaults_to_ask() {
+    let temp_dir = setup_isolated_xdg_config();
+
+    let moriarty_dir = temp_dir.path().join("moriarty");
+    tokio::fs::create_dir_all(&moriarty_dir).await.unwrap();
+    tokio::fs::write(
+        moriarty_dir.join("tool_rules.toml"),
+        "this is not valid [[[[ toml",
+    )
+    .await
+    .unwrap();
+
+    let tool_input = serde_json::json!({"file_path": "/tmp/foo.rs"});
+    let result = handle_pretool_hook("Read", &tool_input)
+        .await
+        .expect("Should succeed with Ask fallback");
+
+    match result.hook_specific_output {
+        Some(HookSpecificOutput::PreToolUse(output)) => {
+            assert_eq!(
+                output.permission_decision,
+                Some(PermissionDecision::Ask),
+                "Invalid config should fail-open to Ask"
+            );
+        }
+        _ => panic!("Expected PreToolUse hook specific output"),
+    }
+}

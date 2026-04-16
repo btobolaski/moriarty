@@ -388,6 +388,7 @@ mod tests {
         let config = UserConfig {
             pattern_fragments: None,
             bash_rules: Some(rules),
+            tool_rules: None,
         };
 
         let config_path = config_dir.join("test_rules.toml");
@@ -558,6 +559,7 @@ mod tests {
                 pattern: r"^ls{{safe_chars}}*$".to_string(),
                 action: BashRuleAction::Allow,
             }]),
+            tool_rules: None,
         };
 
         let config_path = config_dir.join("test_rules.toml");

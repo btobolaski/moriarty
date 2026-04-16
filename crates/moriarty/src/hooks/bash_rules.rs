@@ -86,7 +86,10 @@ pub struct BashRuleEngine {
 /// let expanded = expand_fragments(pattern, &fragments).unwrap();
 /// assert_eq!(expanded, "^ls( [^|&;$]+)*$");
 /// ```
-fn expand_fragments(pattern: &str, fragments: &HashMap<String, String>) -> Result<String> {
+pub(crate) fn expand_fragments(
+    pattern: &str,
+    fragments: &HashMap<String, String>,
+) -> Result<String> {
     // Maximum nesting depth chosen to allow reasonable fragment composition
     // (e.g., safe_chars -> safe_arg -> safe_pipe) while preventing
     // resource exhaustion from deeply nested or circular references.
@@ -171,7 +174,7 @@ fn expand_fragments(pattern: &str, fragments: &HashMap<String, String>) -> Resul
 ///
 /// These fragments are merged with user-defined fragments, with user
 /// definitions taking precedence.
-fn default_fragments() -> HashMap<String, String> {
+pub(crate) fn default_fragments() -> HashMap<String, String> {
     let mut fragments = HashMap::new();
 
     // Character classes - fundamental building blocks

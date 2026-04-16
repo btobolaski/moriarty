@@ -1,10 +1,11 @@
-# Bash Rules Configuration Guide
+# Tool & Bash Rules Configuration Guide
 
-Moriarty provides a powerful bash command validation system that allows you to control which commands Claude Code can execute, modify commands before execution, or require user approval for potentially dangerous operations.
+Moriarty provides a powerful tool call validation system that allows you to control which tools and commands Claude Code can execute. **Tool rules** permission any tool call (Read, Write, Edit, Bash, etc.), while **bash rules** provide command-level validation specifically for Bash tool calls.
 
 ## Table of Contents
 
 - [Quick Start](#quick-start)
+- [Tool Rules](#tool-rules)
 - [Configuration File](#configuration-file)
 - [Rule Actions](#rule-actions)
 - [Pattern Fragments](#pattern-fragments)
@@ -26,6 +27,127 @@ action = { type = "Allow" }
 name = "deny-rm-rf-root"
 pattern = "^rm\\s+-rf\\s+/"
 action = { type = "Deny", value = "Dangerous recursive delete of root directories" }
+```
+
+## Tool Rules
+
+Tool rules permission any Claude Code tool call — not just Bash. They are checked **before** bash rules, providing a unified way to control tool access.
+
+### Quick Start
+
+```toml
+[[tool_rules]]
+name = "allow-read"
+tool = "Read"
+action = { type = "Allow" }
+
+[[tool_rules]]
+name = "deny-write-env"
+tool = "Write"
+field = "file_path"
+pattern = "\\.env$"
+action = { type = "Deny", value = "Cannot write to .env files" }
+
+[[tool_rules]]
+name = "deny-all-unknown"
+tool = "*"
+action = { type = "Ask" }
+```
+
+### Structure
+
+```toml
+[[tool_rules]]
+name = "descriptive-name"
+tool = "ToolName"           # Exact tool name or "*" for any tool
+field = "field_name"        # Optional: field in tool_input to match
+pattern = "regex-pattern"   # Optional: regex pattern for the field value
+action = { type = "ActionType", ... }
+```
+
+- **name**: A descriptive name for the rule (used in logs)
+- **tool**: Exact tool name to match (e.g., `"Read"`, `"Write"`, `"Edit"`, `"Bash"`, `"Glob"`, `"Grep"`), or `"*"` to match any tool
+- **field** + **pattern**: Optional pair. When both present, the regex `pattern` matches against the named field's value in `tool_input`. When absent, the rule applies to any invocation of the tool. If only one is present, the rule is skipped (configuration error, logged).
+- **action**: `Allow`, `Deny`, or `Ask` (see [Rule Actions](#rule-actions)). Note: `Modify` and `ArgumentFilter` are Bash-specific and not available for tool rules.
+
+### Field Pattern Matching
+
+When `field` and `pattern` are specified, Moriarty extracts the field value from the tool input:
+
+- **Strings**: matched directly (e.g., `file_path`, `content`)
+- **Numbers**: converted to string (e.g., `42` → `"42"`)
+- **Booleans**: converted to string (`true`/`false`)
+- **Arrays/Objects/Null**: cannot be matched (rule doesn't match)
+
+### Evaluation Order
+
+```
+PreToolUse event (any tool)
+  |
+  +-> tool_rules engine (first-match-wins)
+  |     Match found? -> return Allow/Deny/Ask
+  |     NoMatch? -> continue
+  |
+  +-> tool_name == "Bash"?
+  |     Yes -> bash_rules engine (existing behavior)
+  |     No  -> default to Ask
+```
+
+Both `tool_rules` and `bash_rules` coexist in the same `tool_rules.toml` config file.
+
+### Examples
+
+Allow reading files, deny writing `.env` files, ask for everything else:
+
+```toml
+[[tool_rules]]
+name = "allow-read"
+tool = "Read"
+action = { type = "Allow" }
+
+[[tool_rules]]
+name = "allow-glob"
+tool = "Glob"
+action = { type = "Allow" }
+
+[[tool_rules]]
+name = "allow-grep"
+tool = "Grep"
+action = { type = "Allow" }
+
+[[tool_rules]]
+name = "deny-write-env"
+tool = "Write"
+field = "file_path"
+pattern = "\\.env$"
+action = { type = "Deny", value = "Cannot write to .env files" }
+
+# Bash tools fall through to bash_rules below
+# Everything else requires user approval
+[[tool_rules]]
+name = "ask-unknown"
+tool = "*"
+action = { type = "Ask" }
+
+# Bash-specific rules (only used when no tool_rule matches Bash)
+[[bash_rules]]
+name = "allow-ls"
+pattern = "^ls($|\\s)"
+action = { type = "Allow" }
+```
+
+Use [pattern fragments](#pattern-fragments) in tool rule patterns:
+
+```toml
+[pattern_fragments]
+project = "/home/user/project"
+
+[[tool_rules]]
+name = "allow-project-read"
+tool = "Read"
+field = "file_path"
+pattern = "^{{project}}/"
+action = { type = "Allow" }
 ```
 
 ## Configuration File

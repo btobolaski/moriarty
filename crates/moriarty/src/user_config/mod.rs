@@ -61,6 +61,9 @@ pub struct UserConfig {
 
     #[serde(default)]
     pub bash_rules: Option<Vec<BashRule>>,
+
+    #[serde(default)]
+    pub tool_rules: Option<Vec<ToolRule>>,
 }
 
 /// Rules evaluated in order with first-match-wins semantics.
@@ -122,6 +125,42 @@ pub enum BashRuleAction {
     },
 }
 
+/// A rule for permissioning any Claude Code tool call (Read, Write, Edit, Bash, etc.).
+///
+/// Rules are evaluated in order with first-match-wins semantics. The `tool` field is an exact
+/// string match against the tool name (or `"*"` for catch-all). Optional `field` + `pattern`
+/// provide regex matching against a specific field in the tool input.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ToolRule {
+    pub name: String,
+    /// Exact tool name to match (e.g., "Read", "Write", "Bash"), or `"*"` for any tool.
+    pub tool: String,
+    /// Optional field name in tool_input to match against.
+    /// Must be paired with `pattern`; if only one is present, the rule is skipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+    /// Optional regex pattern to match against the field value.
+    /// Must be paired with `field`; if only one is present, the rule is skipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+    pub action: ToolRuleAction,
+}
+
+/// Action to take when a tool rule matches.
+///
+/// Only Allow, Deny, and Ask are supported. Modify and ArgumentFilter are Bash-specific
+/// and excluded because they operate on command strings, not arbitrary tool inputs.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "type")]
+pub enum ToolRuleAction {
+    /// Explicitly allow the tool call to execute.
+    Allow,
+    /// Deny execution of the tool call with the specified reason.
+    Deny { value: String },
+    /// Defer to the user for case-by-case authorization.
+    Ask,
+}
+
 /// Load user-level configuration from `~/.config/moriarty/tool_rules.toml`.
 ///
 /// Fails-open only when the config file is missing, returning a default (empty) configuration.
@@ -171,6 +210,7 @@ mod tests {
         let config = UserConfig::default();
         assert_eq!(config.bash_rules, None);
         assert_eq!(config.pattern_fragments, None);
+        assert_eq!(config.tool_rules, None);
     }
 
     #[test]
@@ -344,6 +384,7 @@ reason = "Browser not needed""#;
                     action: BashRuleAction::Allow,
                 },
             ]),
+            tool_rules: None,
         };
 
         FileType::Config
@@ -365,6 +406,7 @@ reason = "Browser not needed""#;
         let test_config = UserConfig {
             pattern_fragments: None,
             bash_rules: None,
+            tool_rules: None,
         };
 
         FileType::Config
@@ -403,5 +445,127 @@ reason = "Browser not needed""#;
         );
 
         std::env::remove_var("XDG_CONFIG_HOME");
+    }
+
+    #[test]
+    fn test_tool_rule_serialization() {
+        let rule = ToolRule {
+            name: "test-rule".to_string(),
+            tool: "Read".to_string(),
+            field: Some("file_path".to_string()),
+            pattern: Some("\\.env$".to_string()),
+            action: ToolRuleAction::Deny {
+                value: "Cannot read .env files".to_string(),
+            },
+        };
+
+        let toml = toml::to_string(&rule).unwrap();
+        let deserialized: ToolRule = toml::from_str(&toml).unwrap();
+        assert_eq!(rule, deserialized);
+    }
+
+    #[test]
+    fn test_tool_rule_serialization_without_field_pattern() {
+        let rule = ToolRule {
+            name: "allow-read".to_string(),
+            tool: "Read".to_string(),
+            field: None,
+            pattern: None,
+            action: ToolRuleAction::Allow,
+        };
+
+        let toml = toml::to_string(&rule).unwrap();
+        assert!(!toml.contains("field"));
+        assert!(!toml.contains("pattern"));
+
+        let deserialized: ToolRule = toml::from_str(&toml).unwrap();
+        assert_eq!(rule, deserialized);
+    }
+
+    #[test]
+    fn test_tool_rule_action_serialization() {
+        let actions = vec![
+            ToolRuleAction::Allow,
+            ToolRuleAction::Deny {
+                value: "reason".to_string(),
+            },
+            ToolRuleAction::Ask,
+        ];
+
+        for action in actions {
+            let toml = toml::to_string(&action).unwrap();
+            let deserialized: ToolRuleAction = toml::from_str(&toml).unwrap();
+            assert_eq!(action, deserialized);
+        }
+    }
+
+    #[test]
+    fn test_tool_rule_action_toml_format_compatibility() {
+        let toml_allow = r#"type = "Allow""#;
+        let action: ToolRuleAction = toml::from_str(toml_allow).unwrap();
+        assert_eq!(action, ToolRuleAction::Allow);
+
+        let toml_deny = r#"type = "Deny"
+value = "not allowed""#;
+        let action: ToolRuleAction = toml::from_str(toml_deny).unwrap();
+        assert_eq!(
+            action,
+            ToolRuleAction::Deny {
+                value: "not allowed".to_string()
+            }
+        );
+
+        let toml_ask = r#"type = "Ask""#;
+        let action: ToolRuleAction = toml::from_str(toml_ask).unwrap();
+        assert_eq!(action, ToolRuleAction::Ask);
+    }
+
+    #[test]
+    fn test_tool_rule_wildcard() {
+        let rule = ToolRule {
+            name: "catch-all".to_string(),
+            tool: "*".to_string(),
+            field: None,
+            pattern: None,
+            action: ToolRuleAction::Ask,
+        };
+
+        let toml = toml::to_string(&rule).unwrap();
+        let deserialized: ToolRule = toml::from_str(&toml).unwrap();
+        assert_eq!(rule, deserialized);
+    }
+
+    #[test]
+    fn test_user_config_round_trip_with_tool_rules() {
+        let config = UserConfig {
+            pattern_fragments: None,
+            bash_rules: Some(vec![BashRule {
+                name: "allow-ls".to_string(),
+                pattern: "^ls".to_string(),
+                action: BashRuleAction::Allow,
+            }]),
+            tool_rules: Some(vec![
+                ToolRule {
+                    name: "allow-read".to_string(),
+                    tool: "Read".to_string(),
+                    field: None,
+                    pattern: None,
+                    action: ToolRuleAction::Allow,
+                },
+                ToolRule {
+                    name: "deny-env-write".to_string(),
+                    tool: "Write".to_string(),
+                    field: Some("file_path".to_string()),
+                    pattern: Some(r"\.env$".to_string()),
+                    action: ToolRuleAction::Deny {
+                        value: "Cannot write .env".to_string(),
+                    },
+                },
+            ]),
+        };
+
+        let toml = toml::to_string(&config).unwrap();
+        let deserialized: UserConfig = toml::from_str(&toml).unwrap();
+        assert_eq!(config, deserialized);
     }
 }

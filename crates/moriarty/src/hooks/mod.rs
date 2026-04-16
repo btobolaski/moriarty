@@ -54,6 +54,7 @@
 
 pub mod bash_rules;
 pub mod parser;
+pub mod tool_rules;
 pub mod tracing;
 
 use crate::project_config::{approvals::ProjectApprovals, config::load_project_settings};
@@ -174,17 +175,15 @@ async fn exec_hook_impl<R: Read>(reader: R) -> Result<()> {
         ref tool_input,
     } = hook_input.event_data
     {
-        if tool_name == "Bash" {
-            let hook_output = handle_bash_pretool_hook(tool_input).await?;
+        let hook_output = handle_pretool_hook(tool_name, tool_input).await?;
 
-            let json_output = serde_json::to_string(&hook_output)
-                .map_err(|e| miette::miette!("Failed to serialize HookOutput: {}", e))?;
+        let json_output = serde_json::to_string(&hook_output)
+            .map_err(|e| miette::miette!("Failed to serialize HookOutput: {}", e))?;
 
-            println!("{}", json_output);
+        println!("{}", json_output);
 
-            info!(?hook_output, "Bash PreToolUse hook completed");
-            return Ok(());
-        }
+        info!(?hook_output, "PreToolUse hook completed");
+        return Ok(());
     }
 
     // Handle Stop hook
@@ -345,11 +344,95 @@ fn pretool_modify_hook(new_input: serde_json::Value, reason: Option<String>) -> 
     }
 }
 
-/// Apply user-level bash_rules from ~/.config/moriarty/tool_rules.toml to validate Bash commands.
+/// Unified PreToolUse handler: checks tool_rules first, then falls back to bash_rules for Bash.
 ///
-/// Uses fail-open design: returns Ask when rules are missing or unconfigured, ensuring bash_rules
-/// remain opt-in without breaking workflows.
+/// Evaluation order:
+/// 1. tool_rules engine (first-match-wins) — if match, return Allow/Deny/Ask
+/// 2. If NoMatch and tool is Bash — bash_rules engine (existing behavior)
+/// 3. If NoMatch and tool is not Bash — default to Ask
+async fn handle_pretool_hook(
+    tool_name: &str,
+    tool_input: &serde_json::Value,
+) -> Result<HookOutput> {
+    let config = match load_user_config().await {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            warn!(error = %e, "Failed to load user config, defaulting to Ask");
+            return Ok(pretool_ask_hook());
+        }
+    };
+
+    if let Some(rules) = &config.tool_rules {
+        if !rules.is_empty() {
+            let engine = tool_rules::ToolRuleEngine::from_config(
+                rules.clone(),
+                config.pattern_fragments.clone(),
+            );
+            let result = engine.apply_rules(tool_name, tool_input);
+
+            match result {
+                tool_rules::ToolRuleResult::Allowed { rule_name } => {
+                    info!(
+                        tool_name = %tool_name,
+                        rule = %rule_name,
+                        "Tool call allowed by tool rule"
+                    );
+                    return Ok(pretool_allow_hook(None));
+                }
+                tool_rules::ToolRuleResult::Denied { rule_name, reason } => {
+                    info!(
+                        tool_name = %tool_name,
+                        rule = %rule_name,
+                        reason = %reason,
+                        "Tool call denied by tool rule"
+                    );
+                    return Ok(pretool_deny_hook(reason));
+                }
+                tool_rules::ToolRuleResult::Asked { rule_name } => {
+                    info!(
+                        tool_name = %tool_name,
+                        rule = %rule_name,
+                        "Tool rule requests user permission"
+                    );
+                    return Ok(pretool_ask_hook());
+                }
+                tool_rules::ToolRuleResult::NoMatch => {
+                    debug!(tool_name = %tool_name, "No tool rules matched, continuing to engine-specific handling");
+                }
+            }
+        }
+    }
+
+    if tool_name == "Bash" {
+        handle_bash_pretool_hook_with_config(tool_input, config).await
+    } else {
+        debug!(tool_name = %tool_name, "No tool rules matched for non-Bash tool, defaulting to Ask");
+        Ok(pretool_ask_hook())
+    }
+}
+
+/// Test-only entry point for bash rule validation.
+///
+/// Production code routes through `handle_pretool_hook` instead. This wrapper is kept so
+/// existing bash-rule tests can call it directly without going through the tool_rules layer.
+#[cfg(test)]
 async fn handle_bash_pretool_hook(tool_input: &serde_json::Value) -> Result<HookOutput> {
+    let config = match load_user_config().await {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            warn!(error = %e, "Failed to load user config, defaulting to Ask");
+            return Ok(pretool_ask_hook());
+        }
+    };
+
+    handle_bash_pretool_hook_with_config(tool_input, config).await
+}
+
+/// Apply bash_rules from a pre-loaded config to validate Bash commands.
+async fn handle_bash_pretool_hook_with_config(
+    tool_input: &serde_json::Value,
+    config: crate::user_config::UserConfig,
+) -> Result<HookOutput> {
     use bash_rules::{BashRuleEngine, RuleResult};
 
     let command = tool_input
@@ -358,14 +441,6 @@ async fn handle_bash_pretool_hook(tool_input: &serde_json::Value) -> Result<Hook
         .ok_or_else(|| miette::miette!("Missing 'command' field in Bash tool_input"))?;
 
     info!(command = %command, "Processing Bash PreToolUse hook");
-
-    let config = match load_user_config().await {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            warn!(error = %e, "Failed to load user config, defaulting to Ask");
-            return Ok(pretool_ask_hook());
-        }
-    };
 
     let bash_rules = match config.bash_rules {
         Some(rules) if !rules.is_empty() => rules,
