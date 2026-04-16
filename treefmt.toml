@@ -1,0 +1,8 @@
+[formatter.md]
+command = "prettier"
+options = ["--prose-wrap", "always", "--print-width", "120", "--write"]
+includes = ["*.md"]
+
+[formatter.nix]
+command = "alejandra"
+includes = ["*.nix"]

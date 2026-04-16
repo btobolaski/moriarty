@@ -1,6 +1,8 @@
 # Tool & Bash Rules Configuration Guide
 
-Moriarty provides a powerful tool call validation system that allows you to control which tools and commands Claude Code can execute. **Tool rules** permission any tool call (Read, Write, Edit, Bash, etc.), while **bash rules** provide command-level validation specifically for Bash tool calls.
+Moriarty provides a powerful tool call validation system that allows you to control which tools and commands Claude Code
+can execute. **Tool rules** permission any tool call (Read, Write, Edit, Bash, etc.), while **bash rules** provide
+command-level validation specifically for Bash tool calls.
 
 ## Table of Contents
 
@@ -31,7 +33,8 @@ action = { type = "Deny", value = "Dangerous recursive delete of root directorie
 
 ## Tool Rules
 
-Tool rules permission any Claude Code tool call — not just Bash. They are checked **before** bash rules, providing a unified way to control tool access.
+Tool rules permission any Claude Code tool call — not just Bash. They are checked **before** bash rules, providing a
+unified way to control tool access.
 
 ### Quick Start
 
@@ -66,9 +69,13 @@ action = { type = "ActionType", ... }
 ```
 
 - **name**: A descriptive name for the rule (used in logs)
-- **tool**: Exact tool name to match (e.g., `"Read"`, `"Write"`, `"Edit"`, `"Bash"`, `"Glob"`, `"Grep"`), or `"*"` to match any tool
-- **field** + **pattern**: Optional pair. When both present, the regex `pattern` matches against the named field's value in `tool_input`. When absent, the rule applies to any invocation of the tool. If only one is present, the rule is skipped (configuration error, logged).
-- **action**: `Allow`, `Deny`, or `Ask` (see [Rule Actions](#rule-actions)). Note: `Modify` and `ArgumentFilter` are Bash-specific and not available for tool rules.
+- **tool**: Exact tool name to match (e.g., `"Read"`, `"Write"`, `"Edit"`, `"Bash"`, `"Glob"`, `"Grep"`), or `"*"` to
+  match any tool
+- **field** + **pattern**: Optional pair. When both present, the regex `pattern` matches against the named field's value
+  in `tool_input`. When absent, the rule applies to any invocation of the tool. If only one is present, the rule is
+  skipped (configuration error, logged).
+- **action**: `Allow`, `Deny`, or `Ask` (see [Rule Actions](#rule-actions)). Note: `Modify` and `ArgumentFilter` are
+  Bash-specific and not available for tool rules.
 
 ### Field Pattern Matching
 
@@ -79,7 +86,10 @@ When `field` and `pattern` are specified, Moriarty extracts the field value from
 - **Booleans**: converted to string (`true`/`false`)
 - **Arrays/Objects/Null**: cannot be matched (rule doesn't match)
 
-**CWD prefix stripping**: Claude Code sends absolute paths in tool inputs (e.g., `/home/user/project/src/main.rs`). Before regex matching, Moriarty strips the hook input's `cwd` prefix from field values, so rules can use relative paths. For example, with `cwd = "/home/user/project"`, a field value of `/home/user/project/src/main.rs` becomes `src/main.rs` for matching purposes. If the value doesn't start with `cwd`, it's matched as-is.
+**CWD prefix stripping**: Claude Code sends absolute paths in tool inputs (e.g., `/home/user/project/src/main.rs`).
+Before regex matching, Moriarty strips the hook input's `cwd` prefix from field values, so rules can use relative paths.
+For example, with `cwd = "/home/user/project"`, a field value of `/home/user/project/src/main.rs` becomes `src/main.rs`
+for matching purposes. If the value doesn't start with `cwd`, it's matched as-is.
 
 ### Evaluation Order
 
@@ -154,7 +164,8 @@ action = { type = "Allow" }
 
 ## Configuration File
 
-Bash rules are configured in `~/.config/moriarty/tool_rules.toml`. Rules are evaluated in order with **first-match-wins** semantics - the first rule that matches a command determines the action.
+Bash rules are configured in `~/.config/moriarty/tool_rules.toml`. Rules are evaluated in order with
+**first-match-wins** semantics - the first rule that matches a command determines the action.
 
 ### Basic Structure
 
@@ -224,7 +235,8 @@ pattern = "^(docker\\s+system\\s+prune)"
 action = { type = "Modify", value = "$1 --dry-run" }
 ```
 
-**Security Warning**: Modify actions use unescaped capture group replacement. Avoid patterns like `^docker (.*)` that capture arbitrary input. Use specific patterns like `^(docker\\s+system\\s+prune)$` instead.
+**Security Warning**: Modify actions use unescaped capture group replacement. Avoid patterns like `^docker (.*)` that
+capture arbitrary input. Use specific patterns like `^(docker\\s+system\\s+prune)$` instead.
 
 ### Ask
 
@@ -239,9 +251,12 @@ action = { type = "Ask" }
 
 ### ArgumentFilter
 
-Structurally remove, add, or replace command arguments before execution. Unlike `Modify` which uses regex capture groups, `ArgumentFilter` manipulates arguments as discrete tokens, making it easier to handle flags regardless of their position in the command.
+Structurally remove, add, or replace command arguments before execution. Unlike `Modify` which uses regex capture
+groups, `ArgumentFilter` manipulates arguments as discrete tokens, making it easier to handle flags regardless of their
+position in the command.
 
-**Important**: After filtering, the modified command is automatically re-validated against all rules. The filtered command must match an `Allow` rule (or be manually approved via an `Ask` rule) to execute.
+**Important**: After filtering, the modified command is automatically re-validated against all rules. The filtered
+command must match an `Allow` rule (or be manually approved via an `Ask` rule) to execute.
 
 #### Removing Arguments
 
@@ -260,6 +275,7 @@ action = { type = "Allow" }
 ```
 
 The `remove` field supports:
+
 - **Exact matches**: `--open` removes `--open`
 - **Prefix matches**: `--open` removes both `--open` and `--open=browser`
 - **Position independence**: Removes the argument regardless of where it appears
@@ -310,6 +326,7 @@ action = { type = "Allow" }
 #### Operation Order
 
 ArgumentFilter operations are applied in this order:
+
 1. **Remove** specified arguments
 2. **Replace** specified arguments (if the `replace` field is used)
 3. **Add** new arguments
@@ -345,19 +362,22 @@ action = { type = "Allow" }
 ```
 
 **What happens**:
+
 1. `cargo doc --open --no-deps` matches the first rule
 2. Command is filtered to `cargo doc --no-deps`
 3. Filtered command is re-validated
 4. Matches the Allow rule → execution allowed
 
 **Security guarantees**:
+
 - If the filtered command doesn't match any Allow rule, it's rejected or requires user approval
 - If the filtered command matches a Deny rule, execution is blocked
 - Chained ArgumentFilter rules (filter → filter) are prevented to avoid infinite loops
 
 ## Pattern Fragments
 
-Pattern fragments allow you to define reusable regex snippets that can be referenced in rule patterns using `{{fragment_name}}` syntax. This eliminates duplication and makes rules easier to maintain.
+Pattern fragments allow you to define reusable regex snippets that can be referenced in rule patterns using
+`{{fragment_name}}` syntax. This eliminates duplication and makes rules easier to maintain.
 
 ### Basic Usage
 
@@ -390,24 +410,25 @@ action = { type = "Allow" }
 ```
 
 Expansion happens in multiple passes:
+
 1. `{{safe_arg}}` → `( [^|&;$`()<>{}]+)`
-2. `{{safe_pipe}}` → `( \\| (head|tail|grep)( [^|&;$`()<>{}]+)*)`
+2. `{{safe_pipe}}` → `( \\| (head|tail|grep)( [^|&;$`()<>{}]+)\*)`
 3. Final pattern is fully expanded
 
 ### Built-in Default Fragments
 
 Moriarty provides default fragments for common security patterns:
 
-| Fragment | Expansion | Description |
-|----------|-----------|-------------|
-| `safe_chars` | `[^|&;$\`()<>{}]` | Characters that don't allow shell injection |
-| `identifier` | `[a-zA-Z_][a-zA-Z0-9_-]*` | Valid identifier pattern |
-| `number` | `[0-9]+` | Numeric values |
-| `safe_arg` | `( [^|&;$\`()<>{}]+)` | Safe command argument |
-| `safe_flag` | `( -[a-zA-Z_][a-zA-Z0-9_-]*)` | Safe command flag |
-| `safe_path` | `( [^|&;$\`()<>{}]+/[^|&;$\`()<>{}]*)` | Safe file path |
-| `safe_pipe_cmd` | `(head\|tail\|grep\|wc\|sort\|uniq)` | Safe pipe commands |
-| `safe_pipe` | `( \\\| (head\|tail\|grep\|wc\|sort\|uniq)( [^|&;$\`()<>{}]+)*)` | Safe command piping |
+| Fragment        | Expansion                                      | Description              |
+| --------------- | ---------------------------------------------- | ------------------------ | ------------------------------------------- | -------------- |
+| `safe_chars`    | `[^                                            | &;$\`()<>{}]`            | Characters that don't allow shell injection |
+| `identifier`    | `[a-zA-Z_][a-zA-Z0-9_-]*`                      | Valid identifier pattern |
+| `number`        | `[0-9]+`                                       | Numeric values           |
+| `safe_arg`      | `( [^                                          | &;$\`()<>{}]+)`          | Safe command argument                       |
+| `safe_flag`     | `( -[a-zA-Z_][a-zA-Z0-9_-]*)`                  | Safe command flag        |
+| `safe_path`     | `( [^                                          | &;$\`()<>{}]+/[^         | &;$\`()<>{}]\*)`                            | Safe file path |
+| `safe_pipe_cmd` | `(head\|tail\|grep\|wc\|sort\|uniq)`           | Safe pipe commands       |
+| `safe_pipe`     | `( \\\| (head\|tail\|grep\|wc\|sort\|uniq)( [^ | &;$\`()<>{}]+)\*)`       | Safe command piping                         |
 
 You can override these by defining your own fragment with the same name.
 
@@ -434,7 +455,8 @@ The system detects circular dependencies and reports an error when loading the c
 
 ### 1. Block Shell Injection Characters
 
-Always exclude shell metacharacters (`|`, `&`, `;`, `$`, `` ` ``, `(`, `)`, `<`, `>`, `{`, `}`) unless you explicitly intend to allow them:
+Always exclude shell metacharacters (`|`, `&`, `;`, `$`, `` ` ``, `(`, `)`, `<`, `>`, `{`, `}`) unless you explicitly
+intend to allow them:
 
 ```toml
 # Good: Blocks shell injection
@@ -608,6 +630,7 @@ tail -f ~/.local/state/moriarty/logs/moriarty-*.log | grep "Bash rule matched"
 **Problem**: You see "Failed to expand pattern fragments" in the logs.
 
 **Solutions**:
+
 - Check for undefined fragments: `{{undefined}}`
 - Check for circular dependencies: `a` → `b` → `a`
 - Verify fragment names follow naming rules (start with letter/underscore)
@@ -627,6 +650,7 @@ tail -f ~/.local/state/moriarty/logs/moriarty-*.log | grep "Command modified"
 **Problem**: Your rules don't seem to be taking effect.
 
 **Solutions**:
+
 - Verify config file location: `~/.config/moriarty/tool_rules.toml`
 - Check TOML syntax: `cat ~/.config/moriarty/tool_rules.toml`
 - Look for parse errors in logs: `~/.local/state/moriarty/logs/`
@@ -634,6 +658,7 @@ tail -f ~/.local/state/moriarty/logs/moriarty-*.log | grep "Command modified"
 ### Testing Patterns
 
 Use online regex testers like [regex101.com](https://regex101.com/) to test your patterns. Remember:
+
 - Moriarty uses Rust regex syntax
 - Patterns are case-sensitive
 - Use the "Rust" flavor in online testers
