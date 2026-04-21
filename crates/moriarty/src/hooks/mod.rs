@@ -349,7 +349,7 @@ fn pretool_modify_hook(new_input: serde_json::Value, reason: Option<String>) -> 
 /// Evaluation order:
 /// 1. tool_rules engine (first-match-wins) — if match, return Allow/Deny/Ask
 /// 2. If NoMatch and tool is Bash — bash_rules engine (existing behavior)
-/// 3. If NoMatch and tool is not Bash — default to Ask
+/// 3. If NoMatch and tool is not Bash — return no decision (defer to Claude Code)
 ///
 /// `cwd` is the current working directory from the hook input. It is used to strip absolute path
 /// prefixes from field values before matching against tool rule patterns, allowing rules to be
@@ -411,8 +411,8 @@ async fn handle_pretool_hook(
     if tool_name == "Bash" {
         handle_bash_pretool_hook_with_config(tool_input, config).await
     } else {
-        debug!(tool_name = %tool_name, "No tool rules matched for non-Bash tool, defaulting to Ask");
-        Ok(pretool_ask_hook())
+        debug!(tool_name = %tool_name, "No tool rules matched for non-Bash tool, deferring to Claude Code");
+        Ok(HookOutput::default())
     }
 }
 

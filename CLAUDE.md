@@ -106,7 +106,7 @@ test in a separate process, making this safe and preventing tests from clobberin
     stripped before regex matching, so rules can use relative paths (e.g., `^src/` instead of absolute paths).
   - `bash_rules`: Bash-specific command validation with regex patterns. Actions: Allow, Deny, Modify, Ask,
     ArgumentFilter. Checked when no tool_rule matches a Bash call.
-  - Evaluation order: tool_rules → bash_rules (for Bash) → default Ask (for non-Bash)
+  - Evaluation order: tool_rules → bash_rules (for Bash) → passthrough (for non-Bash, defers to Claude Code)
 - **Stop hook**: Runs project checks before allowing execution
 - Structured logging with tracing crate for debugging hook execution
 - Security model: Defaults to "Ask" when unconfigured, fail-closed once configured (verification failures block
@@ -131,8 +131,8 @@ test in a separate process, making this safe and preventing tests from clobberin
 
 **Security Model**:
 
-- **Default to Ask when unconfigured**: If no rules/checks configured, defaults to "Ask" which prompts the user in
-  Claude Code UI
+- **Default to Ask for Bash when unconfigured**: If no bash rules configured, Bash defaults to "Ask". Non-Bash tools
+  with no matching tool rules return no decision, deferring to Claude Code's native permission system.
 - **Fail-closed when configured**: Once security measures are in place, any verification failure blocks execution:
   - ConfigHashMismatch: tools.toml was modified after approval
   - BinaryHashMismatch: Binary changed (update, corruption, tampering)

@@ -102,7 +102,7 @@ PreToolUse event (any tool)
   |
   +-> tool_name == "Bash"?
   |     Yes -> bash_rules engine (existing behavior)
-  |     No  -> default to Ask
+  |     No  -> defer to Claude Code (no decision)
 ```
 
 Both `tool_rules` and `bash_rules` coexist in the same `tool_rules.toml` config file.

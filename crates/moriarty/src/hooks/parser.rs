@@ -214,7 +214,7 @@ pub enum HookSpecificOutput {
 }
 
 /// Advanced control via JSON output from hook scripts
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HookOutput {
     #[serde(rename = "continue", skip_serializing_if = "Option::is_none")]
@@ -711,6 +711,13 @@ mod tests {
         assert!(!json.contains(r#""suppressOutput""#));
         assert!(!json.contains(r#""reason""#));
         assert!(!json.contains(r#""systemMessage""#));
+    }
+
+    #[test]
+    fn test_hook_output_default_serializes_to_empty_object() {
+        let json =
+            serde_json::to_string(&HookOutput::default()).expect("Failed to serialize default");
+        assert_eq!(json, "{}");
     }
 
     #[test]

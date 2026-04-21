@@ -1489,7 +1489,7 @@ action = { type = "Deny", value = "rm not allowed" }
 }
 
 #[tokio::test]
-async fn test_non_bash_tool_no_rules_defaults_to_ask() {
+async fn test_non_bash_tool_no_rules_returns_passthrough() {
     let _xdg_config = setup_isolated_xdg_config();
 
     let tool_input = serde_json::json!({"file_path": "/tmp/foo"});
@@ -1497,16 +1497,33 @@ async fn test_non_bash_tool_no_rules_defaults_to_ask() {
         .await
         .expect("Should succeed");
 
-    match result.hook_specific_output {
-        Some(HookSpecificOutput::PreToolUse(output)) => {
-            assert_eq!(
-                output.permission_decision,
-                Some(PermissionDecision::Ask),
-                "Non-Bash tools with no rules should default to Ask"
-            );
-        }
-        _ => panic!("Expected PreToolUse hook specific output"),
-    }
+    // When no tool rules match a non-Bash tool, all fields should be None
+    // (serializes to `{}`, deferring to Claude Code's native permission system)
+    assert_eq!(
+        result.hook_specific_output, None,
+        "Non-Bash tools with no rules should return passthrough (no hook_specific_output)"
+    );
+    assert_eq!(result.permission_decision, None);
+    assert_eq!(result.decision, None);
+}
+
+#[tokio::test]
+async fn test_non_bash_tool_no_matching_rule_returns_passthrough() {
+    let config = r#"
+[[tool_rules]]
+name = "allow-write"
+tool = "Write"
+action = { type = "Allow" }
+"#;
+    let _xdg_config = setup_user_bash_rules(config).await;
+
+    // Config exists with rules, but none match Read — should passthrough
+    let result = handle_pretool_hook("Read", &serde_json::json!({"file_path": "/tmp/foo"}), "")
+        .await
+        .expect("Should succeed");
+
+    assert_eq!(result.hook_specific_output, None);
+    assert_eq!(result.permission_decision, None);
 }
 
 #[tokio::test]
@@ -1571,7 +1588,7 @@ async fn test_exec_hook_impl_non_bash_pretool_produces_output() {
     let _xdg_dir = setup_isolated_xdg_state();
     let _xdg_config = setup_isolated_xdg_config();
 
-    // Non-Bash PreToolUse event should now produce JSON output (Ask by default)
+    // Non-Bash PreToolUse event should succeed and produce empty JSON output (passthrough)
     let input = r#"{
         "session_id": "test-session",
         "transcript_path": "/tmp/transcript.json",
@@ -1688,20 +1705,16 @@ action = { type = "Allow" }
 "#;
     let _xdg_config = setup_user_bash_rules(config).await;
 
-    // Different cwd means path is not stripped, so "^flake\.nix$" won't match the absolute path
+    // Different cwd means path is not stripped, so "^flake\.nix$" won't match the absolute path.
+    // Since no tool rule matches and this is a non-Bash tool, we get passthrough (no decision).
     let tool_input = serde_json::json!({"path": "/tmp/project/flake.nix"});
     let result = handle_pretool_hook("Read", &tool_input, "/other/dir")
         .await
         .expect("Should succeed");
 
-    match result.hook_specific_output {
-        Some(HookSpecificOutput::PreToolUse(output)) => {
-            assert_eq!(
-                output.permission_decision,
-                Some(PermissionDecision::Ask),
-                "Should not match when cwd doesn't match path prefix"
-            );
-        }
-        _ => panic!("Expected PreToolUse hook specific output"),
-    }
+    assert_eq!(
+        result.hook_specific_output, None,
+        "Should not match when cwd doesn't match path prefix; non-Bash passthrough"
+    );
+    assert_eq!(result.permission_decision, None);
 }
