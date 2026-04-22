@@ -1815,7 +1815,10 @@ action = { type = "Allow" }
     )
     .await
     .expect("Should succeed");
-    assert_eq!(result.hook_specific_output, None);
+    assert_eq!(
+        result.hook_specific_output, None,
+        "Should not match: path is outside cwd, allow_local must reject"
+    );
 }
 
 #[tokio::test]
@@ -1844,7 +1847,10 @@ action = { type = "Allow" }
     )
     .await
     .expect("Should succeed");
-    assert_eq!(result.hook_specific_output, None);
+    assert_eq!(
+        result.hook_specific_output, None,
+        "Should not match: path is local but regex does not match Cargo.toml"
+    );
 }
 
 #[tokio::test]
@@ -1947,7 +1953,10 @@ action = { type = "Allow" }
     .await
     .expect("Should succeed");
 
-    assert_eq!(result.hook_specific_output, None);
+    assert_eq!(
+        result.hook_specific_output, None,
+        "Should not match: field='command' is not a path field, allow_local always fails"
+    );
 }
 
 #[cfg(unix)]
@@ -1978,7 +1987,10 @@ action = { type = "Allow" }
     .await
     .expect("Should succeed");
 
-    assert_eq!(result.hook_specific_output, None);
+    assert_eq!(
+        result.hook_specific_output, None,
+        "Should not match: broken symlink cannot be resolved, treated as non-local"
+    );
 }
 
 #[cfg(unix)]
@@ -2011,5 +2023,8 @@ action = { type = "Allow" }
     .await
     .expect("Should succeed");
 
-    assert_eq!(result.hook_specific_output, None);
+    assert_eq!(
+        result.hook_specific_output, None,
+        "Should not match: symlink resolves outside cwd, treated as non-local"
+    );
 }

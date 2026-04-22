@@ -137,7 +137,9 @@ pub struct ToolRule {
     pub name: String,
     /// Exact tool name to match (e.g., "Read", "Write", "Bash"), or `"*"` for any tool.
     pub tool: String,
-    /// Optional locality requirement against `path` or `file_path` in tool_input.
+    /// When `true`, the rule only fires if the relevant path resolves within the
+    /// canonicalized hook `cwd`. Prevents rules from matching absolute paths that point
+    /// outside the current project, regardless of whether the regex would match.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub allow_local: bool,
     /// Optional field name in tool_input to match against.

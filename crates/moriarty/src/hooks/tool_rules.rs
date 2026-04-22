@@ -33,16 +33,30 @@ struct CompiledToolRule {
     action: ToolRuleAction,
 }
 
+/// Result of resolving a single candidate path (`path` or `file_path`) for an `allow_local`
+/// check. `None` at the call site means the field was absent or non-string in the tool input.
+/// When present, `is_local` indicates whether the fully-resolved path falls under `canonical_cwd`.
+/// Broken symlinks and unresolvable paths are represented as `None` (not `is_local = false`),
+/// so they can never satisfy a locality check.
 #[derive(Debug, Clone)]
 struct CandidatePathEvaluation {
+    /// Whether the resolved path starts with the canonicalized `cwd`.
     is_local: bool,
+    /// The fully canonicalized path (existing portions) with any non-existent suffix safely
+    /// appended via [`rebuild_missing_suffix`].
     resolved_path: PathBuf,
 }
 
+/// Aggregated locality evaluation for both `path` and `file_path` fields of a tool input.
+/// Produced once per `apply_rules` call (potentially on the blocking thread pool) and then
+/// shared across all `allow_local` rules during first-match-wins evaluation.
 #[derive(Debug, Clone)]
 struct LocalPathEvaluation {
+    /// The canonicalized hook working directory — the trust boundary for locality checks.
     canonical_cwd: PathBuf,
+    /// Evaluation of the `path` field, if present and resolvable.
     path: Option<CandidatePathEvaluation>,
+    /// Evaluation of the `file_path` field, if present and resolvable.
     file_path: Option<CandidatePathEvaluation>,
 }
 
@@ -103,6 +117,9 @@ fn record_allow_local_tool(
     }
 }
 
+/// Extracts only the `path` and `file_path` fields from the tool input so that only those
+/// two small strings need to be moved into the `spawn_blocking` closure, avoiding a full
+/// clone of a potentially-large input (e.g., a Write tool call's `content` field).
 fn locality_input(tool_input: &serde_json::Value) -> serde_json::Value {
     serde_json::json!({
         "path": tool_input.get("path"),
@@ -465,6 +482,11 @@ fn canonicalize_allow_missing(path: &Path) -> io::Result<PathBuf> {
                 return rebuild_missing_suffix(canonical, removed_components.into_iter().rev())
             }
             Err(error) if is_missing_path_error(&error) => {
+                // TOCTOU note: between `canonicalize` failing and this `symlink_metadata`
+                // call, the entry at `current` can change. All possible races are fail-safe:
+                // we either correctly detect a broken symlink, or conservatively reject a
+                // path that has been concurrently replaced. We never incorrectly admit an
+                // escaping path.
                 if fs::symlink_metadata(&current)
                     .is_ok_and(|metadata| metadata.file_type().is_symlink())
                 {
@@ -502,6 +524,10 @@ fn rebuild_missing_suffix(
     mut base: PathBuf,
     components: impl IntoIterator<Item = MissingPathComponent>,
 ) -> io::Result<PathBuf> {
+    // `floor` is the component-depth of the canonicalized ancestor — the security boundary.
+    // Any `..` that would push depth below this level means the non-existent suffix is trying
+    // to climb above the verified canonical root, which must be rejected to prevent path
+    // traversal attacks (e.g., `cwd/missing/../../etc/passwd`).
     let floor = base.components().count();
     let mut depth = floor;
 
@@ -1367,6 +1393,50 @@ mod tests {
     }
 
     #[test]
+    fn test_allow_local_wildcard_with_regex() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cwd = temp_dir.path();
+        fs::create_dir_all(cwd.join("src")).unwrap();
+        fs::write(cwd.join("src/lib.rs"), "fn lib() {}\n").unwrap();
+        fs::write(cwd.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+
+        let engine = ToolRuleEngine::from_config(
+            vec![make_local_rule(
+                "deny-any-local-rs",
+                "*",
+                Some("path"),
+                Some(r"\.rs$"),
+                ToolRuleAction::Deny {
+                    value: "no rs".to_string(),
+                },
+            )],
+            None,
+        );
+
+        // Matches: local path + regex hits
+        let result = engine.apply_rules_sync(
+            "Edit",
+            &serde_json::json!({"path": cwd.join("src/lib.rs")}),
+            cwd.to_str().unwrap(),
+        );
+        assert_eq!(
+            result,
+            ToolRuleResult::Denied {
+                rule_name: "deny-any-local-rs".to_string(),
+                reason: "no rs".to_string(),
+            }
+        );
+
+        // No match: local path but regex misses
+        let result = engine.apply_rules_sync(
+            "Write",
+            &serde_json::json!({"path": cwd.join("Cargo.toml")}),
+            cwd.to_str().unwrap(),
+        );
+        assert_eq!(result, ToolRuleResult::NoMatch);
+    }
+
+    #[test]
     fn test_allow_local_falls_through_to_later_rule() {
         let temp_dir = tempfile::tempdir().unwrap();
         let cwd = temp_dir.path();
@@ -1412,7 +1482,6 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let cwd = temp_dir.path();
         fs::write(cwd.join("secret.txt"), "shh\n").unwrap();
-        fs::write(cwd.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
 
         let engine = ToolRuleEngine::from_config(
             vec![make_local_rule(
@@ -1438,6 +1507,30 @@ mod tests {
                 rule_name: "deny-local-read".to_string(),
                 reason: "local reads denied".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn test_allow_local_treats_path_through_file_as_local() {
+        // A path like `Cargo.toml/child.txt` where `Cargo.toml` is a regular file (not a
+        // directory) cannot actually be read, but `canonicalize_allow_missing` still resolves
+        // it as local because `Cargo.toml` exists inside cwd. This ensures Deny rules catch
+        // such paths rather than silently passing through.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cwd = temp_dir.path();
+        fs::write(cwd.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+
+        let engine = ToolRuleEngine::from_config(
+            vec![make_local_rule(
+                "deny-local-read",
+                "Read",
+                None,
+                None,
+                ToolRuleAction::Deny {
+                    value: "local reads denied".to_string(),
+                },
+            )],
+            None,
         );
 
         let result = engine.apply_rules_sync(
@@ -1485,6 +1578,26 @@ mod tests {
 
         assert!(!tool_input_has_local_path(
             &[PathBuf::from("broken-link/file.txt")],
+            &cwd
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_allow_local_rejects_broken_symlink_as_leaf() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cwd = temp_dir.path().join("project");
+        let missing = temp_dir.path().join("missing-target");
+        fs::create_dir_all(&cwd).unwrap();
+        symlink(&missing, cwd.join("broken-link")).unwrap();
+
+        // "broken-link" is itself the broken symlink — no child path appended.
+        // This exercises symlink_metadata on the first canonicalize failure iteration,
+        // unlike the parent-component test which hits it on a later iteration.
+        assert!(!tool_input_has_local_path(
+            &[PathBuf::from("broken-link")],
             &cwd
         ));
     }

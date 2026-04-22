@@ -77,9 +77,9 @@ action = { type = "ActionType", ... }
   field must be local. If `field` is omitted, either `path` or `file_path` being local is sufficient. If `field` is any
   other value, the `allow_local` check always fails. Relative inputs are resolved against `cwd`; existing paths are
   fully canonicalized; non-existent paths are checked by canonicalizing the deepest existing ancestor and safely
-  rebuilding the missing suffix so `..` cannot escape. Symlinks are followed during canonicalization, so symlinks that
-  resolve outside `cwd` are rejected, and broken symlinks are treated as non-local. Hard links are treated as local
-  filesystem entries and are not distinguished from ordinary files.
+  rebuilding the missing suffix so `..` cannot escape above that ancestor. Symlinks are followed during
+  canonicalization, so symlinks that resolve outside `cwd` are rejected, and broken symlinks are treated as non-local.
+  Hard links are treated as local filesystem entries and are not distinguished from ordinary files.
 - **field** + **pattern**: Optional pair. When both present, the regex `pattern` matches against the named field's value
   in `tool_input`. When absent, the rule applies to any invocation of the tool. If only one is present, the rule is
   skipped (configuration error, logged). If `allow_local = true` is also set, **both** the local-path check and the
