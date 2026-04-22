@@ -12,7 +12,7 @@
 //! - **Read-only operations**: All exposed git commands are read-only; no modifications
 //!   to the repository are possible
 
-use std::{path::PathBuf, str};
+use std::path::{Path, PathBuf};
 
 use rmcp::{
     handler::server::{router::prompt::PromptRouter, tool::ToolRouter, wrapper::Parameters},
@@ -23,7 +23,8 @@ use rmcp::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use tokio::process::Command;
+
+use super::read_only::{run_read_only_command, CommandResult};
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct StatusArgs {
@@ -57,14 +58,6 @@ pub struct ShowArgs {
     pub args: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct CommandResult {
-    pub stdout: String,
-    pub stderr: String,
-    /// Exit code (0 indicates success)
-    pub exit_code: i32,
-}
-
 /// MCP server providing read-only git operations.
 ///
 /// This server exposes four git commands via MCP tools:
@@ -89,58 +82,7 @@ impl GitReadOnly {
         project_dir: PathBuf,
         args: Vec<String>,
     ) -> Result<Json<CommandResult>, McpError> {
-        // Canonicalize path to prevent traversal attacks and resolve symlinks
-        let canonical_dir = project_dir.canonicalize().map_err(|e| McpError {
-            code: ErrorCode::INVALID_PARAMS,
-            message: format!(
-                "Invalid project directory: {} ({})",
-                project_dir.display(),
-                e
-            )
-            .into(),
-            data: None,
-        })?;
-
-        // Verify this is a valid project directory by checking for .config/tools.toml
-        let config_path = canonical_dir.join(".config").join("tools.toml");
-        if !config_path.exists() {
-            return Err(McpError {
-                code: ErrorCode::INVALID_PARAMS,
-                message: format!(
-                    "Invalid project directory: {} (missing .config/tools.toml)",
-                    canonical_dir.display()
-                )
-                .into(),
-                data: None,
-            });
-        }
-
-        let mut cmd = Command::new("git");
-        cmd.arg(subcommand);
-        cmd.current_dir(canonical_dir);
-        cmd.args(args);
-
-        match cmd.output().await {
-            Ok(result) => {
-                // Use lossy UTF-8 conversion to handle potentially invalid encodings
-                // in filenames (e.g., legacy encodings). This prevents server crashes
-                // while allowing output to be displayed with replacement characters (�).
-                // This is acceptable for a read-only tool where we never modify data.
-                let stderr = String::from_utf8_lossy(&result.stderr).to_string();
-                let stdout = String::from_utf8_lossy(&result.stdout).to_string();
-
-                Ok(Json(CommandResult {
-                    exit_code: result.status.code().unwrap_or(-1),
-                    stderr,
-                    stdout,
-                }))
-            }
-            Err(error) => Err(McpError {
-                code: ErrorCode::INTERNAL_ERROR,
-                message: format!("{} failed: {error:?}", subcommand).into(),
-                data: None,
-            }),
-        }
+        run_read_only_command("git", subcommand, project_dir, [subcommand], args).await
     }
 }
 
@@ -183,6 +125,31 @@ impl GitReadOnly {
     }
 }
 
+/// Build the two-message `GetPromptResult` used by every git-prompt handler.
+///
+/// `tool_label` is the git subcommand (e.g. `"status"`) interpolated into the
+/// user message (`"run the {tool_label} tool…"`); `description_phrase` is the
+/// phrase following `"get git "` in the description string; `role_msg` is the
+/// assistant preamble for this prompt.
+fn build_prompt(
+    tool_label: &str,
+    description_phrase: &str,
+    role_msg: &str,
+    project_dir: &Path,
+) -> GetPromptResult {
+    let project = project_dir.to_string_lossy();
+    GetPromptResult {
+        description: Some(format!("get git {description_phrase} for {project}")),
+        messages: vec![
+            PromptMessage::new_text(PromptMessageRole::Assistant, role_msg.to_string()),
+            PromptMessage::new_text(
+                PromptMessageRole::User,
+                format!("run the {tool_label} tool with project \"{project}\""),
+            ),
+        ],
+    }
+}
+
 #[prompt_router]
 impl GitReadOnly {
     #[prompt(name = "status", description = "Gets the git status")]
@@ -190,24 +157,12 @@ impl GitReadOnly {
         &self,
         Parameters(args): Parameters<StatusArgs>,
     ) -> Result<GetPromptResult, McpError> {
-        let messages = vec![
-            PromptMessage::new_text(PromptMessageRole::Assistant, "You report the git status"),
-            PromptMessage::new_text(
-                PromptMessageRole::User,
-                format!(
-                    "run the status tool with project \"{}\"",
-                    args.project_dir.to_string_lossy()
-                ),
-            ),
-        ];
-
-        Ok(GetPromptResult {
-            description: Some(format!(
-                "get git status for {}",
-                args.project_dir.to_string_lossy()
-            )),
-            messages,
-        })
+        Ok(build_prompt(
+            "status",
+            "status",
+            "You report the git status",
+            &args.project_dir,
+        ))
     }
 
     #[prompt(name = "diff", description = "Gets the git diff")]
@@ -215,27 +170,12 @@ impl GitReadOnly {
         &self,
         Parameters(args): Parameters<DiffArgs>,
     ) -> Result<GetPromptResult, McpError> {
-        let messages = vec![
-            PromptMessage::new_text(
-                PromptMessageRole::Assistant,
-                "You report the results of git diff",
-            ),
-            PromptMessage::new_text(
-                PromptMessageRole::User,
-                format!(
-                    "run the diff tool with project \"{}\"",
-                    args.project_dir.to_string_lossy()
-                ),
-            ),
-        ];
-
-        Ok(GetPromptResult {
-            description: Some(format!(
-                "get git diff status for {}",
-                args.project_dir.to_string_lossy()
-            )),
-            messages,
-        })
+        Ok(build_prompt(
+            "diff",
+            "diff status",
+            "You report the results of git diff",
+            &args.project_dir,
+        ))
     }
 
     #[prompt(name = "log", description = "Gets the git log")]
@@ -243,27 +183,12 @@ impl GitReadOnly {
         &self,
         Parameters(args): Parameters<LogArgs>,
     ) -> Result<GetPromptResult, McpError> {
-        let messages = vec![
-            PromptMessage::new_text(
-                PromptMessageRole::Assistant,
-                "You report the results of git log",
-            ),
-            PromptMessage::new_text(
-                PromptMessageRole::User,
-                format!(
-                    "run the log tool with project \"{}\"",
-                    args.project_dir.to_string_lossy()
-                ),
-            ),
-        ];
-
-        Ok(GetPromptResult {
-            description: Some(format!(
-                "get git log for {}",
-                args.project_dir.to_string_lossy()
-            )),
-            messages,
-        })
+        Ok(build_prompt(
+            "log",
+            "log",
+            "You report the results of git log",
+            &args.project_dir,
+        ))
     }
 
     #[prompt(name = "show", description = "Gets the git show output")]
@@ -271,27 +196,12 @@ impl GitReadOnly {
         &self,
         Parameters(args): Parameters<ShowArgs>,
     ) -> Result<GetPromptResult, McpError> {
-        let messages = vec![
-            PromptMessage::new_text(
-                PromptMessageRole::Assistant,
-                "You report the results of git show",
-            ),
-            PromptMessage::new_text(
-                PromptMessageRole::User,
-                format!(
-                    "run the show tool with project \"{}\"",
-                    args.project_dir.to_string_lossy()
-                ),
-            ),
-        ];
-
-        Ok(GetPromptResult {
-            description: Some(format!(
-                "get git show output for {}",
-                args.project_dir.to_string_lossy()
-            )),
-            messages,
-        })
+        Ok(build_prompt(
+            "show",
+            "show output",
+            "You report the results of git show",
+            &args.project_dir,
+        ))
     }
 }
 
@@ -322,6 +232,7 @@ impl Default for GitReadOnly {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_helpers::write_tools_config;
     use tempfile::TempDir;
 
     async fn setup_git_repo() -> TempDir {
@@ -344,14 +255,10 @@ mod tests {
             .status()
             .unwrap();
 
-        // Create .config/tools.toml to mark as valid project directory
-        let config_dir = temp_dir.path().join(".config");
-        std::fs::create_dir(&config_dir).unwrap();
-        std::fs::write(
-            config_dir.join("tools.toml"),
+        write_tools_config(
+            temp_dir.path(),
             "[commands]\nlint = [\"cargo\", \"clippy\"]\n",
-        )
-        .unwrap();
+        );
 
         temp_dir
     }
@@ -430,46 +337,23 @@ mod tests {
         assert_eq!(cmd_result.0.exit_code, 0);
     }
 
-    #[tokio::test]
-    async fn test_rejects_directory_without_config_file() {
-        let temp_dir = TempDir::new().unwrap();
-
-        // Initialize git but don't create .config/tools.toml
-        std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(temp_dir.path())
-            .status()
-            .unwrap();
-
-        let args = StatusArgs {
-            project_dir: temp_dir.path().to_path_buf(),
-            args: vec![],
-        };
-
-        let Err(error) = GitReadOnly::run_git_command("status", args.project_dir, args.args).await
-        else {
-            panic!("Expected error for directory without .config/tools.toml");
-        };
-
-        assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
-        assert!(error.message.contains("Invalid project directory"));
-        assert!(error.message.contains("missing .config/tools.toml"));
-    }
-
-    #[tokio::test]
-    async fn test_rejects_nonexistent_directory() {
-        let args = StatusArgs {
-            project_dir: PathBuf::from("/nonexistent/directory"),
-            args: vec![],
-        };
-
-        let Err(error) = GitReadOnly::run_git_command("status", args.project_dir, args.args).await
-        else {
-            panic!("Expected error for nonexistent directory");
-        };
-
-        assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
-    }
+    // Shared path-safety tests (traversal, symlink resolution, missing config,
+    // nonexistent directory) live in `crate::mcp::read_only::test_support`
+    // because `git_read_only` and `jj_read_only` validate the project dir via
+    // the same helper.
+    crate::mcp::read_only::test_support::path_safety_tests!(
+        |dir: std::path::PathBuf, args: Vec<String>| async move {
+            GitReadOnly::run_git_command("status", dir, args).await
+        },
+        setup_git_repo(),
+        |path: &std::path::Path| {
+            std::process::Command::new("git")
+                .args(["init"])
+                .current_dir(path)
+                .status()
+                .unwrap();
+        },
+    );
 
     #[tokio::test]
     async fn test_diff_tool_handler() {
@@ -527,95 +411,84 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_status_prompt() {
+    async fn test_prompt_handlers() {
         let temp_dir = setup_git_repo().await;
         let server = GitReadOnly::default();
+        let project_dir = temp_dir.path().to_path_buf();
+        let project_str = project_dir.to_string_lossy().to_string();
 
-        let args = StatusArgs {
-            project_dir: temp_dir.path().to_path_buf(),
-            args: vec![],
-        };
+        // Pair each handler result with a name so assertion failures in the
+        // shared loop name the specific prompt that misbehaved.
+        let prompts = [
+            (
+                "status",
+                server
+                    .status_prompt(Parameters(StatusArgs {
+                        project_dir: project_dir.clone(),
+                        args: vec![],
+                    }))
+                    .await
+                    .unwrap(),
+            ),
+            (
+                "diff",
+                server
+                    .diff_prompt(Parameters(DiffArgs {
+                        project_dir: project_dir.clone(),
+                        args: vec![],
+                    }))
+                    .await
+                    .unwrap(),
+            ),
+            (
+                "log",
+                server
+                    .log_prompt(Parameters(LogArgs {
+                        project_dir: project_dir.clone(),
+                        args: vec![],
+                    }))
+                    .await
+                    .unwrap(),
+            ),
+            (
+                "show",
+                server
+                    .show_prompt(Parameters(ShowArgs {
+                        project_dir: project_dir.clone(),
+                        args: vec![],
+                    }))
+                    .await
+                    .unwrap(),
+            ),
+        ];
 
-        let prompt = server.status_prompt(Parameters(args)).await.unwrap();
-        assert!(prompt.description.is_some());
-        assert!(prompt
-            .description
-            .unwrap()
-            .contains(&temp_dir.path().to_string_lossy().to_string()));
-        assert_eq!(prompt.messages.len(), 2);
-        assert_eq!(prompt.messages[0].role, PromptMessageRole::Assistant);
-        assert_eq!(prompt.messages[1].role, PromptMessageRole::User);
-    }
-
-    #[tokio::test]
-    async fn test_diff_prompt() {
-        let temp_dir = setup_git_repo().await;
-        let server = GitReadOnly::default();
-
-        let args = DiffArgs {
-            project_dir: temp_dir.path().to_path_buf(),
-            args: vec![],
-        };
-
-        let prompt = server.diff_prompt(Parameters(args)).await.unwrap();
-        assert!(prompt.description.is_some());
-        assert_eq!(prompt.messages.len(), 2);
-        assert_eq!(prompt.messages[0].role, PromptMessageRole::Assistant);
-        assert_eq!(prompt.messages[1].role, PromptMessageRole::User);
-    }
-
-    #[tokio::test]
-    async fn test_log_prompt() {
-        let temp_dir = setup_git_repo().await;
-        let server = GitReadOnly::default();
-
-        let args = LogArgs {
-            project_dir: temp_dir.path().to_path_buf(),
-            args: vec![],
-        };
-
-        let prompt = server.log_prompt(Parameters(args)).await.unwrap();
-        assert!(prompt.description.is_some());
-        assert!(prompt
-            .description
-            .unwrap()
-            .contains(&temp_dir.path().to_string_lossy().to_string()));
-        assert_eq!(prompt.messages.len(), 2);
-        assert_eq!(prompt.messages[0].role, PromptMessageRole::Assistant);
-        assert_eq!(prompt.messages[1].role, PromptMessageRole::User);
-    }
-
-    #[tokio::test]
-    async fn test_show_prompt() {
-        let temp_dir = setup_git_repo().await;
-        let server = GitReadOnly::default();
-
-        let args = ShowArgs {
-            project_dir: temp_dir.path().to_path_buf(),
-            args: vec![],
-        };
-
-        let prompt = server.show_prompt(Parameters(args)).await.unwrap();
-        assert!(prompt.description.is_some());
-        assert!(prompt
-            .description
-            .unwrap()
-            .contains(&temp_dir.path().to_string_lossy().to_string()));
-        assert_eq!(prompt.messages.len(), 2);
-        assert_eq!(prompt.messages[0].role, PromptMessageRole::Assistant);
-        assert_eq!(prompt.messages[1].role, PromptMessageRole::User);
+        for (name, prompt) in prompts {
+            let description = prompt
+                .description
+                .unwrap_or_else(|| panic!("{name}: description missing"));
+            assert!(
+                description.contains(&project_str),
+                "{name}: description {description:?} missing project path"
+            );
+            assert_eq!(prompt.messages.len(), 2, "{name}: message count");
+            assert_eq!(
+                prompt.messages[0].role,
+                PromptMessageRole::Assistant,
+                "{name}: messages[0] role"
+            );
+            assert_eq!(
+                prompt.messages[1].role,
+                PromptMessageRole::User,
+                "{name}: messages[1] role"
+            );
+        }
     }
 
     #[tokio::test]
     async fn test_handles_not_a_git_repository() {
         // Create a directory with .config/tools.toml but no git repo
         let temp_dir = TempDir::new().unwrap();
-        std::fs::create_dir_all(temp_dir.path().join(".config")).unwrap();
-        std::fs::write(
-            temp_dir.path().join(".config").join("tools.toml"),
-            "[commands]\n",
-        )
-        .unwrap();
+        write_tools_config(temp_dir.path(), "[commands]\n");
 
         let args = StatusArgs {
             project_dir: temp_dir.path().to_path_buf(),
@@ -633,53 +506,4 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_rejects_path_with_parent_traversal() {
-        let temp_dir = setup_git_repo().await;
-
-        // Try to escape the project directory using parent directory references
-        // This will traverse to a directory that doesn't have .config/tools.toml
-        let malicious_path = temp_dir.path().join("..").join("..").join("tmp");
-
-        let args = StatusArgs {
-            project_dir: malicious_path,
-            args: vec![],
-        };
-
-        // Should reject with INVALID_PARAMS - either from canonicalize failing
-        // or from missing .config/tools.toml
-        let Err(error) = GitReadOnly::run_git_command("status", args.project_dir, args.args).await
-        else {
-            panic!("Expected error for path traversal attempt");
-        };
-
-        assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
-        assert!(error.message.contains("Invalid project directory"));
-    }
-
-    #[tokio::test]
-    async fn test_resolves_symlinks_safely() {
-        let temp_dir = setup_git_repo().await;
-
-        // Create a symlink to the project directory
-        let link_dir = TempDir::new().unwrap();
-        let link_path = link_dir.path().join("project_link");
-
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(temp_dir.path(), &link_path).unwrap();
-
-        #[cfg(windows)]
-        std::os::windows::fs::symlink_dir(temp_dir.path(), &link_path).unwrap();
-
-        let args = StatusArgs {
-            project_dir: link_path,
-            args: vec!["--short".to_string()],
-        };
-
-        // Should succeed - canonicalize resolves the symlink
-        let cmd_result = GitReadOnly::run_git_command("status", args.project_dir, args.args)
-            .await
-            .unwrap();
-        assert_eq!(cmd_result.0.exit_code, 0);
-    }
 }

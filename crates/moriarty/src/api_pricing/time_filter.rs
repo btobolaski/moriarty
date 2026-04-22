@@ -60,61 +60,67 @@ impl TimeRangeFilter {
     }
 }
 
+/// Try parsing as ISO 8601 with timezone (RFC 3339).
+fn try_parse_rfc3339(s: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+/// Try parsing as a naive datetime without timezone (assume UTC).
+fn try_parse_naive_datetime(s: &str) -> Option<DateTime<Utc>> {
+    NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S")
+        .ok()
+        .map(|dt| DateTime::from_naive_utc_and_offset(dt, Utc))
+}
+
+fn date_to_midnight_utc(date: NaiveDate) -> DateTime<Utc> {
+    let datetime = date
+        .and_hms_opt(0, 0, 0)
+        .expect("00:00:00 is always a valid time");
+    DateTime::from_naive_utc_and_offset(datetime, Utc)
+}
+
+fn invalid_datetime_error(s: &str) -> miette::Report {
+    miette::miette!(
+        "Invalid datetime format: '{}'. Expected ISO 8601 (e.g., '2025-01-01T00:00:00Z') or date (e.g., '2025-01-01')",
+        s
+    )
+}
+
+/// Parses `s` as RFC3339, a date, or a naive datetime, calling `date_to_dt`
+/// to convert a date-only string into a full `DateTime<Utc>`.
+fn parse_datetime_with(
+    s: &str,
+    date_to_dt: impl FnOnce(NaiveDate) -> DateTime<Utc>,
+) -> Result<DateTime<Utc>> {
+    if let Some(dt) = try_parse_rfc3339(s) {
+        return Ok(dt);
+    }
+    if let Ok(date) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        return Ok(date_to_dt(date));
+    }
+    if let Some(dt) = try_parse_naive_datetime(s) {
+        return Ok(dt);
+    }
+    Err(invalid_datetime_error(s))
+}
+
 /// Parses start time boundary. Date-only strings use 00:00:00 of the specified day
 /// to include messages from the beginning of that day (inclusive start).
 fn parse_datetime_for_start(s: &str) -> Result<DateTime<Utc>> {
-    // Try ISO 8601 with timezone first
-    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
-        return Ok(dt.with_timezone(&Utc));
-    }
-
-    // Try date only (YYYY-MM-DD) - use start of day UTC
-    if let Ok(date) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-        let datetime = date
-            .and_hms_opt(0, 0, 0)
-            .expect("00:00:00 is always a valid time");
-        return Ok(DateTime::from_naive_utc_and_offset(datetime, Utc));
-    }
-
-    // Try datetime without timezone (assume UTC)
-    if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
-        return Ok(DateTime::from_naive_utc_and_offset(dt, Utc));
-    }
-
-    Err(miette::miette!(
-        "Invalid datetime format: '{}'. Expected ISO 8601 (e.g., '2025-01-01T00:00:00Z') or date (e.g., '2025-01-01')",
-        s
-    ))
+    parse_datetime_with(s, date_to_midnight_utc)
 }
 
 /// For date-only strings, returns start of NEXT day to include the entire specified day
 /// (since end boundary is exclusive). Time-based strings are used as-is.
 fn parse_datetime_for_end(s: &str) -> Result<DateTime<Utc>> {
-    // Try ISO 8601 with timezone first
-    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
-        return Ok(dt.with_timezone(&Utc));
-    }
-
-    // Try date only (YYYY-MM-DD) - use start of NEXT day for exclusive end
-    if let Ok(date) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+    parse_datetime_with(s, |date| {
         let next_day = date
             .succ_opt()
             .expect("Date overflow only occurs beyond year 262000, unreachable for API logs");
-        let datetime = next_day
-            .and_hms_opt(0, 0, 0)
-            .expect("00:00:00 is always a valid time");
-        return Ok(DateTime::from_naive_utc_and_offset(datetime, Utc));
-    }
-
-    // Try datetime without timezone (assume UTC)
-    if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
-        return Ok(DateTime::from_naive_utc_and_offset(dt, Utc));
-    }
-
-    Err(miette::miette!(
-        "Invalid datetime format: '{}'. Expected ISO 8601 (e.g., '2025-01-01T00:00:00Z') or date (e.g., '2025-01-01')",
-        s
-    ))
+        date_to_midnight_utc(next_day)
+    })
 }
 
 #[cfg(test)]

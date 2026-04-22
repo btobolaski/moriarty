@@ -12,11 +12,13 @@ use tracing::{debug, trace, warn};
 
 #[cfg(test)]
 use crate::logs::parser;
-use crate::logs::parser::{LogLine, LogMessageContent, LogMessageTaggedContent};
+use crate::logs::parser::{
+    AssistantLogLine, AssistantUsage, LogLine, LogMessageContent, LogMessageTaggedContent,
+};
 
 use super::{
     line_counter,
-    pricing::{ModelType, TokenCosts, TokenCounts},
+    pricing::{ModelCostsMap, ModelType, ModelUsageMap, TokenCounts},
     time_filter::TimeRangeFilter,
 };
 
@@ -48,6 +50,53 @@ fn is_synthetic_model(model: &str) -> bool {
     model.eq_ignore_ascii_case("<synthetic>")
 }
 
+#[inline]
+fn token_counts_from_usage(usage: &AssistantUsage) -> TokenCounts {
+    TokenCounts::new(
+        usage.input_tokens,
+        usage.output_tokens,
+        usage.cache_creation_input_tokens,
+        usage.cache_read_input_tokens,
+    )
+}
+
+/// Parse raw string contents into a `Vec<LogLine>`, reporting errors with the file path.
+fn parse_content_to_log_lines(contents: &str, file_path: &Path) -> miette::Result<Vec<LogLine>> {
+    contents
+        .split('\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            serde_json::from_str::<LogLine>(line).inspect_err(|e| {
+                eprintln!(
+                    "Error parsing file {}: {}\nLine: {line}",
+                    file_path.display(),
+                    e
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .into_diagnostic()
+}
+
+/// Iterate over log lines, calling `visitor` for each non-synthetic assistant line within the filter range.
+fn for_each_assistant_line(
+    log_lines: Vec<LogLine>,
+    filter: &TimeRangeFilter,
+    mut visitor: impl FnMut(AssistantLogLine),
+) {
+    for line in log_lines {
+        if let LogLine::Assistant(assistant_line) = line {
+            if !filter.contains(&assistant_line.timestamp) {
+                continue;
+            }
+            if is_synthetic_model(&assistant_line.message.model) {
+                continue;
+            }
+            visitor(*assistant_line);
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct AnalysisResult {
     pub daily_costs: Vec<DailyCosts>,
@@ -72,11 +121,7 @@ pub struct SessionAnalysisResult {
 #[derive(Debug)]
 pub struct DailyUsage {
     pub date: NaiveDate,
-    pub sonnet_usage: TokenCounts,
-    pub haiku_usage: TokenCounts,
-    pub opus_usage: TokenCounts,
-    pub opus4_usage: TokenCounts,
-    pub unknown_usage: TokenCounts,
+    pub per_model: ModelUsageMap,
     pub lines_changed: usize,
 }
 
@@ -84,23 +129,13 @@ impl DailyUsage {
     pub fn new(date: NaiveDate) -> Self {
         Self {
             date,
-            sonnet_usage: TokenCounts::default(),
-            haiku_usage: TokenCounts::default(),
-            opus_usage: TokenCounts::default(),
-            opus4_usage: TokenCounts::default(),
-            unknown_usage: TokenCounts::default(),
+            per_model: ModelUsageMap::default(),
             lines_changed: 0,
         }
     }
 
     pub fn add_usage(&mut self, model_type: ModelType, counts: TokenCounts) {
-        match model_type {
-            ModelType::Sonnet => self.sonnet_usage.add(&counts),
-            ModelType::Haiku => self.haiku_usage.add(&counts),
-            ModelType::Opus => self.opus_usage.add(&counts),
-            ModelType::Opus4 => self.opus4_usage.add(&counts),
-            ModelType::Unknown => self.unknown_usage.add(&counts),
-        }
+        self.per_model.add(model_type, counts);
     }
 
     pub fn add_lines_changed(&mut self, lines: usize) {
@@ -108,32 +143,9 @@ impl DailyUsage {
     }
 
     pub fn calculate_costs(&self) -> DailyCosts {
-        let sonnet_costs = ModelType::Sonnet
-            .pricing()
-            .map(|p| p.calculate_cost(&self.sonnet_usage))
-            .unwrap_or_default();
-
-        let haiku_costs = ModelType::Haiku
-            .pricing()
-            .map(|p| p.calculate_cost(&self.haiku_usage))
-            .unwrap_or_default();
-
-        let opus_costs = ModelType::Opus
-            .pricing()
-            .map(|p| p.calculate_cost(&self.opus_usage))
-            .unwrap_or_default();
-
-        let opus4_costs = ModelType::Opus4
-            .pricing()
-            .map(|p| p.calculate_cost(&self.opus4_usage))
-            .unwrap_or_default();
-
         DailyCosts {
             date: self.date,
-            sonnet_costs,
-            haiku_costs,
-            opus_costs,
-            opus4_costs,
+            per_model: self.per_model.calculate_costs(),
             lines_changed: self.lines_changed,
         }
     }
@@ -142,19 +154,13 @@ impl DailyUsage {
 #[derive(Debug)]
 pub struct DailyCosts {
     pub date: NaiveDate,
-    pub sonnet_costs: TokenCosts,
-    pub haiku_costs: TokenCosts,
-    pub opus_costs: TokenCosts,
-    pub opus4_costs: TokenCosts,
+    pub per_model: ModelCostsMap,
     pub lines_changed: usize,
 }
 
 impl DailyCosts {
     pub fn total(&self) -> f64 {
-        self.sonnet_costs.total()
-            + self.haiku_costs.total()
-            + self.opus_costs.total()
-            + self.opus4_costs.total()
+        self.per_model.total()
     }
 }
 
@@ -167,11 +173,7 @@ pub struct SessionUsage {
     pub session_id: String,
     pub start_time: DateTime<Utc>,
     pub end_time: DateTime<Utc>,
-    pub sonnet_usage: TokenCounts,
-    pub haiku_usage: TokenCounts,
-    pub opus_usage: TokenCounts,
-    pub opus4_usage: TokenCounts,
-    pub unknown_usage: TokenCounts,
+    pub per_model: ModelUsageMap,
     pub lines_changed: usize,
 }
 
@@ -181,11 +183,7 @@ impl SessionUsage {
             session_id,
             start_time: timestamp,
             end_time: timestamp,
-            sonnet_usage: TokenCounts::default(),
-            haiku_usage: TokenCounts::default(),
-            opus_usage: TokenCounts::default(),
-            opus4_usage: TokenCounts::default(),
-            unknown_usage: TokenCounts::default(),
+            per_model: ModelUsageMap::default(),
             lines_changed: 0,
         }
     }
@@ -205,13 +203,7 @@ impl SessionUsage {
         counts: TokenCounts,
         timestamp: DateTime<Utc>,
     ) {
-        match model_type {
-            ModelType::Sonnet => self.sonnet_usage.add(&counts),
-            ModelType::Haiku => self.haiku_usage.add(&counts),
-            ModelType::Opus => self.opus_usage.add(&counts),
-            ModelType::Opus4 => self.opus4_usage.add(&counts),
-            ModelType::Unknown => self.unknown_usage.add(&counts),
-        }
+        self.per_model.add(model_type, counts);
         self.update_time_range(timestamp);
     }
 
@@ -221,34 +213,11 @@ impl SessionUsage {
     }
 
     pub fn calculate_costs(&self) -> SessionCosts {
-        let sonnet_costs = ModelType::Sonnet
-            .pricing()
-            .map(|p| p.calculate_cost(&self.sonnet_usage))
-            .unwrap_or_default();
-
-        let haiku_costs = ModelType::Haiku
-            .pricing()
-            .map(|p| p.calculate_cost(&self.haiku_usage))
-            .unwrap_or_default();
-
-        let opus_costs = ModelType::Opus
-            .pricing()
-            .map(|p| p.calculate_cost(&self.opus_usage))
-            .unwrap_or_default();
-
-        let opus4_costs = ModelType::Opus4
-            .pricing()
-            .map(|p| p.calculate_cost(&self.opus4_usage))
-            .unwrap_or_default();
-
         SessionCosts {
             session_id: self.session_id.clone(),
             start_time: self.start_time,
             end_time: self.end_time,
-            sonnet_costs,
-            haiku_costs,
-            opus_costs,
-            opus4_costs,
+            per_model: self.per_model.calculate_costs(),
             lines_changed: self.lines_changed,
         }
     }
@@ -264,19 +233,13 @@ pub struct SessionCosts {
     pub session_id: String,
     pub start_time: DateTime<Utc>,
     pub end_time: DateTime<Utc>,
-    pub sonnet_costs: TokenCosts,
-    pub haiku_costs: TokenCosts,
-    pub opus_costs: TokenCosts,
-    pub opus4_costs: TokenCosts,
+    pub per_model: ModelCostsMap,
     pub lines_changed: usize,
 }
 
 impl SessionCosts {
     pub fn total(&self) -> f64 {
-        self.sonnet_costs.total()
-            + self.haiku_costs.total()
-            + self.opus_costs.total()
-            + self.opus4_costs.total()
+        self.per_model.total()
     }
 
     pub fn duration_minutes(&self) -> i64 {
@@ -328,89 +291,48 @@ pub(crate) struct SessionBasedMessage {
 
 /// Deduplicates messages by requestId, keeping only the final message per streaming group.
 ///
-/// For messages with the same requestId, retains the one with the highest output_tokens.
-/// Messages without a requestId (non-streaming) are kept as-is.
+/// For messages with the same requestId, retains the one with the highest `output_tokens`;
+/// messages without a requestId (non-streaming) are kept as-is.
+///
+/// ## Implementation
+///
+/// Delegates to [`deduplicate_across_files`] and drops its extra timestamp
+/// tie-break by passing an epoch-0 sentinel for every message. The
+/// token-count comparison inside `deduplicate_across_files` still runs, but
+/// because two equal sentinel timestamps never satisfy `new_ts < old_ts` the
+/// tie-break always resolves to "keep the first-seen entry" — matching the
+/// historical behaviour of this function when it was a standalone loop.
 ///
 /// ## Design Decision: Using output_tokens as Finality Heuristic
 ///
-/// This function uses `max(output_tokens)` to identify the final message in a streaming group.
-/// This works because streaming responses accumulate tokens monotonically - each subsequent
-/// message has equal or greater token counts than the previous.
-///
-/// **Alternative considered**: Using message timestamps for ordering. While more semantically
-/// correct, this would require restructuring the message tuples to include timestamps in
-/// `parse_log_file`, significantly complicating the codebase. The current approach is simpler
-/// and handles all realistic streaming scenarios correctly.
+/// Using `max(output_tokens)` to identify the final message in a streaming group works
+/// because streaming responses accumulate tokens monotonically: each subsequent message has
+/// equal or greater token counts than the previous.
 ///
 /// **Known limitations**:
 /// - If all messages have zero output_tokens, keeps the first encountered. This is
 ///   acceptable because zero-token messages are rare edge cases (API errors, empty
 ///   responses) and all such messages are functionally equivalent for cost calculation.
-/// - Assumes in-order message delivery (true for Claude API in practice)
-/// - If the API ever sent decreasing token counts, this would fail (not observed)
+/// - Assumes in-order message delivery (true for Claude API in practice).
+/// - If the API ever sent decreasing token counts, this would fail (not observed).
 fn deduplicate_by_request_id<T>(
     messages: Vec<(Option<String>, T)>,
     get_output_tokens: impl Fn(&T) -> u64,
 ) -> Vec<T> {
-    let total_messages = messages.len();
-    let mut result: Vec<T> = Vec::new();
-    let mut request_id_to_index: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
-    let mut duplicates_found = 0;
-    let mut duplicate_request_ids: HashSet<String> = HashSet::new();
-
-    debug!(
-        "deduplicate_by_request_id: Processing {} messages",
-        total_messages
-    );
-
-    for (request_id, payload) in messages {
-        if let Some(req_id) = request_id {
-            // Message has a requestId - part of a streaming group
-            if let Some(&existing_idx) = request_id_to_index.get(&req_id) {
-                duplicates_found += 1;
-                duplicate_request_ids.insert(req_id.clone());
-                let old_tokens = get_output_tokens(&result[existing_idx]);
-                let new_tokens = get_output_tokens(&payload);
-                trace!(
-                    "Found duplicate requestId='{}': old_tokens={}, new_tokens={}",
-                    req_id,
-                    old_tokens,
-                    new_tokens
-                );
-                // Keep the message with higher output_tokens (final message)
-                if new_tokens > old_tokens {
-                    trace!("  -> Keeping new message (higher token count)");
-                    result[existing_idx] = payload;
-                } else {
-                    trace!("  -> Keeping existing message");
-                }
-            } else {
-                // First occurrence of this requestId
-                trace!(
-                    "First occurrence of requestId='{}' with {} output tokens",
-                    req_id,
-                    get_output_tokens(&payload)
-                );
-                request_id_to_index.insert(req_id, result.len());
-                result.push(payload);
-            }
-        } else {
-            // No requestId - non-streaming message, keep as-is
-            trace!("Non-streaming message (no requestId)");
-            result.push(payload);
-        }
-    }
-
-    debug!(
-        "deduplicate_by_request_id: {} messages -> {} after deduplication ({} duplicates removed, {} unique request_ids had duplicates)",
-        total_messages,
-        result.len(),
-        duplicates_found,
-        duplicate_request_ids.len()
-    );
-
-    result
+    // Callers already provide `(Option<String>, T)` tuples so
+    // deduplicate_across_files can pull request_id out via the first closure
+    // without requiring T to carry it. See the function doc for why the
+    // epoch-0 sentinel timestamp neutralises the tie-break.
+    let sentinel = DateTime::<Utc>::from_timestamp(0, 0).expect("valid timestamp");
+    deduplicate_across_files(
+        messages,
+        |(req_id, _)| req_id,
+        |(_, payload)| get_output_tokens(payload),
+        |_| sentinel,
+    )
+    .into_iter()
+    .map(|(_, payload)| payload)
+    .collect()
 }
 
 /// Deduplicates messages across files by requestId to handle forked conversations.
@@ -541,53 +463,7 @@ pub async fn parse_log_file(
     filter: &TimeRangeFilter,
 ) -> miette::Result<Vec<DateBasedMessage>> {
     let log_lines = parser::read_file(file).await?;
-
-    // Temporary structure to hold all messages with their requestId
-    let mut all_messages: Vec<(Option<String>, DateBasedMessage)> = Vec::new();
-
-    for line in log_lines {
-        if let LogLine::Assistant(assistant_line) = line {
-            // Skip if timestamp is outside filter range
-            if !filter.contains(&assistant_line.timestamp) {
-                continue;
-            }
-
-            if is_synthetic_model(&assistant_line.message.model) {
-                continue;
-            }
-
-            let date = timezone.to_date(&assistant_line.timestamp);
-            let model_string = assistant_line.message.model.clone();
-            let model_type = ModelType::from_model_string(&model_string);
-            let usage = &assistant_line.message.usage;
-
-            let counts = TokenCounts {
-                input_tokens: usage.input_tokens,
-                output_tokens: usage.output_tokens,
-                cache_write_tokens: usage.cache_creation_input_tokens,
-                cache_read_tokens: usage.cache_read_input_tokens,
-            };
-
-            all_messages.push((
-                assistant_line.request_id.clone(),
-                DateBasedMessage {
-                    date,
-                    model_type,
-                    model_string,
-                    token_counts: counts,
-                    request_id: assistant_line.request_id.clone(),
-                    timestamp: assistant_line.timestamp,
-                },
-            ));
-        }
-    }
-
-    // Deduplicate streaming messages by requestId
-    let usages = deduplicate_by_request_id(all_messages, |msg: &DateBasedMessage| {
-        msg.token_counts.output_tokens as u64
-    });
-
-    Ok(usages)
+    Ok(extract_date_messages(log_lines, timezone, filter))
 }
 
 /// Parse a log file and extract token usage by session
@@ -607,54 +483,7 @@ pub async fn parse_log_file_by_session(
     filter: &TimeRangeFilter,
 ) -> miette::Result<Vec<SessionBasedMessage>> {
     let log_lines = parser::read_file(file).await?;
-
-    // Temporary structure to hold all messages with their requestId
-    let mut all_messages: Vec<(Option<String>, SessionBasedMessage)> = Vec::new();
-
-    for line in log_lines {
-        if let LogLine::Assistant(assistant_line) = line {
-            // Skip if timestamp is outside filter range
-            if !filter.contains(&assistant_line.timestamp) {
-                continue;
-            }
-
-            if is_synthetic_model(&assistant_line.message.model) {
-                continue;
-            }
-
-            let session_id = assistant_line.session_id.clone();
-            let timestamp = assistant_line.timestamp;
-            let model_string = assistant_line.message.model.clone();
-            let model_type = ModelType::from_model_string(&model_string);
-            let usage = &assistant_line.message.usage;
-
-            let counts = TokenCounts {
-                input_tokens: usage.input_tokens,
-                output_tokens: usage.output_tokens,
-                cache_write_tokens: usage.cache_creation_input_tokens,
-                cache_read_tokens: usage.cache_read_input_tokens,
-            };
-
-            all_messages.push((
-                assistant_line.request_id.clone(),
-                SessionBasedMessage {
-                    session_id,
-                    timestamp,
-                    model_type,
-                    model_string,
-                    token_counts: counts,
-                    request_id: assistant_line.request_id.clone(),
-                },
-            ));
-        }
-    }
-
-    // Deduplicate streaming messages by requestId
-    let usages = deduplicate_by_request_id(all_messages, |msg: &SessionBasedMessage| {
-        msg.token_counts.output_tokens as u64
-    });
-
-    Ok(usages)
+    Ok(extract_session_messages(log_lines, filter))
 }
 
 /// Extract lines changed from assistant messages in a log file
@@ -671,37 +500,135 @@ pub async fn parse_lines_changed(
     filter: &TimeRangeFilter,
 ) -> miette::Result<Vec<(NaiveDate, usize)>> {
     let log_lines = parser::read_file(file).await?;
+    Ok(extract_date_lines_changed(log_lines, timezone, filter))
+}
+
+/// Extract date-based messages from log lines, deduplicating by request ID.
+fn extract_date_messages(
+    log_lines: Vec<LogLine>,
+    timezone: DateTimezone,
+    filter: &TimeRangeFilter,
+) -> Vec<DateBasedMessage> {
+    let mut all_messages: Vec<(Option<String>, DateBasedMessage)> = Vec::new();
+
+    for_each_assistant_line(log_lines, filter, |assistant_line| {
+        let date = timezone.to_date(&assistant_line.timestamp);
+        let model_string = assistant_line.message.model.clone();
+        let model_type = ModelType::from_model_string(&model_string);
+        let counts = token_counts_from_usage(&assistant_line.message.usage);
+
+        all_messages.push((
+            assistant_line.request_id.clone(),
+            DateBasedMessage {
+                date,
+                model_type,
+                model_string,
+                token_counts: counts,
+                request_id: assistant_line.request_id.clone(),
+                timestamp: assistant_line.timestamp,
+            },
+        ));
+    });
+
+    deduplicate_by_request_id(all_messages, |msg: &DateBasedMessage| {
+        msg.token_counts.output_tokens as u64
+    })
+}
+
+/// Extract session-based messages from log lines, deduplicating by request ID.
+fn extract_session_messages(
+    log_lines: Vec<LogLine>,
+    filter: &TimeRangeFilter,
+) -> Vec<SessionBasedMessage> {
+    let mut all_messages: Vec<(Option<String>, SessionBasedMessage)> = Vec::new();
+
+    for_each_assistant_line(log_lines, filter, |assistant_line| {
+        let session_id = assistant_line.session_id.clone();
+        let timestamp = assistant_line.timestamp;
+        let model_string = assistant_line.message.model.clone();
+        let model_type = ModelType::from_model_string(&model_string);
+        let counts = token_counts_from_usage(&assistant_line.message.usage);
+
+        all_messages.push((
+            assistant_line.request_id.clone(),
+            SessionBasedMessage {
+                session_id,
+                timestamp,
+                model_type,
+                model_string,
+                token_counts: counts,
+                request_id: assistant_line.request_id.clone(),
+            },
+        ));
+    });
+
+    deduplicate_by_request_id(all_messages, |msg: &SessionBasedMessage| {
+        msg.token_counts.output_tokens as u64
+    })
+}
+
+/// Extract lines changed per date from log lines.
+fn extract_date_lines_changed(
+    log_lines: Vec<LogLine>,
+    timezone: DateTimezone,
+    filter: &TimeRangeFilter,
+) -> Vec<(NaiveDate, usize)> {
     let mut results = Vec::new();
 
-    for line in log_lines {
-        if let LogLine::Assistant(assistant_line) = line {
-            // Skip if timestamp is outside filter range
-            if !filter.contains(&assistant_line.timestamp) {
-                continue;
-            }
+    for_each_assistant_line(log_lines, filter, |assistant_line| {
+        let date = timezone.to_date(&assistant_line.timestamp);
+        extract_lines_from_content(&assistant_line.message.content, |lines| {
+            results.push((date, lines));
+        });
+    });
 
-            if is_synthetic_model(&assistant_line.message.model) {
-                continue;
-            }
+    results
+}
 
-            let date = timezone.to_date(&assistant_line.timestamp);
+/// Extract lines changed per session from log lines.
+fn extract_session_lines_changed(
+    log_lines: Vec<LogLine>,
+    filter: &TimeRangeFilter,
+) -> Vec<(String, DateTime<Utc>, usize)> {
+    let mut results = Vec::new();
 
-            // Check if content is an array (contains tool uses)
-            if let LogMessageContent::Vec(content_blocks) = &assistant_line.message.content {
-                for content_item in content_blocks {
-                    if let LogMessageTaggedContent::ToolUse { name, input, .. } = content_item {
-                        if let Some(lines) =
-                            line_counter::extract_lines_from_tool(name.as_str(), input)
-                        {
-                            results.push((date, lines));
-                        }
-                    }
+    for_each_assistant_line(log_lines, filter, |assistant_line| {
+        let session_id = assistant_line.session_id.clone();
+        let timestamp = assistant_line.timestamp;
+        extract_lines_from_content(&assistant_line.message.content, |lines| {
+            results.push((session_id.clone(), timestamp, lines));
+        });
+    });
+
+    results
+}
+
+/// Extract line counts from tool uses in message content, calling `on_lines` for each found.
+fn extract_lines_from_content(content: &LogMessageContent, mut on_lines: impl FnMut(usize)) {
+    if let LogMessageContent::Vec(content_blocks) = content {
+        for content_item in content_blocks {
+            if let LogMessageTaggedContent::ToolUse { name, input, .. } = content_item {
+                if let Some(lines) = line_counter::extract_lines_from_tool(name.as_str(), input) {
+                    on_lines(lines);
                 }
             }
         }
     }
+}
 
-    Ok(results)
+/// Records unknown-model usage in the aggregate tracking sets used by both
+/// daily and session aggregation.
+fn track_unknown_usage(
+    model_type: ModelType,
+    model_string: &str,
+    token_counts: &TokenCounts,
+    unknown_models: &mut HashSet<String>,
+    total_unknown_tokens: &mut TokenCounts,
+) {
+    if model_type == ModelType::Unknown {
+        unknown_models.insert(model_string.to_string());
+        total_unknown_tokens.add(token_counts);
+    }
 }
 
 /// Aggregate usage data by date
@@ -715,11 +642,13 @@ pub fn aggregate_by_date(
 
     // Aggregate token usage
     for msg in usages {
-        // Track unknown models
-        if msg.model_type == ModelType::Unknown {
-            unknown_models.insert(msg.model_string);
-            total_unknown_tokens.add(&msg.token_counts);
-        }
+        track_unknown_usage(
+            msg.model_type,
+            &msg.model_string,
+            &msg.token_counts,
+            unknown_models,
+            total_unknown_tokens,
+        );
 
         daily_usage
             .entry(msg.date)
@@ -749,11 +678,13 @@ pub fn aggregate_by_session(
 
     // Aggregate token usage
     for msg in usages {
-        // Track unknown models
-        if msg.model_type == ModelType::Unknown {
-            unknown_models.insert(msg.model_string);
-            total_unknown_tokens.add(&msg.token_counts);
-        }
+        track_unknown_usage(
+            msg.model_type,
+            &msg.model_string,
+            &msg.token_counts,
+            unknown_models,
+            total_unknown_tokens,
+        );
 
         session_usage
             .entry(msg.session_id.clone())
@@ -774,260 +705,55 @@ pub fn aggregate_by_session(
 
 /// Accepts pre-loaded contents to avoid file I/O within rayon parallel contexts,
 /// preventing worker thread starvation.
+fn parse_preloaded_content<T>(
+    contents: &str,
+    file_path: &Path,
+    extract: impl FnOnce(Vec<LogLine>) -> T,
+) -> miette::Result<T> {
+    let log_lines = parse_content_to_log_lines(contents, file_path)?;
+    Ok(extract(log_lines))
+}
+
 fn parse_log_content(
     contents: &str,
     file_path: &Path,
     timezone: DateTimezone,
     filter: &TimeRangeFilter,
 ) -> miette::Result<Vec<DateBasedMessage>> {
-    // Parse lines sequentially from the string contents
-    let log_lines: Vec<LogLine> = contents
-        .split('\n')
-        .filter(|line| !line.is_empty())
-        .map(|line| {
-            serde_json::from_str::<LogLine>(line).inspect_err(|e| {
-                eprintln!(
-                    "Error parsing file {}: {}\nLine: {line}",
-                    file_path.display(),
-                    e
-                )
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .into_diagnostic()?;
-
-    // Temporary structure to hold all messages with their requestId
-    let mut all_messages: Vec<(Option<String>, DateBasedMessage)> = Vec::new();
-
-    for line in log_lines {
-        if let LogLine::Assistant(assistant_line) = line {
-            // Skip if timestamp is outside filter range
-            if !filter.contains(&assistant_line.timestamp) {
-                continue;
-            }
-
-            if is_synthetic_model(&assistant_line.message.model) {
-                continue;
-            }
-
-            let date = timezone.to_date(&assistant_line.timestamp);
-            let model_string = assistant_line.message.model.clone();
-            let model_type = ModelType::from_model_string(&model_string);
-            let usage = &assistant_line.message.usage;
-
-            let counts = TokenCounts {
-                input_tokens: usage.input_tokens,
-                output_tokens: usage.output_tokens,
-                cache_write_tokens: usage.cache_creation_input_tokens,
-                cache_read_tokens: usage.cache_read_input_tokens,
-            };
-
-            all_messages.push((
-                assistant_line.request_id.clone(),
-                DateBasedMessage {
-                    date,
-                    model_type,
-                    model_string,
-                    token_counts: counts,
-                    request_id: assistant_line.request_id.clone(),
-                    timestamp: assistant_line.timestamp,
-                },
-            ));
-        }
-    }
-
-    // Deduplicate streaming messages by requestId
-    let usages = deduplicate_by_request_id(all_messages, |msg: &DateBasedMessage| {
-        msg.token_counts.output_tokens as u64
-    });
-
-    Ok(usages)
+    parse_preloaded_content(contents, file_path, |log_lines| {
+        extract_date_messages(log_lines, timezone, filter)
+    })
 }
 
-/// Accepts pre-loaded contents to avoid file I/O within rayon parallel contexts,
-/// preventing worker thread starvation.
 fn parse_lines_changed_content(
     contents: &str,
     file_path: &Path,
     timezone: DateTimezone,
     filter: &TimeRangeFilter,
 ) -> miette::Result<Vec<(NaiveDate, usize)>> {
-    // Parse lines sequentially from the string contents
-    let log_lines: Vec<LogLine> = contents
-        .split('\n')
-        .filter(|line| !line.is_empty())
-        .map(|line| {
-            serde_json::from_str::<LogLine>(line).inspect_err(|e| {
-                eprintln!(
-                    "Error parsing file {}: {}\nLine: {line}",
-                    file_path.display(),
-                    e
-                )
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .into_diagnostic()?;
-
-    let mut results = Vec::new();
-
-    for line in log_lines {
-        if let LogLine::Assistant(assistant_line) = line {
-            // Skip if timestamp is outside filter range
-            if !filter.contains(&assistant_line.timestamp) {
-                continue;
-            }
-
-            if is_synthetic_model(&assistant_line.message.model) {
-                continue;
-            }
-
-            let date = timezone.to_date(&assistant_line.timestamp);
-
-            // Check if content is an array (contains tool uses)
-            if let LogMessageContent::Vec(content_blocks) = &assistant_line.message.content {
-                for content_item in content_blocks {
-                    if let LogMessageTaggedContent::ToolUse { name, input, .. } = content_item {
-                        if let Some(lines) =
-                            line_counter::extract_lines_from_tool(name.as_str(), input)
-                        {
-                            results.push((date, lines));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(results)
+    parse_preloaded_content(contents, file_path, |log_lines| {
+        extract_date_lines_changed(log_lines, timezone, filter)
+    })
 }
 
-/// Accepts pre-loaded contents to avoid file I/O within rayon parallel contexts,
-/// preventing worker thread starvation.
 fn parse_log_content_by_session(
     contents: &str,
     file_path: &Path,
     filter: &TimeRangeFilter,
 ) -> miette::Result<Vec<SessionBasedMessage>> {
-    // Parse lines sequentially from the string contents
-    let log_lines: Vec<LogLine> = contents
-        .split('\n')
-        .filter(|line| !line.is_empty())
-        .map(|line| {
-            serde_json::from_str::<LogLine>(line).inspect_err(|e| {
-                eprintln!(
-                    "Error parsing file {}: {}\nLine: {line}",
-                    file_path.display(),
-                    e
-                )
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .into_diagnostic()?;
-
-    // Temporary structure to hold all messages with their requestId
-    let mut all_messages: Vec<(Option<String>, SessionBasedMessage)> = Vec::new();
-
-    for line in log_lines {
-        if let LogLine::Assistant(assistant_line) = line {
-            // Skip if timestamp is outside filter range
-            if !filter.contains(&assistant_line.timestamp) {
-                continue;
-            }
-
-            if is_synthetic_model(&assistant_line.message.model) {
-                continue;
-            }
-
-            let session_id = assistant_line.session_id.clone();
-            let timestamp = assistant_line.timestamp;
-            let model_string = assistant_line.message.model.clone();
-            let model_type = ModelType::from_model_string(&model_string);
-            let usage = &assistant_line.message.usage;
-
-            let counts = TokenCounts {
-                input_tokens: usage.input_tokens,
-                output_tokens: usage.output_tokens,
-                cache_write_tokens: usage.cache_creation_input_tokens,
-                cache_read_tokens: usage.cache_read_input_tokens,
-            };
-
-            all_messages.push((
-                assistant_line.request_id.clone(),
-                SessionBasedMessage {
-                    session_id,
-                    timestamp,
-                    model_type,
-                    model_string,
-                    token_counts: counts,
-                    request_id: assistant_line.request_id.clone(),
-                },
-            ));
-        }
-    }
-
-    // Deduplicate streaming messages by requestId
-    let usages = deduplicate_by_request_id(all_messages, |msg: &SessionBasedMessage| {
-        msg.token_counts.output_tokens as u64
-    });
-
-    Ok(usages)
+    parse_preloaded_content(contents, file_path, |log_lines| {
+        extract_session_messages(log_lines, filter)
+    })
 }
 
-/// Accepts pre-loaded contents to avoid file I/O within rayon parallel contexts,
-/// preventing worker thread starvation.
 fn parse_lines_changed_content_by_session(
     contents: &str,
     file_path: &Path,
     filter: &TimeRangeFilter,
 ) -> miette::Result<Vec<(String, DateTime<Utc>, usize)>> {
-    // Parse lines sequentially from the string contents
-    let log_lines: Vec<LogLine> = contents
-        .split('\n')
-        .filter(|line| !line.is_empty())
-        .map(|line| {
-            serde_json::from_str::<LogLine>(line).inspect_err(|e| {
-                eprintln!(
-                    "Error parsing file {}: {}\nLine: {line}",
-                    file_path.display(),
-                    e
-                )
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .into_diagnostic()?;
-
-    let mut results = Vec::new();
-
-    for line in log_lines {
-        if let LogLine::Assistant(assistant_line) = line {
-            // Skip if timestamp is outside filter range
-            if !filter.contains(&assistant_line.timestamp) {
-                continue;
-            }
-
-            if is_synthetic_model(&assistant_line.message.model) {
-                continue;
-            }
-
-            let session_id = assistant_line.session_id.clone();
-            let timestamp = assistant_line.timestamp;
-
-            // Check if content is an array (contains tool uses)
-            if let LogMessageContent::Vec(content_blocks) = &assistant_line.message.content {
-                for content_item in content_blocks {
-                    if let LogMessageTaggedContent::ToolUse { name, input, .. } = content_item {
-                        if let Some(lines) =
-                            line_counter::extract_lines_from_tool(name.as_str(), input)
-                        {
-                            results.push((session_id.clone(), timestamp, lines));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(results)
+    parse_preloaded_content(contents, file_path, |log_lines| {
+        extract_session_lines_changed(log_lines, filter)
+    })
 }
 
 /// Reads files asynchronously with concurrency limit to prevent file descriptor exhaustion.
@@ -1111,33 +837,60 @@ where
 }
 
 /// Analyze all log files in a directory and return daily costs
+/// Shared pipeline: find files → read → parse.
+///
+/// Returns `None` when the directory contains no `.jsonl` files.
+/// Otherwise returns `(usages, lines_changed, files_parsed, files_failed)`.
+/// Callers handle deduplication and aggregation since those steps differ
+/// between daily and session analysis.
+async fn analyze_pipeline<U, L>(
+    dir: &Path,
+    parse_usage: impl Fn(&str, &Path) -> miette::Result<Vec<U>> + Send + Sync,
+    parse_lines: impl Fn(&str, &Path) -> miette::Result<Vec<L>> + Send + Sync,
+) -> miette::Result<Option<(Vec<U>, Vec<L>, usize, usize)>>
+where
+    U: Send,
+    L: Send,
+{
+    let jsonl_files = find_jsonl_files(dir).await?;
+
+    if jsonl_files.is_empty() {
+        warn!("No .jsonl files found in directory");
+        return Ok(None);
+    }
+
+    println!("Found {} log files to analyze", jsonl_files.len());
+
+    let (file_contents, mut files_failed) = read_files_parallel(jsonl_files).await;
+
+    let (all_usages, all_lines_changed, files_parsed, parse_failed) =
+        parse_files_parallel(file_contents, parse_usage, parse_lines);
+
+    files_failed += parse_failed;
+
+    Ok(Some((
+        all_usages,
+        all_lines_changed,
+        files_parsed,
+        files_failed,
+    )))
+}
+
 pub async fn analyze_directory(
     dir: &Path,
     timezone: DateTimezone,
     filter: &TimeRangeFilter,
 ) -> miette::Result<AnalysisResult> {
-    let jsonl_files = find_jsonl_files(dir).await?;
-
-    if jsonl_files.is_empty() {
-        warn!("No .jsonl files found in directory");
-        return Ok(AnalysisResult::default());
-    }
-
-    println!("Found {} log files to analyze", jsonl_files.len());
-
-    // Step 1: Read all files in parallel
-    let (file_contents, mut files_failed) = read_files_parallel(jsonl_files).await;
-
-    // Step 2: Parse files in parallel using rayon
-    let (all_usages, all_lines_changed, files_parsed, parse_failed) = parse_files_parallel(
-        file_contents,
+    let Some((all_usages, all_lines_changed, files_parsed, files_failed)) = analyze_pipeline(
+        dir,
         |contents, path| parse_log_content(contents, path, timezone, filter),
         |contents, path| parse_lines_changed_content(contents, path, timezone, filter),
-    );
+    )
+    .await?
+    else {
+        return Ok(AnalysisResult::default());
+    };
 
-    files_failed += parse_failed;
-
-    // Step 2.5: Deduplicate across files (handles forked conversations)
     let all_usages = deduplicate_across_files(
         all_usages,
         |msg| &msg.request_id,
@@ -1145,7 +898,6 @@ pub async fn analyze_directory(
         |msg| msg.timestamp,
     );
 
-    // Step 3: Aggregate results
     let mut unknown_models = HashSet::new();
     let mut total_unknown_tokens = TokenCounts::default();
 
@@ -1174,28 +926,16 @@ pub async fn analyze_directory_by_session(
     dir: &Path,
     filter: &TimeRangeFilter,
 ) -> miette::Result<SessionAnalysisResult> {
-    let jsonl_files = find_jsonl_files(dir).await?;
-
-    if jsonl_files.is_empty() {
-        warn!("No .jsonl files found in directory");
-        return Ok(SessionAnalysisResult::default());
-    }
-
-    println!("Found {} log files to analyze", jsonl_files.len());
-
-    // Step 1: Read all files in parallel
-    let (file_contents, mut files_failed) = read_files_parallel(jsonl_files).await;
-
-    // Step 2: Parse files in parallel using rayon
-    let (all_usages, all_lines_changed, files_parsed, parse_failed) = parse_files_parallel(
-        file_contents,
+    let Some((all_usages, all_lines_changed, files_parsed, files_failed)) = analyze_pipeline(
+        dir,
         |contents, path| parse_log_content_by_session(contents, path, filter),
         |contents, path| parse_lines_changed_content_by_session(contents, path, filter),
-    );
+    )
+    .await?
+    else {
+        return Ok(SessionAnalysisResult::default());
+    };
 
-    files_failed += parse_failed;
-
-    // Step 2.5: Deduplicate across files (handles forked conversations)
     let all_usages = deduplicate_across_files(
         all_usages,
         |msg| &msg.request_id,
@@ -1203,7 +943,6 @@ pub async fn analyze_directory_by_session(
         |msg| msg.timestamp,
     );
 
-    // Step 3: Aggregate results
     let mut unknown_models = HashSet::new();
     let mut total_unknown_tokens = TokenCounts::default();
 
@@ -1218,7 +957,6 @@ pub async fn analyze_directory_by_session(
         .map(|usage| usage.calculate_costs())
         .collect();
 
-    // Sort sessions chronologically (oldest first) by start_time
     session_costs.sort_by_key(|s| s.start_time);
 
     Ok(SessionAnalysisResult {

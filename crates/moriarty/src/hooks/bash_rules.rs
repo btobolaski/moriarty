@@ -525,24 +525,78 @@ fn filter_arguments(
 mod tests {
     use super::*;
 
+    fn filter_remove(cmd: &str, remove: &[&str]) -> String {
+        let remove = Some(remove.iter().map(|s| s.to_string()).collect());
+        filter_arguments(cmd, &remove, &None, &None).unwrap()
+    }
+
+    fn filter_add(cmd: &str, add: &[&str]) -> String {
+        let add = Some(add.iter().map(|s| s.to_string()).collect());
+        filter_arguments(cmd, &None, &add, &None).unwrap()
+    }
+
+    fn filter_replace(cmd: &str, replacements: &[(&str, &str)]) -> String {
+        let replace_map: HashMap<String, String> = replacements
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        filter_arguments(cmd, &None, &None, &Some(replace_map)).unwrap()
+    }
+
+    fn allow_rule(name: &str, pattern: &str) -> BashRule {
+        BashRule {
+            name: name.to_string(),
+            pattern: pattern.to_string(),
+            action: BashRuleAction::Allow,
+        }
+    }
+
+    fn deny_rule(name: &str, pattern: &str, reason: &str) -> BashRule {
+        BashRule {
+            name: name.to_string(),
+            pattern: pattern.to_string(),
+            action: BashRuleAction::Deny {
+                value: reason.to_string(),
+            },
+        }
+    }
+
+    fn ask_rule(name: &str, pattern: &str) -> BashRule {
+        BashRule {
+            name: name.to_string(),
+            pattern: pattern.to_string(),
+            action: BashRuleAction::Ask,
+        }
+    }
+
+    fn modify_rule(name: &str, pattern: &str, replacement: &str) -> BashRule {
+        BashRule {
+            name: name.to_string(),
+            pattern: pattern.to_string(),
+            action: BashRuleAction::Modify {
+                value: replacement.to_string(),
+            },
+        }
+    }
+
+    fn make_engine(rules: Vec<BashRule>) -> BashRuleEngine {
+        BashRuleEngine::from_config(rules, None).unwrap()
+    }
+
     #[test]
     fn test_empty_rules() {
-        let engine = BashRuleEngine::from_config(vec![], None).unwrap();
+        let engine = make_engine(vec![]);
         let result = engine.apply_rules("ls -la");
         assert_eq!(result, RuleResult::NoMatch);
     }
 
     #[test]
     fn test_deny_rule() {
-        let rules = vec![BashRule {
-            name: "deny-rm-rf".to_string(),
-            pattern: r"^rm\s+-rf\s+/".to_string(),
-            action: BashRuleAction::Deny {
-                value: "Dangerous recursive delete".to_string(),
-            },
-        }];
-
-        let engine = BashRuleEngine::from_config(rules, None).unwrap();
+        let engine = make_engine(vec![deny_rule(
+            "deny-rm-rf",
+            r"^rm\s+-rf\s+/",
+            "Dangerous recursive delete",
+        )]);
         let result = engine.apply_rules("rm -rf /");
 
         match result {
@@ -556,13 +610,7 @@ mod tests {
 
     #[test]
     fn test_allow_rule() {
-        let rules = vec![BashRule {
-            name: "allow-ls".to_string(),
-            pattern: r"^ls($|\s)".to_string(),
-            action: BashRuleAction::Allow,
-        }];
-
-        let engine = BashRuleEngine::from_config(rules, None).unwrap();
+        let engine = make_engine(vec![allow_rule("allow-ls", r"^ls($|\s)")]);
         let result = engine.apply_rules("ls -la");
         assert_eq!(
             result,
@@ -574,13 +622,7 @@ mod tests {
 
     #[test]
     fn test_ask_rule() {
-        let rules = vec![BashRule {
-            name: "ask-docker".to_string(),
-            pattern: r"^docker".to_string(),
-            action: BashRuleAction::Ask,
-        }];
-
-        let engine = BashRuleEngine::from_config(rules, None).unwrap();
+        let engine = make_engine(vec![ask_rule("ask-docker", r"^docker")]);
         let result = engine.apply_rules("docker build");
         assert_eq!(
             result,
@@ -592,15 +634,11 @@ mod tests {
 
     #[test]
     fn test_modify_rule_simple() {
-        let rules = vec![BashRule {
-            name: "add-dry-run".to_string(),
-            pattern: r"^(docker\s+system\s+prune)$".to_string(),
-            action: BashRuleAction::Modify {
-                value: "$1 --dry-run".to_string(),
-            },
-        }];
-
-        let engine = BashRuleEngine::from_config(rules, None).unwrap();
+        let engine = make_engine(vec![modify_rule(
+            "add-dry-run",
+            r"^(docker\s+system\s+prune)$",
+            "$1 --dry-run",
+        )]);
         let result = engine.apply_rules("docker system prune");
 
         match result {
@@ -617,15 +655,11 @@ mod tests {
 
     #[test]
     fn test_modify_rule_multiple_groups() {
-        let rules = vec![BashRule {
-            name: "swap-args".to_string(),
-            pattern: r"^echo\s+(\w+)\s+(\w+)$".to_string(),
-            action: BashRuleAction::Modify {
-                value: "echo $2 $1".to_string(),
-            },
-        }];
-
-        let engine = BashRuleEngine::from_config(rules, None).unwrap();
+        let engine = make_engine(vec![modify_rule(
+            "swap-args",
+            r"^echo\s+(\w+)\s+(\w+)$",
+            "echo $2 $1",
+        )]);
         let result = engine.apply_rules("echo hello world");
 
         match result {
@@ -642,24 +676,11 @@ mod tests {
 
     #[test]
     fn test_first_match_wins() {
-        let rules = vec![
-            BashRule {
-                name: "allow-ls".to_string(),
-                pattern: r"^ls".to_string(),
-                action: BashRuleAction::Allow,
-            },
-            BashRule {
-                name: "deny-all".to_string(),
-                pattern: r".*".to_string(),
-                action: BashRuleAction::Deny {
-                    value: "All commands denied".to_string(),
-                },
-            },
-        ];
+        let engine = make_engine(vec![
+            allow_rule("allow-ls", r"^ls"),
+            deny_rule("deny-all", r".*", "All commands denied"),
+        ]);
 
-        let engine = BashRuleEngine::from_config(rules, None).unwrap();
-
-        // ls matches first rule (allow)
         let result = engine.apply_rules("ls -la");
         assert_eq!(
             result,
@@ -668,7 +689,6 @@ mod tests {
             }
         );
 
-        // rm matches second rule (deny)
         let result = engine.apply_rules("rm file.txt");
         match result {
             RuleResult::Denied { rule_name, .. } => {
@@ -680,22 +700,11 @@ mod tests {
 
     #[test]
     fn test_ask_overrides_allow_with_ordering() {
-        let rules = vec![
-            BashRule {
-                name: "ask-specific-docker".to_string(),
-                pattern: r"^docker\s+system\s+prune".to_string(),
-                action: BashRuleAction::Ask,
-            },
-            BashRule {
-                name: "allow-all-docker".to_string(),
-                pattern: r"^docker".to_string(),
-                action: BashRuleAction::Allow,
-            },
-        ];
+        let engine = make_engine(vec![
+            ask_rule("ask-specific-docker", r"^docker\s+system\s+prune"),
+            allow_rule("allow-all-docker", r"^docker"),
+        ]);
 
-        let engine = BashRuleEngine::from_config(rules, None).unwrap();
-
-        // Specific pattern matches first (ask)
         let result = engine.apply_rules("docker system prune");
         assert_eq!(
             result,
@@ -704,7 +713,6 @@ mod tests {
             }
         );
 
-        // Generic pattern matches second (allow)
         let result = engine.apply_rules("docker build");
         assert_eq!(
             result,
@@ -717,22 +725,10 @@ mod tests {
     #[test]
     fn test_ask_vs_deny_ordering() {
         // Test 1: Ask before Deny - Ask wins
-        let rules = vec![
-            BashRule {
-                name: "ask-specific".to_string(),
-                pattern: r"^docker\s+system\s+prune".to_string(),
-                action: BashRuleAction::Ask,
-            },
-            BashRule {
-                name: "deny-all-docker".to_string(),
-                pattern: r"^docker".to_string(),
-                action: BashRuleAction::Deny {
-                    value: "Docker denied".to_string(),
-                },
-            },
-        ];
-
-        let engine = BashRuleEngine::from_config(rules, None).unwrap();
+        let engine = make_engine(vec![
+            ask_rule("ask-specific", r"^docker\s+system\s+prune"),
+            deny_rule("deny-all-docker", r"^docker", "Docker denied"),
+        ]);
         let result = engine.apply_rules("docker system prune");
         assert_eq!(
             result,
@@ -742,22 +738,10 @@ mod tests {
         );
 
         // Test 2: Deny before Ask - Deny wins
-        let rules = vec![
-            BashRule {
-                name: "deny-all-docker".to_string(),
-                pattern: r"^docker".to_string(),
-                action: BashRuleAction::Deny {
-                    value: "Docker denied".to_string(),
-                },
-            },
-            BashRule {
-                name: "ask-specific".to_string(),
-                pattern: r"^docker\s+system\s+prune".to_string(),
-                action: BashRuleAction::Ask,
-            },
-        ];
-
-        let engine = BashRuleEngine::from_config(rules, None).unwrap();
+        let engine = make_engine(vec![
+            deny_rule("deny-all-docker", r"^docker", "Docker denied"),
+            ask_rule("ask-specific", r"^docker\s+system\s+prune"),
+        ]);
         let result = engine.apply_rules("docker system prune");
         match result {
             RuleResult::Denied { rule_name, reason } => {
@@ -771,22 +755,10 @@ mod tests {
     #[test]
     fn test_ask_vs_modify_ordering() {
         // Test 1: Ask before Modify - Ask wins
-        let rules = vec![
-            BashRule {
-                name: "ask-specific".to_string(),
-                pattern: r"^docker\s+system\s+prune".to_string(),
-                action: BashRuleAction::Ask,
-            },
-            BashRule {
-                name: "modify-all-docker".to_string(),
-                pattern: r"^(docker\s+.*)".to_string(),
-                action: BashRuleAction::Modify {
-                    value: "$1 --dry-run".to_string(),
-                },
-            },
-        ];
-
-        let engine = BashRuleEngine::from_config(rules, None).unwrap();
+        let engine = make_engine(vec![
+            ask_rule("ask-specific", r"^docker\s+system\s+prune"),
+            modify_rule("modify-all-docker", r"^(docker\s+.*)", "$1 --dry-run"),
+        ]);
         let result = engine.apply_rules("docker system prune");
         assert_eq!(
             result,
@@ -796,22 +768,10 @@ mod tests {
         );
 
         // Test 2: Modify before Ask - Modify wins
-        let rules = vec![
-            BashRule {
-                name: "modify-all-docker".to_string(),
-                pattern: r"^(docker\s+.*)".to_string(),
-                action: BashRuleAction::Modify {
-                    value: "$1 --dry-run".to_string(),
-                },
-            },
-            BashRule {
-                name: "ask-specific".to_string(),
-                pattern: r"^docker\s+system\s+prune".to_string(),
-                action: BashRuleAction::Ask,
-            },
-        ];
-
-        let engine = BashRuleEngine::from_config(rules, None).unwrap();
+        let engine = make_engine(vec![
+            modify_rule("modify-all-docker", r"^(docker\s+.*)", "$1 --dry-run"),
+            ask_rule("ask-specific", r"^docker\s+system\s+prune"),
+        ]);
         let result = engine.apply_rules("docker system prune");
         match result {
             RuleResult::Modified {
@@ -827,15 +787,7 @@ mod tests {
 
     #[test]
     fn test_no_match() {
-        let rules = vec![BashRule {
-            name: "deny-rm".to_string(),
-            pattern: r"^rm\s".to_string(),
-            action: BashRuleAction::Deny {
-                value: "rm denied".to_string(),
-            },
-        }];
-
-        let engine = BashRuleEngine::from_config(rules, None).unwrap();
+        let engine = make_engine(vec![deny_rule("deny-rm", r"^rm\s", "rm denied")]);
         let result = engine.apply_rules("ls -la");
         assert_eq!(result, RuleResult::NoMatch);
     }
@@ -843,24 +795,13 @@ mod tests {
     #[test]
     fn test_invalid_regex() {
         let rules = vec![
-            BashRule {
-                name: "bad-regex".to_string(),
-                pattern: r"[invalid(".to_string(),
-                action: BashRuleAction::Deny {
-                    value: "test".to_string(),
-                },
-            },
-            BashRule {
-                name: "good-rule".to_string(),
-                pattern: r"^ls".to_string(),
-                action: BashRuleAction::Allow,
-            },
+            deny_rule("bad-regex", r"[invalid(", "test"),
+            allow_rule("good-rule", r"^ls"),
         ];
 
         let engine = BashRuleEngine::from_config(rules, None)
             .expect("Should succeed, skipping invalid rules");
 
-        // The invalid rule should be skipped, but the valid rule should work
         let result = engine.apply_rules("ls -la");
         assert_eq!(
             result,
@@ -869,7 +810,6 @@ mod tests {
             }
         );
 
-        // Command not matching any valid rule should return NoMatch
         let result = engine.apply_rules("rm file.txt");
         assert_eq!(result, RuleResult::NoMatch);
     }
@@ -925,15 +865,7 @@ mod tests {
 
     #[test]
     fn test_apply_rules_empty_command() {
-        let rules = vec![BashRule {
-            name: "deny-all".to_string(),
-            pattern: r".*".to_string(),
-            action: BashRuleAction::Deny {
-                value: "denied".to_string(),
-            },
-        }];
-
-        let engine = BashRuleEngine::from_config(rules, None).unwrap();
+        let engine = make_engine(vec![deny_rule("deny-all", r".*", "denied")]);
         let result = engine.apply_rules("");
 
         match result {
@@ -944,15 +876,11 @@ mod tests {
 
     #[test]
     fn test_apply_rules_whitespace_only() {
-        let rules = vec![BashRule {
-            name: "deny-whitespace".to_string(),
-            pattern: r"^\s+$".to_string(),
-            action: BashRuleAction::Deny {
-                value: "whitespace only".to_string(),
-            },
-        }];
-
-        let engine = BashRuleEngine::from_config(rules, None).unwrap();
+        let engine = make_engine(vec![deny_rule(
+            "deny-whitespace",
+            r"^\s+$",
+            "whitespace only",
+        )]);
         let result = engine.apply_rules("   \t\n");
 
         match result {
@@ -965,30 +893,18 @@ mod tests {
 
     #[test]
     fn test_apply_rules_no_match_on_whitespace() {
-        let rules = vec![BashRule {
-            name: "match-non-whitespace".to_string(),
-            pattern: r"^\S+$".to_string(),
-            action: BashRuleAction::Allow,
-        }];
-
-        let engine = BashRuleEngine::from_config(rules, None).unwrap();
+        let engine = make_engine(vec![allow_rule("match-non-whitespace", r"^\S+$")]);
         let result = engine.apply_rules("   ");
-
         assert_eq!(result, RuleResult::NoMatch);
     }
 
     #[test]
     fn test_regexset_individual_regex_invariant() {
-        let rules = vec![BashRule {
-            name: "capture-test".to_string(),
-            pattern: r"^(docker\s+\w+)".to_string(),
-            action: BashRuleAction::Modify {
-                value: "$1 --flag".to_string(),
-            },
-        }];
-
-        let engine = BashRuleEngine::from_config(rules, None).unwrap();
-
+        let engine = make_engine(vec![modify_rule(
+            "capture-test",
+            r"^(docker\s+\w+)",
+            "$1 --flag",
+        )]);
         let result = engine.apply_rules("docker build");
 
         match result {
@@ -1001,22 +917,10 @@ mod tests {
 
     #[test]
     fn test_multiple_patterns_match_first_wins() {
-        let rules = vec![
-            BashRule {
-                name: "specific-deny".to_string(),
-                pattern: r"^rm\s+-rf".to_string(),
-                action: BashRuleAction::Deny {
-                    value: "Dangerous rm -rf".to_string(),
-                },
-            },
-            BashRule {
-                name: "generic-allow-rm".to_string(),
-                pattern: r"^rm".to_string(),
-                action: BashRuleAction::Allow,
-            },
-        ];
-
-        let engine = BashRuleEngine::from_config(rules, None).unwrap();
+        let engine = make_engine(vec![
+            deny_rule("specific-deny", r"^rm\s+-rf", "Dangerous rm -rf"),
+            allow_rule("generic-allow-rm", r"^rm"),
+        ]);
 
         let result = engine.apply_rules("rm -rf /");
 
@@ -1031,24 +935,12 @@ mod tests {
 
     #[test]
     fn test_large_rule_set_still_matches_correctly() {
-        let mut rules = vec![];
-        for i in 0..100 {
-            rules.push(BashRule {
-                name: format!("rule-{}", i),
-                pattern: format!(r"^command-{}($|\s)", i),
-                action: BashRuleAction::Allow,
-            });
-        }
+        let mut rules: Vec<BashRule> = (0..100)
+            .map(|i| allow_rule(&format!("rule-{}", i), &format!(r"^command-{}($|\s)", i)))
+            .collect();
+        rules.push(deny_rule("final-match", r"^target-command", "Found it"));
 
-        rules.push(BashRule {
-            name: "final-match".to_string(),
-            pattern: r"^target-command".to_string(),
-            action: BashRuleAction::Deny {
-                value: "Found it".to_string(),
-            },
-        });
-
-        let engine = BashRuleEngine::from_config(rules, None).unwrap();
+        let engine = make_engine(rules);
 
         let result = engine.apply_rules("target-command");
         match result {
@@ -1215,19 +1107,12 @@ mod tests {
         let mut fragments = HashMap::new();
         fragments.insert("safe".to_string(), "[^|&;$`]".to_string());
 
-        let rules = vec![BashRule {
-            name: "allow-ls".to_string(),
-            pattern: "^ls{{safe}}*$".to_string(),
-            action: BashRuleAction::Allow,
-        }];
-
+        let rules = vec![allow_rule("allow-ls", "^ls{{safe}}*$")];
         let engine = BashRuleEngine::from_config(rules, Some(fragments)).unwrap();
 
-        // Should match after expansion
         let result = engine.apply_rules("ls -la");
         assert!(matches!(result, RuleResult::Allowed { .. }));
 
-        // Should not match (contains pipe)
         let result = engine.apply_rules("ls | grep foo");
         assert!(matches!(result, RuleResult::NoMatch));
     }
@@ -1256,7 +1141,7 @@ mod tests {
         let defaults = default_fragments();
 
         // Try expanding each default fragment
-        for (name, _) in &defaults {
+        for name in defaults.keys() {
             let pattern = format!("{{{{{}}}}}", name);
             let result = expand_fragments(&pattern, &defaults);
             assert!(
@@ -1272,19 +1157,12 @@ mod tests {
         let mut user_fragments = HashMap::new();
         user_fragments.insert("safe_chars".to_string(), "[a-z]".to_string());
 
-        let rules = vec![BashRule {
-            name: "test".to_string(),
-            pattern: "^{{safe_chars}}+$".to_string(),
-            action: BashRuleAction::Allow,
-        }];
-
+        let rules = vec![allow_rule("test", "^{{safe_chars}}+$")];
         let engine = BashRuleEngine::from_config(rules, Some(user_fragments)).unwrap();
 
-        // Should match with user override (lowercase only)
         let result = engine.apply_rules("abc");
         assert!(matches!(result, RuleResult::Allowed { .. }));
 
-        // Should not match uppercase (user override, not default)
         let result = engine.apply_rules("ABC");
         assert!(matches!(result, RuleResult::NoMatch));
     }
@@ -1295,24 +1173,12 @@ mod tests {
         fragments.insert("valid".to_string(), "[a-z]".to_string());
 
         let rules = vec![
-            BashRule {
-                name: "bad-fragment".to_string(),
-                pattern: "^{{undefined}}$".to_string(),
-                action: BashRuleAction::Deny {
-                    value: "test".to_string(),
-                },
-            },
-            BashRule {
-                name: "good-rule".to_string(),
-                pattern: "^{{valid}}+$".to_string(),
-                action: BashRuleAction::Allow,
-            },
+            deny_rule("bad-fragment", "^{{undefined}}$", "test"),
+            allow_rule("good-rule", "^{{valid}}+$"),
         ];
 
-        // Engine should succeed, skipping the bad rule
         let engine = BashRuleEngine::from_config(rules, Some(fragments)).unwrap();
 
-        // The valid rule should work
         let result = engine.apply_rules("abc");
         assert!(matches!(result, RuleResult::Allowed { .. }));
     }
@@ -1322,14 +1188,11 @@ mod tests {
         let mut fragments = HashMap::new();
         fragments.insert("safe".to_string(), "[^|&;$`]".to_string());
 
-        let rules = vec![BashRule {
-            name: "modify-docker".to_string(),
-            pattern: "^(docker{{safe}}+)$".to_string(),
-            action: BashRuleAction::Modify {
-                value: "$1 --dry-run".to_string(),
-            },
-        }];
-
+        let rules = vec![modify_rule(
+            "modify-docker",
+            "^(docker{{safe}}+)$",
+            "$1 --dry-run",
+        )];
         let engine = BashRuleEngine::from_config(rules, Some(fragments)).unwrap();
         let result = engine.apply_rules("docker build");
 
@@ -1389,7 +1252,7 @@ mod tests {
     fn test_default_fragments_compile_to_valid_regex() {
         let defaults = default_fragments();
 
-        for (name, _) in &defaults {
+        for name in defaults.keys() {
             // Each default fragment should expand without error
             let test_pattern = format!("{{{{{}}}}}", name);
             let expanded = expand_fragments(&test_pattern, &defaults)
@@ -1462,179 +1325,166 @@ mod tests {
 
     #[test]
     fn test_filter_arguments_remove_simple() {
-        let command = "cargo doc --open --no-deps";
-        let remove = Some(vec!["--open".to_string()]);
-        let filtered = filter_arguments(command, &remove, &None, &None).unwrap();
-        assert_eq!(filtered, "cargo doc --no-deps");
+        assert_eq!(
+            filter_remove("cargo doc --open --no-deps", &["--open"]),
+            "cargo doc --no-deps"
+        );
     }
 
     #[test]
     fn test_filter_arguments_remove_position_independent() {
         // --open at the beginning
-        let command = "cargo doc --open --no-deps";
-        let remove = Some(vec!["--open".to_string()]);
-        let filtered = filter_arguments(command, &remove, &None, &None).unwrap();
-        assert_eq!(filtered, "cargo doc --no-deps");
-
+        assert_eq!(
+            filter_remove("cargo doc --open --no-deps", &["--open"]),
+            "cargo doc --no-deps"
+        );
         // --open in the middle
-        let command = "cargo doc --no-deps --open foo";
-        let filtered = filter_arguments(command, &remove, &None, &None).unwrap();
-        assert_eq!(filtered, "cargo doc --no-deps foo");
-
+        assert_eq!(
+            filter_remove("cargo doc --no-deps --open foo", &["--open"]),
+            "cargo doc --no-deps foo"
+        );
         // --open at the end
-        let command = "cargo doc --no-deps --open";
-        let filtered = filter_arguments(command, &remove, &None, &None).unwrap();
-        assert_eq!(filtered, "cargo doc --no-deps");
+        assert_eq!(
+            filter_remove("cargo doc --no-deps --open", &["--open"]),
+            "cargo doc --no-deps"
+        );
     }
 
     #[test]
     fn test_filter_arguments_remove_with_equals() {
-        let command = "cargo build --color=always";
-        let remove = Some(vec!["--color".to_string()]);
-        let filtered = filter_arguments(command, &remove, &None, &None).unwrap();
-        assert_eq!(filtered, "cargo build");
+        assert_eq!(
+            filter_remove("cargo build --color=always", &["--color"]),
+            "cargo build"
+        );
     }
 
     #[test]
     fn test_filter_arguments_remove_multiple() {
-        let command = "cargo doc --open --color=always --no-deps";
-        let remove = Some(vec!["--open".to_string(), "--color".to_string()]);
-        let filtered = filter_arguments(command, &remove, &None, &None).unwrap();
-        assert_eq!(filtered, "cargo doc --no-deps");
+        assert_eq!(
+            filter_remove(
+                "cargo doc --open --color=always --no-deps",
+                &["--open", "--color"]
+            ),
+            "cargo doc --no-deps"
+        );
     }
 
     #[test]
     fn test_filter_arguments_add() {
-        let command = "docker run ubuntu";
-        let add = Some(vec!["--read-only".to_string()]);
-        let filtered = filter_arguments(command, &None, &add, &None).unwrap();
-        assert_eq!(filtered, "docker run ubuntu --read-only");
+        assert_eq!(
+            filter_add("docker run ubuntu", &["--read-only"]),
+            "docker run ubuntu --read-only"
+        );
     }
 
     #[test]
     fn test_filter_arguments_add_multiple() {
-        let command = "docker run ubuntu";
-        let add = Some(vec![
-            "--read-only".to_string(),
-            "--network=none".to_string(),
-        ]);
-        let filtered = filter_arguments(command, &None, &add, &None).unwrap();
-        assert_eq!(filtered, "docker run ubuntu --read-only --network=none");
+        assert_eq!(
+            filter_add("docker run ubuntu", &["--read-only", "--network=none"]),
+            "docker run ubuntu --read-only --network=none"
+        );
     }
 
     #[test]
     fn test_filter_arguments_replace() {
-        let command = "rm -f file.txt";
-        let mut replace_map = HashMap::new();
-        replace_map.insert("-f".to_string(), "-i".to_string());
-        let filtered = filter_arguments(command, &None, &None, &Some(replace_map)).unwrap();
-        assert_eq!(filtered, "rm -i file.txt");
+        assert_eq!(
+            filter_replace("rm -f file.txt", &[("-f", "-i")]),
+            "rm -i file.txt"
+        );
     }
 
     #[test]
     fn test_filter_arguments_replace_multiple() {
-        let command = "rm -f file1.txt -rf file2.txt";
-        let mut replace_map = HashMap::new();
-        replace_map.insert("-f".to_string(), "-i".to_string());
-        replace_map.insert("-rf".to_string(), "-ri".to_string());
-        let filtered = filter_arguments(command, &None, &None, &Some(replace_map)).unwrap();
-        assert_eq!(filtered, "rm -i file1.txt -ri file2.txt");
+        assert_eq!(
+            filter_replace(
+                "rm -f file1.txt -rf file2.txt",
+                &[("-f", "-i"), ("-rf", "-ri")]
+            ),
+            "rm -i file1.txt -ri file2.txt"
+        );
     }
 
     #[test]
     fn test_filter_arguments_replace_nonexistent() {
-        let command = "cargo build";
-        let mut replace_map = HashMap::new();
-        replace_map.insert("--open".to_string(), "--offline".to_string());
-        let filtered = filter_arguments(command, &None, &None, &Some(replace_map)).unwrap();
-        assert_eq!(filtered, "cargo build");
+        assert_eq!(
+            filter_replace("cargo build", &[("--open", "--offline")]),
+            "cargo build"
+        );
     }
 
     #[test]
     fn test_filter_arguments_combined() {
-        let command = "npm start --open --verbose";
         let remove = Some(vec!["--open".to_string()]);
         let add = Some(vec!["--no-browser".to_string()]);
-        let filtered = filter_arguments(command, &remove, &add, &None).unwrap();
+        let filtered =
+            filter_arguments("npm start --open --verbose", &remove, &add, &None).unwrap();
         assert_eq!(filtered, "npm start --verbose --no-browser");
     }
 
     #[test]
     fn test_filter_arguments_no_changes() {
-        let command = "cargo build";
-        let filtered = filter_arguments(command, &None, &None, &None).unwrap();
-        assert_eq!(filtered, "cargo build");
+        assert_eq!(
+            filter_arguments("cargo build", &None, &None, &None).unwrap(),
+            "cargo build"
+        );
     }
 
     #[test]
     fn test_filter_arguments_remove_nonexistent() {
-        let command = "cargo build";
-        let remove = Some(vec!["--open".to_string()]);
-        let filtered = filter_arguments(command, &remove, &None, &None).unwrap();
-        assert_eq!(filtered, "cargo build");
+        assert_eq!(filter_remove("cargo build", &["--open"]), "cargo build");
     }
 
     #[test]
     fn test_filter_arguments_empty_command() {
-        let filtered = filter_arguments("", &None, &None, &None).unwrap();
-        assert_eq!(filtered, "");
-
-        let filtered =
-            filter_arguments("", &Some(vec!["--flag".to_string()]), &None, &None).unwrap();
-        assert_eq!(filtered, "");
+        assert_eq!(filter_arguments("", &None, &None, &None).unwrap(), "");
+        assert_eq!(filter_remove("", &["--flag"]), "");
     }
 
     #[test]
     fn test_filter_arguments_whitespace_handling() {
-        let command = "cargo  doc    --open   --no-deps";
-        let remove = Some(vec!["--open".to_string()]);
-        let filtered = filter_arguments(command, &remove, &None, &None).unwrap();
-        assert_eq!(filtered, "cargo doc --no-deps");
+        assert_eq!(
+            filter_remove("cargo  doc    --open   --no-deps", &["--open"]),
+            "cargo doc --no-deps"
+        );
     }
 
     #[test]
     fn test_filter_arguments_prefix_match_boundaries() {
-        let command = "cargo build --color=always";
-        let remove = Some(vec!["--color".to_string()]);
-        let filtered = filter_arguments(command, &remove, &None, &None).unwrap();
-        assert_eq!(filtered, "cargo build");
-
-        let command = "cargo build --color=always";
-        let remove = Some(vec!["--col".to_string()]);
-        let filtered = filter_arguments(command, &remove, &None, &None).unwrap();
-        assert_eq!(filtered, "cargo build --color=always");
-
-        let command = "cargo build --colours=always";
-        let remove = Some(vec!["--color".to_string()]);
-        let filtered = filter_arguments(command, &remove, &None, &None).unwrap();
-        assert_eq!(filtered, "cargo build --colours=always");
+        assert_eq!(
+            filter_remove("cargo build --color=always", &["--color"]),
+            "cargo build"
+        );
+        // --col should NOT match --color
+        assert_eq!(
+            filter_remove("cargo build --color=always", &["--col"]),
+            "cargo build --color=always"
+        );
+        // --color should NOT match --colours
+        assert_eq!(
+            filter_remove("cargo build --colours=always", &["--color"]),
+            "cargo build --colours=always"
+        );
     }
 
     #[test]
     fn test_filter_arguments_replace_exact_match_only() {
-        let mut replace = HashMap::new();
-        replace.insert("-f".to_string(), "-i".to_string());
-
-        let filtered =
-            filter_arguments("rm -f file", &None, &None, &Some(replace.clone())).unwrap();
-        assert_eq!(filtered, "rm -i file");
-
-        let filtered =
-            filter_arguments("rm -rf file", &None, &None, &Some(replace.clone())).unwrap();
-        assert_eq!(filtered, "rm -rf file");
-
-        let filtered = filter_arguments("rm file-f.txt", &None, &None, &Some(replace)).unwrap();
-        assert_eq!(filtered, "rm file-f.txt");
+        assert_eq!(filter_replace("rm -f file", &[("-f", "-i")]), "rm -i file");
+        // -rf should NOT be affected by -f replacement
+        assert_eq!(
+            filter_replace("rm -rf file", &[("-f", "-i")]),
+            "rm -rf file"
+        );
+        // file-f.txt should NOT be affected
+        assert_eq!(
+            filter_replace("rm file-f.txt", &[("-f", "-i")]),
+            "rm file-f.txt"
+        );
     }
 
     #[test]
     fn test_filter_arguments_empty_filter_lists() {
-        let command = "cargo build";
-        let filtered = filter_arguments(command, &Some(vec![]), &None, &None).unwrap();
-        assert_eq!(filtered, "cargo build");
-
-        let filtered = filter_arguments(command, &None, &Some(vec![]), &None).unwrap();
-        assert_eq!(filtered, "cargo build");
+        assert_eq!(filter_remove("cargo build", &[]), "cargo build");
+        assert_eq!(filter_add("cargo build", &[]), "cargo build");
     }
 
     #[test]
@@ -1666,7 +1516,7 @@ mod tests {
 
     #[test]
     fn test_argument_filter_action() {
-        let rules = vec![BashRule {
+        let engine = make_engine(vec![BashRule {
             name: "filter-cargo-doc".to_string(),
             pattern: r"^cargo doc\b".to_string(),
             action: BashRuleAction::ArgumentFilter {
@@ -1675,9 +1525,7 @@ mod tests {
                 replace: None,
                 reason: Some("Browser flags removed".to_string()),
             },
-        }];
-
-        let engine = BashRuleEngine::from_config(rules, None).unwrap();
+        }]);
 
         let result = engine.apply_rules("cargo doc --open --no-deps");
         match result {
@@ -1690,8 +1538,7 @@ mod tests {
 
     #[test]
     fn test_argument_filter_with_revalidation() {
-        let rules = vec![
-            // First rule: filter --open from cargo doc (only matches when --open is present)
+        let engine = make_engine(vec![
             BashRule {
                 name: "filter-cargo-doc".to_string(),
                 pattern: r"^cargo doc.*--open".to_string(),
@@ -1702,15 +1549,8 @@ mod tests {
                     reason: Some("Removed --open".to_string()),
                 },
             },
-            // Second rule: allow cargo doc (without --open)
-            BashRule {
-                name: "allow-cargo-doc".to_string(),
-                pattern: r"^cargo doc($|\s)".to_string(),
-                action: BashRuleAction::Allow,
-            },
-        ];
-
-        let engine = BashRuleEngine::from_config(rules, None).unwrap();
+            allow_rule("allow-cargo-doc", r"^cargo doc($|\s)"),
+        ]);
 
         // First check: matches filter rule
         let result = engine.apply_rules("cargo doc --open");

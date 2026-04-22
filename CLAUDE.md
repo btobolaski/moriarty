@@ -6,7 +6,6 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Moriarty is a Rust CLI tool for analyzing Claude Code logs and API usage. It provides:
 
-- **Logs viewer**: An interactive TUI for viewing and navigating Claude Code conversation logs
 - **API pricing analyzer**: Analyzes Claude API usage from log directories and generates detailed cost reports
 - **MCP servers**: Provides Model Context Protocol servers for git operations and project tools
 - **Hooks system**: Security integration for validating commands before execution (bash rules, project checks)
@@ -23,12 +22,6 @@ cargo build
 **Running:**
 
 ```bash
-# Run the logs viewer TUI
-cargo run -- logs -f <path-to-log-file>
-
-# Run the logs validator (no TUI)
-cargo run -- logs -f <path-to-log-file> --validate
-
 # Run API pricing analyzer
 cargo run -- api-pricing -d <directory> --timezone local|utc
 
@@ -66,32 +59,35 @@ test in a separate process, making this safe and preventing tests from clobberin
 
 ### High-Level Module Organization
 
-**`logs/`** - Log file parsing and TUI viewer:
+**`logs/`** - Log file parsing:
 
 - Deserializes Claude Code log files (JSON lines format) into typed structs using serde with tagged enums
 - The `LogLine` enum represents different message types (User, Assistant, FileHistorySnapshot, Summary, System)
-- Provides hierarchical thread view with message selection and rendering
-- Modal dialog for viewing detailed message content
-- Entry point: `logs` subcommand in `main.rs`
+- Used by `api_pricing` to analyze Claude Code conversation logs
 
 **`api_pricing/`** - API usage cost analysis:
 
 - Two-pass architecture: aggregates token usage into daily/conversation buckets (by timezone), then calculates costs
+- Per-model aggregation uses shared `ModelUsageMap` / `ModelCostsMap` containers instead of repeating named fields
+  across daily/session structs
 - Two-level deduplication for streaming responses and forked conversations
 - Handles unknown models gracefully by tracking them separately
 - Line counter tracks code changes from file history snapshots
 - Entry point: `api-pricing` subcommand in `main.rs`
 
-**`tui/`** - Terminal UI infrastructure:
+**`tui/`** - Terminal UI event infrastructure:
 
-- Event-driven async architecture where `App` owns all state and orchestrates rendering/event handling
-- Uses ratatui for rendering, crossterm for terminal control, and tui-scrollview for scrolling
-- Async event stream combining keyboard input and other UI events
+- Provides an async event stream (`input_stream`) that maps crossterm terminal events (keys, resize, paste) into the
+  internal `Event` / `UIEvent` enum
+- Used by `approval_tui/` as its input source
 
 **`mcp/`** - Model Context Protocol servers:
 
 - Three MCP servers: `git_read_only` (status, diff, log, show), `jj_read_only` (status, diff, log, show, op log), and
   `tool_runner` (lint, test, build, format)
+- `read_only`: Shared infrastructure used by both `git_read_only` and `jj_read_only`. Provides `CommandResult`,
+  `validate_project_dir`, and the generic `run_read_only_command`. Neither server implements its own process spawning,
+  UTF-8 loss-tolerant output handling, or project-dir validation; both delegate to this module.
 - Uses rmcp library with stdio transport for Claude Code integration
 - All servers run as stdin/stdout servers that Claude Code can invoke
 - `install` command configures all servers in Claude Code's MCP registry
@@ -187,6 +183,11 @@ test in a separate process, making this safe and preventing tests from clobberin
 ## Development Notes
 
 **Workspace Optimization**: The `my-workspace-hack` crate is managed by cargo-hakari to unify dependencies.
+
+**Shared Test Utilities**: Test helpers used across multiple modules (`setup_isolated_xdg_config`,
+`setup_isolated_xdg_state`, `setup_project_dir_with_config`, `write_tools_config`, `create_executable_script`) live in
+`crates/moriarty/src/test_helpers.rs`. This module is compiled only in test builds (`#[cfg(test)]`). New test-only
+helpers needed in more than one module belong here rather than being duplicated.
 
 **Logging**: Structured logging via tracing to `~/.local/state/moriarty/logs/` (auto-rotated). Sensitive env vars
 (TOKEN, SECRET, KEY, PASSWORD) are redacted.

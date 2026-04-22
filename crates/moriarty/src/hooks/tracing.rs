@@ -105,14 +105,7 @@ pub async fn get_current_log_path() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
-
-    /// Safe to use std::env::set_var because cargo nextest isolates each test in a separate process.
-    fn setup_isolated_xdg_state() -> TempDir {
-        let temp_dir = tempfile::tempdir().unwrap();
-        std::env::set_var("XDG_STATE_HOME", temp_dir.path());
-        temp_dir
-    }
+    use crate::test_helpers::setup_isolated_xdg_state;
 
     #[tokio::test]
     async fn test_get_current_log_path() {
@@ -154,34 +147,30 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_init_tracing_logs_correctly() {
-        let _xdg_dir = setup_isolated_xdg_state();
-        let _guard = init_tracing().await.unwrap();
-
-        // Write a test log message
-        tracing::info!("Test message from hooks tracing");
-
-        // Force flush by dropping the guard
-        drop(_guard);
-
-        // Get the log directory and find the actual log file
+    /// Reads the first hooks.log file from the current log directory.
+    /// The tracing guard must be dropped before calling this to flush pending writes.
+    async fn read_first_log_file() -> String {
         let log_path = get_current_log_path().await.unwrap();
         let log_dir = log_path.parent().expect("Log path should have parent");
-
-        // Find log files in the directory (daily rotation creates dated files)
         let entries: Vec<_> = std::fs::read_dir(log_dir)
             .expect("Failed to read log directory")
             .filter_map(|e| e.ok())
             .filter(|e| e.file_name().to_string_lossy().starts_with("hooks.log"))
             .collect();
-
         assert!(!entries.is_empty(), "Should have at least one log file");
+        std::fs::read_to_string(entries[0].path()).expect("Failed to read log file")
+    }
 
-        // Read the first log file found
-        let log_file = &entries[0];
-        let content = std::fs::read_to_string(log_file.path()).expect("Failed to read log file");
+    #[tokio::test]
+    async fn test_init_tracing_logs_correctly() {
+        let _xdg_dir = setup_isolated_xdg_state();
+        let _guard = init_tracing().await.unwrap();
 
+        tracing::info!("Test message from hooks tracing");
+        // Force flush by dropping the guard before reading log file
+        drop(_guard);
+
+        let content = read_first_log_file().await;
         assert!(
             content.contains("Test message from hooks tracing"),
             "Log file should contain test message. Content:\n{}",
@@ -195,31 +184,12 @@ mod tests {
         std::env::set_var("RUST_LOG", "debug");
 
         let _guard = init_tracing().await.unwrap();
-
-        // Write debug and info messages
         tracing::debug!("Debug level message");
         tracing::info!("Info level message");
-
-        // Force flush
+        // Force flush by dropping the guard before reading log file
         drop(_guard);
 
-        // Get the log directory and find the actual log file
-        let log_path = get_current_log_path().await.unwrap();
-        let log_dir = log_path.parent().expect("Log path should have parent");
-
-        // Find log files in the directory
-        let entries: Vec<_> = std::fs::read_dir(log_dir)
-            .expect("Failed to read log directory")
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().starts_with("hooks.log"))
-            .collect();
-
-        assert!(!entries.is_empty(), "Should have at least one log file");
-
-        // Read the first log file found
-        let log_file = &entries[0];
-        let content = std::fs::read_to_string(log_file.path()).expect("Failed to read log file");
-
+        let content = read_first_log_file().await;
         assert!(
             content.contains("Debug level message"),
             "Debug message should appear when RUST_LOG=debug. Content:\n{}",
@@ -235,32 +205,15 @@ mod tests {
     #[tokio::test]
     async fn test_debug_messages_filtered_by_default() {
         let _xdg_dir = setup_isolated_xdg_state();
-
-        // Don't set RUST_LOG - use default "info" level
         std::env::remove_var("RUST_LOG");
 
         let _guard = init_tracing().await.unwrap();
-
-        // Write both debug and info messages
         tracing::debug!("Debug message that should not appear");
         tracing::info!("Info message that should appear");
-
+        // Force flush by dropping the guard before reading log file
         drop(_guard);
 
-        let log_path = get_current_log_path().await.unwrap();
-        let log_dir = log_path.parent().expect("Log path should have parent");
-
-        let entries: Vec<_> = std::fs::read_dir(log_dir)
-            .expect("Failed to read log directory")
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().starts_with("hooks.log"))
-            .collect();
-
-        assert!(!entries.is_empty(), "Should have at least one log file");
-
-        let log_file = &entries[0];
-        let content = std::fs::read_to_string(log_file.path()).expect("Failed to read log file");
-
+        let content = read_first_log_file().await;
         assert!(
             !content.contains("Debug message that should not appear"),
             "Debug message should be filtered at default info level. Content:\n{}",
@@ -279,23 +232,10 @@ mod tests {
         std::env::set_var("RUST_LOG", "debug");
 
         let _guard = init_tracing().await.unwrap();
-
+        // Force flush by dropping the guard before reading log file
         drop(_guard);
 
-        let log_path = get_current_log_path().await.unwrap();
-        let log_dir = log_path.parent().expect("Log path should have parent");
-
-        let entries: Vec<_> = std::fs::read_dir(log_dir)
-            .expect("Failed to read log directory")
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().starts_with("hooks.log"))
-            .collect();
-
-        assert!(!entries.is_empty(), "Should have at least one log file");
-
-        let log_file = &entries[0];
-        let content = std::fs::read_to_string(log_file.path()).expect("Failed to read log file");
-
+        let content = read_first_log_file().await;
         assert!(
             content.contains("Hooks tracing initialized"),
             "Initialization message should appear at debug level. Content:\n{}",

@@ -29,7 +29,8 @@ use rmcp::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use tokio::process::Command;
+
+use super::read_only::{run_read_only_command, CommandResult};
 
 /// Supported jj commands that can be executed via the MCP server.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -81,15 +82,6 @@ pub struct JjArgs {
     pub args: Vec<String>,
 }
 
-/// Result of executing a jj command.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct CommandResult {
-    pub stdout: String,
-    pub stderr: String,
-    /// Exit code (0 indicates success)
-    pub exit_code: i32,
-}
-
 /// MCP server providing read-only jj operations.
 ///
 /// This server exposes a single tool that accepts a `JjCommand` enum to specify
@@ -115,58 +107,8 @@ impl JjReadOnly {
         project_dir: PathBuf,
         args: Vec<String>,
     ) -> Result<Json<CommandResult>, McpError> {
-        // Canonicalize path to prevent traversal attacks and resolve symlinks
-        let canonical_dir = project_dir.canonicalize().map_err(|e| McpError {
-            code: ErrorCode::INVALID_PARAMS,
-            message: format!(
-                "Invalid project directory: {} ({})",
-                project_dir.display(),
-                e
-            )
-            .into(),
-            data: None,
-        })?;
-
-        // Verify this is a valid project directory by checking for .config/tools.toml
-        let config_path = canonical_dir.join(".config").join("tools.toml");
-        if !config_path.exists() {
-            return Err(McpError {
-                code: ErrorCode::INVALID_PARAMS,
-                message: format!(
-                    "Invalid project directory: {} (missing .config/tools.toml)",
-                    canonical_dir.display()
-                )
-                .into(),
-                data: None,
-            });
-        }
-
-        let mut cmd = Command::new("jj");
-        cmd.args(command.as_args());
-        cmd.current_dir(canonical_dir);
-        cmd.args(args);
-
-        match cmd.output().await {
-            Ok(result) => {
-                // Use lossy UTF-8 conversion to handle potentially invalid encodings
-                // in filenames (e.g., legacy encodings). This prevents server crashes
-                // while allowing output to be displayed with replacement characters (�).
-                // This is acceptable for a read-only tool where we never modify data.
-                let stderr = String::from_utf8_lossy(&result.stderr).to_string();
-                let stdout = String::from_utf8_lossy(&result.stdout).to_string();
-
-                Ok(Json(CommandResult {
-                    exit_code: result.status.code().unwrap_or(-1),
-                    stderr,
-                    stdout,
-                }))
-            }
-            Err(error) => Err(McpError {
-                code: ErrorCode::INTERNAL_ERROR,
-                message: format!("{} failed: {error:?}", command.name()).into(),
-                data: None,
-            }),
-        }
+        let label = command.name().to_string();
+        run_read_only_command("jj", &label, project_dir, command.as_args(), args).await
     }
 }
 
@@ -213,6 +155,7 @@ impl Default for JjReadOnly {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_helpers::write_tools_config;
     use tempfile::TempDir;
 
     async fn setup_jj_repo() -> TempDir {
@@ -225,14 +168,10 @@ mod tests {
             .status()
             .unwrap();
 
-        // Create .config/tools.toml to mark as valid project directory
-        let config_dir = temp_dir.path().join(".config");
-        std::fs::create_dir(&config_dir).unwrap();
-        std::fs::write(
-            config_dir.join("tools.toml"),
+        write_tools_config(
+            temp_dir.path(),
             "[commands]\nlint = [\"cargo\", \"clippy\"]\n",
-        )
-        .unwrap();
+        );
 
         temp_dir
     }
@@ -336,50 +275,20 @@ mod tests {
         assert_eq!(cmd_result.0.exit_code, 0);
     }
 
-    #[tokio::test]
-    async fn test_rejects_directory_without_config_file() {
-        let temp_dir = TempDir::new().unwrap();
-
-        // Initialize jj but don't create .config/tools.toml
-        std::process::Command::new("jj")
-            .args(["git", "init", "--colocate"])
-            .current_dir(temp_dir.path())
-            .status()
-            .unwrap();
-
-        let args = JjArgs {
-            project_dir: temp_dir.path().to_path_buf(),
-            command: JjCommand::Status,
-            args: vec![],
-        };
-
-        let Err(error) =
-            JjReadOnly::run_jj_command(args.command, args.project_dir, args.args).await
-        else {
-            panic!("Expected error for directory without .config/tools.toml");
-        };
-
-        assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
-        assert!(error.message.contains("Invalid project directory"));
-        assert!(error.message.contains("missing .config/tools.toml"));
-    }
-
-    #[tokio::test]
-    async fn test_rejects_nonexistent_directory() {
-        let args = JjArgs {
-            project_dir: PathBuf::from("/nonexistent/directory"),
-            command: JjCommand::Status,
-            args: vec![],
-        };
-
-        let Err(error) =
-            JjReadOnly::run_jj_command(args.command, args.project_dir, args.args).await
-        else {
-            panic!("Expected error for nonexistent directory");
-        };
-
-        assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
-    }
+    // Shared path-safety tests: see git_read_only.rs for commentary.
+    crate::mcp::read_only::test_support::path_safety_tests!(
+        |dir: std::path::PathBuf, args: Vec<String>| async move {
+            JjReadOnly::run_jj_command(JjCommand::Status, dir, args).await
+        },
+        setup_jj_repo(),
+        |path: &std::path::Path| {
+            std::process::Command::new("jj")
+                .args(["git", "init", "--colocate"])
+                .current_dir(path)
+                .status()
+                .unwrap();
+        },
+    );
 
     #[tokio::test]
     async fn test_diff_command() {
@@ -420,7 +329,7 @@ mod tests {
         let args = JjArgs {
             project_dir: temp_dir.path().to_path_buf(),
             command: JjCommand::Log,
-            args: vec!["-r", "@"].iter().map(|s| s.to_string()).collect(),
+            args: ["-r", "@"].iter().map(|s| s.to_string()).collect(),
         };
 
         let cmd_result = server.run(Parameters(args)).await.unwrap();
@@ -480,12 +389,7 @@ mod tests {
     async fn test_handles_not_a_jj_repository() {
         // Create a directory with .config/tools.toml but no jj repo
         let temp_dir = TempDir::new().unwrap();
-        std::fs::create_dir_all(temp_dir.path().join(".config")).unwrap();
-        std::fs::write(
-            temp_dir.path().join(".config").join("tools.toml"),
-            "[commands]\n",
-        )
-        .unwrap();
+        write_tools_config(temp_dir.path(), "[commands]\n");
 
         let args = JjArgs {
             project_dir: temp_dir.path().to_path_buf(),
@@ -506,56 +410,4 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_rejects_path_with_parent_traversal() {
-        let temp_dir = setup_jj_repo().await;
-
-        // Try to escape the project directory using parent directory references
-        // This will traverse to a directory that doesn't have .config/tools.toml
-        let malicious_path = temp_dir.path().join("..").join("..").join("tmp");
-
-        let args = JjArgs {
-            project_dir: malicious_path,
-            command: JjCommand::Status,
-            args: vec![],
-        };
-
-        // Should reject with INVALID_PARAMS - either from canonicalize failing
-        // or from missing .config/tools.toml
-        let Err(error) =
-            JjReadOnly::run_jj_command(args.command, args.project_dir, args.args).await
-        else {
-            panic!("Expected error for path traversal attempt");
-        };
-
-        assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
-        assert!(error.message.contains("Invalid project directory"));
-    }
-
-    #[tokio::test]
-    async fn test_resolves_symlinks_safely() {
-        let temp_dir = setup_jj_repo().await;
-
-        // Create a symlink to the project directory
-        let link_dir = TempDir::new().unwrap();
-        let link_path = link_dir.path().join("project_link");
-
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(temp_dir.path(), &link_path).unwrap();
-
-        #[cfg(windows)]
-        std::os::windows::fs::symlink_dir(temp_dir.path(), &link_path).unwrap();
-
-        let args = JjArgs {
-            project_dir: link_path,
-            command: JjCommand::Status,
-            args: vec![],
-        };
-
-        // Should succeed - canonicalize resolves the symlink
-        let cmd_result = JjReadOnly::run_jj_command(args.command, args.project_dir, args.args)
-            .await
-            .unwrap();
-        assert_eq!(cmd_result.0.exit_code, 0);
-    }
 }

@@ -729,9 +729,9 @@ fn test_parse_stop_hook_summary() {
             assert_eq!(summary.hook_infos.len(), 1);
             assert_eq!(summary.hook_infos[0].command, "moriarty hooks exec");
             assert_eq!(summary.hook_errors.len(), 0);
-            assert_eq!(summary.prevented_continuation, false);
+            assert!(!summary.prevented_continuation);
             assert_eq!(summary.stop_reason, "");
-            assert_eq!(summary.has_output, false);
+            assert!(!summary.has_output);
             assert_eq!(summary.level, "suggestion");
             assert_eq!(summary.tool_use_id, "8f3746a9-caa9-4d2d-8e6e-e7a7b005d5d4");
         }
@@ -912,9 +912,9 @@ fn test_parse_stop_hook_summary_with_multiple_hooks_and_errors() {
             assert_eq!(summary.hook_errors[0].exit_code(), Some(1));
             assert_eq!(summary.hook_errors[1].message(), "Error 2");
             assert_eq!(summary.hook_errors[1].command(), None);
-            assert_eq!(summary.prevented_continuation, true);
+            assert!(summary.prevented_continuation);
             assert_eq!(summary.stop_reason, "Multiple hooks failed");
-            assert_eq!(summary.has_output, true);
+            assert!(summary.has_output);
             assert_eq!(summary.level, "error");
         }
         _ => panic!("Expected System(StopHookSummary) variant"),
@@ -953,8 +953,8 @@ fn test_parse_stop_hook_summary_with_empty_arrays() {
             assert_eq!(summary.hook_count, 0);
             assert_eq!(summary.hook_infos.len(), 0);
             assert_eq!(summary.hook_errors.len(), 0);
-            assert_eq!(summary.prevented_continuation, false);
-            assert_eq!(summary.has_output, false);
+            assert!(!summary.prevented_continuation);
+            assert!(!summary.has_output);
         }
         _ => panic!("Expected System(StopHookSummary) variant"),
     }

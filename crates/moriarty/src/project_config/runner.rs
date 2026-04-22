@@ -86,6 +86,12 @@ pub async fn verify_and_load_project(project_dir: PathBuf) -> Result<VerifiedPro
     })
 }
 
+/// Formats the "Run: moriarty approve-project <dir>" fragment used by every
+/// non-Approved verification error, so the advice stays worded the same way.
+fn approve_hint(canonical_dir: &Path) -> String {
+    format!("Run: moriarty approve-project {}", canonical_dir.display())
+}
+
 fn handle_verification_result(
     result: VerificationResult,
     item_type_plural: &str,
@@ -94,15 +100,13 @@ fn handle_verification_result(
     match result {
         VerificationResult::Approved => Ok(()),
         VerificationResult::NotApproved => Err(miette::miette!(
-            "Project {} not approved. Run: moriarty approve-project {}",
+            "Project {} not approved. {}",
             item_type_plural,
-            canonical_dir.display()
+            approve_hint(canonical_dir)
         )),
         VerificationResult::ConfigHashMismatch { expected, actual } => Err(miette::miette!(
-            "tools.toml has been modified since approval. \
-             Run: moriarty approve-project {} \
-             (expected: {}, actual: {})",
-            canonical_dir.display(),
+            "tools.toml has been modified since approval. {} (expected: {}, actual: {})",
+            approve_hint(canonical_dir),
             expected,
             actual
         )),
@@ -111,18 +115,16 @@ fn handle_verification_result(
             expected,
             actual,
         } => Err(miette::miette!(
-            "Binary for '{}' has been modified since approval. \
-             Run: moriarty approve-project {} \
-             (expected: {}, actual: {})",
+            "Binary for '{}' has been modified since approval. {} (expected: {}, actual: {})",
             item,
-            canonical_dir.display(),
+            approve_hint(canonical_dir),
             expected,
             actual
         )),
         VerificationResult::ItemNotApproved { item } => Err(miette::miette!(
-            "Item '{}' not approved. Run: moriarty approve-project {}",
+            "Item '{}' not approved. {}",
             item,
-            canonical_dir.display()
+            approve_hint(canonical_dir)
         )),
     }
 }
@@ -325,24 +327,13 @@ impl VerifiedProject {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::project_config::approvals;
     use tempfile::TempDir;
 
-    fn setup_test_project(config_content: &str) -> TempDir {
-        let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let config_dir = temp_dir.path().join(".config");
-        std::fs::create_dir(&config_dir).expect("Failed to create .config dir");
-        std::fs::write(config_dir.join("tools.toml"), config_content)
-            .expect("Failed to write tools.toml");
-        temp_dir
-    }
-
-    fn setup_isolated_xdg_config() -> TempDir {
-        let temp_dir = tempfile::tempdir().unwrap();
-        std::env::set_var("XDG_CONFIG_HOME", temp_dir.path());
-        temp_dir
-    }
+    use super::*;
+    use crate::project_config::approvals;
+    use crate::test_helpers::{
+        setup_isolated_xdg_config, setup_project_dir_with_config as setup_test_project,
+    };
 
     async fn setup_test_project_with_approvals(config_content: &str) -> (TempDir, TempDir) {
         let xdg_dir = setup_isolated_xdg_config();
@@ -351,6 +342,33 @@ mod tests {
             .await
             .unwrap();
         (temp_dir, xdg_dir)
+    }
+
+    /// Sets up, approves, and loads a project from `config_content`, returning
+    /// the project and the `TempDir` guards that must outlive it.
+    async fn approved_project(
+        config_content: &str,
+    ) -> (TempDir, TempDir, VerifiedProject) {
+        let (temp_dir, xdg_dir) = setup_test_project_with_approvals(config_content).await;
+        let project = verify_and_load_project(temp_dir.path().to_path_buf())
+            .await
+            .expect("Should load approved project");
+        (temp_dir, xdg_dir, project)
+    }
+
+    /// Runs `verify_and_load_project` and asserts it fails with a `not approved`
+    /// error. Used by the many tests that exercise the unapproved path.
+    async fn assert_verify_not_approved(dir: &Path) {
+        let err_msg = format!(
+            "{:?}",
+            verify_and_load_project(dir.to_path_buf())
+                .await
+                .expect_err("Should fail on approval check")
+        );
+        assert!(
+            err_msg.contains("not approved"),
+            "expected 'not approved' in error, got: {err_msg}"
+        );
     }
 
     #[tokio::test]
@@ -400,15 +418,8 @@ test = ["echo", "test output"]
 "#,
         );
 
-        // For now, this will fail at verification - we need approval mocking for full test
-        // This test documents the expected behavior once approvals are mocked
-        let err_msg = format!(
-            "{:?}",
-            verify_and_load_project(temp_dir.path().to_path_buf())
-                .await
-                .expect_err("Should fail on approval check")
-        );
-        assert!(err_msg.contains("not approved"));
+        // Without approval mocking, this exercises the verification failure path.
+        assert_verify_not_approved(temp_dir.path()).await;
     }
 
     #[tokio::test]
@@ -451,14 +462,8 @@ format = ["echo", "format"]
 "#,
         );
 
-        // Would need approval mocking to test the full parallel execution and ordering
-        let err_msg = format!(
-            "{:?}",
-            verify_and_load_project(temp_dir.path().to_path_buf())
-                .await
-                .expect_err("Should fail on approval check")
-        );
-        assert!(err_msg.contains("not approved"));
+        // Without approval mocking, this exercises the verification failure path.
+        assert_verify_not_approved(temp_dir.path()).await;
     }
 
     #[tokio::test]
@@ -602,7 +607,6 @@ command = ["echo", "second"]
         let project = verify_and_load_project(temp_dir.path().to_path_buf())
             .await
             .expect("Should load approved project");
-
         let outputs = project.run_all_checks().await.expect("Should run checks");
 
         assert_eq!(outputs.len(), 2);
@@ -617,17 +621,13 @@ command = ["echo", "second"]
 
     #[tokio::test]
     async fn test_run_all_checks_empty() {
-        let (temp_dir, _xdg_dir) = setup_test_project_with_approvals(
+        let (_t, _xdg, project) = approved_project(
             r#"
 [commands]
 lint = ["echo", "lint"]
 "#,
         )
         .await;
-
-        let project = verify_and_load_project(temp_dir.path().to_path_buf())
-            .await
-            .expect("Should load approved project");
 
         let outputs = project
             .run_all_checks()
@@ -638,7 +638,7 @@ lint = ["echo", "lint"]
 
     #[tokio::test]
     async fn test_run_all_checks_nonzero_exit() {
-        let (temp_dir, _xdg_dir) = setup_test_project_with_approvals(
+        let (_t, _xdg, project) = approved_project(
             r#"
 [commands]
 
@@ -648,10 +648,6 @@ command = ["sh", "-c", "exit 1"]
 "#,
         )
         .await;
-
-        let project = verify_and_load_project(temp_dir.path().to_path_buf())
-            .await
-            .expect("Should load approved project");
 
         let outputs = project
             .run_all_checks()
@@ -664,7 +660,7 @@ command = ["sh", "-c", "exit 1"]
 
     #[tokio::test]
     async fn test_run_all_checks_alphabetical_sorting() {
-        let (temp_dir, _xdg_dir) = setup_test_project_with_approvals(
+        let (_t, _xdg, project) = approved_project(
             r#"
 [commands]
 
@@ -683,10 +679,6 @@ command = ["echo", "b"]
         )
         .await;
 
-        let project = verify_and_load_project(temp_dir.path().to_path_buf())
-            .await
-            .expect("Should load approved project");
-
         let outputs = project.run_all_checks().await.expect("Should run checks");
 
         assert_eq!(outputs.len(), 3);
@@ -697,7 +689,7 @@ command = ["echo", "b"]
 
     #[tokio::test]
     async fn test_run_all_commands_fixed_sorting() {
-        let (temp_dir, _xdg_dir) = setup_test_project_with_approvals(
+        let (_t, _xdg, project) = approved_project(
             r#"
 [commands]
 format = ["echo", "format"]
@@ -707,10 +699,6 @@ lint = ["echo", "lint"]
 "#,
         )
         .await;
-
-        let project = verify_and_load_project(temp_dir.path().to_path_buf())
-            .await
-            .expect("Should load approved project");
 
         let outputs = project
             .run_all_commands()

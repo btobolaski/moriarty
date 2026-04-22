@@ -1,28 +1,33 @@
 use super::ApprovalApp;
-use crate::approval_tui::approval_state::{Screen, Section};
+use crate::{
+    approval_tui::approval_state::{Screen, Section},
+    test_helpers::{create_executable_script, setup_project_dir_with_config, write_tools_config},
+};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use std::io::Write;
 use tempfile::TempDir;
 
+/// Alias for the shared fixture, chosen for readability in this module's tests.
+use setup_project_dir_with_config as project_with_config;
+
+/// Shared config with one `lint` command and one `security` check used by the
+/// command→check section transition tests and the "requires all checks approved"
+/// regression test.
+const LINT_PLUS_SECURITY_TOML: &str = r#"
+[commands]
+lint = ["echo", "lint"]
+
+[[checks]]
+name = "security"
+command = ["echo", "security"]
+"#;
+
+/// Creates a temp project with a `test.sh` in-project script plus an `echo`-based
+/// `lint` command, writing a `.config/tools.toml` wired to both.
 fn setup_test_project() -> TempDir {
     let temp_dir = TempDir::new().unwrap();
-    let config_dir = temp_dir.path().join(".config");
-    std::fs::create_dir(&config_dir).unwrap();
 
-    // Create a simple test script
     let script_path = temp_dir.path().join("test.sh");
-    let mut script = std::fs::File::create(&script_path).unwrap();
-    writeln!(script, "#!/bin/bash").unwrap();
-    writeln!(script, "echo 'test'").unwrap();
-    drop(script);
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&script_path, perms).unwrap();
-    }
+    create_executable_script(&script_path, "echo 'test'");
 
     let config_content = format!(
         r#"
@@ -32,10 +37,16 @@ lint = ["echo", "lint"]
 "#,
         script_path.display()
     );
-
-    std::fs::write(config_dir.join("tools.toml"), config_content).unwrap();
+    write_tools_config(temp_dir.path(), &config_content);
 
     temp_dir
+}
+
+/// Builds an `ApprovalApp` for `temp_dir`, keeping the fixture alive in the caller.
+async fn new_test_app(temp_dir: &TempDir) -> ApprovalApp {
+    ApprovalApp::new(temp_dir.path().to_path_buf())
+        .await
+        .expect("ApprovalApp initialization should succeed")
 }
 
 #[tokio::test]
@@ -43,9 +54,7 @@ async fn test_approval_app_initialization() {
     // Test that ApprovalApp correctly loads project configuration
     let temp_dir = setup_test_project();
 
-    let app = ApprovalApp::new(temp_dir.path().to_path_buf())
-        .await
-        .expect("ApprovalApp initialization should succeed");
+    let app = new_test_app(&temp_dir).await;
 
     // Verify initial state
     assert_eq!(app.state.current_item_index, 0);
@@ -73,11 +82,7 @@ async fn test_approval_app_initialization() {
 #[tokio::test]
 async fn test_approval_app_initialization_with_empty_config() {
     // Test that empty tools.toml returns an error
-    let temp_dir = TempDir::new().unwrap();
-    let config_dir = temp_dir.path().join(".config");
-    std::fs::create_dir(&config_dir).unwrap();
-
-    std::fs::write(config_dir.join("tools.toml"), "[commands]\n").unwrap();
+    let temp_dir = project_with_config("[commands]\n");
 
     let err_msg = format!(
         "{:?}",
@@ -114,9 +119,7 @@ async fn test_approve_current_and_advance() {
     // Test state transitions when approving commands
     let temp_dir = setup_test_project();
 
-    let mut app = ApprovalApp::new(temp_dir.path().to_path_buf())
-        .await
-        .unwrap();
+    let mut app = new_test_app(&temp_dir).await;
 
     // Start at command review screen
     app.state.screen = Screen::CommandReview;
@@ -160,9 +163,7 @@ async fn test_save_approvals_validation() {
     let _xdg_dir = TempDir::new().unwrap();
     std::env::set_var("XDG_CONFIG_HOME", _xdg_dir.path());
 
-    let mut app = ApprovalApp::new(temp_dir.path().to_path_buf())
-        .await
-        .unwrap();
+    let mut app = new_test_app(&temp_dir).await;
 
     // Try to save with unapproved commands
     let result = app.save_approvals().await;
@@ -201,9 +202,7 @@ async fn test_command_info_metadata_loading() {
     // Test that CommandInfo captures all necessary metadata
     let temp_dir = setup_test_project();
 
-    let app = ApprovalApp::new(temp_dir.path().to_path_buf())
-        .await
-        .unwrap();
+    let app = new_test_app(&temp_dir).await;
 
     // Find the test command
     let test_cmd = app
@@ -217,10 +216,11 @@ async fn test_command_info_metadata_loading() {
     assert!(test_cmd.is_script, "test.sh should be detected as script");
     assert!(test_cmd.is_in_project, "test.sh should be in project");
     assert!(!test_cmd.binary_hash.is_empty(), "Should have binary hash");
-    assert!(
-        test_cmd.script_contents.is_some(),
-        "Should have script contents for writable script"
-    );
+    let script_contents = test_cmd
+        .script_contents
+        .as_ref()
+        .expect("Should have script contents for writable script");
+    assert!(!script_contents.is_empty(), "Script contents should be non-empty");
 
     // Find the lint command (uses echo binary)
     let lint_cmd = app
@@ -242,9 +242,7 @@ async fn test_in_project_warning_flow() {
     // Test that in-project writeable scripts trigger warning screen
     let temp_dir = setup_test_project();
 
-    let app = ApprovalApp::new(temp_dir.path().to_path_buf())
-        .await
-        .unwrap();
+    let app = new_test_app(&temp_dir).await;
 
     // Find the test command (in-project script)
     let test_cmd_idx = app
@@ -268,9 +266,7 @@ async fn test_tools_config_hash_captured() {
     // Test that tools.toml hash is correctly computed and stored
     let temp_dir = setup_test_project();
 
-    let app = ApprovalApp::new(temp_dir.path().to_path_buf())
-        .await
-        .unwrap();
+    let app = new_test_app(&temp_dir).await;
 
     assert!(
         app.state.tools_config_hash.starts_with("sha256:"),
@@ -313,11 +309,8 @@ async fn test_canonical_path_resolution() {
 #[tokio::test]
 async fn test_approval_app_with_checks() {
     // Test that ApprovalApp correctly loads projects with checks
-    let temp_dir = TempDir::new().unwrap();
-    let config_dir = temp_dir.path().join(".config");
-    std::fs::create_dir(&config_dir).unwrap();
-
-    let config_content = r#"
+    let temp_dir = project_with_config(
+        r#"
 [commands]
 lint = ["echo", "lint"]
 
@@ -328,13 +321,10 @@ command = ["echo", "audit"]
 [[checks]]
 name = "license-check"
 command = ["echo", "license"]
-"#;
+"#,
+    );
 
-    std::fs::write(config_dir.join("tools.toml"), config_content).unwrap();
-
-    let app = ApprovalApp::new(temp_dir.path().to_path_buf())
-        .await
-        .expect("ApprovalApp initialization should succeed");
+    let app = new_test_app(&temp_dir).await;
 
     // Verify commands were loaded
     assert_eq!(app.state.commands.len(), 1, "Should load 1 command");
@@ -370,24 +360,9 @@ command = ["echo", "license"]
 #[tokio::test]
 async fn test_approve_commands_then_checks_section_transition() {
     // Test the section transition from Commands to Checks during approval flow
-    let temp_dir = TempDir::new().unwrap();
-    let config_dir = temp_dir.path().join(".config");
-    std::fs::create_dir(&config_dir).unwrap();
+    let temp_dir = project_with_config(LINT_PLUS_SECURITY_TOML);
 
-    let config_content = r#"
-[commands]
-lint = ["echo", "lint"]
-
-[[checks]]
-name = "security"
-command = ["echo", "security"]
-"#;
-
-    std::fs::write(config_dir.join("tools.toml"), config_content).unwrap();
-
-    let mut app = ApprovalApp::new(temp_dir.path().to_path_buf())
-        .await
-        .unwrap();
+    let mut app = new_test_app(&temp_dir).await;
 
     // Start at command review
     app.state.screen = Screen::CommandReview;
@@ -424,27 +399,12 @@ command = ["echo", "security"]
 #[tokio::test]
 async fn test_save_approvals_requires_all_checks_approved() {
     // Test that save_approvals fails when checks are not approved
-    let temp_dir = TempDir::new().unwrap();
     let _xdg_dir = TempDir::new().unwrap();
     std::env::set_var("XDG_CONFIG_HOME", _xdg_dir.path());
 
-    let config_dir = temp_dir.path().join(".config");
-    std::fs::create_dir(&config_dir).unwrap();
+    let temp_dir = project_with_config(LINT_PLUS_SECURITY_TOML);
 
-    let config_content = r#"
-[commands]
-lint = ["echo", "lint"]
-
-[[checks]]
-name = "security"
-command = ["echo", "security"]
-"#;
-
-    std::fs::write(config_dir.join("tools.toml"), config_content).unwrap();
-
-    let mut app = ApprovalApp::new(temp_dir.path().to_path_buf())
-        .await
-        .unwrap();
+    let mut app = new_test_app(&temp_dir).await;
 
     // Approve only commands, not checks
     for cmd in &mut app.state.commands {
@@ -476,11 +436,8 @@ command = ["echo", "security"]
 #[tokio::test]
 async fn test_approval_app_with_only_checks() {
     // Test that a project with only checks (no commands) loads correctly
-    let temp_dir = TempDir::new().unwrap();
-    let config_dir = temp_dir.path().join(".config");
-    std::fs::create_dir(&config_dir).unwrap();
-
-    let config_content = r#"
+    let temp_dir = project_with_config(
+        r#"
 [commands]
 
 [[checks]]
@@ -490,13 +447,10 @@ command = ["echo", "security"]
 [[checks]]
 name = "license"
 command = ["echo", "license"]
-"#;
+"#,
+    );
 
-    std::fs::write(config_dir.join("tools.toml"), config_content).unwrap();
-
-    let app = ApprovalApp::new(temp_dir.path().to_path_buf())
-        .await
-        .expect("Should load checks-only config");
+    let app = new_test_app(&temp_dir).await;
 
     assert_eq!(app.state.commands.len(), 0, "Should have no commands");
     assert_eq!(app.state.checks.len(), 2, "Should have 2 checks");
@@ -504,16 +458,11 @@ command = ["echo", "license"]
 
 #[tokio::test]
 async fn test_approve_checks_when_no_commands() {
-    use tempfile::TempDir;
-
     let _xdg_dir = TempDir::new().unwrap();
     std::env::set_var("XDG_CONFIG_HOME", _xdg_dir.path());
 
-    let temp_dir = TempDir::new().unwrap();
-    let config_dir = temp_dir.path().join(".config");
-    std::fs::create_dir(&config_dir).unwrap();
-
-    let config_content = r#"
+    let temp_dir = project_with_config(
+        r#"
 [commands]
 
 [[checks]]
@@ -523,13 +472,10 @@ command = ["echo", "security"]
 [[checks]]
 name = "license-check"
 command = ["echo", "license"]
-"#;
+"#,
+    );
 
-    std::fs::write(config_dir.join("tools.toml"), config_content).unwrap();
-
-    let mut app = ApprovalApp::new(temp_dir.path().to_path_buf())
-        .await
-        .expect("Should load checks-only config");
+    let mut app = new_test_app(&temp_dir).await;
 
     // Verify no commands, only checks
     assert_eq!(app.state.commands.len(), 0);
@@ -564,42 +510,27 @@ command = ["echo", "license"]
 
 #[tokio::test]
 async fn test_check_with_relative_script_path() {
-    use tempfile::TempDir;
-
     let _xdg_dir = TempDir::new().unwrap();
     std::env::set_var("XDG_CONFIG_HOME", _xdg_dir.path());
 
     let temp_dir = TempDir::new().unwrap();
-    let config_dir = temp_dir.path().join(".config");
-    std::fs::create_dir(&config_dir).unwrap();
 
     // Create a script in a subdirectory with relative path
-    let scripts_dir = temp_dir.path().join("scripts");
-    std::fs::create_dir(&scripts_dir).unwrap();
-    let script_path = scripts_dir.join("custom-check.sh");
-    std::fs::write(&script_path, "#!/bin/bash\necho 'checking'\n").unwrap();
+    let script_path = temp_dir.path().join("scripts/custom-check.sh");
+    create_executable_script(&script_path, "echo 'checking'");
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let permissions = std::fs::Permissions::from_mode(0o755);
-        std::fs::set_permissions(&script_path, permissions).unwrap();
-    }
-
-    let config_content = r#"
+    write_tools_config(
+        temp_dir.path(),
+        r#"
 [commands]
 
 [[checks]]
 name = "custom-check"
 command = ["./scripts/custom-check.sh"]
-"#
-    .to_string();
+"#,
+    );
 
-    std::fs::write(config_dir.join("tools.toml"), &config_content).unwrap();
-
-    let app = ApprovalApp::new(temp_dir.path().to_path_buf())
-        .await
-        .expect("Should load config with relative check path");
+    let app = new_test_app(&temp_dir).await;
 
     assert_eq!(app.state.checks.len(), 1);
     let check = &app.state.checks[0];
@@ -633,28 +564,14 @@ command = ["./scripts/custom-check.sh"]
 
 #[tokio::test]
 async fn test_check_metadata_captured() {
-    use tempfile::TempDir;
-
     let _xdg_dir = TempDir::new().unwrap();
     std::env::set_var("XDG_CONFIG_HOME", _xdg_dir.path());
 
     let temp_dir = TempDir::new().unwrap();
-    let config_dir = temp_dir.path().join(".config");
-    std::fs::create_dir(&config_dir).unwrap();
 
     // Create a writable script in the project
-    let scripts_dir = temp_dir.path().join("scripts");
-    std::fs::create_dir(&scripts_dir).unwrap();
-    let writable_script = scripts_dir.join("writable-check.sh");
-    std::fs::write(&writable_script, "#!/bin/bash\necho 'writable check'\n").unwrap();
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // Make it writable and executable
-        let permissions = std::fs::Permissions::from_mode(0o755);
-        std::fs::set_permissions(&writable_script, permissions).unwrap();
-    }
+    let writable_script = temp_dir.path().join("scripts/writable-check.sh");
+    create_executable_script(&writable_script, "echo 'writable check'");
 
     let config_content = format!(
         r#"
@@ -666,12 +583,9 @@ command = ["{}"]
 "#,
         writable_script.display()
     );
+    write_tools_config(temp_dir.path(), &config_content);
 
-    std::fs::write(config_dir.join("tools.toml"), &config_content).unwrap();
-
-    let app = ApprovalApp::new(temp_dir.path().to_path_buf())
-        .await
-        .expect("Should load config with writable check");
+    let app = new_test_app(&temp_dir).await;
 
     assert_eq!(app.state.checks.len(), 1);
     let check = &app.state.checks[0];
@@ -689,11 +603,10 @@ command = ["{}"]
         );
 
         // For writable scripts, content should be captured
-        assert!(
-            check.script_contents.is_some(),
-            "Writable script contents should be captured"
-        );
-        let contents = check.script_contents.as_ref().unwrap();
+        let contents = check
+            .script_contents
+            .as_ref()
+            .expect("Writable script contents should be captured");
         assert!(
             contents.contains("writable check"),
             "Script contents should include the echo message"

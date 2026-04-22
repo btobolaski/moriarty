@@ -370,163 +370,184 @@ fn output_pretty(command: &str, result: &RuleResult) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::user_config::{BashRule, BashRuleAction, UserConfig};
+    use std::collections::HashMap;
+
     use tempfile::TempDir;
 
-    /// Safe to use std::env::set_var because cargo nextest isolates each test in a separate process.
-    fn setup_isolated_xdg_config() -> TempDir {
-        let temp_dir = tempfile::tempdir().unwrap();
-        std::env::set_var("XDG_CONFIG_HOME", temp_dir.path());
-        temp_dir
-    }
+    use super::*;
+    use crate::test_helpers::setup_isolated_xdg_config;
+    use crate::user_config::{BashRule, BashRuleAction, UserConfig};
 
     async fn create_test_config(dir: &TempDir, rules: Vec<BashRule>) -> PathBuf {
+        write_user_config(
+            dir,
+            UserConfig {
+                pattern_fragments: None,
+                bash_rules: Some(rules),
+                tool_rules: None,
+            },
+        )
+        .await
+    }
+
+    async fn write_user_config(dir: &TempDir, config: UserConfig) -> PathBuf {
         let config_dir = dir.path().join("moriarty");
         tokio::fs::create_dir_all(&config_dir).await.unwrap();
-
-        let config = UserConfig {
-            pattern_fragments: None,
-            bash_rules: Some(rules),
-            tool_rules: None,
-        };
-
         let config_path = config_dir.join("test_rules.toml");
-        let config_toml = toml::to_string_pretty(&config).unwrap();
-        tokio::fs::write(&config_path, config_toml).await.unwrap();
-
+        let toml = toml::to_string_pretty(&config).unwrap();
+        tokio::fs::write(&config_path, toml).await.unwrap();
         config_path
     }
 
-    #[tokio::test]
-    async fn test_bash_rules_allowed() {
-        let temp_dir = setup_isolated_xdg_config();
-        let rules = vec![BashRule {
-            name: "allow-ls".to_string(),
-            pattern: r"^ls".to_string(),
-            action: BashRuleAction::Allow,
-        }];
-
-        let config_path = create_test_config(&temp_dir, rules).await;
-
-        test_bash_rules(Some("ls -la".to_string()), Some(config_path), false)
-            .await
-            .unwrap();
+    /// Run `test_bash_rules` with a single rule and return its `Result`.
+    ///
+    /// Callers are expected to `.unwrap_or_else(|e| panic!("case {label:?}: {e}"))`
+    /// so table-driven tests identify the failing case in panic output.
+    async fn run_once(rule: BashRule, command: &str, json: bool) -> miette::Result<()> {
+        let dir = setup_isolated_xdg_config();
+        let cfg = create_test_config(&dir, vec![rule]).await;
+        test_bash_rules(Some(command.to_string()), Some(cfg), json).await
     }
 
-    #[tokio::test]
-    async fn test_bash_rules_denied() {
-        let temp_dir = setup_isolated_xdg_config();
-        let rules = vec![BashRule {
-            name: "deny-rm".to_string(),
-            pattern: r"^rm\s+-rf\s+/".to_string(),
+    fn allow(name: &str, pattern: &str) -> BashRule {
+        BashRule {
+            name: name.to_string(),
+            pattern: pattern.to_string(),
+            action: BashRuleAction::Allow,
+        }
+    }
+    fn deny(name: &str, pattern: &str, value: &str) -> BashRule {
+        BashRule {
+            name: name.to_string(),
+            pattern: pattern.to_string(),
             action: BashRuleAction::Deny {
-                value: "Dangerous recursive delete".to_string(),
+                value: value.to_string(),
             },
-        }];
-
-        let config_path = create_test_config(&temp_dir, rules).await;
-
-        test_bash_rules(Some("rm -rf /".to_string()), Some(config_path), false)
-            .await
-            .unwrap();
+        }
     }
-
-    #[tokio::test]
-    async fn test_bash_rules_modified() {
-        let temp_dir = setup_isolated_xdg_config();
-        let rules = vec![BashRule {
-            name: "modify-docker".to_string(),
-            pattern: r"^(docker\s+system\s+prune)$".to_string(),
+    fn modify(name: &str, pattern: &str, value: &str) -> BashRule {
+        BashRule {
+            name: name.to_string(),
+            pattern: pattern.to_string(),
             action: BashRuleAction::Modify {
-                value: "$1 --dry-run".to_string(),
+                value: value.to_string(),
             },
-        }];
-
-        let config_path = create_test_config(&temp_dir, rules).await;
-
-        test_bash_rules(
-            Some("docker system prune".to_string()),
-            Some(config_path),
-            false,
-        )
-        .await
-        .unwrap();
+        }
     }
-
-    #[tokio::test]
-    async fn test_bash_rules_ask() {
-        let temp_dir = setup_isolated_xdg_config();
-        let rules = vec![BashRule {
-            name: "ask-docker".to_string(),
-            pattern: r"^docker".to_string(),
+    fn ask(name: &str, pattern: &str) -> BashRule {
+        BashRule {
+            name: name.to_string(),
+            pattern: pattern.to_string(),
             action: BashRuleAction::Ask,
-        }];
+        }
+    }
 
-        let config_path = create_test_config(&temp_dir, rules).await;
+    /// Table-driven coverage for the happy-path bash-rule flows.
+    ///
+    /// Each case just asserts `test_bash_rules(...)` returns Ok; the earlier
+    /// individual tests only did the same smoke-check.
+    #[tokio::test]
+    async fn test_bash_rule_matrix() {
+        struct Case {
+            label: &'static str,
+            rule: BashRule,
+            command: &'static str,
+            json: bool,
+        }
+        let cases = [
+            Case { label: "allowed",                    rule: allow("allow-ls", r"^ls"),                                      command: "ls -la",             json: false },
+            Case { label: "denied",                     rule: deny("deny-rm", r"^rm\s+-rf\s+/", "Dangerous recursive delete"), command: "rm -rf /",           json: false },
+            Case { label: "modified",                   rule: modify("modify-docker", r"^(docker\s+system\s+prune)$", "$1 --dry-run"), command: "docker system prune", json: false },
+            Case { label: "ask",                        rule: ask("ask-docker", r"^docker"),                                  command: "docker build",       json: false },
+            Case { label: "no match",                   rule: allow("allow-ls", r"^ls"),                                      command: "cargo build",        json: false },
+            Case { label: "json output",                rule: allow("allow-ls", r"^ls"),                                      command: "ls -la",             json: true },
+            Case { label: "json structure allowed",     rule: allow("allow-ls", r"^ls"),                                      command: "ls",                 json: true },
+            Case { label: "json structure denied",      rule: deny("deny-rm", r"^rm", "Dangerous command"),                    command: "rm file.txt",        json: true },
+            Case { label: "json structure modified",    rule: modify("add-flag", r"^(ls)$", "$1 -la"),                        command: "ls",                 json: true },
+            Case { label: "invalid regex skipped",      rule: deny("bad-regex", r"[invalid(", "test"),                        command: "anything",           json: false },
+            Case { label: "special chars quotes",       rule: allow("allow-echo", r"^echo"),                                  command: "echo \"hello world\"", json: false },
+            Case { label: "special chars unicode",      rule: allow("allow-echo", r"^echo"),                                  command: "echo '\u{4f60}\u{597d}\u{4e16}\u{754c} \u{1f30d}'", json: false },
+            Case { label: "whitespace only",            rule: deny("deny-whitespace", r"^\s+$", "Whitespace only"),            command: "   \t\n",            json: false },
+        ];
 
-        test_bash_rules(Some("docker build".to_string()), Some(config_path), false)
+        for c in cases {
+            run_once(c.rule.clone(), c.command, c.json)
+                .await
+                .unwrap_or_else(|e| panic!("bash_rule_matrix case {:?}: {e}", c.label));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bash_rules_very_long_command() {
+        let long = "echo ".to_string() + &"a".repeat(1000);
+        run_once(allow("allow-all", r".*"), &long, false)
             .await
             .unwrap();
     }
 
     #[tokio::test]
-    async fn test_bash_rules_no_match() {
-        let temp_dir = setup_isolated_xdg_config();
-        let rules = vec![BashRule {
-            name: "allow-ls".to_string(),
-            pattern: r"^ls".to_string(),
-            action: BashRuleAction::Allow,
-        }];
-
-        let config_path = create_test_config(&temp_dir, rules).await;
-
-        test_bash_rules(Some("cargo build".to_string()), Some(config_path), false)
+    async fn test_bash_rules_first_match_wins() {
+        // Two-rule config; first deny rule should win over later allow.
+        let dir = setup_isolated_xdg_config();
+        let cfg = create_test_config(
+            &dir,
+            vec![
+                deny("deny-ls", r"^ls", "First rule denies"),
+                allow("allow-ls", r"^ls"),
+            ],
+        )
+        .await;
+        test_bash_rules(Some("ls".to_string()), Some(cfg), false)
             .await
             .unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_bash_rules_json_output() {
-        let temp_dir = setup_isolated_xdg_config();
-        let rules = vec![BashRule {
-            name: "allow-ls".to_string(),
-            pattern: r"^ls".to_string(),
-            action: BashRuleAction::Allow,
-        }];
-
-        let config_path = create_test_config(&temp_dir, rules).await;
-
-        test_bash_rules(Some("ls -la".to_string()), Some(config_path), true)
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_bash_rules_empty_command() {
-        let temp_dir = setup_isolated_xdg_config();
-        let rules = vec![BashRule {
-            name: "allow-ls".to_string(),
-            pattern: r"^ls".to_string(),
-            action: BashRuleAction::Allow,
-        }];
-
-        let config_path = create_test_config(&temp_dir, rules).await;
-
-        let err = test_bash_rules(Some("".to_string()), Some(config_path), false)
-            .await
-            .expect_err("Should fail with empty command");
-        assert!(err.to_string().contains("No command provided"));
     }
 
     #[tokio::test]
     async fn test_bash_rules_no_rules_configured() {
-        let temp_dir = setup_isolated_xdg_config();
-        let config_path = create_test_config(&temp_dir, vec![]).await;
-
-        test_bash_rules(Some("ls -la".to_string()), Some(config_path), false)
+        let dir = setup_isolated_xdg_config();
+        let cfg = create_test_config(&dir, vec![]).await;
+        test_bash_rules(Some("ls -la".to_string()), Some(cfg), false)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_bash_rules_with_pattern_fragments() {
+        let dir = setup_isolated_xdg_config();
+        let mut fragments = HashMap::new();
+        fragments.insert("safe_chars".to_string(), "[^|&;$`]".to_string());
+        let cfg = write_user_config(
+            &dir,
+            UserConfig {
+                pattern_fragments: Some(fragments),
+                bash_rules: Some(vec![allow("allow-ls-with-fragment", r"^ls{{safe_chars}}*$")]),
+                tool_rules: None,
+            },
+        )
+        .await;
+
+        // Matches: every char in " -la" is permitted by safe_chars ([^|&;$`]).
+        test_bash_rules(Some("ls -la".to_string()), Some(cfg.clone()), false)
+            .await
+            .unwrap_or_else(|e| panic!("pattern_fragments ls -la: {e}"));
+
+        // Must NOT match: the pipe char is excluded by safe_chars, so the
+        // expanded pattern `^ls[^|&;$`]*$` rejects "ls | grep foo".
+        // test_bash_rules still returns Ok (no rule error); the hook simply
+        // emits NO MATCH output, which is the behaviour under test.
+        test_bash_rules(Some("ls | grep foo".to_string()), Some(cfg), false)
+            .await
+            .unwrap_or_else(|e| panic!("pattern_fragments ls | grep foo: {e}"));
+    }
+
+    #[tokio::test]
+    async fn test_bash_rules_empty_command() {
+        let dir = setup_isolated_xdg_config();
+        let cfg = create_test_config(&dir, vec![allow("allow-ls", r"^ls")]).await;
+        let err = test_bash_rules(Some(String::new()), Some(cfg), false)
+            .await
+            .expect_err("Should fail with empty command");
+        assert!(err.to_string().contains("No command provided"));
     }
 
     #[tokio::test]
@@ -542,224 +563,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_bash_rules_with_pattern_fragments() {
-        use std::collections::HashMap;
-
-        let temp_dir = setup_isolated_xdg_config();
-        let config_dir = temp_dir.path().join("moriarty");
-        tokio::fs::create_dir_all(&config_dir).await.unwrap();
-
-        let mut fragments = HashMap::new();
-        fragments.insert("safe_chars".to_string(), "[^|&;$`]".to_string());
-
-        let config = UserConfig {
-            pattern_fragments: Some(fragments),
-            bash_rules: Some(vec![BashRule {
-                name: "allow-ls-with-fragment".to_string(),
-                pattern: r"^ls{{safe_chars}}*$".to_string(),
-                action: BashRuleAction::Allow,
-            }]),
-            tool_rules: None,
-        };
-
-        let config_path = config_dir.join("test_rules.toml");
-        let config_toml = toml::to_string_pretty(&config).unwrap();
-        tokio::fs::write(&config_path, config_toml).await.unwrap();
-
-        // Should match with fragment expansion
-        test_bash_rules(Some("ls -la".to_string()), Some(config_path.clone()), false)
-            .await
-            .unwrap();
-
-        // Should not match (contains pipe, which is excluded by safe_chars)
-        test_bash_rules(Some("ls | grep foo".to_string()), Some(config_path), false)
-            .await
-            .unwrap(); // Returns Ok but should show NO MATCH
-    }
-
-    #[tokio::test]
     async fn test_bash_rules_malformed_toml() {
-        let temp_dir = setup_isolated_xdg_config();
-        let config_dir = temp_dir.path().join("moriarty");
+        let dir = setup_isolated_xdg_config();
+        let config_dir = dir.path().join("moriarty");
         tokio::fs::create_dir_all(&config_dir).await.unwrap();
-
-        let config_path = config_dir.join("bad_config.toml");
-        tokio::fs::write(&config_path, "this is not valid [[[ toml")
+        let cfg = config_dir.join("bad_config.toml");
+        tokio::fs::write(&cfg, "this is not valid [[[ toml")
             .await
             .unwrap();
-
-        let err = test_bash_rules(Some("ls".to_string()), Some(config_path), false)
+        let err = test_bash_rules(Some("ls".to_string()), Some(cfg), false)
             .await
             .expect_err("Should fail with malformed TOML");
         assert!(err.to_string().contains("Failed to parse config file"));
-    }
-
-    #[tokio::test]
-    async fn test_bash_rules_invalid_regex_pattern() {
-        let temp_dir = setup_isolated_xdg_config();
-        let rules = vec![BashRule {
-            name: "bad-regex".to_string(),
-            pattern: r"[invalid(".to_string(),
-            action: BashRuleAction::Deny {
-                value: "test".to_string(),
-            },
-        }];
-
-        let config_path = create_test_config(&temp_dir, rules).await;
-
-        // Should succeed but skip the invalid rule
-        test_bash_rules(Some("anything".to_string()), Some(config_path), false)
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_bash_rules_command_with_special_characters() {
-        let temp_dir = setup_isolated_xdg_config();
-        let rules = vec![BashRule {
-            name: "allow-echo".to_string(),
-            pattern: r"^echo".to_string(),
-            action: BashRuleAction::Allow,
-        }];
-
-        let config_path = create_test_config(&temp_dir, rules).await;
-
-        // Test with quotes, newlines, tabs
-        test_bash_rules(
-            Some("echo \"hello world\"".to_string()),
-            Some(config_path.clone()),
-            false,
-        )
-        .await
-        .unwrap();
-
-        // Test with unicode
-        test_bash_rules(
-            Some("echo '你好世界 🌍'".to_string()),
-            Some(config_path),
-            false,
-        )
-        .await
-        .unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_bash_rules_very_long_command() {
-        let temp_dir = setup_isolated_xdg_config();
-        let rules = vec![BashRule {
-            name: "allow-all".to_string(),
-            pattern: r".*".to_string(),
-            action: BashRuleAction::Allow,
-        }];
-
-        let config_path = create_test_config(&temp_dir, rules).await;
-
-        // Test with a very long command (1000 characters)
-        let long_command = "echo ".to_string() + &"a".repeat(1000);
-        test_bash_rules(Some(long_command), Some(config_path), false)
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_bash_rules_whitespace_only_command() {
-        let temp_dir = setup_isolated_xdg_config();
-        let rules = vec![BashRule {
-            name: "deny-whitespace".to_string(),
-            pattern: r"^\s+$".to_string(),
-            action: BashRuleAction::Deny {
-                value: "Whitespace only".to_string(),
-            },
-        }];
-
-        let config_path = create_test_config(&temp_dir, rules).await;
-
-        test_bash_rules(Some("   \t\n".to_string()), Some(config_path), false)
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_bash_rules_json_output_structure_allowed() {
-        let temp_dir = setup_isolated_xdg_config();
-        let rules = vec![BashRule {
-            name: "allow-ls".to_string(),
-            pattern: r"^ls".to_string(),
-            action: BashRuleAction::Allow,
-        }];
-
-        let config_path = create_test_config(&temp_dir, rules).await;
-
-        // Capture stdout by redirecting to a temp file
-        let output_file = temp_dir.path().join("output.json");
-        let _file = std::fs::File::create(&output_file).unwrap();
-
-        // Run the command (output goes to stdout, we can't easily capture it here)
-        // But we can at least verify it doesn't crash with JSON mode
-        test_bash_rules(Some("ls".to_string()), Some(config_path), true)
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_bash_rules_json_output_structure_denied() {
-        let temp_dir = setup_isolated_xdg_config();
-        let rules = vec![BashRule {
-            name: "deny-rm".to_string(),
-            pattern: r"^rm".to_string(),
-            action: BashRuleAction::Deny {
-                value: "Dangerous command".to_string(),
-            },
-        }];
-
-        let config_path = create_test_config(&temp_dir, rules).await;
-
-        test_bash_rules(Some("rm file.txt".to_string()), Some(config_path), true)
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_bash_rules_json_output_structure_modified() {
-        let temp_dir = setup_isolated_xdg_config();
-        let rules = vec![BashRule {
-            name: "add-flag".to_string(),
-            pattern: r"^(ls)$".to_string(),
-            action: BashRuleAction::Modify {
-                value: "$1 -la".to_string(),
-            },
-        }];
-
-        let config_path = create_test_config(&temp_dir, rules).await;
-
-        test_bash_rules(Some("ls".to_string()), Some(config_path), true)
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_bash_rules_first_match_wins() {
-        let temp_dir = setup_isolated_xdg_config();
-        let rules = vec![
-            BashRule {
-                name: "deny-ls".to_string(),
-                pattern: r"^ls".to_string(),
-                action: BashRuleAction::Deny {
-                    value: "First rule denies".to_string(),
-                },
-            },
-            BashRule {
-                name: "allow-ls".to_string(),
-                pattern: r"^ls".to_string(),
-                action: BashRuleAction::Allow,
-            },
-        ];
-
-        let config_path = create_test_config(&temp_dir, rules).await;
-
-        // First rule should win (deny)
-        test_bash_rules(Some("ls".to_string()), Some(config_path), false)
-            .await
-            .unwrap();
     }
 }

@@ -1,8 +1,12 @@
-use std::{collections::HashMap, path::Path};
+use std::collections::HashMap;
+#[cfg(test)]
+use std::path::Path;
 
 use chrono::{DateTime, Utc};
+#[cfg(test)]
 use miette::IntoDiagnostic;
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use tokio::fs::read_to_string;
 use uuid::Uuid;
 
@@ -568,6 +572,11 @@ pub enum HookError {
     Structured(HookErrorDetails),
 }
 
+// The accessors below are only exercised by `logs::parser::tests`; production
+// code matches the enum variants directly. Gate on `cfg(test)` to avoid the
+// `dead_code` warning in release builds rather than pretending a binary crate
+// has downstream consumers.
+#[cfg(test)]
 impl HookError {
     pub fn message(&self) -> &str {
         match self {
@@ -1087,6 +1096,7 @@ pub struct AssistantCacheCreation {
     pub ephemeral_1h_input_tokens: usize,
 }
 
+#[cfg(test)]
 pub async fn read_file(file: impl AsRef<Path>) -> miette::Result<Vec<LogLine>> {
     let string_contents = read_to_string(file).await.into_diagnostic()?;
 

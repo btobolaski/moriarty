@@ -136,62 +136,71 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_current_items_returns_commands_section() {
-        let state = ApprovalState {
+    /// Create a default `ApprovalState` for tests with the given commands and checks.
+    fn create_test_state(
+        commands: Vec<CommandInfo>,
+        checks: Vec<CommandInfo>,
+        section: Section,
+        screen: Screen,
+    ) -> ApprovalState {
+        ApprovalState {
             project_dir: PathBuf::from("/test"),
             tools_config_hash: "hash".to_string(),
-            commands: vec![
-                create_test_command_info("cmd1"),
-                create_test_command_info("cmd2"),
-            ],
-            checks: vec![create_test_command_info("check1")],
-            current_section: Section::Commands,
+            commands,
+            checks,
+            current_section: section,
             current_item_index: 0,
-            screen: Screen::CommandReview,
-        };
+            screen,
+        }
+    }
 
-        let items = state.current_items();
-        assert_eq!(items.len(), 2);
-        assert_eq!(items[0].name, "cmd1");
-        assert_eq!(items[1].name, "cmd2");
+    /// Collects item names so table-driven tests can assert ordering without
+    /// comparing the rest of each `CommandInfo` fixture.
+    fn item_names(items: &[CommandInfo]) -> Vec<&str> {
+        items.iter().map(|item| item.name.as_str()).collect()
     }
 
     #[test]
-    fn test_current_items_returns_checks_section() {
-        let state = ApprovalState {
-            project_dir: PathBuf::from("/test"),
-            tools_config_hash: "hash".to_string(),
-            commands: vec![create_test_command_info("cmd1")],
-            checks: vec![
-                create_test_command_info("check1"),
-                create_test_command_info("check2"),
-            ],
-            current_section: Section::Checks,
-            current_item_index: 0,
-            screen: Screen::CommandReview,
-        };
+    fn test_current_items_returns_section_items() {
+        let cases = [
+            (
+                vec![
+                    create_test_command_info("cmd1"),
+                    create_test_command_info("cmd2"),
+                ],
+                vec![create_test_command_info("check1")],
+                Section::Commands,
+                vec!["cmd1", "cmd2"],
+            ),
+            (
+                vec![create_test_command_info("cmd1")],
+                vec![
+                    create_test_command_info("check1"),
+                    create_test_command_info("check2"),
+                ],
+                Section::Checks,
+                vec!["check1", "check2"],
+            ),
+        ];
 
-        let items = state.current_items();
-        assert_eq!(items.len(), 2);
-        assert_eq!(items[0].name, "check1");
-        assert_eq!(items[1].name, "check2");
+        for (index, (commands, checks, section, expected)) in cases.into_iter().enumerate() {
+            let state = create_test_state(commands, checks, section, Screen::CommandReview);
+            assert_eq!(item_names(state.current_items()), expected, "case {index}");
+        }
     }
 
     #[test]
     fn test_current_item_returns_correct_item() {
-        let state = ApprovalState {
-            project_dir: PathBuf::from("/test"),
-            tools_config_hash: "hash".to_string(),
-            commands: vec![
+        let mut state = create_test_state(
+            vec![
                 create_test_command_info("cmd1"),
                 create_test_command_info("cmd2"),
             ],
-            checks: vec![],
-            current_section: Section::Commands,
-            current_item_index: 1,
-            screen: Screen::CommandReview,
-        };
+            vec![],
+            Section::Commands,
+            Screen::CommandReview,
+        );
+        state.current_item_index = 1;
 
         let item = state.current_item();
         assert!(item.is_some());
@@ -200,15 +209,13 @@ mod tests {
 
     #[test]
     fn test_current_item_out_of_bounds_returns_none() {
-        let state = ApprovalState {
-            project_dir: PathBuf::from("/test"),
-            tools_config_hash: "hash".to_string(),
-            commands: vec![create_test_command_info("cmd1")],
-            checks: vec![],
-            current_section: Section::Commands,
-            current_item_index: 5, // Out of bounds
-            screen: Screen::CommandReview,
-        };
+        let mut state = create_test_state(
+            vec![create_test_command_info("cmd1")],
+            vec![],
+            Section::Commands,
+            Screen::CommandReview,
+        );
+        state.current_item_index = 5;
 
         let item = state.current_item();
         assert!(item.is_none());
@@ -216,15 +223,12 @@ mod tests {
 
     #[test]
     fn test_current_item_with_empty_section_returns_none() {
-        let state = ApprovalState {
-            project_dir: PathBuf::from("/test"),
-            tools_config_hash: "hash".to_string(),
-            commands: vec![],
-            checks: vec![create_test_command_info("check1")],
-            current_section: Section::Commands, // Empty section
-            current_item_index: 0,
-            screen: Screen::CommandReview,
-        };
+        let state = create_test_state(
+            vec![],
+            vec![create_test_command_info("check1")],
+            Section::Commands,
+            Screen::CommandReview,
+        );
 
         let item = state.current_item();
         assert!(item.is_none());
@@ -232,18 +236,15 @@ mod tests {
 
     #[test]
     fn test_current_item_mut_modifies_correct_item() {
-        let mut state = ApprovalState {
-            project_dir: PathBuf::from("/test"),
-            tools_config_hash: "hash".to_string(),
-            commands: vec![
+        let mut state = create_test_state(
+            vec![
                 create_test_command_info("cmd1"),
                 create_test_command_info("cmd2"),
             ],
-            checks: vec![],
-            current_section: Section::Commands,
-            current_item_index: 0,
-            screen: Screen::CommandReview,
-        };
+            vec![],
+            Section::Commands,
+            Screen::CommandReview,
+        );
 
         if let Some(item) = state.current_item_mut() {
             item.approved = true;
@@ -254,86 +255,48 @@ mod tests {
     }
 
     #[test]
-    fn test_all_items_chains_commands_and_checks() {
-        let state = ApprovalState {
-            project_dir: PathBuf::from("/test"),
-            tools_config_hash: "hash".to_string(),
-            commands: vec![
-                create_test_command_info("cmd1"),
-                create_test_command_info("cmd2"),
-            ],
-            checks: vec![
-                create_test_command_info("check1"),
-                create_test_command_info("check2"),
-            ],
-            current_section: Section::Commands,
-            current_item_index: 0,
-            screen: Screen::CommandReview,
-        };
+    fn test_all_items_collects_commands_then_checks() {
+        let cases = [
+            (
+                vec![
+                    create_test_command_info("cmd1"),
+                    create_test_command_info("cmd2"),
+                ],
+                vec![
+                    create_test_command_info("check1"),
+                    create_test_command_info("check2"),
+                ],
+                vec!["cmd1", "cmd2", "check1", "check2"],
+            ),
+            (
+                vec![],
+                vec![
+                    create_test_command_info("check1"),
+                    create_test_command_info("check2"),
+                ],
+                vec!["check1", "check2"],
+            ),
+            (
+                vec![
+                    create_test_command_info("cmd1"),
+                    create_test_command_info("cmd2"),
+                ],
+                vec![],
+                vec!["cmd1", "cmd2"],
+            ),
+            (vec![], vec![], vec![]),
+        ];
 
-        let all: Vec<&CommandInfo> = state.all_items().collect();
-        assert_eq!(all.len(), 4);
-        assert_eq!(all[0].name, "cmd1");
-        assert_eq!(all[1].name, "cmd2");
-        assert_eq!(all[2].name, "check1");
-        assert_eq!(all[3].name, "check2");
-    }
-
-    #[test]
-    fn test_all_items_with_empty_commands() {
-        let state = ApprovalState {
-            project_dir: PathBuf::from("/test"),
-            tools_config_hash: "hash".to_string(),
-            commands: vec![],
-            checks: vec![
-                create_test_command_info("check1"),
-                create_test_command_info("check2"),
-            ],
-            current_section: Section::Checks,
-            current_item_index: 0,
-            screen: Screen::CommandReview,
-        };
-
-        let all: Vec<&CommandInfo> = state.all_items().collect();
-        assert_eq!(all.len(), 2);
-        assert_eq!(all[0].name, "check1");
-        assert_eq!(all[1].name, "check2");
-    }
-
-    #[test]
-    fn test_all_items_with_empty_checks() {
-        let state = ApprovalState {
-            project_dir: PathBuf::from("/test"),
-            tools_config_hash: "hash".to_string(),
-            commands: vec![
-                create_test_command_info("cmd1"),
-                create_test_command_info("cmd2"),
-            ],
-            checks: vec![],
-            current_section: Section::Commands,
-            current_item_index: 0,
-            screen: Screen::CommandReview,
-        };
-
-        let all: Vec<&CommandInfo> = state.all_items().collect();
-        assert_eq!(all.len(), 2);
-        assert_eq!(all[0].name, "cmd1");
-        assert_eq!(all[1].name, "cmd2");
-    }
-
-    #[test]
-    fn test_all_items_with_both_empty() {
-        let state = ApprovalState {
-            project_dir: PathBuf::from("/test"),
-            tools_config_hash: "hash".to_string(),
-            commands: vec![],
-            checks: vec![],
-            current_section: Section::Commands,
-            current_item_index: 0,
-            screen: Screen::ProjectOverview,
-        };
-
-        let all: Vec<&CommandInfo> = state.all_items().collect();
-        assert_eq!(all.len(), 0);
+        for (index, (commands, checks, expected)) in cases.into_iter().enumerate() {
+            let state = create_test_state(
+                commands,
+                checks,
+                Section::Commands,
+                Screen::ProjectOverview,
+            );
+            let names: Vec<_> = state.all_items().map(|item| item.name.as_str()).collect();
+            assert_eq!(names, expected, "case {index}");
+        }
     }
 }
+

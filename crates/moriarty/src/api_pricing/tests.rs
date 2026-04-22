@@ -1,328 +1,210 @@
 use super::*;
 use crate::api_pricing::{
     analyzer::{AnalysisResult, DailyCosts},
-    pricing::{TokenCosts, TokenCounts},
+    pricing::{ModelCostsMap, ModelType, TokenCosts, TokenCounts},
 };
 use chrono::NaiveDate;
 use std::collections::HashSet;
 
-#[test]
-fn test_display_analysis_summary_no_failures() {
-    let result = AnalysisResult {
-        daily_costs: vec![],
-        unknown_models: HashSet::new(),
-        total_unknown_tokens: TokenCounts::default(),
-        files_parsed: 5,
-        files_failed: 0,
-    };
-
-    display_analysis_summary(&result);
-}
-
-#[test]
-fn test_display_analysis_summary_with_failures() {
-    let result = AnalysisResult {
-        daily_costs: vec![],
-        unknown_models: HashSet::new(),
-        total_unknown_tokens: TokenCounts::default(),
-        files_parsed: 3,
-        files_failed: 2,
-    };
-
-    display_analysis_summary(&result);
-}
-
-#[test]
-fn test_display_costs_empty() {
-    let daily_costs = vec![];
-    display_costs(&daily_costs);
-}
-
-#[test]
-fn test_display_costs_single_day_sonnet_only() {
-    let date = NaiveDate::from_ymd_opt(2025, 10, 23).unwrap();
-    let daily_costs = vec![DailyCosts {
+/// Builder helper for creating DailyCosts with defaults
+fn make_daily_costs(date: NaiveDate) -> DailyCosts {
+    DailyCosts {
         date,
-        sonnet_costs: TokenCosts {
-            input: 1.0,
-            output: 2.0,
-            cache_write: 0.5,
-            cache_read: 0.25,
-        },
-        haiku_costs: TokenCosts::default(),
-        opus_costs: TokenCosts::default(),
-        opus4_costs: TokenCosts::default(),
-        lines_changed: 145,
-    }];
-
-    display_costs(&daily_costs);
-}
-
-#[test]
-fn test_display_costs_single_day_opus_only() {
-    let date = NaiveDate::from_ymd_opt(2025, 10, 23).unwrap();
-    let daily_costs = vec![DailyCosts {
-        date,
-        opus_costs: TokenCosts {
-            input: 15.0,
-            output: 75.0,
-            cache_write: 18.75,
-            cache_read: 1.5,
-        },
-        sonnet_costs: TokenCosts::default(),
-        haiku_costs: TokenCosts::default(),
-        opus4_costs: TokenCosts::default(),
+        per_model: ModelCostsMap::default(),
         lines_changed: 0,
-    }];
+    }
+}
 
-    display_costs(&daily_costs);
+/// Short date constructor used throughout the display tests.
+fn test_date(year: i32, month: u32, day: u32) -> NaiveDate {
+    NaiveDate::from_ymd_opt(year, month, day).unwrap()
+}
+
+/// Builder helper for creating DailyCosts with defaults for a specific date.
+fn costs_on(year: i32, month: u32, day: u32) -> DailyCosts {
+    make_daily_costs(test_date(year, month, day))
+}
+
+trait DailyCostsExt {
+    fn with_sonnet(self, input: f64, output: f64, cache_write: f64, cache_read: f64) -> Self;
+    fn with_haiku(self, input: f64, output: f64, cache_write: f64, cache_read: f64) -> Self;
+    fn with_opus(self, input: f64, output: f64, cache_write: f64, cache_read: f64) -> Self;
+    fn with_opus4(self, input: f64, output: f64, cache_write: f64, cache_read: f64) -> Self;
+    fn with_lines(self, lines: usize) -> Self;
+}
+
+impl DailyCostsExt for DailyCosts {
+    fn with_sonnet(mut self, input: f64, output: f64, cache_write: f64, cache_read: f64) -> Self {
+        self.per_model.set(
+            ModelType::Sonnet,
+            TokenCosts {
+                input,
+                output,
+                cache_write,
+                cache_read,
+            },
+        );
+        self
+    }
+    fn with_haiku(mut self, input: f64, output: f64, cache_write: f64, cache_read: f64) -> Self {
+        self.per_model.set(
+            ModelType::Haiku,
+            TokenCosts {
+                input,
+                output,
+                cache_write,
+                cache_read,
+            },
+        );
+        self
+    }
+    fn with_opus(mut self, input: f64, output: f64, cache_write: f64, cache_read: f64) -> Self {
+        self.per_model.set(
+            ModelType::Opus,
+            TokenCosts {
+                input,
+                output,
+                cache_write,
+                cache_read,
+            },
+        );
+        self
+    }
+    fn with_opus4(mut self, input: f64, output: f64, cache_write: f64, cache_read: f64) -> Self {
+        self.per_model.set(
+            ModelType::Opus4,
+            TokenCosts {
+                input,
+                output,
+                cache_write,
+                cache_read,
+            },
+        );
+        self
+    }
+    fn with_lines(mut self, lines: usize) -> Self {
+        self.lines_changed = lines;
+        self
+    }
 }
 
 #[test]
-fn test_display_costs_single_day_both_models() {
-    let date = NaiveDate::from_ymd_opt(2025, 10, 23).unwrap();
-    let daily_costs = vec![DailyCosts {
-        date,
-        sonnet_costs: TokenCosts {
-            input: 1.0,
-            output: 2.0,
-            cache_write: 0.5,
-            cache_read: 0.25,
+fn test_display_analysis_summary_variants() {
+    for result in [
+        AnalysisResult {
+            daily_costs: vec![],
+            unknown_models: HashSet::new(),
+            total_unknown_tokens: TokenCounts::default(),
+            files_parsed: 5,
+            files_failed: 0,
         },
-        haiku_costs: TokenCosts {
-            input: 0.5,
-            output: 1.0,
-            cache_write: 0.25,
-            cache_read: 0.1,
+        AnalysisResult {
+            daily_costs: vec![],
+            unknown_models: HashSet::new(),
+            total_unknown_tokens: TokenCounts::default(),
+            files_parsed: 3,
+            files_failed: 2,
         },
-        opus_costs: TokenCosts::default(),
-        opus4_costs: TokenCosts::default(),
-        lines_changed: 0,
-    }];
-
-    display_costs(&daily_costs);
+    ] {
+        display_parsing_summary(result.files_parsed, result.files_failed);
+    }
 }
 
 #[test]
-fn test_display_costs_multiple_days() {
-    let daily_costs = vec![
-        DailyCosts {
-            date: NaiveDate::from_ymd_opt(2025, 10, 23).unwrap(),
-            sonnet_costs: TokenCosts {
-                input: 1.0,
-                output: 2.0,
-                cache_write: 0.5,
-                cache_read: 0.25,
-            },
-            haiku_costs: TokenCosts::default(),
-            opus_costs: TokenCosts::default(),
-            opus4_costs: TokenCosts::default(),
-            lines_changed: 100,
-        },
-        DailyCosts {
-            date: NaiveDate::from_ymd_opt(2025, 10, 24).unwrap(),
-            sonnet_costs: TokenCosts::default(),
-            haiku_costs: TokenCosts {
-                input: 0.5,
-                output: 1.0,
-                cache_write: 0.25,
-                cache_read: 0.1,
-            },
-            opus_costs: TokenCosts::default(),
-            opus4_costs: TokenCosts::default(),
-            lines_changed: 50,
-        },
+fn test_display_costs_smoke_variants() {
+    let mut thirty_two_days: Vec<_> = (1..=31)
+        .map(|day| costs_on(2025, 1, day).with_sonnet(1.0, 1.0, 0.0, 0.0).with_lines(10))
+        .collect();
+    thirty_two_days.push(costs_on(2025, 2, 1).with_sonnet(1.0, 1.0, 0.0, 0.0).with_lines(10));
+
+    let cases = vec![
+        ("empty", vec![]),
+        (
+            "two-day mixed models",
+            vec![
+                costs_on(2025, 10, 23)
+                    .with_sonnet(1.0, 2.0, 0.5, 0.25)
+                    .with_lines(145),
+                costs_on(2025, 10, 24)
+                    .with_haiku(0.5, 1.0, 0.25, 0.1)
+                    .with_lines(50),
+            ],
+        ),
+        // 3 days => num_separators = 2 branch in display_costs.
+        (
+            "three days",
+            vec![
+                costs_on(2025, 10, 23).with_sonnet(1.0, 1.0, 0.0, 0.0).with_lines(100),
+                costs_on(2025, 10, 24).with_haiku(0.5, 0.5, 0.0, 0.0).with_lines(50),
+                costs_on(2025, 10, 25).with_opus(2.0, 2.0, 0.0, 0.0).with_lines(75),
+            ],
+        ),
+        (
+            "multi-model days",
+            vec![
+                costs_on(2025, 10, 23)
+                    .with_opus(1.0, 1.0, 0.0, 0.0)
+                    .with_sonnet(2.0, 2.0, 0.0, 0.0)
+                    .with_haiku(0.5, 0.5, 0.0, 0.0)
+                    .with_lines(100),
+                costs_on(2025, 10, 24).with_sonnet(1.0, 1.0, 0.0, 0.0).with_lines(50),
+            ],
+        ),
+        // 10 days => num_separators = 9 branch near the end of the explicit match arms.
+        (
+            "ten days",
+            (1..=10)
+                .map(|day| costs_on(2025, 10, day).with_sonnet(1.0, 1.0, 0.0, 0.0).with_lines(10))
+                .collect(),
+        ),
+        // 31 days => the last explicit match branch.
+        (
+            "thirty-one days",
+            (1..=31)
+                .map(|day| costs_on(2025, 10, day).with_sonnet(1.0, 1.0, 0.0, 0.0).with_lines(10))
+                .collect(),
+        ),
+        // 32 days => fallback branch for values above the explicit match table.
+        ("thirty-two days", thirty_two_days),
     ];
 
-    display_costs(&daily_costs);
+    for (label, daily_costs) in cases {
+        let result = std::panic::catch_unwind(|| display_costs(&daily_costs));
+        assert!(result.is_ok(), "display_costs panicked on case {label}");
+    }
 }
 
 #[test]
-fn test_display_costs_three_days() {
-    // Tests num_separators = 2 match branch
-    let daily_costs = vec![
-        DailyCosts {
-            date: NaiveDate::from_ymd_opt(2025, 10, 23).unwrap(),
-            sonnet_costs: TokenCosts {
-                input: 1.0,
-                output: 1.0,
-                cache_write: 0.0,
-                cache_read: 0.0,
-            },
-            haiku_costs: TokenCosts::default(),
-            opus_costs: TokenCosts::default(),
-            opus4_costs: TokenCosts::default(),
-            lines_changed: 100,
-        },
-        DailyCosts {
-            date: NaiveDate::from_ymd_opt(2025, 10, 24).unwrap(),
-            haiku_costs: TokenCosts {
-                input: 0.5,
-                output: 0.5,
-                cache_write: 0.0,
-                cache_read: 0.0,
-            },
-            sonnet_costs: TokenCosts::default(),
-            opus_costs: TokenCosts::default(),
-            opus4_costs: TokenCosts::default(),
-            lines_changed: 50,
-        },
-        DailyCosts {
-            date: NaiveDate::from_ymd_opt(2025, 10, 25).unwrap(),
-            opus_costs: TokenCosts {
-                input: 2.0,
-                output: 2.0,
-                cache_write: 0.0,
-                cache_read: 0.0,
-            },
-            sonnet_costs: TokenCosts::default(),
-            haiku_costs: TokenCosts::default(),
-            opus4_costs: TokenCosts::default(),
-            lines_changed: 75,
-        },
+fn test_display_costs_single_day_variants() {
+    let cases = [
+        (
+            "sonnet-only",
+            costs_on(2025, 10, 23)
+                .with_sonnet(1.0, 2.0, 0.5, 0.25)
+                .with_lines(145),
+        ),
+        (
+            "opus-only",
+            costs_on(2025, 10, 23).with_opus(15.0, 75.0, 18.75, 1.5),
+        ),
+        (
+            "sonnet-haiku",
+            costs_on(2025, 10, 23)
+                .with_sonnet(1.0, 2.0, 0.5, 0.25)
+                .with_haiku(0.5, 1.0, 0.25, 0.1),
+        ),
     ];
 
-    display_costs(&daily_costs);
+    for (label, daily) in cases {
+        let result = std::panic::catch_unwind(|| display_costs(&[daily]));
+        assert!(result.is_ok(), "display_costs panicked on case {label}");
+    }
 }
 
-#[test]
-fn test_display_costs_day_with_all_three_models() {
-    // Verify separator placement when multiple models create multiple rows per day
-    let daily_costs = vec![
-        DailyCosts {
-            date: NaiveDate::from_ymd_opt(2025, 10, 23).unwrap(),
-            opus_costs: TokenCosts {
-                input: 1.0,
-                output: 1.0,
-                cache_write: 0.0,
-                cache_read: 0.0,
-            },
-            sonnet_costs: TokenCosts {
-                input: 2.0,
-                output: 2.0,
-                cache_write: 0.0,
-                cache_read: 0.0,
-            },
-            haiku_costs: TokenCosts {
-                input: 0.5,
-                output: 0.5,
-                cache_write: 0.0,
-                cache_read: 0.0,
-            },
-            opus4_costs: TokenCosts::default(),
-            lines_changed: 100,
-        },
-        DailyCosts {
-            date: NaiveDate::from_ymd_opt(2025, 10, 24).unwrap(),
-            sonnet_costs: TokenCosts {
-                input: 1.0,
-                output: 1.0,
-                cache_write: 0.0,
-                cache_read: 0.0,
-            },
-            haiku_costs: TokenCosts::default(),
-            opus_costs: TokenCosts::default(),
-            opus4_costs: TokenCosts::default(),
-            lines_changed: 50,
-        },
-    ];
-
-    display_costs(&daily_costs);
-}
-
-#[test]
-fn test_display_costs_ten_days() {
-    // Tests num_separators = 9 (near end of explicit match branches)
-    let daily_costs: Vec<_> = (1..=10)
-        .map(|day| DailyCosts {
-            date: NaiveDate::from_ymd_opt(2025, 10, day).unwrap(),
-            sonnet_costs: TokenCosts {
-                input: 1.0,
-                output: 1.0,
-                cache_write: 0.0,
-                cache_read: 0.0,
-            },
-            haiku_costs: TokenCosts::default(),
-            opus_costs: TokenCosts::default(),
-            opus4_costs: TokenCosts::default(),
-            lines_changed: 10,
-        })
-        .collect();
-
-    display_costs(&daily_costs);
-}
-
-#[test]
-fn test_display_costs_thirty_one_days() {
-    // Tests num_separators = 30 (last explicit match branch)
-    let daily_costs: Vec<_> = (1..=31)
-        .map(|day| DailyCosts {
-            date: NaiveDate::from_ymd_opt(2025, 10, day).unwrap(),
-            sonnet_costs: TokenCosts {
-                input: 1.0,
-                output: 1.0,
-                cache_write: 0.0,
-                cache_read: 0.0,
-            },
-            haiku_costs: TokenCosts::default(),
-            opus_costs: TokenCosts::default(),
-            opus4_costs: TokenCosts::default(),
-            lines_changed: 10,
-        })
-        .collect();
-
-    display_costs(&daily_costs);
-}
-
-#[test]
-fn test_display_costs_thirty_two_days_uses_fallback() {
-    // Tests fallback branch for >31 days
-    // Use January (31 days) + 1 day from February
-    let mut daily_costs: Vec<_> = (1..=31)
-        .map(|day| DailyCosts {
-            date: NaiveDate::from_ymd_opt(2025, 1, day).unwrap(),
-            sonnet_costs: TokenCosts {
-                input: 1.0,
-                output: 1.0,
-                cache_write: 0.0,
-                cache_read: 0.0,
-            },
-            haiku_costs: TokenCosts::default(),
-            opus_costs: TokenCosts::default(),
-            opus4_costs: TokenCosts::default(),
-            lines_changed: 10,
-        })
-        .collect();
-
-    // Add one more day from February to get 32 total days
-    daily_costs.push(DailyCosts {
-        date: NaiveDate::from_ymd_opt(2025, 2, 1).unwrap(),
-        sonnet_costs: TokenCosts {
-            input: 1.0,
-            output: 1.0,
-            cache_write: 0.0,
-            cache_read: 0.0,
-        },
-        haiku_costs: TokenCosts::default(),
-        opus_costs: TokenCosts::default(),
-        opus4_costs: TokenCosts::default(),
-        lines_changed: 10,
-    });
-
-    display_costs(&daily_costs);
-}
 
 #[test]
 fn test_display_warnings_no_unknown_models() {
-    let result = AnalysisResult {
-        daily_costs: vec![],
-        unknown_models: HashSet::new(),
-        total_unknown_tokens: TokenCounts::default(),
-        files_parsed: 0,
-        files_failed: 0,
-    };
-
-    display_warnings(&result);
+    display_unknown_model_warnings(&HashSet::new(), &TokenCounts::default());
 }
 
 #[test]
@@ -331,46 +213,47 @@ fn test_display_warnings_with_unknown_models() {
     unknown_models.insert("gpt-4".to_string());
     unknown_models.insert("gemini-pro".to_string());
 
-    let result = AnalysisResult {
-        daily_costs: vec![],
-        unknown_models,
-        total_unknown_tokens: TokenCounts {
-            input_tokens: 1000,
-            output_tokens: 500,
-            cache_write_tokens: 100,
-            cache_read_tokens: 50,
-        },
-        files_parsed: 0,
-        files_failed: 0,
-    };
+    let total_unknown_tokens = TokenCounts::new(1000, 500, 100, 50);
 
-    display_warnings(&result);
+    display_unknown_model_warnings(&unknown_models, &total_unknown_tokens);
 }
 
 #[test]
-fn test_cost_row_new_formats_currency() {
-    let row = CostRow::new("2025-10-23", "Sonnet", 1.2345, 2.3456, 0.5, 0.25, "100");
+fn test_cost_row_variants() {
+    let cases = [
+        (
+            "formats mixed costs",
+            CostRow::new("2025-10-23", "Sonnet", 1.2345, 2.3456, 0.5, 0.25, "100"),
+            ("2025-10-23", "Sonnet", "$1.2345", "$2.3456", "$0.5000", "$0.2500", "$4.3301", "100"),
+        ),
+        (
+            "formats subtotal without lines",
+            CostRow::new("2025-10-23", "Test", 1.0, 2.0, 0.5, 0.25, ""),
+            ("2025-10-23", "Test", "$1.0000", "$2.0000", "$0.5000", "$0.2500", "$3.7500", ""),
+        ),
+        (
+            "formats zero row",
+            CostRow::new("", "Haiku", 0.0, 0.0, 0.0, 0.0, ""),
+            ("", "Haiku", "$0.0000", "$0.0000", "$0.0000", "$0.0000", "$0.0000", ""),
+        ),
+    ];
 
-    assert_eq!(row.date, "2025-10-23");
-    assert_eq!(row.model, "Sonnet");
-    assert_eq!(row.input, "$1.2345");
-    assert_eq!(row.output, "$2.3456");
-    assert_eq!(row.cache_write, "$0.5000");
-    assert_eq!(row.cache_read, "$0.2500");
-    assert_eq!(row.subtotal, "$4.3301");
-    assert_eq!(row.lines, "100");
-}
-
-#[test]
-fn test_cost_row_new_calculates_subtotal() {
-    let row = CostRow::new("2025-10-23", "Test", 1.0, 2.0, 0.5, 0.25, "");
-    assert_eq!(row.subtotal, "$3.7500");
-}
-
-#[test]
-fn test_cost_row_new_handles_zero_costs() {
-    let row = CostRow::new("", "Haiku", 0.0, 0.0, 0.0, 0.0, "");
-    assert_eq!(row.subtotal, "$0.0000");
+    for (label, row, expected) in cases {
+        assert_eq!(
+            (
+                row.date.as_str(),
+                row.model.as_str(),
+                row.input.as_str(),
+                row.output.as_str(),
+                row.cache_write.as_str(),
+                row.cache_read.as_str(),
+                row.subtotal.as_str(),
+                row.lines.as_str(),
+            ),
+            expected,
+            "case {label}",
+        );
+    }
 }
 
 #[test]
@@ -388,21 +271,19 @@ fn test_cost_row_new_total_row_formats_correctly() {
 }
 
 #[test]
-fn test_cost_row_new_total_row_zero_values() {
-    let row = CostRow::new_total_row(0, 0.0);
+fn test_cost_row_new_total_row_variants() {
+    let cases = [
+        ("zero", 0, 0.0, "$0.0000", "0"),
+        ("large-values", 999999, 12345.6789, "$12345.6789", "999999"),
+    ];
 
-    assert_eq!(row.date, "");
-    assert_eq!(row.model, "Total");
-    assert_eq!(row.subtotal, "$0.0000");
-    assert_eq!(row.lines, "0");
-}
-
-#[test]
-fn test_cost_row_new_total_row_large_numbers() {
-    let row = CostRow::new_total_row(999999, 12345.6789);
-
-    assert_eq!(row.subtotal, "$12345.6789");
-    assert_eq!(row.lines, "999999");
+    for (label, lines, total, expected_subtotal, expected_lines) in cases {
+        let row = CostRow::new_total_row(lines, total);
+        assert_eq!(row.date, "", "case {label}");
+        assert_eq!(row.model, "Total", "case {label}");
+        assert_eq!(row.subtotal, expected_subtotal, "case {label}");
+        assert_eq!(row.lines, expected_lines, "case {label}");
+    }
 }
 
 #[test]
@@ -422,19 +303,17 @@ fn test_grand_total_row_new_formats_currency() {
 }
 
 #[test]
-fn test_grand_total_row_new_handles_zero() {
-    let row = GrandTotalRow::new(0.0, 0);
+fn test_grand_total_row_new_variants() {
+    let cases = [
+        ("zero", 0.0, 0, "$0.0000", "0"),
+        ("large-values", 99999.9999, 999999, "$99999.9999", "999999"),
+    ];
 
-    assert_eq!(row.grand_total, "$0.0000");
-    assert_eq!(row.total_lines_changed, "0");
-}
-
-#[test]
-fn test_grand_total_row_new_handles_large_numbers() {
-    let row = GrandTotalRow::new(99999.9999, 999999);
-
-    assert_eq!(row.grand_total, "$99999.9999");
-    assert_eq!(row.total_lines_changed, "999999");
+    for (label, grand_total, total_lines, expected_total, expected_lines) in cases {
+        let row = GrandTotalRow::new(grand_total, total_lines);
+        assert_eq!(row.grand_total, expected_total, "case {label}");
+        assert_eq!(row.total_lines_changed, expected_lines, "case {label}");
+    }
 }
 
 // Smoke tests for display_grand_total - verify the function doesn't panic
@@ -442,301 +321,138 @@ fn test_grand_total_row_new_handles_large_numbers() {
 // that would require capturing stdout or refactoring the function signature.
 
 #[test]
-fn test_display_grand_total_zero_values() {
-    display_grand_total(0.0, 0);
-}
-
-#[test]
-fn test_display_grand_total_typical_values() {
-    display_grand_total(143.7082, 13010);
-}
-
-#[test]
-fn test_display_grand_total_large_values() {
-    display_grand_total(12345.6789, 999999);
-}
-
-#[test]
-fn test_display_grand_total_small_values() {
-    display_grand_total(0.0001, 1);
+fn test_display_grand_total_variants() {
+    for (grand_total, total_lines) in [(0.0, 0), (143.7082, 13010), (12345.6789, 999999), (0.0001, 1)] {
+        display_grand_total(grand_total, total_lines);
+    }
 }
 
 // Unit tests for helper functions extracted during refactoring
 
 #[test]
-fn test_build_cost_rows_single_model_per_day() {
-    let daily_costs = vec![DailyCosts {
-        date: NaiveDate::from_ymd_opt(2025, 10, 23).unwrap(),
-        sonnet_costs: TokenCosts {
-            input: 1.0,
-            output: 2.0,
-            cache_write: 0.0,
-            cache_read: 0.0,
-        },
-        haiku_costs: TokenCosts::default(),
-        opus_costs: TokenCosts::default(),
-        opus4_costs: TokenCosts::default(),
-        lines_changed: 100,
-    }];
-
-    let (rows, total_row_indices) = build_cost_rows(&daily_costs);
-
-    assert_eq!(rows.len(), 2); // 1 model row + 1 total row
-    assert_eq!(total_row_indices, vec![1]);
-    assert_eq!(rows[0].date, "2025-10-23");
-    assert_eq!(rows[0].model, "Sonnet");
-    assert_eq!(rows[1].model, "Total");
-    assert_eq!(rows[1].date, ""); // Total row has empty date
-}
-
-#[test]
-fn test_build_cost_rows_multiple_models_same_day() {
-    let daily_costs = vec![DailyCosts {
-        date: NaiveDate::from_ymd_opt(2025, 10, 23).unwrap(),
-        opus_costs: TokenCosts {
-            input: 1.0,
-            output: 1.0,
-            cache_write: 0.0,
-            cache_read: 0.0,
-        },
-        sonnet_costs: TokenCosts {
-            input: 2.0,
-            output: 2.0,
-            cache_write: 0.0,
-            cache_read: 0.0,
-        },
-        haiku_costs: TokenCosts {
-            input: 0.5,
-            output: 0.5,
-            cache_write: 0.0,
-            cache_read: 0.0,
-        },
-        opus4_costs: TokenCosts::default(),
-        lines_changed: 200,
-    }];
-
-    let (rows, total_row_indices) = build_cost_rows(&daily_costs);
-
-    // Should have: Opus (with date), Sonnet (no date), Haiku (no date), Total
-    assert_eq!(rows.len(), 4);
-    assert_eq!(total_row_indices, vec![3]); // Total row is at index 3
-    assert_eq!(rows[0].date, "2025-10-23"); // First row shows date
-    assert_eq!(rows[0].model, "Opus");
-    assert_eq!(rows[1].date, ""); // Subsequent rows empty date
-    assert_eq!(rows[1].model, "Sonnet");
-    assert_eq!(rows[2].date, "");
-    assert_eq!(rows[2].model, "Haiku");
-    assert_eq!(rows[3].model, "Total");
-}
-
-#[test]
-fn test_build_cost_rows_only_zero_cost_models() {
-    let daily_costs = vec![DailyCosts {
-        date: NaiveDate::from_ymd_opt(2025, 10, 23).unwrap(),
-        opus_costs: TokenCosts::default(),
-        sonnet_costs: TokenCosts::default(),
-        haiku_costs: TokenCosts::default(),
-        opus4_costs: TokenCosts::default(),
-        lines_changed: 0,
-    }];
-
-    let (rows, total_row_indices) = build_cost_rows(&daily_costs);
-
-    // Should only have total row (no model rows since all costs are 0)
-    assert_eq!(rows.len(), 1);
-    assert_eq!(total_row_indices, vec![0]);
-    assert_eq!(rows[0].model, "Total");
-}
-
-#[test]
-fn test_build_cost_rows_multiple_days() {
-    let daily_costs = vec![
-        DailyCosts {
-            date: NaiveDate::from_ymd_opt(2025, 10, 23).unwrap(),
-            sonnet_costs: TokenCosts {
-                input: 1.0,
-                output: 1.0,
-                cache_write: 0.0,
-                cache_read: 0.0,
-            },
-            opus_costs: TokenCosts::default(),
-            haiku_costs: TokenCosts::default(),
-            opus4_costs: TokenCosts::default(),
-            lines_changed: 50,
-        },
-        DailyCosts {
-            date: NaiveDate::from_ymd_opt(2025, 10, 24).unwrap(),
-            haiku_costs: TokenCosts {
-                input: 0.5,
-                output: 0.5,
-                cache_write: 0.0,
-                cache_read: 0.0,
-            },
-            sonnet_costs: TokenCosts::default(),
-            opus_costs: TokenCosts::default(),
-            opus4_costs: TokenCosts::default(),
-            lines_changed: 25,
-        },
+fn test_build_cost_rows_variants() {
+    let cases = vec![
+        (
+            "single-model day",
+            vec![costs_on(2025, 10, 23).with_sonnet(1.0, 2.0, 0.0, 0.0).with_lines(100)],
+            vec![1],
+            vec![("2025-10-23", "Sonnet"), ("", "Total")],
+        ),
+        (
+            "multi-model same day",
+            vec![
+                costs_on(2025, 10, 23)
+                    .with_opus(1.0, 1.0, 0.0, 0.0)
+                    .with_sonnet(2.0, 2.0, 0.0, 0.0)
+                    .with_haiku(0.5, 0.5, 0.0, 0.0)
+                    .with_lines(200),
+            ],
+            vec![3],
+            vec![
+                ("2025-10-23", "Opus"),
+                ("", "Sonnet"),
+                ("", "Haiku"),
+                ("", "Total"),
+            ],
+        ),
+        (
+            "zero-cost day still gets total row",
+            vec![costs_on(2025, 10, 23)],
+            vec![0],
+            vec![("", "Total")],
+        ),
+        (
+            "multiple days",
+            vec![
+                costs_on(2025, 10, 23).with_sonnet(1.0, 1.0, 0.0, 0.0).with_lines(50),
+                costs_on(2025, 10, 24).with_haiku(0.5, 0.5, 0.0, 0.0).with_lines(25),
+            ],
+            vec![1, 3],
+            vec![
+                ("2025-10-23", "Sonnet"),
+                ("", "Total"),
+                ("2025-10-24", "Haiku"),
+                ("", "Total"),
+            ],
+        ),
+        ("empty", vec![], vec![], vec![]),
+        (
+            "opus-haiku day",
+            vec![
+                costs_on(2025, 10, 23)
+                    .with_opus(1.0, 1.0, 0.0, 0.0)
+                    .with_haiku(0.5, 0.5, 0.0, 0.0)
+                    .with_lines(100),
+            ],
+            vec![2],
+            vec![("2025-10-23", "Opus"), ("", "Haiku"), ("", "Total")],
+        ),
+        (
+            "sonnet-haiku day",
+            vec![
+                costs_on(2025, 10, 23)
+                    .with_sonnet(1.0, 1.0, 0.0, 0.0)
+                    .with_haiku(0.5, 0.5, 0.0, 0.0)
+                    .with_lines(100),
+            ],
+            vec![2],
+            vec![("2025-10-23", "Sonnet"), ("", "Haiku"), ("", "Total")],
+        ),
     ];
 
-    let (rows, total_row_indices) = build_cost_rows(&daily_costs);
+    for (label, daily_costs, expected_total_row_indices, expected_rows) in cases {
+        let (rows, total_row_indices) = build_cost_rows(&daily_costs);
 
-    // Day 1: Sonnet + Total, Day 2: Haiku + Total
-    assert_eq!(rows.len(), 4);
-    assert_eq!(total_row_indices, vec![1, 3]);
-    assert_eq!(rows[0].date, "2025-10-23");
-    assert_eq!(rows[2].date, "2025-10-24");
+        assert_eq!(total_row_indices, expected_total_row_indices, "case {label}");
+        assert_eq!(rows.len(), expected_rows.len(), "case {label}");
+        for (row, (expected_date, expected_model)) in rows.iter().zip(expected_rows) {
+            assert_eq!(row.date, expected_date, "case {label}");
+            assert_eq!(row.model, expected_model, "case {label}");
+        }
+    }
 }
 
 #[test]
-fn test_build_cost_rows_empty() {
-    let daily_costs = vec![];
-    let (rows, total_row_indices) = build_cost_rows(&daily_costs);
-
-    assert!(rows.is_empty());
-    assert!(total_row_indices.is_empty());
-}
-
-#[test]
-fn test_build_cost_rows_filters_zero_cost_models() {
-    let daily_costs = vec![DailyCosts {
-        date: NaiveDate::from_ymd_opt(2025, 10, 23).unwrap(),
-        opus_costs: TokenCosts {
-            input: 1.0,
-            output: 1.0,
-            cache_write: 0.0,
-            cache_read: 0.0,
-        },
-        sonnet_costs: TokenCosts::default(), // Zero - should be filtered out
-        haiku_costs: TokenCosts {
-            input: 0.5,
-            output: 0.5,
-            cache_write: 0.0,
-            cache_read: 0.0,
-        },
-        opus4_costs: TokenCosts::default(),
-        lines_changed: 100,
-    }];
-
-    let (rows, total_row_indices) = build_cost_rows(&daily_costs);
-
-    // Should have Opus, Haiku, Total (NOT Sonnet since it has zero costs)
-    assert_eq!(rows.len(), 3);
-    assert_eq!(total_row_indices, vec![2]);
-    assert_eq!(rows[0].model, "Opus");
-    assert_eq!(rows[1].model, "Haiku"); // Sonnet skipped!
-    assert_eq!(rows[2].model, "Total");
-}
-
-#[test]
-fn test_build_cost_rows_date_only_on_first_nonzero_model() {
-    let daily_costs = vec![DailyCosts {
-        date: NaiveDate::from_ymd_opt(2025, 10, 23).unwrap(),
-        opus_costs: TokenCosts::default(), // Zero - will be skipped
-        sonnet_costs: TokenCosts {
-            input: 1.0,
-            output: 1.0,
-            cache_write: 0.0,
-            cache_read: 0.0,
-        },
-        haiku_costs: TokenCosts {
-            input: 0.5,
-            output: 0.5,
-            cache_write: 0.0,
-            cache_read: 0.0,
-        },
-        opus4_costs: TokenCosts::default(),
-        lines_changed: 100,
-    }];
-
-    let (rows, _) = build_cost_rows(&daily_costs);
-
-    // Opus is skipped, so Sonnet is first row and should show the date
-    assert_eq!(rows[0].date, "2025-10-23"); // Date on first non-zero (Sonnet)
-    assert_eq!(rows[0].model, "Sonnet");
-    assert_eq!(rows[1].date, ""); // Empty on second (Haiku)
-    assert_eq!(rows[1].model, "Haiku");
-    assert_eq!(rows[2].date, ""); // Empty on total
-    assert_eq!(rows[2].model, "Total");
-}
-
-#[test]
-fn test_create_styled_table_no_separators_single_day() {
-    let rows = vec![
-        CostRow::new("2025-10-23", "Sonnet", 1.0, 1.0, 0.0, 0.0, ""),
-        CostRow::new_total_row(100, 2.0),
+fn test_create_grouped_table_variants() {
+    let cases = vec![
+        (
+            "single group",
+            vec![
+                CostRow::new("2025-10-23", "Sonnet", 1.0, 1.0, 0.0, 0.0, ""),
+                CostRow::new_total_row(100, 2.0),
+            ],
+            vec![1],
+            vec!["Sonnet", "Total"],
+            false,
+        ),
+        (
+            "multiple groups with separator",
+            vec![
+                CostRow::new("2025-10-23", "Sonnet", 1.0, 1.0, 0.0, 0.0, ""),
+                CostRow::new_total_row(100, 2.0),
+                CostRow::new("2025-10-24", "Haiku", 0.5, 0.5, 0.0, 0.0, ""),
+                CostRow::new_total_row(50, 1.0),
+            ],
+            vec![1, 3],
+            vec!["2025-10-23", "2025-10-24", "Sonnet", "Haiku"],
+            true,
+        ),
+        ("empty", vec![], vec![], vec![], false),
     ];
-    let total_row_indices = vec![1];
 
-    let table = create_styled_table(&rows, &total_row_indices);
-
-    // Verify it doesn't panic and can be converted to string
-    let output = table.to_string();
-    assert!(!output.is_empty());
-    assert!(output.contains("Sonnet"));
-    assert!(output.contains("Total"));
-}
-
-#[test]
-fn test_create_styled_table_with_separators_multiple_days() {
-    let rows = vec![
-        CostRow::new("2025-10-23", "Sonnet", 1.0, 1.0, 0.0, 0.0, ""),
-        CostRow::new_total_row(100, 2.0),
-        CostRow::new("2025-10-24", "Haiku", 0.5, 0.5, 0.0, 0.0, ""),
-        CostRow::new_total_row(50, 1.0),
-    ];
-    let total_row_indices = vec![1, 3];
-
-    let table = create_styled_table(&rows, &total_row_indices);
-    let output = table.to_string();
-
-    assert!(!output.is_empty());
-    assert!(output.contains("2025-10-23"));
-    assert!(output.contains("2025-10-24"));
-}
-
-#[test]
-fn test_create_styled_table_empty_rows() {
-    let rows: Vec<CostRow> = vec![];
-    let total_row_indices: Vec<usize> = vec![];
-
-    let table = create_styled_table(&rows, &total_row_indices);
-    let output = table.to_string();
-
-    // Should at least have headers
-    assert!(!output.is_empty());
-}
-
-#[test]
-fn test_create_styled_table_separator_placement() {
-    let rows = vec![
-        CostRow::new("2025-10-23", "Sonnet", 1.0, 1.0, 0.0, 0.0, ""),
-        CostRow::new_total_row(100, 2.0),
-        CostRow::new("2025-10-24", "Haiku", 0.5, 0.5, 0.0, 0.0, ""),
-        CostRow::new_total_row(50, 1.0),
-    ];
-    let total_row_indices = vec![1, 3];
-
-    let table = create_styled_table(&rows, &total_row_indices);
-    let output = table.to_string();
-    let lines: Vec<&str> = output.lines().collect();
-
-    // Verify separators appear in the output by checking for lines with
-    // the junction character (┼) which appears in day separators
-    let has_day_separator = lines.iter().any(|line| line.contains('┼'));
-
-    assert!(
-        has_day_separator,
-        "Expected to find day separator (with ┼ character) in table output"
-    );
-
-    // Verify the dates appear in the output
-    assert!(output.contains("2025-10-23"));
-    assert!(output.contains("2025-10-24"));
-
-    // Verify both models appear
-    assert!(output.contains("Sonnet"));
-    assert!(output.contains("Haiku"));
+    for (label, rows, total_row_indices, expected_substrings, expect_separator) in cases {
+        let output = create_grouped_table(&rows, &total_row_indices).to_string();
+        assert!(!output.is_empty(), "case {label}");
+        for expected in expected_substrings {
+            assert!(output.contains(expected), "case {label}: missing {expected:?} in {output}");
+        }
+        if expect_separator {
+            assert!(
+                output.lines().any(|line| line.contains('┼')),
+                "case {label}: expected to find day separator (with ┼ character) in table output"
+            );
+        }
+    }
 }
 
 // Smoke tests for apply_width_config - verify function doesn't panic at
@@ -744,7 +460,7 @@ fn test_create_styled_table_separator_placement() {
 // by the tabled library and verified through integration tests.
 
 #[test]
-fn test_apply_width_config_wraps_at_threshold() {
+fn test_apply_width_config_variants() {
     let rows = vec![CostRow::new(
         "2025-10-23",
         "Sonnet",
@@ -754,139 +470,52 @@ fn test_apply_width_config_wraps_at_threshold() {
         0.0,
         "100",
     )];
-    let mut table = Table::new(&rows);
 
-    apply_width_config(&mut table, 100); // Exactly at MIN_WIDTH_FOR_WRAPPING
-
-    // Smoke test: verify it doesn't panic
-    let output = table.to_string();
-    assert!(!output.is_empty());
-}
-
-#[test]
-fn test_apply_width_config_truncates_below_threshold() {
-    let rows = vec![CostRow::new(
-        "2025-10-23",
-        "Sonnet",
-        1.0,
-        1.0,
-        0.0,
-        0.0,
-        "100",
-    )];
-    let mut table = Table::new(&rows);
-
-    apply_width_config(&mut table, 99); // Just below MIN_WIDTH_FOR_WRAPPING
-
-    // Smoke test: verify it doesn't panic
-    let output = table.to_string();
-    assert!(!output.is_empty());
-}
-
-#[test]
-fn test_apply_width_config_wraps_above_threshold() {
-    let rows = vec![CostRow::new(
-        "2025-10-23",
-        "Sonnet",
-        1.0,
-        1.0,
-        0.0,
-        0.0,
-        "100",
-    )];
-    let mut table = Table::new(&rows);
-
-    apply_width_config(&mut table, 101); // Just above MIN_WIDTH_FOR_WRAPPING
-
-    // Smoke test: verify it doesn't panic
-    let output = table.to_string();
-    assert!(!output.is_empty());
+    for width in [99, 100, 101] {
+        let mut table = Table::new(&rows);
+        apply_width_config(&mut table, width);
+        assert!(!table.to_string().is_empty());
+    }
 }
 
 #[test]
 fn test_iter_model_costs_returns_correct_order() {
-    let costs = DailyCosts {
-        date: NaiveDate::from_ymd_opt(2025, 10, 23).unwrap(),
-        opus_costs: TokenCosts {
-            input: 1.0,
-            output: 1.0,
-            cache_write: 0.0,
-            cache_read: 0.0,
-        },
-        sonnet_costs: TokenCosts {
-            input: 2.0,
-            output: 2.0,
-            cache_write: 0.0,
-            cache_read: 0.0,
-        },
-        haiku_costs: TokenCosts {
-            input: 0.5,
-            output: 0.5,
-            cache_write: 0.0,
-            cache_read: 0.0,
-        },
-        opus4_costs: TokenCosts {
-            input: 0.0,
-            output: 0.0,
-            cache_write: 0.0,
-            cache_read: 0.0,
-        },
-        lines_changed: 100,
-    };
+    let costs = make_daily_costs(NaiveDate::from_ymd_opt(2025, 10, 23).unwrap())
+        .with_opus(1.0, 1.0, 0.0, 0.0)
+        .with_sonnet(2.0, 2.0, 0.0, 0.0)
+        .with_haiku(0.5, 0.5, 0.0, 0.0)
+        .with_lines(100);
 
-    let models: Vec<&str> = iter_model_costs(&costs).map(|(name, _)| name).collect();
+    let models: Vec<&str> = costs
+        .per_model
+        .model_costs()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
 
     assert_eq!(models, vec!["Opus 4", "Opus", "Sonnet", "Haiku"]);
 }
 
 #[test]
-fn test_iter_model_costs_returns_correct_references() {
-    let costs = DailyCosts {
-        date: NaiveDate::from_ymd_opt(2025, 10, 23).unwrap(),
-        opus_costs: TokenCosts {
-            input: 15.0,
-            output: 75.0,
-            cache_write: 0.0,
-            cache_read: 0.0,
-        },
-        sonnet_costs: TokenCosts {
-            input: 3.0,
-            output: 15.0,
-            cache_write: 0.0,
-            cache_read: 0.0,
-        },
-        haiku_costs: TokenCosts {
-            input: 0.25,
-            output: 1.25,
-            cache_write: 0.0,
-            cache_read: 0.0,
-        },
-        opus4_costs: TokenCosts {
-            input: 5.0,
-            output: 25.0,
-            cache_write: 0.0,
-            cache_read: 0.0,
-        },
-        lines_changed: 100,
-    };
+fn test_iter_model_costs_returns_correct_values() {
+    let costs = make_daily_costs(NaiveDate::from_ymd_opt(2025, 10, 23).unwrap())
+        .with_opus(15.0, 75.0, 0.0, 0.0)
+        .with_sonnet(3.0, 15.0, 0.0, 0.0)
+        .with_haiku(0.25, 1.25, 0.0, 0.0)
+        .with_opus4(5.0, 25.0, 0.0, 0.0)
+        .with_lines(100);
 
-    let mut iter = iter_model_costs(&costs);
+    let model_costs = costs.per_model.model_costs();
 
-    let (name, token_costs) = iter.next().unwrap();
-    assert_eq!(name, "Opus 4");
-    assert_eq!(token_costs.input, 5.0);
+    assert_eq!(model_costs[0].0, "Opus 4");
+    assert_eq!(model_costs[0].1.input, 5.0);
 
-    let (name, token_costs) = iter.next().unwrap();
-    assert_eq!(name, "Opus");
-    assert_eq!(token_costs.input, 15.0);
+    assert_eq!(model_costs[1].0, "Opus");
+    assert_eq!(model_costs[1].1.input, 15.0);
 
-    let (name, token_costs) = iter.next().unwrap();
-    assert_eq!(name, "Sonnet");
-    assert_eq!(token_costs.input, 3.0);
+    assert_eq!(model_costs[2].0, "Sonnet");
+    assert_eq!(model_costs[2].1.input, 3.0);
 
-    let (name, token_costs) = iter.next().unwrap();
-    assert_eq!(name, "Haiku");
-    assert_eq!(token_costs.input, 0.25);
-
-    assert!(iter.next().is_none());
+    assert_eq!(model_costs[3].0, "Haiku");
+    assert_eq!(model_costs[3].1.input, 0.25);
 }

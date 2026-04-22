@@ -212,14 +212,10 @@ async fn exec_hook_impl<R: Read>(reader: R) -> Result<()> {
 /// why their command was allowed despite appearing potentially dangerous.
 fn allow_hook(message: Option<String>) -> HookOutput {
     HookOutput {
-        continue_execution: None,
-        stop_reason: None,
-        suppress_output: None,
         decision: Some(HookDecision::Approve),
         reason: message.clone(),
         system_message: message,
-        permission_decision: None,
-        hook_specific_output: None,
+        ..HookOutput::default()
     }
 }
 
@@ -233,114 +229,63 @@ fn allow_hook(message: Option<String>) -> HookOutput {
 fn deny_hook(reason: impl Into<String>) -> HookOutput {
     let message = reason.into();
     HookOutput {
-        continue_execution: None,
-        stop_reason: None,
-        suppress_output: None,
         decision: Some(HookDecision::Block),
         reason: Some(message.clone()),
         system_message: Some(message),
-        permission_decision: None,
-        hook_specific_output: None,
+        ..HookOutput::default()
     }
 }
 
-/// Allows PreToolUse execution with optional user-facing feedback.
+/// Construct a PreToolUse hook output with the given decision, reason, and optional updated input.
 ///
-/// If a reason is provided, it's sent as both `permission_decision_reason` (for hook-specific output)
-/// and `system_message` (for immediate user feedback without verbose mode).
+/// This is the single constructor used by all PreToolUse responses. The wrappers below
+/// (`pretool_allow_hook`, `pretool_deny_hook`, `pretool_ask_hook`, `pretool_modify_hook`)
+/// provide ergonomic call sites for each decision type.
 ///
-/// Use the reason parameter when you want to explain why a command was allowed, especially
-/// when a bash rule explicitly permits something that might look suspicious (e.g., "Allowed
-/// by whitelist rule 'safe-rm'").
+/// When a reason is provided, it is sent as both `permission_decision_reason` (hook-specific)
+/// and `system_message` (immediate user feedback without verbose mode).
+fn pretool_hook(
+    decision: PermissionDecision,
+    reason: Option<String>,
+    updated_input: Option<serde_json::Value>,
+) -> HookOutput {
+    HookOutput {
+        system_message: reason.clone(),
+        hook_specific_output: Some(HookSpecificOutput::PreToolUse(PreToolUseOutput {
+            hook_event_name: "PreToolUse".to_string(),
+            permission_decision: Some(decision),
+            permission_decision_reason: reason,
+            updated_input,
+        })),
+        ..HookOutput::default()
+    }
+}
+
 fn pretool_allow_hook(reason: Option<String>) -> HookOutput {
-    HookOutput {
-        continue_execution: None,
-        stop_reason: None,
-        suppress_output: None,
-        decision: None,
-        reason: None,
-        system_message: reason.clone(),
-        permission_decision: None,
-        hook_specific_output: Some(HookSpecificOutput::PreToolUse(PreToolUseOutput {
-            hook_event_name: "PreToolUse".to_string(),
-            permission_decision: Some(PermissionDecision::Allow),
-            permission_decision_reason: reason,
-            updated_input: None,
-        })),
-    }
+    pretool_hook(PermissionDecision::Allow, reason, None)
 }
 
-/// Denies PreToolUse execution with user-facing feedback.
-///
-/// The reason is sent as both `permission_decision_reason` (for hook-specific output)
-/// and `system_message` (for immediate user feedback without verbose mode).
-///
-/// Use this when bash rules deny a command, providing clear feedback about why the
-/// command was blocked (e.g., "Dangerous recursive delete" or "Command blocked by
-/// security rule 'deny-rm-rf'").
 fn pretool_deny_hook(reason: String) -> HookOutput {
-    HookOutput {
-        continue_execution: None,
-        stop_reason: None,
-        suppress_output: None,
-        decision: None,
-        reason: None,
-        system_message: Some(reason.clone()),
-        permission_decision: None,
-        hook_specific_output: Some(HookSpecificOutput::PreToolUse(PreToolUseOutput {
-            hook_event_name: "PreToolUse".to_string(),
-            permission_decision: Some(PermissionDecision::Deny),
-            permission_decision_reason: Some(reason),
-            updated_input: None,
-        })),
-    }
+    pretool_hook(PermissionDecision::Deny, Some(reason), None)
 }
 
-/// Asks the user for permission to execute a command.
-///
-/// Use this when bash rules don't have enough information to make a decision
-/// (e.g., command doesn't match any allow/deny rules, or an Ask rule matched).
 fn pretool_ask_hook() -> HookOutput {
-    HookOutput {
-        continue_execution: None,
-        stop_reason: None,
-        suppress_output: None,
-        decision: None,
-        reason: None,
-        system_message: None,
-        permission_decision: None,
-        hook_specific_output: Some(HookSpecificOutput::PreToolUse(PreToolUseOutput {
-            hook_event_name: "PreToolUse".to_string(),
-            permission_decision: Some(PermissionDecision::Ask),
-            permission_decision_reason: None,
-            updated_input: None,
-        })),
-    }
+    pretool_hook(PermissionDecision::Ask, None, None)
 }
 
-/// Modifies a command and allows execution with optional user-facing feedback.
-///
-/// If a reason is provided, it's sent as both `permission_decision_reason` (for hook-specific output)
-/// and `system_message` (for immediate user feedback without verbose mode).
-///
-/// Use this when bash rules modify a command to make it safer (e.g., adding safety flags
-/// or filtering dangerous arguments). The reason should explain what was changed and why
-/// (e.g., "Command modified by rule 'add-dry-run': added --dry-run flag").
 fn pretool_modify_hook(new_input: serde_json::Value, reason: Option<String>) -> HookOutput {
-    HookOutput {
-        continue_execution: None,
-        stop_reason: None,
-        suppress_output: None,
-        decision: None,
-        reason: None,
-        system_message: reason.clone(),
-        permission_decision: None,
-        hook_specific_output: Some(HookSpecificOutput::PreToolUse(PreToolUseOutput {
-            hook_event_name: "PreToolUse".to_string(),
-            permission_decision: Some(PermissionDecision::Allow),
-            permission_decision_reason: reason,
-            updated_input: Some(new_input),
-        })),
+    pretool_hook(PermissionDecision::Allow, reason, Some(new_input))
+}
+
+/// Loads user config, logging and returning the Ask-fallback `HookOutput` (via `Err`)
+/// on failure. The `Ok` branch yields the parsed config for continued evaluation.
+async fn load_config_or_ask() -> std::result::Result<crate::user_config::UserConfig, HookOutput> {
+    match load_user_config().await {
+        Ok(cfg) => Ok(cfg),
+        Err(e) => {
+            warn!(error = %e, "Failed to load user config, defaulting to Ask");
+            Err(pretool_ask_hook())
+        }
     }
 }
 
@@ -359,12 +304,9 @@ async fn handle_pretool_hook(
     tool_input: &serde_json::Value,
     cwd: &str,
 ) -> Result<HookOutput> {
-    let config = match load_user_config().await {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            warn!(error = %e, "Failed to load user config, defaulting to Ask");
-            return Ok(pretool_ask_hook());
-        }
+    let config = match load_config_or_ask().await {
+        Ok(c) => c,
+        Err(fallback) => return Ok(fallback),
     };
 
     if let Some(rules) = &config.tool_rules {
@@ -422,14 +364,10 @@ async fn handle_pretool_hook(
 /// existing bash-rule tests can call it directly without going through the tool_rules layer.
 #[cfg(test)]
 async fn handle_bash_pretool_hook(tool_input: &serde_json::Value) -> Result<HookOutput> {
-    let config = match load_user_config().await {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            warn!(error = %e, "Failed to load user config, defaulting to Ask");
-            return Ok(pretool_ask_hook());
-        }
+    let config = match load_config_or_ask().await {
+        Ok(c) => c,
+        Err(fallback) => return Ok(fallback),
     };
-
     handle_bash_pretool_hook_with_config(tool_input, config).await
 }
 

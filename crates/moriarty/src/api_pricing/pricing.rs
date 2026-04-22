@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{collections::HashMap, fmt};
 
 #[derive(Debug, Clone, Copy)]
 pub struct ModelPricing {
@@ -70,6 +70,14 @@ pub enum ModelType {
 }
 
 impl ModelType {
+    /// Display order for cost reporting: highest-cost models first.
+    pub const DISPLAY_ORDER: [(Self, &'static str); 4] = [
+        (Self::Opus4, "Opus 4"),
+        (Self::Opus, "Opus"),
+        (Self::Sonnet, "Sonnet"),
+        (Self::Haiku, "Haiku"),
+    ];
+
     /// Detect model type from the model string.
     ///
     /// Matches known Claude model families based on substring detection.
@@ -110,26 +118,28 @@ impl ModelType {
         }
     }
 
-    pub fn pricing(&self) -> Option<ModelPricing> {
+    /// Returns the model's pricing, when known, plus the display name used in reports.
+    ///
+    /// The tuple is `(pricing, display_name)`. Unknown models have no pricing and
+    /// therefore return `(None, "Unknown")`.
+    fn pricing_and_display_name(&self) -> (Option<ModelPricing>, &'static str) {
         match self {
-            Self::Sonnet => Some(ModelPricing::SONNET),
-            Self::Haiku => Some(ModelPricing::HAIKU),
-            Self::Opus => Some(ModelPricing::OPUS),
-            Self::Opus4 => Some(ModelPricing::OPUS_4),
-            Self::Unknown => None,
+            Self::Sonnet => (Some(ModelPricing::SONNET), "Sonnet"),
+            Self::Haiku => (Some(ModelPricing::HAIKU), "Haiku"),
+            Self::Opus => (Some(ModelPricing::OPUS), "Opus"),
+            Self::Opus4 => (Some(ModelPricing::OPUS_4), "Opus 4"),
+            Self::Unknown => (None, "Unknown"),
         }
+    }
+
+    pub fn pricing(&self) -> Option<ModelPricing> {
+        self.pricing_and_display_name().0
     }
 }
 
 impl fmt::Display for ModelType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Sonnet => write!(f, "Sonnet"),
-            Self::Haiku => write!(f, "Haiku"),
-            Self::Opus => write!(f, "Opus"),
-            Self::Opus4 => write!(f, "Opus 4"),
-            Self::Unknown => write!(f, "Unknown"),
-        }
+        f.write_str(self.pricing_and_display_name().1)
     }
 }
 
@@ -142,6 +152,21 @@ pub struct TokenCounts {
 }
 
 impl TokenCounts {
+    /// Creates token counts from raw values: input, output, cache-write, and cache-read.
+    pub fn new(
+        input_tokens: usize,
+        output_tokens: usize,
+        cache_write_tokens: usize,
+        cache_read_tokens: usize,
+    ) -> Self {
+        Self {
+            input_tokens,
+            output_tokens,
+            cache_write_tokens,
+            cache_read_tokens,
+        }
+    }
+
     pub fn add(&mut self, other: &TokenCounts) {
         self.input_tokens += other.input_tokens;
         self.output_tokens += other.output_tokens;
@@ -161,6 +186,67 @@ pub struct TokenCosts {
 impl TokenCosts {
     pub fn total(&self) -> f64 {
         self.input + self.output + self.cache_write + self.cache_read
+    }
+}
+
+/// Accumulates token usage by model family.
+#[derive(Debug, Clone, Default)]
+pub struct ModelUsageMap {
+    counts: HashMap<ModelType, TokenCounts>,
+}
+
+impl ModelUsageMap {
+    pub fn add(&mut self, model_type: ModelType, counts: TokenCounts) {
+        self.counts.entry(model_type).or_default().add(&counts);
+    }
+
+    /// Returns counts for `model_type`, or zero-default if absent.
+    #[cfg(test)]
+    pub fn get(&self, model_type: ModelType) -> TokenCounts {
+        self.counts.get(&model_type).copied().unwrap_or_default()
+    }
+
+    pub fn calculate_costs(&self) -> ModelCostsMap {
+        let mut costs = ModelCostsMap::default();
+
+        for (model_type, counts) in &self.counts {
+            if let Some(pricing) = model_type.pricing() {
+                costs.set(*model_type, pricing.calculate_cost(counts));
+            }
+        }
+
+        costs
+    }
+}
+
+/// Stores calculated costs by model family.
+#[derive(Debug, Clone, Default)]
+pub struct ModelCostsMap {
+    costs: HashMap<ModelType, TokenCosts>,
+}
+
+impl ModelCostsMap {
+    pub fn set(&mut self, model_type: ModelType, costs: TokenCosts) {
+        self.costs.insert(model_type, costs);
+    }
+
+    /// Returns costs for `model_type`, or zero-default if absent.
+    #[cfg(test)]
+    pub fn get(&self, model_type: ModelType) -> TokenCosts {
+        self.costs.get(&model_type).copied().unwrap_or_default()
+    }
+
+    pub fn total(&self) -> f64 {
+        self.costs.values().map(TokenCosts::total).sum()
+    }
+
+    fn get_or_default(&self, model_type: ModelType) -> TokenCosts {
+        self.costs.get(&model_type).copied().unwrap_or_default()
+    }
+
+    pub fn model_costs(&self) -> [(&'static str, TokenCosts); 4] {
+        ModelType::DISPLAY_ORDER
+            .map(|(model_type, name)| (name, self.get_or_default(model_type)))
     }
 }
 
@@ -407,5 +493,96 @@ mod tests {
         assert_eq!(format!("{}", ModelType::Opus), "Opus");
         assert_eq!(format!("{}", ModelType::Opus4), "Opus 4");
         assert_eq!(format!("{}", ModelType::Unknown), "Unknown");
+    }
+
+    #[test]
+    fn test_model_usage_map_add_accumulates() {
+        let mut map = ModelUsageMap::default();
+        map.add(ModelType::Sonnet, TokenCounts::new(1000, 500, 0, 0));
+        map.add(ModelType::Sonnet, TokenCounts::new(500, 250, 0, 0));
+
+        let counts = map.get(ModelType::Sonnet);
+        assert_eq!(counts.input_tokens, 1500);
+        assert_eq!(counts.output_tokens, 750);
+    }
+
+    #[test]
+    fn test_model_usage_map_get_absent_returns_default() {
+        let map = ModelUsageMap::default();
+        let counts = map.get(ModelType::Sonnet);
+
+        assert_eq!(counts.input_tokens, 0);
+        assert_eq!(counts.output_tokens, 0);
+        assert_eq!(counts.cache_write_tokens, 0);
+        assert_eq!(counts.cache_read_tokens, 0);
+    }
+
+    #[test]
+    fn test_model_usage_map_calculate_costs_known_model() {
+        let mut map = ModelUsageMap::default();
+        map.add(
+            ModelType::Sonnet,
+            TokenCounts::new(1_000_000, 1_000_000, 0, 0),
+        );
+
+        let costs = map.calculate_costs();
+        assert_eq!(costs.get(ModelType::Sonnet).input, 3.0);
+        assert_eq!(costs.get(ModelType::Sonnet).output, 15.0);
+        assert_eq!(costs.total(), 18.0);
+    }
+
+    #[test]
+    fn test_model_usage_map_calculate_costs_unknown_produces_no_cost() {
+        let mut map = ModelUsageMap::default();
+        map.add(
+            ModelType::Unknown,
+            TokenCounts::new(1_000_000, 500_000, 0, 0),
+        );
+
+        let costs = map.calculate_costs();
+        assert_eq!(costs.total(), 0.0);
+        assert_eq!(costs.get(ModelType::Unknown).total(), 0.0);
+    }
+
+    #[test]
+    fn test_model_costs_map_get_absent_returns_default() {
+        let costs = ModelCostsMap::default();
+        assert_eq!(costs.get(ModelType::Sonnet).total(), 0.0);
+    }
+
+    #[test]
+    fn test_model_costs_map_total_sums_all_entries() {
+        let mut costs = ModelCostsMap::default();
+        costs.set(
+            ModelType::Sonnet,
+            TokenCosts {
+                input: 1.0,
+                output: 2.0,
+                cache_write: 0.0,
+                cache_read: 0.0,
+            },
+        );
+        costs.set(
+            ModelType::Haiku,
+            TokenCosts {
+                input: 0.5,
+                output: 1.0,
+                cache_write: 0.0,
+                cache_read: 0.0,
+            },
+        );
+
+        assert_eq!(costs.total(), 4.5);
+    }
+
+    #[test]
+    fn test_model_costs_map_model_costs_zero_fills_absent_entries() {
+        let costs = ModelCostsMap::default();
+        let entries = costs.model_costs();
+
+        assert_eq!(entries.len(), 4);
+        for (_, model_costs) in &entries {
+            assert_eq!(model_costs.total(), 0.0);
+        }
     }
 }

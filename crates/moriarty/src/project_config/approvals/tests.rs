@@ -14,12 +14,166 @@ use miette::{IntoDiagnostic, Result, WrapErr};
 use tempfile::{NamedTempFile, TempDir};
 use tokio::time::{sleep, Duration};
 
-use crate::{hashing, project_config::config::ProjectConfig, repository};
+use crate::{
+    hashing,
+    project_config::config::ProjectConfig,
+    repository,
+    test_helpers::{create_executable_script, write_tools_config},
+};
 
 use super::super::{
     is_script, is_within_project, is_writable, resolve_binary_path_with_original, CommandApproval,
     ProjectApprovals, VerificationResult,
 };
+
+/// Builds a `CommandApproval` with stable dummy hash/path fields for tests that
+/// just need a named entry in the approvals map.
+fn make_command_approval(original: &str, canonical: &str, binary_hash: &str) -> CommandApproval {
+    CommandApproval {
+        original_path: original.to_string(),
+        canonical_path: canonical.to_string(),
+        binary_hash: binary_hash.to_string(),
+    }
+}
+
+/// Verifies that `shared_path` resolves to the same repository root as
+/// `repo_root` and that an existing "lint" approval in that root also verifies
+/// from `shared_path`. Used to assert jj workspaces / git worktrees share
+/// approval state.
+async fn assert_shared_repo_approval(repo_root: &Path, shared_path: &Path, label: &str) {
+    let shared_root = repository::detect_repository_root(shared_path).unwrap();
+    assert_eq!(
+        repo_root, shared_root,
+        "Both {label} should resolve to the same repository root"
+    );
+
+    let approvals = ProjectApprovals::load().await.unwrap();
+    let result = approvals
+        .verify_project(shared_path, "lint")
+        .await
+        .unwrap();
+    assert_eq!(
+        result,
+        VerificationResult::Approved,
+        "Approval from one {label} should work in the others"
+    );
+
+    let approval_key = repo_root.to_string_lossy().to_string();
+    assert!(
+        approvals.projects.contains_key(&approval_key),
+        "Approval should be keyed by repository root: {approval_key}"
+    );
+}
+
+/// Asserts a verification result is `Approved`, keeping the case label in the
+/// failure output for table-driven tests.
+fn assert_approved(result: VerificationResult, context: &str) {
+    assert_eq!(result, VerificationResult::Approved, "{context}");
+}
+
+/// Asserts a verification result is `ItemNotApproved` for the requested item.
+fn assert_item_not_approved(result: VerificationResult, item: &str, context: &str) {
+    match result {
+        VerificationResult::ItemNotApproved { item: actual } => {
+            assert_eq!(actual, item, "{context}")
+        }
+        other => panic!("{context}: expected ItemNotApproved for {item}, got {other:?}"),
+    }
+}
+
+const AUDIT_CHECK_CONFIG: &str = r#"
+[commands]
+
+[[checks]]
+name = "audit"
+command = ["echo", "test"]
+"#;
+
+/// Loads approvals and verifies `item`, returning the raw verification result so
+/// table-driven tests can assert the expected branch explicitly.
+async fn verify_check_result(project_dir: &Path, item: &str) -> VerificationResult {
+    ProjectApprovals::load()
+        .await
+        .unwrap()
+        .verify_check(project_dir, item)
+        .await
+        .unwrap()
+}
+
+/// Approves `config_content`, lets the caller mutate the project, then verifies
+/// `item` and returns the resulting verification status.
+async fn approve_mutate_and_verify_check(
+    project_dir: &Path,
+    config_content: &str,
+    item: &str,
+    mutate: impl FnOnce(&Path),
+) -> VerificationResult {
+    approve_project_config(project_dir, config_content).await.unwrap();
+    mutate(project_dir);
+    verify_check_result(project_dir, item).await
+}
+
+/// Asserts `is_script(path)` returns `expected` so variant tests keep a single
+/// place for the async call and unwrap.
+async fn assert_is_script(path: &Path, expected: bool, context: &str) {
+    assert_eq!(is_script(path).await.unwrap(), expected, "{context}");
+}
+
+/// Returns the canonicalised string key that `approve_project` uses to store
+/// its `ProjectApproval`.
+fn canonical_key(dir: &Path) -> String {
+    dir.canonicalize().unwrap().to_string_lossy().to_string()
+}
+
+/// Approves a synthetic project with the given `commands` and `checks` maps and
+/// asserts the resulting `ProjectApproval` is stored under the canonical key.
+/// Returns the canonical key and the freshly-populated `ProjectApprovals`
+/// (by value) for further inspection.
+fn approve_fixture(
+    dir: &Path,
+    tools_hash: &str,
+    commands: HashMap<String, CommandApproval>,
+    checks: HashMap<String, CommandApproval>,
+) -> (String, ProjectApprovals) {
+    let mut approvals = ProjectApprovals::default();
+    approvals
+        .approve_project(
+            dir.to_path_buf(),
+            tools_hash.to_string(),
+            commands,
+            checks,
+        )
+        .unwrap();
+    let key = canonical_key(dir);
+    assert!(approvals.projects.contains_key(&key));
+    (key, approvals)
+}
+
+/// Creates a new `#!/bin/bash` script tempfile, chmods it to `mode`, and
+/// returns whether [`is_writable`] reports it as writable. Used by the matrix
+/// of `test_is_writable_with_*` tests that differ only in the mode.
+#[cfg(unix)]
+async fn is_writable_with_mode(mode: u32) -> bool {
+    let mut temp_file = NamedTempFile::new().unwrap();
+    writeln!(temp_file, "#!/bin/bash").unwrap();
+    temp_file.flush().unwrap();
+    let mut perms = std::fs::metadata(temp_file.path()).unwrap().permissions();
+    perms.set_mode(mode);
+    std::fs::set_permissions(temp_file.path(), perms).unwrap();
+    is_writable(temp_file.path()).await.unwrap()
+}
+
+/// Sets up an isolated XDG_CONFIG_HOME and a new project temp dir with the given
+/// tools.toml contents, returning both temp dirs (which must be kept alive).
+fn isolated_project_with_config(config_content: &str) -> (TempDir, TempDir) {
+    let xdg_dir = TempDir::new().unwrap();
+    std::env::set_var("XDG_CONFIG_HOME", xdg_dir.path());
+
+    let project_dir = TempDir::new().unwrap();
+    write_tools_config(project_dir.path(), config_content);
+
+    (xdg_dir, project_dir)
+}
 
 /// Test helper to pre-approve a project with the given config content.
 /// This bypasses the approval TUI for integration tests.
@@ -139,11 +293,12 @@ fn setup_jj_repo(repo_path: &Path) {
     );
 }
 
-/// Helper to create .config/tools.toml with standard test content
+/// Helper to create .config/tools.toml with standard test content.
+///
+/// Thin wrapper over [`crate::test_helpers::write_tools_config`] so existing call sites
+/// using `create_tools_config` keep working while sharing the underlying helper.
 fn create_tools_config(repo_path: &Path, config_content: &str) {
-    let config_dir = repo_path.join(".config");
-    std::fs::create_dir(&config_dir).unwrap();
-    std::fs::write(config_dir.join("tools.toml"), config_content).unwrap();
+    write_tools_config(repo_path, config_content);
 }
 
 #[test]
@@ -152,223 +307,152 @@ fn test_project_approvals_default() {
     assert_eq!(approvals.projects.len(), 0);
 }
 
+/// Table-driven coverage for `approve_project`: every row supplies a `commands`
+/// and `checks` map, and the test asserts the stored `ProjectApproval` reflects
+/// them verbatim.
 #[test]
-fn test_approve_project() {
-    let mut approvals = ProjectApprovals::default();
-    let temp_dir = TempDir::new().unwrap();
-    let tools_hash = "sha256:abc123".to_string();
-
-    let mut commands = HashMap::new();
-    commands.insert(
-        "lint".to_string(),
-        CommandApproval {
-            original_path: "cargo".to_string(),
-            canonical_path: "/usr/bin/cargo".to_string(),
-            binary_hash: "sha256:def456".to_string(),
+fn test_approve_project_matrix() {
+    struct Case {
+        label: &'static str,
+        commands: &'static [(&'static str, &'static str)],
+        checks: &'static [(&'static str, &'static str)],
+    }
+    let cases = [
+        Case {
+            label: "commands only",
+            commands: &[("lint", "sha256:def456")],
+            checks: &[],
         },
-    );
-
-    let checks = HashMap::new();
-
-    approvals
-        .approve_project(
-            temp_dir.path().to_path_buf(),
-            tools_hash.clone(),
-            commands.clone(),
-            checks,
-        )
-        .unwrap();
-
-    // Project key is now the repository root (canonicalized temp dir in this case)
-    let project_key = temp_dir
-        .path()
-        .canonicalize()
-        .unwrap()
-        .to_string_lossy()
-        .to_string();
-    assert!(approvals.projects.contains_key(&project_key));
-
-    let approval = &approvals.projects[&project_key];
-    assert_eq!(approval.tools_config_hash, tools_hash);
-    assert_eq!(approval.commands.len(), 1);
-    assert!(approval.commands.contains_key("lint"));
-}
-
-#[test]
-fn test_approve_project_with_checks() {
-    let mut approvals = ProjectApprovals::default();
-    let temp_dir = TempDir::new().unwrap();
-    let tools_hash = "sha256:abc123".to_string();
-
-    let mut commands = HashMap::new();
-    commands.insert(
-        "lint".to_string(),
-        CommandApproval {
-            original_path: "cargo".to_string(),
-            canonical_path: "/usr/bin/cargo".to_string(),
-            binary_hash: "sha256:def456".to_string(),
+        Case {
+            label: "commands and checks",
+            commands: &[("lint", "sha256:def456")],
+            checks: &[("security-audit", "sha256:abc789")],
         },
-    );
+    ];
 
-    let mut checks = HashMap::new();
-    checks.insert(
-        "security-audit".to_string(),
-        CommandApproval {
-            original_path: "cargo".to_string(),
-            canonical_path: "/usr/bin/cargo".to_string(),
-            binary_hash: "sha256:abc789".to_string(),
-        },
-    );
+    let tools_hash = "sha256:abc123";
+    for case in cases {
+        let temp_dir = TempDir::new().unwrap();
+        let commands: HashMap<String, CommandApproval> = case
+            .commands
+            .iter()
+            .map(|(n, h)| {
+                (
+                    (*n).to_string(),
+                    make_command_approval("cargo", "/usr/bin/cargo", h),
+                )
+            })
+            .collect();
+        let checks: HashMap<String, CommandApproval> = case
+            .checks
+            .iter()
+            .map(|(n, h)| {
+                (
+                    (*n).to_string(),
+                    make_command_approval("cargo", "/usr/bin/cargo", h),
+                )
+            })
+            .collect();
 
-    approvals
-        .approve_project(
-            temp_dir.path().to_path_buf(),
-            tools_hash.clone(),
-            commands.clone(),
-            checks.clone(),
-        )
-        .unwrap();
+        let (key, approvals) =
+            approve_fixture(temp_dir.path(), tools_hash, commands.clone(), checks.clone());
 
-    let project_key = temp_dir
-        .path()
-        .canonicalize()
-        .unwrap()
-        .to_string_lossy()
-        .to_string();
-    assert!(approvals.projects.contains_key(&project_key));
-
-    let approval = &approvals.projects[&project_key];
-    assert_eq!(approval.tools_config_hash, tools_hash);
-    assert_eq!(approval.commands.len(), 1);
-    assert!(approval.commands.contains_key("lint"));
-    assert_eq!(approval.checks.len(), 1);
-    assert!(approval.checks.contains_key("security-audit"));
+        let approval = &approvals.projects[&key];
+        assert_eq!(approval.tools_config_hash, tools_hash, "{}", case.label);
+        assert_eq!(
+            approval.commands.len(),
+            commands.len(),
+            "{}: commands",
+            case.label
+        );
+        for (name, _) in case.commands {
+            assert!(
+                approval.commands.contains_key(*name),
+                "{}: missing command {name}",
+                case.label
+            );
+        }
+        assert_eq!(
+            approval.checks.len(),
+            checks.len(),
+            "{}: checks",
+            case.label
+        );
+        for (name, _) in case.checks {
+            assert!(
+                approval.checks.contains_key(*name),
+                "{}: missing check {name}",
+                case.label
+            );
+        }
+    }
 }
 
 #[tokio::test]
-async fn test_verify_check_approved() {
-    // Test that verify_check correctly verifies an approved check
+async fn test_verify_check_basic_variants() {
+    enum Expected {
+        Approved,
+        NotApproved,
+        ItemNotApproved(&'static str),
+    }
 
-    let _xdg_dir = TempDir::new().unwrap();
-    std::env::set_var("XDG_CONFIG_HOME", _xdg_dir.path());
+    let cases = [
+        ("approved", true, "audit", Expected::Approved),
+        ("not-approved", false, "audit", Expected::NotApproved),
+        (
+            "missing-item",
+            true,
+            "nonexistent-check",
+            Expected::ItemNotApproved("nonexistent-check"),
+        ),
+    ];
 
-    let temp_dir = TempDir::new().unwrap();
-    let config_dir = temp_dir.path().join(".config");
-    std::fs::create_dir(&config_dir).unwrap();
+    for (label, should_approve, item, expected) in cases {
+        let (_xdg_dir, temp_dir) = isolated_project_with_config(AUDIT_CHECK_CONFIG);
+        if should_approve {
+            approve_project_config(temp_dir.path(), AUDIT_CHECK_CONFIG)
+                .await
+                .unwrap();
+        }
 
-    let config_content = r#"
-[commands]
-
-[[checks]]
-name = "audit"
-command = ["echo", "test"]
-"#;
-
-    std::fs::write(config_dir.join("tools.toml"), config_content).unwrap();
-
-    // Use the helper to approve the project with checks
-    approve_project_config(temp_dir.path(), config_content)
-        .await
-        .unwrap();
-
-    // Load approvals and verify the check
-    let approvals = ProjectApprovals::load().await.unwrap();
-    let result = approvals
-        .verify_check(temp_dir.path(), "audit")
-        .await
-        .unwrap();
-
-    assert_eq!(
-        result,
-        VerificationResult::Approved,
-        "Approved check should verify successfully"
-    );
-}
-
-#[tokio::test]
-async fn test_verify_check_not_approved() {
-    // Test that verify_check returns NotApproved for unapproved checks
-
-    let _xdg_dir = TempDir::new().unwrap();
-    std::env::set_var("XDG_CONFIG_HOME", _xdg_dir.path());
-
-    let temp_dir = TempDir::new().unwrap();
-    let config_dir = temp_dir.path().join(".config");
-    std::fs::create_dir(&config_dir).unwrap();
-
-    let config_content = r#"
-[commands]
-
-[[checks]]
-name = "audit"
-command = ["echo", "test"]
-"#;
-
-    std::fs::write(config_dir.join("tools.toml"), config_content).unwrap();
-
-    // Don't approve - just load approvals
-    let approvals = ProjectApprovals::load().await.unwrap();
-    let result = approvals
-        .verify_check(temp_dir.path(), "audit")
-        .await
-        .unwrap();
-
-    assert_eq!(
-        result,
-        VerificationResult::NotApproved,
-        "Unapproved check should return NotApproved"
-    );
+        let result = verify_check_result(temp_dir.path(), item).await;
+        match expected {
+            Expected::Approved => assert_approved(result, &format!("case {label}")),
+            Expected::NotApproved => {
+                assert_eq!(result, VerificationResult::NotApproved, "case {label}")
+            }
+            Expected::ItemNotApproved(expected_item) => {
+                assert_item_not_approved(result, expected_item, &format!("case {label}"))
+            }
+        }
+    }
 }
 
 #[tokio::test]
 async fn test_verify_check_config_hash_mismatch() {
-    let _xdg_dir = TempDir::new().unwrap();
-    std::env::set_var("XDG_CONFIG_HOME", _xdg_dir.path());
+    let (_xdg_dir, temp_dir) = isolated_project_with_config(AUDIT_CHECK_CONFIG);
 
-    let temp_dir = TempDir::new().unwrap();
-    let config_dir = temp_dir.path().join(".config");
-    std::fs::create_dir(&config_dir).unwrap();
-
-    let config_content = r#"
-[commands]
-
-[[checks]]
-name = "audit"
-command = ["echo", "test"]
-"#;
-
-    std::fs::write(config_dir.join("tools.toml"), config_content).unwrap();
-
-    // Approve the project
-    approve_project_config(temp_dir.path(), config_content)
-        .await
-        .unwrap();
-
-    // Modify the config
-    let new_config_content = r#"
+    match approve_mutate_and_verify_check(
+        temp_dir.path(),
+        AUDIT_CHECK_CONFIG,
+        "audit",
+        |project_dir| {
+            write_tools_config(
+                project_dir,
+                r#"
 [commands]
 
 [[checks]]
 name = "audit"
 command = ["echo", "modified"]
-"#;
-    std::fs::write(config_dir.join("tools.toml"), new_config_content).unwrap();
-
-    // Verify should detect config hash mismatch
-    let approvals = ProjectApprovals::load().await.unwrap();
-    let result = approvals
-        .verify_check(temp_dir.path(), "audit")
-        .await
-        .unwrap();
-
-    match result {
-        VerificationResult::ConfigHashMismatch { .. } => {
-            // Expected
-        }
-        _ => panic!(
-            "Expected ConfigHashMismatch for modified config, got {:?}",
-            result
-        ),
+"#,
+            );
+        },
+    )
+    .await
+    {
+        VerificationResult::ConfigHashMismatch { .. } => {}
+        other => panic!("Expected ConfigHashMismatch for modified config, got {other:?}"),
     }
 }
 
@@ -378,19 +462,10 @@ async fn test_verify_check_binary_hash_mismatch() {
     std::env::set_var("XDG_CONFIG_HOME", _xdg_dir.path());
 
     let temp_dir = TempDir::new().unwrap();
-    let config_dir = temp_dir.path().join(".config");
-    std::fs::create_dir(&config_dir).unwrap();
 
     // Create a script
-    let scripts_dir = temp_dir.path().join("scripts");
-    std::fs::create_dir(&scripts_dir).unwrap();
-    let script_path = scripts_dir.join("check.sh");
-    std::fs::write(&script_path, "#!/bin/bash\necho 'original'\n").unwrap();
-    #[cfg(unix)]
-    {
-        let permissions = std::fs::Permissions::from_mode(0o755);
-        std::fs::set_permissions(&script_path, permissions).unwrap();
-    }
+    let script_path = temp_dir.path().join("scripts/check.sh");
+    create_executable_script(&script_path, "echo 'original'");
 
     let config_content = format!(
         r#"
@@ -402,8 +477,7 @@ command = ["{}"]
 "#,
         script_path.display()
     );
-
-    std::fs::write(config_dir.join("tools.toml"), &config_content).unwrap();
+    write_tools_config(temp_dir.path(), &config_content);
 
     // Approve the project
     approve_project_config(temp_dir.path(), &config_content)
@@ -431,47 +505,6 @@ command = ["{}"]
     }
 }
 
-#[tokio::test]
-async fn test_verify_check_not_in_config() {
-    let _xdg_dir = TempDir::new().unwrap();
-    std::env::set_var("XDG_CONFIG_HOME", _xdg_dir.path());
-
-    let temp_dir = TempDir::new().unwrap();
-    let config_dir = temp_dir.path().join(".config");
-    std::fs::create_dir(&config_dir).unwrap();
-
-    let config_content = r#"
-[commands]
-
-[[checks]]
-name = "audit"
-command = ["echo", "test"]
-"#;
-
-    std::fs::write(config_dir.join("tools.toml"), config_content).unwrap();
-
-    // Approve the project
-    approve_project_config(temp_dir.path(), config_content)
-        .await
-        .unwrap();
-
-    // Try to verify a check that wasn't in the config
-    let approvals = ProjectApprovals::load().await.unwrap();
-    let result = approvals
-        .verify_check(temp_dir.path(), "nonexistent-check")
-        .await
-        .unwrap();
-
-    match result {
-        VerificationResult::ItemNotApproved { item } => {
-            assert_eq!(item, "nonexistent-check");
-        }
-        _ => panic!(
-            "Expected ItemNotApproved for check not in config, got {:?}",
-            result
-        ),
-    }
-}
 
 #[test]
 fn test_is_within_project() {
@@ -484,97 +517,31 @@ fn test_is_within_project() {
 }
 
 #[tokio::test]
-async fn test_is_script_with_shebang() {
-    let mut temp_file = NamedTempFile::new().unwrap();
-    writeln!(temp_file, "#!/bin/bash").unwrap();
-    writeln!(temp_file, "echo hello").unwrap();
-    temp_file.flush().unwrap();
-
-    let is_script_result = is_script(temp_file.path()).await.unwrap();
-    assert!(is_script_result);
-}
-
-#[tokio::test]
-async fn test_is_script_without_shebang() {
-    let mut temp_file = NamedTempFile::new().unwrap();
-    writeln!(temp_file, "fn main() {{}}").unwrap();
-    temp_file.flush().unwrap();
-
-    let is_script_result = is_script(temp_file.path()).await.unwrap();
-    assert!(!is_script_result);
+async fn test_is_script_variants() {
+    for (label, contents, expected) in [
+        ("shebang", "#!/bin/bash\necho hello\n", true),
+        ("plain-source", "fn main() {}\n", false),
+    ] {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        write!(temp_file, "{contents}").unwrap();
+        temp_file.flush().unwrap();
+        assert_is_script(temp_file.path(), expected, &format!("case {label}")).await;
+    }
 }
 
 #[cfg(unix)]
 #[tokio::test]
-async fn test_is_writable_with_writable_file() {
-    let mut temp_file = NamedTempFile::new().unwrap();
-    writeln!(temp_file, "#!/bin/bash").unwrap();
-    temp_file.flush().unwrap();
+async fn test_is_writable_mode_variants() {
+    let cases = [
+        (0o600, true, "File with 0o600 permissions should be writable"),
+        (0o400, false, "File with 0o400 permissions should not be writable"),
+        (0o500, false, "File with 0o500 permissions should not be writable"),
+        (0o755, true, "File with 0o755 permissions should be writable by owner"),
+    ];
 
-    // Set owner-writable permission (0o600 = owner read+write)
-    let mut perms = std::fs::metadata(temp_file.path()).unwrap().permissions();
-    perms.set_mode(0o600);
-    std::fs::set_permissions(temp_file.path(), perms).unwrap();
-
-    let result = is_writable(temp_file.path()).await.unwrap();
-    assert!(result, "File with 0o600 permissions should be writable");
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn test_is_writable_with_readonly_file() {
-    let mut temp_file = NamedTempFile::new().unwrap();
-    writeln!(temp_file, "#!/bin/bash").unwrap();
-    temp_file.flush().unwrap();
-
-    // Set readonly permission (0o400 = owner read-only)
-    let mut perms = std::fs::metadata(temp_file.path()).unwrap().permissions();
-    perms.set_mode(0o400);
-    std::fs::set_permissions(temp_file.path(), perms).unwrap();
-
-    let result = is_writable(temp_file.path()).await.unwrap();
-    assert!(
-        !result,
-        "File with 0o400 permissions should not be writable"
-    );
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn test_is_writable_with_executable_only() {
-    let mut temp_file = NamedTempFile::new().unwrap();
-    writeln!(temp_file, "#!/bin/bash").unwrap();
-    temp_file.flush().unwrap();
-
-    // Set execute-only permission (0o500 = owner read+execute, no write)
-    let mut perms = std::fs::metadata(temp_file.path()).unwrap().permissions();
-    perms.set_mode(0o500);
-    std::fs::set_permissions(temp_file.path(), perms).unwrap();
-
-    let result = is_writable(temp_file.path()).await.unwrap();
-    assert!(
-        !result,
-        "File with 0o500 permissions should not be writable"
-    );
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn test_is_writable_with_full_permissions() {
-    let mut temp_file = NamedTempFile::new().unwrap();
-    writeln!(temp_file, "#!/bin/bash").unwrap();
-    temp_file.flush().unwrap();
-
-    // Set full permissions (0o755 = owner rwx, group rx, others rx)
-    let mut perms = std::fs::metadata(temp_file.path()).unwrap().permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(temp_file.path(), perms).unwrap();
-
-    let result = is_writable(temp_file.path()).await.unwrap();
-    assert!(
-        result,
-        "File with 0o755 permissions should be writable by owner"
-    );
+    for (mode, expected, message) in cases {
+        assert_eq!(is_writable_with_mode(mode).await, expected, "{message}");
+    }
 }
 
 #[cfg(unix)]
@@ -654,17 +621,8 @@ fn test_resolve_binary_relative_path() {
     // Relative paths with path separators should be resolved relative to project directory
 
     let project_dir = TempDir::new().unwrap();
-
-    // Create subdirectory
-    let subdir = project_dir.path().join("bin");
-    std::fs::create_dir(&subdir).unwrap();
-
-    let script_path = subdir.join("script.sh");
-
-    // Create a script file
-    let mut script = std::fs::File::create(&script_path).unwrap();
-    writeln!(script, "#!/bin/bash").unwrap();
-    drop(script);
+    let script_path = project_dir.path().join("bin/script.sh");
+    create_executable_script(&script_path, "");
 
     // Use relative path with separator
     let (original, canonical) =
@@ -681,10 +639,7 @@ fn test_resolve_binary_with_dot_slash() {
 
     let project_dir = TempDir::new().unwrap();
     let script_path = project_dir.path().join("test.sh");
-
-    let mut script = std::fs::File::create(&script_path).unwrap();
-    writeln!(script, "#!/bin/bash").unwrap();
-    drop(script);
+    create_executable_script(&script_path, "");
 
     let (original, canonical) =
         resolve_binary_path_with_original("./test.sh", project_dir.path()).unwrap();
@@ -716,13 +671,8 @@ fn test_resolve_binary_with_subdirectory() {
     // Relative paths with subdirectories should work
 
     let project_dir = TempDir::new().unwrap();
-    let scripts_dir = project_dir.path().join("scripts");
-    std::fs::create_dir(&scripts_dir).unwrap();
-
-    let script_path = scripts_dir.join("build.sh");
-    let mut script = std::fs::File::create(&script_path).unwrap();
-    writeln!(script, "#!/bin/bash").unwrap();
-    drop(script);
+    let script_path = project_dir.path().join("scripts/build.sh");
+    create_executable_script(&script_path, "");
 
     let (original, canonical) =
         resolve_binary_path_with_original("scripts/build.sh", project_dir.path()).unwrap();
@@ -742,9 +692,7 @@ fn test_resolve_binary_follows_symlinks() {
 
     // Create actual binary
     let real_binary = temp_dir.path().join("real.sh");
-    let mut script = std::fs::File::create(&real_binary).unwrap();
-    writeln!(script, "#!/bin/bash").unwrap();
-    drop(script);
+    create_executable_script(&real_binary, "");
 
     // Create symlink
     let link_path = temp_dir.path().join("link.sh");
@@ -770,9 +718,7 @@ fn test_resolve_binary_multilevel_symlinks() {
 
     // Create actual binary
     let real_binary = temp_dir.path().join("real.sh");
-    let mut script = std::fs::File::create(&real_binary).unwrap();
-    writeln!(script, "#!/bin/bash").unwrap();
-    drop(script);
+    create_executable_script(&real_binary, "");
 
     // Create symlink chain: link1 -> link2 -> real
     let link2 = temp_dir.path().join("link2.sh");
@@ -812,11 +758,11 @@ async fn test_concurrent_approvals_use_file_locking() {
 
             commands.insert(
                 format!("command{}", i),
-                CommandApproval {
-                    original_path: format!("/usr/bin/cmd{}", i),
-                    canonical_path: format!("/usr/bin/cmd{}", i),
-                    binary_hash: format!("sha256:binary{}", i),
-                },
+                make_command_approval(
+                    &format!("/usr/bin/cmd{}", i),
+                    &format!("/usr/bin/cmd{}", i),
+                    &format!("sha256:binary{}", i),
+                ),
             );
 
             ProjectApprovals::update(move |approvals| {
@@ -880,11 +826,11 @@ async fn test_concurrent_updates_to_same_project() {
 
             commands.insert(
                 "test".to_string(),
-                CommandApproval {
-                    original_path: format!("/usr/bin/test{}", i),
-                    canonical_path: format!("/usr/bin/test{}", i),
-                    binary_hash: format!("sha256:binary{}", i),
-                },
+                make_command_approval(
+                    &format!("/usr/bin/test{}", i),
+                    &format!("/usr/bin/test{}", i),
+                    &format!("sha256:binary{}", i),
+                ),
             );
 
             ProjectApprovals::update(move |approvals| {
@@ -996,13 +942,6 @@ async fn test_file_locking_prevents_read_during_write() {
 
 #[tokio::test]
 async fn test_save_approvals_persists_checks() {
-    let _xdg_dir = TempDir::new().unwrap();
-    std::env::set_var("XDG_CONFIG_HOME", _xdg_dir.path());
-
-    let temp_dir = TempDir::new().unwrap();
-    let config_dir = temp_dir.path().join(".config");
-    std::fs::create_dir(&config_dir).unwrap();
-
     let config_content = r#"
 [commands]
 lint = ["echo", "lint"]
@@ -1015,8 +954,7 @@ command = ["echo", "audit"]
 name = "license-check"
 command = ["echo", "check"]
 "#;
-
-    std::fs::write(config_dir.join("tools.toml"), config_content).unwrap();
+    let (_xdg_dir, temp_dir) = isolated_project_with_config(config_content);
 
     // Approve the project using the helper
     approve_project_config(temp_dir.path(), config_content)
@@ -1080,33 +1018,7 @@ lint = ["echo", "lint"]
         repo_path,
     );
 
-    // Verify both workspaces resolve to the same repository root
-    let workspace2_root = repository::detect_repository_root(&workspace2_path).unwrap();
-    assert_eq!(
-        repo_root, workspace2_root,
-        "Both workspaces should resolve to the same repository root"
-    );
-
-    // Verify approval works in the second workspace
-    let approvals = ProjectApprovals::load().await.unwrap();
-    let result = approvals
-        .verify_project(&workspace2_path, "lint")
-        .await
-        .unwrap();
-
-    assert_eq!(
-        result,
-        VerificationResult::Approved,
-        "Approval from workspace1 should work in workspace2"
-    );
-
-    // Verify the approval key is the repository root
-    let approval_key = repo_root.to_string_lossy().to_string();
-    assert!(
-        approvals.projects.contains_key(&approval_key),
-        "Approval should be keyed by repository root: {}",
-        approval_key
-    );
+    assert_shared_repo_approval(&repo_root, &workspace2_path, "workspaces").await;
 }
 
 #[tokio::test]
@@ -1137,33 +1049,7 @@ lint = ["echo", "lint"]
         repo_path,
     );
 
-    // Verify both worktrees resolve to the same repository root
-    let worktree_root = repository::detect_repository_root(&worktree_path).unwrap();
-    assert_eq!(
-        repo_root, worktree_root,
-        "Both worktrees should resolve to the same repository root"
-    );
-
-    // Verify approval works in the worktree
-    let approvals = ProjectApprovals::load().await.unwrap();
-    let result = approvals
-        .verify_project(&worktree_path, "lint")
-        .await
-        .unwrap();
-
-    assert_eq!(
-        result,
-        VerificationResult::Approved,
-        "Approval from main worktree should work in worktree2"
-    );
-
-    // Verify the approval key is the repository root
-    let approval_key = repo_root.to_string_lossy().to_string();
-    assert!(
-        approvals.projects.contains_key(&approval_key),
-        "Approval should be keyed by repository root: {}",
-        approval_key
-    );
+    assert_shared_repo_approval(&repo_root, &worktree_path, "worktrees").await;
 }
 
 #[tokio::test]

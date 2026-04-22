@@ -27,6 +27,7 @@ use tool_runner::ToolRunner;
 
 pub mod git_read_only;
 pub mod jj_read_only;
+pub mod read_only;
 pub mod tool_runner;
 
 #[derive(Debug, Subcommand)]

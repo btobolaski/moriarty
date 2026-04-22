@@ -59,6 +59,18 @@ pub struct Commands {
 }
 
 impl Commands {
+    /// Pushes a configured command into `result`, preserving caller-defined
+    /// insertion order so MCP tool listings remain stable.
+    fn push_if_configured(
+        result: &mut Vec<(String, Vec<String>)>,
+        name: &str,
+        command: &Option<Vec<String>>,
+    ) {
+        if let Some(command) = command {
+            result.push((name.to_string(), command.clone()));
+        }
+    }
+
     /// Get all configured commands as a vector of (name, command_array) tuples.
     ///
     /// Returns a vector containing all non-None commands. The order is deterministic:
@@ -81,20 +93,10 @@ impl Commands {
     /// ```
     pub fn all(&self) -> Vec<(String, Vec<String>)> {
         let mut result = Vec::new();
-
-        if let Some(cmd) = &self.lint {
-            result.push(("lint".to_string(), cmd.clone()));
-        }
-        if let Some(cmd) = &self.test {
-            result.push(("test".to_string(), cmd.clone()));
-        }
-        if let Some(cmd) = &self.build {
-            result.push(("build".to_string(), cmd.clone()));
-        }
-        if let Some(cmd) = &self.format {
-            result.push(("format".to_string(), cmd.clone()));
-        }
-
+        Self::push_if_configured(&mut result, "lint", &self.lint);
+        Self::push_if_configured(&mut result, "test", &self.test);
+        Self::push_if_configured(&mut result, "build", &self.build);
+        Self::push_if_configured(&mut result, "format", &self.format);
         result
     }
 }
@@ -185,6 +187,23 @@ mod tests {
         temp_dir
     }
 
+    /// Assert that `config.commands.{lint,test}` carry the "full" cargo-clippy /
+    /// cargo-nextest-run values used by the two happy-path tests below.
+    fn assert_full_clippy_nextest_commands(config: &ProjectConfig) {
+        assert_eq!(
+            config.commands.lint,
+            Some(vec!["cargo".to_string(), "clippy".to_string()])
+        );
+        assert_eq!(
+            config.commands.test,
+            Some(vec![
+                "cargo".to_string(),
+                "nextest".to_string(),
+                "run".to_string()
+            ])
+        );
+    }
+
     #[tokio::test]
     async fn test_load_project_settings_valid_config() {
         let temp_dir = setup_project_with_config(
@@ -201,18 +220,7 @@ format = ["cargo", "fmt"]
             .await
             .expect("Should load valid config");
 
-        assert_eq!(
-            config.commands.lint,
-            Some(vec!["cargo".to_string(), "clippy".to_string()])
-        );
-        assert_eq!(
-            config.commands.test,
-            Some(vec![
-                "cargo".to_string(),
-                "nextest".to_string(),
-                "run".to_string()
-            ])
-        );
+        assert_full_clippy_nextest_commands(&config);
         assert_eq!(
             config.commands.build,
             Some(vec!["cargo".to_string(), "build".to_string()])
@@ -476,18 +484,7 @@ command = ["./check-licenses.sh"]
             .await
             .expect("Should load config with both commands and checks");
 
-        assert_eq!(
-            config.commands.lint,
-            Some(vec!["cargo".to_string(), "clippy".to_string()])
-        );
-        assert_eq!(
-            config.commands.test,
-            Some(vec![
-                "cargo".to_string(),
-                "nextest".to_string(),
-                "run".to_string()
-            ])
-        );
+        assert_full_clippy_nextest_commands(&config);
         assert!(config.checks.is_some());
         let checks = config.checks.unwrap();
         assert_eq!(checks.len(), 2);

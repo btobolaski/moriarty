@@ -5,19 +5,7 @@ use std::io::Cursor;
 use tempfile::TempDir;
 
 use super::*;
-
-/// Safe to use std::env::set_var because cargo nextest isolates each test in a separate process.
-fn setup_isolated_xdg_state() -> TempDir {
-    let temp_dir = tempfile::tempdir().unwrap();
-    std::env::set_var("XDG_STATE_HOME", temp_dir.path());
-    temp_dir
-}
-
-fn setup_isolated_xdg_config() -> TempDir {
-    let temp_dir = tempfile::tempdir().unwrap();
-    std::env::set_var("XDG_CONFIG_HOME", temp_dir.path());
-    temp_dir
-}
+use crate::test_helpers::{setup_isolated_xdg_config, setup_isolated_xdg_state};
 
 async fn setup_user_bash_rules(rules_toml: &str) -> TempDir {
     let temp_dir = setup_isolated_xdg_config();
@@ -29,6 +17,249 @@ async fn setup_user_bash_rules(rules_toml: &str) -> TempDir {
         .unwrap();
 
     temp_dir
+}
+
+/// Creates a temp dir with `.config/tools.toml` and sets CLAUDE_PROJECT_DIR.
+fn setup_project_with_config(toml_content: &str) -> TempDir {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_dir = temp_dir.path().join(".config");
+    std::fs::create_dir(&config_dir).expect("Failed to create .config dir");
+    std::fs::write(config_dir.join("tools.toml"), toml_content)
+        .expect("Failed to write tools.toml");
+    std::env::set_var("CLAUDE_PROJECT_DIR", temp_dir.path());
+    temp_dir
+}
+
+/// A cross-platform `(command, args)` pair whose exit code matches `exit_ok`.
+///
+/// On Unix uses `true`/`false`; on Windows uses `cmd /c exit 0|1`. The string
+/// data is `'static`, so callers can copy the references freely without
+/// duplicating the underlying bytes (the `Vec<&str>` container itself still
+/// allocates, as always).
+fn check_cmd(exit_ok: bool) -> (&'static str, Vec<&'static str>) {
+    #[cfg(unix)]
+    {
+        if exit_ok {
+            ("true", vec![])
+        } else {
+            ("false", vec![])
+        }
+    }
+    #[cfg(windows)]
+    {
+        if exit_ok {
+            ("cmd", vec!["/c", "exit 0"])
+        } else {
+            ("cmd", vec!["/c", "exit 1"])
+        }
+    }
+}
+
+/// Runs `handle_stop_hook` for a project set up with the given checks (all approved).
+/// Returns the temp dir (kept alive by caller) and the hook result.
+async fn run_stop_hook_with_checks(
+    checks: Vec<(&str, &str, Vec<&str>)>,
+) -> (TempDir, HookOutput) {
+    let temp_dir = setup_approved_project_with_checks(checks).await;
+    std::env::set_var("CLAUDE_PROJECT_DIR", temp_dir.path());
+    let result = handle_stop_hook().await.expect("Should succeed");
+    (temp_dir, result)
+}
+
+/// Assert a stop-hook result is `Block` and the reason contains each substring.
+/// Also verifies that `system_message == reason` (the public contract).
+fn assert_stop_blocked_with(result: &HookOutput, substrs: &[&str]) {
+    assert_eq!(result.decision, Some(HookDecision::Block));
+    let reason = result.reason.as_ref().expect("reason should be set");
+    for substr in substrs {
+        assert!(
+            reason.contains(substr),
+            "reason {reason:?} should contain {substr:?}"
+        );
+    }
+    assert_eq!(
+        result.system_message, result.reason,
+        "system_message should match reason for user feedback"
+    );
+}
+
+/// Extract the PreToolUseOutput from a HookOutput, panicking if not present
+fn unwrap_pretool_output(result: &HookOutput) -> &PreToolUseOutput {
+    match &result.hook_specific_output {
+        Some(HookSpecificOutput::PreToolUse(output)) => output,
+        _ => panic!("Expected PreToolUse hook specific output"),
+    }
+}
+
+fn assert_pretool_allow(result: &HookOutput) {
+    let output = unwrap_pretool_output(result);
+    assert_eq!(output.permission_decision, Some(PermissionDecision::Allow));
+    assert_eq!(output.updated_input, None);
+}
+
+fn assert_pretool_deny(result: &HookOutput, reason_contains: &str) {
+    let output = unwrap_pretool_output(result);
+    assert_eq!(output.permission_decision, Some(PermissionDecision::Deny));
+    assert!(
+        output
+            .permission_decision_reason
+            .as_ref()
+            .expect("Deny decision should always carry a reason")
+            .contains(reason_contains),
+        "Expected reason to contain '{}', got: {:?}",
+        reason_contains,
+        output.permission_decision_reason
+    );
+}
+
+fn assert_pretool_ask(result: &HookOutput) {
+    let output = unwrap_pretool_output(result);
+    assert_eq!(output.permission_decision, Some(PermissionDecision::Ask));
+    assert_eq!(output.permission_decision_reason, None);
+    assert_eq!(output.updated_input, None);
+}
+
+async fn run_bash_hook(config: &str, command: &str) -> HookOutput {
+    let _xdg_config = setup_user_bash_rules(config).await;
+    let tool_input = serde_json::json!({"command": command});
+    handle_bash_pretool_hook(&tool_input)
+        .await
+        .expect("Should succeed")
+}
+
+async fn run_pretool_hook(
+    config: &str,
+    tool: &str,
+    input: &serde_json::Value,
+    cwd: &str,
+) -> HookOutput {
+    let _xdg_config = setup_user_bash_rules(config).await;
+    handle_pretool_hook(tool, input, cwd)
+        .await
+        .expect("Should succeed")
+}
+
+/// Variant-test wrapper for `assert_pretool_modified` that threads a case label
+/// into every assertion failure.
+fn assert_pretool_modified_case(result: &HookOutput, expected_command: &str, label: &str) {
+    let output = unwrap_pretool_output(result);
+    assert_eq!(
+        output.permission_decision,
+        Some(PermissionDecision::Allow),
+        "case {label}"
+    );
+    let updated = output
+        .updated_input
+        .as_ref()
+        .expect("Should have updated input");
+    assert_eq!(
+        updated["command"],
+        serde_json::Value::String(expected_command.to_string()),
+        "case {label}"
+    );
+}
+
+/// Variant-test wrapper for `assert_pretool_modified_contains` that keeps the
+/// case label visible in fragment-match failures.
+fn assert_pretool_modified_contains_case(
+    result: &HookOutput,
+    expected_fragments: &[&str],
+    label: &str,
+) {
+    let output = unwrap_pretool_output(result);
+    assert_eq!(
+        output.permission_decision,
+        Some(PermissionDecision::Allow),
+        "case {label}"
+    );
+    let command = output
+        .updated_input
+        .as_ref()
+        .expect("Expected updated input")["command"]
+        .as_str()
+        .expect("Expected command string");
+
+    for fragment in expected_fragments {
+        assert!(
+            command.contains(fragment),
+            "case {label}: expected command {command:?} to contain {fragment:?}"
+        );
+    }
+}
+
+/// Asserts a deprecated `decision` enum value is rejected during JSON parsing
+/// and that serde surfaces the invalid value in its error text.
+fn assert_invalid_decision_value(decision: &str) {
+    let err = serde_json::from_str::<HookOutput>(&format!(r#"{{"decision": "{decision}"}}"#))
+        .expect_err("deprecated decision value should fail to parse");
+    let err_msg = err.to_string();
+    assert!(
+        err_msg.contains("unknown variant") || err_msg.contains(decision),
+        "Error should mention invalid decision value {decision:?}, got: {err_msg}"
+    );
+}
+
+/// Sets up isolated XDG state, then runs `setup` so callers can configure
+/// `CLAUDE_PROJECT_DIR`; the returned `TempDir` guard is held alive until the
+/// stop hook has been asserted as approved.
+async fn assert_stop_approved_case(label: &str, setup: impl FnOnce() -> Option<TempDir>) {
+    let _xdg_dir = setup_isolated_xdg_state();
+    let _guard = setup();
+    let result = run_stop_hook().await;
+    assert_eq!(result.decision, Some(HookDecision::Approve), "case: {label}");
+    assert_eq!(result.reason, None, "case: {label}");
+}
+
+/// Build a single-entry `[[tool_rules]]` TOML fragment for the given fields.
+///
+/// `name` and `tool` are inserted into TOML *literal* strings (single-quoted),
+/// so they must not contain single quotes. Pass `action_toml` exactly as it
+/// should appear after `action = ` (e.g. `r#"{ type = "Allow" }"#`). Used to
+/// collapse test configs that differ only in the tool name and action.
+fn cfg_tool_rule(name: &str, tool: &str, action_toml: &str) -> String {
+    format!("[[tool_rules]]\nname = '{name}'\ntool = '{tool}'\naction = {action_toml}\n")
+}
+
+/// Build a single-entry `[[bash_rules]]` TOML fragment for the given fields.
+///
+/// `pattern` is inserted into a TOML *literal* string (single-quoted) so regex
+/// backslashes are passed through verbatim without TOML-level escaping. The
+/// pattern must therefore not contain single quotes. `action_toml` is the
+/// value after `action = ` (e.g. `r#"{ type = "Ask" }"#`).
+fn cfg_bash_rule(name: &str, pattern: &str, action_toml: &str) -> String {
+    format!("[[bash_rules]]\nname = '{name}'\npattern = '{pattern}'\naction = {action_toml}\n")
+}
+
+/// Build an `[[tool_rules]]` fragment with `allow_local = true` plus a
+/// field+pattern constraint and an action. Used by the allow-local integration
+/// tests that differ only in which field/pattern they assert on.
+fn cfg_allow_local_rule(tool: &str, field: &str, pattern: &str, action_toml: &str) -> String {
+    format!(
+        "[[tool_rules]]\nname = 'allow-local-test'\ntool = '{tool}'\nallow_local = true\nfield = '{field}'\npattern = '{pattern}'\naction = {action_toml}\n",
+    )
+}
+
+/// Runs `handle_stop_hook` and unwraps the result. Assumes callers have already
+/// set up `CLAUDE_PROJECT_DIR` and any required config.
+async fn run_stop_hook() -> HookOutput {
+    handle_stop_hook().await.expect("Should succeed")
+}
+
+/// Runs a Bash pretool hook against an empty XDG config dir (no rules file),
+/// with a default `ls -la` command. Used by the "no config" passthrough tests.
+async fn run_bash_hook_empty_xdg() -> HookOutput {
+    let _xdg_config = setup_isolated_xdg_config();
+    let tool_input = serde_json::json!({"command": "ls -la"});
+    handle_bash_pretool_hook(&tool_input)
+        .await
+        .expect("Should succeed")
+}
+
+/// Runs `exec_hook_impl` with the given JSON input and expects success. Used by
+/// the PreToolUse passthrough tests that share a literal event payload.
+async fn run_exec_hook_expect_ok(input: &str, ctx: &str) {
+    let cursor = Cursor::new(input);
+    exec_hook_impl(cursor).await.expect(ctx);
 }
 
 #[tokio::test]
@@ -152,26 +383,9 @@ async fn test_exec_hook_all_event_types() {
 
 #[test]
 fn test_hook_output_rejects_old_decision_values() {
-    // Verify that hook output with old decision values fails to parse
-    let old_allow = r#"{"decision": "allow"}"#;
-    let err = serde_json::from_str::<HookOutput>(old_allow)
-        .expect_err("Should reject old 'allow' decision value");
-    let err_msg = err.to_string();
-    assert!(
-        err_msg.contains("unknown variant") || err_msg.contains("allow"),
-        "Error should mention unknown variant, got: {}",
-        err_msg
-    );
-
-    let old_deny = r#"{"decision": "deny"}"#;
-    let err = serde_json::from_str::<HookOutput>(old_deny)
-        .expect_err("Should reject old 'deny' decision value");
-    let err_msg = err.to_string();
-    assert!(
-        err_msg.contains("unknown variant") || err_msg.contains("deny"),
-        "Error should mention unknown variant, got: {}",
-        err_msg
-    );
+    for decision in ["allow", "deny"] {
+        assert_invalid_decision_value(decision);
+    }
 
     // 'ask' is now a valid decision value
     let ask_decision = r#"{"decision": "ask"}"#;
@@ -194,69 +408,47 @@ async fn test_stop_hook_no_env_var() {
 }
 
 #[tokio::test]
-async fn test_stop_hook_no_config_file() {
-    let _xdg_dir = setup_isolated_xdg_state();
-
-    // Create a temp directory without .config/tools.toml
-    let temp_dir = TempDir::new().expect("Failed to create temp dir");
-    std::env::set_var("CLAUDE_PROJECT_DIR", temp_dir.path());
-
-    let result = handle_stop_hook().await.expect("Should succeed");
-
-    assert_eq!(result.decision, Some(HookDecision::Approve));
-    assert_eq!(result.reason, None);
-}
-
-#[tokio::test]
-async fn test_stop_hook_no_checks_defined() {
-    let _xdg_dir = setup_isolated_xdg_state();
-
-    // Create project with config but no checks
-    let temp_dir = TempDir::new().expect("Failed to create temp dir");
-    let config_dir = temp_dir.path().join(".config");
-    std::fs::create_dir(&config_dir).expect("Failed to create .config dir");
-    std::fs::write(
-        config_dir.join("tools.toml"),
-        r#"
+async fn test_stop_hook_approval_variants() {
+    let cases = [
+        (
+            "no config file",
+            Box::new(|| {
+                let temp_dir = TempDir::new().expect("Failed to create temp dir");
+                std::env::set_var("CLAUDE_PROJECT_DIR", temp_dir.path());
+                Some(temp_dir)
+            }) as Box<dyn FnOnce() -> Option<TempDir>>,
+        ),
+        (
+            "no checks defined",
+            Box::new(|| {
+                Some(setup_project_with_config(
+                    r#"
 [commands]
 lint = ["echo", "lint"]
 "#,
-    )
-    .expect("Failed to write tools.toml");
-
-    std::env::set_var("CLAUDE_PROJECT_DIR", temp_dir.path());
-
-    let result = handle_stop_hook().await.expect("Should succeed");
-
-    assert_eq!(result.decision, Some(HookDecision::Approve));
-    assert_eq!(result.reason, None);
-}
-
-#[tokio::test]
-async fn test_stop_hook_empty_checks() {
-    let _xdg_dir = setup_isolated_xdg_state();
-
-    // Create project with empty checks array
-    let temp_dir = TempDir::new().expect("Failed to create temp dir");
-    let config_dir = temp_dir.path().join(".config");
-    std::fs::create_dir(&config_dir).expect("Failed to create .config dir");
-    std::fs::write(
-        config_dir.join("tools.toml"),
-        r#"
+                ))
+            }),
+        ),
+        (
+            // TOML parse fails on incomplete `[[checks]]` tables.
+            // Tests the intentional fail-open behavior documented in the security model.
+            "empty checks",
+            Box::new(|| {
+                Some(setup_project_with_config(
+                    r#"
 [commands]
 lint = ["echo", "lint"]
 
 [[checks]]
 "#,
-    )
-    .expect("Failed to write tools.toml");
+                ))
+            }),
+        ),
+    ];
 
-    std::env::set_var("CLAUDE_PROJECT_DIR", temp_dir.path());
-
-    // TOML parse fails on incomplete table arrays (`[[checks]]` with no fields).
-    // This tests fail-open behavior documented in the security model (lines 145-161).
-    let result = handle_stop_hook().await.expect("Should succeed");
-    assert_eq!(result.decision, Some(HookDecision::Approve));
+    for (label, setup) in cases {
+        assert_stop_approved_case(label, setup).await;
+    }
 }
 
 #[tokio::test]
@@ -264,11 +456,7 @@ async fn test_stop_hook_empty_command_array() {
     let _xdg_dir = setup_isolated_xdg_state();
 
     // Create project with check that has empty command array
-    let temp_dir = TempDir::new().expect("Failed to create temp dir");
-    let config_dir = temp_dir.path().join(".config");
-    std::fs::create_dir(&config_dir).expect("Failed to create .config dir");
-    std::fs::write(
-        config_dir.join("tools.toml"),
+    let _temp_dir = setup_project_with_config(
         r#"
 [commands]
 lint = ["echo", "lint"]
@@ -277,10 +465,7 @@ lint = ["echo", "lint"]
 name = "empty-command"
 command = []
 "#,
-    )
-    .expect("Failed to write tools.toml");
-
-    std::env::set_var("CLAUDE_PROJECT_DIR", temp_dir.path());
+    );
 
     let result = handle_stop_hook().await.expect("Should succeed");
 
@@ -308,11 +493,7 @@ async fn test_stop_hook_unapproved_check() {
     let _xdg_dir = setup_isolated_xdg_state();
 
     // Create project with a check
-    let temp_dir = TempDir::new().expect("Failed to create temp dir");
-    let config_dir = temp_dir.path().join(".config");
-    std::fs::create_dir(&config_dir).expect("Failed to create .config dir");
-    std::fs::write(
-        config_dir.join("tools.toml"),
+    let _temp_dir = setup_project_with_config(
         r#"
 [commands]
 
@@ -320,10 +501,7 @@ async fn test_stop_hook_unapproved_check() {
 name = "test-check"
 command = ["echo", "test"]
 "#,
-    )
-    .expect("Failed to write tools.toml");
-
-    std::env::set_var("CLAUDE_PROJECT_DIR", temp_dir.path());
+    );
 
     // Don't approve the project, so it should be denied
     let result = handle_stop_hook().await.expect("Should succeed");
@@ -341,98 +519,62 @@ command = ["echo", "test"]
 }
 
 #[tokio::test]
-async fn test_stop_hook_check_passes() {
-    let _xdg_dir = setup_isolated_xdg_state();
-    let _config_dir = setup_isolated_xdg_config();
+async fn test_stop_hook_check_result_variants() {
+    #[derive(Clone, Copy)]
+    enum Case {
+        ApprovedOne,
+        ApprovedMany,
+        Failed,
+    }
 
-    #[cfg(unix)]
-    let (check_command, check_args) = ("true", vec![]);
-    #[cfg(windows)]
-    let (check_command, check_args) = ("cmd", vec!["/c", "exit 0"]);
+    for case in [Case::ApprovedOne, Case::ApprovedMany, Case::Failed] {
+        let _xdg_dir = setup_isolated_xdg_state();
+        let _config_dir = setup_isolated_xdg_config();
 
-    let temp_dir =
-        setup_approved_project_with_checks(vec![("passing-check", check_command, check_args)])
-            .await;
+        let label = match case {
+            Case::ApprovedOne => "approved-one",
+            Case::ApprovedMany => "approved-many",
+            Case::Failed => "failed",
+        };
+        let checks = match case {
+            Case::ApprovedOne => {
+                let (command, args) = check_cmd(true);
+                vec![("passing-check", command, args)]
+            }
+            Case::ApprovedMany => {
+                let (command, args) = check_cmd(true);
+                vec![("check1", command, args.clone()), ("check2", command, args)]
+            }
+            Case::Failed => {
+                let (command, args) = check_cmd(false);
+                vec![("failing-check", command, args)]
+            }
+        };
 
-    std::env::set_var("CLAUDE_PROJECT_DIR", temp_dir.path());
-
-    let result = handle_stop_hook().await.expect("Should succeed");
-
-    assert_eq!(result.decision, Some(HookDecision::Approve));
-    assert_eq!(result.reason, None);
-}
-
-#[tokio::test]
-async fn test_stop_hook_check_fails() {
-    let _xdg_dir = setup_isolated_xdg_state();
-    let _config_dir = setup_isolated_xdg_config();
-
-    #[cfg(unix)]
-    let (check_command, check_args) = ("false", vec![]);
-    #[cfg(windows)]
-    let (check_command, check_args) = ("cmd", vec!["/c", "exit 1"]);
-
-    let temp_dir =
-        setup_approved_project_with_checks(vec![("failing-check", check_command, check_args)])
-            .await;
-
-    std::env::set_var("CLAUDE_PROJECT_DIR", temp_dir.path());
-
-    let result = handle_stop_hook().await.expect("Should succeed");
-
-    assert_eq!(result.decision, Some(HookDecision::Block));
-
-    let reason = result.reason.as_ref().expect("reason should be set");
-    assert!(reason.contains("Checks failed"), "Reason: {}", reason);
-    assert!(
-        reason.contains("failing-check"),
-        "Should mention check name: {}",
-        reason
-    );
-
-    // Verify system_message matches reason for user feedback
-    assert_eq!(
-        result.system_message, result.reason,
-        "system_message should match reason for user feedback"
-    );
-}
-
-#[tokio::test]
-async fn test_stop_hook_multiple_checks_all_pass() {
-    let _xdg_dir = setup_isolated_xdg_state();
-    let _config_dir = setup_isolated_xdg_config();
-
-    #[cfg(unix)]
-    let (check_command, check_args) = ("true", vec![]);
-    #[cfg(windows)]
-    let (check_command, check_args) = ("cmd", vec!["/c", "exit 0"]);
-
-    let temp_dir = setup_approved_project_with_checks(vec![
-        ("check1", check_command, check_args.clone()),
-        ("check2", check_command, check_args),
-    ])
-    .await;
-
-    std::env::set_var("CLAUDE_PROJECT_DIR", temp_dir.path());
-
-    let result = handle_stop_hook().await.expect("Should succeed");
-
-    assert_eq!(result.decision, Some(HookDecision::Approve));
-    assert_eq!(result.reason, None);
+        let (_temp_dir, result) = run_stop_hook_with_checks(checks).await;
+        match case {
+            Case::ApprovedOne | Case::ApprovedMany => {
+                assert_eq!(result.decision, Some(HookDecision::Approve), "case: {label}");
+                assert_eq!(result.reason, None, "case: {label}");
+            }
+            Case::Failed => {
+                assert_eq!(result.decision, Some(HookDecision::Block), "case: {label}");
+                let reason = result.reason.as_ref().expect("reason should be set");
+                for needle in ["Checks failed", "failing-check"] {
+                    assert!(reason.contains(needle), "case {label}: {reason:?} should contain {needle:?}");
+                }
+                assert_eq!(result.system_message, result.reason, "case: {label}");
+            }
+        }
+    }
 }
 
 #[tokio::test]
 async fn test_stop_hook_check_binary_hash_mismatch() {
     let _xdg_dir = setup_isolated_xdg_state();
     let _config_dir = setup_isolated_xdg_config();
-
-    #[cfg(unix)]
-    let (check_command, check_args) = ("true", vec![]);
-    #[cfg(windows)]
-    let (check_command, check_args) = ("cmd", vec!["/c", "exit 0"]);
-
-    let temp_dir =
-        setup_approved_project_with_checks(vec![("test-check", check_command, check_args)]).await;
+    let (c, a) = check_cmd(true);
+    let temp_dir = setup_approved_project_with_checks(vec![("test-check", c, a)]).await;
 
     // Manually corrupt the binary hash in approvals
     let mut approvals = ProjectApprovals::load()
@@ -460,28 +602,8 @@ async fn test_stop_hook_check_binary_hash_mismatch() {
         .expect("Failed to save corrupted approvals");
 
     std::env::set_var("CLAUDE_PROJECT_DIR", temp_dir.path());
-
     let result = handle_stop_hook().await.expect("Should succeed");
-
-    assert_eq!(result.decision, Some(HookDecision::Block));
-
-    let reason = result.reason.as_ref().expect("reason should be set");
-    assert!(
-        reason.contains("binary changed"),
-        "Expected binary changed error. Reason: {}",
-        reason
-    );
-    assert!(
-        reason.contains("test-check"),
-        "Expected check name in error. Reason: {}",
-        reason
-    );
-
-    // Verify system_message matches reason for user feedback
-    assert_eq!(
-        result.system_message, result.reason,
-        "system_message should match reason for user feedback"
-    );
+    assert_stop_blocked_with(&result, &["binary changed", "test-check"]);
 }
 
 /// Helper to set up an approved project with checks
@@ -550,20 +672,43 @@ async fn setup_approved_project_with_checks(
 }
 
 #[tokio::test]
-async fn test_bash_hook_no_user_config() {
-    let _xdg_config = setup_isolated_xdg_config();
+async fn test_bash_hook_ask_variants() {
+    #[derive(Clone, Copy)]
+    enum Case {
+        NoUserConfig,
+        NoConfigFile,
+        NoRulesConfigured,
+        RuleAsks,
+    }
 
-    let tool_input = serde_json::json!({"command": "ls -la"});
-    let result = handle_bash_pretool_hook(&tool_input)
-        .await
-        .expect("Should succeed");
-
-    match result.hook_specific_output {
-        Some(HookSpecificOutput::PreToolUse(output)) => {
-            assert_eq!(output.permission_decision, Some(PermissionDecision::Ask));
-            assert_eq!(output.updated_input, None);
-        }
-        _ => panic!("Expected PreToolUse hook specific output"),
+    for case in [
+        Case::NoUserConfig,
+        Case::NoConfigFile,
+        Case::NoRulesConfigured,
+        Case::RuleAsks,
+    ] {
+        let label = match case {
+            Case::NoUserConfig => "no-user-config",
+            Case::NoConfigFile => "no-config-file",
+            Case::NoRulesConfigured => "no-rules-configured",
+            Case::RuleAsks => "rule-asks",
+        };
+        let result = match case {
+            Case::NoUserConfig | Case::NoConfigFile => run_bash_hook_empty_xdg().await,
+            Case::NoRulesConfigured => run_bash_hook("# Empty config file\n", "ls -la").await,
+            Case::RuleAsks => {
+                let config = cfg_bash_rule("ask-docker", "^docker", r#"{ type = "Ask" }"#);
+                run_bash_hook(&config, "docker build .").await
+            }
+        };
+        let output = unwrap_pretool_output(&result);
+        assert_eq!(
+            output.permission_decision,
+            Some(PermissionDecision::Ask),
+            "case {label}"
+        );
+        assert_eq!(output.permission_decision_reason, None, "case {label}");
+        assert_eq!(output.updated_input, None, "case {label}");
     }
 }
 
@@ -584,187 +729,104 @@ async fn test_bash_hook_missing_command_field() {
 }
 
 #[tokio::test]
-async fn test_bash_hook_no_config_file() {
-    let _xdg_config = setup_isolated_xdg_config();
-
-    let tool_input = serde_json::json!({"command": "ls -la"});
-    let result = handle_bash_pretool_hook(&tool_input)
-        .await
-        .expect("Should succeed");
-
-    match result.hook_specific_output {
-        Some(HookSpecificOutput::PreToolUse(output)) => {
-            assert_eq!(output.permission_decision, Some(PermissionDecision::Ask));
-            assert_eq!(output.updated_input, None);
-        }
-        _ => panic!("Expected PreToolUse hook specific output"),
+async fn test_bash_hook_rule_outcome_variants() {
+    enum Expect {
+        Allow,
+        Ask,
+        Deny(&'static str),
+        Modify {
+            expected_command: &'static str,
+            reason_fragments: &'static [&'static str],
+        },
     }
-}
 
-#[tokio::test]
-async fn test_bash_hook_no_rules_configured() {
-    let _xdg_config = setup_user_bash_rules("# Empty config file\n").await;
+    let cases = [
+        (
+            "deny-rm-rf",
+            cfg_bash_rule(
+                "deny-rm-rf",
+                r"^rm\s+-rf\s+/",
+                r#"{ type = "Deny", value = "Dangerous recursive delete" }"#,
+            ),
+            "rm -rf /",
+            Expect::Deny("Dangerous recursive delete"),
+        ),
+        (
+            "modify-dry-run",
+            cfg_bash_rule(
+                "add-dry-run",
+                r"^(docker\s+system\s+prune)",
+                r#"{ type = "Modify", value = "$1 --dry-run" }"#,
+            ),
+            "docker system prune",
+            Expect::Modify {
+                expected_command: "docker system prune --dry-run",
+                reason_fragments: &[
+                    "modified by rule 'add-dry-run'",
+                    "to: docker system prune --dry-run",
+                ],
+            },
+        ),
+        (
+            "allow-ls",
+            cfg_bash_rule("allow-ls", r"^ls($|\s)", r#"{ type = "Allow" }"#),
+            "ls -la",
+            Expect::Allow,
+        ),
+        (
+            "no-match-falls-back-to-ask",
+            cfg_bash_rule(
+                "deny-rm",
+                r"^rm\s",
+                r#"{ type = "Deny", value = "rm denied" }"#,
+            ),
+            "ls -la",
+            Expect::Ask,
+        ),
+    ];
 
-    let tool_input = serde_json::json!({"command": "ls -la"});
-    let result = handle_bash_pretool_hook(&tool_input)
-        .await
-        .expect("Should succeed");
-
-    match result.hook_specific_output {
-        Some(HookSpecificOutput::PreToolUse(output)) => {
-            assert_eq!(output.permission_decision, Some(PermissionDecision::Ask));
-            assert_eq!(output.updated_input, None);
+    for (label, config, command, expected) in cases {
+        let result = run_bash_hook(&config, command).await;
+        match expected {
+            Expect::Allow => {
+                let output = unwrap_pretool_output(&result);
+                assert_eq!(output.permission_decision, Some(PermissionDecision::Allow), "case {label}");
+                assert_eq!(output.updated_input, None, "case {label}");
+            }
+            Expect::Ask => {
+                let output = unwrap_pretool_output(&result);
+                assert_eq!(output.permission_decision, Some(PermissionDecision::Ask), "case {label}");
+                assert_eq!(output.permission_decision_reason, None, "case {label}");
+                assert_eq!(output.updated_input, None, "case {label}");
+            }
+            Expect::Deny(reason) => {
+                assert_eq!(
+                    result.system_message,
+                    Some(reason.to_string()),
+                    "case {label}: system_message should be populated at top level for deny decisions"
+                );
+                let output = unwrap_pretool_output(&result);
+                assert_eq!(output.permission_decision, Some(PermissionDecision::Deny), "case {label}");
+                assert!(output.permission_decision_reason.as_ref().expect("Deny decision should always carry a reason").contains(reason), "case {label}");
+            }
+            Expect::Modify {
+                expected_command,
+                reason_fragments,
+            } => {
+                let output = unwrap_pretool_output(&result);
+                let reason = output
+                    .permission_decision_reason
+                    .as_ref()
+                    .expect("Should have permission decision reason");
+                for fragment in reason_fragments {
+                    assert!(
+                        reason.contains(fragment),
+                        "case {label}: reason should include {fragment:?}: {reason}"
+                    );
+                }
+                assert_pretool_modified_case(&result, expected_command, label);
+            }
         }
-        _ => panic!("Expected PreToolUse hook specific output"),
-    }
-}
-
-#[tokio::test]
-async fn test_bash_hook_rule_asks() {
-    let config = r#"
-[[bash_rules]]
-name = "ask-docker"
-pattern = "^docker"
-action = { type = "Ask" }
-"#;
-    let _xdg_config = setup_user_bash_rules(config).await;
-
-    let tool_input = serde_json::json!({"command": "docker build ."});
-    let result = handle_bash_pretool_hook(&tool_input)
-        .await
-        .expect("Should succeed");
-
-    match result.hook_specific_output {
-        Some(HookSpecificOutput::PreToolUse(output)) => {
-            assert_eq!(output.permission_decision, Some(PermissionDecision::Ask));
-            assert_eq!(output.permission_decision_reason, None);
-            assert_eq!(output.updated_input, None);
-        }
-        _ => panic!("Expected PreToolUse hook specific output"),
-    }
-}
-
-#[tokio::test]
-async fn test_bash_hook_rule_denies() {
-    let config = r#"
-[[bash_rules]]
-name = "deny-rm-rf"
-pattern = "^rm\\s+-rf\\s+/"
-action = { type = "Deny", value = "Dangerous recursive delete" }
-"#;
-    let _xdg_config = setup_user_bash_rules(config).await;
-
-    let tool_input = serde_json::json!({"command": "rm -rf /"});
-    let result = handle_bash_pretool_hook(&tool_input)
-        .await
-        .expect("Should succeed");
-
-    // Verify system_message is populated for user feedback
-    assert_eq!(
-        result.system_message,
-        Some("Dangerous recursive delete".to_string()),
-        "system_message should be populated at top level for deny decisions"
-    );
-
-    match result.hook_specific_output {
-        Some(HookSpecificOutput::PreToolUse(output)) => {
-            assert_eq!(output.permission_decision, Some(PermissionDecision::Deny));
-            assert!(output
-                .permission_decision_reason
-                .unwrap()
-                .contains("Dangerous recursive delete"));
-            assert_eq!(output.updated_input, None);
-        }
-        _ => panic!("Expected PreToolUse hook specific output"),
-    }
-}
-
-#[tokio::test]
-async fn test_bash_hook_rule_modifies() {
-    let config = r#"
-[[bash_rules]]
-name = "add-dry-run"
-pattern = "^(docker\\s+system\\s+prune)"
-action = { type = "Modify", value = "$1 --dry-run" }
-"#;
-    let _xdg_config = setup_user_bash_rules(config).await;
-
-    let tool_input = serde_json::json!({"command": "docker system prune"});
-    let result = handle_bash_pretool_hook(&tool_input)
-        .await
-        .expect("Should succeed");
-
-    match result.hook_specific_output {
-        Some(HookSpecificOutput::PreToolUse(output)) => {
-            assert_eq!(output.permission_decision, Some(PermissionDecision::Allow));
-            let reason = output
-                .permission_decision_reason
-                .expect("Should have permission decision reason");
-            assert!(
-                reason.contains("modified by rule 'add-dry-run'"),
-                "Reason should include rule name: {}",
-                reason
-            );
-            assert!(
-                reason.contains("to: docker system prune --dry-run"),
-                "Reason should include modified command: {}",
-                reason
-            );
-            let updated = output.updated_input.expect("Should have updated input");
-            assert_eq!(
-                updated["command"],
-                serde_json::Value::String("docker system prune --dry-run".to_string())
-            );
-        }
-        _ => panic!("Expected PreToolUse hook specific output"),
-    }
-}
-
-#[tokio::test]
-async fn test_bash_hook_rule_allows() {
-    let config = r#"
-[[bash_rules]]
-name = "allow-ls"
-pattern = "^ls($|\\s)"
-action = { type = "Allow" }
-"#;
-    let _xdg_config = setup_user_bash_rules(config).await;
-
-    let tool_input = serde_json::json!({"command": "ls -la"});
-    let result = handle_bash_pretool_hook(&tool_input)
-        .await
-        .expect("Should succeed");
-
-    match result.hook_specific_output {
-        Some(HookSpecificOutput::PreToolUse(output)) => {
-            assert_eq!(output.permission_decision, Some(PermissionDecision::Allow));
-            assert_eq!(output.updated_input, None);
-        }
-        _ => panic!("Expected PreToolUse hook specific output"),
-    }
-}
-
-#[tokio::test]
-async fn test_bash_hook_no_rules_match() {
-    let config = r#"
-[[bash_rules]]
-name = "deny-rm"
-pattern = "^rm\\s"
-action = { type = "Deny", value = "rm denied" }
-"#;
-    let _xdg_config = setup_user_bash_rules(config).await;
-
-    let tool_input = serde_json::json!({"command": "ls -la"});
-    let result = handle_bash_pretool_hook(&tool_input)
-        .await
-        .expect("Should succeed");
-
-    match result.hook_specific_output {
-        Some(HookSpecificOutput::PreToolUse(output)) => {
-            assert_eq!(output.permission_decision, Some(PermissionDecision::Ask));
-            assert_eq!(output.updated_input, None);
-        }
-        _ => panic!("Expected PreToolUse hook specific output"),
     }
 }
 
@@ -781,41 +843,26 @@ name = "generic-allow-rm"
 pattern = "^rm"
 action = { type = "Allow" }
 "#;
-    let _xdg_config = setup_user_bash_rules(config).await;
+    let result = run_bash_hook(config, "rm -rf /").await;
+    assert_pretool_deny(&result, "Dangerous rm -rf");
 
-    let tool_input = serde_json::json!({"command": "rm -rf /"});
-    let result = handle_bash_pretool_hook(&tool_input)
-        .await
-        .expect("Should succeed");
-
-    match result.hook_specific_output {
-        Some(HookSpecificOutput::PreToolUse(output)) => {
-            assert_eq!(output.permission_decision, Some(PermissionDecision::Deny));
-            assert!(output
-                .permission_decision_reason
-                .as_ref()
-                .unwrap()
-                .contains("Dangerous rm -rf"));
-        }
-        _ => panic!("Expected PreToolUse hook specific output"),
-    }
-
-    let tool_input = serde_json::json!({"command": "rm file.txt"});
-    let result = handle_bash_pretool_hook(&tool_input)
-        .await
-        .expect("Should succeed");
-
-    match result.hook_specific_output {
-        Some(HookSpecificOutput::PreToolUse(output)) => {
-            assert_eq!(output.permission_decision, Some(PermissionDecision::Allow));
-        }
-        _ => panic!("Expected PreToolUse hook specific output"),
-    }
+    let result = run_bash_hook(config, "rm file.txt").await;
+    assert_pretool_allow(&result);
 }
 
 #[tokio::test]
-async fn test_argument_filter_with_allow() {
-    let config = r#"
+async fn test_argument_filter_variants() {
+    enum Expect {
+        Ask,
+        Deny(&'static str),
+        Modified(&'static str),
+        ModifiedContains(&'static [&'static str]),
+    }
+
+    let cases = [
+        (
+            "remove-open-flag",
+            r#"
 [[bash_rules]]
 name = "filter-cargo-doc"
 pattern = "^cargo doc.*--open"
@@ -825,36 +872,13 @@ action = { type = "ArgumentFilter", remove = ["--open"], reason = "Browser flag 
 name = "allow-cargo-doc"
 pattern = "^cargo doc"
 action = { type = "Allow" }
-"#;
-    let _xdg_config = setup_user_bash_rules(config).await;
-
-    let tool_input = serde_json::json!({"command": "cargo doc --open --no-deps"});
-    let result = handle_bash_pretool_hook(&tool_input)
-        .await
-        .expect("Should succeed");
-
-    match result.hook_specific_output {
-        Some(HookSpecificOutput::PreToolUse(output)) => {
-            assert_eq!(output.permission_decision, Some(PermissionDecision::Allow));
-            // Check that command was filtered
-            if let Some(serde_json::Value::Object(modified)) = &output.updated_input {
-                assert_eq!(
-                    modified.get("command"),
-                    Some(&serde_json::Value::String(
-                        "cargo doc --no-deps".to_string()
-                    ))
-                );
-            } else {
-                panic!("Expected updated_input");
-            }
-        }
-        _ => panic!("Expected PreToolUse hook specific output"),
-    }
-}
-
-#[tokio::test]
-async fn test_argument_filter_with_deny() {
-    let config = r#"
+"#,
+            "cargo doc --open --no-deps",
+            Expect::Modified("cargo doc --no-deps"),
+        ),
+        (
+            "filtered-command-now-denied",
+            r#"
 [[bash_rules]]
 name = "filter-dangerous-rm"
 pattern = "^rm .*-rf"
@@ -864,31 +888,13 @@ action = { type = "ArgumentFilter", remove = ["-rf"], reason = "Removed dangerou
 name = "deny-rm-root"
 pattern = "^rm.*/"
 action = { type = "Deny", value = "Cannot delete root paths" }
-"#;
-    let _xdg_config = setup_user_bash_rules(config).await;
-
-    // Command with -rf and / - filter removes -rf, but / still matches deny rule
-    let tool_input = serde_json::json!({"command": "rm -rf /"});
-    let result = handle_bash_pretool_hook(&tool_input)
-        .await
-        .expect("Should succeed");
-
-    match result.hook_specific_output {
-        Some(HookSpecificOutput::PreToolUse(output)) => {
-            assert_eq!(output.permission_decision, Some(PermissionDecision::Deny));
-            assert!(output
-                .permission_decision_reason
-                .as_ref()
-                .unwrap()
-                .contains("Cannot delete root paths"));
-        }
-        _ => panic!("Expected PreToolUse hook specific output"),
-    }
-}
-
-#[tokio::test]
-async fn test_argument_filter_with_no_match() {
-    let config = r#"
+"#,
+            "rm -rf /",
+            Expect::Deny("Cannot delete root paths"),
+        ),
+        (
+            "filtered-command-falls-back-to-ask",
+            r#"
 [[bash_rules]]
 name = "filter-cargo-doc"
 pattern = "^cargo doc\\b"
@@ -898,27 +904,13 @@ action = { type = "ArgumentFilter", remove = ["--open"], reason = "Browser flag 
 name = "allow-cargo-build"
 pattern = "^cargo build"
 action = { type = "Allow" }
-"#;
-    let _xdg_config = setup_user_bash_rules(config).await;
-
-    // cargo doc --open gets filtered to "cargo doc", but no rule allows "cargo doc"
-    let tool_input = serde_json::json!({"command": "cargo doc --open"});
-    let result = handle_bash_pretool_hook(&tool_input)
-        .await
-        .expect("Should succeed");
-
-    match result.hook_specific_output {
-        Some(HookSpecificOutput::PreToolUse(output)) => {
-            // Should ask user because filtered command doesn't match any allow rule
-            assert_eq!(output.permission_decision, Some(PermissionDecision::Ask));
-        }
-        _ => panic!("Expected PreToolUse hook specific output"),
-    }
-}
-
-#[tokio::test]
-async fn test_argument_filter_loop_prevention() {
-    let config = r#"
+"#,
+            "cargo doc --open",
+            Expect::Ask,
+        ),
+        (
+            "multiple-filters-no-final-allow",
+            r#"
 [[bash_rules]]
 name = "filter-1"
 pattern = "^cargo doc\\b"
@@ -928,28 +920,13 @@ action = { type = "ArgumentFilter", remove = ["--open"], reason = "First filter"
 name = "filter-2"
 pattern = "^cargo doc\\b"
 action = { type = "ArgumentFilter", add = ["--offline"], reason = "Second filter" }
-"#;
-    let _xdg_config = setup_user_bash_rules(config).await;
-
-    // First filter matches and removes --open, but result matches second filter
-    // Should ask user to prevent infinite loops
-    let tool_input = serde_json::json!({"command": "cargo doc --open"});
-    let result = handle_bash_pretool_hook(&tool_input)
-        .await
-        .expect("Should succeed");
-
-    match result.hook_specific_output {
-        Some(HookSpecificOutput::PreToolUse(output)) => {
-            // Should ask user to prevent chained argument filtering
-            assert_eq!(output.permission_decision, Some(PermissionDecision::Ask));
-        }
-        _ => panic!("Expected PreToolUse hook specific output"),
-    }
-}
-
-#[tokio::test]
-async fn test_argument_filter_add_arguments() {
-    let config = r#"
+"#,
+            "cargo doc --open",
+            Expect::Ask,
+        ),
+        (
+            "add-safety-flags",
+            r#"
 [[bash_rules]]
 name = "allow-docker-run-safe"
 pattern = "^docker run .* --read-only"
@@ -959,35 +936,13 @@ action = { type = "Allow" }
 name = "add-safety-flags"
 pattern = "^docker run ubuntu$"
 action = { type = "ArgumentFilter", add = ["--read-only", "--security-opt=no-new-privileges"], reason = "Added security flags" }
-"#;
-    let _xdg_config = setup_user_bash_rules(config).await;
-
-    let tool_input = serde_json::json!({"command": "docker run ubuntu"});
-    let result = handle_bash_pretool_hook(&tool_input)
-        .await
-        .expect("Should succeed");
-
-    match result.hook_specific_output {
-        Some(HookSpecificOutput::PreToolUse(output)) => {
-            assert_eq!(output.permission_decision, Some(PermissionDecision::Allow));
-            if let Some(serde_json::Value::Object(modified)) = &output.updated_input {
-                let command_str = modified
-                    .get("command")
-                    .and_then(|v| v.as_str())
-                    .expect("Expected command string");
-                assert!(command_str.contains("--read-only"));
-                assert!(command_str.contains("--security-opt=no-new-privileges"));
-            } else {
-                panic!("Expected updated_input");
-            }
-        }
-        _ => panic!("Expected PreToolUse hook specific output"),
-    }
-}
-
-#[tokio::test]
-async fn test_argument_filter_replace_arguments() {
-    let config = r#"
+"#,
+            "docker run ubuntu",
+            Expect::ModifiedContains(&["--read-only", "--security-opt=no-new-privileges"]),
+        ),
+        (
+            "replace-force-with-interactive",
+            r#"
 [[bash_rules]]
 name = "allow-rm-interactive"
 pattern = "^rm .* -i$"
@@ -997,33 +952,13 @@ action = { type = "Allow" }
 name = "force-interactive-rm"
 pattern = "^rm -f file\\.txt$"
 action = { type = "ArgumentFilter", remove = ["-f", "--force"], add = ["-i"], reason = "Replaced force mode with interactive" }
-"#;
-    let _xdg_config = setup_user_bash_rules(config).await;
-
-    let tool_input = serde_json::json!({"command": "rm -f file.txt"});
-    let result = handle_bash_pretool_hook(&tool_input)
-        .await
-        .expect("Should succeed");
-
-    match result.hook_specific_output {
-        Some(HookSpecificOutput::PreToolUse(output)) => {
-            assert_eq!(output.permission_decision, Some(PermissionDecision::Allow));
-            if let Some(serde_json::Value::Object(modified)) = &output.updated_input {
-                assert_eq!(
-                    modified.get("command"),
-                    Some(&serde_json::Value::String("rm file.txt -i".to_string()))
-                );
-            } else {
-                panic!("Expected updated_input");
-            }
-        }
-        _ => panic!("Expected PreToolUse hook specific output"),
-    }
-}
-
-#[tokio::test]
-async fn test_argument_filter_revalidation_to_modify() {
-    let config = r#"
+"#,
+            "rm -f file.txt",
+            Expect::Modified("rm file.txt -i"),
+        ),
+        (
+            "filter-then-modify",
+            r#"
 [[bash_rules]]
 name = "filter-docker-safety"
 pattern = "^docker run.*--privileged"
@@ -1033,41 +968,13 @@ action = { type = "ArgumentFilter", remove = ["--privileged"], reason = "Removed
 name = "modify-docker-add-limits"
 pattern = "^docker run"
 action = { type = "Modify", value = "$0 --memory=1g" }
-"#;
-    let _xdg_config = setup_user_bash_rules(config).await;
-
-    let tool_input = serde_json::json!({"command": "docker run --privileged ubuntu"});
-    let result = handle_bash_pretool_hook(&tool_input)
-        .await
-        .expect("Should succeed");
-
-    match result.hook_specific_output {
-        Some(HookSpecificOutput::PreToolUse(output)) => {
-            // After filtering removes --privileged, the command matches Modify rule
-            // which transforms it further
-            assert_eq!(output.permission_decision, Some(PermissionDecision::Allow));
-            if let Some(serde_json::Value::Object(modified)) = &output.updated_input {
-                // The Modify rule matches "^docker run" and replaces with "$0 --memory=1g"
-                // After ArgumentFilter removes --privileged, we have "docker run ubuntu"
-                // But $0 only captures "docker run" (the matched part), so we get "docker run --memory=1g"
-                // The "ubuntu" argument is not included because it wasn't part of the regex match
-                assert_eq!(
-                    modified.get("command"),
-                    Some(&serde_json::Value::String(
-                        "docker run --memory=1g".to_string()
-                    ))
-                );
-            } else {
-                panic!("Expected updated_input");
-            }
-        }
-        _ => panic!("Expected PreToolUse hook specific output"),
-    }
-}
-
-#[tokio::test]
-async fn test_argument_filter_revalidation_to_ask() {
-    let config = r#"
+"#,
+            "docker run --privileged ubuntu",
+            Expect::Modified("docker run --memory=1g"),
+        ),
+        (
+            "filter-then-ask",
+            r#"
 [[bash_rules]]
 name = "filter-sudo-flags"
 pattern = "^sudo.*--non-interactive"
@@ -1077,19 +984,33 @@ action = { type = "ArgumentFilter", remove = ["--non-interactive"], reason = "Re
 name = "ask-for-sudo"
 pattern = "^sudo"
 action = { type = "Ask" }
-"#;
-    let _xdg_config = setup_user_bash_rules(config).await;
+"#,
+            "sudo --non-interactive apt install vim",
+            Expect::Ask,
+        ),
+    ];
 
-    let tool_input = serde_json::json!({"command": "sudo --non-interactive apt install vim"});
-    let result = handle_bash_pretool_hook(&tool_input)
-        .await
-        .expect("Should succeed");
-
-    match result.hook_specific_output {
-        Some(HookSpecificOutput::PreToolUse(output)) => {
-            assert_eq!(output.permission_decision, Some(PermissionDecision::Ask));
+    for (label, config, command, expected) in cases {
+        let result = run_bash_hook(config, command).await;
+        match expected {
+            Expect::Ask => {
+                let output = unwrap_pretool_output(&result);
+                assert_eq!(output.permission_decision, Some(PermissionDecision::Ask), "case {label}");
+                assert_eq!(output.permission_decision_reason, None, "case {label}");
+                assert_eq!(output.updated_input, None, "case {label}");
+            }
+            Expect::Deny(reason) => {
+                let output = unwrap_pretool_output(&result);
+                assert_eq!(output.permission_decision, Some(PermissionDecision::Deny), "case {label}");
+                assert!(output.permission_decision_reason.as_ref().expect("deny reason").contains(reason), "case {label}");
+            }
+            Expect::Modified(expected_command) => {
+                assert_pretool_modified_case(&result, expected_command, label)
+            }
+            Expect::ModifiedContains(fragments) => {
+                assert_pretool_modified_contains_case(&result, fragments, label)
+            }
         }
-        _ => panic!("Expected PreToolUse hook specific output"),
     }
 }
 
@@ -1150,15 +1071,12 @@ fn test_pretool_deny_hook_serialization_format() {
     let parsed: HookOutput = serde_json::from_str(&json).expect("Failed to parse");
     assert_eq!(parsed.system_message, Some("Command blocked".to_string()));
 
-    if let Some(HookSpecificOutput::PreToolUse(pretool)) = parsed.hook_specific_output {
-        assert_eq!(pretool.permission_decision, Some(PermissionDecision::Deny));
-        assert_eq!(
-            pretool.permission_decision_reason,
-            Some("Command blocked".to_string())
-        );
-    } else {
-        panic!("Expected PreToolUse hook specific output");
-    }
+    let pretool = unwrap_pretool_output(&parsed);
+    assert_eq!(pretool.permission_decision, Some(PermissionDecision::Deny));
+    assert_eq!(
+        pretool.permission_decision_reason,
+        Some("Command blocked".to_string())
+    );
 }
 
 #[test]
@@ -1191,49 +1109,40 @@ fn test_allow_hook_without_message_omits_system_message() {
     assert_eq!(output.decision, Some(HookDecision::Approve));
 }
 
+/// Assert the embedded `PreToolUseOutput` carries the expected decision + optional
+/// reason (matching both `permission_decision_reason` and the top-level
+/// `system_message`).
+fn assert_pretool_decision(
+    output: &HookOutput,
+    decision: PermissionDecision,
+    reason: Option<&str>,
+) {
+    let pretool = unwrap_pretool_output(output);
+    assert_eq!(pretool.permission_decision, Some(decision));
+    let expected = reason.map(str::to_string);
+    assert_eq!(pretool.permission_decision_reason, expected);
+    assert_eq!(output.system_message, expected);
+}
+
 #[test]
 fn test_pretool_deny_hook_sets_system_message() {
     let reason = "Command blocked by bash rules";
     let output = pretool_deny_hook(reason.to_string());
-
-    // PreToolUse hooks use permission_decision_reason, not reason
+    // PreToolUse hooks use permission_decision_reason, not the outer `reason`.
     assert_eq!(output.reason, None);
-    assert_eq!(output.system_message, Some(reason.to_string()));
-
-    if let Some(HookSpecificOutput::PreToolUse(pretool)) = output.hook_specific_output {
-        assert_eq!(pretool.permission_decision_reason, Some(reason.to_string()));
-        assert_eq!(pretool.permission_decision, Some(PermissionDecision::Deny));
-    } else {
-        panic!("Expected PreToolUse hook output");
-    }
+    assert_pretool_decision(&output, PermissionDecision::Deny, Some(reason));
 }
 
 #[test]
-fn test_pretool_allow_hook_with_reason_sets_system_message() {
-    let reason = "Allowed by whitelist rule";
-    let output = pretool_allow_hook(Some(reason.to_string()));
+fn test_pretool_allow_hook_variants() {
+    let cases = [
+        (Some("Allowed by whitelist rule"), Some("Allowed by whitelist rule")),
+        (None, None),
+    ];
 
-    assert_eq!(output.system_message, Some(reason.to_string()));
-
-    if let Some(HookSpecificOutput::PreToolUse(pretool)) = output.hook_specific_output {
-        assert_eq!(pretool.permission_decision_reason, Some(reason.to_string()));
-        assert_eq!(pretool.permission_decision, Some(PermissionDecision::Allow));
-    } else {
-        panic!("Expected PreToolUse hook output");
-    }
-}
-
-#[test]
-fn test_pretool_allow_hook_without_reason_omits_system_message() {
-    let output = pretool_allow_hook(None);
-
-    assert_eq!(output.system_message, None);
-
-    if let Some(HookSpecificOutput::PreToolUse(pretool)) = output.hook_specific_output {
-        assert_eq!(pretool.permission_decision_reason, None);
-        assert_eq!(pretool.permission_decision, Some(PermissionDecision::Allow));
-    } else {
-        panic!("Expected PreToolUse hook output");
+    for (reason, expected_reason) in cases {
+        let output = pretool_allow_hook(reason.map(ToString::to_string));
+        assert_pretool_decision(&output, PermissionDecision::Allow, expected_reason);
     }
 }
 
@@ -1245,12 +1154,9 @@ fn test_pretool_modify_hook_sets_system_message() {
 
     assert_eq!(output.system_message, Some(reason.to_string()));
 
-    if let Some(HookSpecificOutput::PreToolUse(pretool)) = output.hook_specific_output {
-        assert_eq!(pretool.permission_decision_reason, Some(reason.to_string()));
-        assert_eq!(pretool.updated_input, Some(new_input));
-    } else {
-        panic!("Expected PreToolUse hook output");
-    }
+    let pretool = unwrap_pretool_output(&output);
+    assert_eq!(pretool.permission_decision_reason, Some(reason.to_string()));
+    assert_eq!(pretool.updated_input, Some(new_input));
 }
 
 #[test]
@@ -1260,12 +1166,9 @@ fn test_pretool_modify_hook_without_reason_omits_system_message() {
 
     assert_eq!(output.system_message, None);
 
-    if let Some(HookSpecificOutput::PreToolUse(pretool)) = output.hook_specific_output {
-        assert_eq!(pretool.permission_decision_reason, None);
-        assert_eq!(pretool.updated_input, Some(new_input));
-    } else {
-        panic!("Expected PreToolUse hook output");
-    }
+    let pretool = unwrap_pretool_output(&output);
+    assert_eq!(pretool.permission_decision_reason, None);
+    assert_eq!(pretool.updated_input, Some(new_input));
 }
 
 #[test]
@@ -1276,90 +1179,69 @@ fn test_pretool_ask_hook_omits_system_message() {
     assert_eq!(output.system_message, None);
     assert_eq!(output.reason, None);
 
-    if let Some(HookSpecificOutput::PreToolUse(pretool)) = output.hook_specific_output {
-        assert_eq!(pretool.permission_decision, Some(PermissionDecision::Ask));
-    } else {
-        panic!("Expected PreToolUse hook output");
-    }
+    let pretool = unwrap_pretool_output(&output);
+    assert_eq!(pretool.permission_decision, Some(PermissionDecision::Ask));
 }
 
 // ===== Tool Rules integration tests =====
 
 #[tokio::test]
-async fn test_tool_rule_allow_non_bash() {
-    let config = r#"
-[[tool_rules]]
-name = "allow-read"
-tool = "Read"
-action = { type = "Allow" }
-"#;
-    let _xdg_config = setup_user_bash_rules(config).await;
-
-    let tool_input = serde_json::json!({"file_path": "/tmp/foo.rs"});
-    let result = handle_pretool_hook("Read", &tool_input, "")
-        .await
-        .expect("Should succeed");
-
-    match result.hook_specific_output {
-        Some(HookSpecificOutput::PreToolUse(output)) => {
-            assert_eq!(output.permission_decision, Some(PermissionDecision::Allow));
-        }
-        _ => panic!("Expected PreToolUse hook specific output"),
+async fn test_tool_rule_non_bash_outcome_variants() {
+    enum Expect {
+        Allow,
+        Ask,
+        Deny(&'static str),
     }
-}
 
-#[tokio::test]
-async fn test_tool_rule_deny_non_bash() {
-    let config = r#"
-[[tool_rules]]
-name = "deny-write"
-tool = "Write"
-action = { type = "Deny", value = "Writes are blocked" }
-"#;
-    let _xdg_config = setup_user_bash_rules(config).await;
+    let cases = [
+        (
+            "allow-read",
+            cfg_tool_rule("allow-read", "Read", r#"{ type = "Allow" }"#),
+            "Read",
+            serde_json::json!({"file_path": "/tmp/foo.rs"}),
+            Expect::Allow,
+        ),
+        (
+            "deny-write",
+            cfg_tool_rule(
+                "deny-write",
+                "Write",
+                r#"{ type = "Deny", value = "Writes are blocked" }"#,
+            ),
+            "Write",
+            serde_json::json!({"file_path": "/tmp/foo.rs", "content": "hello"}),
+            Expect::Deny("Writes are blocked"),
+        ),
+        (
+            "ask-edit",
+            cfg_tool_rule("ask-edit", "Edit", r#"{ type = "Ask" }"#),
+            "Edit",
+            serde_json::json!({"file_path": "/tmp/foo.rs"}),
+            Expect::Ask,
+        ),
+    ];
 
-    let tool_input = serde_json::json!({"file_path": "/tmp/foo.rs", "content": "hello"});
-    let result = handle_pretool_hook("Write", &tool_input, "")
-        .await
-        .expect("Should succeed");
-
-    assert_eq!(
-        result.system_message,
-        Some("Writes are blocked".to_string())
-    );
-
-    match result.hook_specific_output {
-        Some(HookSpecificOutput::PreToolUse(output)) => {
-            assert_eq!(output.permission_decision, Some(PermissionDecision::Deny));
-            assert!(output
-                .permission_decision_reason
-                .unwrap()
-                .contains("Writes are blocked"));
+    for (label, config, tool, input, expected) in cases {
+        let result = run_pretool_hook(&config, tool, &input, "").await;
+        match expected {
+            Expect::Allow => {
+                let output = unwrap_pretool_output(&result);
+                assert_eq!(output.permission_decision, Some(PermissionDecision::Allow), "case {label}");
+                assert_eq!(output.updated_input, None, "case {label}");
+            }
+            Expect::Ask => {
+                let output = unwrap_pretool_output(&result);
+                assert_eq!(output.permission_decision, Some(PermissionDecision::Ask), "case {label}");
+                assert_eq!(output.permission_decision_reason, None, "case {label}");
+                assert_eq!(output.updated_input, None, "case {label}");
+            }
+            Expect::Deny(reason) => {
+                assert_eq!(result.system_message, Some(reason.to_string()), "case {label}");
+                let output = unwrap_pretool_output(&result);
+                assert_eq!(output.permission_decision, Some(PermissionDecision::Deny), "case {label}");
+                assert!(output.permission_decision_reason.as_ref().expect("deny reason").contains(reason), "case {label}");
+            }
         }
-        _ => panic!("Expected PreToolUse hook specific output"),
-    }
-}
-
-#[tokio::test]
-async fn test_tool_rule_ask_non_bash() {
-    let config = r#"
-[[tool_rules]]
-name = "ask-edit"
-tool = "Edit"
-action = { type = "Ask" }
-"#;
-    let _xdg_config = setup_user_bash_rules(config).await;
-
-    let tool_input = serde_json::json!({"file_path": "/tmp/foo.rs"});
-    let result = handle_pretool_hook("Edit", &tool_input, "")
-        .await
-        .expect("Should succeed");
-
-    match result.hook_specific_output {
-        Some(HookSpecificOutput::PreToolUse(output)) => {
-            assert_eq!(output.permission_decision, Some(PermissionDecision::Ask));
-        }
-        _ => panic!("Expected PreToolUse hook specific output"),
     }
 }
 
@@ -1378,34 +1260,25 @@ name = "allow-write"
 tool = "Write"
 action = { type = "Allow" }
 "#;
-    let _xdg_config = setup_user_bash_rules(config).await;
-
     // .env file should be denied
-    let tool_input = serde_json::json!({"file_path": "/home/user/.env", "content": "SECRET=x"});
-    let result = handle_pretool_hook("Write", &tool_input, "")
-        .await
-        .expect("Should succeed");
-
-    match result.hook_specific_output {
-        Some(HookSpecificOutput::PreToolUse(output)) => {
-            assert_eq!(output.permission_decision, Some(PermissionDecision::Deny));
-        }
-        _ => panic!("Expected PreToolUse hook specific output"),
-    }
+    let result = run_pretool_hook(
+        config,
+        "Write",
+        &serde_json::json!({"file_path": "/home/user/.env", "content": "SECRET=x"}),
+        "",
+    )
+    .await;
+    assert_pretool_deny(&result, "Cannot write to .env files");
 
     // Non-.env file should be allowed
-    let tool_input =
-        serde_json::json!({"file_path": "/home/user/main.rs", "content": "fn main() {}"});
-    let result = handle_pretool_hook("Write", &tool_input, "")
-        .await
-        .expect("Should succeed");
-
-    match result.hook_specific_output {
-        Some(HookSpecificOutput::PreToolUse(output)) => {
-            assert_eq!(output.permission_decision, Some(PermissionDecision::Allow));
-        }
-        _ => panic!("Expected PreToolUse hook specific output"),
-    }
+    let result = run_pretool_hook(
+        config,
+        "Write",
+        &serde_json::json!({"file_path": "/home/user/main.rs", "content": "fn main() {}"}),
+        "",
+    )
+    .await;
+    assert_pretool_allow(&result);
 }
 
 #[tokio::test]
@@ -1421,24 +1294,15 @@ name = "deny-everything"
 pattern = ".*"
 action = { type = "Deny", value = "Everything denied" }
 "#;
-    let _xdg_config = setup_user_bash_rules(config).await;
-
     // tool_rules should match first and Allow, even though bash_rules would deny
-    let tool_input = serde_json::json!({"command": "rm -rf /"});
-    let result = handle_pretool_hook("Bash", &tool_input, "")
-        .await
-        .expect("Should succeed");
-
-    match result.hook_specific_output {
-        Some(HookSpecificOutput::PreToolUse(output)) => {
-            assert_eq!(
-                output.permission_decision,
-                Some(PermissionDecision::Allow),
-                "tool_rules should take precedence over bash_rules"
-            );
-        }
-        _ => panic!("Expected PreToolUse hook specific output"),
-    }
+    let result = run_pretool_hook(
+        config,
+        "Bash",
+        &serde_json::json!({"command": "rm -rf /"}),
+        "",
+    )
+    .await;
+    assert_pretool_allow(&result);
 }
 
 #[tokio::test]
@@ -1459,33 +1323,25 @@ name = "deny-rm"
 pattern = "^rm"
 action = { type = "Deny", value = "rm not allowed" }
 "#;
-    let _xdg_config = setup_user_bash_rules(config).await;
-
     // Bash tool: tool_rules don't match (only Read matches), falls through to bash_rules
-    let tool_input = serde_json::json!({"command": "ls -la"});
-    let result = handle_pretool_hook("Bash", &tool_input, "")
-        .await
-        .expect("Should succeed");
-
-    match result.hook_specific_output {
-        Some(HookSpecificOutput::PreToolUse(output)) => {
-            assert_eq!(output.permission_decision, Some(PermissionDecision::Allow));
-        }
-        _ => panic!("Expected PreToolUse hook specific output"),
-    }
+    let result = run_pretool_hook(
+        config,
+        "Bash",
+        &serde_json::json!({"command": "ls -la"}),
+        "",
+    )
+    .await;
+    assert_pretool_allow(&result);
 
     // rm should be denied by bash_rules
-    let tool_input = serde_json::json!({"command": "rm file.txt"});
-    let result = handle_pretool_hook("Bash", &tool_input, "")
-        .await
-        .expect("Should succeed");
-
-    match result.hook_specific_output {
-        Some(HookSpecificOutput::PreToolUse(output)) => {
-            assert_eq!(output.permission_decision, Some(PermissionDecision::Deny));
-        }
-        _ => panic!("Expected PreToolUse hook specific output"),
-    }
+    let result = run_pretool_hook(
+        config,
+        "Bash",
+        &serde_json::json!({"command": "rm file.txt"}),
+        "",
+    )
+    .await;
+    assert_pretool_deny(&result, "rm not allowed");
 }
 
 #[tokio::test]
@@ -1509,13 +1365,8 @@ async fn test_non_bash_tool_no_rules_returns_passthrough() {
 
 #[tokio::test]
 async fn test_non_bash_tool_no_matching_rule_returns_passthrough() {
-    let config = r#"
-[[tool_rules]]
-name = "allow-write"
-tool = "Write"
-action = { type = "Allow" }
-"#;
-    let _xdg_config = setup_user_bash_rules(config).await;
+    let config = cfg_tool_rule("allow-write", "Write", r#"{ type = "Allow" }"#);
+    let _xdg_config = setup_user_bash_rules(&config).await;
 
     // Config exists with rules, but none match Read — should passthrough
     let result = handle_pretool_hook("Read", &serde_json::json!({"file_path": "/tmp/foo"}), "")
@@ -1539,96 +1390,61 @@ name = "ask-everything-else"
 tool = "*"
 action = { type = "Ask" }
 "#;
-    let _xdg_config = setup_user_bash_rules(config).await;
-
     // Read matches specific rule
-    let result = handle_pretool_hook("Read", &serde_json::json!({}), "")
-        .await
-        .expect("Should succeed");
-
-    match result.hook_specific_output {
-        Some(HookSpecificOutput::PreToolUse(output)) => {
-            assert_eq!(output.permission_decision, Some(PermissionDecision::Allow));
-        }
-        _ => panic!("Expected PreToolUse hook specific output"),
-    }
+    let result = run_pretool_hook(config, "Read", &serde_json::json!({}), "").await;
+    assert_pretool_allow(&result);
 
     // Write matches wildcard
-    let result = handle_pretool_hook("Write", &serde_json::json!({}), "")
-        .await
-        .expect("Should succeed");
-
-    match result.hook_specific_output {
-        Some(HookSpecificOutput::PreToolUse(output)) => {
-            assert_eq!(output.permission_decision, Some(PermissionDecision::Ask));
-        }
-        _ => panic!("Expected PreToolUse hook specific output"),
-    }
+    let result = run_pretool_hook(config, "Write", &serde_json::json!({}), "").await;
+    assert_pretool_ask(&result);
 
     // Bash also matches wildcard (before bash_rules run)
-    let tool_input = serde_json::json!({"command": "echo hi"});
-    let result = handle_pretool_hook("Bash", &tool_input, "")
-        .await
-        .expect("Should succeed");
-
-    match result.hook_specific_output {
-        Some(HookSpecificOutput::PreToolUse(output)) => {
-            assert_eq!(
-                output.permission_decision,
-                Some(PermissionDecision::Ask),
-                "Wildcard should match Bash too"
-            );
-        }
-        _ => panic!("Expected PreToolUse hook specific output"),
-    }
+    let result = run_pretool_hook(
+        config,
+        "Bash",
+        &serde_json::json!({"command": "echo hi"}),
+        "",
+    )
+    .await;
+    assert_pretool_ask(&result);
 }
+
+/// Canonical PreToolUse Read event payload used by the passthrough tests.
+const PRETOOL_READ_EVENT: &str = r#"{
+    "session_id": "test-session",
+    "transcript_path": "/tmp/transcript.json",
+    "cwd": "/tmp/project",
+    "permission_mode": "default",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Read",
+    "tool_input": {"file_path": "/tmp/foo.rs"}
+}"#;
 
 #[tokio::test]
 async fn test_exec_hook_impl_non_bash_pretool_produces_output() {
     let _xdg_dir = setup_isolated_xdg_state();
     let _xdg_config = setup_isolated_xdg_config();
 
-    // Non-Bash PreToolUse event should succeed and produce empty JSON output (passthrough)
-    let input = r#"{
-        "session_id": "test-session",
-        "transcript_path": "/tmp/transcript.json",
-        "cwd": "/tmp/project",
-        "permission_mode": "default",
-        "hook_event_name": "PreToolUse",
-        "tool_name": "Read",
-        "tool_input": {"file_path": "/tmp/foo.rs"}
-    }"#;
-
-    let cursor = Cursor::new(input);
-    let result = exec_hook_impl(cursor).await;
-    result.expect("Non-Bash PreToolUse should succeed and produce output");
+    // Non-Bash PreToolUse event should succeed and produce empty JSON output (passthrough).
+    run_exec_hook_expect_ok(
+        PRETOOL_READ_EVENT,
+        "Non-Bash PreToolUse should succeed and produce output",
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn test_exec_hook_impl_non_bash_pretool_with_tool_rules() {
     let _xdg_dir = setup_isolated_xdg_state();
 
-    let config = r#"
-[[tool_rules]]
-name = "allow-read"
-tool = "Read"
-action = { type = "Allow" }
-"#;
-    let _xdg_config = setup_user_bash_rules(config).await;
+    let config = cfg_tool_rule("allow-read", "Read", r#"{ type = "Allow" }"#);
+    let _xdg_config = setup_user_bash_rules(&config).await;
 
-    let input = r#"{
-        "session_id": "test-session",
-        "transcript_path": "/tmp/transcript.json",
-        "cwd": "/tmp/project",
-        "permission_mode": "default",
-        "hook_event_name": "PreToolUse",
-        "tool_name": "Read",
-        "tool_input": {"file_path": "/tmp/foo.rs"}
-    }"#;
-
-    let cursor = Cursor::new(input);
-    let result = exec_hook_impl(cursor).await;
-    result.expect("Non-Bash PreToolUse with tool_rules should succeed");
+    run_exec_hook_expect_ok(
+        PRETOOL_READ_EVENT,
+        "Non-Bash PreToolUse with tool_rules should succeed",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -1649,16 +1465,7 @@ async fn test_pretool_hook_invalid_config_defaults_to_ask() {
         .await
         .expect("Should succeed with Ask fallback");
 
-    match result.hook_specific_output {
-        Some(HookSpecificOutput::PreToolUse(output)) => {
-            assert_eq!(
-                output.permission_decision,
-                Some(PermissionDecision::Ask),
-                "Invalid config should fail-open to Ask"
-            );
-        }
-        _ => panic!("Expected PreToolUse hook specific output"),
-    }
+    assert_pretool_ask(&result);
 }
 
 // ===== cwd stripping integration tests =====
@@ -1673,24 +1480,15 @@ field = "path"
 pattern = "^flake\\.nix$"
 action = { type = "Allow" }
 "#;
-    let _xdg_config = setup_user_bash_rules(config).await;
-
     // Absolute path with matching cwd should be stripped to "flake.nix" and match
-    let tool_input = serde_json::json!({"path": "/tmp/project/flake.nix"});
-    let result = handle_pretool_hook("Read", &tool_input, "/tmp/project")
-        .await
-        .expect("Should succeed");
-
-    match result.hook_specific_output {
-        Some(HookSpecificOutput::PreToolUse(output)) => {
-            assert_eq!(
-                output.permission_decision,
-                Some(PermissionDecision::Allow),
-                "Relative pattern should match after cwd stripping"
-            );
-        }
-        _ => panic!("Expected PreToolUse hook specific output"),
-    }
+    let result = run_pretool_hook(
+        config,
+        "Read",
+        &serde_json::json!({"path": "/tmp/project/flake.nix"}),
+        "/tmp/project",
+    )
+    .await;
+    assert_pretool_allow(&result);
 }
 
 #[tokio::test]
@@ -1703,14 +1501,15 @@ field = "path"
 pattern = "^flake\\.nix$"
 action = { type = "Allow" }
 "#;
-    let _xdg_config = setup_user_bash_rules(config).await;
-
     // Different cwd means path is not stripped, so "^flake\.nix$" won't match the absolute path.
     // Since no tool rule matches and this is a non-Bash tool, we get passthrough (no decision).
-    let tool_input = serde_json::json!({"path": "/tmp/project/flake.nix"});
-    let result = handle_pretool_hook("Read", &tool_input, "/other/dir")
-        .await
-        .expect("Should succeed");
+    let result = run_pretool_hook(
+        config,
+        "Read",
+        &serde_json::json!({"path": "/tmp/project/flake.nix"}),
+        "/other/dir",
+    )
+    .await;
 
     assert_eq!(
         result.hook_specific_output, None,
@@ -1721,18 +1520,36 @@ action = { type = "Allow" }
 
 // ===== allow_local integration tests =====
 
-#[tokio::test]
-async fn test_tool_rule_allow_local_matches_existing_path() {
-    let config = r#"
+/// Standard `tool_rules` config for `Read` with `allow_local = true` and `Allow` action.
+const ALLOW_LOCAL_READ_CONFIG: &str = r#"
 [[tool_rules]]
 name = "allow-local-read"
 tool = "Read"
 allow_local = true
-field = "file_path"
-pattern = "^src/.*\\.rs$"
 action = { type = "Allow" }
 "#;
-    let _xdg_config = setup_user_bash_rules(config).await;
+
+/// Runs a `Read` pretool hook with the standard allow-local config, returning the
+/// hook result. Callers are responsible for creating the directory structure that
+/// backs `cwd` and `path`.
+async fn run_allow_local_read(
+    cwd: &std::path::Path,
+    path: impl Into<serde_json::Value>,
+) -> HookOutput {
+    let _xdg_config = setup_user_bash_rules(ALLOW_LOCAL_READ_CONFIG).await;
+    handle_pretool_hook(
+        "Read",
+        &serde_json::json!({ "path": path.into() }),
+        cwd.to_str().unwrap(),
+    )
+    .await
+    .expect("Should succeed")
+}
+
+#[tokio::test]
+async fn test_tool_rule_allow_local_matches_existing_path() {
+    let config = cfg_allow_local_rule("Read", "file_path", r"^src/.*\.rs$", r#"{ type = "Allow" }"#);
+    let _xdg_config = setup_user_bash_rules(&config).await;
 
     let temp_dir = TempDir::new().unwrap();
     let cwd = temp_dir.path();
@@ -1748,26 +1565,13 @@ action = { type = "Allow" }
     )
     .await
     .expect("Should succeed");
-    match result.hook_specific_output {
-        Some(HookSpecificOutput::PreToolUse(output)) => {
-            assert_eq!(output.permission_decision, Some(PermissionDecision::Allow));
-        }
-        _ => panic!("Expected PreToolUse hook specific output"),
-    }
+    assert_pretool_allow(&result);
 }
 
 #[tokio::test]
 async fn test_tool_rule_allow_local_matches_nonexistent_path() {
-    let config = r#"
-[[tool_rules]]
-name = "allow-local-read"
-tool = "Read"
-allow_local = true
-field = "file_path"
-pattern = "^src/.*\\.rs$"
-action = { type = "Allow" }
-"#;
-    let _xdg_config = setup_user_bash_rules(config).await;
+    let config = cfg_allow_local_rule("Read", "file_path", r"^src/.*\.rs$", r#"{ type = "Allow" }"#);
+    let _xdg_config = setup_user_bash_rules(&config).await;
 
     let temp_dir = TempDir::new().unwrap();
     let cwd = temp_dir.path();
@@ -1780,26 +1584,13 @@ action = { type = "Allow" }
     )
     .await
     .expect("Should succeed");
-    match result.hook_specific_output {
-        Some(HookSpecificOutput::PreToolUse(output)) => {
-            assert_eq!(output.permission_decision, Some(PermissionDecision::Allow));
-        }
-        _ => panic!("Expected PreToolUse hook specific output"),
-    }
+    assert_pretool_allow(&result);
 }
 
 #[tokio::test]
 async fn test_tool_rule_allow_local_rejects_path_escape() {
-    let config = r#"
-[[tool_rules]]
-name = "allow-local-rust"
-tool = "Read"
-allow_local = true
-field = "path"
-pattern = "src/lib\\.rs$"
-action = { type = "Allow" }
-"#;
-    let _xdg_config = setup_user_bash_rules(config).await;
+    let config = cfg_allow_local_rule("Read", "path", r"src/lib\.rs$", r#"{ type = "Allow" }"#);
+    let _xdg_config = setup_user_bash_rules(&config).await;
 
     let temp_dir = TempDir::new().unwrap();
     let cwd = temp_dir.path().join("project");
@@ -1823,16 +1614,8 @@ action = { type = "Allow" }
 
 #[tokio::test]
 async fn test_tool_rule_allow_local_no_match_for_regex_miss() {
-    let config = r#"
-[[tool_rules]]
-name = "allow-local-rust"
-tool = "Read"
-allow_local = true
-field = "path"
-pattern = "^src/.*\\.rs$"
-action = { type = "Allow" }
-"#;
-    let _xdg_config = setup_user_bash_rules(config).await;
+    let config = cfg_allow_local_rule("Read", "path", r"^src/.*\.rs$", r#"{ type = "Allow" }"#);
+    let _xdg_config = setup_user_bash_rules(&config).await;
 
     let temp_dir = TempDir::new().unwrap();
     let cwd = temp_dir.path();
@@ -1853,22 +1636,25 @@ action = { type = "Allow" }
     );
 }
 
-#[tokio::test]
-async fn test_tool_rule_allow_local_ask_action() {
-    let config = r#"
+/// Runs a Write against a local file under `allow_local = true` for the given
+/// `action_toml` fragment and returns the hook result.
+async fn run_allow_local_write_with_action(action_toml: &str) -> HookOutput {
+    let config = format!(
+        r#"
 [[tool_rules]]
-name = "ask-local-write"
+name = "local-write-action"
 tool = "Write"
 allow_local = true
-action = { type = "Ask" }
-"#;
-    let _xdg_config = setup_user_bash_rules(config).await;
+{action_toml}
+"#,
+    );
+    let _xdg_config = setup_user_bash_rules(&config).await;
 
     let temp_dir = TempDir::new().unwrap();
     let cwd = temp_dir.path();
     std::fs::write(cwd.join("local.txt"), "hello\n").unwrap();
 
-    let result = handle_pretool_hook(
+    handle_pretool_hook(
         "Write",
         &serde_json::json!({
             "path": cwd.join("local.txt"),
@@ -1877,66 +1663,28 @@ action = { type = "Ask" }
         cwd.to_str().unwrap(),
     )
     .await
-    .expect("Should succeed");
+    .expect("Should succeed")
+}
 
-    match result.hook_specific_output {
-        Some(HookSpecificOutput::PreToolUse(output)) => {
-            assert_eq!(output.permission_decision, Some(PermissionDecision::Ask));
-        }
-        _ => panic!("Expected PreToolUse hook specific output"),
-    }
+#[tokio::test]
+async fn test_tool_rule_allow_local_ask_action() {
+    let result = run_allow_local_write_with_action("action = { type = \"Ask\" }").await;
+    assert_pretool_ask(&result);
 }
 
 #[tokio::test]
 async fn test_tool_rule_allow_local_deny_action() {
-    let config = r#"
-[[tool_rules]]
-name = "deny-local-write"
-tool = "Write"
-allow_local = true
-action = { type = "Deny", value = "no local writes" }
-"#;
-    let _xdg_config = setup_user_bash_rules(config).await;
-
-    let temp_dir = TempDir::new().unwrap();
-    let cwd = temp_dir.path();
-    std::fs::write(cwd.join("local.txt"), "hello\n").unwrap();
-
-    let result = handle_pretool_hook(
-        "Write",
-        &serde_json::json!({
-            "path": cwd.join("local.txt"),
-            "content": "updated",
-        }),
-        cwd.to_str().unwrap(),
+    let result = run_allow_local_write_with_action(
+        "action = { type = \"Deny\", value = \"no local writes\" }",
     )
-    .await
-    .expect("Should succeed");
-
-    match result.hook_specific_output {
-        Some(HookSpecificOutput::PreToolUse(output)) => {
-            assert_eq!(output.permission_decision, Some(PermissionDecision::Deny));
-            assert_eq!(
-                output.permission_decision_reason,
-                Some("no local writes".to_string())
-            );
-        }
-        _ => panic!("Expected PreToolUse hook specific output"),
-    }
+    .await;
+    assert_pretool_deny(&result, "no local writes");
 }
 
 #[tokio::test]
 async fn test_tool_rule_allow_local_with_non_path_field_does_not_match() {
-    let config = r#"
-[[tool_rules]]
-name = "bad-local-command"
-tool = "Read"
-allow_local = true
-field = "command"
-pattern = "^cat"
-action = { type = "Allow" }
-"#;
-    let _xdg_config = setup_user_bash_rules(config).await;
+    let config = cfg_allow_local_rule("Read", "command", "^cat", r#"{ type = "Allow" }"#);
+    let _xdg_config = setup_user_bash_rules(&config).await;
 
     let temp_dir = TempDir::new().unwrap();
     let cwd = temp_dir.path();
@@ -1964,28 +1712,13 @@ action = { type = "Allow" }
 async fn test_tool_rule_allow_local_rejects_broken_symlink() {
     use std::os::unix::fs::symlink;
 
-    let config = r#"
-[[tool_rules]]
-name = "allow-local-read"
-tool = "Read"
-allow_local = true
-action = { type = "Allow" }
-"#;
-    let _xdg_config = setup_user_bash_rules(config).await;
-
     let temp_dir = TempDir::new().unwrap();
     let cwd = temp_dir.path().join("project");
     let missing = temp_dir.path().join("missing-target");
     std::fs::create_dir_all(&cwd).unwrap();
     symlink(&missing, cwd.join("broken-link")).unwrap();
 
-    let result = handle_pretool_hook(
-        "Read",
-        &serde_json::json!({"path": "broken-link/file.txt"}),
-        cwd.to_str().unwrap(),
-    )
-    .await
-    .expect("Should succeed");
+    let result = run_allow_local_read(&cwd, "broken-link/file.txt").await;
 
     assert_eq!(
         result.hook_specific_output, None,
@@ -1998,15 +1731,6 @@ action = { type = "Allow" }
 async fn test_tool_rule_allow_local_rejects_symlink_escape() {
     use std::os::unix::fs::symlink;
 
-    let config = r#"
-[[tool_rules]]
-name = "allow-local-read"
-tool = "Read"
-allow_local = true
-action = { type = "Allow" }
-"#;
-    let _xdg_config = setup_user_bash_rules(config).await;
-
     let temp_dir = TempDir::new().unwrap();
     let cwd = temp_dir.path().join("project");
     let outside = temp_dir.path().join("outside");
@@ -2015,13 +1739,7 @@ action = { type = "Allow" }
     std::fs::write(outside.join("secret.txt"), "secret\n").unwrap();
     symlink(&outside, cwd.join("linked-outside")).unwrap();
 
-    let result = handle_pretool_hook(
-        "Read",
-        &serde_json::json!({"path": "linked-outside/secret.txt"}),
-        cwd.to_str().unwrap(),
-    )
-    .await
-    .expect("Should succeed");
+    let result = run_allow_local_read(&cwd, "linked-outside/secret.txt").await;
 
     assert_eq!(
         result.hook_specific_output, None,

@@ -10,14 +10,19 @@ use std::{
     process::Command,
 };
 
+#[cfg(test)]
+use std::fs;
+
 use miette::{IntoDiagnostic, Result, WrapErr};
 use tracing::{debug, info};
 
 /// Detects the repository root directory for the given path.
 ///
 /// This function tries multiple strategies in order:
-/// 1. Jujutsu workspace root (`jj workspace root`)
-/// 2. Git repository root (`git rev-parse --show-toplevel`)
+/// 1. Jujutsu: walks up the directory tree looking for `.jj/repo` and reads it
+///    to resolve the repository root (no `jj` binary required)
+/// 2. Git: runs `git rev-parse --git-common-dir` to find the shared `.git`
+///    directory, supporting both regular repos and worktrees
 /// 3. Canonicalized current directory (fallback for non-repo projects)
 ///
 /// # Arguments
@@ -309,15 +314,18 @@ mod tests {
         );
     }
 
+    /// Writes a `.jj/repo` file inside `temp_dir` so tests can exercise
+    /// malformed or empty workspace metadata without invoking `jj`.
+    fn write_jj_repo_file(temp_dir: &TempDir, contents: &str) {
+        let jj_dir = temp_dir.path().join(".jj");
+        fs::create_dir(&jj_dir).unwrap();
+        fs::write(jj_dir.join("repo"), contents).unwrap();
+    }
+
     #[test]
     fn test_jj_repo_file_corrupted() {
         let temp_dir = TempDir::new().unwrap();
-        let jj_dir = temp_dir.path().join(".jj");
-        std::fs::create_dir(&jj_dir).unwrap();
-
-        // Create .jj/repo with invalid content (path that doesn't exist)
-        let jj_repo_file = jj_dir.join("repo");
-        std::fs::write(&jj_repo_file, "/nonexistent/invalid/path/.jj/repo").unwrap();
+        write_jj_repo_file(&temp_dir, "/nonexistent/invalid/path/.jj/repo");
 
         let result = try_jj_workspace_root(temp_dir.path());
         assert!(
@@ -329,12 +337,7 @@ mod tests {
     #[test]
     fn test_jj_repo_file_empty() {
         let temp_dir = TempDir::new().unwrap();
-        let jj_dir = temp_dir.path().join(".jj");
-        std::fs::create_dir(&jj_dir).unwrap();
-
-        // Create empty .jj/repo file
-        let jj_repo_file = jj_dir.join("repo");
-        std::fs::write(&jj_repo_file, "").unwrap();
+        write_jj_repo_file(&temp_dir, "");
 
         let result = try_jj_workspace_root(temp_dir.path());
         assert!(

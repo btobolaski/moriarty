@@ -212,6 +212,16 @@ pub async fn load_user_config() -> Result<UserConfig> {
 mod tests {
     use super::*;
 
+    /// Builds a minimal `UserConfig` fixture for round-trip tests that only vary
+    /// the bash/tool rule lists.
+    fn sample_config(bash_rules: Option<Vec<BashRule>>, tool_rules: Option<Vec<ToolRule>>) -> UserConfig {
+        UserConfig {
+            pattern_fragments: None,
+            bash_rules,
+            tool_rules,
+        }
+    }
+
     #[test]
     fn test_user_config_default() {
         let config = UserConfig::default();
@@ -370,14 +380,24 @@ reason = "Browser not needed""#;
         std::env::remove_var("XDG_CONFIG_HOME");
     }
 
-    #[tokio::test]
-    async fn test_load_user_config_with_rules() {
+    /// Persist `test_config` to a temp XDG_CONFIG_HOME and assert load_user_config
+    /// round-trips the same value.
+    async fn assert_config_roundtrips(test_config: UserConfig) {
         let temp_dir = tempfile::tempdir().unwrap();
         std::env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+        FileType::Config
+            .persist("tool_rules.toml", &test_config)
+            .await
+            .unwrap();
+        let loaded_config = load_user_config().await.unwrap();
+        assert_eq!(loaded_config, test_config);
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
 
-        let test_config = UserConfig {
-            pattern_fragments: None,
-            bash_rules: Some(vec![
+    #[tokio::test]
+    async fn test_load_user_config_with_rules() {
+        assert_config_roundtrips(sample_config(
+            Some(vec![
                 BashRule {
                     name: "test-deny".to_string(),
                     pattern: "^rm".to_string(),
@@ -391,40 +411,15 @@ reason = "Browser not needed""#;
                     action: BashRuleAction::Allow,
                 },
             ]),
-            tool_rules: None,
-        };
-
-        FileType::Config
-            .persist("tool_rules.toml", &test_config)
-            .await
-            .unwrap();
-
-        let loaded_config = load_user_config().await.unwrap();
-        assert_eq!(loaded_config, test_config);
-
-        std::env::remove_var("XDG_CONFIG_HOME");
+            None,
+        ))
+        .await;
     }
 
     #[tokio::test]
     async fn test_load_user_config_empty_rules() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        std::env::set_var("XDG_CONFIG_HOME", temp_dir.path());
-
-        let test_config = UserConfig {
-            pattern_fragments: None,
-            bash_rules: None,
-            tool_rules: None,
-        };
-
-        FileType::Config
-            .persist("tool_rules.toml", &test_config)
-            .await
-            .unwrap();
-
-        let loaded_config = load_user_config().await.unwrap();
-        assert_eq!(loaded_config, test_config);
-
-        std::env::remove_var("XDG_CONFIG_HOME");
+        assert_config_roundtrips(sample_config(None, None))
+        .await;
     }
 
     #[tokio::test]
@@ -566,14 +561,13 @@ value = "not allowed""#;
 
     #[test]
     fn test_user_config_round_trip_with_tool_rules() {
-        let config = UserConfig {
-            pattern_fragments: None,
-            bash_rules: Some(vec![BashRule {
+        let config = sample_config(
+            Some(vec![BashRule {
                 name: "allow-ls".to_string(),
                 pattern: "^ls".to_string(),
                 action: BashRuleAction::Allow,
             }]),
-            tool_rules: Some(vec![
+            Some(vec![
                 ToolRule {
                     name: "allow-read".to_string(),
                     tool: "Read".to_string(),
@@ -593,7 +587,7 @@ value = "not allowed""#;
                     },
                 },
             ]),
-        };
+        );
 
         let toml = toml::to_string(&config).unwrap();
         let deserialized: UserConfig = toml::from_str(&toml).unwrap();

@@ -5,8 +5,12 @@
 //!
 //! Configuration is JSON-based and stored in Claude settings files.
 
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+#[cfg(test)]
+use std::fmt;
+
+use serde::{Deserialize, Serialize};
 
 /// Hook event types that can trigger scripts
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -292,7 +296,52 @@ pub fn parse_hook_output(json: &str) -> Result<HookOutput, serde_json::Error> {
 
 #[cfg(test)]
 mod tests {
+    use serde::{Serialize, de::DeserializeOwned};
+
     use super::*;
+
+    /// Assert that a Result is Err and the error message contains at least one of the given substrings
+    fn assert_err_contains<T: fmt::Debug>(
+        result: Result<T, impl std::fmt::Display>,
+        expected: &[&str],
+    ) {
+        let err_msg = result.expect_err("Expected error").to_string();
+        assert!(
+            expected.iter().any(|s| err_msg.contains(s)),
+            "Expected error to contain one of {:?}, got: {}",
+            expected,
+            err_msg
+        );
+    }
+
+    fn assert_json_roundtrip<T>(cases: &[(T, &str)])
+    where
+        T: Copy + DeserializeOwned + PartialEq + Serialize + fmt::Debug,
+    {
+        for (value, expected_json) in cases {
+            let json = serde_json::to_string(value).expect("Failed to serialize");
+            assert_eq!(json, *expected_json);
+
+            let parsed: T = serde_json::from_str(&json).expect("Failed to deserialize");
+            assert_eq!(parsed, *value);
+        }
+    }
+
+    fn assert_json_contains<T>(value: &T, present: &[&str], absent: &[&str])
+    where
+        T: Serialize,
+    {
+        let json = serde_json::to_string(value).expect("Failed to serialize");
+        for fragment in present {
+            assert!(json.contains(fragment), "Missing fragment {fragment:?} in {json}");
+        }
+        for fragment in absent {
+            assert!(
+                !json.contains(fragment),
+                "Unexpected fragment {fragment:?} in {json}"
+            );
+        }
+    }
 
     #[test]
     fn test_parse_hooks_config() {
@@ -471,8 +520,8 @@ mod tests {
 
     #[test]
     fn test_hook_event_serialization() {
-        // Test all HookEvent variants serialize to PascalCase
-        let cases = vec![
+        // Test all HookEvent variants serialize to PascalCase.
+        assert_json_roundtrip(&[
             (HookEvent::PreToolUse, r#""PreToolUse""#),
             (HookEvent::PostToolUse, r#""PostToolUse""#),
             (HookEvent::UserPromptSubmit, r#""UserPromptSubmit""#),
@@ -482,130 +531,65 @@ mod tests {
             (HookEvent::Stop, r#""Stop""#),
             (HookEvent::SubagentStop, r#""SubagentStop""#),
             (HookEvent::PreCompact, r#""PreCompact""#),
-        ];
-
-        for (event, expected_json) in cases {
-            let json = serde_json::to_string(&event).expect("Failed to serialize");
-            assert_eq!(
-                json, expected_json,
-                "Event {:?} serialization mismatch",
-                event
-            );
-
-            let parsed: HookEvent = serde_json::from_str(&json).expect("Failed to deserialize");
-            assert_eq!(parsed, event, "Event {:?} round-trip failed", event);
-        }
+        ]);
     }
 
     #[test]
     fn test_session_start_matcher_serialization() {
-        let cases = vec![
+        assert_json_roundtrip(&[
             (SessionStartMatcher::Startup, r#""startup""#),
             (SessionStartMatcher::Resume, r#""resume""#),
             (SessionStartMatcher::Clear, r#""clear""#),
             (SessionStartMatcher::Compact, r#""compact""#),
-        ];
+        ]);
 
-        for (matcher, expected_json) in cases {
-            let json = serde_json::to_string(&matcher).expect("Failed to serialize");
-            assert_eq!(json, expected_json);
-
-            let parsed: SessionStartMatcher =
-                serde_json::from_str(&json).expect("Failed to deserialize");
-            assert_eq!(parsed, matcher);
-        }
-
-        // Test case sensitivity - "Startup" should fail
-        let err = serde_json::from_str::<SessionStartMatcher>(r#""Startup""#)
-            .expect_err("Should reject case-variant 'Startup' (expected 'startup')");
-        let err_msg = err.to_string();
-        assert!(
-            err_msg.contains("unknown variant") || err_msg.contains("Startup"),
-            "Error should mention unknown variant, got: {}",
-            err_msg
+        // Test case sensitivity - "Startup" should fail.
+        assert_err_contains(
+            serde_json::from_str::<SessionStartMatcher>(r#""Startup""#),
+            &["unknown variant", "Startup"],
         );
     }
 
     #[test]
     fn test_session_end_reason_serialization() {
-        let cases = vec![
+        assert_json_roundtrip(&[
             (SessionEndReason::Clear, r#""clear""#),
             (SessionEndReason::Logout, r#""logout""#),
             (SessionEndReason::PromptInputExit, r#""prompt_input_exit""#),
             (SessionEndReason::Other, r#""other""#),
-        ];
-
-        for (reason, expected_json) in cases {
-            let json = serde_json::to_string(&reason).expect("Failed to serialize");
-            assert_eq!(json, expected_json);
-
-            let parsed: SessionEndReason =
-                serde_json::from_str(&json).expect("Failed to deserialize");
-            assert_eq!(parsed, reason);
-        }
+        ]);
     }
 
     #[test]
     fn test_pre_compact_matcher_serialization() {
-        let cases = vec![
+        assert_json_roundtrip(&[
             (PreCompactMatcher::Manual, r#""manual""#),
             (PreCompactMatcher::Auto, r#""auto""#),
-        ];
-
-        for (matcher, expected_json) in cases {
-            let json = serde_json::to_string(&matcher).expect("Failed to serialize");
-            assert_eq!(json, expected_json);
-
-            let parsed: PreCompactMatcher =
-                serde_json::from_str(&json).expect("Failed to deserialize");
-            assert_eq!(parsed, matcher);
-        }
+        ]);
     }
 
     #[test]
     fn test_hook_type_serialization() {
-        let hook_type = HookType::Command;
-        let json = serde_json::to_string(&hook_type).expect("Failed to serialize");
-        assert_eq!(json, r#""command""#);
-
-        let parsed: HookType = serde_json::from_str(&json).expect("Failed to deserialize");
-        assert_eq!(parsed, HookType::Command);
+        assert_json_roundtrip(&[(HookType::Command, r#""command""#)]);
     }
 
     #[test]
     fn test_permission_mode_serialization() {
-        let cases = vec![
+        assert_json_roundtrip(&[
             (PermissionMode::Default, r#""default""#),
             (PermissionMode::Plan, r#""plan""#),
             (PermissionMode::AcceptEdits, r#""acceptEdits""#),
             (PermissionMode::BypassPermissions, r#""bypassPermissions""#),
-        ];
-
-        for (mode, expected_json) in cases {
-            let json = serde_json::to_string(&mode).expect("Failed to serialize");
-            assert_eq!(json, expected_json);
-
-            let parsed: PermissionMode =
-                serde_json::from_str(&json).expect("Failed to deserialize");
-            assert_eq!(parsed, mode);
-        }
+        ]);
     }
 
     #[test]
     fn test_hook_decision_serialization() {
-        let cases = vec![
+        assert_json_roundtrip(&[
             (HookDecision::Approve, r#""approve""#),
             (HookDecision::Block, r#""block""#),
             (HookDecision::Ask, r#""ask""#),
-        ];
-
-        for (decision, expected_json) in cases {
-            let json = serde_json::to_string(&decision).expect("Failed to serialize");
-            assert_eq!(json, expected_json);
-
-            let parsed: HookDecision = serde_json::from_str(&json).expect("Failed to deserialize");
-            assert_eq!(parsed, decision);
-        }
+        ]);
     }
 
     #[test]
@@ -624,70 +608,37 @@ mod tests {
     #[test]
     fn test_parse_errors() {
         // Invalid JSON
-        let err = parse_hooks_config("not valid json {")
-            .expect_err("Should reject malformed JSON in hooks config");
-        let err_msg = err.to_string();
-        assert!(
-            err_msg.contains("expected") || err_msg.contains("EOF") || err_msg.contains("invalid"),
-            "Error should mention parsing failure, got: {}",
-            err_msg
+        assert_err_contains(
+            parse_hooks_config("not valid json {"),
+            &["expected", "EOF", "invalid"],
         );
-
-        let err = parse_hook_input("not valid json {")
-            .expect_err("Should reject malformed JSON in hook input");
-        let err_msg = err.to_string();
-        assert!(
-            err_msg.contains("expected") || err_msg.contains("EOF") || err_msg.contains("invalid"),
-            "Error should mention parsing failure, got: {}",
-            err_msg
+        assert_err_contains(
+            parse_hook_input("not valid json {"),
+            &["expected", "EOF", "invalid"],
         );
-
-        let err = parse_hook_output("not valid json {")
-            .expect_err("Should reject malformed JSON in hook output");
-        let err_msg = err.to_string();
-        assert!(
-            err_msg.contains("expected") || err_msg.contains("EOF") || err_msg.contains("invalid"),
-            "Error should mention parsing failure, got: {}",
-            err_msg
+        assert_err_contains(
+            parse_hook_output("not valid json {"),
+            &["expected", "EOF", "invalid"],
         );
 
         // Invalid enum values
-        let err = serde_json::from_str::<HookDecision>(r#""invalid""#)
-            .expect_err("Should reject invalid HookDecision value");
-        let err_msg = err.to_string();
-        assert!(
-            err_msg.contains("unknown variant") || err_msg.contains("invalid"),
-            "Error should mention unknown variant, got: {}",
-            err_msg
+        assert_err_contains(
+            serde_json::from_str::<HookDecision>(r#""invalid""#),
+            &["unknown variant", "invalid"],
         );
-
-        let err = serde_json::from_str::<HookType>(r#""invalid""#)
-            .expect_err("Should reject invalid HookType value");
-        let err_msg = err.to_string();
-        assert!(
-            err_msg.contains("unknown variant") || err_msg.contains("invalid"),
-            "Error should mention unknown variant, got: {}",
-            err_msg
+        assert_err_contains(
+            serde_json::from_str::<HookType>(r#""invalid""#),
+            &["unknown variant", "invalid"],
         );
-
-        let err = serde_json::from_str::<PermissionMode>(r#""invalid""#)
-            .expect_err("Should reject invalid PermissionMode value");
-        let err_msg = err.to_string();
-        assert!(
-            err_msg.contains("unknown variant") || err_msg.contains("invalid"),
-            "Error should mention unknown variant, got: {}",
-            err_msg
+        assert_err_contains(
+            serde_json::from_str::<PermissionMode>(r#""invalid""#),
+            &["unknown variant", "invalid"],
         );
 
         // Missing required fields
-        let incomplete_input = r#"{"session_id": "abc"}"#;
-        let err = parse_hook_input(incomplete_input)
-            .expect_err("Should reject hook input missing required 'event' field");
-        let err_msg = err.to_string();
-        assert!(
-            err_msg.contains("missing field") || err_msg.contains("event"),
-            "Error should mention missing field, got: {}",
-            err_msg
+        assert_err_contains(
+            parse_hook_input(r#"{"session_id": "abc"}"#),
+            &["missing field", "event"],
         );
     }
 
@@ -847,271 +798,245 @@ mod tests {
         assert_eq!(parsed, config);
     }
 
-    #[test]
-    fn test_hook_event_data_pre_tool_use() {
-        let json = r#"{
-            "session_id": "test",
-            "transcript_path": "/path",
-            "cwd": "/cwd",
-            "permission_mode": "default",
-            "hook_event_name": "PreToolUse",
-            "tool_name": "Write",
-            "tool_input": {"file_path": "test.txt", "content": "hello"}
-        }"#;
-
-        let input = parse_hook_input(json).expect("Failed to parse");
-        match input.event_data {
-            HookEventData::PreToolUse {
-                tool_name,
-                tool_input,
-            } => {
-                assert_eq!(tool_name, "Write");
-                assert_eq!(tool_input["file_path"], "test.txt");
-                assert_eq!(tool_input["content"], "hello");
-            }
-            _ => panic!("Expected PreToolUse"),
-        }
+    /// Build a hook input JSON envelope for the given event name with optional
+    /// extra JSON fields (a comma-separated fragment, no surrounding braces).
+    fn hook_envelope(event_name: &str, extras: &str) -> String {
+        let sep = if extras.is_empty() { "" } else { "," };
+        format!(
+            r#"{{
+                "session_id": "test",
+                "transcript_path": "/path",
+                "cwd": "/cwd",
+                "permission_mode": "default",
+                "hook_event_name": "{event_name}"{sep}{extras}
+            }}"#
+        )
     }
 
-    #[test]
-    fn test_hook_event_data_post_tool_use() {
-        let json = r#"{
-            "session_id": "test",
-            "transcript_path": "/path",
-            "cwd": "/cwd",
-            "permission_mode": "default",
-            "hook_event_name": "PostToolUse",
-            "tool_name": "Read",
-            "tool_input": {"file_path": "test.txt"},
-            "tool_response": {"content": "file contents"}
-        }"#;
-
-        let input = parse_hook_input(json).expect("Failed to parse");
-        match input.event_data {
-            HookEventData::PostToolUse {
-                tool_name,
-                tool_input,
-                tool_response,
-            } => {
-                assert_eq!(tool_name, "Read");
-                assert_eq!(tool_input["file_path"], "test.txt");
-                assert_eq!(tool_response["content"], "file contents");
-            }
-            _ => panic!("Expected PostToolUse"),
-        }
-    }
+    /// Row in the hook-event-data table-driven test: `(event_name,
+    /// extra_fields_json, variant_check_closure)`. The closure receives the
+    /// `event_name` so that assertion failures inside the match arm can name
+    /// the failing variant.
+    type EventDataCase<'a> = (&'a str, &'a str, &'a dyn Fn(&str, HookEventData));
 
     #[test]
-    fn test_hook_event_data_user_prompt_submit() {
-        let json = r#"{
-            "session_id": "test",
-            "transcript_path": "/path",
-            "cwd": "/cwd",
-            "permission_mode": "default",
-            "hook_event_name": "UserPromptSubmit",
-            "user_prompt": "Please help me write code"
-        }"#;
+    fn test_hook_event_data_variants() {
+        let cases: &[EventDataCase] = &[
+            (
+                "PreToolUse",
+                r#""tool_name": "Write", "tool_input": {"file_path": "test.txt", "content": "hello"}"#,
+                &|name, event| match event {
+                    HookEventData::PreToolUse {
+                        tool_name,
+                        tool_input,
+                    } => {
+                        assert_eq!(tool_name, "Write", "case {name}: tool_name");
+                        assert_eq!(
+                            tool_input["file_path"], "test.txt",
+                            "case {name}: file_path"
+                        );
+                        assert_eq!(tool_input["content"], "hello", "case {name}: content");
+                    }
+                    _ => panic!("case {name}: expected PreToolUse"),
+                },
+            ),
+            (
+                "PostToolUse",
+                r#""tool_name": "Read", "tool_input": {"file_path": "test.txt"}, "tool_response": {"content": "file contents"}"#,
+                &|name, event| match event {
+                    HookEventData::PostToolUse {
+                        tool_name,
+                        tool_input,
+                        tool_response,
+                    } => {
+                        assert_eq!(tool_name, "Read", "case {name}: tool_name");
+                        assert_eq!(
+                            tool_input["file_path"], "test.txt",
+                            "case {name}: file_path"
+                        );
+                        assert_eq!(
+                            tool_response["content"], "file contents",
+                            "case {name}: tool_response content"
+                        );
+                    }
+                    _ => panic!("case {name}: expected PostToolUse"),
+                },
+            ),
+            (
+                "UserPromptSubmit",
+                r#""user_prompt": "Please help me write code""#,
+                &|name, event| match event {
+                    HookEventData::UserPromptSubmit { user_prompt } => {
+                        assert_eq!(
+                            user_prompt, "Please help me write code",
+                            "case {name}: user_prompt"
+                        );
+                    }
+                    _ => panic!("case {name}: expected UserPromptSubmit"),
+                },
+            ),
+            (
+                "SessionStart",
+                r#""matcher": "startup""#,
+                &|name, event| match event {
+                    HookEventData::SessionStart { matcher } => {
+                        assert_eq!(
+                            matcher,
+                            SessionStartMatcher::Startup,
+                            "case {name}: matcher"
+                        );
+                    }
+                    _ => panic!("case {name}: expected SessionStart"),
+                },
+            ),
+            (
+                "SessionEnd",
+                r#""reason": "logout""#,
+                &|name, event| match event {
+                    HookEventData::SessionEnd { reason } => {
+                        assert_eq!(reason, SessionEndReason::Logout, "case {name}: reason");
+                    }
+                    _ => panic!("case {name}: expected SessionEnd"),
+                },
+            ),
+            ("Stop", "", &|name, event| match event {
+                HookEventData::Stop => {}
+                _ => panic!("case {name}: expected Stop"),
+            }),
+            (
+                "SubagentStop",
+                r#""subagent_id": "agent-123""#,
+                &|name, event| match event {
+                    HookEventData::SubagentStop { subagent_id } => {
+                        assert_eq!(subagent_id, "agent-123", "case {name}: subagent_id");
+                    }
+                    _ => panic!("case {name}: expected SubagentStop"),
+                },
+            ),
+            (
+                "PreCompact",
+                r#""matcher": "manual""#,
+                &|name, event| match event {
+                    HookEventData::PreCompact { matcher } => {
+                        assert_eq!(matcher, PreCompactMatcher::Manual, "case {name}: matcher");
+                    }
+                    _ => panic!("case {name}: expected PreCompact"),
+                },
+            ),
+            (
+                "Notification",
+                r#""notification_type": "permission_request", "message": "Tool requires approval""#,
+                &|name, event| match event {
+                    HookEventData::Notification {
+                        notification_type,
+                        message,
+                    } => {
+                        assert_eq!(
+                            notification_type, "permission_request",
+                            "case {name}: notification_type"
+                        );
+                        assert_eq!(message, "Tool requires approval", "case {name}: message");
+                    }
+                    _ => panic!("case {name}: expected Notification"),
+                },
+            ),
+        ];
 
-        let input = parse_hook_input(json).expect("Failed to parse");
-        match input.event_data {
-            HookEventData::UserPromptSubmit { user_prompt } => {
-                assert_eq!(user_prompt, "Please help me write code");
-            }
-            _ => panic!("Expected UserPromptSubmit"),
-        }
-    }
-
-    #[test]
-    fn test_hook_event_data_session_start() {
-        let json = r#"{
-            "session_id": "test",
-            "transcript_path": "/path",
-            "cwd": "/cwd",
-            "permission_mode": "default",
-            "hook_event_name": "SessionStart",
-            "matcher": "startup"
-        }"#;
-
-        let input = parse_hook_input(json).expect("Failed to parse");
-        match input.event_data {
-            HookEventData::SessionStart { matcher } => {
-                assert_eq!(matcher, SessionStartMatcher::Startup);
-            }
-            _ => panic!("Expected SessionStart"),
-        }
-    }
-
-    #[test]
-    fn test_hook_event_data_session_end() {
-        let json = r#"{
-            "session_id": "test",
-            "transcript_path": "/path",
-            "cwd": "/cwd",
-            "permission_mode": "default",
-            "hook_event_name": "SessionEnd",
-            "reason": "logout"
-        }"#;
-
-        let input = parse_hook_input(json).expect("Failed to parse");
-        match input.event_data {
-            HookEventData::SessionEnd { reason } => {
-                assert_eq!(reason, SessionEndReason::Logout);
-            }
-            _ => panic!("Expected SessionEnd"),
-        }
-    }
-
-    #[test]
-    fn test_hook_event_data_stop() {
-        let json = r#"{
-            "session_id": "test",
-            "transcript_path": "/path",
-            "cwd": "/cwd",
-            "permission_mode": "default",
-            "hook_event_name": "Stop"
-        }"#;
-
-        let input = parse_hook_input(json).expect("Failed to parse");
-        match input.event_data {
-            HookEventData::Stop => {}
-            _ => panic!("Expected Stop"),
-        }
-    }
-
-    #[test]
-    fn test_hook_event_data_subagent_stop() {
-        let json = r#"{
-            "session_id": "test",
-            "transcript_path": "/path",
-            "cwd": "/cwd",
-            "permission_mode": "default",
-            "hook_event_name": "SubagentStop",
-            "subagent_id": "agent-123"
-        }"#;
-
-        let input = parse_hook_input(json).expect("Failed to parse");
-        match input.event_data {
-            HookEventData::SubagentStop { subagent_id } => {
-                assert_eq!(subagent_id, "agent-123");
-            }
-            _ => panic!("Expected SubagentStop"),
-        }
-    }
-
-    #[test]
-    fn test_hook_event_data_pre_compact() {
-        let json = r#"{
-            "session_id": "test",
-            "transcript_path": "/path",
-            "cwd": "/cwd",
-            "permission_mode": "default",
-            "hook_event_name": "PreCompact",
-            "matcher": "manual"
-        }"#;
-
-        let input = parse_hook_input(json).expect("Failed to parse");
-        match input.event_data {
-            HookEventData::PreCompact { matcher } => {
-                assert_eq!(matcher, PreCompactMatcher::Manual);
-            }
-            _ => panic!("Expected PreCompact"),
+        for (event_name, extras, check) in cases {
+            let json = hook_envelope(event_name, extras);
+            let input = parse_hook_input(&json)
+                .unwrap_or_else(|e| panic!("Failed to parse {event_name}: {e}"));
+            check(event_name, input.event_data);
         }
     }
 
     #[test]
     fn test_permission_decision_serialization() {
-        let cases = vec![
+        assert_json_roundtrip(&[
             (PermissionDecision::Allow, r#""allow""#),
             (PermissionDecision::Deny, r#""deny""#),
             (PermissionDecision::Ask, r#""ask""#),
+        ]);
+    }
+
+    #[test]
+    fn test_pretool_use_output_serialization_variants() {
+        let cases = [
+            (
+                PreToolUseOutput {
+                    hook_event_name: "PreToolUse".to_string(),
+                    permission_decision: Some(PermissionDecision::Ask),
+                    permission_decision_reason: None,
+                    updated_input: None,
+                },
+                vec![r#""hookEventName":"PreToolUse""#, r#""permissionDecision":"ask""#],
+                vec![r#""permissionDecisionReason""#, r#""updatedInput""#],
+            ),
+            (
+                PreToolUseOutput {
+                    hook_event_name: "PreToolUse".to_string(),
+                    permission_decision: Some(PermissionDecision::Allow),
+                    permission_decision_reason: None,
+                    updated_input: None,
+                },
+                vec![r#""permissionDecision":"allow""#],
+                vec![],
+            ),
+            (
+                PreToolUseOutput {
+                    hook_event_name: "PreToolUse".to_string(),
+                    permission_decision: Some(PermissionDecision::Deny),
+                    permission_decision_reason: Some("Dangerous command".to_string()),
+                    updated_input: None,
+                },
+                vec![
+                    r#""permissionDecision":"deny""#,
+                    r#""permissionDecisionReason":"Dangerous command""#,
+                ],
+                vec![],
+            ),
+            (
+                PreToolUseOutput {
+                    hook_event_name: "PreToolUse".to_string(),
+                    permission_decision: Some(PermissionDecision::Allow),
+                    permission_decision_reason: Some("Modified".to_string()),
+                    updated_input: Some(serde_json::json!({"command": "ls -la"})),
+                },
+                vec![r#""updatedInput":{"command":"ls -la"}"#],
+                vec![],
+            ),
+            (
+                PreToolUseOutput {
+                    hook_event_name: "PreToolUse".to_string(),
+                    permission_decision: Some(PermissionDecision::Ask),
+                    permission_decision_reason: Some("Command not in whitelist".to_string()),
+                    updated_input: None,
+                },
+                vec![
+                    r#""permissionDecision":"ask""#,
+                    r#""permissionDecisionReason":"Command not in whitelist""#,
+                ],
+                vec![],
+            ),
+            (
+                PreToolUseOutput {
+                    hook_event_name: "PreToolUse".to_string(),
+                    permission_decision: Some(PermissionDecision::Deny),
+                    permission_decision_reason: Some("Blocked".to_string()),
+                    updated_input: Some(serde_json::json!({"command": "ls"})),
+                },
+                vec![r#""permissionDecision":"deny""#, r#""updatedInput""#],
+                vec![],
+            ),
         ];
 
-        for (decision, expected_json) in cases {
-            let json = serde_json::to_string(&decision).expect("Failed to serialize");
-            assert_eq!(
-                json, expected_json,
-                "Serialization mismatch for {:?}",
-                decision
-            );
-
-            let parsed: PermissionDecision =
-                serde_json::from_str(&json).expect("Failed to deserialize");
-            assert_eq!(parsed, decision, "Round-trip failed for {:?}", decision);
+        for (output, present, absent) in cases {
+            assert_json_contains(&output, &present, &absent);
         }
     }
 
     #[test]
-    fn test_pretool_use_output_serialization() {
-        // Test "ask" decision
-        let ask_output = PreToolUseOutput {
-            hook_event_name: "PreToolUse".to_string(),
-            permission_decision: Some(PermissionDecision::Ask),
-            permission_decision_reason: None,
-            updated_input: None,
-        };
-        let json = serde_json::to_string(&ask_output).expect("Failed to serialize");
-        assert!(json.contains(r#""hookEventName":"PreToolUse""#));
-        assert!(json.contains(r#""permissionDecision":"ask""#));
-        assert!(!json.contains(r#""permissionDecisionReason""#));
-        assert!(!json.contains(r#""updatedInput""#));
-
-        // Test "allow" decision
-        let allow_output = PreToolUseOutput {
-            hook_event_name: "PreToolUse".to_string(),
-            permission_decision: Some(PermissionDecision::Allow),
-            permission_decision_reason: None,
-            updated_input: None,
-        };
-        let json = serde_json::to_string(&allow_output).expect("Failed to serialize");
-        assert!(json.contains(r#""permissionDecision":"allow""#));
-
-        // Test "deny" decision with reason
-        let deny_output = PreToolUseOutput {
-            hook_event_name: "PreToolUse".to_string(),
-            permission_decision: Some(PermissionDecision::Deny),
-            permission_decision_reason: Some("Dangerous command".to_string()),
-            updated_input: None,
-        };
-        let json = serde_json::to_string(&deny_output).expect("Failed to serialize");
-        assert!(json.contains(r#""permissionDecision":"deny""#));
-        assert!(json.contains(r#""permissionDecisionReason":"Dangerous command""#));
-
-        // Test with modified input
-        let modified_output = PreToolUseOutput {
-            hook_event_name: "PreToolUse".to_string(),
-            permission_decision: Some(PermissionDecision::Allow),
-            permission_decision_reason: Some("Modified".to_string()),
-            updated_input: Some(serde_json::json!({"command": "ls -la"})),
-        };
-        let json = serde_json::to_string(&modified_output).expect("Failed to serialize");
-        assert!(json.contains(r#""updatedInput":{"command":"ls -la"}"#));
-    }
-
-    #[test]
-    fn test_pretool_use_output_edge_cases() {
-        // Test Ask with reason
-        let ask_with_reason = PreToolUseOutput {
-            hook_event_name: "PreToolUse".to_string(),
-            permission_decision: Some(PermissionDecision::Ask),
-            permission_decision_reason: Some("Command not in whitelist".to_string()),
-            updated_input: None,
-        };
-        let json = serde_json::to_string(&ask_with_reason).expect("Failed to serialize");
-        assert!(json.contains(r#""permissionDecision":"ask""#));
-        assert!(json.contains(r#""permissionDecisionReason":"Command not in whitelist""#));
-
-        // Test Deny with updated_input (semantically odd but should serialize)
-        let deny_with_input = PreToolUseOutput {
-            hook_event_name: "PreToolUse".to_string(),
-            permission_decision: Some(PermissionDecision::Deny),
-            permission_decision_reason: Some("Blocked".to_string()),
-            updated_input: Some(serde_json::json!({"command": "ls"})),
-        };
-        let json = serde_json::to_string(&deny_with_input).expect("Failed to serialize");
-        assert!(json.contains(r#""permissionDecision":"deny""#));
-        assert!(json.contains(r#""updatedInput""#));
-
-        // Test with complex updated_input
+    fn test_pretool_use_output_complex_updated_input_roundtrips() {
         let complex_input = serde_json::json!({
             "command": "docker run",
             "env": {
@@ -1127,7 +1052,8 @@ mod tests {
             updated_input: Some(complex_input.clone()),
         };
         let json = serde_json::to_string(&complex_output).expect("Failed to serialize");
-        let parsed: PreToolUseOutput = serde_json::from_str(&json).expect("Failed to deserialize");
+        let parsed: PreToolUseOutput =
+            serde_json::from_str(&json).expect("Failed to deserialize");
         assert_eq!(parsed.updated_input, Some(complex_input));
     }
 
@@ -1258,31 +1184,6 @@ mod tests {
                 );
             }
             _ => panic!("Expected PreToolUse hook specific output"),
-        }
-    }
-
-    #[test]
-    fn test_hook_event_data_notification() {
-        let json = r#"{
-            "session_id": "test",
-            "transcript_path": "/path",
-            "cwd": "/cwd",
-            "permission_mode": "default",
-            "hook_event_name": "Notification",
-            "notification_type": "permission_request",
-            "message": "Tool requires approval"
-        }"#;
-
-        let input = parse_hook_input(json).expect("Failed to parse");
-        match input.event_data {
-            HookEventData::Notification {
-                notification_type,
-                message,
-            } => {
-                assert_eq!(notification_type, "permission_request");
-                assert_eq!(message, "Tool requires approval");
-            }
-            _ => panic!("Expected Notification"),
         }
     }
 }

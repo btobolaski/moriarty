@@ -219,21 +219,15 @@ mod tests {
     //! requiring separate processes to avoid race conditions. Use `cargo nextest run` which
     //! provides process isolation; `cargo test` uses thread-level isolation and will fail.
 
-    use super::*;
     use serde::{Deserialize, Serialize};
-    use tempfile::TempDir;
+
+    use super::*;
+    use crate::test_helpers::setup_isolated_xdg_config;
 
     #[derive(Debug, Serialize, Deserialize, PartialEq)]
     struct TestConfig {
         value: String,
         count: i32,
-    }
-
-    /// Safe to use std::env::set_var because cargo nextest isolates each test in a separate process.
-    fn setup_isolated_xdg_config() -> TempDir {
-        let temp_dir = tempfile::tempdir().unwrap();
-        std::env::set_var("XDG_CONFIG_HOME", temp_dir.path());
-        temp_dir
     }
 
     #[tokio::test]

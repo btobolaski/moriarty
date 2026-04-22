@@ -9,6 +9,75 @@ use tui_scrollview::{ScrollView, ScrollViewState};
 
 use super::approval_state::{ApprovalState, Screen};
 
+/// Split the area into the standard 3-part vertical layout: Title (3), Content (fill), Help (2).
+fn standard_layout(area: Rect) -> [Rect; 3] {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // Title
+            Constraint::Min(0),    // Content
+            Constraint::Length(2), // Help
+        ])
+        .split(area);
+    [chunks[0], chunks[1], chunks[2]]
+}
+
+/// Render a bordered title bar with the given text and color.
+fn render_title(frame: &mut Frame, area: Rect, text: &str, color: Color) {
+    let title = Paragraph::new(text.to_string())
+        .block(Block::default().borders(Borders::ALL))
+        .style(Style::default().fg(color).bold());
+    frame.render_widget(title, area);
+}
+
+/// Render a help/status bar at the bottom.
+fn render_help(frame: &mut Frame, area: Rect, text: &str, color: Color) {
+    let help = Paragraph::new(text.to_string()).style(Style::default().fg(color));
+    frame.render_widget(help, area);
+}
+
+/// Render a bold help/status bar — used for high-stakes screens (e.g., security warnings)
+/// where the help text must be visually prominent.
+fn render_help_bold(frame: &mut Frame, area: Rect, text: &str, color: Color) {
+    let help = Paragraph::new(text.to_string()).style(Style::default().fg(color).bold());
+    frame.render_widget(help, area);
+}
+
+/// Render scrollable content in the given area.
+fn render_scrollable_content(
+    frame: &mut Frame,
+    area: Rect,
+    scroll_state: &mut ScrollViewState,
+    content: &str,
+    content_height: u16,
+) {
+    let width = area.width.saturating_sub(2);
+    let height = content_height.max(area.height.saturating_sub(2));
+    let mut scroll_view = ScrollView::new(Size::new(width, height));
+
+    scroll_view.render_widget(
+        Paragraph::new(content.to_string()).wrap(Wrap { trim: false }),
+        Rect::new(0, 0, width, height),
+    );
+
+    frame.render_stateful_widget(scroll_view, area, scroll_state);
+}
+
+/// Render the defensive "Error: Empty Section" fallback for screens that require a current item.
+fn render_empty_section_error(frame: &mut Frame, chunks: &[Rect; 3]) {
+    render_title(frame, chunks[0], "Error: Empty Section", Color::Red);
+
+    let content = Paragraph::new(
+        "No items in this section. This is a bug in the navigation logic.\n\
+        Press q to cancel and report this issue.",
+    )
+    .wrap(Wrap { trim: false })
+    .style(Style::default().fg(Color::Red));
+    frame.render_widget(content, chunks[1]);
+
+    render_help(frame, chunks[2], "q to cancel", Color::Red);
+}
+
 /// Main render function that dispatches to screen-specific renderers
 pub fn render(
     state: &ApprovalState,
@@ -31,34 +100,15 @@ fn render_project_overview(
     scroll_state: &mut ScrollViewState,
     frame: &mut Frame,
 ) {
-    let area = frame.area();
+    let chunks = standard_layout(frame.area());
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // Title
-            Constraint::Min(0),    // Content
-            Constraint::Length(2), // Help
-        ])
-        .split(area);
+    render_title(frame, chunks[0], "Project Tools Approval", Color::Cyan);
 
-    // Title
-    let title = Paragraph::new("Project Tools Approval")
-        .block(Block::default().borders(Borders::ALL))
-        .style(Style::default().fg(Color::Cyan).bold());
-    frame.render_widget(title, chunks[0]);
-
-    // Calculate total items for scroll view height
     let total_items = state.commands.len() + state.checks.len();
-    let content_height = (total_items as u16 * 2 + 15).max(chunks[1].height.saturating_sub(2));
-
-    // Content with scrolling
-    let mut scroll_view =
-        ScrollView::new(Size::new(chunks[1].width.saturating_sub(2), content_height));
+    let content_height = total_items as u16 * 2 + 15;
 
     let mut content = format!("Project: {}\n\n", state.project_dir.display());
 
-    // Commands section
     if !state.commands.is_empty() {
         content.push_str(&format!(
             "Commands ({}):\n\n{}\n\n",
@@ -72,7 +122,6 @@ fn render_project_overview(
         ));
     }
 
-    // Checks section
     if !state.checks.is_empty() {
         content.push_str(&format!(
             "Checks ({}):\n\n{}\n\n",
@@ -95,17 +144,13 @@ fn render_project_overview(
         Press Enter to review each item, or q to cancel.",
     );
 
-    scroll_view.render_widget(
-        Paragraph::new(content).wrap(Wrap { trim: false }),
-        Rect::new(0, 0, chunks[1].width.saturating_sub(2), content_height),
+    render_scrollable_content(frame, chunks[1], scroll_state, &content, content_height);
+    render_help(
+        frame,
+        chunks[2],
+        "↑/k up | ↓/j down | Enter approve | q cancel",
+        Color::DarkGray,
     );
-
-    frame.render_stateful_widget(scroll_view, chunks[1], scroll_state);
-
-    // Help
-    let help = Paragraph::new("↑/k up | ↓/j down | Enter approve | q cancel")
-        .style(Style::default().fg(Color::DarkGray));
-    frame.render_widget(help, chunks[2]);
 }
 
 fn render_command_review(
@@ -113,38 +158,13 @@ fn render_command_review(
     scroll_state: &mut ScrollViewState,
     frame: &mut Frame,
 ) {
-    let area = frame.area();
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // Title
-            Constraint::Min(0),    // Content
-            Constraint::Length(2), // Help
-        ])
-        .split(area);
+    let chunks = standard_layout(frame.area());
 
     let Some(current) = state.current_item() else {
-        // Defensive: Should be unreachable due to validation in new() and handle_overview_keys()
-        let title = Paragraph::new("Error: Empty Section")
-            .block(Block::default().borders(Borders::ALL))
-            .style(Style::default().fg(Color::Red).bold());
-        frame.render_widget(title, chunks[0]);
-
-        let content = Paragraph::new(
-            "No items in this section. This is a bug in the navigation logic.\n\
-            Press q to cancel and report this issue.",
-        )
-        .wrap(Wrap { trim: false })
-        .style(Style::default().fg(Color::Red));
-        frame.render_widget(content, chunks[1]);
-
-        let help = Paragraph::new("q to cancel").style(Style::default().fg(Color::Red));
-        frame.render_widget(help, chunks[2]);
+        render_empty_section_error(frame, &chunks);
         return;
     };
 
-    // Determine section label and counts
     let (section_label, current_num, total_num) = match state.current_section {
         super::approval_state::Section::Commands => (
             "Command",
@@ -156,26 +176,20 @@ fn render_command_review(
         }
     };
 
-    // Title
-    let title = Paragraph::new(format!(
-        "{} Review ({}/{}): {}",
-        section_label, current_num, total_num, current.name
-    ))
-    .block(Block::default().borders(Borders::ALL))
-    .style(Style::default().fg(Color::Cyan).bold());
-    frame.render_widget(title, chunks[0]);
+    render_title(
+        frame,
+        chunks[0],
+        &format!(
+            "{} Review ({}/{}): {}",
+            section_label, current_num, total_num, current.name
+        ),
+        Color::Cyan,
+    );
 
-    // Calculate content height
-    let mut content_lines = 15; // Base lines
+    let mut content_lines: u16 = 15;
     if current.is_script && current.script_contents.is_some() {
         content_lines += current.script_contents.as_ref().unwrap().lines().count() as u16 + 3;
     }
-
-    // Content with scrolling
-    let mut scroll_view = ScrollView::new(Size::new(
-        chunks[1].width.saturating_sub(2),
-        content_lines.max(chunks[1].height.saturating_sub(2)),
-    ));
 
     let mut content = format!(
         "Command: {}\n\
@@ -188,7 +202,6 @@ fn render_command_review(
         current.binary_hash,
     );
 
-    // Add warnings
     let mut warnings = Vec::new();
     if current.is_in_project {
         warnings.push("⚠ WARNING: Executable is INSIDE the project directory");
@@ -208,7 +221,6 @@ fn render_command_review(
         content.push('\n');
     }
 
-    // Show script contents if applicable
     if let Some(script_contents) = &current.script_contents {
         content.push_str("Script contents:\n");
         content.push_str("────────────────────────────────────────\n");
@@ -218,58 +230,25 @@ fn render_command_review(
 
     content.push_str("\nDo you approve this command?\n");
 
-    scroll_view.render_widget(
-        Paragraph::new(content).wrap(Wrap { trim: false }),
-        Rect::new(0, 0, chunks[1].width.saturating_sub(2), content_lines),
+    render_scrollable_content(frame, chunks[1], scroll_state, &content, content_lines);
+    render_help(
+        frame,
+        chunks[2],
+        "↑/k up | ↓/j down | PgUp/PgDn page | y approve | n/q cancel",
+        Color::DarkGray,
     );
-
-    frame.render_stateful_widget(scroll_view, chunks[1], scroll_state);
-
-    // Help
-    let help = Paragraph::new("↑/k up | ↓/j down | PgUp/PgDn page | y approve | n/q cancel")
-        .style(Style::default().fg(Color::DarkGray));
-    frame.render_widget(help, chunks[2]);
 }
 
 fn render_in_project_warning(state: &ApprovalState, frame: &mut Frame) {
-    let area = frame.area();
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // Title
-            Constraint::Min(0),    // Content
-            Constraint::Length(2), // Help
-        ])
-        .split(area);
+    let chunks = standard_layout(frame.area());
 
     let Some(current) = state.current_item() else {
-        // Defensive: Should be unreachable due to validation in new() and handle_overview_keys()
-        let title = Paragraph::new("Error: Empty Section")
-            .block(Block::default().borders(Borders::ALL))
-            .style(Style::default().fg(Color::Red).bold());
-        frame.render_widget(title, chunks[0]);
-
-        let content = Paragraph::new(
-            "No items in this section. This is a bug in the navigation logic.\n\
-            Press q to cancel and report this issue.",
-        )
-        .wrap(Wrap { trim: false })
-        .style(Style::default().fg(Color::Red));
-        frame.render_widget(content, chunks[1]);
-
-        let help = Paragraph::new("q to cancel").style(Style::default().fg(Color::Red));
-        frame.render_widget(help, chunks[2]);
+        render_empty_section_error(frame, &chunks);
         return;
     };
 
-    // Title
-    let title = Paragraph::new("⚠⚠⚠ SECURITY WARNING ⚠⚠⚠")
-        .block(Block::default().borders(Borders::ALL))
-        .style(Style::default().fg(Color::Red).bold());
-    frame.render_widget(title, chunks[0]);
+    render_title(frame, chunks[0], "⚠⚠⚠ SECURITY WARNING ⚠⚠⚠", Color::Red);
 
-    // Content
     let content = format!(
         "This executable is INSIDE the project directory AND writable by you:\n\
         \n\
@@ -295,35 +274,21 @@ fn render_in_project_warning(state: &ApprovalState, frame: &mut Frame) {
         .style(Style::default().fg(Color::Red));
     frame.render_widget(paragraph, chunks[1]);
 
-    // Help
-    let help = Paragraph::new("CAPITAL Y (Shift+Y) to confirm | n/q/Esc to cancel")
-        .style(Style::default().fg(Color::Red).bold());
-    frame.render_widget(help, chunks[2]);
+    render_help_bold(
+        frame,
+        chunks[2],
+        "CAPITAL Y (Shift+Y) to confirm | n/q/Esc to cancel",
+        Color::Red,
+    );
 }
 
 fn render_summary(state: &ApprovalState, scroll_state: &mut ScrollViewState, frame: &mut Frame) {
-    let area = frame.area();
+    let chunks = standard_layout(frame.area());
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // Title
-            Constraint::Min(0),    // Content
-            Constraint::Length(2), // Help
-        ])
-        .split(area);
+    render_title(frame, chunks[0], "Approval Summary", Color::Green);
 
-    // Title
-    let title = Paragraph::new("Approval Summary")
-        .block(Block::default().borders(Borders::ALL))
-        .style(Style::default().fg(Color::Green).bold());
-    frame.render_widget(title, chunks[0]);
-
-    // Calculate content height for both commands and checks
     let total_items = state.commands.len() + state.checks.len();
-    let content_height = (total_items as u16 * 4 + 15).max(chunks[1].height.saturating_sub(2));
-    let mut scroll_view =
-        ScrollView::new(Size::new(chunks[1].width.saturating_sub(2), content_height));
+    let content_height = total_items as u16 * 4 + 15;
 
     let mut content = format!(
         "You have reviewed and approved all items for:\n\
@@ -331,7 +296,6 @@ fn render_summary(state: &ApprovalState, scroll_state: &mut ScrollViewState, fra
         state.project_dir.display()
     );
 
-    // Commands section
     if !state.commands.is_empty() {
         let command_list = state
             .commands
@@ -351,7 +315,6 @@ fn render_summary(state: &ApprovalState, scroll_state: &mut ScrollViewState, fra
         content.push_str(&format!("Approved commands:\n{}\n\n", command_list));
     }
 
-    // Checks section
     if !state.checks.is_empty() {
         let check_list = state
             .checks
@@ -378,38 +341,20 @@ fn render_summary(state: &ApprovalState, scroll_state: &mut ScrollViewState, fra
         Press Enter to save and complete approval, or q to cancel.",
     );
 
-    scroll_view.render_widget(
-        Paragraph::new(content).wrap(Wrap { trim: false }),
-        Rect::new(0, 0, chunks[1].width.saturating_sub(2), content_height),
+    render_scrollable_content(frame, chunks[1], scroll_state, &content, content_height);
+    render_help(
+        frame,
+        chunks[2],
+        "↑/k up | ↓/j down | Enter save & approve | q cancel",
+        Color::DarkGray,
     );
-
-    frame.render_stateful_widget(scroll_view, chunks[1], scroll_state);
-
-    // Help
-    let help = Paragraph::new("↑/k up | ↓/j down | Enter save & approve | q cancel")
-        .style(Style::default().fg(Color::DarkGray));
-    frame.render_widget(help, chunks[2]);
 }
 
 fn render_approved(state: &ApprovalState, frame: &mut Frame) {
-    let area = frame.area();
+    let chunks = standard_layout(frame.area());
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // Title
-            Constraint::Min(0),    // Content
-            Constraint::Length(2), // Help
-        ])
-        .split(area);
+    render_title(frame, chunks[0], "✓ Approval Complete", Color::Green);
 
-    // Title
-    let title = Paragraph::new("✓ Approval Complete")
-        .block(Block::default().borders(Borders::ALL))
-        .style(Style::default().fg(Color::Green).bold());
-    frame.render_widget(title, chunks[0]);
-
-    // Content
     let total_items = state.commands.len() + state.checks.len();
     let content = format!(
         "Successfully approved project tools for:\n\
@@ -429,30 +374,14 @@ fn render_approved(state: &ApprovalState, frame: &mut Frame) {
         .style(Style::default().fg(Color::Green));
     frame.render_widget(paragraph, chunks[1]);
 
-    // Help
-    let help = Paragraph::new("Press any key to exit").style(Style::default().fg(Color::DarkGray));
-    frame.render_widget(help, chunks[2]);
+    render_help(frame, chunks[2], "Press any key to exit", Color::DarkGray);
 }
 
 fn render_cancelled(frame: &mut Frame, error_message: &Option<String>) {
-    let area = frame.area();
+    let chunks = standard_layout(frame.area());
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // Title
-            Constraint::Min(0),    // Content
-            Constraint::Length(2), // Help
-        ])
-        .split(area);
+    render_title(frame, chunks[0], "✗ Approval Cancelled", Color::Yellow);
 
-    // Title
-    let title = Paragraph::new("✗ Approval Cancelled")
-        .block(Block::default().borders(Borders::ALL))
-        .style(Style::default().fg(Color::Yellow).bold());
-    frame.render_widget(title, chunks[0]);
-
-    // Content
     let mut content = String::from("Approval process cancelled.\n\n");
 
     if let Some(error) = error_message {
@@ -467,7 +396,5 @@ fn render_cancelled(frame: &mut Frame, error_message: &Option<String>) {
         .style(Style::default().fg(Color::Yellow));
     frame.render_widget(paragraph, chunks[1]);
 
-    // Help
-    let help = Paragraph::new("Press any key to exit").style(Style::default().fg(Color::DarkGray));
-    frame.render_widget(help, chunks[2]);
+    render_help(frame, chunks[2], "Press any key to exit", Color::DarkGray);
 }

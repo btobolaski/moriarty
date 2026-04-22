@@ -8,10 +8,6 @@
 .Nd an assistant for an assistant \(em Claude Code log analysis, API pricing, and tool call permissioning
 .Sh SYNOPSIS
 .Nm
-.Cm logs
-.Fl f Ar file
-.Op Fl \-validate
-.Nm
 .Cm api\-pricing
 .Fl d Ar dir
 .Op Fl \-timezone Ar local|utc
@@ -40,21 +36,9 @@
 .Sh DESCRIPTION
 .Nm
 is a Rust CLI tool for working with Claude Code.
-It provides an interactive log viewer, API usage analysis, MCP servers,
+It provides API usage analysis, MCP servers,
 and a security hook system for controlling which tools and commands
 Claude Code can execute.
-.Ss Log Viewer
-The
-.Cm logs
-subcommand opens an interactive TUI for viewing and navigating
-Claude Code conversation logs.
-.Bl -tag -width Ds
-.It Fl f , Fl \-file Ar file
-Path to the log file to read.
-.It Fl \-validate
-Parse the log and exit instead of opening the viewer.
-Returns a non\-zero exit code if parsing fails.
-.El
 .Ss API Pricing
 The
 .Cm api\-pricing

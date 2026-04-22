@@ -1,26 +1,8 @@
-use super::*;
-use crate::project_config::{approvals, load_project_settings};
 use tempfile::TempDir;
 
-// IMPORTANT: Tests use `_xdg_dir` variables to keep TempDir instances alive.
-// TempDir deletes its directory when dropped, so binding it to a variable (even
-// with underscore prefix) prevents premature cleanup. Without this binding, the
-// temporary XDG_CONFIG_HOME directory would be deleted before the test completes.
-
-fn setup_project_dir_with_config(config_content: &str) -> TempDir {
-    let temp_dir = TempDir::new().unwrap();
-    let config_dir = temp_dir.path().join(".config");
-    std::fs::create_dir(&config_dir).unwrap();
-    std::fs::write(config_dir.join("tools.toml"), config_content).unwrap();
-    temp_dir
-}
-
-/// Safe to use std::env::set_var because cargo nextest isolates each test in a separate process.
-fn setup_isolated_xdg_config() -> tempfile::TempDir {
-    let temp_dir = tempfile::tempdir().unwrap();
-    std::env::set_var("XDG_CONFIG_HOME", temp_dir.path());
-    temp_dir
-}
+use super::*;
+use crate::project_config::approvals;
+use crate::test_helpers::{setup_isolated_xdg_config, setup_project_dir_with_config};
 
 async fn setup_project_dir_with_approvals(config_content: &str) -> (TempDir, TempDir) {
     let xdg_dir = setup_isolated_xdg_config();
@@ -31,99 +13,108 @@ async fn setup_project_dir_with_approvals(config_content: &str) -> (TempDir, Tem
     (temp_dir, xdg_dir)
 }
 
-#[tokio::test]
-async fn test_load_project_settings_success() {
-    let temp_dir = setup_project_dir_with_config(
-        r#"
-[commands]
-lint = ["cargo", "clippy"]
-test = ["cargo", "test"]
-build = ["cargo", "build"]
-format = ["cargo", "fmt"]
-"#,
-    );
-
-    let config = load_project_settings(temp_dir.path().to_path_buf())
-        .await
-        .unwrap();
-
-    assert_eq!(
-        config.commands.lint,
-        Some(vec!["cargo".to_string(), "clippy".to_string()])
-    );
-    assert_eq!(
-        config.commands.test,
-        Some(vec!["cargo".to_string(), "test".to_string()])
-    );
-    assert_eq!(
-        config.commands.build,
-        Some(vec!["cargo".to_string(), "build".to_string()])
-    );
-    assert_eq!(
-        config.commands.format,
-        Some(vec!["cargo".to_string(), "fmt".to_string()])
-    );
-}
-
-#[tokio::test]
-async fn test_load_project_settings_partial_config() {
-    let temp_dir = setup_project_dir_with_config(
-        r#"
-[commands]
-lint = ["cargo", "clippy"]
-"#,
-    );
-
-    let config = load_project_settings(temp_dir.path().to_path_buf())
-        .await
-        .unwrap();
-
-    assert_eq!(
-        config.commands.lint,
-        Some(vec!["cargo".to_string(), "clippy".to_string()])
-    );
-    assert_eq!(config.commands.test, None);
-    assert_eq!(config.commands.build, None);
-    assert_eq!(config.commands.format, None);
-}
-
-#[tokio::test]
-async fn test_load_project_settings_missing_file() {
+/// Test scaffolding for TOCTOU / binary-swap scenarios.
+///
+/// Creates a temp project dir with `.config/tools.toml` that maps the given
+/// command `key` (lint/test/build/format) to a freshly-created executable
+/// shell script whose body is `initial_body`. Returns:
+///   (temp_dir, script_path, config_content)
+///
+/// Caller is expected to already have isolated XDG config set up.
+fn create_script_project(key: &str, script_name: &str, initial_body: &str) -> (TempDir, std::path::PathBuf, String) {
+    use std::io::Write;
     let temp_dir = TempDir::new().unwrap();
-
-    let result = load_project_settings(temp_dir.path().to_path_buf()).await;
-
-    let error_msg = format!("{:?}", result.expect_err("Should fail with missing file"));
-    assert!(error_msg.contains("failed to read project settings"));
+    let config_dir = temp_dir.path().join(".config");
+    std::fs::create_dir(&config_dir).unwrap();
+    let script_path = temp_dir.path().join(script_name);
+    let mut script = std::fs::File::create(&script_path).unwrap();
+    writeln!(script, "#!/usr/bin/env bash").unwrap();
+    writeln!(script, "{}", initial_body).unwrap();
+    drop(script);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).unwrap();
+    }
+    let config_content = format!("[commands]\n{key} = [\"{}\"]\n", script_path.display());
+    std::fs::write(config_dir.join("tools.toml"), &config_content).unwrap();
+    (temp_dir, script_path, config_content)
 }
 
-#[tokio::test]
-async fn test_load_project_settings_malformed_toml() {
-    let temp_dir = setup_project_dir_with_config("this is not valid toml [[[");
+/// Overwrites `script_path` with a new bash body, preserving its executable bit.
+fn overwrite_script(script_path: &std::path::Path, body: &str) {
+    use std::io::Write;
+    let mut script = std::fs::File::create(script_path).unwrap();
+    writeln!(script, "#!/usr/bin/env bash").unwrap();
+    writeln!(script, "{}", body).unwrap();
+}
 
-    let result = load_project_settings(temp_dir.path().to_path_buf()).await;
+// load_project_settings success/error tests live in project_config::config::tests;
+// duplicating them here just delayed test runs and produced jscpd noise.
 
-    let error_msg = format!("{:?}", result.expect_err("Should fail with malformed TOML"));
-    assert!(error_msg.contains("failed to parse project settings"));
+/// Builds the `RunArgs` wrapper expected by `ToolRunner` for `project_dir`.
+fn run_args(project_dir: &std::path::Path) -> RunArgs {
+    RunArgs {
+        project_dir: project_dir.to_path_buf(),
+    }
+}
+
+/// Runs a single project command through the MCP tool runner against
+/// `project_dir`, returning either the tool result or structured MCP error.
+async fn run_project_cmd(
+    command: ProjectCommand,
+    project_dir: &std::path::Path,
+) -> std::result::Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+    ToolRunner::run_command(command, run_args(project_dir)).await
+}
+
+/// Builds `RunArgs` pointing at `temp_dir` and invokes `ToolRunner::run_command`
+/// for `ProjectCommand::Test`.
+async fn run_test_cmd(
+    temp_dir: &TempDir,
+) -> std::result::Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+    run_project_cmd(ProjectCommand::Test, temp_dir.path()).await
+}
+
+/// Asserts an MCP error uses the INVALID_REQUEST code, which is how approval
+/// and verification failures are surfaced to callers.
+fn assert_invalid_request(err: &rmcp::ErrorData) {
+    assert_eq!(err.code, ErrorCode::INVALID_REQUEST);
+}
+
+/// Asserts an error message mentions generic config-modification or hash
+/// invalidation terms, as expected when tools.toml changes after approval.
+fn assert_hash_or_modified_message(err: &rmcp::ErrorData) {
+    let msg_lower = err.message.to_lowercase();
+    assert!(
+        msg_lower.contains("modified")
+            || msg_lower.contains("hash")
+            || msg_lower.contains("sha256"),
+        "Error should indicate a hash/modification problem. Got: {}",
+        err.message
+    );
+}
+
+/// Asserts an error message specifically points at binary-hash verification,
+/// not just a generic config mutation, for swapped-binary scenarios.
+fn assert_binary_hash_message(err: &rmcp::ErrorData) {
+    let msg_lower = err.message.to_lowercase();
+    assert!(
+        (msg_lower.contains("binary") || msg_lower.contains("modified"))
+            && (msg_lower.contains("hash") || msg_lower.contains("sha256")),
+        "Error should indicate binary hash mismatch. Got: {}",
+        err.message
+    );
 }
 
 #[tokio::test]
 async fn test_run_command_success() {
-    let (temp_dir, _xdg_dir) = setup_project_dir_with_approvals(
-        r#"
-[commands]
-test = ["echo", "test output"]
-"#,
-    )
-    .await;
-
-    let args = RunArgs {
-        project_dir: temp_dir.path().to_path_buf(),
-    };
-
-    let tool_result = ToolRunner::run_command(ProjectCommand::Test, args)
-        .await
-        .unwrap();
+    let (temp_dir, _xdg_dir) =
+        setup_project_dir_with_approvals("[commands]\ntest = [\"echo\", \"test output\"]\n")
+            .await;
+    let tool_result = run_test_cmd(&temp_dir).await.unwrap();
     assert_eq!(tool_result.is_error, Some(false));
     assert_eq!(tool_result.content.len(), 2);
 }
@@ -131,22 +122,11 @@ test = ["echo", "test output"]
 #[tokio::test]
 async fn test_run_command_not_configured() {
     // Verify that commands not in tools.toml are rejected with appropriate error
-    let (temp_dir, _xdg_dir) = setup_project_dir_with_approvals(
-        r#"
-[commands]
-lint = ["cargo", "clippy"]
-"#,
-    )
-    .await;
-
-    let args = RunArgs {
-        project_dir: temp_dir.path().to_path_buf(),
-    };
-
-    let Err(error) = ToolRunner::run_command(ProjectCommand::Test, args).await else {
+    let (temp_dir, _xdg_dir) =
+        setup_project_dir_with_approvals("[commands]\nlint = [\"cargo\", \"clippy\"]\n").await;
+    let Err(error) = run_test_cmd(&temp_dir).await else {
         panic!("Expected error for unconfigured command");
     };
-
     assert_eq!(error.code, ErrorCode::RESOURCE_NOT_FOUND);
     assert!(error.message.contains("not configured"));
 }
@@ -155,42 +135,21 @@ lint = ["cargo", "clippy"]
 async fn test_run_command_not_approved() {
     // Unlike other tests, deliberately skip approval setup to test rejection path
     let _xdg_dir = setup_isolated_xdg_config();
-    let temp_dir = setup_project_dir_with_config(
-        r#"
-[commands]
-test = ["echo", "hello"]
-"#,
-    );
-
-    let args = RunArgs {
-        project_dir: temp_dir.path().to_path_buf(),
-    };
-
-    let Err(error) = ToolRunner::run_command(ProjectCommand::Test, args).await else {
+    let temp_dir =
+        setup_project_dir_with_config("[commands]\ntest = [\"echo\", \"hello\"]\n");
+    let Err(error) = run_test_cmd(&temp_dir).await else {
         panic!("Expected error for unapproved project");
     };
-
     assert_eq!(error.code, ErrorCode::INVALID_REQUEST);
     assert!(error.message.contains("not approved"));
 }
 
 #[tokio::test]
 async fn test_run_command_nonzero_exit() {
-    let (temp_dir, _xdg_dir) = setup_project_dir_with_approvals(
-        r#"
-[commands]
-test = ["sh", "-c", "exit 1"]
-"#,
-    )
-    .await;
-
-    let args = RunArgs {
-        project_dir: temp_dir.path().to_path_buf(),
-    };
-
-    let tool_result = ToolRunner::run_command(ProjectCommand::Test, args)
-        .await
-        .unwrap();
+    let (temp_dir, _xdg_dir) =
+        setup_project_dir_with_approvals("[commands]\ntest = [\"sh\", \"-c\", \"exit 1\"]\n")
+            .await;
+    let tool_result = run_test_cmd(&temp_dir).await.unwrap();
     assert_eq!(tool_result.is_error, Some(true));
 }
 
@@ -215,15 +174,11 @@ test = ["echo", "modified"]
     )
     .unwrap();
 
-    let args = RunArgs {
-        project_dir: temp_dir.path().to_path_buf(),
-    };
-
-    let Err(error) = ToolRunner::run_command(ProjectCommand::Test, args).await else {
+    let Err(error) = run_project_cmd(ProjectCommand::Test, temp_dir.path()).await else {
         panic!("Expected error for modified config");
     };
 
-    assert_eq!(error.code, ErrorCode::INVALID_REQUEST);
+    assert_invalid_request(&error);
     assert!(error.message.contains("tools.toml has been modified"));
 }
 
@@ -235,84 +190,43 @@ async fn test_project_command_display() {
     assert_eq!(format!("{}", ProjectCommand::Format), "format");
 }
 
+/// Runs each of the `run_*` handler shims through a minimal approved project
+/// whose matching `[commands]` entry is `echo <label>`, asserting the tool
+/// returns is_error=false with a 2-item content vec.
 #[tokio::test]
-async fn test_run_lint_handler() {
-    let (temp_dir, _xdg_dir) = setup_project_dir_with_approvals(
-        r#"
-[commands]
-lint = ["echo", "Running lint"]
-"#,
-    )
-    .await;
+async fn test_run_handler_matrix() {
+    type Handler =
+        for<'a> fn(
+            &'a ToolRunner,
+            Parameters<RunArgs>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = std::result::Result<rmcp::model::CallToolResult, rmcp::ErrorData>,
+                    > + Send
+                    + 'a,
+            >,
+        >;
+    let cases: &[(&str, &str, Handler)] = &[
+        ("lint", "Running lint", |s, a| Box::pin(s.run_lint(a))),
+        ("build", "Building project", |s, a| Box::pin(s.run_build(a))),
+        ("format", "Formatting code", |s, a| Box::pin(s.run_formatter(a))),
+        ("test", "Running tests", |s, a| Box::pin(s.run_tests(a))),
+    ];
 
-    let server = ToolRunner::default();
-    let args = RunArgs {
-        project_dir: temp_dir.path().to_path_buf(),
-    };
-
-    let tool_result = server.run_lint(Parameters(args)).await.unwrap();
-    assert_eq!(tool_result.is_error, Some(false));
-    assert_eq!(tool_result.content.len(), 2);
-}
-
-#[tokio::test]
-async fn test_run_build_handler() {
-    let (temp_dir, _xdg_dir) = setup_project_dir_with_approvals(
-        r#"
-[commands]
-build = ["echo", "Building project"]
-"#,
-    )
-    .await;
-
-    let server = ToolRunner::default();
-    let args = RunArgs {
-        project_dir: temp_dir.path().to_path_buf(),
-    };
-
-    let tool_result = server.run_build(Parameters(args)).await.unwrap();
-    assert_eq!(tool_result.is_error, Some(false));
-    assert_eq!(tool_result.content.len(), 2);
-}
-
-#[tokio::test]
-async fn test_run_formatter_handler() {
-    let (temp_dir, _xdg_dir) = setup_project_dir_with_approvals(
-        r#"
-[commands]
-format = ["echo", "Formatting code"]
-"#,
-    )
-    .await;
-
-    let server = ToolRunner::default();
-    let args = RunArgs {
-        project_dir: temp_dir.path().to_path_buf(),
-    };
-
-    let tool_result = server.run_formatter(Parameters(args)).await.unwrap();
-    assert_eq!(tool_result.is_error, Some(false));
-    assert_eq!(tool_result.content.len(), 2);
-}
-
-#[tokio::test]
-async fn test_run_tests_handler() {
-    let (temp_dir, _xdg_dir) = setup_project_dir_with_approvals(
-        r#"
-[commands]
-test = ["echo", "Running tests"]
-"#,
-    )
-    .await;
-
-    let server = ToolRunner::default();
-    let args = RunArgs {
-        project_dir: temp_dir.path().to_path_buf(),
-    };
-
-    let tool_result = server.run_tests(Parameters(args)).await.unwrap();
-    assert_eq!(tool_result.is_error, Some(false));
-    assert_eq!(tool_result.content.len(), 2);
+    for (key, label, handler) in cases {
+        let toml = format!("[commands]\n{key} = [\"echo\", \"{label}\"]\n");
+        let (temp_dir, _xdg_dir) = setup_project_dir_with_approvals(&toml).await;
+        let server = ToolRunner::default();
+        let args = RunArgs {
+            project_dir: temp_dir.path().to_path_buf(),
+        };
+        let tool_result = handler(&server, Parameters(args))
+            .await
+            .unwrap_or_else(|e| panic!("{key}: handler returned Err: {e:?}"));
+        assert_eq!(tool_result.is_error, Some(false), "{key}");
+        assert_eq!(tool_result.content.len(), 2, "{key}");
+    }
 }
 
 #[tokio::test]
@@ -371,62 +285,26 @@ test = ["echo", "hello"]
 
 #[tokio::test]
 async fn test_detects_binary_swap_toctou_attack() {
-    // TOCTOU attack: Approve legitimate binary, then swap with malicious one
-    // This simulates an attacker replacing a binary after approval but before execution
-    use std::io::Write;
-
+    // TOCTOU attack: Approve legitimate binary, then swap with malicious one.
     let _xdg_dir = setup_isolated_xdg_config();
-
-    // Create a custom script that will be approved
-    let temp_dir = TempDir::new().unwrap();
-    let config_dir = temp_dir.path().join(".config");
-    std::fs::create_dir(&config_dir).unwrap();
-
-    let script_path = temp_dir.path().join("legitimate.sh");
-    let mut script = std::fs::File::create(&script_path).unwrap();
-    writeln!(script, "#!/usr/bin/env bash").unwrap();
-    writeln!(script, "echo 'legitimate'").unwrap();
-    drop(script);
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&script_path, perms).unwrap();
-    }
-
-    let config_content = format!(
-        r#"
-[commands]
-test = ["{}"]
-"#,
-        script_path.display()
-    );
-
-    std::fs::write(config_dir.join("tools.toml"), &config_content).unwrap();
-
-    // Approve the legitimate binary
+    let (temp_dir, script_path, config_content) =
+        create_script_project("test", "legitimate.sh", "echo 'legitimate'");
     approvals::approve_project_config(temp_dir.path(), &config_content)
         .await
         .unwrap();
 
-    // TOCTOU attack: Swap the binary with malicious content after approval
-    let mut malicious_script = std::fs::File::create(&script_path).unwrap();
-    writeln!(malicious_script, "#!/usr/bin/env bash").unwrap();
-    writeln!(malicious_script, "echo 'malicious'").unwrap();
-    writeln!(malicious_script, "rm -rf /").unwrap(); // Simulated malicious command
-    drop(malicious_script);
+    // Swap the binary with malicious content after approval.
+    overwrite_script(
+        &script_path,
+        "echo 'malicious'\nrm -rf /", // simulated malicious command
+    );
 
-    // Attempt to execute - should be rejected due to hash mismatch
     let args = RunArgs {
         project_dir: temp_dir.path().to_path_buf(),
     };
-
     let Err(error) = ToolRunner::run_command(ProjectCommand::Test, args).await else {
         panic!("TOCTOU attack should be detected - binary was swapped after approval");
     };
-
     assert_eq!(error.code, ErrorCode::INVALID_REQUEST);
     let msg_lower = error.message.to_lowercase();
     assert!(
@@ -498,23 +376,22 @@ test = ["{}"]
         std::fs::remove_file(&symlink_path).unwrap();
         std::os::unix::fs::symlink(&malicious_path, &symlink_path).unwrap();
 
-        // Attempt execution - should be rejected (canonical path changed)
-        let args = RunArgs {
-            project_dir: temp_dir.path().to_path_buf(),
-        };
-
-        let Err(error) = ToolRunner::run_command(ProjectCommand::Test, args).await else {
+        let Err(error) = run_project_cmd(ProjectCommand::Test, temp_dir.path()).await else {
             panic!("Symlink TOCTOU attack should be detected - target was changed");
         };
 
-        assert_eq!(error.code, ErrorCode::INVALID_REQUEST);
+        assert_invalid_request(&error);
         let msg_lower = error.message.to_lowercase();
         assert!(
-            (msg_lower.contains("canonical path")
+            msg_lower.contains("canonical path")
                 || msg_lower.contains("binary")
-                || msg_lower.contains("modified"))
-                && (msg_lower.contains("hash") || msg_lower.contains("sha256")),
-            "Error should indicate path or hash mismatch. Got: {}",
+                || msg_lower.contains("modified"),
+            "Error should indicate path or binary mismatch. Got: {}",
+            error.message
+        );
+        assert!(
+            msg_lower.contains("hash") || msg_lower.contains("sha256"),
+            "Error should indicate a hash mismatch. Got: {}",
             error.message
         );
     }
@@ -522,50 +399,17 @@ test = ["{}"]
 
 #[tokio::test]
 async fn test_full_approval_lifecycle() {
-    // Integration test: approve → execute → modify config → reject → re-approve → execute
-    // This validates the complete approval workflow end-to-end
-    use std::io::Write;
-
-    // Setup isolated XDG config to avoid cross-test contamination
+    // Integration test: approve → execute → modify config → reject → re-approve → execute.
     let xdg_dir = setup_isolated_xdg_config();
-
-    let temp_dir = TempDir::new().unwrap();
+    let (temp_dir, script_path, config_content_v1) =
+        create_script_project("test", "test.sh", "echo 'test'");
     let config_dir = temp_dir.path().join(".config");
-    std::fs::create_dir(&config_dir).unwrap();
-
-    let script_path = temp_dir.path().join("test.sh");
-    let mut script = std::fs::File::create(&script_path).unwrap();
-    writeln!(script, "#!/usr/bin/env bash").unwrap();
-    writeln!(script, "echo 'test'").unwrap();
-    drop(script);
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&script_path, perms).unwrap();
-    }
-
-    let config_content_v1 = format!(
-        r#"
-[commands]
-test = ["{}"]
-"#,
-        script_path.display()
-    );
-
-    std::fs::write(config_dir.join("tools.toml"), &config_content_v1).unwrap();
-
-    // Step 1: Initial approval
     approvals::approve_project_config(temp_dir.path(), &config_content_v1)
         .await
         .unwrap();
 
     // Step 2: Execute command - should succeed
-    let args = RunArgs {
-        project_dir: temp_dir.path().to_path_buf(),
-    };
+    let args = run_args(temp_dir.path());
 
     let result = ToolRunner::run_command(ProjectCommand::Test, args.clone()).await;
     result.expect("Initial execution should succeed");
@@ -587,15 +431,8 @@ build = ["echo", "build"]
         panic!("Execution should fail after config modification");
     };
 
-    assert_eq!(error.code, ErrorCode::INVALID_REQUEST);
-    let msg_lower = error.message.to_lowercase();
-    assert!(
-        msg_lower.contains("modified")
-            || msg_lower.contains("hash")
-            || msg_lower.contains("sha256"),
-        "Error should indicate config modification. Got: {}",
-        error.message
-    );
+    assert_invalid_request(&error);
+    assert_hash_or_modified_message(&error);
 
     // Step 5: Re-approve with new config
     approvals::approve_project_config(temp_dir.path(), &config_content_v2)
@@ -612,72 +449,29 @@ build = ["echo", "build"]
 
 #[tokio::test]
 async fn test_approval_lifecycle_with_binary_modification() {
-    // Integration test: approve → modify binary → reject → re-approve → execute
-    // Validates that binary hash verification works throughout the lifecycle
-    use std::io::Write;
-
-    // Setup isolated XDG config to avoid cross-test contamination
+    // Integration test: approve → modify binary → reject → re-approve → execute.
     let xdg_dir = setup_isolated_xdg_config();
-
-    let temp_dir = TempDir::new().unwrap();
-    let config_dir = temp_dir.path().join(".config");
-    std::fs::create_dir(&config_dir).unwrap();
-
-    let script_path = temp_dir.path().join("build.sh");
-    let mut script = std::fs::File::create(&script_path).unwrap();
-    writeln!(script, "#!/usr/bin/env bash").unwrap();
-    writeln!(script, "echo 'version 1'").unwrap();
-    drop(script);
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&script_path, perms).unwrap();
-    }
-
-    let config_content = format!(
-        r#"
-[commands]
-build = ["{}"]
-"#,
-        script_path.display()
-    );
-
-    std::fs::write(config_dir.join("tools.toml"), &config_content).unwrap();
-
-    // Approve version 1
+    let (temp_dir, script_path, config_content) =
+        create_script_project("build", "build.sh", "echo 'version 1'");
     approvals::approve_project_config(temp_dir.path(), &config_content)
         .await
         .unwrap();
 
     // Execute - should succeed
-    let args = RunArgs {
-        project_dir: temp_dir.path().to_path_buf(),
-    };
+    let args = run_args(temp_dir.path());
     let result = ToolRunner::run_command(ProjectCommand::Build, args.clone()).await;
     result.expect("Initial execution should succeed");
 
     // Modify the binary
-    let mut script = std::fs::File::create(&script_path).unwrap();
-    writeln!(script, "#!/usr/bin/env bash").unwrap();
-    writeln!(script, "echo 'version 2 - modified'").unwrap();
-    drop(script);
+    overwrite_script(&script_path, "echo 'version 2 - modified'");
 
     // Attempt execution - should fail due to binary hash mismatch
     let Err(error) = ToolRunner::run_command(ProjectCommand::Build, args.clone()).await else {
         panic!("Execution should fail after binary modification");
     };
 
-    assert_eq!(error.code, ErrorCode::INVALID_REQUEST);
-    let msg_lower = error.message.to_lowercase();
-    assert!(
-        (msg_lower.contains("binary") || msg_lower.contains("modified"))
-            && (msg_lower.contains("hash") || msg_lower.contains("sha256")),
-        "Error should indicate binary modification. Got: {}",
-        error.message
-    );
+    assert_invalid_request(&error);
+    assert_binary_hash_message(&error);
 
     // Re-approve with modified binary
     approvals::approve_project_config(temp_dir.path(), &config_content)

@@ -5,11 +5,11 @@ mod line_counter;
 mod pricing;
 mod time_filter;
 
-use std::path::Path;
+use std::{collections::HashSet, path::Path};
 
-use analyzer::{AnalysisResult, DailyCosts, SessionAnalysisResult, SessionCosts};
+use analyzer::{DailyCosts, SessionCosts};
 use chrono::{DateTime, Local, Utc};
-use pricing::TokenCosts;
+use pricing::{TokenCosts, TokenCounts};
 
 // Re-export DateTimezone and TimeRangeFilter for use in main.rs
 pub use analyzer::DateTimezone;
@@ -17,6 +17,39 @@ pub use time_filter::TimeRangeFilter;
 
 // Type alias for cost components tuple
 type CostComponents = (f64, f64, f64, f64); // (input, output, cache_write, cache_read)
+
+/// Formats a currency amount with four decimal places (e.g. `$0.1234`).
+fn fmt_money(amount: f64) -> String {
+    format!("${:.4}", amount)
+}
+
+/// Formats the four per-category costs plus their subtotal.
+///
+/// Returns `(input, output, cache_write, cache_read, subtotal)` as pre-formatted strings.
+fn fmt_cost_components(costs: CostComponents) -> (String, String, String, String, String) {
+    let (input, output, cache_write, cache_read) = costs;
+    (
+        fmt_money(input),
+        fmt_money(output),
+        fmt_money(cache_write),
+        fmt_money(cache_read),
+        fmt_money(input + output + cache_write + cache_read),
+    )
+}
+
+fn total_row_values(lines_changed: usize, total_cost: f64) -> (String, String) {
+    (fmt_money(total_cost), lines_changed.to_string())
+}
+
+fn empty_cost_columns() -> (String, String, String, String) {
+    (String::new(), String::new(), String::new(), String::new())
+}
+
+/// Returns `value` on the first model row in a group and an empty string for
+/// subsequent rows, so grouped tables only show identifying columns once.
+fn grouped_label(first_row: bool, value: &str) -> &str {
+    if first_row { value } else { "" }
+}
 
 use tabled::{
     settings::{
@@ -68,14 +101,16 @@ impl CostRow {
         cache_read: f64,
         lines: &str,
     ) -> Self {
+        let (input, output, cache_write, cache_read, subtotal) =
+            fmt_cost_components((input, output, cache_write, cache_read));
         Self {
             date: date.to_string(),
             model: model.to_string(),
-            input: format!("${:.4}", input),
-            output: format!("${:.4}", output),
-            cache_write: format!("${:.4}", cache_write),
-            cache_read: format!("${:.4}", cache_read),
-            subtotal: format!("${:.4}", input + output + cache_write + cache_read),
+            input,
+            output,
+            cache_write,
+            cache_read,
+            subtotal,
             lines: lines.to_string(),
         }
     }
@@ -86,15 +121,17 @@ impl CostRow {
     /// costs in a total row would be misleading - users might confuse them for
     /// additional costs rather than components of the subtotal.
     fn new_total_row(lines_changed: usize, total_cost: f64) -> Self {
+        let (subtotal, lines) = total_row_values(lines_changed, total_cost);
+        let (input, output, cache_write, cache_read) = empty_cost_columns();
         Self {
             date: String::new(),
             model: "Total".to_string(),
-            input: String::new(),
-            output: String::new(),
-            cache_write: String::new(),
-            cache_read: String::new(),
-            subtotal: format!("${:.4}", total_cost),
-            lines: lines_changed.to_string(),
+            input,
+            output,
+            cache_write,
+            cache_read,
+            subtotal,
+            lines,
         }
     }
 }
@@ -112,7 +149,7 @@ impl GrandTotalRow {
     /// Creates a new grand total row with formatted values.
     fn new(grand_total: f64, total_lines: usize) -> Self {
         Self {
-            grand_total: format!("${:.4}", grand_total),
+            grand_total: fmt_money(grand_total),
             total_lines_changed: total_lines.to_string(),
         }
     }
@@ -153,34 +190,36 @@ impl SessionCostRow {
         costs: CostComponents,
         lines: &str,
     ) -> Self {
-        let (input, output, cache_write, cache_read) = costs;
+        let (input, output, cache_write, cache_read, subtotal) = fmt_cost_components(costs);
         Self {
             session: session.to_string(),
             time_range: time_range.to_string(),
             duration: duration.to_string(),
             model: model.to_string(),
-            input: format!("${:.4}", input),
-            output: format!("${:.4}", output),
-            cache_write: format!("${:.4}", cache_write),
-            cache_read: format!("${:.4}", cache_read),
-            subtotal: format!("${:.4}", input + output + cache_write + cache_read),
+            input,
+            output,
+            cache_write,
+            cache_read,
+            subtotal,
             lines: lines.to_string(),
         }
     }
 
     /// Creates a total row for displaying session summary
     fn new_total_row(lines_changed: usize, total_cost: f64) -> Self {
+        let (subtotal, lines) = total_row_values(lines_changed, total_cost);
+        let (input, output, cache_write, cache_read) = empty_cost_columns();
         Self {
             session: String::new(),
             time_range: String::new(),
             duration: String::new(),
             model: "Total".to_string(),
-            input: String::new(),
-            output: String::new(),
-            cache_write: String::new(),
-            cache_read: String::new(),
-            subtotal: format!("${:.4}", total_cost),
-            lines: lines_changed.to_string(),
+            input,
+            output,
+            cache_write,
+            cache_read,
+            subtotal,
+            lines,
         }
     }
 }
@@ -206,62 +245,87 @@ fn apply_width_config(table: &mut Table, term_width: usize) {
     }
 }
 
-/// Returns model costs in display order: Opus 4, Opus, Sonnet, Haiku
-fn iter_model_costs(costs: &DailyCosts) -> impl Iterator<Item = (&'static str, &TokenCosts)> {
-    [
-        ("Opus 4", &costs.opus4_costs),
-        ("Opus", &costs.opus_costs),
-        ("Sonnet", &costs.sonnet_costs),
-        ("Haiku", &costs.haiku_costs),
-    ]
-    .into_iter()
+/// Appends one row per non-zero-cost model in display order, using `make_row`
+/// to populate the leading identifying columns only on the first emitted row.
+fn push_nonzero_model_rows<Row>(
+    rows: &mut Vec<Row>,
+    model_costs: [(&'static str, TokenCosts); 4],
+    mut make_row: impl FnMut(bool, &'static str, TokenCosts) -> Row,
+) {
+    let mut first_row = true;
+
+    for (model_name, costs) in model_costs {
+        if costs.total() > 0.0 {
+            rows.push(make_row(first_row, model_name, costs));
+            first_row = false;
+        }
+    }
 }
 
-/// Build cost rows from daily costs data
-fn build_cost_rows(daily_costs: &[DailyCosts]) -> (Vec<CostRow>, Vec<usize>) {
+/// Returns the rendered rows plus the position of each group's terminal row,
+/// which callers use to insert separators between groups without re-scanning.
+fn build_grouped_rows<Item, Row>(
+    items: &[Item],
+    mut push_item_rows: impl FnMut(&mut Vec<Row>, &Item),
+    mut push_total_row: impl FnMut(&mut Vec<Row>, &Item),
+) -> (Vec<Row>, Vec<usize>) {
     let mut rows = Vec::new();
     let mut total_row_indices = Vec::new();
 
-    for costs in daily_costs {
-        let date_str = costs.date.to_string();
-        let mut first_row = true;
-
-        // Iterate over models in priority order
-        for (model_name, model_costs) in iter_model_costs(costs) {
-            if model_costs.total() > 0.0 {
-                rows.push(CostRow::new(
-                    if first_row { &date_str } else { "" },
-                    model_name,
-                    model_costs.input,
-                    model_costs.output,
-                    model_costs.cache_write,
-                    model_costs.cache_read,
-                    "",
-                ));
-                first_row = false;
-            }
-        }
-
-        // Add total row for this day
-        rows.push(CostRow::new_total_row(costs.lines_changed, costs.total()));
+    for item in items {
+        push_item_rows(&mut rows, item);
+        push_total_row(&mut rows, item);
         total_row_indices.push(rows.len() - 1);
     }
 
     (rows, total_row_indices)
 }
 
-/// Create a table with day separators using Theme API
-fn create_styled_table(rows: &[CostRow], total_row_indices: &[usize]) -> Table {
+/// Centralizes grand-total accumulation so daily and session displays stay in
+/// lockstep when we add or remove per-group summary columns.
+fn summed_totals<Item>(items: &[Item], total: impl Fn(&Item) -> f64, lines: impl Fn(&Item) -> usize) -> (f64, usize) {
+    items.iter().fold((0.0_f64, 0usize), |(cost, total_lines), item| {
+        (cost + total(item), total_lines + lines(item))
+    })
+}
+
+/// Build cost rows from daily costs data
+fn build_cost_rows(daily_costs: &[DailyCosts]) -> (Vec<CostRow>, Vec<usize>) {
+    build_grouped_rows(
+        daily_costs,
+        |rows, costs| {
+            let date_str = costs.date.to_string();
+            push_nonzero_model_rows(
+                rows,
+                costs.per_model.model_costs(),
+                |first_row, model_name, model_costs| {
+                    CostRow::new(
+                        grouped_label(first_row, &date_str),
+                        model_name,
+                        model_costs.input,
+                        model_costs.output,
+                        model_costs.cache_write,
+                        model_costs.cache_read,
+                        "",
+                    )
+                },
+            );
+        },
+        |rows, costs| rows.push(CostRow::new_total_row(costs.lines_changed, costs.total())),
+    )
+}
+
+/// Create a table with group separators using Theme API.
+///
+/// `total_row_indices` marks the last row of each group; separators are inserted between groups.
+fn create_grouped_table<T: Tabled>(rows: &[T], total_row_indices: &[usize]) -> Table {
     let mut table = Table::new(rows);
 
-    // Apply base style
     let mut theme = Theme::from_style(Style::rounded());
 
-    // Add horizontal separators after each day (except the last)
     if total_row_indices.len() > 1 {
         let separator_line = HorizontalLine::full('─', '┼', '├', '┤');
 
-        // Build separators dynamically - works for ANY number of days
         for &idx in &total_row_indices[..total_row_indices.len() - 1] {
             // +1 for header row, +1 to place separator after the total row
             theme.insert_horizontal_line(idx + 2, separator_line);
@@ -309,83 +373,56 @@ fn format_duration(minutes: i64) -> String {
     }
 }
 
-/// Returns model costs in display order: Opus 4, Opus, Sonnet, Haiku
-fn iter_session_model_costs(
-    costs: &SessionCosts,
-) -> impl Iterator<Item = (&'static str, &TokenCosts)> {
-    [
-        ("Opus 4", &costs.opus4_costs),
-        ("Opus", &costs.opus_costs),
-        ("Sonnet", &costs.sonnet_costs),
-        ("Haiku", &costs.haiku_costs),
-    ]
-    .into_iter()
-}
-
 /// Build session cost rows from session costs data
 fn build_session_cost_rows(session_costs: &[SessionCosts]) -> (Vec<SessionCostRow>, Vec<usize>) {
-    let mut rows = Vec::new();
-    let mut total_row_indices = Vec::new();
-
-    for costs in session_costs {
-        let session_id = format_session_id(&costs.session_id);
-        let time_range = format_time_range(costs.start_time, costs.end_time);
-        let duration = format_duration(costs.duration_minutes());
-        let mut first_row = true;
-
-        // Iterate over models in priority order
-        for (model_name, model_costs) in iter_session_model_costs(costs) {
-            if model_costs.total() > 0.0 {
-                rows.push(SessionCostRow::new(
-                    if first_row { &session_id } else { "" },
-                    if first_row { &time_range } else { "" },
-                    if first_row { &duration } else { "" },
-                    model_name,
-                    (
-                        model_costs.input,
-                        model_costs.output,
-                        model_costs.cache_write,
-                        model_costs.cache_read,
-                    ),
-                    "",
-                ));
-                first_row = false;
-            }
-        }
-
-        // Add total row for this session
-        rows.push(SessionCostRow::new_total_row(
-            costs.lines_changed,
-            costs.total(),
-        ));
-        total_row_indices.push(rows.len() - 1);
-    }
-
-    (rows, total_row_indices)
+    build_grouped_rows(
+        session_costs,
+        |rows, costs| {
+            let session_id = format_session_id(&costs.session_id);
+            let time_range = format_time_range(costs.start_time, costs.end_time);
+            let duration = format_duration(costs.duration_minutes());
+            push_nonzero_model_rows(
+                rows,
+                costs.per_model.model_costs(),
+                |first_row, model_name, model_costs| {
+                    SessionCostRow::new(
+                        grouped_label(first_row, &session_id),
+                        grouped_label(first_row, &time_range),
+                        grouped_label(first_row, &duration),
+                        model_name,
+                        (
+                            model_costs.input,
+                            model_costs.output,
+                            model_costs.cache_write,
+                            model_costs.cache_read,
+                        ),
+                        "",
+                    )
+                },
+            );
+        },
+        |rows, costs| rows.push(SessionCostRow::new_total_row(costs.lines_changed, costs.total())),
+    )
 }
 
-/// Display session costs
-fn display_session_costs(session_costs: &[SessionCosts]) {
+/// Render a grouped cost table: title banner, table body, grand-total summary.
+///
+/// `rows` and `total_row_indices` typically come from `build_cost_rows` or
+/// `build_session_cost_rows`. `grand_total` and `total_lines` are the footer totals.
+fn render_cost_report<T: Tabled>(
+    title: &str,
+    rows: &[T],
+    total_row_indices: &[usize],
+    grand_total: f64,
+    total_lines: usize,
+) {
     let term_width = get_terminal_width();
     println!("{}", divider(term_width));
-    println!("API Cost Report by Conversation");
+    println!("{}", title);
     println!("{}", divider(term_width));
     println!();
 
-    // Build rows and track totals
-    let mut grand_total = 0.0;
-    let mut total_lines = 0usize;
-
-    let (rows, total_row_indices) = build_session_cost_rows(session_costs);
-
-    // Calculate grand totals
-    for costs in session_costs {
-        grand_total += costs.total();
-        total_lines += costs.lines_changed;
-    }
-
-    // Create and configure table
-    let mut table = create_styled_table_sessions(&rows, &total_row_indices);
+    let mut table = create_grouped_table(rows, total_row_indices);
     apply_width_config(&mut table, term_width);
 
     println!("{}", table);
@@ -394,82 +431,74 @@ fn display_session_costs(session_costs: &[SessionCosts]) {
     display_grand_total(grand_total, total_lines);
 }
 
-/// Create a table with session separators using Theme API
-fn create_styled_table_sessions(rows: &[SessionCostRow], total_row_indices: &[usize]) -> Table {
-    let mut table = Table::new(rows);
-
-    // Apply base style
-    let mut theme = Theme::from_style(Style::rounded());
-
-    // Add horizontal separators after each session (except the last)
-    if total_row_indices.len() > 1 {
-        let separator_line = HorizontalLine::full('─', '┼', '├', '┤');
-
-        // Build separators dynamically - works for ANY number of sessions
-        for &idx in &total_row_indices[..total_row_indices.len() - 1] {
-            // +1 for header row, +1 to place separator after the total row
-            theme.insert_horizontal_line(idx + 2, separator_line);
-        }
-    }
-
-    table.with(theme);
-    table.with(Modify::new(Rows::first()).with(Alignment::center()));
-
-    table
+fn display_grouped_costs<Item, Row: Tabled>(
+    title: &str,
+    items: &[Item],
+    build_rows: impl Fn(&[Item]) -> (Vec<Row>, Vec<usize>),
+    total: impl Fn(&Item) -> f64,
+    lines: impl Fn(&Item) -> usize,
+) {
+    let (rows, total_row_indices) = build_rows(items);
+    let (grand_total, total_lines) = summed_totals(items, total, lines);
+    render_cost_report(title, &rows, &total_row_indices, grand_total, total_lines);
 }
 
-fn display_session_analysis_summary(result: &SessionAnalysisResult) {
+/// Display session costs
+fn display_session_costs(session_costs: &[SessionCosts]) {
+    display_grouped_costs(
+        "API Cost Report by Conversation",
+        session_costs,
+        build_session_cost_rows,
+        SessionCosts::total,
+        |costs| costs.lines_changed,
+    );
+}
+
+/// Print the file-parsing summary (count of successes and failures) to stdout.
+fn display_parsing_summary(files_parsed: usize, files_failed: usize) {
     let term_width = get_terminal_width();
     println!("\n{}", divider(term_width));
     println!("File Parsing Summary");
     println!("{}", divider(term_width));
-    println!("  Successfully parsed: {} files", result.files_parsed);
-    if result.files_failed > 0 {
-        println!("  Failed to parse:     {} files", result.files_failed);
+    println!("  Successfully parsed: {} files", files_parsed);
+    if files_failed > 0 {
+        println!("  Failed to parse:     {} files", files_failed);
     }
     println!();
 }
 
-fn display_session_warnings(result: &SessionAnalysisResult) {
-    if !result.unknown_models.is_empty() {
+/// Print a WARNINGS section listing unknown models and their token totals, if any.
+fn display_unknown_model_warnings(
+    unknown_models: &HashSet<String>,
+    total_unknown_tokens: &TokenCounts,
+) {
+    if !unknown_models.is_empty() {
         let term_width = get_terminal_width();
         println!("\n{}", divider(term_width));
         println!("WARNINGS");
         println!("{}", divider(term_width));
         println!(
             "\nUnknown models detected ({} unique):",
-            result.unknown_models.len()
+            unknown_models.len()
         );
 
-        let mut models: Vec<_> = result.unknown_models.iter().collect();
+        let mut models: Vec<_> = unknown_models.iter().collect();
         models.sort();
 
         for model in models {
             println!("  - {}", model);
         }
 
-        let total_tokens = result.total_unknown_tokens.input_tokens
-            + result.total_unknown_tokens.output_tokens
-            + result.total_unknown_tokens.cache_write_tokens
-            + result.total_unknown_tokens.cache_read_tokens;
+        let total_tokens = total_unknown_tokens.input_tokens
+            + total_unknown_tokens.output_tokens
+            + total_unknown_tokens.cache_write_tokens
+            + total_unknown_tokens.cache_read_tokens;
 
         println!("\nTotal tokens from unknown models: {}", total_tokens);
-        println!(
-            "  Input:       {}",
-            result.total_unknown_tokens.input_tokens
-        );
-        println!(
-            "  Output:      {}",
-            result.total_unknown_tokens.output_tokens
-        );
-        println!(
-            "  Cache Write: {}",
-            result.total_unknown_tokens.cache_write_tokens
-        );
-        println!(
-            "  Cache Read:  {}",
-            result.total_unknown_tokens.cache_read_tokens
-        );
+        println!("  Input:       {}", total_unknown_tokens.input_tokens);
+        println!("  Output:      {}", total_unknown_tokens.output_tokens);
+        println!("  Cache Write: {}", total_unknown_tokens.cache_write_tokens);
+        println!("  Cache Read:  {}", total_unknown_tokens.cache_read_tokens);
         println!("\n⚠️  These tokens are NOT included in the cost calculations above.");
         println!("{}", divider(term_width));
     }
@@ -479,7 +508,7 @@ fn display_session_warnings(result: &SessionAnalysisResult) {
 pub async fn run_by_session(dir: &Path, filter: &TimeRangeFilter) -> miette::Result<()> {
     let result = analyzer::analyze_directory_by_session(dir, filter).await?;
 
-    display_session_analysis_summary(&result);
+    display_parsing_summary(result.files_parsed, result.files_failed);
 
     if result.session_costs.is_empty() {
         println!("\nNo usage data found.");
@@ -487,7 +516,7 @@ pub async fn run_by_session(dir: &Path, filter: &TimeRangeFilter) -> miette::Res
     }
 
     display_session_costs(&result.session_costs);
-    display_session_warnings(&result);
+    display_unknown_model_warnings(&result.unknown_models, &result.total_unknown_tokens);
 
     Ok(())
 }
@@ -505,7 +534,7 @@ pub async fn run(
 
     let result = analyzer::analyze_directory(dir, timezone, filter).await?;
 
-    display_analysis_summary(&result);
+    display_parsing_summary(result.files_parsed, result.files_failed);
 
     if result.daily_costs.is_empty() {
         println!("\nNo usage data found.");
@@ -513,50 +542,19 @@ pub async fn run(
     }
 
     display_costs(&result.daily_costs);
-    display_warnings(&result);
+    display_unknown_model_warnings(&result.unknown_models, &result.total_unknown_tokens);
 
     Ok(())
 }
 
-fn display_analysis_summary(result: &AnalysisResult) {
-    let term_width = get_terminal_width();
-    println!("\n{}", divider(term_width));
-    println!("File Parsing Summary");
-    println!("{}", divider(term_width));
-    println!("  Successfully parsed: {} files", result.files_parsed);
-    if result.files_failed > 0 {
-        println!("  Failed to parse:     {} files", result.files_failed);
-    }
-    println!();
-}
-
 fn display_costs(daily_costs: &[DailyCosts]) {
-    let term_width = get_terminal_width();
-    println!("{}", divider(term_width));
-    println!("API Cost Report");
-    println!("{}", divider(term_width));
-    println!();
-
-    // Build rows and track totals
-    let mut grand_total = 0.0;
-    let mut total_lines = 0usize;
-
-    let (rows, total_row_indices) = build_cost_rows(daily_costs);
-
-    // Calculate grand totals
-    for costs in daily_costs {
-        grand_total += costs.total();
-        total_lines += costs.lines_changed;
-    }
-
-    // Create and configure table
-    let mut table = create_styled_table(&rows, &total_row_indices);
-    apply_width_config(&mut table, term_width);
-
-    println!("{}", table);
-    println!();
-
-    display_grand_total(grand_total, total_lines);
+    display_grouped_costs(
+        "API Cost Report",
+        daily_costs,
+        build_cost_rows,
+        DailyCosts::total,
+        |costs| costs.lines_changed,
+    );
 }
 
 fn display_grand_total(grand_total: f64, total_lines: usize) {
@@ -575,51 +573,6 @@ fn display_grand_total(grand_total: f64, total_lines: usize) {
 
     println!("{}", table);
     println!("{}", divider(term_width));
-}
-
-fn display_warnings(result: &AnalysisResult) {
-    if !result.unknown_models.is_empty() {
-        let term_width = get_terminal_width();
-        println!("\n{}", divider(term_width));
-        println!("WARNINGS");
-        println!("{}", divider(term_width));
-        println!(
-            "\nUnknown models detected ({} unique):",
-            result.unknown_models.len()
-        );
-
-        let mut models: Vec<_> = result.unknown_models.iter().collect();
-        models.sort();
-
-        for model in models {
-            println!("  - {}", model);
-        }
-
-        let total_tokens = result.total_unknown_tokens.input_tokens
-            + result.total_unknown_tokens.output_tokens
-            + result.total_unknown_tokens.cache_write_tokens
-            + result.total_unknown_tokens.cache_read_tokens;
-
-        println!("\nTotal tokens from unknown models: {}", total_tokens);
-        println!(
-            "  Input:       {}",
-            result.total_unknown_tokens.input_tokens
-        );
-        println!(
-            "  Output:      {}",
-            result.total_unknown_tokens.output_tokens
-        );
-        println!(
-            "  Cache Write: {}",
-            result.total_unknown_tokens.cache_write_tokens
-        );
-        println!(
-            "  Cache Read:  {}",
-            result.total_unknown_tokens.cache_read_tokens
-        );
-        println!("\n⚠️  These tokens are NOT included in the cost calculations above.");
-        println!("{}", divider(term_width));
-    }
 }
 
 #[cfg(test)]

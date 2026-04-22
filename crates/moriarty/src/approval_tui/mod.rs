@@ -43,6 +43,20 @@ pub struct ApprovalApp {
 }
 
 impl ApprovalApp {
+    fn render_frame(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
+        terminal
+            .draw(|frame| {
+                renderer::render(
+                    &self.state,
+                    &mut self.scroll_state,
+                    frame,
+                    &self.error_message,
+                )
+            })
+            .into_diagnostic()?;
+        Ok(())
+    }
+
     /// Helper function to load command/check information with binary resolution and security analysis
     async fn load_command_info(
         name: String,
@@ -158,16 +172,7 @@ impl ApprovalApp {
         let mut event_stream = input_stream();
 
         // Initial render
-        terminal
-            .draw(|frame| {
-                renderer::render(
-                    &self.state,
-                    &mut self.scroll_state,
-                    frame,
-                    &self.error_message,
-                )
-            })
-            .into_diagnostic()?;
+        self.render_frame(&mut terminal)?;
 
         while !self.should_quit {
             if let Some(event) = event_stream.next().await {
@@ -175,16 +180,7 @@ impl ApprovalApp {
                 self.handle_event(event).await?;
 
                 // Re-render after handling event
-                terminal
-                    .draw(|frame| {
-                        renderer::render(
-                            &self.state,
-                            &mut self.scroll_state,
-                            frame,
-                            &self.error_message,
-                        )
-                    })
-                    .into_diagnostic()?;
+                self.render_frame(&mut terminal)?;
             }
         }
 
@@ -215,12 +211,55 @@ impl ApprovalApp {
         }
     }
 
-    fn handle_overview_keys(&mut self, key: KeyEvent) {
+    /// Returns true if `key` was consumed by one of the common navigation bindings
+    /// (j/k/Down/Up scroll, optionally PageDown/PageUp if `include_page` is set).
+    fn handle_scroll_keys(&mut self, key: KeyEvent, include_page: bool) -> bool {
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => {
-                self.state.screen = Screen::Cancelled;
-                self.should_quit = true;
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.scroll_state.scroll_down();
+                true
             }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.scroll_state.scroll_up();
+                true
+            }
+            KeyCode::PageDown if include_page => {
+                self.scroll_state.scroll_page_down();
+                true
+            }
+            KeyCode::PageUp if include_page => {
+                self.scroll_state.scroll_page_up();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Cancel+quit on q/Esc, and on `'n'` when `also_n` is true.
+    ///
+    /// Command-review, warning, and summary screens pass `also_n = true`
+    /// because `'n'` is their explicit "no" affirmation. The overview screen
+    /// passes `false`: `'n'` has no meaning there and is silently ignored
+    /// (it falls through to the `_ =>` arm of `handle_scroll_keys`, which
+    /// returns `false` without acting on it).
+    ///
+    /// Returns true if the key was consumed.
+    fn handle_cancel_key(&mut self, key: KeyEvent, also_n: bool) -> bool {
+        let is_n = also_n && matches!(key.code, KeyCode::Char('n'));
+        if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) || is_n {
+            self.state.screen = Screen::Cancelled;
+            self.should_quit = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn handle_overview_keys(&mut self, key: KeyEvent) {
+        if self.handle_cancel_key(key, false) {
+            return;
+        }
+        match key.code {
             KeyCode::Enter | KeyCode::Char('y') => {
                 // Start at the first non-empty section
                 if !self.state.commands.is_empty() {
@@ -236,22 +275,17 @@ impl ApprovalApp {
                     self.state.screen = Screen::Summary;
                 }
             }
-            KeyCode::Char('j') | KeyCode::Down => {
-                self.scroll_state.scroll_down();
+            _ => {
+                self.handle_scroll_keys(key, false);
             }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.scroll_state.scroll_up();
-            }
-            _ => {}
         }
     }
 
     fn handle_command_review_keys(&mut self, key: KeyEvent) {
+        if self.handle_cancel_key(key, true) {
+            return;
+        }
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => {
-                self.state.screen = Screen::Cancelled;
-                self.should_quit = true;
-            }
             KeyCode::Enter | KeyCode::Char('y') => {
                 if let Some(current_item) = self.state.current_item() {
                     if current_item.is_in_project && current_item.is_writable {
@@ -261,45 +295,26 @@ impl ApprovalApp {
                     }
                 }
             }
-            KeyCode::Char('n') => {
-                self.state.screen = Screen::Cancelled;
-                self.should_quit = true;
+            _ => {
+                self.handle_scroll_keys(key, true);
             }
-            KeyCode::Char('j') | KeyCode::Down => {
-                self.scroll_state.scroll_down();
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.scroll_state.scroll_up();
-            }
-            KeyCode::PageDown => {
-                self.scroll_state.scroll_page_down();
-            }
-            KeyCode::PageUp => {
-                self.scroll_state.scroll_page_up();
-            }
-            _ => {}
         }
     }
 
     fn handle_warning_keys(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('n') => {
-                self.state.screen = Screen::Cancelled;
-                self.should_quit = true;
-            }
-            KeyCode::Char('Y') => {
-                self.approve_current_and_advance();
-            }
-            _ => {}
+        if self.handle_cancel_key(key, true) {
+            return;
+        }
+        if matches!(key.code, KeyCode::Char('Y')) {
+            self.approve_current_and_advance();
         }
     }
 
     async fn handle_summary_keys(&mut self, key: KeyEvent) {
+        if self.handle_cancel_key(key, true) {
+            return;
+        }
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('n') => {
-                self.state.screen = Screen::Cancelled;
-                self.should_quit = true;
-            }
             KeyCode::Enter | KeyCode::Char('y') => {
                 if let Err(e) = self.save_approvals().await {
                     self.error_message = Some(format!("Failed to save approvals: {}", e));
@@ -309,13 +324,9 @@ impl ApprovalApp {
                 }
                 self.should_quit = true;
             }
-            KeyCode::Char('j') | KeyCode::Down => {
-                self.scroll_state.scroll_down();
+            _ => {
+                self.handle_scroll_keys(key, false);
             }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.scroll_state.scroll_up();
-            }
-            _ => {}
         }
     }
 

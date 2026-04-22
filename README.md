@@ -4,7 +4,6 @@ A Rust CLI tool for analyzing Claude Code logs and API usage, with security hook
 
 ## Features
 
-- **Logs viewer**: An interactive TUI for viewing and navigating Claude Code conversation logs
 - **API pricing analyzer**: Analyzes Claude API usage from log directories and generates detailed cost reports
 - **MCP servers**: Provides Model Context Protocol servers for git operations and project tools
 - **Tool call permissioning**: Security hooks that control which tools and commands Claude Code can execute
