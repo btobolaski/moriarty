@@ -128,13 +128,18 @@ pub enum BashRuleAction {
 /// A rule for permissioning any Claude Code tool call (Read, Write, Edit, Bash, etc.).
 ///
 /// Rules are evaluated in order with first-match-wins semantics. The `tool` field is an exact
-/// string match against the tool name (or `"*"` for catch-all). Optional `field` + `pattern`
-/// provide regex matching against a specific field in the tool input.
+/// string match against the tool name (or `"*"` for catch-all). Optional `allow_local = true`
+/// requires that the `path` or `file_path` input resolves to a canonical path within the hook
+/// cwd. Optional `field` + `pattern` provide regex matching against a specific field in the tool
+/// input.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ToolRule {
     pub name: String,
     /// Exact tool name to match (e.g., "Read", "Write", "Bash"), or `"*"` for any tool.
     pub tool: String,
+    /// Optional locality requirement against `path` or `file_path` in tool_input.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_local: bool,
     /// Optional field name in tool_input to match against.
     /// Must be paired with `pattern`; if only one is present, the rule is skipped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -452,6 +457,7 @@ reason = "Browser not needed""#;
         let rule = ToolRule {
             name: "test-rule".to_string(),
             tool: "Read".to_string(),
+            allow_local: false,
             field: Some("file_path".to_string()),
             pattern: Some("\\.env$".to_string()),
             action: ToolRuleAction::Deny {
@@ -469,6 +475,7 @@ reason = "Browser not needed""#;
         let rule = ToolRule {
             name: "allow-read".to_string(),
             tool: "Read".to_string(),
+            allow_local: false,
             field: None,
             pattern: None,
             action: ToolRuleAction::Allow,
@@ -477,6 +484,25 @@ reason = "Browser not needed""#;
         let toml = toml::to_string(&rule).unwrap();
         assert!(!toml.contains("field"));
         assert!(!toml.contains("pattern"));
+        assert!(!toml.contains("allow_local"));
+
+        let deserialized: ToolRule = toml::from_str(&toml).unwrap();
+        assert_eq!(rule, deserialized);
+    }
+
+    #[test]
+    fn test_tool_rule_serialization_with_allow_local() {
+        let rule = ToolRule {
+            name: "allow-local-read".to_string(),
+            tool: "Read".to_string(),
+            allow_local: true,
+            field: Some("file_path".to_string()),
+            pattern: Some(r"^src/.*\.rs$".to_string()),
+            action: ToolRuleAction::Allow,
+        };
+
+        let toml = toml::to_string(&rule).unwrap();
+        assert!(toml.contains("allow_local = true"));
 
         let deserialized: ToolRule = toml::from_str(&toml).unwrap();
         assert_eq!(rule, deserialized);
@@ -525,6 +551,7 @@ value = "not allowed""#;
         let rule = ToolRule {
             name: "catch-all".to_string(),
             tool: "*".to_string(),
+            allow_local: false,
             field: None,
             pattern: None,
             action: ToolRuleAction::Ask,
@@ -548,6 +575,7 @@ value = "not allowed""#;
                 ToolRule {
                     name: "allow-read".to_string(),
                     tool: "Read".to_string(),
+                    allow_local: false,
                     field: None,
                     pattern: None,
                     action: ToolRuleAction::Allow,
@@ -555,6 +583,7 @@ value = "not allowed""#;
                 ToolRule {
                     name: "deny-env-write".to_string(),
                     tool: "Write".to_string(),
+                    allow_local: false,
                     field: Some("file_path".to_string()),
                     pattern: Some(r"\.env$".to_string()),
                     action: ToolRuleAction::Deny {

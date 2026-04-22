@@ -1718,3 +1718,298 @@ action = { type = "Allow" }
     );
     assert_eq!(result.permission_decision, None);
 }
+
+// ===== allow_local integration tests =====
+
+#[tokio::test]
+async fn test_tool_rule_allow_local_matches_existing_path() {
+    let config = r#"
+[[tool_rules]]
+name = "allow-local-read"
+tool = "Read"
+allow_local = true
+field = "file_path"
+pattern = "^src/.*\\.rs$"
+action = { type = "Allow" }
+"#;
+    let _xdg_config = setup_user_bash_rules(config).await;
+
+    let temp_dir = TempDir::new().unwrap();
+    let cwd = temp_dir.path();
+    let src_dir = cwd.join("src");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    let existing = src_dir.join("lib.rs");
+    std::fs::write(&existing, "fn lib() {}\n").unwrap();
+
+    let result = handle_pretool_hook(
+        "Read",
+        &serde_json::json!({"file_path": existing}),
+        cwd.to_str().unwrap(),
+    )
+    .await
+    .expect("Should succeed");
+    match result.hook_specific_output {
+        Some(HookSpecificOutput::PreToolUse(output)) => {
+            assert_eq!(output.permission_decision, Some(PermissionDecision::Allow));
+        }
+        _ => panic!("Expected PreToolUse hook specific output"),
+    }
+}
+
+#[tokio::test]
+async fn test_tool_rule_allow_local_matches_nonexistent_path() {
+    let config = r#"
+[[tool_rules]]
+name = "allow-local-read"
+tool = "Read"
+allow_local = true
+field = "file_path"
+pattern = "^src/.*\\.rs$"
+action = { type = "Allow" }
+"#;
+    let _xdg_config = setup_user_bash_rules(config).await;
+
+    let temp_dir = TempDir::new().unwrap();
+    let cwd = temp_dir.path();
+    std::fs::create_dir_all(cwd.join("src")).unwrap();
+
+    let result = handle_pretool_hook(
+        "Read",
+        &serde_json::json!({"file_path": "src/generated.rs"}),
+        cwd.to_str().unwrap(),
+    )
+    .await
+    .expect("Should succeed");
+    match result.hook_specific_output {
+        Some(HookSpecificOutput::PreToolUse(output)) => {
+            assert_eq!(output.permission_decision, Some(PermissionDecision::Allow));
+        }
+        _ => panic!("Expected PreToolUse hook specific output"),
+    }
+}
+
+#[tokio::test]
+async fn test_tool_rule_allow_local_rejects_path_escape() {
+    let config = r#"
+[[tool_rules]]
+name = "allow-local-rust"
+tool = "Read"
+allow_local = true
+field = "path"
+pattern = "src/lib\\.rs$"
+action = { type = "Allow" }
+"#;
+    let _xdg_config = setup_user_bash_rules(config).await;
+
+    let temp_dir = TempDir::new().unwrap();
+    let cwd = temp_dir.path().join("project");
+    let sibling = temp_dir.path().join("sibling");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(sibling.join("src")).unwrap();
+    std::fs::write(sibling.join("src/lib.rs"), "fn lib() {}\n").unwrap();
+
+    let result = handle_pretool_hook(
+        "Read",
+        &serde_json::json!({"path": sibling.join("src/lib.rs")}),
+        cwd.to_str().unwrap(),
+    )
+    .await
+    .expect("Should succeed");
+    assert_eq!(result.hook_specific_output, None);
+}
+
+#[tokio::test]
+async fn test_tool_rule_allow_local_no_match_for_regex_miss() {
+    let config = r#"
+[[tool_rules]]
+name = "allow-local-rust"
+tool = "Read"
+allow_local = true
+field = "path"
+pattern = "^src/.*\\.rs$"
+action = { type = "Allow" }
+"#;
+    let _xdg_config = setup_user_bash_rules(config).await;
+
+    let temp_dir = TempDir::new().unwrap();
+    let cwd = temp_dir.path();
+    std::fs::create_dir_all(cwd.join("src")).unwrap();
+    std::fs::write(cwd.join("Cargo.toml"), "[package]\nname='x'\n").unwrap();
+
+    // This path is local, but the regex still prevents a match.
+    let result = handle_pretool_hook(
+        "Read",
+        &serde_json::json!({"path": cwd.join("Cargo.toml")}),
+        cwd.to_str().unwrap(),
+    )
+    .await
+    .expect("Should succeed");
+    assert_eq!(result.hook_specific_output, None);
+}
+
+#[tokio::test]
+async fn test_tool_rule_allow_local_ask_action() {
+    let config = r#"
+[[tool_rules]]
+name = "ask-local-write"
+tool = "Write"
+allow_local = true
+action = { type = "Ask" }
+"#;
+    let _xdg_config = setup_user_bash_rules(config).await;
+
+    let temp_dir = TempDir::new().unwrap();
+    let cwd = temp_dir.path();
+    std::fs::write(cwd.join("local.txt"), "hello\n").unwrap();
+
+    let result = handle_pretool_hook(
+        "Write",
+        &serde_json::json!({
+            "path": cwd.join("local.txt"),
+            "content": "updated",
+        }),
+        cwd.to_str().unwrap(),
+    )
+    .await
+    .expect("Should succeed");
+
+    match result.hook_specific_output {
+        Some(HookSpecificOutput::PreToolUse(output)) => {
+            assert_eq!(output.permission_decision, Some(PermissionDecision::Ask));
+        }
+        _ => panic!("Expected PreToolUse hook specific output"),
+    }
+}
+
+#[tokio::test]
+async fn test_tool_rule_allow_local_deny_action() {
+    let config = r#"
+[[tool_rules]]
+name = "deny-local-write"
+tool = "Write"
+allow_local = true
+action = { type = "Deny", value = "no local writes" }
+"#;
+    let _xdg_config = setup_user_bash_rules(config).await;
+
+    let temp_dir = TempDir::new().unwrap();
+    let cwd = temp_dir.path();
+    std::fs::write(cwd.join("local.txt"), "hello\n").unwrap();
+
+    let result = handle_pretool_hook(
+        "Write",
+        &serde_json::json!({
+            "path": cwd.join("local.txt"),
+            "content": "updated",
+        }),
+        cwd.to_str().unwrap(),
+    )
+    .await
+    .expect("Should succeed");
+
+    match result.hook_specific_output {
+        Some(HookSpecificOutput::PreToolUse(output)) => {
+            assert_eq!(output.permission_decision, Some(PermissionDecision::Deny));
+            assert_eq!(
+                output.permission_decision_reason,
+                Some("no local writes".to_string())
+            );
+        }
+        _ => panic!("Expected PreToolUse hook specific output"),
+    }
+}
+
+#[tokio::test]
+async fn test_tool_rule_allow_local_with_non_path_field_does_not_match() {
+    let config = r#"
+[[tool_rules]]
+name = "bad-local-command"
+tool = "Read"
+allow_local = true
+field = "command"
+pattern = "^cat"
+action = { type = "Allow" }
+"#;
+    let _xdg_config = setup_user_bash_rules(config).await;
+
+    let temp_dir = TempDir::new().unwrap();
+    let cwd = temp_dir.path();
+    std::fs::write(cwd.join("local.txt"), "hello\n").unwrap();
+
+    let result = handle_pretool_hook(
+        "Read",
+        &serde_json::json!({
+            "command": "cat local.txt",
+            "path": cwd.join("local.txt"),
+        }),
+        cwd.to_str().unwrap(),
+    )
+    .await
+    .expect("Should succeed");
+
+    assert_eq!(result.hook_specific_output, None);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_tool_rule_allow_local_rejects_broken_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let config = r#"
+[[tool_rules]]
+name = "allow-local-read"
+tool = "Read"
+allow_local = true
+action = { type = "Allow" }
+"#;
+    let _xdg_config = setup_user_bash_rules(config).await;
+
+    let temp_dir = TempDir::new().unwrap();
+    let cwd = temp_dir.path().join("project");
+    let missing = temp_dir.path().join("missing-target");
+    std::fs::create_dir_all(&cwd).unwrap();
+    symlink(&missing, cwd.join("broken-link")).unwrap();
+
+    let result = handle_pretool_hook(
+        "Read",
+        &serde_json::json!({"path": "broken-link/file.txt"}),
+        cwd.to_str().unwrap(),
+    )
+    .await
+    .expect("Should succeed");
+
+    assert_eq!(result.hook_specific_output, None);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_tool_rule_allow_local_rejects_symlink_escape() {
+    use std::os::unix::fs::symlink;
+
+    let config = r#"
+[[tool_rules]]
+name = "allow-local-read"
+tool = "Read"
+allow_local = true
+action = { type = "Allow" }
+"#;
+    let _xdg_config = setup_user_bash_rules(config).await;
+
+    let temp_dir = TempDir::new().unwrap();
+    let cwd = temp_dir.path().join("project");
+    let outside = temp_dir.path().join("outside");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("secret.txt"), "secret\n").unwrap();
+    symlink(&outside, cwd.join("linked-outside")).unwrap();
+
+    let result = handle_pretool_hook(
+        "Read",
+        &serde_json::json!({"path": "linked-outside/secret.txt"}),
+        cwd.to_str().unwrap(),
+    )
+    .await
+    .expect("Should succeed");
+
+    assert_eq!(result.hook_specific_output, None);
+}

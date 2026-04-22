@@ -33,6 +33,7 @@ Each tool rule is a TOML array\-of\-tables entry:
 [[tool_rules]]
 name = "descriptive\-name"
 tool = "ToolName"
+allow_local = true          # optional
 field = "field_name"       # optional
 pattern = "regex\-pattern"  # optional
 action = { type = "ActionType", value = "..." }
@@ -53,6 +54,36 @@ Known tools include:
 .Cm Glob ,
 and
 .Cm Grep .
+.It Ic allow_local
+Optional.
+When set to
+.Cm true ,
+the rule only matches if the relevant path field resolves to a canonical path within the hook's canonicalized
+.Ic cwd .
+If
+.Ic field
+is set to
+.Ql path
+or
+.Ql file_path ,
+that specific field must be local.
+If
+.Ic field
+is absent, either field being local is sufficient.
+If
+.Ic field
+is set to any other value, the
+.Ic allow_local
+check always fails.
+Relative paths are resolved against
+.Ic cwd .
+Existing paths are fully canonicalized; non\-existent paths are checked by canonicalizing the deepest existing ancestor and safely rebuilding the missing suffix so
+.Ql ..
+cannot escape above that ancestor.
+Symlinks that resolve outside
+.Ic cwd
+are rejected, and broken symlinks are treated as non\-local.
+Hard links are treated as ordinary local filesystem entries and are not distinguished from regular files.
 .It Ic field
 Optional.
 The name of a field in the tool input to match against.
@@ -72,6 +103,9 @@ Pattern fragments
 may be used with
 .Ql {{fragment_name}}
 syntax.
+If
+.Ic allow_local
+is also enabled, both checks must pass.
 .It Ic action
 The action to take when the rule matches.
 One of
@@ -127,6 +161,18 @@ for matching purposes.
 If the value does not start with
 .Ic cwd ,
 it is matched as\-is.
+.Pp
+When
+.Ic allow_local
+is enabled,
+.Nm moriarty
+also canonicalizes
+.Ic cwd
+and checks
+.Ic path
+and
+.Ic file_path
+against it before any regex match is considered successful.
 .Sh ACTIONS
 .Bl -tag -width Ds
 .It Cm Allow
@@ -157,6 +203,9 @@ actions are only available in bash rules.
 PreToolUse event (any tool)
   |
   +\-> tool_rules engine (first\-match\-wins)
+  |     tool matches?
+  |       \-> allow_local check (if enabled)
+  |       \-> field/pattern regex check (if configured)
   |     Match found? \-> return Allow/Deny/Ask
   |     No match?    \-> continue
   |
@@ -206,6 +255,17 @@ name = "allow\-project\-read"
 tool = "Read"
 field = "file_path"
 pattern = "^{{project}}/"
+action = { type = "Allow" }
+.Ed
+.Pp
+Restrict writes to local Rust source files under the current working directory:
+.Bd -literal -offset indent
+[[tool_rules]]
+name = "allow\-local\-src\-writes"
+tool = "Write"
+allow_local = true
+field = "file_path"
+pattern = "^src/.*\e\.rs$"
 action = { type = "Allow" }
 .Ed
 .Sh FILES

@@ -3,12 +3,20 @@
 //! This module provides a rule engine for permissioning arbitrary tool calls (Read, Write, Edit,
 //! Bash, etc.) before they are executed by Claude Code. Unlike `bash_rules` which operates on
 //! command strings, tool rules match on tool name and optionally on a specific field in the
-//! tool input using regex patterns. Field values that start with the hook input's `cwd` have
-//! that prefix stripped before matching, so rules can use relative paths.
+//! tool input using regex patterns. Rules may also set `allow_local = true` to require that
+//! `path` or `file_path` resolves to a canonical path within the canonicalized hook `cwd`, with
+//! safe handling of non-existent targets. Field values that start with the hook input's `cwd`
+//! have that prefix stripped before matching, so rules can use relative paths.
 
-use std::collections::HashMap;
+use std::{
+    collections::{HashMap, HashSet},
+    ffi::OsString,
+    fs, io,
+    path::{Component, Path, PathBuf},
+};
 
 use regex::Regex;
+use tokio::task::spawn_blocking;
 use tracing::{debug, warn};
 
 use super::bash_rules::{default_fragments, expand_fragments};
@@ -19,9 +27,51 @@ use crate::user_config::{ToolRule, ToolRuleAction};
 struct CompiledToolRule {
     name: String,
     tool: String,
+    allow_local: bool,
     field: Option<String>,
     regex: Option<Regex>,
     action: ToolRuleAction,
+}
+
+#[derive(Debug, Clone)]
+struct CandidatePathEvaluation {
+    is_local: bool,
+    resolved_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct LocalPathEvaluation {
+    canonical_cwd: PathBuf,
+    path: Option<CandidatePathEvaluation>,
+    file_path: Option<CandidatePathEvaluation>,
+}
+
+impl LocalPathEvaluation {
+    fn any_local(&self) -> bool {
+        self.path
+            .as_ref()
+            .is_some_and(|evaluation| evaluation.is_local)
+            || self
+                .file_path
+                .as_ref()
+                .is_some_and(|evaluation| evaluation.is_local)
+    }
+
+    fn resolved_local_path(&self, field: &str) -> Option<&Path> {
+        match field {
+            "path" => self
+                .path
+                .as_ref()
+                .filter(|evaluation| evaluation.is_local)
+                .map(|evaluation| evaluation.resolved_path.as_path()),
+            "file_path" => self
+                .file_path
+                .as_ref()
+                .filter(|evaluation| evaluation.is_local)
+                .map(|evaluation| evaluation.resolved_path.as_path()),
+            _ => None,
+        }
+    }
 }
 
 /// Result of evaluating tool rules against a tool call.
@@ -37,6 +87,36 @@ pub enum ToolRuleResult {
 #[derive(Debug)]
 pub struct ToolRuleEngine {
     rules: Vec<CompiledToolRule>,
+    allow_local_tools: HashSet<String>,
+    has_wildcard_allow_local: bool,
+}
+
+fn record_allow_local_tool(
+    allow_local_tools: &mut HashSet<String>,
+    has_wildcard_allow_local: &mut bool,
+    tool: &str,
+) {
+    if tool == "*" {
+        *has_wildcard_allow_local = true;
+    } else {
+        allow_local_tools.insert(tool.to_string());
+    }
+}
+
+fn locality_input(tool_input: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "path": tool_input.get("path"),
+        "file_path": tool_input.get("file_path"),
+    })
+}
+
+fn is_missing_path_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+    )
+        // Older Windows/Rust combinations may surface ERROR_DIRECTORY (267) as ErrorKind::Other.
+        || cfg!(windows) && error.raw_os_error() == Some(267)
 }
 
 impl ToolRuleEngine {
@@ -51,6 +131,8 @@ impl ToolRuleEngine {
         }
 
         let mut compiled = Vec::new();
+        let mut allow_local_tools = HashSet::new();
+        let mut has_wildcard_allow_local = false;
 
         for rule in rules {
             // Validate field/pattern pairing
@@ -93,9 +175,18 @@ impl ToolRuleEngine {
                                 pattern = %expanded,
                                 "Compiled tool rule with field pattern"
                             );
+                            if rule.allow_local {
+                                record_allow_local_tool(
+                                    &mut allow_local_tools,
+                                    &mut has_wildcard_allow_local,
+                                    &rule.tool,
+                                );
+                            }
+
                             compiled.push(CompiledToolRule {
                                 name: rule.name,
                                 tool: rule.tool,
+                                allow_local: rule.allow_local,
                                 field: Some(field.clone()),
                                 regex: Some(regex),
                                 action: rule.action,
@@ -117,9 +208,18 @@ impl ToolRuleEngine {
                         tool = %rule.tool,
                         "Compiled tool rule (tool-name only)"
                     );
+                    if rule.allow_local {
+                        record_allow_local_tool(
+                            &mut allow_local_tools,
+                            &mut has_wildcard_allow_local,
+                            &rule.tool,
+                        );
+                    }
+
                     compiled.push(CompiledToolRule {
                         name: rule.name,
                         tool: rule.tool,
+                        allow_local: rule.allow_local,
                         field: None,
                         regex: None,
                         action: rule.action,
@@ -128,52 +228,43 @@ impl ToolRuleEngine {
             }
         }
 
-        Self { rules: compiled }
+        Self {
+            rules: compiled,
+            allow_local_tools,
+            has_wildcard_allow_local,
+        }
     }
 
-    /// Evaluate rules against a tool call. Returns the first matching rule's result.
-    ///
-    /// `tool_input` is `serde_json::Value` rather than a typed struct because Claude Code tool
-    /// inputs are heterogeneous — each tool (Read, Write, Edit, Bash, Grep, etc.) has a different
-    /// schema, so no single typed struct can represent them all. The upstream `HookEventData`
-    /// parser already delivers `tool_input` as `serde_json::Value`.
-    ///
-    /// When a field value starts with `cwd/`, the prefix is stripped before regex matching so
-    /// that rules can be written with relative paths (e.g., `^src/` instead of
-    /// `^/home/user/project/src/`).
-    pub fn apply_rules(
+    fn has_matching_allow_local_rule(&self, tool_name: &str) -> bool {
+        self.has_wildcard_allow_local || self.allow_local_tools.contains(tool_name)
+    }
+
+    fn apply_rules_core(
         &self,
         tool_name: &str,
         tool_input: &serde_json::Value,
         cwd: &str,
+        local_evaluation: Option<&LocalPathEvaluation>,
     ) -> ToolRuleResult {
         for rule in &self.rules {
             if rule.tool != "*" && rule.tool != tool_name {
                 continue;
             }
 
-            // If rule has field+regex, check the field value
-            if let (Some(field), Some(regex)) = (&rule.field, &rule.regex) {
-                let field_value = match tool_input.get(field) {
-                    Some(v) => extract_field_value(v),
-                    None => {
-                        // Field doesn't exist in input, rule doesn't match
-                        continue;
-                    }
-                };
-
-                let Some(value_str) = field_value else {
-                    continue;
-                };
-
-                let value_for_matching = strip_cwd_prefix(&value_str, cwd);
-
-                if !regex.is_match(value_for_matching) {
-                    continue;
-                }
+            if rule.allow_local && !rule_matches_allow_local(rule, local_evaluation) {
+                continue;
             }
 
-            // Rule matched
+            let local_evaluation_for_regex = if rule.allow_local {
+                local_evaluation
+            } else {
+                None
+            };
+
+            if !rule_matches_regex(rule, tool_input, cwd, local_evaluation_for_regex) {
+                continue;
+            }
+
             debug!(
                 rule_name = %rule.name,
                 tool_name = %tool_name,
@@ -196,6 +287,252 @@ impl ToolRuleEngine {
 
         ToolRuleResult::NoMatch
     }
+
+    /// Evaluate rules against a tool call. Returns the first matching rule's result.
+    ///
+    /// `tool_input` is `serde_json::Value` rather than a typed struct because Claude Code tool
+    /// inputs are heterogeneous — each tool (Read, Write, Edit, Bash, Grep, etc.) has a different
+    /// schema, so no single typed struct can represent them all. The upstream `HookEventData`
+    /// parser already delivers `tool_input` as `serde_json::Value`.
+    ///
+    /// When a field value starts with `cwd/`, the prefix is stripped before regex matching so
+    /// that rules can be written with relative paths (e.g., `^src/` instead of
+    /// `^/home/user/project/src/`). Rules with `allow_local = true` additionally require that
+    /// either the `path` or `file_path` field resolves to a canonical path within the canonicalized
+    /// hook cwd. The filesystem work for that locality check runs on the blocking thread pool.
+    pub async fn apply_rules(
+        &self,
+        tool_name: &str,
+        tool_input: &serde_json::Value,
+        cwd: &str,
+    ) -> ToolRuleResult {
+        let local_evaluation = if self.has_matching_allow_local_rule(tool_name) {
+            let locality_value = locality_input(tool_input);
+            let cwd_owned = cwd.to_string();
+            match spawn_blocking(move || {
+                evaluate_local_paths(&locality_value, Path::new(&cwd_owned))
+            })
+            .await
+            {
+                Ok(evaluation) => evaluation,
+                Err(error) => {
+                    // Treat locality evaluation failures as a non-match so the hook never
+                    // panics. All allow_local rules are skipped in this case, so evaluation falls
+                    // through to any later non-allow_local rules or NoMatch.
+                    warn!(error = %error, "allow_local path evaluation task failed");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        self.apply_rules_core(tool_name, tool_input, cwd, local_evaluation.as_ref())
+    }
+
+    #[cfg(test)]
+    fn apply_rules_sync(
+        &self,
+        tool_name: &str,
+        tool_input: &serde_json::Value,
+        cwd: &str,
+    ) -> ToolRuleResult {
+        let local_evaluation = if self.has_matching_allow_local_rule(tool_name) {
+            let locality_value = locality_input(tool_input);
+            evaluate_local_paths(&locality_value, Path::new(cwd))
+        } else {
+            None
+        };
+
+        self.apply_rules_core(tool_name, tool_input, cwd, local_evaluation.as_ref())
+    }
+}
+
+fn rule_matches_allow_local(
+    rule: &CompiledToolRule,
+    local_evaluation: Option<&LocalPathEvaluation>,
+) -> bool {
+    let Some(local_evaluation) = local_evaluation else {
+        return false;
+    };
+
+    match rule.field.as_deref() {
+        Some("path") => local_evaluation
+            .path
+            .as_ref()
+            .is_some_and(|evaluation| evaluation.is_local),
+        Some("file_path") => local_evaluation
+            .file_path
+            .as_ref()
+            .is_some_and(|evaluation| evaluation.is_local),
+        Some(_) => false,
+        None => local_evaluation.any_local(),
+    }
+}
+
+fn rule_matches_regex(
+    rule: &CompiledToolRule,
+    tool_input: &serde_json::Value,
+    cwd: &str,
+    local_evaluation: Option<&LocalPathEvaluation>,
+) -> bool {
+    if let (Some(field), Some(regex)) = (&rule.field, &rule.regex) {
+        let value_for_matching = match local_evaluation {
+            Some(local_evaluation) => {
+                let Some(resolved_path) = local_evaluation.resolved_local_path(field) else {
+                    return false;
+                };
+                strip_cwd_prefix(
+                    &resolved_path.to_string_lossy(),
+                    &local_evaluation.canonical_cwd.to_string_lossy(),
+                )
+                .to_string()
+            }
+            None => {
+                let field_value = match tool_input.get(field) {
+                    Some(v) => extract_field_value(v),
+                    None => return false,
+                };
+
+                let Some(value_str) = field_value else {
+                    return false;
+                };
+
+                strip_cwd_prefix(&value_str, cwd).to_string()
+            }
+        };
+
+        regex.is_match(&value_for_matching)
+    } else {
+        true
+    }
+}
+
+fn evaluate_local_paths(tool_input: &serde_json::Value, cwd: &Path) -> Option<LocalPathEvaluation> {
+    let canonical_cwd = match fs::canonicalize(cwd) {
+        Ok(path) => path,
+        Err(error) => {
+            warn!(cwd = %cwd.display(), error = %error, "Failed to canonicalize hook cwd for allow_local check");
+            return None;
+        }
+    };
+
+    Some(LocalPathEvaluation {
+        canonical_cwd: canonical_cwd.clone(),
+        path: evaluate_candidate_path(tool_input, "path", &canonical_cwd),
+        file_path: evaluate_candidate_path(tool_input, "file_path", &canonical_cwd),
+    })
+}
+
+fn evaluate_candidate_path(
+    tool_input: &serde_json::Value,
+    field: &str,
+    canonical_cwd: &Path,
+) -> Option<CandidatePathEvaluation> {
+    let candidate = tool_input.get(field).and_then(|value| value.as_str())?;
+    let candidate = PathBuf::from(candidate);
+    let resolved = if candidate.is_absolute() {
+        candidate
+    } else {
+        canonical_cwd.join(candidate)
+    };
+
+    match canonicalize_allow_missing(&resolved) {
+        Ok(path) => Some(CandidatePathEvaluation {
+            is_local: path.starts_with(canonical_cwd),
+            resolved_path: path,
+        }),
+        Err(error) => {
+            debug!(
+                field,
+                candidate = %resolved.display(),
+                cwd = %canonical_cwd.display(),
+                error = %error,
+                "Failed to resolve candidate path for allow_local check"
+            );
+            None
+        }
+    }
+}
+
+fn canonicalize_allow_missing(path: &Path) -> io::Result<PathBuf> {
+    let mut current = path.to_path_buf();
+    let mut removed_components = Vec::new();
+
+    loop {
+        match fs::canonicalize(&current) {
+            Ok(canonical) => {
+                return rebuild_missing_suffix(canonical, removed_components.into_iter().rev())
+            }
+            Err(error) if is_missing_path_error(&error) => {
+                if fs::symlink_metadata(&current)
+                    .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "broken symlink in path; cannot determine locality",
+                    ));
+                }
+
+                let Some(component) = current.components().next_back() else {
+                    return Err(error);
+                };
+
+                match component {
+                    Component::Prefix(_) | Component::RootDir => return Err(error),
+                    Component::CurDir => removed_components.push(MissingPathComponent::CurDir),
+                    Component::ParentDir => {
+                        removed_components.push(MissingPathComponent::ParentDir)
+                    }
+                    Component::Normal(name) => {
+                        removed_components.push(MissingPathComponent::Normal(name.to_os_string()))
+                    }
+                }
+
+                if !current.pop() {
+                    return Err(error);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn rebuild_missing_suffix(
+    mut base: PathBuf,
+    components: impl IntoIterator<Item = MissingPathComponent>,
+) -> io::Result<PathBuf> {
+    let floor = base.components().count();
+    let mut depth = floor;
+
+    for component in components {
+        match component {
+            MissingPathComponent::CurDir => {}
+            MissingPathComponent::Normal(name) => {
+                base.push(name);
+                depth += 1;
+            }
+            MissingPathComponent::ParentDir => {
+                if depth == floor {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "path escapes canonicalized ancestor",
+                    ));
+                }
+                base.pop();
+                depth -= 1;
+            }
+        }
+    }
+
+    Ok(base)
+}
+
+#[derive(Debug)]
+enum MissingPathComponent {
+    CurDir,
+    ParentDir,
+    Normal(OsString),
 }
 
 /// Extract a string representation from a JSON value for regex matching.
@@ -249,16 +586,44 @@ mod tests {
         ToolRule {
             name: name.to_string(),
             tool: tool.to_string(),
+            allow_local: false,
             field: field.map(|s| s.to_string()),
             pattern: pattern.map(|s| s.to_string()),
             action,
         }
     }
 
+    fn make_local_rule(
+        name: &str,
+        tool: &str,
+        field: Option<&str>,
+        pattern: Option<&str>,
+        action: ToolRuleAction,
+    ) -> ToolRule {
+        ToolRule {
+            allow_local: true,
+            ..make_rule(name, tool, field, pattern, action)
+        }
+    }
+
+    fn tool_input_has_local_path(paths: &[PathBuf], cwd: &Path) -> bool {
+        let tool_input = serde_json::json!({
+            "path": paths.first().map(|path| path.to_string_lossy().to_string()),
+            "file_path": paths
+                .get(1)
+                .map(|path| path.to_string_lossy().to_string()),
+        });
+
+        evaluate_local_paths(&tool_input, cwd)
+            .as_ref()
+            .is_some_and(LocalPathEvaluation::any_local)
+    }
+
     #[test]
     fn test_empty_rules() {
         let engine = ToolRuleEngine::from_config(vec![], None);
-        let result = engine.apply_rules("Read", &serde_json::json!({"file_path": "/tmp/foo"}), "");
+        let result =
+            engine.apply_rules_sync("Read", &serde_json::json!({"file_path": "/tmp/foo"}), "");
         assert_eq!(result, ToolRuleResult::NoMatch);
     }
 
@@ -273,7 +638,8 @@ mod tests {
         )];
         let engine = ToolRuleEngine::from_config(rules, None);
 
-        let result = engine.apply_rules("Read", &serde_json::json!({"file_path": "/tmp/foo"}), "");
+        let result =
+            engine.apply_rules_sync("Read", &serde_json::json!({"file_path": "/tmp/foo"}), "");
         assert_eq!(
             result,
             ToolRuleResult::Allowed {
@@ -282,7 +648,7 @@ mod tests {
         );
 
         // Doesn't match other tools
-        let result = engine.apply_rules("Write", &serde_json::json!({}), "");
+        let result = engine.apply_rules_sync("Write", &serde_json::json!({}), "");
         assert_eq!(result, ToolRuleResult::NoMatch);
     }
 
@@ -299,7 +665,7 @@ mod tests {
         )];
         let engine = ToolRuleEngine::from_config(rules, None);
 
-        let result = engine.apply_rules("Write", &serde_json::json!({}), "");
+        let result = engine.apply_rules_sync("Write", &serde_json::json!({}), "");
         assert_eq!(
             result,
             ToolRuleResult::Denied {
@@ -320,7 +686,7 @@ mod tests {
         )];
         let engine = ToolRuleEngine::from_config(rules, None);
 
-        let result = engine.apply_rules("Edit", &serde_json::json!({}), "");
+        let result = engine.apply_rules_sync("Edit", &serde_json::json!({}), "");
         assert_eq!(
             result,
             ToolRuleResult::Asked {
@@ -335,19 +701,19 @@ mod tests {
         let engine = ToolRuleEngine::from_config(rules, None);
 
         assert_eq!(
-            engine.apply_rules("Read", &serde_json::json!({}), ""),
+            engine.apply_rules_sync("Read", &serde_json::json!({}), ""),
             ToolRuleResult::Asked {
                 rule_name: "catch-all".to_string()
             }
         );
         assert_eq!(
-            engine.apply_rules("Write", &serde_json::json!({}), ""),
+            engine.apply_rules_sync("Write", &serde_json::json!({}), ""),
             ToolRuleResult::Asked {
                 rule_name: "catch-all".to_string()
             }
         );
         assert_eq!(
-            engine.apply_rules("Bash", &serde_json::json!({}), ""),
+            engine.apply_rules_sync("Bash", &serde_json::json!({}), ""),
             ToolRuleResult::Asked {
                 rule_name: "catch-all".to_string()
             }
@@ -368,7 +734,7 @@ mod tests {
         let engine = ToolRuleEngine::from_config(rules, None);
 
         // Matches
-        let result = engine.apply_rules(
+        let result = engine.apply_rules_sync(
             "Write",
             &serde_json::json!({"file_path": "/home/user/.env"}),
             "",
@@ -382,7 +748,7 @@ mod tests {
         );
 
         // Doesn't match (different extension)
-        let result = engine.apply_rules(
+        let result = engine.apply_rules_sync(
             "Write",
             &serde_json::json!({"file_path": "/home/user/main.rs"}),
             "",
@@ -404,7 +770,7 @@ mod tests {
         let engine = ToolRuleEngine::from_config(rules, None);
 
         // Field doesn't exist in input
-        let result = engine.apply_rules("Write", &serde_json::json!({"content": "hello"}), "");
+        let result = engine.apply_rules_sync("Write", &serde_json::json!({"content": "hello"}), "");
         assert_eq!(result, ToolRuleResult::NoMatch);
     }
 
@@ -420,7 +786,7 @@ mod tests {
         let engine = ToolRuleEngine::from_config(rules, None);
 
         // Number field
-        let result = engine.apply_rules("Test", &serde_json::json!({"count": 42}), "");
+        let result = engine.apply_rules_sync("Test", &serde_json::json!({"count": 42}), "");
         assert_eq!(
             result,
             ToolRuleResult::Allowed {
@@ -429,14 +795,14 @@ mod tests {
         );
 
         // Bool field (doesn't match "42")
-        let result = engine.apply_rules("Test", &serde_json::json!({"count": true}), "");
+        let result = engine.apply_rules_sync("Test", &serde_json::json!({"count": true}), "");
         assert_eq!(result, ToolRuleResult::NoMatch);
 
         // Array/object/null fields can't be matched
-        let result = engine.apply_rules("Test", &serde_json::json!({"count": [42]}), "");
+        let result = engine.apply_rules_sync("Test", &serde_json::json!({"count": [42]}), "");
         assert_eq!(result, ToolRuleResult::NoMatch);
 
-        let result = engine.apply_rules("Test", &serde_json::json!({"count": null}), "");
+        let result = engine.apply_rules_sync("Test", &serde_json::json!({"count": null}), "");
         assert_eq!(result, ToolRuleResult::NoMatch);
 
         // Bool positive match (bools are converted to "true"/"false" strings)
@@ -449,7 +815,7 @@ mod tests {
         )];
         let bool_engine = ToolRuleEngine::from_config(bool_rules, None);
 
-        let result = bool_engine.apply_rules("Test", &serde_json::json!({"flag": true}), "");
+        let result = bool_engine.apply_rules_sync("Test", &serde_json::json!({"flag": true}), "");
         assert_eq!(
             result,
             ToolRuleResult::Allowed {
@@ -457,7 +823,7 @@ mod tests {
             }
         );
 
-        let result = bool_engine.apply_rules("Test", &serde_json::json!({"flag": false}), "");
+        let result = bool_engine.apply_rules_sync("Test", &serde_json::json!({"flag": false}), "");
         assert_eq!(result, ToolRuleResult::NoMatch);
     }
 
@@ -484,7 +850,8 @@ mod tests {
         let engine = ToolRuleEngine::from_config(rules, None);
 
         // .rs file matches first rule
-        let result = engine.apply_rules("Write", &serde_json::json!({"file_path": "main.rs"}), "");
+        let result =
+            engine.apply_rules_sync("Write", &serde_json::json!({"file_path": "main.rs"}), "");
         assert_eq!(
             result,
             ToolRuleResult::Allowed {
@@ -493,7 +860,8 @@ mod tests {
         );
 
         // Other file matches second rule
-        let result = engine.apply_rules("Write", &serde_json::json!({"file_path": "data.csv"}), "");
+        let result =
+            engine.apply_rules_sync("Write", &serde_json::json!({"file_path": "data.csv"}), "");
         assert_eq!(
             result,
             ToolRuleResult::Denied {
@@ -533,7 +901,7 @@ mod tests {
 
         // Both bad rules should be skipped, fallback should match
         let result =
-            engine.apply_rules("Write", &serde_json::json!({"file_path": "/home/.env"}), "");
+            engine.apply_rules_sync("Write", &serde_json::json!({"file_path": "/home/.env"}), "");
         assert_eq!(
             result,
             ToolRuleResult::Asked {
@@ -559,7 +927,7 @@ mod tests {
         let engine = ToolRuleEngine::from_config(rules, None);
 
         let result =
-            engine.apply_rules("Write", &serde_json::json!({"file_path": "/home/.env"}), "");
+            engine.apply_rules_sync("Write", &serde_json::json!({"file_path": "/home/.env"}), "");
         assert_eq!(
             result,
             ToolRuleResult::Allowed {
@@ -582,7 +950,7 @@ mod tests {
         )];
         let engine = ToolRuleEngine::from_config(rules, Some(fragments));
 
-        let result = engine.apply_rules(
+        let result = engine.apply_rules_sync(
             "Read",
             &serde_json::json!({"file_path": "/home/user/project/src/main.rs"}),
             "",
@@ -595,7 +963,7 @@ mod tests {
         );
 
         let result =
-            engine.apply_rules("Read", &serde_json::json!({"file_path": "/other/path"}), "");
+            engine.apply_rules_sync("Read", &serde_json::json!({"file_path": "/other/path"}), "");
         assert_eq!(result, ToolRuleResult::NoMatch);
     }
 
@@ -608,7 +976,7 @@ mod tests {
         let engine = ToolRuleEngine::from_config(rules, None);
 
         // Read matches specific rule
-        let result = engine.apply_rules("Read", &serde_json::json!({}), "");
+        let result = engine.apply_rules_sync("Read", &serde_json::json!({}), "");
         assert_eq!(
             result,
             ToolRuleResult::Allowed {
@@ -617,13 +985,549 @@ mod tests {
         );
 
         // Write falls through to wildcard
-        let result = engine.apply_rules("Write", &serde_json::json!({}), "");
+        let result = engine.apply_rules_sync("Write", &serde_json::json!({}), "");
         assert_eq!(
             result,
             ToolRuleResult::Asked {
                 rule_name: "ask-all".to_string()
             }
         );
+    }
+
+    #[test]
+    fn test_allow_local_matches_path_and_file_path() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cwd = temp_dir.path();
+        let existing_file = cwd.join("src/lib.rs");
+        fs::create_dir_all(existing_file.parent().unwrap()).unwrap();
+        fs::write(&existing_file, "fn lib() {}\n").unwrap();
+
+        assert!(tool_input_has_local_path(
+            &[PathBuf::from("src/lib.rs")],
+            cwd
+        ));
+        assert!(tool_input_has_local_path(&[existing_file.clone()], cwd));
+
+        let engine = ToolRuleEngine::from_config(
+            vec![make_local_rule(
+                "allow-local-read",
+                "Read",
+                Some("file_path"),
+                Some(r"^src/.*\.rs$"),
+                ToolRuleAction::Allow,
+            )],
+            None,
+        );
+
+        let result = engine.apply_rules_sync(
+            "Read",
+            &serde_json::json!({"file_path": existing_file}),
+            cwd.to_str().unwrap(),
+        );
+        assert_eq!(
+            result,
+            ToolRuleResult::Allowed {
+                rule_name: "allow-local-read".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_allow_local_matches_nonexistent_targets_inside_cwd() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cwd = temp_dir.path();
+
+        assert!(tool_input_has_local_path(
+            &[PathBuf::from("nested/new/file.txt")],
+            cwd
+        ));
+        assert!(tool_input_has_local_path(
+            &[PathBuf::from("nested/./deeper/../file.txt")],
+            cwd
+        ));
+
+        let engine = ToolRuleEngine::from_config(
+            vec![make_local_rule(
+                "allow-generated",
+                "Write",
+                Some("file_path"),
+                Some(r"^nested/new/.*\.txt$"),
+                ToolRuleAction::Allow,
+            )],
+            None,
+        );
+
+        let result = engine.apply_rules_sync(
+            "Write",
+            &serde_json::json!({"file_path": "nested/new/file.txt"}),
+            cwd.to_str().unwrap(),
+        );
+        assert_eq!(
+            result,
+            ToolRuleResult::Allowed {
+                rule_name: "allow-generated".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_allow_local_rejects_parent_escape() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cwd = temp_dir.path();
+
+        assert!(!tool_input_has_local_path(
+            &[PathBuf::from("../outside.txt")],
+            cwd
+        ));
+        assert!(!tool_input_has_local_path(
+            &[PathBuf::from("nested/../../outside.txt")],
+            cwd
+        ));
+    }
+
+    #[test]
+    fn test_allow_local_rejects_missing_path_fields() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cwd = temp_dir.path();
+
+        let engine = ToolRuleEngine::from_config(
+            vec![make_local_rule(
+                "allow-local-read",
+                "Read",
+                None,
+                None,
+                ToolRuleAction::Allow,
+            )],
+            None,
+        );
+
+        let result = engine.apply_rules_sync(
+            "Read",
+            &serde_json::json!({"content": "x"}),
+            cwd.to_str().unwrap(),
+        );
+        assert_eq!(result, ToolRuleResult::NoMatch);
+    }
+
+    #[test]
+    fn test_allow_local_requires_both_locality_and_regex() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cwd = temp_dir.path();
+        fs::create_dir_all(cwd.join("src")).unwrap();
+        fs::write(cwd.join("src/lib.rs"), "fn lib() {}\n").unwrap();
+        fs::write(cwd.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+
+        let engine = ToolRuleEngine::from_config(
+            vec![make_local_rule(
+                "allow-local-rust-only",
+                "Read",
+                Some("path"),
+                Some(r"^src/.*\.rs$"),
+                ToolRuleAction::Allow,
+            )],
+            None,
+        );
+
+        let non_matching_regex = engine.apply_rules_sync(
+            "Read",
+            &serde_json::json!({"path": cwd.join("Cargo.toml")}),
+            cwd.to_str().unwrap(),
+        );
+        assert_eq!(non_matching_regex, ToolRuleResult::NoMatch);
+    }
+
+    #[test]
+    fn test_allow_local_still_blocks_matching_non_local_regex() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cwd = temp_dir.path();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside_file = outside_dir.path().join("src/lib.rs");
+        fs::create_dir_all(outside_file.parent().unwrap()).unwrap();
+        fs::write(&outside_file, "fn lib() {}\n").unwrap();
+
+        let engine = ToolRuleEngine::from_config(
+            vec![make_local_rule(
+                "allow-local-rust-only",
+                "Read",
+                Some("path"),
+                Some(r"src/lib\.rs$"),
+                ToolRuleAction::Allow,
+            )],
+            None,
+        );
+
+        let non_local = engine.apply_rules_sync(
+            "Read",
+            &serde_json::json!({"path": outside_file}),
+            cwd.to_str().unwrap(),
+        );
+        assert_eq!(non_local, ToolRuleResult::NoMatch);
+    }
+
+    #[test]
+    fn test_allow_local_rejects_when_target_field_is_missing() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cwd = temp_dir.path();
+        fs::write(cwd.join("lib.rs"), "fn lib() {}\n").unwrap();
+
+        let path_engine = ToolRuleEngine::from_config(
+            vec![make_local_rule(
+                "allow-local-path",
+                "Read",
+                Some("path"),
+                Some(".*"),
+                ToolRuleAction::Allow,
+            )],
+            None,
+        );
+
+        let result = path_engine.apply_rules_sync(
+            "Read",
+            &serde_json::json!({"file_path": cwd.join("lib.rs")}),
+            cwd.to_str().unwrap(),
+        );
+        assert_eq!(result, ToolRuleResult::NoMatch);
+
+        let file_path_engine = ToolRuleEngine::from_config(
+            vec![make_local_rule(
+                "allow-local-file-path",
+                "Read",
+                Some("file_path"),
+                Some(".*"),
+                ToolRuleAction::Allow,
+            )],
+            None,
+        );
+
+        let result = file_path_engine.apply_rules_sync(
+            "Read",
+            &serde_json::json!({"path": cwd.join("lib.rs")}),
+            cwd.to_str().unwrap(),
+        );
+        assert_eq!(result, ToolRuleResult::NoMatch);
+    }
+
+    #[test]
+    fn test_allow_local_rejects_missing_cwd() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let missing_cwd = temp_dir.path().join("missing");
+
+        assert!(!tool_input_has_local_path(
+            &[PathBuf::from("src/lib.rs")],
+            &missing_cwd
+        ));
+    }
+
+    #[test]
+    fn test_allow_local_treats_non_string_path_as_absent() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cwd = temp_dir.path();
+        let engine = ToolRuleEngine::from_config(
+            vec![make_local_rule(
+                "allow-any-local",
+                "Read",
+                None,
+                None,
+                ToolRuleAction::Allow,
+            )],
+            None,
+        );
+
+        let result = engine.apply_rules_sync(
+            "Read",
+            &serde_json::json!({"path": 42}),
+            cwd.to_str().unwrap(),
+        );
+        assert_eq!(result, ToolRuleResult::NoMatch);
+    }
+
+    #[test]
+    fn test_allow_local_matches_when_either_path_field_is_local() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cwd = temp_dir.path();
+        let outside_dir = tempfile::tempdir().unwrap();
+
+        assert!(tool_input_has_local_path(
+            &[
+                outside_dir.path().join("outside.txt"),
+                cwd.join("inside.txt"),
+            ],
+            cwd,
+        ));
+    }
+
+    #[test]
+    fn test_allow_local_with_non_path_field_never_matches() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cwd = temp_dir.path();
+        fs::write(cwd.join("local.txt"), "hello\n").unwrap();
+
+        let engine = ToolRuleEngine::from_config(
+            vec![make_local_rule(
+                "bad-command-locality",
+                "Read",
+                Some("command"),
+                Some("^cat"),
+                ToolRuleAction::Allow,
+            )],
+            None,
+        );
+
+        let result = engine.apply_rules_sync(
+            "Read",
+            &serde_json::json!({
+                "command": "cat local.txt",
+                "path": cwd.join("local.txt"),
+            }),
+            cwd.to_str().unwrap(),
+        );
+        assert_eq!(result, ToolRuleResult::NoMatch);
+    }
+
+    #[test]
+    fn test_allow_local_without_field_matches_local_path() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cwd = temp_dir.path();
+        fs::write(cwd.join("local.txt"), "hello\n").unwrap();
+
+        let engine = ToolRuleEngine::from_config(
+            vec![make_local_rule(
+                "allow-any-local",
+                "Read",
+                None,
+                None,
+                ToolRuleAction::Allow,
+            )],
+            None,
+        );
+
+        let result = engine.apply_rules_sync(
+            "Read",
+            &serde_json::json!({"path": cwd.join("local.txt")}),
+            cwd.to_str().unwrap(),
+        );
+        assert_eq!(
+            result,
+            ToolRuleResult::Allowed {
+                rule_name: "allow-any-local".to_string()
+            }
+        );
+
+        let result = engine.apply_rules_sync(
+            "Read",
+            &serde_json::json!({"file_path": cwd.join("local.txt")}),
+            cwd.to_str().unwrap(),
+        );
+        assert_eq!(
+            result,
+            ToolRuleResult::Allowed {
+                rule_name: "allow-any-local".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_allow_local_wildcard_matches_any_tool() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cwd = temp_dir.path();
+        fs::write(cwd.join("local.txt"), "hello\n").unwrap();
+
+        let engine = ToolRuleEngine::from_config(
+            vec![make_local_rule(
+                "deny-all-local",
+                "*",
+                None,
+                None,
+                ToolRuleAction::Deny {
+                    value: "no local ops".to_string(),
+                },
+            )],
+            None,
+        );
+
+        let result = engine.apply_rules_sync(
+            "Edit",
+            &serde_json::json!({"path": cwd.join("local.txt")}),
+            cwd.to_str().unwrap(),
+        );
+        assert_eq!(
+            result,
+            ToolRuleResult::Denied {
+                rule_name: "deny-all-local".to_string(),
+                reason: "no local ops".to_string(),
+            }
+        );
+
+        let result = engine.apply_rules_sync(
+            "Edit",
+            &serde_json::json!({"path": "/outside/local.txt"}),
+            cwd.to_str().unwrap(),
+        );
+        assert_eq!(result, ToolRuleResult::NoMatch);
+    }
+
+    #[test]
+    fn test_allow_local_falls_through_to_later_rule() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cwd = temp_dir.path();
+
+        let engine = ToolRuleEngine::from_config(
+            vec![
+                make_local_rule(
+                    "allow-local-rust",
+                    "Write",
+                    Some("path"),
+                    Some(r"\.rs$"),
+                    ToolRuleAction::Allow,
+                ),
+                make_rule(
+                    "deny-all-writes",
+                    "Write",
+                    None,
+                    None,
+                    ToolRuleAction::Deny {
+                        value: "writes denied".to_string(),
+                    },
+                ),
+            ],
+            None,
+        );
+
+        let result = engine.apply_rules_sync(
+            "Write",
+            &serde_json::json!({"path": "/outside/src/lib.rs"}),
+            cwd.to_str().unwrap(),
+        );
+        assert_eq!(
+            result,
+            ToolRuleResult::Denied {
+                rule_name: "deny-all-writes".to_string(),
+                reason: "writes denied".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_allow_local_can_deny_local_path() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cwd = temp_dir.path();
+        fs::write(cwd.join("secret.txt"), "shh\n").unwrap();
+        fs::write(cwd.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+
+        let engine = ToolRuleEngine::from_config(
+            vec![make_local_rule(
+                "deny-local-read",
+                "Read",
+                None,
+                None,
+                ToolRuleAction::Deny {
+                    value: "local reads denied".to_string(),
+                },
+            )],
+            None,
+        );
+
+        let result = engine.apply_rules_sync(
+            "Read",
+            &serde_json::json!({"path": cwd.join("secret.txt")}),
+            cwd.to_str().unwrap(),
+        );
+        assert_eq!(
+            result,
+            ToolRuleResult::Denied {
+                rule_name: "deny-local-read".to_string(),
+                reason: "local reads denied".to_string(),
+            }
+        );
+
+        let result = engine.apply_rules_sync(
+            "Read",
+            &serde_json::json!({"path": cwd.join("Cargo.toml/child.txt")}),
+            cwd.to_str().unwrap(),
+        );
+        assert_eq!(
+            result,
+            ToolRuleResult::Denied {
+                rule_name: "deny-local-read".to_string(),
+                reason: "local reads denied".to_string(),
+            }
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_allow_local_accepts_symlink_within_cwd() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cwd = temp_dir.path().join("project");
+        let inside = cwd.join("inside");
+        fs::create_dir_all(&inside).unwrap();
+        fs::write(inside.join("file.txt"), "data\n").unwrap();
+        symlink(&inside, cwd.join("linked-inside")).unwrap();
+
+        assert!(tool_input_has_local_path(
+            &[PathBuf::from("linked-inside/file.txt")],
+            &cwd
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_allow_local_rejects_broken_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cwd = temp_dir.path().join("project");
+        let missing = temp_dir.path().join("missing-target");
+        fs::create_dir_all(&cwd).unwrap();
+        symlink(&missing, cwd.join("broken-link")).unwrap();
+
+        assert!(!tool_input_has_local_path(
+            &[PathBuf::from("broken-link/file.txt")],
+            &cwd
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_allow_local_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cwd = temp_dir.path().join("project");
+        let outside = temp_dir.path().join("outside");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret.txt"), "secret\n").unwrap();
+        symlink(&outside, cwd.join("linked-outside")).unwrap();
+
+        assert!(!tool_input_has_local_path(
+            &[PathBuf::from("linked-outside/secret.txt")],
+            &cwd
+        ));
+    }
+
+    #[test]
+    fn test_canonicalize_allow_missing_handles_non_directory_ancestor() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cwd = temp_dir.path();
+        let file = cwd.join("Cargo.toml");
+        fs::write(&file, "[package]\nname = \"x\"\n").unwrap();
+
+        let canonical_cwd = fs::canonicalize(cwd).unwrap();
+        let resolved = canonicalize_allow_missing(&cwd.join("Cargo.toml/child.txt")).unwrap();
+        assert_eq!(resolved, canonical_cwd.join("Cargo.toml/child.txt"));
+    }
+
+    #[test]
+    fn test_canonicalize_allow_missing_rejects_escape_in_missing_suffix() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cwd = temp_dir.path();
+
+        let err = canonicalize_allow_missing(&cwd.join("missing/../..")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("escapes"));
     }
 
     // ===== strip_cwd_prefix tests =====
@@ -708,7 +1612,7 @@ mod tests {
         )];
         let engine = ToolRuleEngine::from_config(rules, None);
 
-        let result = engine.apply_rules(
+        let result = engine.apply_rules_sync(
             "Read",
             &serde_json::json!({"path": "/tmp/project/flake.nix"}),
             "/tmp/project",
@@ -733,7 +1637,7 @@ mod tests {
         let engine = ToolRuleEngine::from_config(rules, None);
 
         // Path doesn't start with cwd, so no stripping — absolute path won't match "^flake\.nix$"
-        let result = engine.apply_rules(
+        let result = engine.apply_rules_sync(
             "Read",
             &serde_json::json!({"path": "/tmp/project/flake.nix"}),
             "/other/dir",
@@ -752,7 +1656,7 @@ mod tests {
         )];
         let engine = ToolRuleEngine::from_config(rules, None);
 
-        let result = engine.apply_rules(
+        let result = engine.apply_rules_sync(
             "Read",
             &serde_json::json!({"path": "/tmp/project/flake.nix"}),
             "",
@@ -776,7 +1680,7 @@ mod tests {
         )];
         let engine = ToolRuleEngine::from_config(rules, None);
 
-        let result = engine.apply_rules(
+        let result = engine.apply_rules_sync(
             "Write",
             &serde_json::json!({"file_path": "/home/user/project/src/lib.rs"}),
             "/home/user/project",
@@ -800,7 +1704,7 @@ mod tests {
         )];
         let engine = ToolRuleEngine::from_config(rules, None);
 
-        let result = engine.apply_rules(
+        let result = engine.apply_rules_sync(
             "Read",
             &serde_json::json!({"file_path": "/home/user/project/src/main.rs"}),
             "/home/user/project/",
@@ -825,7 +1729,7 @@ mod tests {
         )];
         let engine = ToolRuleEngine::from_config(rules, None);
 
-        let result = engine.apply_rules(
+        let result = engine.apply_rules_sync(
             "Read",
             &serde_json::json!({"path": "/home/user/project"}),
             "/home/user/project",

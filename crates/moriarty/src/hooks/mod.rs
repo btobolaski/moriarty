@@ -373,7 +373,7 @@ async fn handle_pretool_hook(
                 rules.clone(),
                 config.pattern_fragments.clone(),
             );
-            let result = engine.apply_rules(tool_name, tool_input, cwd);
+            let result = engine.apply_rules(tool_name, tool_input, cwd).await;
 
             match result {
                 tool_rules::ToolRuleResult::Allowed { rule_name } => {

@@ -63,6 +63,7 @@ action = { type = "Ask" }
 [[tool_rules]]
 name = "descriptive-name"
 tool = "ToolName"           # Exact tool name or "*" for any tool
+allow_local = true           # Optional: require local path/file_path under cwd
 field = "field_name"        # Optional: field in tool_input to match
 pattern = "regex-pattern"   # Optional: regex pattern for the field value
 action = { type = "ActionType", ... }
@@ -71,9 +72,18 @@ action = { type = "ActionType", ... }
 - **name**: A descriptive name for the rule (used in logs)
 - **tool**: Exact tool name to match (e.g., `"Read"`, `"Write"`, `"Edit"`, `"Bash"`, `"Glob"`, `"Grep"`), or `"*"` to
   match any tool
+- **allow_local**: Optional boolean. When `true`, the rule only matches if the relevant path field resolves to a
+  canonical path within the hook's canonicalized `cwd`. If `field = "path"` or `field = "file_path"`, that specific
+  field must be local. If `field` is omitted, either `path` or `file_path` being local is sufficient. If `field` is any
+  other value, the `allow_local` check always fails. Relative inputs are resolved against `cwd`; existing paths are
+  fully canonicalized; non-existent paths are checked by canonicalizing the deepest existing ancestor and safely
+  rebuilding the missing suffix so `..` cannot escape. Symlinks are followed during canonicalization, so symlinks that
+  resolve outside `cwd` are rejected, and broken symlinks are treated as non-local. Hard links are treated as local
+  filesystem entries and are not distinguished from ordinary files.
 - **field** + **pattern**: Optional pair. When both present, the regex `pattern` matches against the named field's value
   in `tool_input`. When absent, the rule applies to any invocation of the tool. If only one is present, the rule is
-  skipped (configuration error, logged).
+  skipped (configuration error, logged). If `allow_local = true` is also set, **both** the local-path check and the
+  regex check must pass.
 - **action**: `Allow`, `Deny`, or `Ask` (see [Rule Actions](#rule-actions)). Note: `Modify` and `ArgumentFilter` are
   Bash-specific and not available for tool rules.
 
@@ -97,6 +107,9 @@ for matching purposes. If the value doesn't start with `cwd`, it's matched as-is
 PreToolUse event (any tool)
   |
   +-> tool_rules engine (first-match-wins)
+  |     tool matches?
+  |       -> allow_local check (if enabled)
+  |       -> field/pattern regex check (if configured)
   |     Match found? -> return Allow/Deny/Ask
   |     NoMatch? -> continue
   |
@@ -161,6 +174,23 @@ field = "file_path"
 pattern = "^{{project}}/"
 action = { type = "Allow" }
 ```
+
+Restrict writes to local files under the current working directory:
+
+```toml
+[[tool_rules]]
+name = "allow-local-src-writes"
+tool = "Write"
+allow_local = true
+field = "file_path"
+pattern = "^src/.*\\.rs$"
+action = { type = "Allow" }
+```
+
+This rule checks both:
+
+- the `file_path` resolves within the canonicalized hook `cwd`
+- after cwd-prefix stripping, the relative path matches `^src/.*\\.rs$`
 
 ## Configuration File
 

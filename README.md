@@ -8,8 +8,9 @@ A Rust CLI tool for analyzing Claude Code logs and API usage, with security hook
 - **API pricing analyzer**: Analyzes Claude API usage from log directories and generates detailed cost reports
 - **MCP servers**: Provides Model Context Protocol servers for git operations and project tools
 - **Tool call permissioning**: Security hooks that control which tools and commands Claude Code can execute
-  - **Tool rules**: Permission any tool call (Read, Write, Edit, Bash, etc.) with optional field-level regex matching.
-    Absolute paths are automatically converted to relative paths using the session's working directory before matching.
+  - **Tool rules**: Permission any tool call (Read, Write, Edit, Bash, etc.) with optional field-level regex matching
+    and optional `allow_local` checks for `path` / `file_path` under the session's working directory. Absolute paths are
+    automatically converted to relative paths using the session's working directory before regex matching.
   - **Bash rules**: Fine-grained command validation with pattern matching, modification, and argument filtering
   - See [BASH_RULES.md](./BASH_RULES.md) for complete configuration guide
 
