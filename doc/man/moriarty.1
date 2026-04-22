@@ -1,0 +1,140 @@
+.\" Copyright (c) 2025 Moriarty contributors
+.\" SPDX-License-Identifier: MIT
+.Dd July 2025
+.Dt MORIARTY 1
+.Os
+.Sh NAME
+.Nm moriarty
+.Nd an assistant for an assistant \(em Claude Code log analysis, API pricing, and tool call permissioning
+.Sh SYNOPSIS
+.Nm
+.Cm logs
+.Fl f Ar file
+.Op Fl \-validate
+.Nm
+.Cm api\-pricing
+.Fl d Ar dir
+.Op Fl \-timezone Ar local|utc
+.Op Fl \-conversations
+.Op Fl \-start\-time Ar DATETIME
+.Op Fl \-end\-time Ar DATETIME
+.Nm
+.Cm mcp
+.Ar server
+.Nm
+.Cm approve\-project
+.Ar project_dir
+.Nm
+.Cm hooks exec
+.Nm
+.Cm test project\-tools
+.Op Ar project_dir
+.Nm
+.Cm test checks
+.Op Ar project_dir
+.Nm
+.Cm test bash\-rules
+.Op Fl c Ar config
+.Op Fl \-json
+.Op Ar command
+.Sh DESCRIPTION
+.Nm
+is a Rust CLI tool for working with Claude Code.
+It provides an interactive log viewer, API usage analysis, MCP servers,
+and a security hook system for controlling which tools and commands
+Claude Code can execute.
+.Ss Log Viewer
+The
+.Cm logs
+subcommand opens an interactive TUI for viewing and navigating
+Claude Code conversation logs.
+.Bl -tag -width Ds
+.It Fl f , Fl \-file Ar file
+Path to the log file to read.
+.It Fl \-validate
+Parse the log and exit instead of opening the viewer.
+Returns a non\-zero exit code if parsing fails.
+.El
+.Ss API Pricing
+The
+.Cm api\-pricing
+subcommand analyzes Claude API usage from log directories
+and generates detailed cost reports.
+.Bl -tag -width Ds
+.It Fl d , Fl \-dir Ar dir
+Directory to analyze for API usage.
+.It Fl \-timezone Ar local|utc
+Timezone for date determination.
+Default:
+.Ar local .
+.It Fl \-conversations
+Aggregate by conversation/session instead of by date.
+.It Fl \-start\-time Ar DATETIME
+Start time filter in ISO 8601 format
+.Pq e.g., 2025\-01\-01T00:00:00Z .
+UTC is assumed if no timezone is specified.
+.It Fl \-end\-time Ar DATETIME
+End time filter in ISO 8601 format.
+.El
+.Ss MCP Servers
+The
+.Cm mcp
+subcommand runs one of the built\-in Model Context Protocol servers
+for git operations and project tools.
+.Ss Project Approval
+The
+.Cm approve\-project
+subcommand opens a TUI to approve project tools
+defined in
+.Pa .config/tools.toml
+for MCP server execution.
+.Ss Hooks
+The
+.Cm hooks exec
+subcommand executes Claude Code hooks, reading input from stdin
+and applying configured tool and bash rules.
+This is the entry point used by Claude Code's hook system.
+.Ss Test Commands
+.Bl -tag -width Ds
+.It Cm test project\-tools Op Ar project_dir
+Run all configured project tools in parallel.
+Defaults to the current directory.
+.It Cm test checks Op Ar project_dir
+Run all configured project checks in parallel.
+.It Cm test bash\-rules Op Ar command
+Test a bash command against configured rules.
+If no command is provided, reads from stdin.
+.Bl -tag -width Ds
+.It Fl c , Fl \-config Ar path
+Custom config file path.
+Defaults to
+.Pa ~/.config/moriarty/tool_rules.toml .
+.It Fl \-json
+Output results as JSON instead of pretty\-printed text.
+.El
+.El
+.Sh ENVIRONMENT
+.Bl -tag -width Ds
+.It Ev XDG_CONFIG_HOME
+Base directory for configuration files.
+Defaults to
+.Pa ~/.config .
+.It Ev XDG_STATE_HOME
+Base directory for state files including logs.
+Defaults to
+.Pa ~/.local/state .
+.El
+.Sh FILES
+.Bl -tag -width Ds
+.It Pa ~/.config/moriarty/tool_rules.toml
+Tool and bash rules configuration file.
+See
+.Xr moriarty\-tool\-rules 5
+and
+.Xr moriarty\-bash\-rules 5 .
+.It Pa ~/.local/state/moriarty/logs/
+Runtime log directory.
+.El
+.Sh SEE ALSO
+.Xr moriarty\-tool\-rules 5 ,
+.Xr moriarty\-bash\-rules 5

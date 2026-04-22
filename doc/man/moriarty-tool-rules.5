@@ -1,0 +1,220 @@
+.\" Copyright (c) 2025 Moriarty contributors
+.\" SPDX-License-Identifier: MIT
+.Dd July 2025
+.Dt MORIARTY\-TOOL\-RULES 5
+.Os
+.Sh NAME
+.Nm moriarty\-tool\-rules
+.Nd tool call permissioning rules for moriarty
+.Sh DESCRIPTION
+Tool rules permission any Claude Code tool call \(em not just Bash.
+They are configured as
+.Ic [[tool_rules]]
+entries in
+.Pa ~/.config/moriarty/tool_rules.toml
+and are checked
+.Em before
+bash rules, providing a unified way to control tool access.
+.Pp
+Both tool rules and bash rules coexist in the same configuration file.
+See
+.Xr moriarty\-bash\-rules 5
+for bash\-specific rules.
+.Sh CONFIGURATION
+.Ss File Location
+.Pa ~/.config/moriarty/tool_rules.toml
+.Pp
+The path respects
+.Ev XDG_CONFIG_HOME
+if set.
+.Ss Rule Structure
+Each tool rule is a TOML array\-of\-tables entry:
+.Bd -literal -offset indent
+[[tool_rules]]
+name = "descriptive\-name"
+tool = "ToolName"
+field = "field_name"       # optional
+pattern = "regex\-pattern"  # optional
+action = { type = "ActionType", value = "..." }
+.Ed
+.Ss Fields
+.Bl -tag -width Ds
+.It Ic name
+A descriptive name for the rule, used in log output.
+.It Ic tool
+Exact tool name to match, or
+.Ql *
+to match any tool.
+Known tools include:
+.Cm Read ,
+.Cm Write ,
+.Cm Edit ,
+.Cm Bash ,
+.Cm Glob ,
+and
+.Cm Grep .
+.It Ic field
+Optional.
+The name of a field in the tool input to match against.
+Must be paired with
+.Ic pattern ;
+if only one is present, the rule is skipped and a configuration error is logged.
+.It Ic pattern
+Optional.
+A regular expression
+.Pq Rust regex syntax
+to match against the value of
+.Ic field .
+Must be paired with
+.Ic field .
+Pattern fragments
+.Pq see Xr moriarty\-bash\-rules 5
+may be used with
+.Ql {{fragment_name}}
+syntax.
+.It Ic action
+The action to take when the rule matches.
+One of
+.Cm Allow ,
+.Cm Deny ,
+or
+.Cm Ask .
+See
+.Sx ACTIONS .
+.El
+.Ss Field Pattern Matching
+When
+.Ic field
+and
+.Ic pattern
+are both specified,
+.Nm moriarty
+extracts the field value from the tool input:
+.Bl -bullet
+.It
+.Em Strings :
+matched directly
+.Pq e.g., file_path, content .
+.It
+.Em Numbers :
+converted to string
+.Pq e.g., 42 becomes \(lq42\(rq .
+.It
+.Em Booleans :
+converted to
+.Ql true
+or
+.Ql false .
+.It
+.Em Arrays, Objects, Null :
+cannot be matched; the rule does not apply.
+.El
+.Ss CWD Prefix Stripping
+Claude Code sends absolute paths in tool inputs
+.Pq e.g., /home/user/project/src/main.rs .
+Before regex matching,
+.Nm moriarty
+strips the hook input's
+.Ic cwd
+prefix from field values, so rules can use relative paths.
+For example, with
+.Ic cwd = \(lq/home/user/project\(rq ,
+the field value
+.Pa /home/user/project/src/main.rs
+becomes
+.Pa src/main.rs
+for matching purposes.
+If the value does not start with
+.Ic cwd ,
+it is matched as\-is.
+.Sh ACTIONS
+.Bl -tag -width Ds
+.It Cm Allow
+Permit the tool call without user confirmation.
+.Bd -literal -offset indent
+action = { type = "Allow" }
+.Ed
+.It Cm Deny
+Block the tool call and display an error message.
+.Bd -literal -offset indent
+action = { type = "Deny", value = "reason message" }
+.Ed
+.It Cm Ask
+Defer to the user for case\-by\-case authorization.
+Claude Code will prompt the user to approve or deny.
+.Bd -literal -offset indent
+action = { type = "Ask" }
+.Ed
+.El
+.Pp
+Note:
+.Cm Modify
+and
+.Cm ArgumentFilter
+actions are only available in bash rules.
+.Sh EVALUATION ORDER
+.Bd -literal -offset indent
+PreToolUse event (any tool)
+  |
+  +\-> tool_rules engine (first\-match\-wins)
+  |     Match found? \-> return Allow/Deny/Ask
+  |     No match?    \-> continue
+  |
+  +\-> tool_name == "Bash"?
+  |     Yes \-> bash_rules engine
+  |     No  \-> defer to Claude Code (no decision)
+.Ed
+.Pp
+Rules are evaluated in order.
+The first matching rule determines the action
+.Pq first\-match\-wins semantics .
+.Sh EXAMPLES
+Allow read\-only tools, deny writing to
+.Pa .env
+files, ask for everything else:
+.Bd -literal -offset indent
+[[tool_rules]]
+name = "allow\-read"
+tool = "Read"
+action = { type = "Allow" }
+
+[[tool_rules]]
+name = "allow\-glob"
+tool = "Glob"
+action = { type = "Allow" }
+
+[[tool_rules]]
+name = "deny\-write\-env"
+tool = "Write"
+field = "file_path"
+pattern = "\e\e.env$"
+action = { type = "Deny", value = "Cannot write to .env files" }
+
+[[tool_rules]]
+name = "ask\-unknown"
+tool = "*"
+action = { type = "Ask" }
+.Ed
+.Pp
+Using pattern fragments:
+.Bd -literal -offset indent
+[pattern_fragments]
+project = "/home/user/project"
+
+[[tool_rules]]
+name = "allow\-project\-read"
+tool = "Read"
+field = "file_path"
+pattern = "^{{project}}/"
+action = { type = "Allow" }
+.Ed
+.Sh FILES
+.Bl -tag -width Ds
+.It Pa ~/.config/moriarty/tool_rules.toml
+Tool and bash rules configuration file.
+.It Pa ~/.local/state/moriarty/logs/
+Log files showing rule evaluation details.
+.El
+.Sh SEE ALSO
+.Xr moriarty 1 ,
+.Xr moriarty\-bash\-rules 5

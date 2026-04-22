@@ -1,0 +1,361 @@
+.\" Copyright (c) 2025 Moriarty contributors
+.\" SPDX-License-Identifier: MIT
+.Dd July 2025
+.Dt MORIARTY\-BASH\-RULES 5
+.Os
+.Sh NAME
+.Nm moriarty\-bash\-rules
+.Nd bash command validation rules and pattern fragments for moriarty
+.Sh DESCRIPTION
+Bash rules provide command\-level validation specifically for Bash tool calls
+in Claude Code.
+They are configured as
+.Ic [[bash_rules]]
+entries in
+.Pa ~/.config/moriarty/tool_rules.toml
+and are evaluated only when no tool rule
+.Pq see Xr moriarty\-tool\-rules 5
+has matched the Bash tool call.
+.Pp
+Rules are evaluated top\-to\-bottom with
+.Em first\-match\-wins
+semantics.
+Place more specific rules before general ones.
+.Sh CONFIGURATION
+.Ss File Location
+.Pa ~/.config/moriarty/tool_rules.toml
+.Pp
+The path respects
+.Ev XDG_CONFIG_HOME
+if set.
+.Ss Rule Structure
+.Bd -literal -offset indent
+[[bash_rules]]
+name = "descriptive\-name"
+pattern = "regex\-pattern"
+action = { type = "ActionType", ... }
+.Ed
+.Ss Fields
+.Bl -tag -width Ds
+.It Ic name
+A descriptive name for the rule, used in log output.
+.It Ic pattern
+A regular expression
+.Pq Rust regex syntax
+to match against the bash command.
+Pattern fragments may be used with
+.Ql {{fragment_name}}
+syntax; see
+.Sx PATTERN FRAGMENTS .
+.It Ic action
+The action to take when the pattern matches.
+See
+.Sx ACTIONS .
+.El
+.Sh ACTIONS
+.Ss Allow
+Explicitly allow the command to execute without user confirmation.
+.Bd -literal -offset indent
+[[bash_rules]]
+name = "allow\-git\-status"
+pattern = "^git\e\es+status"
+action = { type = "Allow" }
+.Ed
+.Ss Deny
+Block the command and show an error message to the user.
+.Bd -literal -offset indent
+[[bash_rules]]
+name = "deny\-rm\-rf"
+pattern = "^rm\e\es+\-rf\e\es+/"
+action = { type = "Deny", value = "Recursive delete of root is not allowed" }
+.Ed
+.Ss Modify
+Transform the command before execution using regex capture groups
+.Pq $0, $1, $2, etc. .
+.Bd -literal -offset indent
+[[bash_rules]]
+name = "add\-dry\-run"
+pattern = "^(docker\e\es+system\e\es+prune)"
+action = { type = "Modify", value = "$1 \-\-dry\-run" }
+.Ed
+.Pp
+.Sy Security Warning :
+Modify actions use unescaped capture group replacement.
+Avoid patterns like
+.Ql ^docker (.*)
+that capture arbitrary input.
+Use specific patterns like
+.Ql ^(docker\e\es+system\e\es+prune)$
+instead.
+.Ss Ask
+Defer to the user for case\-by\-case authorization.
+Claude Code will prompt the user to approve or deny.
+.Bd -literal -offset indent
+[[bash_rules]]
+name = "ask\-for\-sudo"
+pattern = "^sudo\e\eb"
+action = { type = "Ask" }
+.Ed
+.Ss ArgumentFilter
+Structurally remove, add, or replace command arguments before execution.
+Unlike
+.Cm Modify ,
+.Cm ArgumentFilter
+manipulates arguments as discrete tokens,
+making it easier to handle flags regardless of their position.
+.Pp
+.Sy Important :
+After filtering, the modified command is automatically re\-validated
+against all rules.
+The filtered command must match an
+.Cm Allow
+rule (or be manually approved via
+.Cm Ask )
+to execute.
+Chained ArgumentFilter rules are prevented to avoid infinite loops.
+.Pp
+.Em Removing arguments :
+.Bd -literal -offset indent
+[[bash_rules]]
+name = "cargo\-doc\-no\-browser"
+pattern = "^cargo doc.*\-\-open"
+action = { type = "ArgumentFilter", remove = ["\-\-open", "\-o"],
+           reason = "Browser flags removed" }
+.Ed
+.Pp
+The
+.Ic remove
+field supports exact matches
+.Pq Ql \-\-open
+and prefix matches
+.Pq Ql \-\-open No also removes Ql \-\-open=browser .
+Arguments are removed regardless of position.
+.Pp
+.Em Adding arguments :
+.Bd -literal -offset indent
+[[bash_rules]]
+name = "docker\-run\-safety"
+pattern = "^docker run(?!.* \-\-read\-only)"
+action = { type = "ArgumentFilter",
+           add = ["\-\-read\-only", "\-\-security\-opt=no\-new\-privileges"],
+           reason = "Added security restrictions" }
+.Ed
+.Pp
+Arguments are appended to the end of the command.
+.Pp
+.Em Replacing arguments
+.Pq combining remove and add :
+.Bd -literal -offset indent
+[[bash_rules]]
+name = "rm\-force\-interactive"
+pattern = "^rm .*\-f"
+action = { type = "ArgumentFilter",
+           remove = ["\-f", "\-\-force"],
+           add = ["\-i"],
+           reason = "Replaced force with interactive" }
+.Ed
+.Pp
+.Em Operation order :
+.Bl -enum -offset indent -compact
+.It
+Remove specified arguments.
+.It
+Replace specified arguments (if the
+.Ic replace
+field is used).
+.It
+Add new arguments.
+.El
+.Sh PATTERN FRAGMENTS
+Pattern fragments allow defining reusable regex snippets referenced in
+rule patterns using
+.Ql {{fragment_name}}
+syntax.
+.Ss Defining Fragments
+.Bd -literal -offset indent
+[pattern_fragments]
+safe_chars = "[^|&;$\`()<>{}]"
+
+[[bash_rules]]
+name = "allow\-ls"
+pattern = "^ls{{safe_chars}}*$"
+action = { type = "Allow" }
+.Ed
+.Ss Nested Fragments
+Fragments can reference other fragments.
+Expansion happens in multiple passes:
+.Bd -literal -offset indent
+[pattern_fragments]
+safe_chars = "[^|&;$\`()<>{}]"
+safe_arg = "( {{safe_chars}}+)"
+safe_pipe = "( \e\e| (head|tail|grep){{safe_arg}}*)"
+.Ed
+.Ss Built\-in Default Fragments
+.Nm moriarty
+provides the following default fragments:
+.Bl -tag -width "safe_pipe_cmd" -compact
+.It Ic safe_chars
+.Ql [^|&;$\`()<>{}]
+\(em characters that don't allow shell injection.
+.It Ic identifier
+.Ql [a\-zA\-Z_][a\-zA\-Z0\-9_\-]*
+\(em valid identifier pattern.
+.It Ic number
+.Ql [0\-9]+
+\(em numeric values.
+.It Ic safe_arg
+.Ql "( [^|&;$\`()<>{}]+)"
+\(em safe command argument.
+.It Ic safe_flag
+.Ql "( \-[a\-zA\-Z_][a\-zA\-Z0\-9_\-]*)"
+\(em safe command flag.
+.It Ic safe_path
+Safe file path (no shell metacharacters).
+.It Ic safe_pipe_cmd
+.Ql (head|tail|grep|wc|sort|uniq)
+\(em safe pipe target commands.
+.It Ic safe_pipe
+Safe command piping using
+.Ic safe_pipe_cmd .
+.El
+.Pp
+User\-defined fragments with the same name override the defaults.
+.Ss Fragment Naming Rules
+Fragment names must start with a letter or underscore
+.Pq Ql [a\-zA\-Z_]
+and may contain letters, numbers, underscores, and hyphens
+.Pq Ql [a\-zA\-Z0\-9_\-]* .
+.Ss Circular Dependencies
+Fragments cannot reference each other in a cycle.
+The system detects circular dependencies and reports an error
+when loading the configuration.
+.Sh SECURITY BEST PRACTICES
+.Bl -enum
+.It
+.Em Block shell injection characters.
+Exclude
+.Ql | , & , ; , $ , \` , ( , ) , < , > , { , }
+unless explicitly needed:
+.Bd -literal -offset indent
+pattern = "^ls( [^|&;$\`()<>{}]+)?$"
+.Ed
+.It
+.Em Use anchors.
+Always anchor with
+.Ql ^
+and
+.Ql $
+to prevent partial matching.
+Without anchors,
+.Ql git status
+would also match
+.Ql git status && rm \-rf / .
+.It
+.Em Escape regex metacharacters.
+Remember to escape
+.Ql \e\e , ( , ) , [ , ] , { , } , \&. , * , + , ? , |
+in patterns.
+.It
+.Em Order rules from specific to general.
+Deny rules for dangerous commands should come before
+broader allow rules.
+.It
+.Em Use fragments for security patterns.
+Define injection\-safe character classes once and reuse them.
+.El
+.Sh EXAMPLES
+.Ss Safe Cargo Commands
+.Bd -literal -offset indent
+[pattern_fragments]
+safe_chars = "[^|&;$\`()<>{}]"
+
+[[bash_rules]]
+name = "cargo\-doc\-no\-browser"
+pattern = "^cargo doc.*\-\-open"
+action = { type = "ArgumentFilter", remove = ["\-\-open", "\-o"],
+           reason = "Browser not useful for Claude" }
+
+[[bash_rules]]
+name = "cargo\-safe\-commands"
+pattern = "^cargo (build|check|test|clippy|fmt|doc)( {{safe_chars}}+)*$"
+action = { type = "Allow" }
+.Ed
+.Ss Git Operations
+.Bd -literal -offset indent
+[[bash_rules]]
+name = "allow\-git\-read"
+pattern = "^git (status|diff|log|show)"
+action = { type = "Allow" }
+
+[[bash_rules]]
+name = "ask\-git\-write"
+pattern = "^git (commit|push|pull|rebase)"
+action = { type = "Ask" }
+
+[[bash_rules]]
+name = "deny\-git\-force"
+pattern = "^git\e\es+push.*\-\-force"
+action = { type = "Deny", value = "Force push is not allowed" }
+.Ed
+.Ss Comprehensive Security
+.Bd -literal -offset indent
+[pattern_fragments]
+safe = "[^|&;$\`()<>{}]"
+safe_arg = "( {{safe}}+)"
+
+[[bash_rules]]
+name = "deny\-rm\-rf\-root"
+pattern = "^rm\e\es+\-rf\e\es+/"
+action = { type = "Deny", value = "Cannot delete from root" }
+
+[[bash_rules]]
+name = "deny\-sudo"
+pattern = "^sudo\e\eb"
+action = { type = "Deny", value = "sudo not allowed" }
+
+[[bash_rules]]
+name = "allow\-read\-commands"
+pattern = "^(ls|cat|head|tail|grep|wc|find){{safe_arg}}*$"
+action = { type = "Allow" }
+
+[[bash_rules]]
+name = "allow\-cargo"
+pattern = "^cargo (build|check|test|clippy|fmt){{safe_arg}}*$"
+action = { type = "Allow" }
+.Ed
+.Sh TROUBLESHOOTING
+.Bl -tag -width Ds
+.It Em Rule not matching
+Check logs at
+.Pa ~/.local/state/moriarty/logs/
+to see which rule matched:
+.Pp
+.Dl tail \-f ~/.local/state/moriarty/logs/moriarty\-*.log | grep \(lqBash rule matched\(rq
+.It Em Pattern expansion errors
+Check for undefined fragments, circular dependencies, or invalid
+fragment names.
+.It Em Unexpected modifications
+Check
+.Cm Modify
+rules and their capture groups in the logs:
+.Pp
+.Dl tail \-f ~/.local/state/moriarty/logs/moriarty\-*.log | grep \(lqCommand modified\(rq
+.It Em Rules not loading
+Verify the config file exists at the expected path,
+check TOML syntax, and look for parse errors in the logs.
+.It Em Testing patterns
+Use
+.Cm moriarty test bash\-rules
+to test a command against your rules,
+or use an online regex tester with the Rust regex flavor.
+.El
+.Sh FILES
+.Bl -tag -width Ds
+.It Pa ~/.config/moriarty/tool_rules.toml
+Tool and bash rules configuration file.
+.It Pa ~/.local/state/moriarty/logs/
+Log files showing rule evaluation details.
+.El
+.Sh SEE ALSO
+.Xr moriarty 1 ,
+.Xr moriarty\-tool\-rules 5
