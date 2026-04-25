@@ -75,6 +75,12 @@ test in a separate process, making this safe and preventing tests from clobberin
 - Line counter tracks code changes from file history snapshots
 - Entry point: `api-pricing` subcommand in `main.rs`
 
+**`pi_logs/`** - Pi session log parsing:
+
+- Independent workspace crate for parsing pi session JSONL logs into strongly typed serde models
+- Mirrors the main log parser's strictness with pervasive `#[serde(deny_unknown_fields)]` and path-aware parse errors
+- Includes a `parse_pi_sessions` binary that recursively smoke-tests a sessions tree by parsing every `*.jsonl` file
+
 **`tui/`** - Terminal UI event infrastructure:
 
 - Provides an async event stream (`input_stream`) that maps crossterm terminal events (keys, resize, paste) into the

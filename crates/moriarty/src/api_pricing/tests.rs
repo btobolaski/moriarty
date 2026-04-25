@@ -193,8 +193,10 @@ fn test_display_costs_smoke_variants() {
     ];
 
     for (label, daily_costs) in cases {
-        let result = std::panic::catch_unwind(|| display_costs(&daily_costs));
-        assert!(result.is_ok(), "display_costs panicked on case {label}");
+        match std::panic::catch_unwind(|| display_costs(&daily_costs)) {
+            Ok(()) => {}
+            Err(_) => panic!("display_costs panicked on case {label}"),
+        }
     }
 }
 
@@ -220,8 +222,10 @@ fn test_display_costs_single_day_variants() {
     ];
 
     for (label, daily) in cases {
-        let result = std::panic::catch_unwind(|| display_costs(&[daily]));
-        assert!(result.is_ok(), "display_costs panicked on case {label}");
+        match std::panic::catch_unwind(|| display_costs(&[daily])) {
+            Ok(()) => {}
+            Err(_) => panic!("display_costs panicked on case {label}"),
+        }
     }
 }
 

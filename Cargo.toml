@@ -18,3 +18,20 @@ edition = "2021"
 
 [workspace.metadata.crane]
 name = "my-workspace"
+
+[workspace.dependencies]
+chrono = { version = "0.4.42", features = ["serde"] }
+clap = { version = "4.5.49", features = ["derive", "env"] }
+miette = { version = "7.6.0", features = ["fancy"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+tokio = { version = "1.47.1", features = [
+  "macros",
+  "parking_lot",
+  "rt-multi-thread",
+  "sync",
+  "fs",
+  "time",
+  "process",
+] }
+uuid = { version = "1.18.1", features = ["v4", "serde"] }
