@@ -455,19 +455,88 @@ mod tests {
             json: bool,
         }
         let cases = [
-            Case { label: "allowed",                    rule: allow("allow-ls", r"^ls"),                                      command: "ls -la",             json: false },
-            Case { label: "denied",                     rule: deny("deny-rm", r"^rm\s+-rf\s+/", "Dangerous recursive delete"), command: "rm -rf /",           json: false },
-            Case { label: "modified",                   rule: modify("modify-docker", r"^(docker\s+system\s+prune)$", "$1 --dry-run"), command: "docker system prune", json: false },
-            Case { label: "ask",                        rule: ask("ask-docker", r"^docker"),                                  command: "docker build",       json: false },
-            Case { label: "no match",                   rule: allow("allow-ls", r"^ls"),                                      command: "cargo build",        json: false },
-            Case { label: "json output",                rule: allow("allow-ls", r"^ls"),                                      command: "ls -la",             json: true },
-            Case { label: "json structure allowed",     rule: allow("allow-ls", r"^ls"),                                      command: "ls",                 json: true },
-            Case { label: "json structure denied",      rule: deny("deny-rm", r"^rm", "Dangerous command"),                    command: "rm file.txt",        json: true },
-            Case { label: "json structure modified",    rule: modify("add-flag", r"^(ls)$", "$1 -la"),                        command: "ls",                 json: true },
-            Case { label: "invalid regex skipped",      rule: deny("bad-regex", r"[invalid(", "test"),                        command: "anything",           json: false },
-            Case { label: "special chars quotes",       rule: allow("allow-echo", r"^echo"),                                  command: "echo \"hello world\"", json: false },
-            Case { label: "special chars unicode",      rule: allow("allow-echo", r"^echo"),                                  command: "echo '\u{4f60}\u{597d}\u{4e16}\u{754c} \u{1f30d}'", json: false },
-            Case { label: "whitespace only",            rule: deny("deny-whitespace", r"^\s+$", "Whitespace only"),            command: "   \t\n",            json: false },
+            Case {
+                label: "allowed",
+                rule: allow("allow-ls", r"^ls"),
+                command: "ls -la",
+                json: false,
+            },
+            Case {
+                label: "denied",
+                rule: deny("deny-rm", r"^rm\s+-rf\s+/", "Dangerous recursive delete"),
+                command: "rm -rf /",
+                json: false,
+            },
+            Case {
+                label: "modified",
+                rule: modify(
+                    "modify-docker",
+                    r"^(docker\s+system\s+prune)$",
+                    "$1 --dry-run",
+                ),
+                command: "docker system prune",
+                json: false,
+            },
+            Case {
+                label: "ask",
+                rule: ask("ask-docker", r"^docker"),
+                command: "docker build",
+                json: false,
+            },
+            Case {
+                label: "no match",
+                rule: allow("allow-ls", r"^ls"),
+                command: "cargo build",
+                json: false,
+            },
+            Case {
+                label: "json output",
+                rule: allow("allow-ls", r"^ls"),
+                command: "ls -la",
+                json: true,
+            },
+            Case {
+                label: "json structure allowed",
+                rule: allow("allow-ls", r"^ls"),
+                command: "ls",
+                json: true,
+            },
+            Case {
+                label: "json structure denied",
+                rule: deny("deny-rm", r"^rm", "Dangerous command"),
+                command: "rm file.txt",
+                json: true,
+            },
+            Case {
+                label: "json structure modified",
+                rule: modify("add-flag", r"^(ls)$", "$1 -la"),
+                command: "ls",
+                json: true,
+            },
+            Case {
+                label: "invalid regex skipped",
+                rule: deny("bad-regex", r"[invalid(", "test"),
+                command: "anything",
+                json: false,
+            },
+            Case {
+                label: "special chars quotes",
+                rule: allow("allow-echo", r"^echo"),
+                command: "echo \"hello world\"",
+                json: false,
+            },
+            Case {
+                label: "special chars unicode",
+                rule: allow("allow-echo", r"^echo"),
+                command: "echo '\u{4f60}\u{597d}\u{4e16}\u{754c} \u{1f30d}'",
+                json: false,
+            },
+            Case {
+                label: "whitespace only",
+                rule: deny("deny-whitespace", r"^\s+$", "Whitespace only"),
+                command: "   \t\n",
+                json: false,
+            },
         ];
 
         for c in cases {
@@ -520,7 +589,10 @@ mod tests {
             &dir,
             UserConfig {
                 pattern_fragments: Some(fragments),
-                bash_rules: Some(vec![allow("allow-ls-with-fragment", r"^ls{{safe_chars}}*$")]),
+                bash_rules: Some(vec![allow(
+                    "allow-ls-with-fragment",
+                    r"^ls{{safe_chars}}*$",
+                )]),
                 tool_rules: None,
             },
         )

@@ -245,8 +245,7 @@ impl ModelCostsMap {
     }
 
     pub fn model_costs(&self) -> [(&'static str, TokenCosts); 4] {
-        ModelType::DISPLAY_ORDER
-            .map(|(model_type, name)| (name, self.get_or_default(model_type)))
+        ModelType::DISPLAY_ORDER.map(|(model_type, name)| (name, self.get_or_default(model_type)))
     }
 }
 

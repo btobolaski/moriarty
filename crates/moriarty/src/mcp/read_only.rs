@@ -165,8 +165,7 @@ pub(crate) mod test_support {
                 let init_bare_repo = $init_bare_repo;
                 let temp_dir = ::tempfile::TempDir::new().unwrap();
                 init_bare_repo(temp_dir.path());
-                let Err(error) =
-                    run(temp_dir.path().to_path_buf(), Vec::<String>::new()).await
+                let Err(error) = run(temp_dir.path().to_path_buf(), Vec::<String>::new()).await
                 else {
                     panic!("Expected error for directory without .config/tools.toml");
                 };

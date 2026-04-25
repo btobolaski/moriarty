@@ -214,7 +214,10 @@ mod tests {
 
     /// Builds a minimal `UserConfig` fixture for round-trip tests that only vary
     /// the bash/tool rule lists.
-    fn sample_config(bash_rules: Option<Vec<BashRule>>, tool_rules: Option<Vec<ToolRule>>) -> UserConfig {
+    fn sample_config(
+        bash_rules: Option<Vec<BashRule>>,
+        tool_rules: Option<Vec<ToolRule>>,
+    ) -> UserConfig {
         UserConfig {
             pattern_fragments: None,
             bash_rules,
@@ -418,8 +421,7 @@ reason = "Browser not needed""#;
 
     #[tokio::test]
     async fn test_load_user_config_empty_rules() {
-        assert_config_roundtrips(sample_config(None, None))
-        .await;
+        assert_config_roundtrips(sample_config(None, None)).await;
     }
 
     #[tokio::test]

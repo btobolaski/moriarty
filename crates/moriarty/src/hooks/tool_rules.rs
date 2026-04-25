@@ -774,7 +774,13 @@ mod tests {
             },
         );
         // Doesn't match other tools
-        assert_engine_result(&engine, "Write", serde_json::json!({}), "", ToolRuleResult::NoMatch);
+        assert_engine_result(
+            &engine,
+            "Write",
+            serde_json::json!({}),
+            "",
+            ToolRuleResult::NoMatch,
+        );
     }
 
     #[test]
@@ -812,7 +818,13 @@ mod tests {
         let engine = ToolRuleEngine::from_config(vec![rule], None);
 
         assert_engine_result(&engine, "Read", serde_json::json!({}), "", expected.clone());
-        assert_engine_result(&engine, "Write", serde_json::json!({}), "", expected.clone());
+        assert_engine_result(
+            &engine,
+            "Write",
+            serde_json::json!({}),
+            "",
+            expected.clone(),
+        );
         assert_engine_result(&engine, "Bash", serde_json::json!({}), "", expected);
     }
 
@@ -877,10 +889,34 @@ mod tests {
             rule_name: "match-number".to_string(),
         };
 
-        assert_engine_result(&engine, "Test", serde_json::json!({"count": 42}), "", allowed);
-        assert_engine_result(&engine, "Test", serde_json::json!({"count": true}), "", ToolRuleResult::NoMatch);
-        assert_engine_result(&engine, "Test", serde_json::json!({"count": [42]}), "", ToolRuleResult::NoMatch);
-        assert_engine_result(&engine, "Test", serde_json::json!({"count": null}), "", ToolRuleResult::NoMatch);
+        assert_engine_result(
+            &engine,
+            "Test",
+            serde_json::json!({"count": 42}),
+            "",
+            allowed,
+        );
+        assert_engine_result(
+            &engine,
+            "Test",
+            serde_json::json!({"count": true}),
+            "",
+            ToolRuleResult::NoMatch,
+        );
+        assert_engine_result(
+            &engine,
+            "Test",
+            serde_json::json!({"count": [42]}),
+            "",
+            ToolRuleResult::NoMatch,
+        );
+        assert_engine_result(
+            &engine,
+            "Test",
+            serde_json::json!({"count": null}),
+            "",
+            ToolRuleResult::NoMatch,
+        );
 
         // Bool positive match (bools are converted to "true"/"false" strings)
         let bool_rule = make_rule(
@@ -895,8 +931,20 @@ mod tests {
             rule_name: "match-bool".to_string(),
         };
 
-        assert_engine_result(&bool_engine, "Test", serde_json::json!({"flag": true}), "", bool_allowed);
-        assert_engine_result(&bool_engine, "Test", serde_json::json!({"flag": false}), "", ToolRuleResult::NoMatch);
+        assert_engine_result(
+            &bool_engine,
+            "Test",
+            serde_json::json!({"flag": true}),
+            "",
+            bool_allowed,
+        );
+        assert_engine_result(
+            &bool_engine,
+            "Test",
+            serde_json::json!({"flag": false}),
+            "",
+            ToolRuleResult::NoMatch,
+        );
     }
 
     #[test]
@@ -1149,13 +1197,7 @@ mod tests {
             ),
             (
                 "non-string path",
-                make_local_rule(
-                    "allow-any-local",
-                    "Read",
-                    None,
-                    None,
-                    ToolRuleAction::Allow,
-                ),
+                make_local_rule("allow-any-local", "Read", None, None, ToolRuleAction::Allow),
                 serde_json::json!({"path": 42}),
             ),
             (
@@ -1340,8 +1382,15 @@ mod tests {
             ),
         ];
 
-        for (label, rule, files, matching_path, matching_expected, nonmatching_path, nonmatching_expected) in
-            cases
+        for (
+            label,
+            rule,
+            files,
+            matching_path,
+            matching_expected,
+            nonmatching_path,
+            nonmatching_expected,
+        ) in cases
         {
             let temp_dir = tempfile::tempdir().unwrap();
             let cwd = temp_dir.path();
@@ -1356,7 +1405,11 @@ mod tests {
             let cwd_str = cwd.to_str().unwrap();
 
             assert_eq!(
-                engine.apply_rules_sync("Edit", &serde_json::json!({"path": cwd.join(matching_path)}), cwd_str),
+                engine.apply_rules_sync(
+                    "Edit",
+                    &serde_json::json!({"path": cwd.join(matching_path)}),
+                    cwd_str
+                ),
                 matching_expected,
                 "case {label}: matching path"
             );
@@ -1413,7 +1466,12 @@ mod tests {
     #[test]
     fn test_allow_local_denied_variants() {
         let cases = [
-            ("direct local file", "secret.txt", "shh\n", PathBuf::from("secret.txt")),
+            (
+                "direct local file",
+                "secret.txt",
+                "shh\n",
+                PathBuf::from("secret.txt"),
+            ),
             (
                 "path-through-file ancestor",
                 "Cargo.toml",
@@ -1486,7 +1544,10 @@ mod tests {
             ),
         ];
         for (label, path) in broken_cases {
-            assert!(!tool_input_has_local_path(&[PathBuf::from(path)], &cwd), "case {label}");
+            assert!(
+                !tool_input_has_local_path(&[PathBuf::from(path)], &cwd),
+                "case {label}"
+            );
         }
     }
 

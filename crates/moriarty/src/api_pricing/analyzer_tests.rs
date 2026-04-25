@@ -98,7 +98,10 @@ fn assert_single_lines_changed_entry(
     label: &str,
 ) {
     assert_eq!(result.len(), 1, "{label} should produce one entry");
-    assert_eq!(result[0].0, date, "{label} should attribute to correct date");
+    assert_eq!(
+        result[0].0, date,
+        "{label} should attribute to correct date"
+    );
     assert_eq!(
         result[0].1, expected_lines,
         "{label} should report {expected_lines} lines"
@@ -141,13 +144,11 @@ const STREAMING_GROUP_CACHE_WRITE_TOKENS: usize = 17_932;
 fn assert_streaming_group_token_counts(counts: TokenCounts) {
     assert_eq!(counts.input_tokens, STREAMING_GROUP_INPUT_TOKENS);
     assert_eq!(
-        counts.output_tokens,
-        STREAMING_GROUP_OUTPUT_TOKENS,
+        counts.output_tokens, STREAMING_GROUP_OUTPUT_TOKENS,
         "Should have final output count"
     );
     assert_eq!(
-        counts.cache_write_tokens,
-        STREAMING_GROUP_CACHE_WRITE_TOKENS,
+        counts.cache_write_tokens, STREAMING_GROUP_CACHE_WRITE_TOKENS,
         "Should count cache_write only once"
     );
 }
@@ -181,7 +182,12 @@ fn create_date_based_message(
 
 /// Shortcut: Sonnet date-based test message on the given date with the given counts.
 fn sonnet_msg(date: NaiveDate, counts: TokenCounts) -> DateBasedMessage {
-    create_date_based_message(date, ModelType::Sonnet, "claude-sonnet-4".to_string(), counts)
+    create_date_based_message(
+        date,
+        ModelType::Sonnet,
+        "claude-sonnet-4".to_string(),
+        counts,
+    )
 }
 
 /// Shortcut: Haiku date-based test message on the given date with the given counts.
@@ -528,7 +534,10 @@ fn test_aggregate_by_date_usage_variants() {
     let cases = [
         (
             "single entry",
-            vec![sonnet_msg(test_date(2025, 10, 23), TokenCounts::new(1000, 500, 0, 0))],
+            vec![sonnet_msg(
+                test_date(2025, 10, 23),
+                TokenCounts::new(1000, 500, 0, 0),
+            )],
             vec![(test_date(2025, 10, 23), ModelType::Sonnet, 1000, 500)],
         ),
         (
@@ -566,10 +575,8 @@ fn test_aggregate_by_date_tracks_unknown_models() {
     let date = NaiveDate::from_ymd_opt(2025, 10, 23).unwrap();
 
     let usages = vec![
-        unknown_msg(date, "gemini-pro", TokenCounts::new(1000, 500, 100, 50),
-        ),
-        unknown_msg(date, "gpt-4", TokenCounts::new(500, 250, 0, 0),
-        ),
+        unknown_msg(date, "gemini-pro", TokenCounts::new(1000, 500, 100, 50)),
+        unknown_msg(date, "gpt-4", TokenCounts::new(500, 250, 0, 0)),
     ];
     let (result, unknown_models, total_unknown_tokens) = aggregate_test_with_unknowns(usages);
 
@@ -593,12 +600,9 @@ fn test_aggregate_by_date_sorted_by_date() {
     let date3 = NaiveDate::from_ymd_opt(2025, 10, 25).unwrap();
 
     let usages = vec![
-        sonnet_msg(date1, TokenCounts::default(),
-        ),
-        sonnet_msg(date2, TokenCounts::default(),
-        ),
-        sonnet_msg(date3, TokenCounts::default(),
-        ),
+        sonnet_msg(date1, TokenCounts::default()),
+        sonnet_msg(date2, TokenCounts::default()),
+        sonnet_msg(date3, TokenCounts::default()),
     ];
     let result = aggregate_test(usages);
     let dates: Vec<_> = result.keys().collect();
@@ -616,7 +620,13 @@ async fn test_find_jsonl_files_variants() {
         Deep,
     }
 
-    for case in [Case::Empty, Case::NoJsonl, Case::Single, Case::Recursive, Case::Deep] {
+    for case in [
+        Case::Empty,
+        Case::NoJsonl,
+        Case::Single,
+        Case::Recursive,
+        Case::Deep,
+    ] {
         let temp_dir = tempfile::tempdir().unwrap();
         let (label, expected_len, expected_suffix): (&str, usize, Option<&str>) = match case {
             Case::Empty => ("empty", 0, None),
@@ -953,8 +963,7 @@ async fn test_parse_log_file_synthetic_filter_variants() {
             assert_eq!(result.len(), 1, "case {label}");
             assert_eq!(result[0].model_string, model, "case {label}");
             assert_eq!(
-                result[0].token_counts.input_tokens,
-                input_tokens,
+                result[0].token_counts.input_tokens, input_tokens,
                 "case {label}"
             );
         } else {
@@ -1048,7 +1057,11 @@ async fn test_parse_log_file_deduplicates_streaming_messages_by_request_id() {
     let file_path = write_streaming_group_file(temp_dir.path()).await;
 
     let result = parse_test_file(&file_path).await;
-    assert_eq!(result.len(), 1, "streaming dedup should produce one message");
+    assert_eq!(
+        result.len(),
+        1,
+        "streaming dedup should produce one message"
+    );
     let msg = &result[0];
 
     assert_eq!(msg.model_type, ModelType::Sonnet);
@@ -1063,7 +1076,11 @@ async fn test_parse_log_file_by_session_deduplicates_streaming_messages() {
     let result = parse_log_file_by_session(&file_path, &empty_filter())
         .await
         .unwrap();
-    assert_eq!(result.len(), 1, "streaming dedup should produce one session message");
+    assert_eq!(
+        result.len(),
+        1,
+        "streaming dedup should produce one session message"
+    );
     let msg = &result[0];
 
     assert_eq!(msg.session_id, "session-1");
@@ -1518,8 +1535,18 @@ async fn test_analyze_directory_deduplicates_forked_conversation() {
     // If any assertion fails, values were doubled — cross-file dedup didn't run.
     assert_cost_close(per_model.input, 100.0, 3.0, "input counted once");
     assert_cost_close(per_model.output, 500.0, 15.0, "output counted once");
-    assert_cost_close(per_model.cache_write, 5000.0, 3.75, "cache_write counted once");
-    assert_cost_close(per_model.cache_read, 2000.0, 0.30, "cache_read counted once");
+    assert_cost_close(
+        per_model.cache_write,
+        5000.0,
+        3.75,
+        "cache_write counted once",
+    );
+    assert_cost_close(
+        per_model.cache_read,
+        2000.0,
+        0.30,
+        "cache_read counted once",
+    );
 }
 
 #[tokio::test]

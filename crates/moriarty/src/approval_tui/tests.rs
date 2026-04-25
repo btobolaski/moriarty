@@ -220,7 +220,10 @@ async fn test_command_info_metadata_loading() {
         .script_contents
         .as_ref()
         .expect("Should have script contents for writable script");
-    assert!(!script_contents.is_empty(), "Script contents should be non-empty");
+    assert!(
+        !script_contents.is_empty(),
+        "Script contents should be non-empty"
+    );
 
     // Find the lint command (uses echo binary)
     let lint_cmd = app

@@ -48,10 +48,7 @@ async fn assert_shared_repo_approval(repo_root: &Path, shared_path: &Path, label
     );
 
     let approvals = ProjectApprovals::load().await.unwrap();
-    let result = approvals
-        .verify_project(shared_path, "lint")
-        .await
-        .unwrap();
+    let result = approvals.verify_project(shared_path, "lint").await.unwrap();
     assert_eq!(
         result,
         VerificationResult::Approved,
@@ -108,7 +105,9 @@ async fn approve_mutate_and_verify_check(
     item: &str,
     mutate: impl FnOnce(&Path),
 ) -> VerificationResult {
-    approve_project_config(project_dir, config_content).await.unwrap();
+    approve_project_config(project_dir, config_content)
+        .await
+        .unwrap();
     mutate(project_dir);
     verify_check_result(project_dir, item).await
 }
@@ -137,12 +136,7 @@ fn approve_fixture(
 ) -> (String, ProjectApprovals) {
     let mut approvals = ProjectApprovals::default();
     approvals
-        .approve_project(
-            dir.to_path_buf(),
-            tools_hash.to_string(),
-            commands,
-            checks,
-        )
+        .approve_project(dir.to_path_buf(), tools_hash.to_string(), commands, checks)
         .unwrap();
     let key = canonical_key(dir);
     assert!(approvals.projects.contains_key(&key));
@@ -354,8 +348,12 @@ fn test_approve_project_matrix() {
             })
             .collect();
 
-        let (key, approvals) =
-            approve_fixture(temp_dir.path(), tools_hash, commands.clone(), checks.clone());
+        let (key, approvals) = approve_fixture(
+            temp_dir.path(),
+            tools_hash,
+            commands.clone(),
+            checks.clone(),
+        );
 
         let approval = &approvals.projects[&key];
         assert_eq!(approval.tools_config_hash, tools_hash, "{}", case.label);
@@ -505,7 +503,6 @@ command = ["{}"]
     }
 }
 
-
 #[test]
 fn test_is_within_project() {
     let project_dir = Path::new("/home/user/project");
@@ -533,10 +530,26 @@ async fn test_is_script_variants() {
 #[tokio::test]
 async fn test_is_writable_mode_variants() {
     let cases = [
-        (0o600, true, "File with 0o600 permissions should be writable"),
-        (0o400, false, "File with 0o400 permissions should not be writable"),
-        (0o500, false, "File with 0o500 permissions should not be writable"),
-        (0o755, true, "File with 0o755 permissions should be writable by owner"),
+        (
+            0o600,
+            true,
+            "File with 0o600 permissions should be writable",
+        ),
+        (
+            0o400,
+            false,
+            "File with 0o400 permissions should not be writable",
+        ),
+        (
+            0o500,
+            false,
+            "File with 0o500 permissions should not be writable",
+        ),
+        (
+            0o755,
+            true,
+            "File with 0o755 permissions should be writable by owner",
+        ),
     ];
 
     for (mode, expected, message) in cases {

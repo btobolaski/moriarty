@@ -21,7 +21,11 @@ async fn setup_project_dir_with_approvals(config_content: &str) -> (TempDir, Tem
 ///   (temp_dir, script_path, config_content)
 ///
 /// Caller is expected to already have isolated XDG config set up.
-fn create_script_project(key: &str, script_name: &str, initial_body: &str) -> (TempDir, std::path::PathBuf, String) {
+fn create_script_project(
+    key: &str,
+    script_name: &str,
+    initial_body: &str,
+) -> (TempDir, std::path::PathBuf, String) {
     use std::io::Write;
     let temp_dir = TempDir::new().unwrap();
     let config_dir = temp_dir.path().join(".config");
@@ -112,8 +116,7 @@ fn assert_binary_hash_message(err: &rmcp::ErrorData) {
 #[tokio::test]
 async fn test_run_command_success() {
     let (temp_dir, _xdg_dir) =
-        setup_project_dir_with_approvals("[commands]\ntest = [\"echo\", \"test output\"]\n")
-            .await;
+        setup_project_dir_with_approvals("[commands]\ntest = [\"echo\", \"test output\"]\n").await;
     let tool_result = run_test_cmd(&temp_dir).await.unwrap();
     assert_eq!(tool_result.is_error, Some(false));
     assert_eq!(tool_result.content.len(), 2);
@@ -135,8 +138,7 @@ async fn test_run_command_not_configured() {
 async fn test_run_command_not_approved() {
     // Unlike other tests, deliberately skip approval setup to test rejection path
     let _xdg_dir = setup_isolated_xdg_config();
-    let temp_dir =
-        setup_project_dir_with_config("[commands]\ntest = [\"echo\", \"hello\"]\n");
+    let temp_dir = setup_project_dir_with_config("[commands]\ntest = [\"echo\", \"hello\"]\n");
     let Err(error) = run_test_cmd(&temp_dir).await else {
         panic!("Expected error for unapproved project");
     };
@@ -147,8 +149,7 @@ async fn test_run_command_not_approved() {
 #[tokio::test]
 async fn test_run_command_nonzero_exit() {
     let (temp_dir, _xdg_dir) =
-        setup_project_dir_with_approvals("[commands]\ntest = [\"sh\", \"-c\", \"exit 1\"]\n")
-            .await;
+        setup_project_dir_with_approvals("[commands]\ntest = [\"sh\", \"-c\", \"exit 1\"]\n").await;
     let tool_result = run_test_cmd(&temp_dir).await.unwrap();
     assert_eq!(tool_result.is_error, Some(true));
 }
@@ -195,22 +196,23 @@ async fn test_project_command_display() {
 /// returns is_error=false with a 2-item content vec.
 #[tokio::test]
 async fn test_run_handler_matrix() {
-    type Handler =
-        for<'a> fn(
-            &'a ToolRunner,
-            Parameters<RunArgs>,
-        ) -> std::pin::Pin<
-            Box<
-                dyn std::future::Future<
-                        Output = std::result::Result<rmcp::model::CallToolResult, rmcp::ErrorData>,
-                    > + Send
-                    + 'a,
-            >,
-        >;
+    type Handler = for<'a> fn(
+        &'a ToolRunner,
+        Parameters<RunArgs>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = std::result::Result<rmcp::model::CallToolResult, rmcp::ErrorData>,
+                > + Send
+                + 'a,
+        >,
+    >;
     let cases: &[(&str, &str, Handler)] = &[
         ("lint", "Running lint", |s, a| Box::pin(s.run_lint(a))),
         ("build", "Building project", |s, a| Box::pin(s.run_build(a))),
-        ("format", "Formatting code", |s, a| Box::pin(s.run_formatter(a))),
+        ("format", "Formatting code", |s, a| {
+            Box::pin(s.run_formatter(a))
+        }),
         ("test", "Running tests", |s, a| Box::pin(s.run_tests(a))),
     ];
 

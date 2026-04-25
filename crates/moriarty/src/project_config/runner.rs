@@ -346,9 +346,7 @@ mod tests {
 
     /// Sets up, approves, and loads a project from `config_content`, returning
     /// the project and the `TempDir` guards that must outlive it.
-    async fn approved_project(
-        config_content: &str,
-    ) -> (TempDir, TempDir, VerifiedProject) {
+    async fn approved_project(config_content: &str) -> (TempDir, TempDir, VerifiedProject) {
         let (temp_dir, xdg_dir) = setup_test_project_with_approvals(config_content).await;
         let project = verify_and_load_project(temp_dir.path().to_path_buf())
             .await

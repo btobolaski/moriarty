@@ -288,15 +288,10 @@ mod tests {
         ];
 
         for (index, (commands, checks, expected)) in cases.into_iter().enumerate() {
-            let state = create_test_state(
-                commands,
-                checks,
-                Section::Commands,
-                Screen::ProjectOverview,
-            );
+            let state =
+                create_test_state(commands, checks, Section::Commands, Screen::ProjectOverview);
             let names: Vec<_> = state.all_items().map(|item| item.name.as_str()).collect();
             assert_eq!(names, expected, "case {index}");
         }
     }
 }
-

@@ -409,5 +409,4 @@ mod tests {
                 || cmd_result.0.stderr.contains("There is no jj repo")
         );
     }
-
 }

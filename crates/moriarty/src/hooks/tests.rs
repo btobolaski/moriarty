@@ -57,9 +57,7 @@ fn check_cmd(exit_ok: bool) -> (&'static str, Vec<&'static str>) {
 
 /// Runs `handle_stop_hook` for a project set up with the given checks (all approved).
 /// Returns the temp dir (kept alive by caller) and the hook result.
-async fn run_stop_hook_with_checks(
-    checks: Vec<(&str, &str, Vec<&str>)>,
-) -> (TempDir, HookOutput) {
+async fn run_stop_hook_with_checks(checks: Vec<(&str, &str, Vec<&str>)>) -> (TempDir, HookOutput) {
     let temp_dir = setup_approved_project_with_checks(checks).await;
     std::env::set_var("CLAUDE_PROJECT_DIR", temp_dir.path());
     let result = handle_stop_hook().await.expect("Should succeed");
@@ -206,7 +204,11 @@ async fn assert_stop_approved_case(label: &str, setup: impl FnOnce() -> Option<T
     let _xdg_dir = setup_isolated_xdg_state();
     let _guard = setup();
     let result = run_stop_hook().await;
-    assert_eq!(result.decision, Some(HookDecision::Approve), "case: {label}");
+    assert_eq!(
+        result.decision,
+        Some(HookDecision::Approve),
+        "case: {label}"
+    );
     assert_eq!(result.reason, None, "case: {label}");
 }
 
@@ -554,14 +556,21 @@ async fn test_stop_hook_check_result_variants() {
         let (_temp_dir, result) = run_stop_hook_with_checks(checks).await;
         match case {
             Case::ApprovedOne | Case::ApprovedMany => {
-                assert_eq!(result.decision, Some(HookDecision::Approve), "case: {label}");
+                assert_eq!(
+                    result.decision,
+                    Some(HookDecision::Approve),
+                    "case: {label}"
+                );
                 assert_eq!(result.reason, None, "case: {label}");
             }
             Case::Failed => {
                 assert_eq!(result.decision, Some(HookDecision::Block), "case: {label}");
                 let reason = result.reason.as_ref().expect("reason should be set");
                 for needle in ["Checks failed", "failing-check"] {
-                    assert!(reason.contains(needle), "case {label}: {reason:?} should contain {needle:?}");
+                    assert!(
+                        reason.contains(needle),
+                        "case {label}: {reason:?} should contain {needle:?}"
+                    );
                 }
                 assert_eq!(result.system_message, result.reason, "case: {label}");
             }
@@ -790,12 +799,20 @@ async fn test_bash_hook_rule_outcome_variants() {
         match expected {
             Expect::Allow => {
                 let output = unwrap_pretool_output(&result);
-                assert_eq!(output.permission_decision, Some(PermissionDecision::Allow), "case {label}");
+                assert_eq!(
+                    output.permission_decision,
+                    Some(PermissionDecision::Allow),
+                    "case {label}"
+                );
                 assert_eq!(output.updated_input, None, "case {label}");
             }
             Expect::Ask => {
                 let output = unwrap_pretool_output(&result);
-                assert_eq!(output.permission_decision, Some(PermissionDecision::Ask), "case {label}");
+                assert_eq!(
+                    output.permission_decision,
+                    Some(PermissionDecision::Ask),
+                    "case {label}"
+                );
                 assert_eq!(output.permission_decision_reason, None, "case {label}");
                 assert_eq!(output.updated_input, None, "case {label}");
             }
@@ -806,8 +823,19 @@ async fn test_bash_hook_rule_outcome_variants() {
                     "case {label}: system_message should be populated at top level for deny decisions"
                 );
                 let output = unwrap_pretool_output(&result);
-                assert_eq!(output.permission_decision, Some(PermissionDecision::Deny), "case {label}");
-                assert!(output.permission_decision_reason.as_ref().expect("Deny decision should always carry a reason").contains(reason), "case {label}");
+                assert_eq!(
+                    output.permission_decision,
+                    Some(PermissionDecision::Deny),
+                    "case {label}"
+                );
+                assert!(
+                    output
+                        .permission_decision_reason
+                        .as_ref()
+                        .expect("Deny decision should always carry a reason")
+                        .contains(reason),
+                    "case {label}"
+                );
             }
             Expect::Modify {
                 expected_command,
@@ -995,14 +1023,29 @@ action = { type = "Ask" }
         match expected {
             Expect::Ask => {
                 let output = unwrap_pretool_output(&result);
-                assert_eq!(output.permission_decision, Some(PermissionDecision::Ask), "case {label}");
+                assert_eq!(
+                    output.permission_decision,
+                    Some(PermissionDecision::Ask),
+                    "case {label}"
+                );
                 assert_eq!(output.permission_decision_reason, None, "case {label}");
                 assert_eq!(output.updated_input, None, "case {label}");
             }
             Expect::Deny(reason) => {
                 let output = unwrap_pretool_output(&result);
-                assert_eq!(output.permission_decision, Some(PermissionDecision::Deny), "case {label}");
-                assert!(output.permission_decision_reason.as_ref().expect("deny reason").contains(reason), "case {label}");
+                assert_eq!(
+                    output.permission_decision,
+                    Some(PermissionDecision::Deny),
+                    "case {label}"
+                );
+                assert!(
+                    output
+                        .permission_decision_reason
+                        .as_ref()
+                        .expect("deny reason")
+                        .contains(reason),
+                    "case {label}"
+                );
             }
             Expect::Modified(expected_command) => {
                 assert_pretool_modified_case(&result, expected_command, label)
@@ -1136,7 +1179,10 @@ fn test_pretool_deny_hook_sets_system_message() {
 #[test]
 fn test_pretool_allow_hook_variants() {
     let cases = [
-        (Some("Allowed by whitelist rule"), Some("Allowed by whitelist rule")),
+        (
+            Some("Allowed by whitelist rule"),
+            Some("Allowed by whitelist rule"),
+        ),
         (None, None),
     ];
 
@@ -1226,20 +1272,43 @@ async fn test_tool_rule_non_bash_outcome_variants() {
         match expected {
             Expect::Allow => {
                 let output = unwrap_pretool_output(&result);
-                assert_eq!(output.permission_decision, Some(PermissionDecision::Allow), "case {label}");
+                assert_eq!(
+                    output.permission_decision,
+                    Some(PermissionDecision::Allow),
+                    "case {label}"
+                );
                 assert_eq!(output.updated_input, None, "case {label}");
             }
             Expect::Ask => {
                 let output = unwrap_pretool_output(&result);
-                assert_eq!(output.permission_decision, Some(PermissionDecision::Ask), "case {label}");
+                assert_eq!(
+                    output.permission_decision,
+                    Some(PermissionDecision::Ask),
+                    "case {label}"
+                );
                 assert_eq!(output.permission_decision_reason, None, "case {label}");
                 assert_eq!(output.updated_input, None, "case {label}");
             }
             Expect::Deny(reason) => {
-                assert_eq!(result.system_message, Some(reason.to_string()), "case {label}");
+                assert_eq!(
+                    result.system_message,
+                    Some(reason.to_string()),
+                    "case {label}"
+                );
                 let output = unwrap_pretool_output(&result);
-                assert_eq!(output.permission_decision, Some(PermissionDecision::Deny), "case {label}");
-                assert!(output.permission_decision_reason.as_ref().expect("deny reason").contains(reason), "case {label}");
+                assert_eq!(
+                    output.permission_decision,
+                    Some(PermissionDecision::Deny),
+                    "case {label}"
+                );
+                assert!(
+                    output
+                        .permission_decision_reason
+                        .as_ref()
+                        .expect("deny reason")
+                        .contains(reason),
+                    "case {label}"
+                );
             }
         }
     }
@@ -1548,7 +1617,12 @@ async fn run_allow_local_read(
 
 #[tokio::test]
 async fn test_tool_rule_allow_local_matches_existing_path() {
-    let config = cfg_allow_local_rule("Read", "file_path", r"^src/.*\.rs$", r#"{ type = "Allow" }"#);
+    let config = cfg_allow_local_rule(
+        "Read",
+        "file_path",
+        r"^src/.*\.rs$",
+        r#"{ type = "Allow" }"#,
+    );
     let _xdg_config = setup_user_bash_rules(&config).await;
 
     let temp_dir = TempDir::new().unwrap();
@@ -1570,7 +1644,12 @@ async fn test_tool_rule_allow_local_matches_existing_path() {
 
 #[tokio::test]
 async fn test_tool_rule_allow_local_matches_nonexistent_path() {
-    let config = cfg_allow_local_rule("Read", "file_path", r"^src/.*\.rs$", r#"{ type = "Allow" }"#);
+    let config = cfg_allow_local_rule(
+        "Read",
+        "file_path",
+        r"^src/.*\.rs$",
+        r#"{ type = "Allow" }"#,
+    );
     let _xdg_config = setup_user_bash_rules(&config).await;
 
     let temp_dir = TempDir::new().unwrap();

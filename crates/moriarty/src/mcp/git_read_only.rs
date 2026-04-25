@@ -505,5 +505,4 @@ mod tests {
                 || cmd_result.0.stderr.contains("not a git repo")
         );
     }
-
 }

@@ -296,7 +296,7 @@ pub fn parse_hook_output(json: &str) -> Result<HookOutput, serde_json::Error> {
 
 #[cfg(test)]
 mod tests {
-    use serde::{Serialize, de::DeserializeOwned};
+    use serde::{de::DeserializeOwned, Serialize};
 
     use super::*;
 
@@ -333,7 +333,10 @@ mod tests {
     {
         let json = serde_json::to_string(value).expect("Failed to serialize");
         for fragment in present {
-            assert!(json.contains(fragment), "Missing fragment {fragment:?} in {json}");
+            assert!(
+                json.contains(fragment),
+                "Missing fragment {fragment:?} in {json}"
+            );
         }
         for fragment in absent {
             assert!(
@@ -969,7 +972,10 @@ mod tests {
                     permission_decision_reason: None,
                     updated_input: None,
                 },
-                vec![r#""hookEventName":"PreToolUse""#, r#""permissionDecision":"ask""#],
+                vec![
+                    r#""hookEventName":"PreToolUse""#,
+                    r#""permissionDecision":"ask""#,
+                ],
                 vec![r#""permissionDecisionReason""#, r#""updatedInput""#],
             ),
             (
@@ -1052,8 +1058,7 @@ mod tests {
             updated_input: Some(complex_input.clone()),
         };
         let json = serde_json::to_string(&complex_output).expect("Failed to serialize");
-        let parsed: PreToolUseOutput =
-            serde_json::from_str(&json).expect("Failed to deserialize");
+        let parsed: PreToolUseOutput = serde_json::from_str(&json).expect("Failed to deserialize");
         assert_eq!(parsed.updated_input, Some(complex_input));
     }
 

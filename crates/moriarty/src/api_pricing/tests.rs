@@ -113,9 +113,17 @@ fn test_display_analysis_summary_variants() {
 #[test]
 fn test_display_costs_smoke_variants() {
     let mut thirty_two_days: Vec<_> = (1..=31)
-        .map(|day| costs_on(2025, 1, day).with_sonnet(1.0, 1.0, 0.0, 0.0).with_lines(10))
+        .map(|day| {
+            costs_on(2025, 1, day)
+                .with_sonnet(1.0, 1.0, 0.0, 0.0)
+                .with_lines(10)
+        })
         .collect();
-    thirty_two_days.push(costs_on(2025, 2, 1).with_sonnet(1.0, 1.0, 0.0, 0.0).with_lines(10));
+    thirty_two_days.push(
+        costs_on(2025, 2, 1)
+            .with_sonnet(1.0, 1.0, 0.0, 0.0)
+            .with_lines(10),
+    );
 
     let cases = vec![
         ("empty", vec![]),
@@ -134,9 +142,15 @@ fn test_display_costs_smoke_variants() {
         (
             "three days",
             vec![
-                costs_on(2025, 10, 23).with_sonnet(1.0, 1.0, 0.0, 0.0).with_lines(100),
-                costs_on(2025, 10, 24).with_haiku(0.5, 0.5, 0.0, 0.0).with_lines(50),
-                costs_on(2025, 10, 25).with_opus(2.0, 2.0, 0.0, 0.0).with_lines(75),
+                costs_on(2025, 10, 23)
+                    .with_sonnet(1.0, 1.0, 0.0, 0.0)
+                    .with_lines(100),
+                costs_on(2025, 10, 24)
+                    .with_haiku(0.5, 0.5, 0.0, 0.0)
+                    .with_lines(50),
+                costs_on(2025, 10, 25)
+                    .with_opus(2.0, 2.0, 0.0, 0.0)
+                    .with_lines(75),
             ],
         ),
         (
@@ -147,21 +161,31 @@ fn test_display_costs_smoke_variants() {
                     .with_sonnet(2.0, 2.0, 0.0, 0.0)
                     .with_haiku(0.5, 0.5, 0.0, 0.0)
                     .with_lines(100),
-                costs_on(2025, 10, 24).with_sonnet(1.0, 1.0, 0.0, 0.0).with_lines(50),
+                costs_on(2025, 10, 24)
+                    .with_sonnet(1.0, 1.0, 0.0, 0.0)
+                    .with_lines(50),
             ],
         ),
         // 10 days => num_separators = 9 branch near the end of the explicit match arms.
         (
             "ten days",
             (1..=10)
-                .map(|day| costs_on(2025, 10, day).with_sonnet(1.0, 1.0, 0.0, 0.0).with_lines(10))
+                .map(|day| {
+                    costs_on(2025, 10, day)
+                        .with_sonnet(1.0, 1.0, 0.0, 0.0)
+                        .with_lines(10)
+                })
                 .collect(),
         ),
         // 31 days => the last explicit match branch.
         (
             "thirty-one days",
             (1..=31)
-                .map(|day| costs_on(2025, 10, day).with_sonnet(1.0, 1.0, 0.0, 0.0).with_lines(10))
+                .map(|day| {
+                    costs_on(2025, 10, day)
+                        .with_sonnet(1.0, 1.0, 0.0, 0.0)
+                        .with_lines(10)
+                })
                 .collect(),
         ),
         // 32 days => fallback branch for values above the explicit match table.
@@ -201,7 +225,6 @@ fn test_display_costs_single_day_variants() {
     }
 }
 
-
 #[test]
 fn test_display_warnings_no_unknown_models() {
     display_unknown_model_warnings(&HashSet::new(), &TokenCounts::default());
@@ -224,17 +247,37 @@ fn test_cost_row_variants() {
         (
             "formats mixed costs",
             CostRow::new("2025-10-23", "Sonnet", 1.2345, 2.3456, 0.5, 0.25, "100"),
-            ("2025-10-23", "Sonnet", "$1.2345", "$2.3456", "$0.5000", "$0.2500", "$4.3301", "100"),
+            (
+                "2025-10-23",
+                "Sonnet",
+                "$1.2345",
+                "$2.3456",
+                "$0.5000",
+                "$0.2500",
+                "$4.3301",
+                "100",
+            ),
         ),
         (
             "formats subtotal without lines",
             CostRow::new("2025-10-23", "Test", 1.0, 2.0, 0.5, 0.25, ""),
-            ("2025-10-23", "Test", "$1.0000", "$2.0000", "$0.5000", "$0.2500", "$3.7500", ""),
+            (
+                "2025-10-23",
+                "Test",
+                "$1.0000",
+                "$2.0000",
+                "$0.5000",
+                "$0.2500",
+                "$3.7500",
+                "",
+            ),
         ),
         (
             "formats zero row",
             CostRow::new("", "Haiku", 0.0, 0.0, 0.0, 0.0, ""),
-            ("", "Haiku", "$0.0000", "$0.0000", "$0.0000", "$0.0000", "$0.0000", ""),
+            (
+                "", "Haiku", "$0.0000", "$0.0000", "$0.0000", "$0.0000", "$0.0000", "",
+            ),
         ),
     ];
 
@@ -322,7 +365,12 @@ fn test_grand_total_row_new_variants() {
 
 #[test]
 fn test_display_grand_total_variants() {
-    for (grand_total, total_lines) in [(0.0, 0), (143.7082, 13010), (12345.6789, 999999), (0.0001, 1)] {
+    for (grand_total, total_lines) in [
+        (0.0, 0),
+        (143.7082, 13010),
+        (12345.6789, 999999),
+        (0.0001, 1),
+    ] {
         display_grand_total(grand_total, total_lines);
     }
 }
@@ -334,19 +382,19 @@ fn test_build_cost_rows_variants() {
     let cases = vec![
         (
             "single-model day",
-            vec![costs_on(2025, 10, 23).with_sonnet(1.0, 2.0, 0.0, 0.0).with_lines(100)],
+            vec![costs_on(2025, 10, 23)
+                .with_sonnet(1.0, 2.0, 0.0, 0.0)
+                .with_lines(100)],
             vec![1],
             vec![("2025-10-23", "Sonnet"), ("", "Total")],
         ),
         (
             "multi-model same day",
-            vec![
-                costs_on(2025, 10, 23)
-                    .with_opus(1.0, 1.0, 0.0, 0.0)
-                    .with_sonnet(2.0, 2.0, 0.0, 0.0)
-                    .with_haiku(0.5, 0.5, 0.0, 0.0)
-                    .with_lines(200),
-            ],
+            vec![costs_on(2025, 10, 23)
+                .with_opus(1.0, 1.0, 0.0, 0.0)
+                .with_sonnet(2.0, 2.0, 0.0, 0.0)
+                .with_haiku(0.5, 0.5, 0.0, 0.0)
+                .with_lines(200)],
             vec![3],
             vec![
                 ("2025-10-23", "Opus"),
@@ -364,8 +412,12 @@ fn test_build_cost_rows_variants() {
         (
             "multiple days",
             vec![
-                costs_on(2025, 10, 23).with_sonnet(1.0, 1.0, 0.0, 0.0).with_lines(50),
-                costs_on(2025, 10, 24).with_haiku(0.5, 0.5, 0.0, 0.0).with_lines(25),
+                costs_on(2025, 10, 23)
+                    .with_sonnet(1.0, 1.0, 0.0, 0.0)
+                    .with_lines(50),
+                costs_on(2025, 10, 24)
+                    .with_haiku(0.5, 0.5, 0.0, 0.0)
+                    .with_lines(25),
             ],
             vec![1, 3],
             vec![
@@ -378,23 +430,19 @@ fn test_build_cost_rows_variants() {
         ("empty", vec![], vec![], vec![]),
         (
             "opus-haiku day",
-            vec![
-                costs_on(2025, 10, 23)
-                    .with_opus(1.0, 1.0, 0.0, 0.0)
-                    .with_haiku(0.5, 0.5, 0.0, 0.0)
-                    .with_lines(100),
-            ],
+            vec![costs_on(2025, 10, 23)
+                .with_opus(1.0, 1.0, 0.0, 0.0)
+                .with_haiku(0.5, 0.5, 0.0, 0.0)
+                .with_lines(100)],
             vec![2],
             vec![("2025-10-23", "Opus"), ("", "Haiku"), ("", "Total")],
         ),
         (
             "sonnet-haiku day",
-            vec![
-                costs_on(2025, 10, 23)
-                    .with_sonnet(1.0, 1.0, 0.0, 0.0)
-                    .with_haiku(0.5, 0.5, 0.0, 0.0)
-                    .with_lines(100),
-            ],
+            vec![costs_on(2025, 10, 23)
+                .with_sonnet(1.0, 1.0, 0.0, 0.0)
+                .with_haiku(0.5, 0.5, 0.0, 0.0)
+                .with_lines(100)],
             vec![2],
             vec![("2025-10-23", "Sonnet"), ("", "Haiku"), ("", "Total")],
         ),
@@ -403,7 +451,10 @@ fn test_build_cost_rows_variants() {
     for (label, daily_costs, expected_total_row_indices, expected_rows) in cases {
         let (rows, total_row_indices) = build_cost_rows(&daily_costs);
 
-        assert_eq!(total_row_indices, expected_total_row_indices, "case {label}");
+        assert_eq!(
+            total_row_indices, expected_total_row_indices,
+            "case {label}"
+        );
         assert_eq!(rows.len(), expected_rows.len(), "case {label}");
         for (row, (expected_date, expected_model)) in rows.iter().zip(expected_rows) {
             assert_eq!(row.date, expected_date, "case {label}");
@@ -444,7 +495,10 @@ fn test_create_grouped_table_variants() {
         let output = create_grouped_table(&rows, &total_row_indices).to_string();
         assert!(!output.is_empty(), "case {label}");
         for expected in expected_substrings {
-            assert!(output.contains(expected), "case {label}: missing {expected:?} in {output}");
+            assert!(
+                output.contains(expected),
+                "case {label}: missing {expected:?} in {output}"
+            );
         }
         if expect_separator {
             assert!(

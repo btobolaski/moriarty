@@ -48,7 +48,11 @@ fn empty_cost_columns() -> (String, String, String, String) {
 /// Returns `value` on the first model row in a group and an empty string for
 /// subsequent rows, so grouped tables only show identifying columns once.
 fn grouped_label(first_row: bool, value: &str) -> &str {
-    if first_row { value } else { "" }
+    if first_row {
+        value
+    } else {
+        ""
+    }
 }
 
 use tabled::{
@@ -283,10 +287,16 @@ fn build_grouped_rows<Item, Row>(
 
 /// Centralizes grand-total accumulation so daily and session displays stay in
 /// lockstep when we add or remove per-group summary columns.
-fn summed_totals<Item>(items: &[Item], total: impl Fn(&Item) -> f64, lines: impl Fn(&Item) -> usize) -> (f64, usize) {
-    items.iter().fold((0.0_f64, 0usize), |(cost, total_lines), item| {
-        (cost + total(item), total_lines + lines(item))
-    })
+fn summed_totals<Item>(
+    items: &[Item],
+    total: impl Fn(&Item) -> f64,
+    lines: impl Fn(&Item) -> usize,
+) -> (f64, usize) {
+    items
+        .iter()
+        .fold((0.0_f64, 0usize), |(cost, total_lines), item| {
+            (cost + total(item), total_lines + lines(item))
+        })
 }
 
 /// Build cost rows from daily costs data
@@ -401,7 +411,12 @@ fn build_session_cost_rows(session_costs: &[SessionCosts]) -> (Vec<SessionCostRo
                 },
             );
         },
-        |rows, costs| rows.push(SessionCostRow::new_total_row(costs.lines_changed, costs.total())),
+        |rows, costs| {
+            rows.push(SessionCostRow::new_total_row(
+                costs.lines_changed,
+                costs.total(),
+            ))
+        },
     )
 }
 
