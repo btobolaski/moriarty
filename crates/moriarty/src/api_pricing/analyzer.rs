@@ -5,16 +5,13 @@ use std::{
 
 use async_walkdir::WalkDir;
 use chrono::{DateTime, Local, NaiveDate, Utc};
+use claude_logs::{
+    AssistantLogLine, AssistantUsage, LogLine, LogMessageContent, LogMessageTaggedContent,
+};
 use futures::stream::{self, StreamExt};
 use miette::IntoDiagnostic;
 use rayon::prelude::*;
 use tracing::{debug, trace, warn};
-
-#[cfg(test)]
-use crate::logs::parser;
-use crate::logs::parser::{
-    AssistantLogLine, AssistantUsage, LogLine, LogMessageContent, LogMessageTaggedContent,
-};
 
 use super::{
     line_counter,
@@ -462,7 +459,8 @@ pub async fn parse_log_file(
     timezone: DateTimezone,
     filter: &TimeRangeFilter,
 ) -> miette::Result<Vec<DateBasedMessage>> {
-    let log_lines = parser::read_file(file).await?;
+    let contents = tokio::fs::read_to_string(file).await.into_diagnostic()?;
+    let log_lines = parse_content_to_log_lines(&contents, file)?;
     Ok(extract_date_messages(log_lines, timezone, filter))
 }
 
@@ -482,7 +480,8 @@ pub async fn parse_log_file_by_session(
     file: &Path,
     filter: &TimeRangeFilter,
 ) -> miette::Result<Vec<SessionBasedMessage>> {
-    let log_lines = parser::read_file(file).await?;
+    let contents = tokio::fs::read_to_string(file).await.into_diagnostic()?;
+    let log_lines = parse_content_to_log_lines(&contents, file)?;
     Ok(extract_session_messages(log_lines, filter))
 }
 
@@ -499,7 +498,8 @@ pub async fn parse_lines_changed(
     timezone: DateTimezone,
     filter: &TimeRangeFilter,
 ) -> miette::Result<Vec<(NaiveDate, usize)>> {
-    let log_lines = parser::read_file(file).await?;
+    let contents = tokio::fs::read_to_string(file).await.into_diagnostic()?;
+    let log_lines = parse_content_to_log_lines(&contents, file)?;
     Ok(extract_date_lines_changed(log_lines, timezone, filter))
 }
 

@@ -44,8 +44,9 @@ cargo run -- hooks exec
 # Run tests (MUST use cargo nextest, NOT cargo test)
 cargo nextest run
 
-# Run tests for specific package
+# Run tests for specific packages
 cargo nextest run -p moriarty
+cargo nextest run -p claude_logs
 
 # Save yourself a great deal of repeated output
 cargo nextest run --no-fail-fast --hide-progress-bar --success-output never --status-level fail --final-status-level flaky
@@ -59,11 +60,11 @@ test in a separate process, making this safe and preventing tests from clobberin
 
 ### High-Level Module Organization
 
-**`logs/`** - Log file parsing:
+**`claude_logs/`** - Claude Code log parsing:
 
-- Deserializes Claude Code log files (JSON lines format) into typed structs using serde with tagged enums
+- Independent workspace crate for parsing Claude Code JSONL logs into strongly typed serde models
 - The `LogLine` enum represents different message types (User, Assistant, FileHistorySnapshot, Summary, System)
-- Used by `api_pricing` to analyze Claude Code conversation logs
+- Used by `moriarty`'s `api_pricing` module to analyze Claude Code conversation logs
 
 **`api_pricing/`** - API usage cost analysis:
 

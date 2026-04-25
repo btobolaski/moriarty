@@ -569,6 +569,159 @@ fn test_parse_queue_operation_dequeue() {
 }
 
 #[test]
+fn test_parse_file_history_snapshot() {
+    let json = serde_json::json!({
+        "type": "file-history-snapshot",
+        "messageId": "550e8400-e29b-41d4-a716-446655440010",
+        "snapshot": {
+            "messageId": "550e8400-e29b-41d4-a716-446655440010",
+            "trackedFileBackups": {
+                "src/main.rs": {"hash": "abc123"}
+            },
+            "timestamp": "2025-01-01T00:00:00Z"
+        },
+        "isSnapshotUpdate": false
+    });
+
+    let line: LogLine =
+        serde_json::from_value(json).expect("Failed to parse file-history-snapshot");
+
+    match line {
+        LogLine::FileHistorySnapshot(snapshot) => {
+            assert_eq!(
+                snapshot.message_id,
+                Uuid::parse_str("550e8400-e29b-41d4-a716-446655440010").unwrap()
+            );
+            assert!(!snapshot.is_snapshot_update);
+            assert!(snapshot
+                .snapshot
+                .tracked_file_backups
+                .contains_key("src/main.rs"));
+        }
+        _ => panic!("Expected FileHistorySnapshot variant"),
+    }
+}
+
+#[test]
+fn test_parse_file_history_snapshot_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "type": "file-history-snapshot",
+        "messageId": "550e8400-e29b-41d4-a716-446655440010",
+        "snapshot": {
+            "messageId": "550e8400-e29b-41d4-a716-446655440010",
+            "trackedFileBackups": {},
+            "timestamp": "2025-01-01T00:00:00Z"
+        },
+        "isSnapshotUpdate": false,
+        "unknownField": "should be rejected"
+    });
+
+    let err_msg = serde_json::from_value::<LogLine>(json)
+        .expect_err("Should reject unknown fields in file-history-snapshot")
+        .to_string();
+    assert!(
+        err_msg.contains("unknown field") || err_msg.contains("unknownField"),
+        "Error should mention unknown field, got: {}",
+        err_msg
+    );
+}
+
+#[test]
+fn test_parse_file_history_snapshot_with_update() {
+    let json = serde_json::json!({
+        "type": "file-history-snapshot",
+        "messageId": "550e8400-e29b-41d4-a716-446655440010",
+        "snapshot": {
+            "messageId": "550e8400-e29b-41d4-a716-446655440010",
+            "trackedFileBackups": {
+                "src/lib.rs": {"hash": "def456"}
+            },
+            "timestamp": "2025-01-01T00:00:00Z"
+        },
+        "isSnapshotUpdate": true
+    });
+
+    let line: LogLine =
+        serde_json::from_value(json).expect("Failed to parse updated file-history-snapshot");
+
+    match line {
+        LogLine::FileHistorySnapshot(snapshot) => {
+            assert!(snapshot.is_snapshot_update);
+            assert!(snapshot
+                .snapshot
+                .tracked_file_backups
+                .contains_key("src/lib.rs"));
+        }
+        _ => panic!("Expected FileHistorySnapshot variant"),
+    }
+}
+
+#[test]
+fn test_parse_file_history_snapshot_inner_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "type": "file-history-snapshot",
+        "messageId": "550e8400-e29b-41d4-a716-446655440010",
+        "snapshot": {
+            "messageId": "550e8400-e29b-41d4-a716-446655440010",
+            "trackedFileBackups": {},
+            "timestamp": "2025-01-01T00:00:00Z",
+            "unknownField": "should be rejected"
+        },
+        "isSnapshotUpdate": false
+    });
+
+    let err_msg = serde_json::from_value::<LogLine>(json)
+        .expect_err("Should reject unknown fields in file-history-snapshot snapshot")
+        .to_string();
+    assert!(
+        err_msg.contains("unknown field") || err_msg.contains("unknownField"),
+        "Error should mention unknown field, got: {}",
+        err_msg
+    );
+}
+
+#[test]
+fn test_parse_summary() {
+    let json = serde_json::json!({
+        "type": "summary",
+        "summary": "Condensed conversation summary",
+        "leafUuid": "550e8400-e29b-41d4-a716-446655440011"
+    });
+
+    let line: LogLine = serde_json::from_value(json).expect("Failed to parse summary");
+
+    match line {
+        LogLine::Summary(summary) => {
+            assert_eq!(summary.summary, "Condensed conversation summary");
+            assert_eq!(
+                summary.leaf_uuid,
+                Uuid::parse_str("550e8400-e29b-41d4-a716-446655440011").unwrap()
+            );
+        }
+        _ => panic!("Expected Summary variant"),
+    }
+}
+
+#[test]
+fn test_parse_summary_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "type": "summary",
+        "summary": "Condensed conversation summary",
+        "leafUuid": "550e8400-e29b-41d4-a716-446655440011",
+        "unknownField": "should be rejected"
+    });
+
+    let err_msg = serde_json::from_value::<LogLine>(json)
+        .expect_err("Should reject unknown fields in summary")
+        .to_string();
+    assert!(
+        err_msg.contains("unknown field") || err_msg.contains("unknownField"),
+        "Error should mention unknown field, got: {}",
+        err_msg
+    );
+}
+
+#[test]
 fn test_parse_assistant_with_web_fetch_and_context_management() {
     // Test new format with web_fetch_requests and context_management
     let json = serde_json::json!({
@@ -1136,6 +1289,203 @@ fn test_parse_turn_duration_rejects_unknown_fields() {
 
     let err_msg = serde_json::from_value::<LogLine>(json)
         .expect_err("Should reject unknown fields due to deny_unknown_fields")
+        .to_string();
+    assert!(
+        err_msg.contains("unknown field") || err_msg.contains("unknownField"),
+        "Error should mention unknown field, got: {}",
+        err_msg
+    );
+}
+
+#[test]
+fn test_parse_system_log_error() {
+    let json = serde_json::json!({
+        "type": "system",
+        "subtype": "error",
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "non-uuid-session-id",
+        "version": "2.0.42",
+        "gitBranch": "main",
+        "level": "error",
+        "cause": {"message": "upstream"},
+        "error": {"requestID": "req_abc123"},
+        "retryInMs": 1000.0,
+        "retryAttempt": 1,
+        "maxRetries": 3,
+        "timestamp": "2025-01-01T00:00:00Z",
+        "uuid": "550e8400-e29b-41d4-a716-446655440001"
+    });
+
+    let line: LogLine = serde_json::from_value(json).expect("Failed to parse system error");
+
+    match line {
+        LogLine::System(SystemLogLine::Error(error)) => {
+            assert_eq!(error.session_id, "non-uuid-session-id");
+            assert_eq!(error.retry_in_ms, 1000.0);
+            assert_eq!(error.retry_attempt, 1);
+            assert_eq!(error.max_retries, 3);
+            assert_eq!(error.error.request_id.as_deref(), Some("req_abc123"));
+            assert!(error.cause.is_some());
+        }
+        _ => panic!("Expected System(Error) variant"),
+    }
+}
+
+#[test]
+fn test_parse_system_log_api_error() {
+    let json = serde_json::json!({
+        "type": "system",
+        "subtype": "api_error",
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "non-uuid-session-id",
+        "version": "2.0.42",
+        "gitBranch": "main",
+        "level": "error",
+        "error": {"requestID": "req_api_123", "status": 429},
+        "retryInMs": 250.5,
+        "retryAttempt": 2,
+        "maxRetries": 5,
+        "timestamp": "2025-01-01T00:00:00Z",
+        "uuid": "550e8400-e29b-41d4-a716-446655440003"
+    });
+
+    let line: LogLine = serde_json::from_value(json).expect("Failed to parse api_error");
+
+    match line {
+        LogLine::System(SystemLogLine::ApiError(error)) => {
+            assert_eq!(error.session_id, "non-uuid-session-id");
+            assert_eq!(error.retry_in_ms, 250.5);
+            assert_eq!(error.retry_attempt, 2);
+            assert_eq!(error.max_retries, 5);
+            assert_eq!(error.error.request_id.as_deref(), Some("req_api_123"));
+            assert_eq!(error.error.status, Some(429));
+        }
+        _ => panic!("Expected System(ApiError) variant"),
+    }
+}
+
+#[test]
+fn test_parse_system_log_informational_without_git_branch() {
+    let json = serde_json::json!({
+        "type": "system",
+        "subtype": "informational",
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.0.0",
+        "content": "Session started",
+        "isMeta": false,
+        "level": "info",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "uuid": "550e8400-e29b-41d4-a716-446655440002"
+    });
+
+    let line: LogLine =
+        serde_json::from_value(json).expect("Failed to parse informational system message");
+
+    match line {
+        LogLine::System(SystemLogLine::Informational(info)) => {
+            assert_eq!(info.git_branch, None);
+            assert_eq!(info.content, "Session started");
+            assert!(!info.is_meta);
+        }
+        _ => panic!("Expected System(Informational) variant"),
+    }
+}
+
+#[test]
+fn test_parse_system_log_error_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "type": "system",
+        "subtype": "error",
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "non-uuid-session-id",
+        "version": "2.0.42",
+        "gitBranch": "main",
+        "level": "error",
+        "error": {"requestID": "req_abc123"},
+        "retryInMs": 1000.0,
+        "retryAttempt": 1,
+        "maxRetries": 3,
+        "timestamp": "2025-01-01T00:00:00Z",
+        "uuid": "550e8400-e29b-41d4-a716-446655440001",
+        "unknownField": "should be rejected"
+    });
+
+    let err_msg = serde_json::from_value::<LogLine>(json)
+        .expect_err("Should reject unknown fields in SystemLogError")
+        .to_string();
+    assert!(
+        err_msg.contains("unknown field") || err_msg.contains("unknownField"),
+        "Error should mention unknown field, got: {}",
+        err_msg
+    );
+}
+
+#[test]
+fn test_parse_system_log_api_error_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "type": "system",
+        "subtype": "api_error",
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "non-uuid-session-id",
+        "version": "2.0.42",
+        "gitBranch": "main",
+        "level": "error",
+        "error": {"requestID": "req_api_123", "status": 429},
+        "retryInMs": 250.5,
+        "retryAttempt": 2,
+        "maxRetries": 5,
+        "timestamp": "2025-01-01T00:00:00Z",
+        "uuid": "550e8400-e29b-41d4-a716-446655440003",
+        "unknownField": "should be rejected"
+    });
+
+    let err_msg = serde_json::from_value::<LogLine>(json)
+        .expect_err("Should reject unknown fields in SystemLogError api_error variant")
+        .to_string();
+    assert!(
+        err_msg.contains("unknown field") || err_msg.contains("unknownField"),
+        "Error should mention unknown field, got: {}",
+        err_msg
+    );
+}
+
+#[test]
+fn test_parse_system_log_informational_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "type": "system",
+        "subtype": "informational",
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.0.0",
+        "content": "Session started",
+        "isMeta": false,
+        "level": "info",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "unknownField": "should be rejected"
+    });
+
+    let err_msg = serde_json::from_value::<LogLine>(json)
+        .expect_err("Should reject unknown fields in SystemLogInformational")
         .to_string();
     assert!(
         err_msg.contains("unknown field") || err_msg.contains("unknownField"),
@@ -2177,6 +2527,156 @@ fn test_parse_nested_mcp_progress_in_agent() {
 }
 
 #[test]
+fn test_parse_compact_boundary() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "logicalParentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.0.0",
+        "gitBranch": "main",
+        "slug": "noble-floating-lemon",
+        "type": "system",
+        "subtype": "compact_boundary",
+        "content": "Compacted",
+        "isMeta": false,
+        "timestamp": "2025-01-01T00:00:00Z",
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "level": "info",
+        "compactMetadata": {
+            "trigger": "manual",
+            "preTokens": 100000
+        }
+    });
+
+    let line: LogLine =
+        serde_json::from_value(json).expect("Failed to parse compact_boundary system message");
+
+    match line {
+        LogLine::System(SystemLogLine::CompactBoundary(boundary)) => {
+            assert!(boundary.parent_uuid.is_none());
+            assert_eq!(
+                boundary.logical_parent_uuid,
+                Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap()
+            );
+            assert_eq!(boundary.content, "Compacted");
+            assert!(!boundary.is_meta);
+            assert_eq!(boundary.compact_metadata.trigger, "manual");
+            assert_eq!(boundary.compact_metadata.pre_tokens, 100000);
+            assert_eq!(boundary.slug.as_deref(), Some("noble-floating-lemon"));
+        }
+        _ => panic!("Expected System(CompactBoundary) variant"),
+    }
+}
+
+#[test]
+fn test_parse_compact_boundary_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "logicalParentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.0.0",
+        "gitBranch": "main",
+        "type": "system",
+        "subtype": "compact_boundary",
+        "content": "Compacted",
+        "isMeta": false,
+        "timestamp": "2025-01-01T00:00:00Z",
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "level": "info",
+        "compactMetadata": {
+            "trigger": "manual",
+            "preTokens": 100000
+        },
+        "extraField": "should be rejected"
+    });
+
+    let err_msg = serde_json::from_value::<LogLine>(json)
+        .expect_err("Should reject unknown fields in CompactBoundary")
+        .to_string();
+    assert!(
+        err_msg.contains("unknown field") || err_msg.contains("extraField"),
+        "Error should mention unknown field, got: {}",
+        err_msg
+    );
+}
+
+#[test]
+fn test_parse_compact_metadata_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "logicalParentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.0.0",
+        "gitBranch": "main",
+        "type": "system",
+        "subtype": "compact_boundary",
+        "content": "Compacted",
+        "isMeta": false,
+        "timestamp": "2025-01-01T00:00:00Z",
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "level": "info",
+        "compactMetadata": {
+            "trigger": "manual",
+            "preTokens": 100000,
+            "extraField": "should be rejected"
+        }
+    });
+
+    let err_msg = serde_json::from_value::<LogLine>(json)
+        .expect_err("Should reject unknown fields in CompactMetadata")
+        .to_string();
+    assert!(
+        err_msg.contains("unknown field") || err_msg.contains("extraField"),
+        "Error should mention unknown field, got: {}",
+        err_msg
+    );
+}
+
+#[test]
+fn test_parse_local_command() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.0.51",
+        "gitBranch": "main",
+        "slug": "bold-flying-eagle",
+        "type": "system",
+        "subtype": "local_command",
+        "content": "ls -la",
+        "level": "info",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "isMeta": false
+    });
+
+    let line: LogLine =
+        serde_json::from_value(json).expect("Failed to parse local_command system message");
+
+    match line {
+        LogLine::System(SystemLogLine::LocalCommand(command)) => {
+            assert!(command.parent_uuid.is_none());
+            assert_eq!(command.content, "ls -la");
+            assert_eq!(command.git_branch, "main");
+            assert_eq!(command.slug.as_deref(), Some("bold-flying-eagle"));
+            assert_eq!(command.entrypoint, None);
+        }
+        _ => panic!("Expected System(LocalCommand) variant"),
+    }
+}
+
+#[test]
 fn test_parse_microcompact_boundary() {
     let json = serde_json::json!({
         "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
@@ -2218,6 +2718,44 @@ fn test_parse_microcompact_boundary() {
                 .microcompact_metadata
                 .cleared_attachment_uuids
                 .is_empty());
+        }
+        _ => panic!("Expected System(MicrocompactBoundary) variant"),
+    }
+}
+
+#[test]
+fn test_parse_microcompact_boundary_with_entrypoint() {
+    let json = serde_json::json!({
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.104",
+        "gitBranch": "HEAD",
+        "type": "system",
+        "subtype": "microcompact_boundary",
+        "content": "Context microcompacted",
+        "isMeta": false,
+        "timestamp": "2026-01-18T23:44:09.153Z",
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "level": "info",
+        "entrypoint": "cli",
+        "microcompactMetadata": {
+            "trigger": "auto",
+            "preTokens": 58482,
+            "tokensSaved": 20010,
+            "compactedToolIds": [],
+            "clearedAttachmentUUIDs": []
+        }
+    });
+
+    let line: LogLine = serde_json::from_value(json)
+        .expect("Failed to parse microcompact_boundary with entrypoint");
+
+    match line {
+        LogLine::System(SystemLogLine::MicrocompactBoundary(boundary)) => {
+            assert_eq!(boundary.entrypoint.as_deref(), Some("cli"));
         }
         _ => panic!("Expected System(MicrocompactBoundary) variant"),
     }

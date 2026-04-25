@@ -572,11 +572,9 @@ pub enum HookError {
     Structured(HookErrorDetails),
 }
 
-// The accessors below are only exercised by `logs::parser::tests`; production
-// code matches the enum variants directly. Gate on `cfg(test)` to avoid the
-// `dead_code` warning in release builds rather than pretending a binary crate
-// has downstream consumers.
-#[cfg(test)]
+// Accessors that preserve a uniform interface across the legacy string-only and
+// structured hook error formats. Keep these available in normal builds so
+// downstream crates can inspect parsed hook errors without matching variants.
 impl HookError {
     pub fn message(&self) -> &str {
         match self {
@@ -651,28 +649,48 @@ pub struct SystemLogErrorError {
     pub cause: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[serde(deny_unknown_fields)]
-pub struct CompactBoundary {
-    pub parent_uuid: Option<Uuid>,
-    pub logical_parent_uuid: Uuid,
-    pub is_sidechain: bool,
-    pub user_type: String,
-    pub cwd: String,
-    pub session_id: Uuid,
-    pub version: String,
-    pub git_branch: String,
-    /// Session slug identifier (e.g., "noble-floating-lemon"). Added in Claude Code 2.0.51.
-    pub slug: Option<String>,
-    pub content: String,
-    pub is_meta: bool,
-    pub timestamp: DateTime<Utc>,
-    pub uuid: Uuid,
-    pub level: String,
-    pub compact_metadata: CompactMetadata,
-    /// Entry point that started the session (e.g., "cli"). Added in Claude Code 2.1.104+.
-    pub entrypoint: Option<String>,
+macro_rules! define_boundary_log {
+    (
+        $(#[$struct_meta:meta])*
+        $name:ident,
+        parent_uuid: $parent_uuid:ty,
+        $(logical_parent_uuid: $logical_parent_uuid:ty,)?
+        metadata: $metadata_field:ident => $metadata_ty:ty,
+        derives: [$($derive:tt)+]
+    ) => {
+        $(#[$struct_meta])*
+        #[derive($($derive)+)]
+        #[serde(rename_all = "camelCase")]
+        #[serde(deny_unknown_fields)]
+        pub struct $name {
+            pub parent_uuid: $parent_uuid,
+            $(pub logical_parent_uuid: $logical_parent_uuid,)?
+            pub is_sidechain: bool,
+            pub user_type: String,
+            pub cwd: String,
+            pub session_id: Uuid,
+            pub version: String,
+            pub git_branch: String,
+            /// Session slug identifier (e.g., "noble-floating-lemon"). Added in Claude Code 2.0.51.
+            pub slug: Option<String>,
+            pub content: String,
+            pub is_meta: bool,
+            pub timestamp: DateTime<Utc>,
+            pub uuid: Uuid,
+            pub level: String,
+            pub $metadata_field: $metadata_ty,
+            /// Entry point that started the session (e.g., "cli"). Added in Claude Code 2.1.104+.
+            pub entrypoint: Option<String>,
+        }
+    };
+}
+
+define_boundary_log! {
+    CompactBoundary,
+    parent_uuid: Option<Uuid>,
+    logical_parent_uuid: Uuid,
+    metadata: compact_metadata => CompactMetadata,
+    derives: [Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize]
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -705,29 +723,14 @@ pub struct CompactMetadata {
     pub pre_tokens: usize,
 }
 
-/// Microcompact boundary event from Claude Code 2.1.12+. Unlike full compaction, microcompaction
-/// selectively removes tool use content to reduce context size while preserving conversation flow.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[serde(deny_unknown_fields)]
-pub struct MicrocompactBoundary {
-    pub parent_uuid: Uuid,
-    pub is_sidechain: bool,
-    pub user_type: String,
-    pub cwd: String,
-    pub session_id: Uuid,
-    pub version: String,
-    pub git_branch: String,
-    /// Session slug identifier (e.g., "noble-floating-lemon"). Added in Claude Code 2.0.51.
-    pub slug: Option<String>,
-    pub content: String,
-    pub is_meta: bool,
-    pub timestamp: DateTime<Utc>,
-    pub uuid: Uuid,
-    pub level: String,
-    pub microcompact_metadata: MicrocompactMetadata,
-    /// Entry point that started the session (e.g., "cli"). Added in Claude Code 2.1.104+.
-    pub entrypoint: Option<String>,
+define_boundary_log! {
+    /// Microcompact boundary event from Claude Code 2.1.12+. Unlike full compaction,
+    /// microcompaction selectively removes tool use content to reduce context size while
+    /// preserving conversation flow.
+    MicrocompactBoundary,
+    parent_uuid: Uuid,
+    metadata: microcompact_metadata => MicrocompactMetadata,
+    derives: [Debug, Clone, PartialEq, Eq, Serialize, Deserialize]
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
