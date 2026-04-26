@@ -1,21 +1,20 @@
 [package]
-name = "pi_logs"
+name = "cost_analyzer"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
+async-walkdir = "2.1.0"
 chrono = { workspace = true }
-clap = { workspace = true }
+futures = { workspace = true }
 miette = { workspace = true }
+pi_logs = { path = "../pi_logs" }
 rust_decimal = { workspace = true, features = ["serde-with-str"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
-thiserror = "2.0"
-uuid = { workspace = true }
-walkdir = "2.5"
-
-[[bin]]
-name = "parse_pi_sessions"
-path = "src/bin/parse_pi_sessions.rs"
+tokio = { workspace = true }
+tokio-stream = "0.1.18"
+tracing = { workspace = true }
 
 [dev-dependencies]
+tempfile = "3"
