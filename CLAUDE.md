@@ -68,12 +68,10 @@ test in a separate process, making this safe and preventing tests from clobberin
 
 **`api_pricing/`** - API usage cost analysis:
 
-- Two-pass architecture: aggregates token usage into daily/conversation buckets (by timezone), then calculates costs
-- Per-model aggregation uses shared `ModelUsageMap` / `ModelCostsMap` containers instead of repeating named fields
-  across daily/session structs
-- Two-level deduplication for streaming responses and forked conversations
-- Handles unknown models gracefully by tracking them separately
-- Line counter tracks code changes from file history snapshots
+- Aggregates pre-priced `LlmCost` values from `cost_analyzer` into daily buckets (keyed by timezone-adjusted date) or
+  per-conversation buckets (keyed by session ID)
+- Per-model aggregation uses `ModelCostsMap` to accumulate already-priced cost components into model-family buckets
+- Unknown Claude models surface as stderr tracing errors via `cost_analyzer`; they are not rendered in the report
 - Entry point: `api-pricing` subcommand in `main.rs`
 
 **`pi_logs/`** - Pi session log parsing:
@@ -84,11 +82,18 @@ test in a separate process, making this safe and preventing tests from clobberin
 
 **`cost_analyzer/`** - Generic cost-analysis library:
 
-- Workspace crate for recursively scanning JSONL directories, parsing logs in parallel, and deduplicating billable model responses
-- Core abstractions: `AnalyzableLog` for pluggable log formats, `LlmCost` for input/cache/output cost breakdowns, `LineWithCost` for normalized billable entries, and `AnalysisResult` for returning those deduplicated lines alongside a partial-failure flag
-- Concrete implementations currently support `pi_logs::PiLogLine` and `claude_logs::LogLine`. Claude log costs are calculated in `cost_analyzer` with local Decimal-based Claude pricing helpers rather than by depending on `moriarty::api_pricing` internals.
-- Intended direction: replace much of `moriarty::api_pricing::analyzer` with this reusable library over time, while keeping the existing Claude-specific reporting pipeline in place until that migration is complete
-- Deduplication keeps the highest-cost duplicate for a `(ModelId, LogId)` pair and breaks equal-cost ties by keeping the earliest timestamped entry
+- Workspace crate for recursively scanning JSONL directories, parsing logs in parallel, and deduplicating billable model
+  responses
+- Core abstractions: `AnalyzableLog` for pluggable log formats, `LlmCost` for input/cache/output cost breakdowns,
+  `LineWithCost` for normalized billable entries, and `AnalysisResult` for returning those deduplicated lines alongside
+  a partial-failure flag
+- Concrete implementations currently support `pi_logs::PiLogLine` and `claude_logs::LogLine`. Claude log costs are
+  calculated in `cost_analyzer` with local Decimal-based Claude pricing helpers rather than by depending on
+  `moriarty::api_pricing` internals.
+- `moriarty::api_pricing` delegates all log loading, deduplication, and pricing to this crate; it only aggregates the
+  returned `LlmCost` values into report buckets
+- Deduplication keeps the highest-cost duplicate for a `(ModelId, LogId)` pair and breaks equal-cost ties by keeping the
+  earliest timestamped entry
 - Public entry point: `cost_analyzer::analyze_directory(path)`
 
 **`tui/`** - Terminal UI event infrastructure:
@@ -207,6 +212,28 @@ helpers needed in more than one module belong here rather than being duplicated.
 
 **Logging**: Structured logging via tracing to `~/.local/state/moriarty/logs/` (auto-rotated). Sensitive env vars
 (TOKEN, SECRET, KEY, PASSWORD) are redacted.
+
+### Doc Comments
+
+Doc comments (`///`) and inline comments (`//`) on Rust items must explain WHY, not WHAT. The function name, signature,
+and body already say what the code does; comments should add information that is not visible from the code itself.
+
+**Delete** doc comments that:
+
+- Restate the function name (e.g. `/// Format duration in a readable way` on `fn format_duration`).
+- Narrate the body line-by-line (e.g. `/// Appends one row per non-zero-cost model in display order` on a function that
+  does exactly that and nothing else).
+- Re-describe parameter names (e.g. `/// `grand_total` is the footer total.` on a parameter named `grand_total`).
+
+**Keep or write** doc comments that:
+
+- Explain a non-obvious choice or trade-off (e.g. why an enum arm must come before another to avoid misclassification).
+- Document an invariant a caller must uphold (e.g. that two parameters are produced together and the indices are only
+  valid against the matching vector).
+- Capture context that is not obvious from the surrounding code (e.g. why a sentinel timestamp is safe because the
+  variant is never billable).
+
+Applies to source files only. CLAUDE.md and other docs use ordinary prose.
 
 ### Error Handling
 

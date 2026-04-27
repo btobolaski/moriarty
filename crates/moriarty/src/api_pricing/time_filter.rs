@@ -60,14 +60,12 @@ impl TimeRangeFilter {
     }
 }
 
-/// Try parsing as ISO 8601 with timezone (RFC 3339).
 fn try_parse_rfc3339(s: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(s)
         .ok()
         .map(|dt| dt.with_timezone(&Utc))
 }
 
-/// Try parsing as a naive datetime without timezone (assume UTC).
 fn try_parse_naive_datetime(s: &str) -> Option<DateTime<Utc>> {
     NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S")
         .ok()
@@ -167,17 +165,25 @@ mod tests {
 
     #[test]
     fn test_time_range_filter_contains() {
+        // One assertion per side of each boundary plus one mid-range datapoint;
+        // covers the inclusive-start / exclusive-end contract that the rest of
+        // the pipeline depends on.
         let filter = TimeRangeFilter {
             start: Some(parse_datetime_for_start("2025-01-01T00:00:00Z").unwrap()),
-            end: Some(parse_datetime_for_start("2025-02-01T00:00:00Z").unwrap()), // Exclusive end
+            end: Some(parse_datetime_for_start("2025-02-01T00:00:00Z").unwrap()),
         };
 
-        // Inside range
-        assert!(filter.contains(&parse_datetime_for_start("2025-01-15T12:00:00Z").unwrap()));
-        // Before start
+        // Start boundary is inclusive.
+        assert!(filter.contains(&parse_datetime_for_start("2025-01-01T00:00:00Z").unwrap()));
+        // One second before start: rejected.
         assert!(!filter.contains(&parse_datetime_for_start("2024-12-31T23:59:59Z").unwrap()));
-        // At or after end (exclusive)
+        // Mid-range: included.
+        assert!(filter.contains(&parse_datetime_for_start("2025-01-15T12:00:00Z").unwrap()));
+        // One second before the exclusive end: included.
+        assert!(filter.contains(&parse_datetime_for_start("2025-01-31T23:59:59Z").unwrap()));
+        // End boundary is exclusive.
         assert!(!filter.contains(&parse_datetime_for_start("2025-02-01T00:00:00Z").unwrap()));
+        // After end: rejected.
         assert!(!filter.contains(&parse_datetime_for_start("2025-02-01T00:00:01Z").unwrap()));
     }
 
@@ -220,31 +226,21 @@ mod tests {
         assert!(filter.contains(&parse_datetime_for_start("2030-01-01T00:00:00Z").unwrap()));
     }
 
-    #[test]
-    fn test_time_range_filter_boundary_conditions() {
-        let filter = TimeRangeFilter {
-            start: Some(parse_datetime_for_start("2025-01-01T00:00:00Z").unwrap()),
-            end: Some(parse_datetime_for_start("2025-02-01T00:00:00Z").unwrap()), // Exclusive end
-        };
-
-        // Start boundary is inclusive
-        assert!(filter.contains(&parse_datetime_for_start("2025-01-01T00:00:00Z").unwrap()));
-        // One microsecond before start
-        assert!(!filter.contains(&parse_datetime_for_start("2024-12-31T23:59:59Z").unwrap()));
-        // Just before end (should be included)
-        assert!(filter.contains(&parse_datetime_for_start("2025-01-31T23:59:59Z").unwrap()));
-        // At end boundary (exclusive, should NOT be included)
-        assert!(!filter.contains(&parse_datetime_for_start("2025-02-01T00:00:00Z").unwrap()));
+    /// Filter for the calendar month 2025-01: `--start-time 2025-01-01` and
+    /// `--end-time 2025-01-31` (date-only end is expanded to next-day 00:00).
+    fn valid_jan_2025_filter() -> TimeRangeFilter {
+        TimeRangeFilter::new(
+            Some("2025-01-01".to_string()),
+            Some("2025-01-31".to_string()),
+        )
+        .unwrap()
     }
 
     #[test]
     fn test_date_only_end_includes_entire_day() {
-        // Test that --end-time "2025-01-31" includes all of Jan 31
-        let filter = TimeRangeFilter::new(
-            Some("2025-01-01".to_string()),
-            Some("2025-01-31".to_string()),
-        )
-        .unwrap();
+        // Verifies the date-only end-time expansion: `--end-time 2025-01-31`
+        // must keep all of Jan 31 (not stop at 2025-01-31T00:00:00Z).
+        let filter = valid_jan_2025_filter();
 
         // Should include messages throughout Jan 31
         assert!(filter.contains(&parse_datetime_for_start("2025-01-31T00:00:00Z").unwrap()));
@@ -277,11 +273,7 @@ mod tests {
 
     #[test]
     fn test_time_range_filter_new_valid() {
-        let filter = TimeRangeFilter::new(
-            Some("2025-01-01".to_string()),
-            Some("2025-01-31".to_string()),
-        )
-        .unwrap();
+        let filter = valid_jan_2025_filter();
 
         assert!(filter.start.is_some());
         assert!(filter.end.is_some());

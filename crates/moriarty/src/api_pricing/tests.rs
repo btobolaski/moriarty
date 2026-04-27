@@ -1,28 +1,27 @@
+use chrono::{NaiveDate, TimeZone, Utc};
+
 use super::*;
 use crate::api_pricing::{
-    analyzer::{AnalysisResult, DailyCosts},
-    pricing::{ModelCostsMap, ModelType, TokenCosts, TokenCounts},
+    analyzer::{DailyCosts, SessionCosts},
+    pricing::{ModelCostsMap, ModelType, TokenCosts},
 };
-use chrono::NaiveDate;
-use std::collections::HashSet;
-
-/// Builder helper for creating DailyCosts with defaults
-fn make_daily_costs(date: NaiveDate) -> DailyCosts {
-    DailyCosts {
-        date,
-        per_model: ModelCostsMap::default(),
-        lines_changed: 0,
-    }
-}
 
 /// Short date constructor used throughout the display tests.
 fn test_date(year: i32, month: u32, day: u32) -> NaiveDate {
     NaiveDate::from_ymd_opt(year, month, day).unwrap()
 }
 
-/// Builder helper for creating DailyCosts with defaults for a specific date.
+/// Build a `DailyCosts` with the given date and an empty cost map.
+///
+/// The builder helpers below add per-model costs through `ModelCostsMap::add`.
+/// Because each builder targets a distinct `ModelType` bucket and the map
+/// starts empty, `add` is equivalent to a wholesale set in this context
+/// while keeping the production aggregation path the only public API.
 fn costs_on(year: i32, month: u32, day: u32) -> DailyCosts {
-    make_daily_costs(test_date(year, month, day))
+    DailyCosts {
+        date: test_date(year, month, day),
+        per_model: ModelCostsMap::default(),
+    }
 }
 
 trait DailyCostsExt {
@@ -30,127 +29,100 @@ trait DailyCostsExt {
     fn with_haiku(self, input: f64, output: f64, cache_write: f64, cache_read: f64) -> Self;
     fn with_opus(self, input: f64, output: f64, cache_write: f64, cache_read: f64) -> Self;
     fn with_opus4(self, input: f64, output: f64, cache_write: f64, cache_read: f64) -> Self;
-    fn with_lines(self, lines: usize) -> Self;
 }
 
 impl DailyCostsExt for DailyCosts {
     fn with_sonnet(mut self, input: f64, output: f64, cache_write: f64, cache_read: f64) -> Self {
-        self.per_model.set(
+        self.per_model.add(
             ModelType::Sonnet,
-            TokenCosts {
-                input,
-                output,
-                cache_write,
-                cache_read,
-            },
+            TokenCosts::new(input, output, cache_write, cache_read),
         );
         self
     }
     fn with_haiku(mut self, input: f64, output: f64, cache_write: f64, cache_read: f64) -> Self {
-        self.per_model.set(
+        self.per_model.add(
             ModelType::Haiku,
-            TokenCosts {
-                input,
-                output,
-                cache_write,
-                cache_read,
-            },
+            TokenCosts::new(input, output, cache_write, cache_read),
         );
         self
     }
     fn with_opus(mut self, input: f64, output: f64, cache_write: f64, cache_read: f64) -> Self {
-        self.per_model.set(
+        self.per_model.add(
             ModelType::Opus,
-            TokenCosts {
-                input,
-                output,
-                cache_write,
-                cache_read,
-            },
+            TokenCosts::new(input, output, cache_write, cache_read),
         );
         self
     }
     fn with_opus4(mut self, input: f64, output: f64, cache_write: f64, cache_read: f64) -> Self {
-        self.per_model.set(
+        self.per_model.add(
             ModelType::Opus4,
-            TokenCosts {
-                input,
-                output,
-                cache_write,
-                cache_read,
-            },
+            TokenCosts::new(input, output, cache_write, cache_read),
         );
         self
     }
-    fn with_lines(mut self, lines: usize) -> Self {
-        self.lines_changed = lines;
-        self
-    }
 }
 
-#[test]
-fn test_display_analysis_summary_variants() {
-    for result in [
-        AnalysisResult {
-            daily_costs: vec![],
-            unknown_models: HashSet::new(),
-            total_unknown_tokens: TokenCounts::default(),
-            files_parsed: 5,
-            files_failed: 0,
-        },
-        AnalysisResult {
-            daily_costs: vec![],
-            unknown_models: HashSet::new(),
-            total_unknown_tokens: TokenCounts::default(),
-            files_parsed: 3,
-            files_failed: 2,
-        },
-    ] {
-        display_parsing_summary(result.files_parsed, result.files_failed);
-    }
-}
-
-#[test]
-fn test_display_costs_smoke_variants() {
-    let mut thirty_two_days: Vec<_> = (1..=31)
-        .map(|day| {
-            costs_on(2025, 1, day)
-                .with_sonnet(1.0, 1.0, 0.0, 0.0)
-                .with_lines(10)
-        })
-        .collect();
-    thirty_two_days.push(
-        costs_on(2025, 2, 1)
-            .with_sonnet(1.0, 1.0, 0.0, 0.0)
-            .with_lines(10),
+/// Assert the four currency columns and the subtotal of a row match the
+/// expected token-cost components.
+///
+/// Takes the embedded `FormattedCostColumns` substruct shared by both `CostRow`
+/// and `SessionCostRow`, so parallel daily/session formatting tests can
+/// collapse to a single helper call instead of repeating five `assert_eq!`
+/// lines apiece.
+fn assert_money_columns(money: &FormattedCostColumns, components: (f64, f64, f64, f64)) {
+    let (e_input, e_output, e_cache_write, e_cache_read) = components;
+    assert_eq!(money.input, fmt_money(e_input), "input column");
+    assert_eq!(money.output, fmt_money(e_output), "output column");
+    assert_eq!(
+        money.cache_write,
+        fmt_money(e_cache_write),
+        "cache_write column"
     );
+    assert_eq!(
+        money.cache_read,
+        fmt_money(e_cache_read),
+        "cache_read column"
+    );
+    let subtotal_total = e_input + e_output + e_cache_write + e_cache_read;
+    assert_eq!(money.subtotal, fmt_money(subtotal_total), "subtotal column");
+}
+
+/// Assert that the four token-cost component columns are blank, as on the
+/// trailing `Total` row in both the daily and session cost tables. The
+/// `subtotal` column is intentionally NOT checked here — callers assert it
+/// directly because it carries the row's only meaningful value.
+fn assert_blank_money_component_columns(money: &FormattedCostColumns) {
+    assert_eq!(money.input, "", "input column");
+    assert_eq!(money.output, "", "output column");
+    assert_eq!(money.cache_write, "", "cache_write column");
+    assert_eq!(money.cache_read, "", "cache_read column");
+}
+
+#[test]
+fn display_costs_smoke_variants() {
+    // Builds a 32-day fixture in two months to exercise the BTreeMap-driven
+    // separator handling on a span larger than any single month.
+    let mut thirty_two_days: Vec<_> = (1..=31)
+        .map(|day| costs_on(2025, 1, day).with_sonnet(1.0, 1.0, 0.0, 0.0))
+        .collect();
+    thirty_two_days.push(costs_on(2025, 2, 1).with_sonnet(1.0, 1.0, 0.0, 0.0));
 
     let cases = vec![
         ("empty", vec![]),
         (
             "two-day mixed models",
             vec![
-                costs_on(2025, 10, 23)
-                    .with_sonnet(1.0, 2.0, 0.5, 0.25)
-                    .with_lines(145),
-                costs_on(2025, 10, 24)
-                    .with_haiku(0.5, 1.0, 0.25, 0.1)
-                    .with_lines(50),
+                costs_on(2025, 10, 23).with_sonnet(1.0, 2.0, 0.5, 0.25),
+                costs_on(2025, 10, 24).with_haiku(0.5, 1.0, 0.25, 0.1),
             ],
         ),
-        // 3 days => num_separators = 2 branch in display_costs.
+        // Three days exercises the separator-between-groups branch.
         (
             "three days",
             vec![
-                costs_on(2025, 10, 23)
-                    .with_sonnet(1.0, 1.0, 0.0, 0.0)
-                    .with_lines(100),
-                costs_on(2025, 10, 24)
-                    .with_haiku(0.5, 0.5, 0.0, 0.0)
-                    .with_lines(50),
-                costs_on(2025, 10, 25)
-                    .with_opus(2.0, 2.0, 0.0, 0.0)
-                    .with_lines(75),
+                costs_on(2025, 10, 23).with_sonnet(1.0, 1.0, 0.0, 0.0),
+                costs_on(2025, 10, 24).with_haiku(0.5, 0.5, 0.0, 0.0),
+                costs_on(2025, 10, 25).with_opus(2.0, 2.0, 0.0, 0.0),
             ],
         ),
         (
@@ -159,36 +131,22 @@ fn test_display_costs_smoke_variants() {
                 costs_on(2025, 10, 23)
                     .with_opus(1.0, 1.0, 0.0, 0.0)
                     .with_sonnet(2.0, 2.0, 0.0, 0.0)
-                    .with_haiku(0.5, 0.5, 0.0, 0.0)
-                    .with_lines(100),
-                costs_on(2025, 10, 24)
-                    .with_sonnet(1.0, 1.0, 0.0, 0.0)
-                    .with_lines(50),
+                    .with_haiku(0.5, 0.5, 0.0, 0.0),
+                costs_on(2025, 10, 24).with_sonnet(1.0, 1.0, 0.0, 0.0),
             ],
         ),
-        // 10 days => num_separators = 9 branch near the end of the explicit match arms.
         (
             "ten days",
             (1..=10)
-                .map(|day| {
-                    costs_on(2025, 10, day)
-                        .with_sonnet(1.0, 1.0, 0.0, 0.0)
-                        .with_lines(10)
-                })
+                .map(|day| costs_on(2025, 10, day).with_sonnet(1.0, 1.0, 0.0, 0.0))
                 .collect(),
         ),
-        // 31 days => the last explicit match branch.
         (
             "thirty-one days",
             (1..=31)
-                .map(|day| {
-                    costs_on(2025, 10, day)
-                        .with_sonnet(1.0, 1.0, 0.0, 0.0)
-                        .with_lines(10)
-                })
+                .map(|day| costs_on(2025, 10, day).with_sonnet(1.0, 1.0, 0.0, 0.0))
                 .collect(),
         ),
-        // 32 days => fallback branch for values above the explicit match table.
         ("thirty-two days", thirty_two_days),
     ];
 
@@ -201,13 +159,11 @@ fn test_display_costs_smoke_variants() {
 }
 
 #[test]
-fn test_display_costs_single_day_variants() {
+fn display_costs_single_day_variants() {
     let cases = [
         (
             "sonnet-only",
-            costs_on(2025, 10, 23)
-                .with_sonnet(1.0, 2.0, 0.5, 0.25)
-                .with_lines(145),
+            costs_on(2025, 10, 23).with_sonnet(1.0, 2.0, 0.5, 0.25),
         ),
         (
             "opus-only",
@@ -230,111 +186,48 @@ fn test_display_costs_single_day_variants() {
 }
 
 #[test]
-fn test_display_warnings_no_unknown_models() {
-    display_unknown_model_warnings(&HashSet::new(), &TokenCounts::default());
+fn cost_row_formats_currency_columns() {
+    let row = CostRow::new("2025-10-23", "Sonnet", (1.2345, 2.3456, 0.5, 0.25));
+
+    assert_eq!(row.date, "2025-10-23");
+    assert_eq!(row.model, "Sonnet");
+    assert_money_columns(&row.money, (1.2345, 2.3456, 0.5, 0.25));
 }
 
 #[test]
-fn test_display_warnings_with_unknown_models() {
-    let mut unknown_models = HashSet::new();
-    unknown_models.insert("gpt-4".to_string());
-    unknown_models.insert("gemini-pro".to_string());
+fn cost_row_zero_values_format_as_zero_currency() {
+    let row = CostRow::new("", "Haiku", (0.0, 0.0, 0.0, 0.0));
 
-    let total_unknown_tokens = TokenCounts::new(1000, 500, 100, 50);
-
-    display_unknown_model_warnings(&unknown_models, &total_unknown_tokens);
+    assert_eq!(row.money.input, "$0.0000");
+    assert_eq!(row.money.subtotal, "$0.0000");
 }
 
 #[test]
-fn test_cost_row_variants() {
-    let cases = [
-        (
-            "formats mixed costs",
-            CostRow::new("2025-10-23", "Sonnet", 1.2345, 2.3456, 0.5, 0.25, "100"),
-            (
-                "2025-10-23",
-                "Sonnet",
-                "$1.2345",
-                "$2.3456",
-                "$0.5000",
-                "$0.2500",
-                "$4.3301",
-                "100",
-            ),
-        ),
-        (
-            "formats subtotal without lines",
-            CostRow::new("2025-10-23", "Test", 1.0, 2.0, 0.5, 0.25, ""),
-            (
-                "2025-10-23",
-                "Test",
-                "$1.0000",
-                "$2.0000",
-                "$0.5000",
-                "$0.2500",
-                "$3.7500",
-                "",
-            ),
-        ),
-        (
-            "formats zero row",
-            CostRow::new("", "Haiku", 0.0, 0.0, 0.0, 0.0, ""),
-            (
-                "", "Haiku", "$0.0000", "$0.0000", "$0.0000", "$0.0000", "$0.0000", "",
-            ),
-        ),
-    ];
-
-    for (label, row, expected) in cases {
-        assert_eq!(
-            (
-                row.date.as_str(),
-                row.model.as_str(),
-                row.input.as_str(),
-                row.output.as_str(),
-                row.cache_write.as_str(),
-                row.cache_read.as_str(),
-                row.subtotal.as_str(),
-                row.lines.as_str(),
-            ),
-            expected,
-            "case {label}",
-        );
-    }
-}
-
-#[test]
-fn test_cost_row_new_total_row_formats_correctly() {
-    let row = CostRow::new_total_row(1234, 56.789);
+fn cost_row_total_row_uses_blank_component_columns() {
+    let row = CostRow::new_total_row(56.789);
 
     assert_eq!(row.date, "");
     assert_eq!(row.model, "Total");
-    assert_eq!(row.input, "");
-    assert_eq!(row.output, "");
-    assert_eq!(row.cache_write, "");
-    assert_eq!(row.cache_read, "");
-    assert_eq!(row.subtotal, "$56.7890");
-    assert_eq!(row.lines, "1234");
+    assert_blank_money_component_columns(&row.money);
+    assert_eq!(row.money.subtotal, "$56.7890");
 }
 
 #[test]
-fn test_cost_row_new_total_row_variants() {
+fn cost_row_total_row_variants() {
     let cases = [
-        ("zero", 0, 0.0, "$0.0000", "0"),
-        ("large-values", 999999, 12345.6789, "$12345.6789", "999999"),
+        ("zero", 0.0, "$0.0000"),
+        ("large value", 12_345.6789, "$12345.6789"),
     ];
 
-    for (label, lines, total, expected_subtotal, expected_lines) in cases {
-        let row = CostRow::new_total_row(lines, total);
-        assert_eq!(row.date, "", "case {label}");
+    for (label, total, expected_subtotal) in cases {
+        let row = CostRow::new_total_row(total);
         assert_eq!(row.model, "Total", "case {label}");
-        assert_eq!(row.subtotal, expected_subtotal, "case {label}");
-        assert_eq!(row.lines, expected_lines, "case {label}");
+        assert_eq!(row.money.subtotal, expected_subtotal, "case {label}");
     }
 }
 
 #[test]
-fn test_divider_generates_correct_length() {
+fn divider_generates_correct_length() {
     assert_eq!(divider(0), "");
     assert_eq!(divider(1), "=");
     assert_eq!(divider(5), "=====");
@@ -342,53 +235,40 @@ fn test_divider_generates_correct_length() {
 }
 
 #[test]
-fn test_grand_total_row_new_formats_currency() {
-    let row = GrandTotalRow::new(143.7082, 13010);
+fn grand_total_row_formats_currency() {
+    let row = GrandTotalRow::new(143.7082);
 
     assert_eq!(row.grand_total, "$143.7082");
-    assert_eq!(row.total_lines_changed, "13010");
 }
 
 #[test]
-fn test_grand_total_row_new_variants() {
+fn grand_total_row_variants() {
     let cases = [
-        ("zero", 0.0, 0, "$0.0000", "0"),
-        ("large-values", 99999.9999, 999999, "$99999.9999", "999999"),
+        ("zero", 0.0, "$0.0000"),
+        ("large value", 99_999.9999, "$99999.9999"),
     ];
 
-    for (label, grand_total, total_lines, expected_total, expected_lines) in cases {
-        let row = GrandTotalRow::new(grand_total, total_lines);
-        assert_eq!(row.grand_total, expected_total, "case {label}");
-        assert_eq!(row.total_lines_changed, expected_lines, "case {label}");
+    for (label, grand_total, expected) in cases {
+        let row = GrandTotalRow::new(grand_total);
+        assert_eq!(row.grand_total, expected, "case {label}");
     }
 }
 
-// Smoke tests for display_grand_total - verify the function doesn't panic
-// with various input values. These tests don't assert on output format since
-// that would require capturing stdout or refactoring the function signature.
-
+// Smoke tests for `display_grand_total`: the function writes to stdout, so we
+// only verify that it does not panic across a representative range of inputs.
 #[test]
-fn test_display_grand_total_variants() {
-    for (grand_total, total_lines) in [
-        (0.0, 0),
-        (143.7082, 13010),
-        (12345.6789, 999999),
-        (0.0001, 1),
-    ] {
-        display_grand_total(grand_total, total_lines);
+fn display_grand_total_smoke_variants() {
+    for grand_total in [0.0, 143.7082, 12_345.6789, 0.0001] {
+        display_grand_total(grand_total);
     }
 }
 
-// Unit tests for helper functions extracted during refactoring
-
 #[test]
-fn test_build_cost_rows_variants() {
-    let cases = vec![
+fn build_cost_rows_variants() {
+    let cases: Vec<(_, Vec<DailyCosts>, Vec<usize>, Vec<(&str, &str)>)> = vec![
         (
             "single-model day",
-            vec![costs_on(2025, 10, 23)
-                .with_sonnet(1.0, 2.0, 0.0, 0.0)
-                .with_lines(100)],
+            vec![costs_on(2025, 10, 23).with_sonnet(1.0, 2.0, 0.0, 0.0)],
             vec![1],
             vec![("2025-10-23", "Sonnet"), ("", "Total")],
         ),
@@ -397,8 +277,7 @@ fn test_build_cost_rows_variants() {
             vec![costs_on(2025, 10, 23)
                 .with_opus(1.0, 1.0, 0.0, 0.0)
                 .with_sonnet(2.0, 2.0, 0.0, 0.0)
-                .with_haiku(0.5, 0.5, 0.0, 0.0)
-                .with_lines(200)],
+                .with_haiku(0.5, 0.5, 0.0, 0.0)],
             vec![3],
             vec![
                 ("2025-10-23", "Opus"),
@@ -407,6 +286,8 @@ fn test_build_cost_rows_variants() {
                 ("", "Total"),
             ],
         ),
+        // A day with no nonzero per-model entries still emits one Total row
+        // so the report shows a $0.0000 footer rather than dropping the day.
         (
             "zero-cost day still gets total row",
             vec![costs_on(2025, 10, 23)],
@@ -416,12 +297,8 @@ fn test_build_cost_rows_variants() {
         (
             "multiple days",
             vec![
-                costs_on(2025, 10, 23)
-                    .with_sonnet(1.0, 1.0, 0.0, 0.0)
-                    .with_lines(50),
-                costs_on(2025, 10, 24)
-                    .with_haiku(0.5, 0.5, 0.0, 0.0)
-                    .with_lines(25),
+                costs_on(2025, 10, 23).with_sonnet(1.0, 1.0, 0.0, 0.0),
+                costs_on(2025, 10, 24).with_haiku(0.5, 0.5, 0.0, 0.0),
             ],
             vec![1, 3],
             vec![
@@ -432,24 +309,6 @@ fn test_build_cost_rows_variants() {
             ],
         ),
         ("empty", vec![], vec![], vec![]),
-        (
-            "opus-haiku day",
-            vec![costs_on(2025, 10, 23)
-                .with_opus(1.0, 1.0, 0.0, 0.0)
-                .with_haiku(0.5, 0.5, 0.0, 0.0)
-                .with_lines(100)],
-            vec![2],
-            vec![("2025-10-23", "Opus"), ("", "Haiku"), ("", "Total")],
-        ),
-        (
-            "sonnet-haiku day",
-            vec![costs_on(2025, 10, 23)
-                .with_sonnet(1.0, 1.0, 0.0, 0.0)
-                .with_haiku(0.5, 0.5, 0.0, 0.0)
-                .with_lines(100)],
-            vec![2],
-            vec![("2025-10-23", "Sonnet"), ("", "Haiku"), ("", "Total")],
-        ),
     ];
 
     for (label, daily_costs, expected_total_row_indices, expected_rows) in cases {
@@ -468,66 +327,73 @@ fn test_build_cost_rows_variants() {
 }
 
 #[test]
-fn test_create_grouped_table_variants() {
+fn create_grouped_table_variants() {
+    struct Case {
+        label: &'static str,
+        rows: Vec<CostRow>,
+        total_row_indices: Vec<usize>,
+        expected_substrings: Vec<&'static str>,
+        expect_separator: bool,
+    }
+
     let cases = vec![
-        (
-            "single group",
-            vec![
-                CostRow::new("2025-10-23", "Sonnet", 1.0, 1.0, 0.0, 0.0, ""),
-                CostRow::new_total_row(100, 2.0),
+        Case {
+            label: "single group",
+            rows: vec![
+                CostRow::new("2025-10-23", "Sonnet", (1.0, 1.0, 0.0, 0.0)),
+                CostRow::new_total_row(2.0),
             ],
-            vec![1],
-            vec!["Sonnet", "Total"],
-            false,
-        ),
-        (
-            "multiple groups with separator",
-            vec![
-                CostRow::new("2025-10-23", "Sonnet", 1.0, 1.0, 0.0, 0.0, ""),
-                CostRow::new_total_row(100, 2.0),
-                CostRow::new("2025-10-24", "Haiku", 0.5, 0.5, 0.0, 0.0, ""),
-                CostRow::new_total_row(50, 1.0),
+            total_row_indices: vec![1],
+            expected_substrings: vec!["Sonnet", "Total"],
+            expect_separator: false,
+        },
+        Case {
+            label: "multiple groups with separator",
+            rows: vec![
+                CostRow::new("2025-10-23", "Sonnet", (1.0, 1.0, 0.0, 0.0)),
+                CostRow::new_total_row(2.0),
+                CostRow::new("2025-10-24", "Haiku", (0.5, 0.5, 0.0, 0.0)),
+                CostRow::new_total_row(1.0),
             ],
-            vec![1, 3],
-            vec!["2025-10-23", "2025-10-24", "Sonnet", "Haiku"],
-            true,
-        ),
-        ("empty", vec![], vec![], vec![], false),
+            total_row_indices: vec![1, 3],
+            expected_substrings: vec!["2025-10-23", "2025-10-24", "Sonnet", "Haiku"],
+            expect_separator: true,
+        },
+        Case {
+            label: "empty",
+            rows: vec![],
+            total_row_indices: vec![],
+            expected_substrings: vec![],
+            expect_separator: false,
+        },
     ];
 
-    for (label, rows, total_row_indices, expected_substrings, expect_separator) in cases {
-        let output = create_grouped_table(&rows, &total_row_indices).to_string();
-        assert!(!output.is_empty(), "case {label}");
-        for expected in expected_substrings {
+    for case in cases {
+        let output = create_grouped_table(&case.rows, &case.total_row_indices).to_string();
+        assert!(!output.is_empty(), "case {}", case.label);
+        for expected in case.expected_substrings {
             assert!(
                 output.contains(expected),
-                "case {label}: missing {expected:?} in {output}"
+                "case {}: missing {expected:?} in {output}",
+                case.label
             );
         }
-        if expect_separator {
+        if case.expect_separator {
             assert!(
                 output.lines().any(|line| line.contains('┼')),
-                "case {label}: expected to find day separator (with ┼ character) in table output"
+                "case {}: expected separator with ┼ character",
+                case.label
             );
         }
     }
 }
 
-// Smoke tests for apply_width_config - verify function doesn't panic at
-// various width boundaries. Actual wrapping/truncation behavior is tested
-// by the tabled library and verified through integration tests.
-
+// Smoke tests for `apply_width_config`: actual wrapping/truncation is a
+// `tabled` concern. We only verify the call does not panic at the wrap/truncate
+// width boundary defined by `MIN_WIDTH_FOR_WRAPPING`.
 #[test]
-fn test_apply_width_config_variants() {
-    let rows = vec![CostRow::new(
-        "2025-10-23",
-        "Sonnet",
-        1.0,
-        1.0,
-        0.0,
-        0.0,
-        "100",
-    )];
+fn apply_width_config_handles_boundary_widths() {
+    let rows = vec![CostRow::new("2025-10-23", "Sonnet", (1.0, 1.0, 0.0, 0.0))];
 
     for width in [99, 100, 101] {
         let mut table = Table::new(&rows);
@@ -537,12 +403,11 @@ fn test_apply_width_config_variants() {
 }
 
 #[test]
-fn test_iter_model_costs_returns_correct_order() {
-    let costs = make_daily_costs(NaiveDate::from_ymd_opt(2025, 10, 23).unwrap())
+fn iter_model_costs_returns_display_order() {
+    let costs = costs_on(2025, 10, 23)
         .with_opus(1.0, 1.0, 0.0, 0.0)
         .with_sonnet(2.0, 2.0, 0.0, 0.0)
-        .with_haiku(0.5, 0.5, 0.0, 0.0)
-        .with_lines(100);
+        .with_haiku(0.5, 0.5, 0.0, 0.0);
 
     let models: Vec<&str> = costs
         .per_model
@@ -555,13 +420,137 @@ fn test_iter_model_costs_returns_correct_order() {
 }
 
 #[test]
-fn test_iter_model_costs_returns_correct_values() {
-    let costs = make_daily_costs(NaiveDate::from_ymd_opt(2025, 10, 23).unwrap())
+fn format_session_id_truncates_to_first_eight_characters() {
+    let cases = [
+        ("019dc252-e50e-766c", "019dc252"),
+        ("01234567", "01234567"),
+        ("012345", "012345"),
+        ("", ""),
+    ];
+
+    for (input, expected) in cases {
+        assert_eq!(format_session_id(input), expected, "input {input:?}");
+    }
+}
+
+#[test]
+fn format_duration_table_driven() {
+    let cases = [
+        (0_i64, "0 min"),
+        (1, "1 min"),
+        (59, "59 min"),
+        (60, "1 hr"),
+        (61, "1 hr 1 min"),
+        (90, "1 hr 30 min"),
+        (120, "2 hr"),
+        (125, "2 hr 5 min"),
+    ];
+
+    for (minutes, expected) in cases {
+        assert_eq!(format_duration(minutes), expected, "minutes {minutes}");
+    }
+}
+
+#[test]
+fn session_cost_row_formats_currency_columns() {
+    let row = SessionCostRow::new(
+        "019dc252",
+        "2025-10-23 09:00 \u{2192} 10:30",
+        "1 hr 30 min",
+        "Sonnet",
+        (1.2345, 2.3456, 0.5, 0.25),
+    );
+
+    assert_eq!(row.session, "019dc252");
+    assert_eq!(row.time_range, "2025-10-23 09:00 \u{2192} 10:30");
+    assert_eq!(row.duration, "1 hr 30 min");
+    assert_eq!(row.model, "Sonnet");
+    assert_money_columns(&row.money, (1.2345, 2.3456, 0.5, 0.25));
+}
+
+#[test]
+fn session_cost_row_total_uses_blank_component_columns() {
+    let row = SessionCostRow::new_total_row(7.5);
+
+    assert_eq!(row.session, "");
+    assert_eq!(row.time_range, "");
+    assert_eq!(row.duration, "");
+    assert_eq!(row.model, "Total");
+    assert_blank_money_component_columns(&row.money);
+    assert_eq!(row.money.subtotal, "$7.5000");
+}
+
+/// Build a `SessionCosts` for a single Sonnet entry with a fixed time range.
+fn session_costs_fixture(session_id: &str) -> SessionCosts {
+    let start = Utc.with_ymd_and_hms(2025, 10, 23, 9, 0, 0).unwrap();
+    let end = Utc.with_ymd_and_hms(2025, 10, 23, 10, 30, 0).unwrap();
+    let mut per_model = ModelCostsMap::default();
+    per_model.add(ModelType::Sonnet, TokenCosts::new(1.0, 2.0, 0.0, 0.0));
+    SessionCosts {
+        session_id: session_id.to_string(),
+        start_time: start,
+        end_time: end,
+        per_model,
+    }
+}
+
+#[test]
+fn build_session_cost_rows_empty_input_returns_empty_rows() {
+    let (rows, total_row_indices) = build_session_cost_rows(&[]);
+
+    assert!(rows.is_empty());
+    assert!(total_row_indices.is_empty());
+}
+
+#[test]
+fn build_session_cost_rows_emits_per_model_row_then_total() {
+    let session = session_costs_fixture("019dc252-e50e-766c");
+
+    let (rows, total_row_indices) = build_session_cost_rows(std::slice::from_ref(&session));
+
+    assert_eq!(total_row_indices, vec![1]);
+    assert_eq!(rows.len(), 2);
+
+    // First row identifies the session and model; the duration string is
+    // produced by `format_duration` and must round-trip via the row.
+    assert_eq!(rows[0].session, "019dc252");
+    assert_eq!(rows[0].duration, "1 hr 30 min");
+    assert_eq!(rows[0].model, "Sonnet");
+
+    // Total row uses the `grouped_label` blanking pattern: the leading
+    // identifier columns must be empty so the table footer reads as
+    // "        Total  $...".
+    assert_eq!(rows[1].session, "");
+    assert_eq!(rows[1].time_range, "");
+    assert_eq!(rows[1].duration, "");
+    assert_eq!(rows[1].model, "Total");
+    assert_eq!(rows[1].money.subtotal, "$3.0000");
+}
+
+#[test]
+fn build_session_cost_rows_inserts_separator_indices_per_session() {
+    let sessions = vec![
+        session_costs_fixture("aaaaaaaa-aaaa"),
+        session_costs_fixture("bbbbbbbb-bbbb"),
+    ];
+
+    let (rows, total_row_indices) = build_session_cost_rows(&sessions);
+
+    // Each fixture contributes one model row + one total row, so the total
+    // rows live at indices 1 and 3 in row order.
+    assert_eq!(total_row_indices, vec![1, 3]);
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[0].session, "aaaaaaaa");
+    assert_eq!(rows[2].session, "bbbbbbbb");
+}
+
+#[test]
+fn iter_model_costs_returns_per_bucket_values() {
+    let costs = costs_on(2025, 10, 23)
         .with_opus(15.0, 75.0, 0.0, 0.0)
         .with_sonnet(3.0, 15.0, 0.0, 0.0)
         .with_haiku(0.25, 1.25, 0.0, 0.0)
-        .with_opus4(5.0, 25.0, 0.0, 0.0)
-        .with_lines(100);
+        .with_opus4(5.0, 25.0, 0.0, 0.0);
 
     let model_costs = costs.per_model.model_costs();
 

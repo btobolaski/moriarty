@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use miette::{Context, IntoDiagnostic};
 use rust_decimal::Decimal;
 use serde::de::DeserializeOwned;
-use tracing::warn;
+use tracing::error;
 use uuid::Uuid;
 
 use claude_logs::{
@@ -289,7 +289,7 @@ fn priced_claude_assistant(
                 .to_ascii_lowercase()
                 .starts_with("claude")
             {
-                warn!(
+                error!(
                     model = %assistant.message.model,
                     "unrecognized Claude model omitted from cost analysis"
                 );

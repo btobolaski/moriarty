@@ -95,6 +95,8 @@
                 ./Cargo.lock
                 (craneLib.fileset.commonCargoSources ./crates/my-workspace-hack)
                 (craneLib.fileset.commonCargoSources ./crates/claude_logs)
+                (craneLib.fileset.commonCargoSources ./crates/pi_logs)
+                (craneLib.fileset.commonCargoSources ./crates/cost_analyzer)
                 (craneLib.fileset.commonCargoSources ./crates/moriarty)
                 ./doc/man
               ];

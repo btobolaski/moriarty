@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use mcp::McpServers;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 mod api_pricing;
 mod approval_tui;
@@ -29,6 +30,15 @@ async fn main() -> miette::Result<()> {
             start_time,
             end_time,
         } => {
+            // Default to info-level so cost_analyzer's parse-failure and
+            // unrecognized-model events reach the operator without setting RUST_LOG.
+            let filter =
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+            let _ = tracing_subscriber::registry()
+                .with(filter)
+                .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+                .try_init();
+
             // Parse timezone argument
             let tz = match timezone.to_lowercase().as_str() {
                 "local" => api_pricing::DateTimezone::Local,

@@ -13,6 +13,7 @@ serde_json = { workspace = true }
 thiserror = "2.0"
 uuid = { workspace = true }
 walkdir = "2.5"
+my-workspace-hack = { version = "0.1", path = "../my-workspace-hack" }
 
 [[bin]]
 name = "parse_pi_sessions"
