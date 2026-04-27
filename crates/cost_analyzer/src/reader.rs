@@ -50,8 +50,6 @@ where
     pub had_errors: bool,
 }
 
-/// jsonl_files walks a directory and finds all of the jsonl files.
-///
 /// This ignores symlinks for now. That is an area for possible future improvement but, that would
 /// require tracking visited directories in order to prevent infinitely recursing.
 fn jsonl_files(path: PathBuf) -> mpsc::Receiver<miette::Result<PathBuf>> {
@@ -64,8 +62,9 @@ fn jsonl_files(path: PathBuf) -> mpsc::Receiver<miette::Result<PathBuf>> {
             let entry = match entry.into_diagnostic().context("failed to get file entry") {
                 Ok(entry) => entry,
                 Err(error) => {
-                    // A walker failure aborts the entire traversal, so we return regardless of
-                    // whether the error could still be delivered to the receiver.
+                    // A walker failure aborts the entire traversal, so we log it here before
+                    // returning regardless of whether the receiver is still listening.
+                    event!(Level::ERROR, ?error, "failed to get file entry");
                     let _ = send_output(&tx, Err(error), None).await;
                     return;
                 }
@@ -196,25 +195,16 @@ fn deduplicate_lines<LogType: AnalyzableLog>(
     lines: Vec<LineWithCost<LogType>>,
 ) {
     for line in lines {
-        match output.entry(line.model.clone()) {
-            Entry::Occupied(mut existing_entry) => {
-                let model_lines = existing_entry.get_mut();
+        let model_lines = output.entry(line.model.clone()).or_default();
 
-                match model_lines.entry(line.id.clone()) {
-                    Entry::Occupied(mut original) => {
-                        if should_replace_existing_line(original.get(), &line) {
-                            original.insert(line);
-                        }
-                    }
-                    Entry::Vacant(vacant) => {
-                        vacant.insert(line);
-                    }
+        match model_lines.entry(line.id.clone()) {
+            Entry::Occupied(mut original) => {
+                if should_replace_existing_line(original.get(), &line) {
+                    original.insert(line);
                 }
             }
             Entry::Vacant(vacant) => {
-                let mut new_model = HashMap::new();
-                new_model.insert(line.id.clone(), line);
-                vacant.insert(new_model);
+                vacant.insert(line);
             }
         }
     }
@@ -244,6 +234,8 @@ pub async fn analyze_directory<LogType: AnalyzableLog>(path: PathBuf) -> Analysi
                         deduplicate_lines(&mut output, lines);
                         (output, had_errors)
                     }
+                    // All stream errors are logged before they reach this fold, so this only
+                    // needs to record that the overall scan had partial failures.
                     Err(_) => (output, true),
                 }
             },
@@ -263,7 +255,6 @@ pub async fn analyze_directory<LogType: AnalyzableLog>(path: PathBuf) -> Analysi
 mod tests {
     use std::{collections::HashSet, path::Path};
 
-    use crate::logs::parse_json_line;
     use chrono::{DateTime, TimeZone, Utc};
     use rust_decimal::Decimal;
     use serde::Deserialize;
@@ -271,8 +262,13 @@ mod tests {
     use tempfile::TempDir;
     use tokio::fs::{create_dir_all, write};
 
+    use claude_logs::LogLine as ClaudeLogLine;
+
     use super::*;
-    use crate::logs::LlmCost;
+    use crate::{
+        logs::{parse_json_line, ClaudeModelPricing, ClaudeTokenCounts, LlmCost},
+        test_support::{claude_assistant_json, claude_usage_json, CLAUDE_TIMESTAMP},
+    };
 
     #[derive(Debug, Clone, Deserialize)]
     #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -323,6 +319,8 @@ mod tests {
     fn decimal(units: i64) -> Decimal {
         Decimal::new(units, 0)
     }
+
+    const LATER_CLAUDE_TIMESTAMP: &str = "2026-04-25T01:48:35.742Z";
 
     fn timestamp(seconds: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(1_700_000_000 + seconds, 0)
@@ -437,9 +435,9 @@ mod tests {
             relative_path,
             format!(
                 "{}{}{}{}",
-                log_entry("msg-1", "2026-04-25T01:48:25.742Z", "3"),
+                log_entry("msg-1", CLAUDE_TIMESTAMP, "3"),
                 separator,
-                log_entry("msg-2", "2026-04-25T01:48:35.742Z", "4"),
+                log_entry("msg-2", LATER_CLAUDE_TIMESTAMP, "4"),
                 terminator
             ),
         )
@@ -476,6 +474,11 @@ mod tests {
         assert_eq!(result.lines[0].cost.total(), decimal(input_cost));
     }
 
+    fn assert_empty_success(result: &AnalysisResult<MockLog>) {
+        assert!(!result.had_errors);
+        assert!(result.lines.is_empty());
+    }
+
     async fn write_log_files(root: &Path, files: &[(&str, String)]) {
         for (relative_path, contents) in files {
             let path = root.join(relative_path);
@@ -492,6 +495,76 @@ mod tests {
         let temp_dir = temp_dir();
         write_log_files(temp_dir.path(), files).await;
         analyze_directory::<MockLog>(temp_dir.path().to_path_buf()).await
+    }
+
+    #[derive(Clone, Copy)]
+    struct ClaudeDedupCase<'a> {
+        name: &'a str,
+        request_id: Option<&'a str>,
+        message_id: &'a str,
+        lower_uuid: &'a str,
+        higher_uuid: &'a str,
+        expected_id: &'a str,
+    }
+
+    fn expected_claude_dedup_cost() -> LlmCost {
+        ClaudeModelPricing::SONNET.calculate_cost(&ClaudeTokenCounts {
+            input_tokens: 2_000_000,
+            ..Default::default()
+        })
+    }
+
+    async fn assert_claude_dedup_case(case: ClaudeDedupCase<'_>) {
+        let temp_dir = temp_dir();
+        let lower_cost = claude_assistant_json(
+            None,
+            case.request_id,
+            case.message_id,
+            case.lower_uuid,
+            "claude-sonnet-4-20250514",
+            claude_usage_json(1, 1, 0, 0),
+        );
+        let higher_cost = claude_assistant_json(
+            None,
+            case.request_id,
+            case.message_id,
+            case.higher_uuid,
+            "claude-sonnet-4-20250514",
+            claude_usage_json(2_000_000, 0, 0, 0),
+        );
+        let contents = format!("{}\n{}\n", lower_cost, higher_cost);
+
+        write_log_files(temp_dir.path(), &[("session.jsonl", contents)]).await;
+
+        let result = analyze_directory::<ClaudeLogLine>(temp_dir.path().to_path_buf()).await;
+
+        assert!(!result.had_errors, "case {}", case.name);
+        assert_eq!(result.lines.len(), 1, "case {}", case.name);
+        assert_eq!(result.lines[0].id, case.expected_id, "case {}", case.name);
+        assert_eq!(
+            result.lines[0].cost,
+            expected_claude_dedup_cost(),
+            "case {}",
+            case.name
+        );
+    }
+
+    #[test]
+    fn should_replace_existing_line_prefers_higher_cost_then_earlier_timestamp() {
+        let lower_cost = line("msg-1", "model-a", decimal(3), timestamp(10));
+        let higher_cost = line("msg-1", "model-a", decimal(5), timestamp(20));
+        let earlier_equal_cost = line("msg-1", "model-a", decimal(5), timestamp(10));
+        let later_equal_cost = line("msg-1", "model-a", decimal(5), timestamp(30));
+
+        assert!(should_replace_existing_line(&lower_cost, &higher_cost));
+        assert!(should_replace_existing_line(
+            &higher_cost,
+            &earlier_equal_cost
+        ));
+        assert!(!should_replace_existing_line(
+            &higher_cost,
+            &later_equal_cost
+        ));
     }
 
     #[test]
@@ -560,8 +633,7 @@ mod tests {
         let temp_dir = temp_dir();
         let result = analyze_directory::<MockLog>(temp_dir.path().to_path_buf()).await;
 
-        assert!(!result.had_errors);
-        assert!(result.lines.is_empty());
+        assert_empty_success(&result);
     }
 
     #[tokio::test]
@@ -582,11 +654,11 @@ mod tests {
                 vec![
                     file(
                         "one.jsonl",
-                        format!("{}\n", log_entry("msg-1", "2026-04-25T01:48:25.742Z", "3")),
+                        format!("{}\n", log_entry("msg-1", CLAUDE_TIMESTAMP, "3")),
                     ),
                     file(
                         "two.jsonl",
-                        format!("{}\n", log_entry("msg-1", "2026-04-25T01:48:35.742Z", "5")),
+                        format!("{}\n", log_entry("msg-1", LATER_CLAUDE_TIMESTAMP, "5")),
                     ),
                 ],
                 false,
@@ -598,13 +670,15 @@ mod tests {
                 single_log_file(
                     "nested/deeper/deep.jsonl",
                     "msg-deep",
-                    "2026-04-25T01:48:25.742Z",
+                    CLAUDE_TIMESTAMP,
                     "4",
                 ),
                 false,
                 &["msg-deep"][..],
                 Some(("msg-deep", 4)),
             ),
+            // These layouts exercise line splitting behavior, so they intentionally skip a
+            // single-line cost assertion and only validate the discovered ids.
             (
                 "handles windows line endings",
                 paired_log_file("windows.jsonl", "\r\n", "\r\n"),
@@ -620,11 +694,18 @@ mod tests {
                 None,
             ),
             (
+                "handles missing trailing newline",
+                paired_log_file("no-trailing-newline.jsonl", "\n", ""),
+                false,
+                &["msg-1", "msg-2"][..],
+                None,
+            ),
+            (
                 "reports partial failures",
                 vec![
                     file(
                         "valid.jsonl",
-                        format!("{}\n", log_entry("msg-1", "2026-04-25T01:48:25.742Z", "3")),
+                        format!("{}\n", log_entry("msg-1", CLAUDE_TIMESTAMP, "3")),
                     ),
                     file("invalid.jsonl", "not-json\n".to_string()),
                     file("ignored.txt", "not a log\n".to_string()),
@@ -657,13 +738,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn claude_analyze_directory_deduplicates_assistants_by_preferred_identifier() {
+        let cases = [
+            ClaudeDedupCase {
+                name: "request id",
+                request_id: Some("req-shared"),
+                message_id: "msg_shared",
+                lower_uuid: "55555555-5555-4555-8555-555555555555",
+                higher_uuid: "66666666-6666-4666-8666-666666666666",
+                expected_id: "req-shared",
+            },
+            ClaudeDedupCase {
+                name: "message id fallback",
+                request_id: None,
+                message_id: "msg_shared",
+                lower_uuid: "55555555-5555-4555-8555-555555555555",
+                higher_uuid: "66666666-6666-4666-8666-666666666666",
+                expected_id: "msg_shared",
+            },
+            ClaudeDedupCase {
+                name: "uuid fallback",
+                request_id: None,
+                message_id: "",
+                lower_uuid: "55555555-5555-4555-8555-555555555555",
+                higher_uuid: "55555555-5555-4555-8555-555555555555",
+                expected_id: "55555555-5555-4555-8555-555555555555",
+            },
+        ];
+
+        for case in cases {
+            assert_claude_dedup_case(case).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn analyze_directory_ignores_empty_files() {
+        let result = analyze_with_files(&[("empty.jsonl", String::new())]).await;
+
+        assert_empty_success(&result);
+    }
+
+    #[tokio::test]
+    async fn analyze_directory_ignores_whitespace_only_files() {
+        let result = analyze_with_files(&[("blank.jsonl", "\n   \n\t\n".to_string())]).await;
+
+        assert_empty_success(&result);
+    }
+
+    #[tokio::test]
+    async fn analyze_directory_ignores_non_jsonl_files() {
+        let result = analyze_with_files(&[
+            ("data.json", "{}".to_string()),
+            ("notes.txt", "hello".to_string()),
+        ])
+        .await;
+
+        assert_empty_success(&result);
+    }
+
+    #[tokio::test]
     async fn analyze_directory_discards_entire_file_on_parse_error() {
         let result = analyze_with_files(&[(
             "mixed.jsonl",
             format!(
                 "{}\nnot-json\n{}\n",
-                mock_log_json("msg-1", "model-a", "2026-04-25T01:48:25.742Z", "3"),
-                mock_log_json("msg-2", "model-a", "2026-04-25T01:48:35.742Z", "4")
+                mock_log_json("msg-1", "model-a", CLAUDE_TIMESTAMP, "3"),
+                mock_log_json("msg-2", "model-a", LATER_CLAUDE_TIMESTAMP, "4")
             ),
         )])
         .await;

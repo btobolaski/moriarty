@@ -449,6 +449,7 @@ version = "0.1.0"
 dependencies = [
  "async-walkdir",
  "chrono",
+ "claude_logs",
  "futures",
  "miette",
  "pi_logs",
@@ -459,6 +460,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

@@ -86,7 +86,7 @@ test in a separate process, making this safe and preventing tests from clobberin
 
 - Workspace crate for recursively scanning JSONL directories, parsing logs in parallel, and deduplicating billable model responses
 - Core abstractions: `AnalyzableLog` for pluggable log formats, `LlmCost` for input/cache/output cost breakdowns, `LineWithCost` for normalized billable entries, and `AnalysisResult` for returning those deduplicated lines alongside a partial-failure flag
-- The first concrete implementation targets `pi_logs::PiLogLine`; do not add `claude_logs` support yet
+- Concrete implementations currently support `pi_logs::PiLogLine` and `claude_logs::LogLine`. Claude log costs are calculated in `cost_analyzer` with local Decimal-based Claude pricing helpers rather than by depending on `moriarty::api_pricing` internals.
 - Intended direction: replace much of `moriarty::api_pricing::analyzer` with this reusable library over time, while keeping the existing Claude-specific reporting pipeline in place until that migration is complete
 - Deduplication keeps the highest-cost duplicate for a `(ModelId, LogId)` pair and breaks equal-cost ties by keeping the earliest timestamped entry
 - Public entry point: `cost_analyzer::analyze_directory(path)`
