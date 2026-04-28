@@ -60,7 +60,8 @@ fn parse(value: Value) -> PiLogLine {
 fn parse_err(value: Value) -> ParseError {
     let raw = value.to_string();
     let parsed = parse_line(raw.as_str());
-    parsed.expect_err(&format!("expected parse error\nJSON: {raw}"))
+    let err = parsed.expect_err(&format!("expected parse error\nJSON: {raw}"));
+    err
 }
 
 fn message_line_json(id: &str, parent_id: &str, message: Value) -> Value {
@@ -460,11 +461,7 @@ fn model_change_optional_parent() {
 
 #[test]
 fn model_change_with_parent() {
-    let line = parse(model_change_json(
-        Some("session-root"),
-        "openai",
-        "gpt-5.4",
-    ));
+    let line = parse(model_change_json(Some("session-root"), "openai", "gpt-5.4"));
 
     match line {
         PiLogLine::ModelChange(model_change) => {
@@ -517,7 +514,10 @@ fn compaction_line() {
             assert_eq!(compaction.tokens_before, 12345);
             assert_eq!(
                 compaction.details.read_files,
-                vec![PathBuf::from("src/main.rs"), PathBuf::from("/tmp/output.log")]
+                vec![
+                    PathBuf::from("src/main.rs"),
+                    PathBuf::from("/tmp/output.log")
+                ]
             );
             assert_eq!(
                 compaction.details.modified_files,
@@ -571,7 +571,10 @@ fn bash_execution_message() {
     ));
 
     assert_eq!(bash_execution.command, "cargo run --bin parse_pi_sessions");
-    assert_eq!(bash_execution.output, "parsed 595 line(s) across 87 file(s)");
+    assert_eq!(
+        bash_execution.output,
+        "parsed 595 line(s) across 87 file(s)"
+    );
     assert_eq!(bash_execution.exit_code, 1);
     assert!(!bash_execution.cancelled);
     assert!(bash_execution.truncated);
@@ -668,7 +671,10 @@ fn ask_user_tool_call_accepts_title_option() {
         panic!("expected AskUser args")
     };
 
-    assert_eq!(args.options, Some(vec![AskUserOption::Title("Continue".to_string())]));
+    assert_eq!(
+        args.options,
+        Some(vec![AskUserOption::Title("Continue".to_string())])
+    );
 }
 
 #[test]
@@ -792,7 +798,12 @@ fn assistant_error_stop_reason_with_error_message() {
 fn assistant_stop_reason_stop() {
     let assistant = parse_assistant_message(
         vec![json!({"type": "text", "text": "done"})],
-        AssistantFixture::new("anthropic-messages", "anthropic", "claude-sonnet-4-5", "stop"),
+        AssistantFixture::new(
+            "anthropic-messages",
+            "anthropic",
+            "claude-sonnet-4-5",
+            "stop",
+        ),
     );
 
     assert_eq!(assistant.stop_reason, AssistantStopReason::Stop);
@@ -910,7 +921,10 @@ fn subagent_tool_result_accepts_error_fields() {
         panic!("expected Subagent details")
     };
 
-    assert_eq!(details.results[0].error.as_deref(), Some("No API key found"));
+    assert_eq!(
+        details.results[0].error.as_deref(),
+        Some("No API key found")
+    );
     assert_eq!(
         details.results[0].saved_output_path,
         Some(PathBuf::from("/tmp/quality.md"))
@@ -1278,9 +1292,15 @@ fn bash_tool_result_accepts_truncation_and_full_output_path() {
         panic!("expected Bash details")
     };
 
-    assert_eq!(details.full_output_path, Some(PathBuf::from("/tmp/pi-bash.log")));
     assert_eq!(
-        details.truncation.as_ref().map(|truncation| truncation.truncated_by),
+        details.full_output_path,
+        Some(PathBuf::from("/tmp/pi-bash.log"))
+    );
+    assert_eq!(
+        details
+            .truncation
+            .as_ref()
+            .map(|truncation| truncation.truncated_by),
         Some(TruncatedBy::Lines)
     );
 }
@@ -1419,9 +1439,18 @@ fn custom_dcp_state() {
             assert_eq!(state.compression_blocks[0].id, 1);
             assert_eq!(state.compression_blocks[0].topic, "Test topic");
             assert_eq!(state.compression_blocks[0].summary, "Test summary");
-            assert_eq!(state.compression_blocks[0].start_timestamp.to_string(), "1777084923000.5");
-            assert_eq!(state.compression_blocks[0].end_timestamp.to_string(), "1777084924000");
-            assert_eq!(state.compression_blocks[0].anchor_timestamp.to_string(), "1777084924000.5");
+            assert_eq!(
+                state.compression_blocks[0].start_timestamp.to_string(),
+                "1777084923000.5"
+            );
+            assert_eq!(
+                state.compression_blocks[0].end_timestamp.to_string(),
+                "1777084924000"
+            );
+            assert_eq!(
+                state.compression_blocks[0].anchor_timestamp.to_string(),
+                "1777084924000.5"
+            );
             assert!(state.compression_blocks[0].active);
             assert_eq!(state.compression_blocks[0].summary_token_estimate, 100);
             assert_eq!(state.compression_blocks[0].created_at, 1777084924500);
@@ -1525,7 +1554,10 @@ fn custom_plannotator_execute() {
         }),
     ) {
         CustomPayload::PlannotatorExecute(details) => {
-            assert_eq!(details.last_submitted_path, Some(PathBuf::from("/tmp/PLAN.md")));
+            assert_eq!(
+                details.last_submitted_path,
+                Some(PathBuf::from("/tmp/PLAN.md"))
+            );
             assert_eq!(details.plan_file_path, None);
         }
         other => panic!("expected PlannotatorExecute, got {other:?}"),
@@ -1625,7 +1657,11 @@ fn parse_file_ignores_blank_lines() {
     let tmp = std::env::temp_dir().join(format!("pi_logs_blank_{}.jsonl", uuid::Uuid::new_v4()));
     std::fs::write(
         &tmp,
-        format!("{}\n\n{}\n", session_json("/tmp"), session_json("/tmp/project")),
+        format!(
+            "{}\n\n{}\n",
+            session_json("/tmp"),
+            session_json("/tmp/project")
+        ),
     )
     .unwrap();
 
@@ -1934,7 +1970,10 @@ fn grep_details_without_optional_read_fields_lands_in_grep() {
         false,
         Some(json!({"matchLimitReached": 50, "linesTruncated": true})),
     ));
-    assert!(matches!(tool_result.details, Some(ToolResultDetails::Grep(_))));
+    assert!(matches!(
+        tool_result.details,
+        Some(ToolResultDetails::Grep(_))
+    ));
 }
 
 #[test]
@@ -1978,10 +2017,7 @@ fn git_read_only_diff_status_show_share_argument_struct() {
         ("git_read_only_status", ToolName::GitReadOnlyStatus),
         ("git_read_only_show", ToolName::GitReadOnlyShow),
     ] {
-        let tool_call = parse_tool_call(
-            tool_name,
-            json!({"project_dir": "/tmp/repo", "args": []}),
-        );
+        let tool_call = parse_tool_call(tool_name, json!({"project_dir": "/tmp/repo", "args": []}));
         assert_eq!(tool_call.name(), expected);
     }
 }
@@ -2088,10 +2124,7 @@ fn custom_plannotator_accepts_snapshot_saved_state() {
             let Some(PlannotatorSavedState::Snapshot(snapshot)) = details.saved_state else {
                 panic!("expected snapshot saved_state")
             };
-            assert_eq!(
-                snapshot.active_tools,
-                vec![ToolName::Read, ToolName::Bash]
-            );
+            assert_eq!(snapshot.active_tools, vec![ToolName::Read, ToolName::Bash]);
             assert_eq!(snapshot.model.provider, Provider::Anthropic);
             assert_eq!(snapshot.model.id, "claude-opus-4-6");
             assert_eq!(snapshot.thinking_level, ThinkingLevel::Medium);
@@ -2103,11 +2136,7 @@ fn custom_plannotator_accepts_snapshot_saved_state() {
 #[test]
 fn custom_message_subagent_notify_has_no_details() {
     assert!(matches!(
-        parse_custom_message_payload(
-            "Background task failed: timeout",
-            "subagent-notify",
-            None,
-        ),
+        parse_custom_message_payload("Background task failed: timeout", "subagent-notify", None,),
         CustomMessagePayload::SubagentNotify
     ));
 }
@@ -2471,10 +2500,7 @@ fn tool_call_content_rejects_unknown_top_level_field() {
 /// absent. Pins `#[serde(default)]` against accidental removal.
 #[test]
 fn git_read_only_tool_call_accepts_absent_args_key() {
-    let tool_call = parse_tool_call(
-        "git_read_only_status",
-        json!({"project_dir": "/tmp/repo"}),
-    );
+    let tool_call = parse_tool_call("git_read_only_status", json!({"project_dir": "/tmp/repo"}));
     let ToolCallArguments::GitReadOnlyStatus(args) = tool_call.tool else {
         panic!("expected GitReadOnlyStatus tool call")
     };

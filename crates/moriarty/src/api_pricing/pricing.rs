@@ -1,17 +1,3 @@
-//! Display-side cost types for the API pricing report.
-//!
-//! After the migration to `cost_analyzer`, moriarty no longer prices token
-//! counts locally. The actual pricing math lives in `cost_analyzer`'s
-//! `ClaudeModelPricing`. This module keeps only what the report tables need:
-//!
-//! - [`ModelType`] — the four-bucket display grouping plus `Unknown`,
-//! - [`TokenCosts`] — already-priced cost components (input / output / cache),
-//! - [`ModelCostsMap`] — accumulator keyed by `ModelType` for grouped tables.
-//!
-//! Aggregation paths receive `cost_analyzer::LineWithCost.cost` values,
-//! convert them to `TokenCosts`, and add them into a `ModelCostsMap` via
-//! `ModelCostsMap::add`.
-
 use std::{collections::HashMap, fmt};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -24,7 +10,6 @@ pub enum ModelType {
 }
 
 impl ModelType {
-    /// Display order for cost reporting: highest-cost models first.
     pub const DISPLAY_ORDER: [(Self, &'static str); 4] = [
         (Self::Opus4, "Opus 4"),
         (Self::Opus, "Opus"),
@@ -32,28 +17,8 @@ impl ModelType {
         (Self::Haiku, "Haiku"),
     ];
 
-    /// Detect model type from the model string for display grouping only.
-    ///
-    /// Pricing is performed in `cost_analyzer`; this function exists solely so
-    /// the report can place each priced cost into its display bucket.
-    ///
-    /// # Matching Rules
-    /// - "sonnet" (case-insensitive) → Sonnet
-    /// - "haiku" (case-insensitive) → Haiku
-    /// - "opus-4" (case-insensitive) → Opus4 (also catches "opus-4-5", "opus-45", etc.)
-    /// - "opus" (case-insensitive) → Opus (for Opus 3)
-    /// - Everything else → Unknown
-    ///
-    /// # Examples
-    /// ```
-    /// # use moriarty::api_pricing::pricing::ModelType;
-    /// assert_eq!(ModelType::from_model_string("claude-sonnet-4-20250514"), ModelType::Sonnet);
-    /// assert_eq!(ModelType::from_model_string("claude-3-haiku-20240307"), ModelType::Haiku);
-    /// assert_eq!(ModelType::from_model_string("claude-opus-4"), ModelType::Opus4);
-    /// assert_eq!(ModelType::from_model_string("claude-opus-4-5"), ModelType::Opus4);
-    /// assert_eq!(ModelType::from_model_string("claude-3-opus-20240229"), ModelType::Opus);
-    /// assert_eq!(ModelType::from_model_string("gpt-4"), ModelType::Unknown);
-    /// ```
+    /// Report rows intentionally collapse concrete Claude model ids into the
+    /// four stable buckets shown in the table.
     pub fn from_model_string(model: &str) -> Self {
         let model_lower = model.to_lowercase();
         if model_lower.contains("sonnet") {
@@ -88,10 +53,6 @@ impl fmt::Display for ModelType {
     }
 }
 
-/// Already-priced cost components for a single model bucket.
-///
-/// All fields are in dollars and produced upstream by `cost_analyzer`'s
-/// pricing tables; moriarty only sums them.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TokenCosts {
     pub input: f64,
@@ -114,18 +75,10 @@ impl TokenCosts {
         self.input + self.output + self.cache_write + self.cache_read
     }
 
-    /// Returns `(input, output, cache_write, cache_read)` so report-side row
-    /// builders can pass cost components positionally without re-listing each
-    /// field name at every construction site.
     pub fn as_components(&self) -> (f64, f64, f64, f64) {
         (self.input, self.output, self.cache_write, self.cache_read)
     }
 
-    /// Adds another set of cost components into this one, in place.
-    ///
-    /// Used by `ModelCostsMap::add` to accumulate already-priced costs that
-    /// arrive line-by-line from `cost_analyzer`. Token counts are intentionally
-    /// not involved here; this path operates on already-computed cost amounts.
     pub fn add(&mut self, other: &TokenCosts) {
         self.input += other.input;
         self.output += other.output;
@@ -134,24 +87,23 @@ impl TokenCosts {
     }
 }
 
-/// Stores accumulated costs by model family for grouped report rendering.
 #[derive(Debug, Clone, Default)]
 pub struct ModelCostsMap {
     costs: HashMap<ModelType, TokenCosts>,
 }
 
 impl ModelCostsMap {
-    /// Accumulates `costs` into the entry for `model_type`, summing components.
-    ///
-    /// This is the single entry point used by aggregation when consuming
-    /// `cost_analyzer::LineWithCost` values: callers convert each line's
-    /// `LlmCost` into `TokenCosts` and add it here without re-running
-    /// per-token pricing.
+    /// Unknown Claude models are dropped here because `cost_analyzer` already
+    /// logged the pricing problem upstream and the report only has stable rows
+    /// for the four named display buckets.
     pub fn add(&mut self, model_type: ModelType, costs: TokenCosts) {
+        if model_type == ModelType::Unknown {
+            return;
+        }
+
         self.costs.entry(model_type).or_default().add(&costs);
     }
 
-    /// Returns costs for `model_type`, or zero-default if absent.
     #[cfg(test)]
     pub fn get(&self, model_type: ModelType) -> TokenCosts {
         self.costs.get(&model_type).copied().unwrap_or_default()
@@ -165,8 +117,6 @@ impl ModelCostsMap {
         self.costs.get(&model_type).copied().unwrap_or_default()
     }
 
-    /// Returns the four display-order buckets (Opus 4, Opus, Sonnet, Haiku),
-    /// zero-filling any model that has no accumulated costs.
     pub fn model_costs(&self) -> [(&'static str, TokenCosts); 4] {
         ModelType::DISPLAY_ORDER.map(|(model_type, name)| (name, self.get_or_default(model_type)))
     }
@@ -289,6 +239,15 @@ mod tests {
         costs.add(ModelType::Haiku, TokenCosts::new(0.5, 1.0, 0.0, 0.0));
 
         assert!((costs.total() - 4.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn model_costs_map_ignores_unknown_buckets() {
+        let mut costs = ModelCostsMap::default();
+        costs.add(ModelType::Unknown, TokenCosts::new(9.0, 8.0, 7.0, 6.0));
+
+        assert_eq!(costs.total(), 0.0);
+        assert_eq!(costs.model_costs().len(), 4);
     }
 
     #[test]

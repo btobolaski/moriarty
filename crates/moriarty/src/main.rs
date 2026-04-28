@@ -1,15 +1,21 @@
-use std::path::PathBuf;
+use std::{
+    env,
+    path::{Path, PathBuf},
+};
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use mcp::McpServers;
+use miette::{IntoDiagnostic, WrapErr};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 mod api_pricing;
 mod approval_tui;
+mod cost_report;
 mod hashing;
 mod hooks;
 mod mcp;
 mod persistence;
+mod pi_cost;
 mod project_config;
 mod repository;
 #[cfg(test)]
@@ -23,53 +29,23 @@ async fn main() -> miette::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::ApiPricing {
-            dir,
-            timezone,
-            conversations,
-            start_time,
-            end_time,
-        } => {
-            // Default to info-level so cost_analyzer's parse-failure and
-            // unrecognized-model events reach the operator without setting RUST_LOG.
-            let filter =
-                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-            let _ = tracing_subscriber::registry()
-                .with(filter)
-                .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
-                .try_init();
-
-            // Parse timezone argument
-            let tz = match timezone.to_lowercase().as_str() {
-                "local" => api_pricing::DateTimezone::Local,
-                "utc" => api_pricing::DateTimezone::Utc,
-                _ => {
-                    eprintln!(
-                        "Error: Invalid timezone '{}'. Must be 'local' or 'utc'",
-                        timezone
-                    );
-                    std::process::exit(1);
-                }
-            };
-
-            // Parse time range filter
-            let filter = api_pricing::TimeRangeFilter::new(start_time, end_time)?;
-
-            // Display filter info if set
-            if !filter.is_unrestricted() {
-                println!("Applying time range filter:");
-                if let Some(start) = filter.start {
-                    println!("  Start: {}", start.to_rfc3339());
-                }
-                if let Some(end) = filter.end {
-                    println!("  End:   {}", end.to_rfc3339());
-                }
-                println!();
-            }
-
-            // Run the API pricing analysis
-            api_pricing::run(&dir, tz, conversations, &filter).await?;
+        Command::ApiPricing { dir, cost_args } => {
+            init_cost_report_tracing();
+            let timezone = parse_date_timezone(&cost_args.timezone)?;
+            let filter = cost_args.time_filter()?;
+            print_time_range_filter(&filter);
+            api_pricing::run(&dir, timezone, cost_args.conversations, &filter).await?;
         }
+        Command::Pi { subcommand } => match subcommand {
+            PiCommand::Cost { dir, cost_args } => {
+                init_cost_report_tracing();
+                let dir = resolve_pi_sessions_dir(dir)?;
+                let timezone = parse_date_timezone(&cost_args.timezone)?;
+                let filter = cost_args.time_filter()?;
+                print_time_range_filter(&filter);
+                pi_cost::run(&dir, timezone, cost_args.conversations, &filter).await?;
+            }
+        },
         Command::Mcp { server } => {
             server.run().await?;
         }
@@ -108,32 +84,124 @@ async fn main() -> miette::Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Args)]
+struct CostCommandArgs {
+    /// Timezone to use for date determination (local or utc)
+    #[arg(long, default_value = "local")]
+    timezone: String,
+    /// Aggregate by conversation/session instead of by date
+    #[arg(long)]
+    conversations: bool,
+    /// Start time for filtering messages (ISO 8601 format, e.g., "2025-01-01T00:00:00Z" or "2025-01-01")
+    /// If no timezone specified, UTC is assumed
+    #[arg(long, value_name = "DATETIME")]
+    start_time: Option<String>,
+    /// End time for filtering messages (ISO 8601 format, e.g., "2025-01-01T23:59:59Z" or "2025-01-01")
+    /// If no timezone specified, UTC is assumed
+    #[arg(long, value_name = "DATETIME")]
+    end_time: Option<String>,
+}
+
+impl CostCommandArgs {
+    fn time_filter(&self) -> miette::Result<cost_report::TimeRangeFilter> {
+        cost_report::TimeRangeFilter::new(self.start_time.clone(), self.end_time.clone())
+    }
+}
+
+fn init_cost_report_tracing() {
+    // Default to info-level so cost_analyzer's parse-failure and
+    // unrecognized-model events reach the operator without setting RUST_LOG.
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+        .try_init();
+}
+
+fn parse_date_timezone(timezone: &str) -> miette::Result<cost_report::DateTimezone> {
+    match timezone.to_ascii_lowercase().as_str() {
+        "local" => Ok(cost_report::DateTimezone::Local),
+        "utc" => Ok(cost_report::DateTimezone::Utc),
+        _ => Err(miette::miette!(
+            "Invalid timezone '{}'. Must be 'local' or 'utc'",
+            timezone
+        )),
+    }
+}
+
+fn print_time_range_filter(filter: &cost_report::TimeRangeFilter) {
+    if filter.is_unrestricted() {
+        return;
+    }
+
+    println!("Applying time range filter:");
+    if let Some(start) = filter.start {
+        println!("  Start: {}", start.to_rfc3339());
+    }
+    if let Some(end) = filter.end {
+        println!("  End:   {}", end.to_rfc3339());
+    }
+    println!();
+}
+
+fn resolve_pi_sessions_dir(override_dir: Option<PathBuf>) -> miette::Result<PathBuf> {
+    let dir = if let Some(dir) = override_dir {
+        dir
+    } else {
+        let Some(home) = env::var_os("HOME") else {
+            return Err(miette::miette!(
+                "HOME is not set; pass --dir to specify the pi sessions directory"
+            ));
+        };
+
+        PathBuf::from(home).join(".pi/agent/sessions")
+    };
+
+    validate_pi_sessions_dir(&dir)?;
+    Ok(dir)
+}
+
+fn validate_pi_sessions_dir(dir: &Path) -> miette::Result<()> {
+    if !dir
+        .try_exists()
+        .into_diagnostic()
+        .wrap_err_with(|| format!("Failed to check pi sessions directory '{}'", dir.display()))?
+    {
+        return Err(miette::miette!(
+            "Pi sessions directory '{}' does not exist",
+            dir.display()
+        ));
+    }
+
+    if !dir.is_dir() {
+        return Err(miette::miette!(
+            "Pi sessions path '{}' is not a directory",
+            dir.display()
+        ));
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Parser)]
-pub struct Cli {
+struct Cli {
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Debug, Subcommand)]
-pub enum Command {
+enum Command {
     ApiPricing {
         /// The directory to analyze for API usage
         #[arg(short, long)]
         dir: PathBuf,
-        /// Timezone to use for date determination (local or utc)
-        #[arg(long, default_value = "local")]
-        timezone: String,
-        /// Aggregate by conversation/session instead of by date
-        #[arg(long)]
-        conversations: bool,
-        /// Start time for filtering messages (ISO 8601 format, e.g., "2025-01-01T00:00:00Z" or "2025-01-01")
-        /// If no timezone specified, UTC is assumed
-        #[arg(long, value_name = "DATETIME")]
-        start_time: Option<String>,
-        /// End time for filtering messages (ISO 8601 format, e.g., "2025-01-01T23:59:59Z" or "2025-01-01")
-        /// If no timezone specified, UTC is assumed
-        #[arg(long, value_name = "DATETIME")]
-        end_time: Option<String>,
+        #[command(flatten)]
+        cost_args: CostCommandArgs,
+    },
+    /// Analyze pi session logs
+    Pi {
+        #[command(subcommand)]
+        subcommand: PiCommand,
     },
     /// Runs one of the mcp servers
     Mcp {
@@ -158,13 +226,25 @@ pub enum Command {
 }
 
 #[derive(Debug, Subcommand)]
-pub enum HooksCommand {
+enum PiCommand {
+    /// Analyze pi session cost reports
+    Cost {
+        /// The directory to analyze for pi session usage
+        #[arg(short, long)]
+        dir: Option<PathBuf>,
+        #[command(flatten)]
+        cost_args: CostCommandArgs,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum HooksCommand {
     /// Execute hook with input and log the results
     Exec,
 }
 
 #[derive(Debug, Subcommand)]
-pub enum TestCommand {
+enum TestCommand {
     /// Run all configured project tools in parallel
     ProjectTools {
         /// The project directory containing .config/tools.toml
@@ -190,4 +270,193 @@ pub enum TestCommand {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        env,
+        ffi::OsString,
+        path::{Path, PathBuf},
+    };
+
+    use clap::Parser;
+    use tempfile::TempDir;
+
+    use super::{parse_date_timezone, resolve_pi_sessions_dir, Cli, Command, PiCommand};
+    use crate::cost_report::DateTimezone;
+
+    struct HomeGuard {
+        original: Option<OsString>,
+    }
+
+    impl HomeGuard {
+        fn set(home: Option<&Path>) -> Self {
+            let original = env::var_os("HOME");
+
+            match home {
+                Some(home) => {
+                    // These tests run under `cargo nextest`, so each test has its own process and can
+                    // safely mutate process-global environment variables.
+                    unsafe { env::set_var("HOME", home) };
+                }
+                None => {
+                    // See comment above about `cargo nextest` process isolation.
+                    unsafe { env::remove_var("HOME") };
+                }
+            }
+
+            Self { original }
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match self.original.as_ref() {
+                Some(value) => {
+                    // See comment above about `cargo nextest` process isolation.
+                    unsafe { env::set_var("HOME", value) };
+                }
+                None => {
+                    // See comment above about `cargo nextest` process isolation.
+                    unsafe { env::remove_var("HOME") };
+                }
+            }
+        }
+    }
+
+    fn with_home<R>(home: Option<&Path>, f: impl FnOnce() -> R) -> R {
+        let _guard = HomeGuard::set(home);
+        f()
+    }
+
+    #[test]
+    fn resolve_pi_sessions_dir_prefers_override() {
+        let temp = TempDir::new().unwrap();
+        let override_dir = temp.path().join("custom/pi/sessions");
+        std::fs::create_dir_all(&override_dir).unwrap();
+
+        let resolved = with_home(None, || {
+            resolve_pi_sessions_dir(Some(override_dir.clone())).unwrap()
+        });
+
+        assert_eq!(resolved, override_dir);
+    }
+
+    #[test]
+    fn resolve_pi_sessions_dir_uses_home_default_path() {
+        let home = TempDir::new().unwrap();
+        let expected = home.path().join(".pi/agent/sessions");
+        std::fs::create_dir_all(&expected).unwrap();
+
+        let resolved = with_home(Some(home.path()), || resolve_pi_sessions_dir(None).unwrap());
+
+        assert_eq!(resolved, expected);
+    }
+
+    #[test]
+    fn resolve_pi_sessions_dir_errors_when_home_is_missing() {
+        let error = with_home(None, || resolve_pi_sessions_dir(None).unwrap_err());
+
+        assert!(
+            error.to_string().contains("HOME is not set"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn resolve_pi_sessions_dir_errors_when_override_is_missing() {
+        let temp = TempDir::new().unwrap();
+        let missing = temp.path().join("missing");
+
+        let error = resolve_pi_sessions_dir(Some(missing.clone())).unwrap_err();
+
+        assert!(
+            error.to_string().contains("does not exist"),
+            "unexpected error: {error}"
+        );
+        assert!(error.to_string().contains(&missing.display().to_string()));
+    }
+
+    #[test]
+    fn resolve_pi_sessions_dir_errors_when_override_is_file() {
+        let temp = TempDir::new().unwrap();
+        let file = temp.path().join("sessions.jsonl");
+        std::fs::write(&file, "[]").unwrap();
+
+        let error = resolve_pi_sessions_dir(Some(file.clone())).unwrap_err();
+
+        assert!(
+            error.to_string().contains("is not a directory"),
+            "unexpected error: {error}"
+        );
+        assert!(error.to_string().contains(&file.display().to_string()));
+    }
+
+    #[test]
+    fn with_home_restores_original_value() {
+        let original = env::var_os("HOME");
+        let temp = TempDir::new().unwrap();
+
+        with_home(Some(temp.path()), || {
+            assert_eq!(env::var_os("HOME"), Some(OsString::from(temp.path())));
+        });
+
+        assert_eq!(env::var_os("HOME"), original);
+    }
+
+    #[test]
+    fn parse_date_timezone_accepts_supported_values_case_insensitively() {
+        assert_eq!(parse_date_timezone("local").unwrap(), DateTimezone::Local);
+        assert_eq!(parse_date_timezone("UTC").unwrap(), DateTimezone::Utc);
+    }
+
+    #[test]
+    fn parse_date_timezone_rejects_invalid_values() {
+        let error = parse_date_timezone("pst").unwrap_err();
+
+        assert!(
+            error.to_string().contains("Invalid timezone"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn cli_parses_nested_pi_cost_command() {
+        let cli = Cli::try_parse_from([
+            "moriarty",
+            "pi",
+            "cost",
+            "--dir",
+            "logs/pi",
+            "--timezone",
+            "utc",
+            "--conversations",
+            "--start-time",
+            "2025-01-01",
+            "--end-time",
+            "2025-01-02",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Command::Pi {
+                subcommand: PiCommand::Cost { dir, cost_args },
+            } => {
+                assert_eq!(dir, Some(PathBuf::from("logs/pi")));
+                assert_eq!(cost_args.timezone, "utc");
+                assert!(cost_args.conversations);
+                assert_eq!(cost_args.start_time.as_deref(), Some("2025-01-01"));
+                assert_eq!(cost_args.end_time.as_deref(), Some("2025-01-02"));
+            }
+            other => panic!("expected nested pi cost command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_rejects_flat_pi_cost_spelling() {
+        let error = Cli::try_parse_from(["moriarty", "pi-cost"]).unwrap_err();
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
+    }
 }

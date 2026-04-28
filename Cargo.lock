@@ -1136,6 +1136,7 @@ dependencies = [
  "hex",
  "miette",
  "my-workspace-hack",
+ "pi_logs",
  "ratatui",
  "regex",
  "rmcp",

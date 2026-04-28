@@ -1,12 +1,19 @@
 use chrono::{NaiveDate, TimeZone, Utc};
+use tabled::Table;
 
 use super::*;
-use crate::api_pricing::{
-    analyzer::{DailyCosts, SessionCosts},
-    pricing::{ModelCostsMap, ModelType, TokenCosts},
+use crate::{
+    api_pricing::{
+        analyzer::{DailyCosts, SessionCosts},
+        pricing::{ModelCostsMap, ModelType, TokenCosts},
+    },
+    cost_report::{
+        apply_width_config, create_grouped_table, display_grand_total, divider, fmt_money,
+        format_duration, format_session_id, format_time_range, DateTimezone, FormattedCostColumns,
+        GrandTotalRow,
+    },
 };
 
-/// Short date constructor used throughout the display tests.
 fn test_date(year: i32, month: u32, day: u32) -> NaiveDate {
     NaiveDate::from_ymd_opt(year, month, day).unwrap()
 }
@@ -235,6 +242,11 @@ fn divider_generates_correct_length() {
 }
 
 #[test]
+fn fmt_money_normalizes_negative_zero() {
+    assert_eq!(fmt_money(-0.0), "$0.0000");
+}
+
+#[test]
 fn grand_total_row_formats_currency() {
     let row = GrandTotalRow::new(143.7082);
 
@@ -289,10 +301,10 @@ fn build_cost_rows_variants() {
         // A day with no nonzero per-model entries still emits one Total row
         // so the report shows a $0.0000 footer rather than dropping the day.
         (
-            "zero-cost day still gets total row",
+            "zero-cost day still gets labeled total row",
             vec![costs_on(2025, 10, 23)],
             vec![0],
-            vec![("", "Total")],
+            vec![("2025-10-23", "Total")],
         ),
         (
             "multiple days",
@@ -425,6 +437,7 @@ fn format_session_id_truncates_to_first_eight_characters() {
         ("019dc252-e50e-766c", "019dc252"),
         ("01234567", "01234567"),
         ("012345", "012345"),
+        ("ééééééééé", "éééééééé"),
         ("", ""),
     ];
 
@@ -449,6 +462,34 @@ fn format_duration_table_driven() {
     for (minutes, expected) in cases {
         assert_eq!(format_duration(minutes), expected, "minutes {minutes}");
     }
+}
+
+#[test]
+fn format_time_range_uses_requested_timezone_for_same_day_ranges() {
+    let start = Utc.with_ymd_and_hms(2025, 1, 1, 23, 30, 0).unwrap();
+    let end = Utc.with_ymd_and_hms(2025, 1, 2, 0, 15, 0).unwrap();
+
+    assert_eq!(
+        format_time_range(DateTimezone::Utc, start, end),
+        "2025-01-01 23:30 → 2025-01-02 00:15"
+    );
+
+    let local = format_time_range(DateTimezone::Local, start, end);
+    assert!(
+        !local.is_empty(),
+        "local formatting should still produce a time range"
+    );
+}
+
+#[test]
+fn format_time_range_shows_end_date_for_cross_day_ranges() {
+    let start = Utc.with_ymd_and_hms(2025, 10, 23, 9, 0, 0).unwrap();
+    let end = Utc.with_ymd_and_hms(2025, 10, 24, 10, 30, 0).unwrap();
+
+    assert_eq!(
+        format_time_range(DateTimezone::Utc, start, end),
+        "2025-10-23 09:00 → 2025-10-24 10:30"
+    );
 }
 
 #[test]
@@ -480,7 +521,6 @@ fn session_cost_row_total_uses_blank_component_columns() {
     assert_eq!(row.money.subtotal, "$7.5000");
 }
 
-/// Build a `SessionCosts` for a single Sonnet entry with a fixed time range.
 fn session_costs_fixture(session_id: &str) -> SessionCosts {
     let start = Utc.with_ymd_and_hms(2025, 10, 23, 9, 0, 0).unwrap();
     let end = Utc.with_ymd_and_hms(2025, 10, 23, 10, 30, 0).unwrap();
@@ -496,7 +536,7 @@ fn session_costs_fixture(session_id: &str) -> SessionCosts {
 
 #[test]
 fn build_session_cost_rows_empty_input_returns_empty_rows() {
-    let (rows, total_row_indices) = build_session_cost_rows(&[]);
+    let (rows, total_row_indices) = build_session_cost_rows(&[], DateTimezone::Utc);
 
     assert!(rows.is_empty());
     assert!(total_row_indices.is_empty());
@@ -506,25 +546,40 @@ fn build_session_cost_rows_empty_input_returns_empty_rows() {
 fn build_session_cost_rows_emits_per_model_row_then_total() {
     let session = session_costs_fixture("019dc252-e50e-766c");
 
-    let (rows, total_row_indices) = build_session_cost_rows(std::slice::from_ref(&session));
+    let (rows, total_row_indices) =
+        build_session_cost_rows(std::slice::from_ref(&session), DateTimezone::Utc);
 
     assert_eq!(total_row_indices, vec![1]);
     assert_eq!(rows.len(), 2);
 
-    // First row identifies the session and model; the duration string is
-    // produced by `format_duration` and must round-trip via the row.
     assert_eq!(rows[0].session, "019dc252");
     assert_eq!(rows[0].duration, "1 hr 30 min");
     assert_eq!(rows[0].model, "Sonnet");
 
-    // Total row uses the `grouped_label` blanking pattern: the leading
-    // identifier columns must be empty so the table footer reads as
-    // "        Total  $...".
     assert_eq!(rows[1].session, "");
     assert_eq!(rows[1].time_range, "");
     assert_eq!(rows[1].duration, "");
     assert_eq!(rows[1].model, "Total");
     assert_eq!(rows[1].money.subtotal, "$3.0000");
+}
+
+#[test]
+fn build_session_cost_rows_zero_cost_session_keeps_identifying_columns() {
+    let session = SessionCosts {
+        session_id: "ééééééééé-session".to_string(),
+        start_time: Utc.with_ymd_and_hms(2025, 10, 23, 9, 0, 0).unwrap(),
+        end_time: Utc.with_ymd_and_hms(2025, 10, 23, 9, 0, 0).unwrap(),
+        per_model: ModelCostsMap::default(),
+    };
+
+    let (rows, total_row_indices) = build_session_cost_rows(&[session], DateTimezone::Utc);
+
+    assert_eq!(total_row_indices, vec![0]);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].session, "éééééééé");
+    assert_eq!(rows[0].time_range, "2025-10-23 09:00 → 09:00");
+    assert_eq!(rows[0].duration, "0 min");
+    assert_eq!(rows[0].model, "Total");
 }
 
 #[test]
@@ -534,10 +589,8 @@ fn build_session_cost_rows_inserts_separator_indices_per_session() {
         session_costs_fixture("bbbbbbbb-bbbb"),
     ];
 
-    let (rows, total_row_indices) = build_session_cost_rows(&sessions);
+    let (rows, total_row_indices) = build_session_cost_rows(&sessions, DateTimezone::Utc);
 
-    // Each fixture contributes one model row + one total row, so the total
-    // rows live at indices 1 and 3 in row order.
     assert_eq!(total_row_indices, vec![1, 3]);
     assert_eq!(rows.len(), 4);
     assert_eq!(rows[0].session, "aaaaaaaa");

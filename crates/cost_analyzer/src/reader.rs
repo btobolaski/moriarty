@@ -136,13 +136,12 @@ async fn read_file_contents(path: &Path) -> miette::Result<String> {
         .inspect_err(|error| log_read_file_error(path, error))
 }
 
-fn parse_cost_line<LogType: AnalyzableLog>(
+fn parse_log_line<LogType: AnalyzableLog>(
     path: &Path,
     line_number: usize,
     line: &str,
-) -> miette::Result<Option<LineWithCost<LogType>>> {
-    LineWithCost::<LogType>::parse(line)
-        .inspect_err(|error| log_parse_line_error(path, line_number, line, error))
+) -> miette::Result<LogType> {
+    LogType::parse(line).inspect_err(|error| log_parse_line_error(path, line_number, line, error))
 }
 
 async fn parse_file<LogType: AnalyzableLog>(
@@ -155,14 +154,20 @@ async fn parse_file<LogType: AnalyzableLog>(
     // but each parse would run inline and effectively serialize the decoding work.
     tokio::spawn(async move {
         let mut output = Vec::new();
+        let mut current_session_id: Option<String> = None;
 
         for (line_number, line) in contents.lines().enumerate() {
             if line.trim().is_empty() {
                 continue;
             }
 
-            if let Some(line_with_cost) = parse_cost_line::<LogType>(&path, line_number + 1, line)?
-            {
+            let log = parse_log_line::<LogType>(&path, line_number + 1, line)?;
+
+            if let Some(session_id) = log.session_id() {
+                current_session_id = Some(session_id);
+            }
+
+            if let Some(line_with_cost) = LineWithCost::from_log(log, current_session_id.clone()) {
                 output.push(line_with_cost);
             }
         }
@@ -263,11 +268,14 @@ mod tests {
     use tokio::fs::{create_dir_all, write};
 
     use claude_logs::LogLine as ClaudeLogLine;
+    use pi_logs::PiLogLine;
 
     use super::*;
     use crate::{
         logs::{parse_json_line, ClaudeModelPricing, ClaudeTokenCounts, LlmCost},
-        test_support::{claude_assistant_json, claude_usage_json, CLAUDE_TIMESTAMP},
+        test_support::{
+            claude_assistant_json, claude_usage_json, CLAUDE_SESSION_ID, CLAUDE_TIMESTAMP,
+        },
     };
 
     #[derive(Debug, Clone, Deserialize)]
@@ -304,6 +312,10 @@ mod tests {
             Some(self.model.clone())
         }
 
+        fn session_id(&self) -> Option<String> {
+            None
+        }
+
         fn parse(value: &str) -> miette::Result<Self> {
             parse_json_line(value, "failed to parse mock log line")
         }
@@ -321,6 +333,51 @@ mod tests {
     }
 
     const LATER_CLAUDE_TIMESTAMP: &str = "2026-04-25T01:48:35.742Z";
+    const PI_SESSION_ID: &str = "019dc252-e50e-766c-8182-d654b46881b0";
+
+    fn pi_assistant_log(id: &str, timestamp: &str) -> String {
+        json!({
+            "type": "message",
+            "id": id,
+            "parentId": "u1",
+            "timestamp": timestamp,
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "hello"}],
+                "api": "anthropic-messages",
+                "provider": "anthropic",
+                "model": "claude-sonnet-4-5",
+                "usage": {
+                    "input": 10,
+                    "output": 5,
+                    "cacheRead": 2,
+                    "cacheWrite": 1,
+                    "totalTokens": 18,
+                    "cost": {
+                        "input": "3",
+                        "output": "5",
+                        "cacheRead": "2",
+                        "cacheWrite": "1",
+                        "total": "11"
+                    }
+                },
+                "stopReason": "stop",
+                "timestamp": 1_700_000_000
+            }
+        })
+        .to_string()
+    }
+
+    fn pi_session_log(session_id: &str, timestamp: &str) -> String {
+        json!({
+            "type": "session",
+            "version": 1,
+            "id": session_id,
+            "timestamp": timestamp,
+            "cwd": "/tmp/project"
+        })
+        .to_string()
+    }
 
     fn timestamp(seconds: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(1_700_000_000 + seconds, 0)
@@ -345,6 +402,7 @@ mod tests {
             id: log.id.clone(),
             model: log.model.clone(),
             timestamp,
+            session_id: None,
             log: Box::new(log),
             cost: LlmCost {
                 input: input_cost,
@@ -547,6 +605,63 @@ mod tests {
             "case {}",
             case.name
         );
+    }
+
+    #[tokio::test]
+    async fn parse_file_attaches_claude_session_id_to_billable_lines() {
+        let temp_dir = temp_dir();
+        let path = temp_dir.path().join("claude.jsonl");
+        let contents = format!(
+            "{}\n",
+            claude_assistant_json(
+                None,
+                Some("req-1"),
+                "msg-1",
+                "22222222-2222-4222-8222-222222222222",
+                "claude-sonnet-4-20250514",
+                claude_usage_json(1, 0, 0, 0),
+            )
+        );
+
+        write(&path, contents).await.unwrap();
+
+        let lines = parse_file::<ClaudeLogLine>(path).await.unwrap();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].session_id.as_deref(), Some(CLAUDE_SESSION_ID));
+    }
+
+    #[tokio::test]
+    async fn parse_file_inherits_pi_session_id_from_session_header() {
+        let temp_dir = temp_dir();
+        let path = temp_dir.path().join("pi.jsonl");
+        let contents = format!(
+            "{}\n{}\n",
+            pi_session_log(PI_SESSION_ID, CLAUDE_TIMESTAMP),
+            pi_assistant_log("a1", LATER_CLAUDE_TIMESTAMP),
+        );
+
+        write(&path, contents).await.unwrap();
+
+        let lines = parse_file::<PiLogLine>(path).await.unwrap();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].session_id.as_deref(), Some(PI_SESSION_ID));
+    }
+
+    #[tokio::test]
+    async fn parse_file_leaves_pi_session_id_empty_before_session_header() {
+        let temp_dir = temp_dir();
+        let path = temp_dir.path().join("pi.jsonl");
+        let contents = format!(
+            "{}\n{}\n",
+            pi_assistant_log("a1", CLAUDE_TIMESTAMP),
+            pi_session_log(PI_SESSION_ID, LATER_CLAUDE_TIMESTAMP),
+        );
+
+        write(&path, contents).await.unwrap();
+
+        let lines = parse_file::<PiLogLine>(path).await.unwrap();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].session_id, None);
     }
 
     #[test]

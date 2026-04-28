@@ -6,7 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Moriarty is a Rust CLI tool for analyzing Claude Code logs and API usage. It provides:
 
-- **API pricing analyzer**: Analyzes Claude API usage from log directories and generates detailed cost reports
+- **Claude API pricing analyzer**: Analyzes Claude API usage from log directories and generates detailed cost reports
+- **Pi cost analyzer**: Analyzes pi session logs and generates daily or per-conversation cost reports grouped by provider and model
 - **MCP servers**: Provides Model Context Protocol servers for git operations and project tools
 - **Hooks system**: Security integration for validating commands before execution (bash rules, project checks)
 - **Project approval TUI**: Interactive interface for approving project tools before execution
@@ -22,8 +23,12 @@ cargo build
 **Running:**
 
 ```bash
-# Run API pricing analyzer
+# Run Claude API pricing analyzer
 cargo run -- api-pricing -d <directory> --timezone local|utc
+
+# Run pi cost analyzer
+cargo run -- pi cost --timezone local|utc
+cargo run -- pi cost --dir <pi-sessions-directory> --conversations
 
 # Run MCP servers
 cargo run -- mcp git-read-only
@@ -66,13 +71,25 @@ test in a separate process, making this safe and preventing tests from clobberin
 - The `LogLine` enum represents different message types (User, Assistant, FileHistorySnapshot, Summary, System)
 - Used by `moriarty`'s `api_pricing` module to analyze Claude Code conversation logs
 
-**`api_pricing/`** - API usage cost analysis:
+**`cost_report/`** - Shared cost report rendering and filtering:
+
+- Holds shared time filtering, grouped-table rendering, money formatting, and report warning helpers used by both cost-report backends
+- Keeps the output behavior for `api-pricing` and `pi cost` aligned without forcing the backends into a dynamic-column abstraction
+
+**`api_pricing/`** - Claude API usage cost analysis:
 
 - Aggregates pre-priced `LlmCost` values from `cost_analyzer` into daily buckets (keyed by timezone-adjusted date) or
   per-conversation buckets (keyed by session ID)
-- Per-model aggregation uses `ModelCostsMap` to accumulate already-priced cost components into model-family buckets
+- Per-model aggregation uses `ModelCostsMap` to accumulate already-priced cost components into Claude-family buckets
 - Unknown Claude models surface as stderr tracing errors via `cost_analyzer`; they are not rendered in the report
 - Entry point: `api-pricing` subcommand in `main.rs`
+
+**`pi_cost/`** - Pi session cost analysis:
+
+- Aggregates pre-priced `LlmCost` values from `cost_analyzer` into daily buckets or per-conversation buckets keyed by normalized session ID
+- Uses raw pi `(provider, model)` pairs for row grouping, with deterministic ordering from a `BTreeMap<PiModel, ...>` accumulator
+- Conversation mode depends on `cost_analyzer::LineWithCost.session_id`, which is attached during the single-pass parse from either Claude assistant lines or pi `SessionLine` headers
+- Entry point: `pi cost` subcommand in `main.rs`
 
 **`pi_logs/`** - Pi session log parsing:
 
@@ -90,8 +107,9 @@ test in a separate process, making this safe and preventing tests from clobberin
 - Concrete implementations currently support `pi_logs::PiLogLine` and `claude_logs::LogLine`. Claude log costs are
   calculated in `cost_analyzer` with local Decimal-based Claude pricing helpers rather than by depending on
   `moriarty::api_pricing` internals.
-- `moriarty::api_pricing` delegates all log loading, deduplication, and pricing to this crate; it only aggregates the
+- `moriarty::api_pricing` and `moriarty::pi_cost` both delegate all log loading, deduplication, and pricing to this crate; they only aggregate the
   returned `LlmCost` values into report buckets
+- `LineWithCost.session_id` is normalized during parsing so backends can group by conversation without re-reading log files; Claude assistant lines provide it inline and pi logs inherit it from the file's `SessionLine`
 - Deduplication keeps the highest-cost duplicate for a `(ModelId, LogId)` pair and breaks equal-cost ties by keeping the
   earliest timestamped entry
 - Public entry point: `cost_analyzer::analyze_directory(path)`

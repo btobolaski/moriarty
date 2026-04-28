@@ -1,57 +1,30 @@
 use std::{collections::BTreeMap, path::Path};
 
-use chrono::{DateTime, Local, NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use rust_decimal::prelude::ToPrimitive;
 
+use super::pricing::{ModelCostsMap, ModelType, TokenCosts};
+use crate::cost_report::{DateTimezone, TimeRangeFilter};
 use claude_logs::LogLine;
 use cost_analyzer::{analyze_directory as cost_analyze_directory, LineWithCost, LlmCost};
 
-use super::{
-    pricing::{ModelCostsMap, ModelType, TokenCosts},
-    time_filter::TimeRangeFilter,
-};
-
-/// Timezone to use when extracting dates from timestamps
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DateTimezone {
-    /// Use the system's local timezone
-    Local,
-    /// Use UTC timezone
-    Utc,
-}
-
-impl DateTimezone {
-    /// Convert a UTC timestamp to a date in this timezone
-    pub fn to_date(self, timestamp: &DateTime<Utc>) -> NaiveDate {
-        match self {
-            Self::Local => timestamp.with_timezone(&Local).date_naive(),
-            Self::Utc => timestamp.date_naive(),
-        }
-    }
-}
-
-/// The aggregated daily-cost output of `analyze_directory`.
-///
-/// `had_errors` is propagated from `cost_analyzer::analyze_directory` and is
-/// `true` when at least one log file could not be read or parsed. The report
-/// layer uses this flag to warn the operator that the totals may be
-/// incomplete; the per-file details are already emitted via tracing.
+/// `had_errors` is propagated from `cost_analyzer::analyze_directory` so the
+/// report layer can warn that totals may be incomplete after per-file details
+/// have already gone to tracing.
 #[derive(Debug, Default)]
 pub struct AnalysisResult {
     pub daily_costs: Vec<DailyCosts>,
     pub had_errors: bool,
 }
 
-/// The aggregated per-conversation output of `analyze_directory_by_session`.
-///
-/// `had_errors` carries the same meaning as on `AnalysisResult`.
+/// Conversation-mode aggregation reuses the same partial-failure flag as the
+/// daily report so callers do not need a separate warning path.
 #[derive(Debug, Default)]
 pub struct SessionAnalysisResult {
     pub session_costs: Vec<SessionCosts>,
     pub had_errors: bool,
 }
 
-/// Computed costs for a single calendar date
 #[derive(Debug)]
 pub struct DailyCosts {
     pub date: NaiveDate,
@@ -64,9 +37,8 @@ impl DailyCosts {
     }
 }
 
-/// Computed costs for a single conversation/session.
-///
-/// `start_time` and `end_time` bracket the timestamps of the kept lines for the session.
+/// `start_time` and `end_time` bracket only the kept billable lines, so the
+/// rendered duration matches any caller-supplied time filter.
 #[derive(Debug)]
 pub struct SessionCosts {
     pub session_id: String,
@@ -85,11 +57,6 @@ impl SessionCosts {
     }
 }
 
-/// Convert an `LlmCost` (Decimal-based) into the display-side `TokenCosts` (f64-based).
-///
-/// `cost_analyzer` produces exact Decimal costs; the moriarty report path renders them
-/// in `f64`. `Decimal::to_f64` is lossy in extreme corner cases but well within rounding
-/// tolerance for the four-decimal-place currency formatting used by the report.
 fn token_costs_from_llm_cost(cost: &LlmCost) -> TokenCosts {
     TokenCosts::new(
         cost.input.to_f64().unwrap_or(0.0),
@@ -99,25 +66,6 @@ fn token_costs_from_llm_cost(cost: &LlmCost) -> TokenCosts {
     )
 }
 
-/// Extracts the Claude session id from a deduplicated billable line.
-///
-/// Returns `None` for any non-Assistant variant. `cost_analyzer` only emits
-/// billable lines for Assistant entries today, but matching defensively here
-/// keeps moriarty's aggregation robust if `AnalyzableLog` is extended later.
-fn session_id_for(line: &LineWithCost<LogLine>) -> Option<&str> {
-    match line.log.as_ref() {
-        LogLine::Assistant(assistant) => Some(assistant.session_id.as_str()),
-        _ => None,
-    }
-}
-
-/// Returns the `(ModelType, TokenCosts)` for a line that should contribute to
-/// the report, or `None` when the time filter excludes it.
-///
-/// Centralizing the post-dedup filter check + model classification + Decimal
-/// → f64 conversion keeps both `analyze_directory` and
-/// `analyze_directory_by_session` from drifting in subtle ways: any new step
-/// in that prelude (e.g., a future cost adjustment) lands in one place.
 /// Loads all dedup-resolved, time-filtered billable entries from `dir`.
 ///
 /// Both `analyze_directory` and `analyze_directory_by_session` start by
@@ -141,6 +89,9 @@ async fn load_billable_lines(
     (entries, result.had_errors)
 }
 
+/// Centralizing the post-dedup filter check + model classification + Decimal
+/// → f64 conversion keeps both aggregation entry points aligned if the shared
+/// prelude ever gains another step.
 fn billable_entry(
     line: &LineWithCost<LogLine>,
     filter: &TimeRangeFilter,
@@ -154,16 +105,6 @@ fn billable_entry(
     ))
 }
 
-/// Analyze all log files in a directory and return daily costs aggregated from
-/// `cost_analyzer`'s deduplicated billable entries.
-///
-/// Behavior:
-/// - Discovery, reading, parsing, and deduplication happen inside
-///   `cost_analyzer::analyze_directory`.
-/// - The `TimeRangeFilter` is applied here, after deduplication, so duplicate
-///   resolution sees the full set of billable entries before any line is dropped.
-/// - Each kept line's already-priced `LlmCost` is added directly to the date
-///   bucket's `ModelCostsMap`; token counts are not re-priced locally.
 pub async fn analyze_directory(
     dir: &Path,
     timezone: DateTimezone,
@@ -189,36 +130,35 @@ pub async fn analyze_directory(
     })
 }
 
-/// Analyze all log files in a directory and return per-conversation costs
-/// aggregated from `cost_analyzer`'s deduplicated billable entries.
-///
-/// Behavior mirrors `analyze_directory`: the `TimeRangeFilter` is applied
-/// after deduplication, and each kept line's `LlmCost` is added directly to
-/// the session bucket without re-pricing. `start_time` and `end_time` are
-/// expanded as kept lines are processed. Output is sorted by `start_time`.
 pub async fn analyze_directory_by_session(
     dir: &Path,
     filter: &TimeRangeFilter,
 ) -> miette::Result<SessionAnalysisResult> {
-    /// Per-session accumulator used while building the report.
-    ///
-    /// Kept private to this function because it only exists to bridge the
-    /// streaming aggregation loop with the public `SessionCosts` shape.
+    let (entries, had_errors) = load_billable_lines(dir, filter).await;
+    session_analysis_from_entries(entries, had_errors)
+}
+
+fn session_analysis_from_entries(
+    entries: Vec<(LineWithCost<LogLine>, ModelType, TokenCosts)>,
+    had_errors: bool,
+) -> miette::Result<SessionAnalysisResult> {
     struct SessionAccumulator {
         start_time: DateTime<Utc>,
         end_time: DateTime<Utc>,
         per_model: ModelCostsMap,
     }
 
-    let (entries, had_errors) = load_billable_lines(dir, filter).await;
-
     let mut buckets: BTreeMap<String, SessionAccumulator> = BTreeMap::new();
 
     for (line, model_type, costs) in entries {
-        let Some(session_id) = session_id_for(&line) else {
-            continue;
-        };
-        let session_id = session_id.to_string();
+        let session_id = line.session_id.clone().ok_or_else(|| {
+            miette::miette!(
+                "Claude billable line '{}' for model '{}' is missing a session id. \
+                 Conversation reports require session metadata on every billable assistant line.",
+                line.id,
+                line.model,
+            )
+        })?;
 
         let acc = buckets
             .entry(session_id)
@@ -474,6 +414,33 @@ mod tests {
         assert!((converted.output - 2.75).abs() < 1e-9);
         assert!((converted.cache_write - 0.50).abs() < 1e-9);
         assert!((converted.cache_read - 0.125).abs() < 1e-9);
+    }
+
+    #[test]
+    fn session_analysis_from_entries_errors_when_session_id_is_missing() {
+        let mut line = LineWithCost::<LogLine>::parse(
+            &assistant_line(
+                "session-a",
+                timestamp(2026, 4, 16, 9, 0),
+                "claude-sonnet-4-20250514",
+                "req-missing-session",
+                usage_json(1_000_000, 0, 0, 0),
+            )
+            .to_string(),
+        )
+        .unwrap()
+        .unwrap();
+        let model_type = ModelType::from_model_string(&line.model);
+        let costs = token_costs_from_llm_cost(&line.cost);
+        line.session_id = None;
+
+        let error =
+            session_analysis_from_entries(vec![(line, model_type, costs)], false).unwrap_err();
+
+        assert!(
+            error.to_string().contains("missing a session id"),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]

@@ -763,10 +763,11 @@ pub struct WriteArgs {
 /// 1. Modern multi-edit form: `{path, edits: [{oldText, newText}, ...]}`.
 /// 2. Older single-edit shorthand: `{path, oldText, newText}` with no
 ///    `edits` array.
-/// Both `edits` and the `(old_text, new_text)` pair are therefore
-/// optional, with the invariant that exactly one shape is populated for a
-/// well-formed call. `path` is also optional because aborted toolCalls
-/// can land here with `arguments: {}`.
+///
+/// Both `edits` and the `(old_text, new_text)` pair are therefore optional,
+/// with the invariant that exactly one shape is populated for a well-formed
+/// call. `path` is also optional because aborted toolCalls can land here
+/// with `arguments: {}`.
 ///
 /// `deny_unknown_fields` is intentionally NOT applied here: completed-but-
 /// corrupted model streams have been observed emitting hallucinated

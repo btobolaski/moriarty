@@ -72,6 +72,9 @@ pub trait AnalyzableLog: std::fmt::Debug + Clone + Send + Sync + 'static {
     fn identifier(&self) -> Self::LogId;
     /// model is only set on messages from the LLM so, this returns option
     fn model(&self) -> Option<Self::ModelId>;
+    /// Returns a normalized conversation/session identifier when the parsed log
+    /// line exposes one.
+    fn session_id(&self) -> Option<String>;
     fn parse(value: &str) -> miette::Result<Self>;
 }
 
@@ -83,6 +86,7 @@ where
     pub id: Log::LogId,
     pub model: Log::ModelId,
     pub timestamp: DateTime<Utc>,
+    pub session_id: Option<String>,
     pub log: Box<Log>,
     pub cost: LlmCost,
 }
@@ -91,18 +95,24 @@ impl<Log> LineWithCost<Log>
 where
     Log: AnalyzableLog,
 {
-    pub fn parse(value: &str) -> miette::Result<Option<Self>> {
-        let log = Log::parse(value)?;
-        Ok(match (log.cost(), log.model()) {
+    pub fn from_log(log: Log, session_id: Option<String>) -> Option<Self> {
+        match (log.cost(), log.model()) {
             (Some(cost), Some(model)) => Some(Self {
                 id: log.identifier(),
                 model,
                 cost,
                 timestamp: log.timestamp(),
+                session_id,
                 log: Box::new(log),
             }),
             _ => None,
-        })
+        }
+    }
+
+    pub fn parse(value: &str) -> miette::Result<Option<Self>> {
+        let log = Log::parse(value)?;
+        let session_id = log.session_id();
+        Ok(Self::from_log(log, session_id))
     }
 }
 
@@ -428,6 +438,13 @@ impl AnalyzableLog for ClaudeLogLine {
         Some(assistant.message.model.clone())
     }
 
+    fn session_id(&self) -> Option<String> {
+        match self {
+            ClaudeLogLine::Assistant(assistant) => Some(assistant.session_id.clone()),
+            _ => None,
+        }
+    }
+
     fn parse(value: &str) -> miette::Result<Self> {
         parse_json_backed_log(value)
     }
@@ -490,6 +507,13 @@ impl AnalyzableLog for PiLogLine {
             PiLogLine::ModelChange(model_change) => model_change.timestamp,
             PiLogLine::Session(session) => session.timestamp,
             PiLogLine::ThinkingLevelChange(thinking_level) => thinking_level.timestamp,
+        }
+    }
+
+    fn session_id(&self) -> Option<String> {
+        match self {
+            PiLogLine::Session(session) => Some(session.id.to_string()),
+            _ => None,
         }
     }
 
@@ -1068,6 +1092,7 @@ mod tests {
             }
         );
         assert_eq!(parsed.cost.total(), Decimal::new(11, 0));
+        assert_eq!(parsed.session_id, None);
     }
 
     #[test]
@@ -1117,6 +1142,10 @@ mod tests {
 
         fn timestamp(&self) -> DateTime<Utc> {
             self.timestamp
+        }
+
+        fn session_id(&self) -> Option<String> {
+            None
         }
 
         fn parse(value: &str) -> miette::Result<Self> {
@@ -1184,7 +1213,25 @@ mod tests {
             assert_eq!(line.timestamp(), timestamp());
             assert_eq!(line.cost().is_some(), expect_cost);
             assert_eq!(line.model().is_some(), expect_model);
+            assert_eq!(
+                line.session_id().is_some(),
+                matches!(line, PiLogLine::Session(_))
+            );
         }
+    }
+
+    #[test]
+    fn line_with_cost_parse_keeps_claude_assistant_session_id() {
+        let parsed = parse_claude_line_with_cost(claude_assistant_json(
+            None,
+            Some("req-1"),
+            "msg-1",
+            CLAUDE_ASSISTANT_UUID,
+            "claude-sonnet-4-20250514",
+            claude_usage_json(1, 0, 0, 0),
+        ));
+
+        assert_eq!(parsed.session_id.as_deref(), Some(CLAUDE_SESSION_ID));
     }
 
     #[test]
