@@ -30,7 +30,6 @@ struct Args {
 
 fn default_sessions_dir() -> Option<PathBuf> {
     // We avoid pulling in an extra `dirs` crate by reading HOME directly.
-    // Pi sessions live at `$HOME/.pi/agent/sessions` on Linux / macOS.
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".pi/agent/sessions"))
 }
 
@@ -91,7 +90,6 @@ fn main() -> ExitCode {
         match parse_file(path) {
             Ok(lines) => {
                 parsed_lines += lines.len();
-                println!("  ok   {} ({} lines)", path.display(), lines.len());
             }
             Err(err) => {
                 println!("  FAIL {}", path.display());

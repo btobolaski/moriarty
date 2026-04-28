@@ -464,6 +464,7 @@ impl AnalyzableLog for PiLogLine {
 
     fn identifier(&self) -> String {
         match self {
+            PiLogLine::Compaction(compaction) => compaction.id.clone(),
             PiLogLine::Custom(custom) => custom.id.clone(),
             PiLogLine::CustomMessage(message) => message.id.clone(),
             PiLogLine::Message(message) => message.id.clone(),
@@ -482,6 +483,7 @@ impl AnalyzableLog for PiLogLine {
 
     fn timestamp(&self) -> DateTime<Utc> {
         match self {
+            PiLogLine::Compaction(compaction) => compaction.timestamp,
             PiLogLine::Custom(custom) => custom.timestamp,
             PiLogLine::CustomMessage(message) => message.timestamp,
             PiLogLine::Message(message) => message.timestamp,
@@ -658,6 +660,23 @@ mod tests {
                 "totalPruneCount": 3,
                 "manualMode": false,
             },
+        })
+    }
+
+    fn compaction_json() -> serde_json::Value {
+        json!({
+            "type": "compaction",
+            "id": "cmp1",
+            "parentId": "p1",
+            "timestamp": CLAUDE_TIMESTAMP,
+            "summary": "Compacted earlier work",
+            "firstKeptEntryId": "m42",
+            "tokensBefore": 12345,
+            "details": {
+                "readFiles": ["src/main.rs"],
+                "modifiedFiles": ["crates/pi_logs/src/parser.rs"]
+            },
+            "fromHook": false,
         })
     }
 
@@ -1150,6 +1169,7 @@ mod tests {
             ),
             (model_change_json(), "m1", false, false),
             (thinking_level_change_json(), "t1", false, false),
+            (compaction_json(), "cmp1", false, false),
             (custom_json(), "c1", false, false),
             (custom_message_json(), "cm1", false, false),
             (user_message_json(), "u1", false, false),

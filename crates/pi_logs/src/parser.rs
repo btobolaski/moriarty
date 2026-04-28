@@ -24,14 +24,13 @@ mod tests;
 // Top-level line
 // ---------------------------------------------------------------------------
 
-/// A single line from a pi session log file. The `type` field selects the
-/// variant.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PiLogLine {
     Session(SessionLine),
     ModelChange(ModelChangeLine),
     ThinkingLevelChange(ThinkingLevelChangeLine),
+    Compaction(CompactionLine),
     Custom(CustomLine),
     CustomMessage(CustomMessageLine),
     Message(MessageLine),
@@ -69,13 +68,36 @@ pub struct ThinkingLevelChangeLine {
     pub thinking_level: ThinkingLevel,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CompactionLine {
+    pub id: String,
+    pub parent_id: String,
+    pub timestamp: DateTime<Utc>,
+    pub summary: String,
+    pub first_kept_entry_id: String,
+    pub tokens_before: u64,
+    pub details: CompactionDetails,
+    pub from_hook: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CompactionDetails {
+    pub read_files: Vec<PathBuf>,
+    pub modified_files: Vec<PathBuf>,
+}
+
 // ---------------------------------------------------------------------------
 // Custom / custom_message
 //
 // Both of these have a discriminator (`customType`) that lives at the outer
 // level alongside `id`, `parentId`, and `timestamp`. We keep those as normal
 // fields and `#[serde(flatten)]` an adjacently-tagged enum so that the
-// discriminator selects a strongly typed payload.
+// discriminator selects a strongly typed payload. Serde rejects
+// `deny_unknown_fields` on a struct that also uses `flatten`, so the outer
+// wrapper cannot be fully strict here; only the flattened payload enum stays
+// tightly typed.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -154,6 +176,8 @@ pub enum RoleMessage {
     Assistant(Box<AssistantMessage>),
     #[serde(rename = "toolResult")]
     ToolResult(Box<ToolResultMessage>),
+    #[serde(rename = "bashExecution")]
+    BashExecution(Box<BashExecutionMessage>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -191,6 +215,20 @@ pub struct ToolResultMessage {
     pub details: Option<ToolResultDetails>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BashExecutionMessage {
+    pub command: String,
+    pub output: String,
+    pub exit_code: i32,
+    pub cancelled: bool,
+    pub truncated: bool,
+    pub timestamp: i64,
+    pub exclude_from_context: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_output_path: Option<PathBuf>,
+}
+
 // ---------------------------------------------------------------------------
 // Content items
 // ---------------------------------------------------------------------------
@@ -201,6 +239,10 @@ pub enum UserContentItem {
     Text { text: String },
 }
 
+/// `Text` and `Thinking` are inline variants of an internally tagged enum, so
+/// serde cannot enforce `deny_unknown_fields` on them. `ToolCall` stays strict
+/// because it delegates to the `ToolCallContent` struct, which can carry that
+/// attribute.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum AssistantContentItem {
@@ -244,10 +286,16 @@ pub enum TextContentKind {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ToolCallContent {
     pub id: String,
-    pub name: ToolName,
-    pub arguments: ToolCallArguments,
+    #[serde(flatten)]
+    pub tool: ToolCallArguments,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partial_json: Option<String>,
+}
+
+impl ToolCallContent {
+    pub fn name(&self) -> ToolName {
+        self.tool.name()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -310,6 +358,8 @@ pub enum AssistantStopReason {
     Stop,
     #[serde(rename = "aborted")]
     Aborted,
+    #[serde(rename = "error")]
+    Error,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -378,8 +428,9 @@ pub enum PlannotatorPhase {
 // Signatures
 // ---------------------------------------------------------------------------
 
-/// A thinking signature is either an opaque (provider-supplied) string or a
-/// structured object with encrypted content and a summary.
+/// Providers sometimes hand back a signature token whose internal structure is
+/// undocumented, so we preserve the raw string instead of guessing how to
+/// decode it.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ThinkingSignature {
@@ -400,29 +451,78 @@ pub struct StructuredThinkingSignature {
 // ---------------------------------------------------------------------------
 // Tool call arguments
 //
-// Each tool has a well known argument schema. We model the arguments as an
-// untagged enum so that `serde_json` picks the variant that structurally
-// matches the tool's JSON. `deny_unknown_fields` on each variant ensures we
-// never silently accept fields we do not model.
+// Each tool has a well known argument schema. We model tool calls as a tagged
+// enum keyed by the sibling `name` field so zero-argument tools stay tied to
+// their declared tool name instead of falling through to whichever all-optional
+// struct happens to appear first.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(untagged)]
+#[serde(tag = "name", content = "arguments", rename_all = "snake_case")]
 pub enum ToolCallArguments {
-    Read(ReadArgs),
-    Bash(BashArgs),
-    Write(WriteArgs),
-    Edit(EditArgs),
-    Grep(GrepArgs),
-    Find(FindArgs),
-    Ls(LsArgs),
     AskUser(AskUserArgs),
-    WebSearch(WebSearchArgs),
+    Bash(BashArgs),
+    CodeSearch(CodeSearchArgs),
+    Compress(CompressArgs),
+    Edit(EditArgs),
+    FactDelete(FactDeleteArgs),
+    FactList(FactListArgs),
+    FactRead(FactReadArgs),
+    FactWrite(FactWriteArgs),
+    FetchContent(FetchContentArgs),
+    Find(FindArgs),
+    GetSearchContent(GetSearchContentArgs),
+    Grep(GrepArgs),
+    InstinctDelete(InstinctDeleteArgs),
+    InstinctList(InstinctListArgs),
+    InstinctMerge(InstinctMergeArgs),
+    InstinctRead(InstinctReadArgs),
+    InstinctWrite(InstinctWriteArgs),
+    Intercom(IntercomArgs),
+    Ls(LsArgs),
     Mcp(McpArgs),
     PlannotatorSubmitPlan(PlannotatorSubmitPlanArgs),
+    Read(ReadArgs),
     Subagent(SubagentArgs),
+    SubagentStatus(SubagentStatusArgs),
     Todo(TodoArgs),
-    Compress(CompressArgs),
+    WebSearch(WebSearchArgs),
+    Write(WriteArgs),
+}
+
+impl ToolCallArguments {
+    pub fn name(&self) -> ToolName {
+        match self {
+            Self::AskUser(_) => ToolName::AskUser,
+            Self::Bash(_) => ToolName::Bash,
+            Self::CodeSearch(_) => ToolName::CodeSearch,
+            Self::Compress(_) => ToolName::Compress,
+            Self::Edit(_) => ToolName::Edit,
+            Self::FactDelete(_) => ToolName::FactDelete,
+            Self::FactList(_) => ToolName::FactList,
+            Self::FactRead(_) => ToolName::FactRead,
+            Self::FactWrite(_) => ToolName::FactWrite,
+            Self::FetchContent(_) => ToolName::FetchContent,
+            Self::Find(_) => ToolName::Find,
+            Self::GetSearchContent(_) => ToolName::GetSearchContent,
+            Self::Grep(_) => ToolName::Grep,
+            Self::InstinctDelete(_) => ToolName::InstinctDelete,
+            Self::InstinctList(_) => ToolName::InstinctList,
+            Self::InstinctMerge(_) => ToolName::InstinctMerge,
+            Self::InstinctRead(_) => ToolName::InstinctRead,
+            Self::InstinctWrite(_) => ToolName::InstinctWrite,
+            Self::Intercom(_) => ToolName::Intercom,
+            Self::Ls(_) => ToolName::Ls,
+            Self::Mcp(_) => ToolName::Mcp,
+            Self::PlannotatorSubmitPlan(_) => ToolName::PlannotatorSubmitPlan,
+            Self::Read(_) => ToolName::Read,
+            Self::Subagent(_) => ToolName::Subagent,
+            Self::SubagentStatus(_) => ToolName::SubagentStatus,
+            Self::Todo(_) => ToolName::Todo,
+            Self::WebSearch(_) => ToolName::WebSearch,
+            Self::Write(_) => ToolName::Write,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -438,6 +538,19 @@ pub struct CompressRange {
     pub start_id: String,
     pub end_id: String,
     pub summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SubagentStatusArgs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -560,7 +673,6 @@ pub struct AskUserArgs {
     pub timeout: Option<u64>,
 }
 
-/// An ask-user option can be either a bare title string or a structured object.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum AskUserOption {
@@ -570,6 +682,13 @@ pub enum AskUserOption {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         description: Option<String>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CodeSearchArgs {
+    pub query: String,
+    pub max_tokens: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -587,6 +706,171 @@ pub struct WebSearchArgs {
     pub provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ScopeDomainArgs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+}
+
+pub type FactListArgs = ScopeDomainArgs;
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct IdArgs {
+    pub id: String,
+}
+
+pub type FactReadArgs = IdArgs;
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ObservationCountersArgs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmed_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contradicted_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inactive_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FactWriteArgs {
+    pub id: String,
+    pub title: String,
+    pub content: String,
+    pub confidence: Decimal,
+    pub domain: String,
+    pub scope: String,
+    #[serde(flatten)]
+    pub counters: ObservationCountersArgs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OptionalScopeIdArgs {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+}
+
+pub type FactDeleteArgs = OptionalScopeIdArgs;
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FetchContentArgs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub urls: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub force_clone: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frames: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GetSearchContentArgs {
+    pub response_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url_index: Option<u32>,
+}
+
+pub type InstinctListArgs = ScopeDomainArgs;
+
+pub type InstinctReadArgs = IdArgs;
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InstinctWriteArgs {
+    pub id: String,
+    pub title: String,
+    pub trigger: String,
+    pub action: String,
+    pub confidence: Decimal,
+    pub domain: String,
+    pub scope: String,
+    #[serde(flatten)]
+    pub counters: ObservationCountersArgs,
+}
+
+pub type InstinctDeleteArgs = OptionalScopeIdArgs;
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InstinctMergeArgs {
+    pub merged: MergedInstinct,
+    pub delete_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete_scoped_ids: Option<Vec<ScopedInstinctDelete>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MergedInstinct {
+    pub id: String,
+    pub title: String,
+    pub trigger: String,
+    pub action: String,
+    pub confidence: Decimal,
+    pub domain: String,
+    pub scope: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ScopedInstinctDelete {
+    pub id: String,
+    pub scope: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct IntercomArgs {
+    pub action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachments: Option<Vec<IntercomAttachment>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct IntercomAttachment {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub name: String,
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -641,6 +925,8 @@ pub struct SubagentArgs {
     #[serde(rename = "async", default, skip_serializing_if = "Option::is_none")]
     pub async_: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifacts: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub include_progress: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub share: Option<bool>,
@@ -649,7 +935,7 @@ pub struct SubagentArgs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clarify: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output: Option<String>,
+    pub output: Option<SubagentOutput>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skill: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -682,6 +968,13 @@ pub struct SubagentTask {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SubagentOutput {
+    Path(String),
+    Enabled(bool),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SubagentChainStep {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -704,9 +997,11 @@ pub enum ToolResultDetails {
     Edit(EditDetails),
     Subagent(SubagentResultDetails),
     AskUser(AskUserDetails),
+    CodeSearch(CodeSearchDetails),
     WebSearch(WebSearchDetails),
     Read(ReadDetails),
     Grep(GrepDetails),
+    Mcp(McpDetails),
     Bash(BashDetails),
     PlannotatorSubmitPlan(PlannotatorSubmitPlanDetails),
     Todo(TodoDetails),
@@ -748,13 +1043,19 @@ pub struct SubagentResultSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_paths: Option<SubagentArtifactPaths>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress_summary: Option<SubagentProgressSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_output: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved_output_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attempted_models: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_attempts: Option<Vec<SubagentModelAttempt>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_file: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<SubagentToolCallSummary>>,
 }
@@ -793,6 +1094,8 @@ pub struct SubagentModelAttempt {
     pub model: String,
     pub success: bool,
     pub exit_code: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     pub usage: SubagentUsage,
 }
 
@@ -814,10 +1117,32 @@ pub struct SubagentArtifacts {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AskUserDetails {
     pub question: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
     pub options: Vec<AskUserOption>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub response: Option<String>,
+    pub response: Option<AskUserResponse>,
     pub cancelled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum AskUserResponse {
+    #[serde(rename = "selection")]
+    Selection {
+        selections: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        comment: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CodeSearchDetails {
+    pub query: String,
+    pub max_tokens: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -838,11 +1163,15 @@ pub struct WebSearchDetails {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReadDetails {
     pub truncation: TruncationInfo,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lines_truncated: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub match_limit_reached: Option<u32>,
 }
 
-/// Grep tool result details. Either or both of `matchLimitReached` and
-/// `linesTruncated` may be present depending on which limit (or both) was
-/// hit, with at least one always present when `details` is emitted.
+/// Either or both of `matchLimitReached` and `linesTruncated` may be
+/// present depending on which limit (or both) was hit, with at least one
+/// always present when `details` is emitted.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GrepDetails {
@@ -853,6 +1182,39 @@ pub struct GrepDetails {
     /// Whether output was further truncated because line/byte caps were hit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lines_truncated: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct McpDetails {
+    pub mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_result: Option<McpCallResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct McpCallResult {
+    pub content: Vec<TextContentItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_content: Option<McpStructuredContent>,
+    pub is_error: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpStructuredContent {
+    pub exit_code: i32,
+    pub stderr: String,
+    pub stdout: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -872,7 +1234,6 @@ pub struct TruncationInfo {
     /// The truncated payload that the model actually saw.
     pub content: String,
     pub truncated: bool,
-    /// Which limit caused truncation, e.g. `"bytes"` or `"lines"`.
     pub truncated_by: TruncatedBy,
     pub total_lines: u64,
     pub total_bytes: u64,
@@ -914,6 +1275,8 @@ pub struct TodoDetails {
     pub params: TodoArgs,
     pub tasks: Vec<TodoTask>,
     pub next_id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -963,17 +1326,20 @@ pub struct DcpStateData {
 ///
 /// Pi stores enough metadata here to render the compressed block in the UI
 /// and to allow rehydration: the topic + summary text, the time range it
-/// spans, and bookkeeping fields used by the DCP loop. Timestamps are
-/// JavaScript epoch millis (numeric), not ISO strings.
+/// spans, and bookkeeping fields used by the DCP loop. Start/end/anchor
+/// timestamps use `Decimal` because DCP can anchor a block halfway between
+/// two messages, which shows up in logs as a `.5` epoch-millis value.
+/// `created_at` is just the wall-clock write time for the block itself, so
+/// it stays a whole-millisecond `i64`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CompressionBlock {
     pub id: u32,
     pub topic: String,
     pub summary: String,
-    pub start_timestamp: i64,
-    pub end_timestamp: i64,
-    pub anchor_timestamp: i64,
+    pub start_timestamp: Decimal,
+    pub end_timestamp: Decimal,
+    pub anchor_timestamp: Decimal,
     pub active: bool,
     pub summary_token_estimate: u32,
     pub created_at: i64,
@@ -1017,11 +1383,11 @@ pub struct WebSearchResult {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PlannotatorExecuteData {
-    /// Path to the plan markdown that the user just approved for execution.
-    /// Newer pi versions emit this as `lastSubmittedPath`; older ones used
-    /// `planFilePath`.
+    /// Path to the plan markdown that newer pi versions store as
+    /// `lastSubmittedPath` after the user approves execution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_submitted_path: Option<PathBuf>,
+    /// Older pi versions stored the same path under `planFilePath`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_file_path: Option<PathBuf>,
 }
@@ -1082,7 +1448,6 @@ pub enum ParseError {
     },
 }
 
-/// Parse a single JSON-encoded pi log line.
 pub fn parse_line(raw: &str) -> Result<PiLogLine, ParseError> {
     serde_json::from_str::<PiLogLine>(raw).map_err(|source| ParseError::SingleLine {
         content: raw.to_owned(),
@@ -1090,8 +1455,6 @@ pub fn parse_line(raw: &str) -> Result<PiLogLine, ParseError> {
     })
 }
 
-/// Parse every non-empty line of a pi session log file into a [`PiLogLine`].
-///
 /// Errors carry the file path and 1-based line number of the offending line
 /// so callers can report precise coverage failures.
 pub fn parse_file(path: impl AsRef<Path>) -> Result<Vec<PiLogLine>, ParseError> {
