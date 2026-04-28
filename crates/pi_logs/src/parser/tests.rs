@@ -376,6 +376,22 @@ fn parse_tool_result_message(value: Value) -> ToolResultMessage {
     *tool_result
 }
 
+// Keep this overlapping Ls/Find details shape shared so the augmentation
+// and dispatch tests cannot drift away from the same serde case.
+fn parse_ls_lean_ctx_fixture(truncated: bool, compression: Value) -> ToolResultMessage {
+    parse_tool_result_message(tool_result_message_json(
+        "ls",
+        vec![json!({"type": "text", "text": "listing"})],
+        false,
+        Some(json!({
+            "path": "crates",
+            "source": "lean-ctx",
+            "truncated": truncated,
+            "compression": compression,
+        })),
+    ))
+}
+
 fn parse_bash_execution_message(value: Value) -> BashExecutionMessage {
     let RoleMessage::BashExecution(bash_execution) = parse_role_message(value) else {
         panic!("expected BashExecution")
@@ -913,6 +929,19 @@ fn subagent_tool_result_accepts_error_fields() {
         details.results[0].tool_calls.as_ref().unwrap()[0].text,
         "grep {\"pattern\":\"duplication\"}"
     );
+
+    // The wire fixture carries a non-zero `durationMs`, so asserting
+    // `progress_summary` value-by-value pins both the camelCase rename and the
+    // numeric meaning. A swap of `tool_count`/`tokens`/`duration_ms` would
+    // otherwise survive parsing because the underlying struct is
+    // `deny_unknown_fields` only, not value-checked.
+    let progress_summary = details.results[0]
+        .progress_summary
+        .as_ref()
+        .expect("expected progress_summary");
+    assert_eq!(progress_summary.tool_count, 0);
+    assert_eq!(progress_summary.tokens, 0);
+    assert_eq!(progress_summary.duration_ms, 4136);
 }
 
 #[test]
@@ -1164,8 +1193,12 @@ fn read_tool_result_accepts_lines_truncated() {
         panic!("expected Read details")
     };
 
-    assert!(details.truncation.truncated);
-    assert_eq!(details.truncation.truncated_by, TruncatedBy::Bytes);
+    let truncation = details
+        .truncation
+        .as_ref()
+        .expect("expected truncation details");
+    assert!(truncation.truncated);
+    assert_eq!(truncation.truncated_by, TruncatedBy::Bytes);
     assert_eq!(details.lines_truncated, Some(true));
     assert_eq!(details.match_limit_reached, Some(100));
 }
@@ -1415,7 +1448,10 @@ fn custom_plannotator() {
                 details.last_submitted_path,
                 Some(PathBuf::from("/tmp/submitted.md"))
             );
-            assert_eq!(details.saved_state.as_deref(), Some("draft"));
+            assert_eq!(
+                details.saved_state,
+                Some(PlannotatorSavedState::Legacy("draft".to_string()))
+            );
         }
         other => panic!("expected Plannotator, got {other:?}"),
     }
@@ -1442,9 +1478,39 @@ fn custom_web_search_results() {
         }),
     ) {
         CustomPayload::WebSearchResults(results) => {
-            assert_eq!(results.kind, WebSearchResultsKind::Search);
-            assert_eq!(results.queries.len(), 1);
-            assert_eq!(results.queries[0].provider, "exa");
+            let WebSearchResultsPayload::Search(search) = &results.payload else {
+                panic!("expected Search payload, got {:?}", results.payload);
+            };
+            assert_eq!(search.queries.len(), 1);
+            assert_eq!(search.queries[0].provider.as_deref(), Some("exa"));
+        }
+        other => panic!("expected WebSearchResults, got {other:?}"),
+    }
+}
+
+#[test]
+fn custom_web_search_results_fetch() {
+    match parse_custom_payload(
+        "web-search-results",
+        json!({
+            "id": "fetch_1",
+            "timestamp": MESSAGE_TIMESTAMP,
+            "type": "fetch",
+            "urls": [{
+                "url": "https://example.com",
+                "title": "Example",
+                "content": "# Example",
+                "error": null
+            }]
+        }),
+    ) {
+        CustomPayload::WebSearchResults(results) => {
+            let WebSearchResultsPayload::Fetch(fetch) = &results.payload else {
+                panic!("expected Fetch payload, got {:?}", results.payload);
+            };
+            assert_eq!(fetch.urls.len(), 1);
+            assert_eq!(fetch.urls[0].url, "https://example.com");
+            assert_eq!(fetch.urls[0].error, None);
         }
         other => panic!("expected WebSearchResults, got {other:?}"),
     }
@@ -1633,4 +1699,870 @@ fn parse_file_reports_path_and_line() {
         }
         other => panic!("expected LineParse, got {other:?}"),
     }
+}
+
+#[test]
+fn find_tool_result_accepts_lean_ctx_augmentation() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "find",
+        vec![json!({"type": "text", "text": "matches"})],
+        false,
+        Some(json!({
+            "path": "crates",
+            "pattern": "*.rs",
+            "source": "lean-ctx",
+            "truncated": false,
+            "compression": {"originalTokens": 1234, "compressedTokens": 456, "percentSaved": 63}
+        })),
+    ));
+    let Some(ToolResultDetails::Find(details)) = tool_result.details else {
+        panic!("expected Find details")
+    };
+    assert_eq!(details.path, Some(PathBuf::from("crates")));
+    assert_eq!(details.pattern.as_deref(), Some("*.rs"));
+    assert_eq!(details.source, Some(ToolResultSource::LeanCtx));
+    assert_eq!(details.truncated, Some(false));
+    let compression = details.compression.expect("expected compression");
+    assert_eq!(compression.original_tokens, 1234);
+    assert_eq!(compression.compressed_tokens, 456);
+    assert_eq!(compression.percent_saved, 63);
+}
+
+#[test]
+fn find_tool_result_accepts_legacy_result_limit() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "find",
+        vec![json!({"type": "text", "text": "..."})],
+        false,
+        Some(json!({"resultLimitReached": 250})),
+    ));
+    let Some(ToolResultDetails::Find(details)) = tool_result.details else {
+        panic!("expected Find details")
+    };
+    assert_eq!(details.result_limit_reached, Some(250));
+    assert!(details.compression.is_none());
+}
+
+#[test]
+fn ls_tool_result_accepts_lean_ctx_augmentation() {
+    let tool_result = parse_ls_lean_ctx_fixture(
+        true,
+        json!({"originalTokens": 100, "compressedTokens": 40, "percentSaved": 60}),
+    );
+    let Some(ToolResultDetails::Ls(details)) = tool_result.details else {
+        panic!("expected Ls details")
+    };
+    assert_eq!(details.path, Some(PathBuf::from("crates")));
+    assert_eq!(details.source, Some(ToolResultSource::LeanCtx));
+    assert_eq!(details.truncated, Some(true));
+    let compression = details.compression.expect("expected compression");
+    assert_eq!(compression.original_tokens, 100);
+    assert_eq!(compression.compressed_tokens, 40);
+    assert_eq!(compression.percent_saved, 60);
+    assert!(details.entry_limit_reached.is_none());
+}
+
+#[test]
+fn ls_tool_result_accepts_entry_limit_only() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "ls",
+        vec![json!({"type": "text", "text": "..."})],
+        false,
+        Some(json!({"entryLimitReached": 500})),
+    ));
+    let Some(ToolResultDetails::Ls(details)) = tool_result.details else {
+        panic!("expected Ls details")
+    };
+    assert_eq!(details.entry_limit_reached, Some(500));
+    assert!(details.compression.is_none());
+}
+
+#[test]
+fn git_read_only_tool_result_accepts_details() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "git_read_only_log",
+        vec![json!({"type": "text", "text": "log output"})],
+        false,
+        Some(json!({"server": "git-read-only", "tool": "log"})),
+    ));
+    let Some(ToolResultDetails::GitReadOnly(details)) = tool_result.details else {
+        panic!("expected GitReadOnly details")
+    };
+    assert_eq!(details.server, "git-read-only");
+    assert_eq!(details.tool, "log");
+}
+
+#[test]
+fn fetch_content_tool_result_accepts_details() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "fetch_content",
+        vec![json!({"type": "text", "text": "fetched"})],
+        false,
+        Some(json!({
+            "urls": ["https://example.com/a", "https://example.com/b"],
+            "urlCount": 2,
+            "successful": 2,
+            "totalChars": 12000u64,
+            "title": "Example",
+            "responseId": "resp_1",
+            "truncated": false,
+            "hasImage": false,
+            "imageCount": 0,
+            "prompt": null
+        })),
+    ));
+    let Some(ToolResultDetails::FetchContent(details)) = tool_result.details else {
+        panic!("expected FetchContent details")
+    };
+    assert_eq!(details.urls.len(), 2);
+    assert_eq!(details.url_count, 2);
+    assert_eq!(details.successful, 2);
+    assert_eq!(details.total_chars, 12000);
+    assert_eq!(details.title, "Example");
+    assert_eq!(details.response_id, "resp_1");
+    assert!(!details.truncated);
+    assert!(!details.has_image);
+    assert_eq!(details.image_count, 0);
+    assert!(details.prompt.is_none());
+}
+
+#[test]
+fn get_search_content_tool_result_accepts_details() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "get_search_content",
+        vec![json!({"type": "text", "text": "cached body"})],
+        false,
+        Some(json!({"url": "https://example.com", "title": "Example", "contentLength": 4096u64})),
+    ));
+    let Some(ToolResultDetails::GetSearchContent(details)) = tool_result.details else {
+        panic!("expected GetSearchContent details")
+    };
+    assert_eq!(details.url, "https://example.com");
+    assert_eq!(details.title, "Example");
+    assert_eq!(details.content_length, 4096);
+}
+
+// `fullOutputPath` is the bash-specific discriminator that distinguishes
+// BashDetails from the all-optional GrepDetails / ReadDetails / LsDetails /
+// FindDetails variants in the untagged enum. A bash result with only
+// `{compression}` would silently land in Grep (the first all-optional
+// variant), so this test pairs the lean-ctx compression breadcrumb with
+// `fullOutputPath` to pin Bash unambiguously. We use `fullOutputPath` rather
+// than `truncation` because `TruncationInfo` has many required fields that
+// would bloat the fixture.
+#[test]
+fn bash_tool_result_accepts_lean_ctx_compression() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "bash",
+        vec![json!({"type": "text", "text": "compressed output"})],
+        false,
+        Some(json!({
+            "fullOutputPath": "/tmp/bash-output.log",
+            "compression": {"originalTokens": 5000, "compressedTokens": 1500, "percentSaved": 70}
+        })),
+    ));
+    let Some(ToolResultDetails::Bash(details)) = tool_result.details else {
+        panic!("expected Bash details")
+    };
+    let compression = details.compression.expect("expected compression");
+    assert_eq!(compression.original_tokens, 5000);
+    assert_eq!(compression.compressed_tokens, 1500);
+    assert_eq!(compression.percent_saved, 70);
+    assert_eq!(
+        details.full_output_path,
+        Some(PathBuf::from("/tmp/bash-output.log"))
+    );
+    assert!(details.truncation.is_none());
+}
+
+#[test]
+fn read_tool_result_accepts_lean_ctx_only() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "read",
+        vec![json!({"type": "text", "text": "lean-ctx wrapped read"})],
+        false,
+        Some(json!({
+            "path": "src/lib.rs",
+            "source": "lean-ctx",
+            "mode": "full",
+            "compression": {"originalTokens": 800, "compressedTokens": 600, "percentSaved": 25}
+        })),
+    ));
+    let Some(ToolResultDetails::Read(details)) = tool_result.details else {
+        panic!("expected Read details")
+    };
+    assert!(details.truncation.is_none());
+    assert_eq!(details.path, Some(PathBuf::from("src/lib.rs")));
+    assert_eq!(details.source, Some(ToolResultSource::LeanCtx));
+    assert_eq!(details.mode.as_deref(), Some("full"));
+    assert!(details.compression.is_some());
+}
+
+#[test]
+fn ask_user_tool_result_accepts_freeform_response() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "ask_user",
+        vec![json!({"type": "text", "text": "User typed: hello"})],
+        false,
+        Some(json!({
+            "question": "What's your favorite editor?",
+            "context": "Tooling preference",
+            "options": [{"title": "neovim"}, {"title": "emacs"}],
+            "response": {"kind": "freeform", "text": "helix"},
+            "cancelled": false
+        })),
+    ));
+    let Some(ToolResultDetails::AskUser(details)) = tool_result.details else {
+        panic!("expected AskUser details")
+    };
+    match details.response {
+        Some(AskUserResponse::Freeform { text }) => assert_eq!(text, "helix"),
+        other => panic!("expected freeform response, got {other:?}"),
+    }
+}
+
+// `grep_tool_result_accepts_both_limits` already exercises the bare
+// `{matchLimitReached, linesTruncated}` shape; this test pins the ordering
+// contract: ReadDetails became permissive enough after the lean-ctx
+// augmentation to absorb the same shape, so Grep MUST precede Read in the
+// untagged enum or a future reorder would silently misclassify these results.
+#[test]
+fn grep_details_without_optional_read_fields_lands_in_grep() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "grep",
+        vec![json!({"type": "text", "text": "..."})],
+        false,
+        Some(json!({"matchLimitReached": 50, "linesTruncated": true})),
+    ));
+    assert!(matches!(tool_result.details, Some(ToolResultDetails::Grep(_))));
+}
+
+#[test]
+fn ctx_cache_tool_call_accepts_action_and_path() {
+    let tool_call = parse_tool_call(
+        "ctx_cache",
+        json!({
+            "action": "invalidate",
+            "path": "crates/moriarty/src/api_pricing/analyzer_tests.rs"
+        }),
+    );
+    let ToolCallArguments::CtxCache(ref args) = tool_call.tool else {
+        panic!("expected CtxCache tool call")
+    };
+    assert_eq!(args.action, "invalidate");
+    assert_eq!(
+        args.path,
+        PathBuf::from("crates/moriarty/src/api_pricing/analyzer_tests.rs")
+    );
+    assert_eq!(tool_call.name(), ToolName::CtxCache);
+}
+
+#[test]
+fn git_read_only_log_tool_call_accepts_snake_case_args() {
+    let tool_call = parse_tool_call(
+        "git_read_only_log",
+        json!({"project_dir": "/tmp/repo", "args": ["--oneline", "-n", "5"]}),
+    );
+    let ToolCallArguments::GitReadOnlyLog(ref args) = tool_call.tool else {
+        panic!("expected GitReadOnlyLog tool call")
+    };
+    assert_eq!(args.project_dir, PathBuf::from("/tmp/repo"));
+    assert_eq!(args.args, vec!["--oneline", "-n", "5"]);
+    assert_eq!(tool_call.name(), ToolName::GitReadOnlyLog);
+}
+
+#[test]
+fn git_read_only_diff_status_show_share_argument_struct() {
+    for (tool_name, expected) in [
+        ("git_read_only_diff", ToolName::GitReadOnlyDiff),
+        ("git_read_only_status", ToolName::GitReadOnlyStatus),
+        ("git_read_only_show", ToolName::GitReadOnlyShow),
+    ] {
+        let tool_call = parse_tool_call(
+            tool_name,
+            json!({"project_dir": "/tmp/repo", "args": []}),
+        );
+        assert_eq!(tool_call.name(), expected);
+    }
+}
+
+#[test]
+fn read_tool_call_accepts_empty_arguments_when_aborted() {
+    let tool_call = parse_tool_call("read", json!({}));
+    let ToolCallArguments::Read(args) = tool_call.tool else {
+        panic!("expected Read tool call")
+    };
+    assert!(args.path.is_none());
+    assert!(args.offset.is_none());
+    assert!(args.limit.is_none());
+}
+
+// Pins tolerance for the observed corruption mode where the model echoed
+// the JSON-Schema field name as the value (`"limit": "limit"`) for a
+// numeric argument. We must keep parsing instead of aborting the file.
+#[test]
+fn read_tool_call_accepts_string_garbage_for_numeric_args() {
+    let tool_call = parse_tool_call(
+        "read",
+        json!({"path": "src/lib.rs", "offset": 1, "limit": "limit"}),
+    );
+    let ToolCallArguments::Read(args) = tool_call.tool else {
+        panic!("expected Read tool call")
+    };
+    assert_eq!(args.offset, Some(MaybeU32::Number(1)));
+    assert!(matches!(args.limit, Some(MaybeU32::Garbage(ref s)) if s == "limit"));
+}
+
+#[test]
+fn bash_tool_call_accepts_empty_arguments_when_aborted() {
+    let tool_call = parse_tool_call("bash", json!({}));
+    let ToolCallArguments::Bash(args) = tool_call.tool else {
+        panic!("expected Bash tool call")
+    };
+    assert!(args.command.is_none());
+}
+
+#[test]
+fn edit_tool_call_accepts_fragment_entries_in_corrupt_stream() {
+    let tool_call = parse_tool_call(
+        "edit",
+        json!({
+            "path": "src/lib.rs",
+            "edits": [
+                {"oldText": "alpha", "newText": "beta"},
+                ",",
+                {"oldText": "gamma", "newText": "delta"}
+            ]
+        }),
+    );
+    let ToolCallArguments::Edit(args) = tool_call.tool else {
+        panic!("expected Edit tool call")
+    };
+    let edits = args.edits.expect("expected edits");
+    assert_eq!(edits.len(), 3);
+    // EditReplacement omits `deny_unknown_fields` so the inner fields are
+    // asserted explicitly; otherwise a future field rename in EditReplacement
+    // would silently start emitting `Full(EditReplacement{None, None, None})`
+    // and this test would still pass.
+    let EditEntry::Full(first) = &edits[0] else {
+        panic!("expected Full edit at index 0")
+    };
+    assert_eq!(first.old_text.as_deref(), Some("alpha"));
+    assert_eq!(first.new_text.as_deref(), Some("beta"));
+    assert!(matches!(edits[1], EditEntry::Fragment(ref s) if s == ","));
+    let EditEntry::Full(third) = &edits[2] else {
+        panic!("expected Full edit at index 2")
+    };
+    assert_eq!(third.old_text.as_deref(), Some("gamma"));
+    assert_eq!(third.new_text.as_deref(), Some("delta"));
+}
+
+#[test]
+fn edit_tool_call_accepts_shorthand_format() {
+    let tool_call = parse_tool_call(
+        "edit",
+        json!({"path": "src/lib.rs", "oldText": "alpha", "newText": "beta"}),
+    );
+    let ToolCallArguments::Edit(args) = tool_call.tool else {
+        panic!("expected Edit tool call")
+    };
+    assert!(args.edits.is_none());
+    assert_eq!(args.old_text.as_deref(), Some("alpha"));
+    assert_eq!(args.new_text.as_deref(), Some("beta"));
+}
+
+#[test]
+fn custom_plannotator_accepts_snapshot_saved_state() {
+    match parse_custom_payload(
+        "plannotator",
+        json!({
+            "phase": "planning",
+            "savedState": {
+                "activeTools": ["read", "bash"],
+                "model": {"provider": "anthropic", "id": "claude-opus-4-6"},
+                "thinkingLevel": "medium"
+            }
+        }),
+    ) {
+        CustomPayload::Plannotator(details) => {
+            let Some(PlannotatorSavedState::Snapshot(snapshot)) = details.saved_state else {
+                panic!("expected snapshot saved_state")
+            };
+            assert_eq!(
+                snapshot.active_tools,
+                vec![ToolName::Read, ToolName::Bash]
+            );
+            assert_eq!(snapshot.model.provider, Provider::Anthropic);
+            assert_eq!(snapshot.model.id, "claude-opus-4-6");
+            assert_eq!(snapshot.thinking_level, ThinkingLevel::Medium);
+        }
+        other => panic!("expected Plannotator, got {other:?}"),
+    }
+}
+
+#[test]
+fn custom_message_subagent_notify_has_no_details() {
+    assert!(matches!(
+        parse_custom_message_payload(
+            "Background task failed: timeout",
+            "subagent-notify",
+            None,
+        ),
+        CustomMessagePayload::SubagentNotify
+    ));
+}
+
+#[test]
+fn custom_message_pi_loaded_tools_accepts_extension_and_mcp_names() {
+    match parse_custom_message_payload(
+        "Loaded tools",
+        "pi-loaded-tools",
+        Some(json!({"tools": [
+            loaded_tool_json("read"),
+            loaded_tool_json("ctx_compress"),
+            loaded_tool_json("git_read_only_log"),
+        ]})),
+    ) {
+        CustomMessagePayload::PiLoadedTools(details) => {
+            assert_eq!(details.tools.len(), 3);
+            assert_eq!(details.tools[0].name, ToolName::Read);
+            assert_eq!(details.tools[1].name, ToolName::CtxCompress);
+            assert_eq!(details.tools[2].name, ToolName::GitReadOnlyLog);
+        }
+        other => panic!("expected PiLoadedTools, got {other:?}"),
+    }
+}
+
+#[test]
+fn custom_web_search_results_accepts_aborted_query_without_provider() {
+    match parse_custom_payload(
+        "web-search-results",
+        json!({
+            "id": "search_aborted",
+            "timestamp": MESSAGE_TIMESTAMP,
+            "type": "search",
+            "queries": [{
+                "query": "anything",
+                "answer": "",
+                "results": [],
+                "error": "This operation was aborted"
+            }]
+        }),
+    ) {
+        CustomPayload::WebSearchResults(results) => {
+            let WebSearchResultsPayload::Search(search) = results.payload else {
+                panic!("expected Search payload")
+            };
+            assert!(search.queries[0].provider.is_none());
+            assert_eq!(
+                search.queries[0].error.as_deref(),
+                Some("This operation was aborted")
+            );
+        }
+        other => panic!("expected WebSearchResults, got {other:?}"),
+    }
+}
+
+#[test]
+fn assistant_thinking_without_signature_parses() {
+    let content = parse_first_assistant_content(
+        json!({"type": "thinking", "thinking": "Hmm..."}),
+        AssistantFixture::new(
+            "anthropic-messages",
+            "anthropic",
+            "claude-sonnet-4-5",
+            "aborted",
+        ),
+    );
+    let AssistantContentItem::Thinking {
+        thinking,
+        thinking_signature,
+    } = content
+    else {
+        panic!("expected Thinking content")
+    };
+    assert_eq!(thinking, "Hmm...");
+    assert!(thinking_signature.is_none());
+}
+
+/// Grep also accepts the lean-ctx augmented shape
+/// `{path, pattern, source, compression}`. The Grep→Read ordering is
+/// already pinned by `grep_details_without_optional_read_fields_lands_in_grep`,
+/// but Grep also precedes Find in the untagged enum and the same shape
+/// would otherwise be classifiable as Find. This test pins the full
+/// lean-ctx field set on Grep so a future enum reorder is caught.
+#[test]
+fn grep_tool_result_accepts_full_lean_ctx_augmentation() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "grep",
+        vec![json!({"type": "text", "text": "hits"})],
+        false,
+        Some(json!({
+            "path": "crates",
+            "pattern": "fn parse",
+            "source": "lean-ctx",
+            "compression": {
+                "originalTokens": 4000,
+                "compressedTokens": 1000,
+                "percentSaved": 75
+            }
+        })),
+    ));
+    let Some(ToolResultDetails::Grep(details)) = tool_result.details else {
+        panic!("expected Grep details")
+    };
+    assert_eq!(details.path, Some(PathBuf::from("crates")));
+    assert_eq!(details.pattern.as_deref(), Some("fn parse"));
+    assert_eq!(details.source, Some(ToolResultSource::LeanCtx));
+    let compression = details.compression.expect("expected compression");
+    assert_eq!(compression.original_tokens, 4000);
+    assert_eq!(compression.compressed_tokens, 1000);
+    assert_eq!(compression.percent_saved, 75);
+}
+
+/// ThinkingLevel::Off is a real wire value (`"off"`). High and Medium
+/// already have coverage; this pins the third arm so a typo in the rename
+/// (e.g. `"none"`/`"disabled"`) fails noisily.
+#[test]
+fn thinking_level_change_off() {
+    let line = parse(thinking_level_change_json("m1", "off"));
+    match line {
+        PiLogLine::ThinkingLevelChange(thinking_level) => {
+            assert_eq!(thinking_level.thinking_level, ThinkingLevel::Off);
+        }
+        other => panic!("expected ThinkingLevelChange, got {other:?}"),
+    }
+}
+
+/// Ls precedes Find in the untagged enum because LsDetails keeps
+/// `deny_unknown_fields` while FindDetails permits an extra `pattern`. This
+/// pins the dispatch: an Ls-shaped payload with no `pattern` MUST land in
+/// Ls even though FindDetails could deserialize the same fields.
+#[test]
+fn ls_details_without_pattern_lands_in_ls_not_find() {
+    let tool_result = parse_ls_lean_ctx_fixture(
+        false,
+        json!({
+            "originalTokens": 50,
+            "compressedTokens": 25,
+            "percentSaved": 50
+        }),
+    );
+    match tool_result.details {
+        Some(ToolResultDetails::Ls(_)) => {}
+        other => panic!("expected Ls details, got {other:?}"),
+    }
+}
+
+/// McpDetails carries strict `deny_unknown_fields`, so a silent rename
+/// of `servers` / `connectedCount` / `totalTools` would leave callers parsing
+/// status responses with empty data. This pins all three plus the
+/// McpServerStatus shape.
+#[test]
+fn mcp_tool_result_accepts_status_mode() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "mcp",
+        vec![json!({"type": "text", "text": "status"})],
+        false,
+        Some(json!({
+            "mode": "status",
+            "servers": [
+                {"name": "git-read-only", "status": "connected", "toolCount": 4},
+                {"name": "flaky", "status": "failed", "toolCount": 0, "failedAgo": 12}
+            ],
+            "totalTools": 4,
+            "connectedCount": 1
+        })),
+    ));
+    let Some(ToolResultDetails::Mcp(details)) = tool_result.details else {
+        panic!("expected Mcp details")
+    };
+    assert_eq!(details.mode, "status");
+    assert_eq!(details.total_tools, Some(4));
+    assert_eq!(details.connected_count, Some(1));
+    let servers = details.servers.expect("expected servers");
+    assert_eq!(servers.len(), 2);
+    assert_eq!(servers[0].name, "git-read-only");
+    assert_eq!(servers[0].status, "connected");
+    assert_eq!(servers[0].tool_count, 4);
+    assert!(servers[0].failed_ago.is_none());
+    assert_eq!(servers[1].name, "flaky");
+    assert_eq!(servers[1].status, "failed");
+    assert_eq!(servers[1].tool_count, 0);
+    assert_eq!(servers[1].failed_ago, Some(12));
+}
+
+/// `mode: "list"` populates `tools` and `count` instead
+/// of the status fields. A field rename or a discriminator swap on either
+/// would silently leave callers parsing list responses with `None` while
+/// the data was on the wire.
+#[test]
+fn mcp_tool_result_accepts_list_mode() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "mcp",
+        vec![json!({"type": "text", "text": "list"})],
+        false,
+        Some(json!({
+            "mode": "list",
+            "server": "git-read-only",
+            "tools": ["status", "diff", "log", "show"],
+            "count": 4
+        })),
+    ));
+    let Some(ToolResultDetails::Mcp(details)) = tool_result.details else {
+        panic!("expected Mcp details")
+    };
+    assert_eq!(details.mode, "list");
+    assert_eq!(details.server.as_deref(), Some("git-read-only"));
+    assert_eq!(
+        details.tools,
+        Some(vec![
+            "status".to_string(),
+            "diff".to_string(),
+            "log".to_string(),
+            "show".to_string()
+        ])
+    );
+    assert_eq!(details.count, Some(4));
+    assert!(details.servers.is_none());
+}
+
+/// `mode: "call"` errors of kind `tool_not_found`
+/// surface the missing tool name in `requested_tool`. Without an
+/// explicit test, a rename of that field would silently drop the only
+/// signal callers have for which tool was asked for.
+#[test]
+fn mcp_tool_result_accepts_tool_not_found_error() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "mcp",
+        vec![json!({"type": "text", "text": "tool not found"})],
+        true,
+        Some(json!({
+            "mode": "call",
+            "server": "git-read-only",
+            "tool": "rebase",
+            "error": "tool_not_found",
+            "message": "Server 'git-read-only' does not expose tool 'rebase'",
+            "requestedTool": "rebase"
+        })),
+    ));
+    let Some(ToolResultDetails::Mcp(details)) = tool_result.details else {
+        panic!("expected Mcp details")
+    };
+    assert_eq!(details.mode, "call");
+    assert_eq!(details.server.as_deref(), Some("git-read-only"));
+    assert_eq!(details.tool.as_deref(), Some("rebase"));
+    assert_eq!(details.error.as_deref(), Some("tool_not_found"));
+    assert_eq!(details.requested_tool.as_deref(), Some("rebase"));
+    // `McpDetails` does not derive `deny_unknown_fields`, so the
+    // tool-not-found shape would silently absorb a stray `mcpResult` payload.
+    // Pinning `is_none()` keeps that negative-shape guarantee under test.
+    assert!(details.mcp_result.is_none());
+}
+
+/// SubagentResultDetails has Optional `progress` (live progress
+/// snapshots) and `async_id` (id assigned to background runs) that aren't
+/// touched by existing tests. A field rename on either would silently leave
+/// callers with `None` while real data was on the wire.
+#[test]
+fn subagent_tool_result_accepts_async_progress() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "subagent",
+        vec![json!({"type": "text", "text": "queued"})],
+        false,
+        Some(json!({
+            "mode": "async",
+            "results": [{"agent": "scout"}],
+            "asyncId": "run_42",
+            "asyncDir": "/tmp/scout-run",
+            "progress": [{
+                "index": 0,
+                "agent": "scout",
+                "status": "running",
+                "task": "inspect",
+                "toolCount": 3,
+                "tokens": 1024,
+                "durationMs": 500,
+                "recentTools": ["read", "grep"],
+                "recentOutput": ["matches found"]
+            }]
+        })),
+    ));
+    let Some(ToolResultDetails::Subagent(details)) = tool_result.details else {
+        panic!("expected Subagent details")
+    };
+    assert_eq!(details.mode, "async");
+    assert_eq!(details.async_id.as_deref(), Some("run_42"));
+    assert_eq!(details.async_dir, Some(PathBuf::from("/tmp/scout-run")));
+    let progress = details.progress.expect("expected progress entries");
+    assert_eq!(progress.len(), 1);
+    assert_eq!(progress[0].agent, "scout");
+    assert_eq!(progress[0].status, "running");
+    assert_eq!(progress[0].tool_count, 3);
+    assert_eq!(progress[0].tokens, 1024);
+    assert_eq!(progress[0].duration_ms, 500);
+    assert_eq!(progress[0].recent_tools, vec!["read", "grep"]);
+    assert_eq!(progress[0].recent_output, vec!["matches found"]);
+    // The fixture supplies `task: "inspect"` and `index: 0`; without
+    // these asserts a rename of either field on `SubagentProgressEntry` would
+    // leak past `deny_unknown_fields` because the new field name would just
+    // appear as additional unknown data on a different code path.
+    assert_eq!(progress[0].task, "inspect");
+    assert_eq!(progress[0].index, 0);
+}
+
+/// `parent_session` is the Rust field, but pi writes the camelCase wire key
+/// `parentSession`. Without this test, a rename drift would silently leave the
+/// parsed field as `None`.
+#[test]
+fn session_line_with_parent_session() {
+    let line = parse(json!({
+        "type": "session",
+        "version": 1,
+        "id": SESSION_ID,
+        "timestamp": FIXED_TIMESTAMP,
+        "cwd": "/home/brendan/src/moriarty",
+        "parentSession": "/home/brendan/.flk/sessions/parent.jsonl"
+    }));
+    match line {
+        PiLogLine::Session(session) => {
+            assert_eq!(
+                session.parent_session,
+                Some(PathBuf::from("/home/brendan/.flk/sessions/parent.jsonl"))
+            );
+        }
+        other => panic!("expected Session, got {other:?}"),
+    }
+}
+
+// Pins the empirical contract documented at the crate level: a struct that
+// `#[serde(flatten)]`s an *adjacently*-tagged enum (here ToolCallArguments,
+// `tag = "name", content = "arguments"`) can still carry
+// `deny_unknown_fields` and reject sibling-key drift. If serde ever changes
+// this codegen path so that flatten silently disables strictness, this test
+// will start passing into Ok and the regression is caught.
+#[test]
+fn tool_call_content_rejects_unknown_top_level_field() {
+    let line = message_line_json(
+        "a1",
+        "u1",
+        json!({
+            "role": "assistant",
+            "content": [{
+                "type": "toolCall",
+                "id": "call_1",
+                "name": "bash",
+                "arguments": {"command": "ls"},
+                "extraUnknown": "should be rejected"
+            }],
+            "api": "openai-responses",
+            "provider": "openai",
+            "model": "gpt-5.4",
+            "requestId": "req_1",
+            "stopReason": "toolUse"
+        }),
+    );
+    // If deny_unknown_fields fires, parse_err returns Ok.
+    // If not, this assertion will panic and we know the rule is non-functional.
+    let _err = parse_err(line);
+}
+
+/// GitReadOnlyArgs.args defaults to an empty Vec when the key is
+/// absent. Pins `#[serde(default)]` against accidental removal.
+#[test]
+fn git_read_only_tool_call_accepts_absent_args_key() {
+    let tool_call = parse_tool_call(
+        "git_read_only_status",
+        json!({"project_dir": "/tmp/repo"}),
+    );
+    let ToolCallArguments::GitReadOnlyStatus(args) = tool_call.tool else {
+        panic!("expected GitReadOnlyStatus tool call")
+    };
+    assert!(args.args.is_empty());
+    assert_eq!(args.project_dir, PathBuf::from("/tmp/repo"));
+}
+
+/// No other test asserts `AssistantUsage` value-by-value. The
+/// struct is `deny_unknown_fields` so wire-shape changes parse-fail loudly,
+/// but a swap of `cache_read`↔`cache_write` (or any other field rename) would
+/// remain invisible because the camelCase wire keys map onto same-typed
+/// fields. Pinning each token count and each cost component as the canonical
+/// string preserves field-meaning under refactors.
+#[test]
+fn assistant_usage_preserves_field_meaning() {
+    let assistant = parse_assistant_message(
+        vec![json!({"type": "text", "text": "reply"})],
+        AssistantFixture::new(
+            "anthropic-messages",
+            "anthropic",
+            "claude-sonnet-4-5",
+            "stop",
+        ),
+    );
+    let usage = &assistant.usage;
+    assert_eq!(usage.input, 10);
+    assert_eq!(usage.output, 5);
+    assert_eq!(usage.cache_read, 0);
+    assert_eq!(usage.cache_write, 0);
+    assert_eq!(usage.total_tokens, 15);
+    // Comparing via `to_string()` keeps the test free of a fresh `FromStr`
+    // import while still pinning each cost component to its exact wire repr,
+    // including the trailing zeros on the zero-cost fields.
+    assert_eq!(usage.cost.input.to_string(), "0.00003");
+    assert_eq!(usage.cost.output.to_string(), "0.000075");
+    assert_eq!(usage.cost.cache_read.to_string(), "0");
+    assert_eq!(usage.cost.cache_write.to_string(), "0");
+    assert_eq!(usage.cost.total.to_string(), "0.000105");
+}
+
+/// The cancelled path through `ask_user` omits `response` entirely
+/// while setting `cancelled: true`. Without an explicit test, a regression
+/// that swallowed the `cancelled` flag (or made `response` required) would
+/// only be caught by users hitting the cancellation path in the wild.
+#[test]
+fn ask_user_tool_result_accepts_cancelled() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "ask_user",
+        vec![json!({"type": "text", "text": "User cancelled"})],
+        false,
+        Some(json!({
+            "question": "Continue?",
+            "options": [{"title": "Yes"}, {"title": "No"}],
+            "cancelled": true
+        })),
+    ));
+    let Some(ToolResultDetails::AskUser(details)) = tool_result.details else {
+        panic!("expected AskUser details")
+    };
+    assert!(details.cancelled);
+    assert!(details.response.is_none());
+    assert!(details.context.is_none());
+    assert_eq!(details.options.len(), 2);
+}
+
+/// `SubagentResultDetails.mode` is a freeform `String`, so a typo
+/// like `"paralel"` would parse silently. Pinning the canonical "parallel"
+/// string with a multi-result fixture documents the wire convention and
+/// guards against an accidental rename of the field itself.
+#[test]
+fn subagent_tool_result_accepts_parallel_mode() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "subagent",
+        vec![json!({"type": "text", "text": "parallel run complete"})],
+        false,
+        Some(json!({
+            "mode": "parallel",
+            "results": [
+                {"agent": "alpha"},
+                {"agent": "beta"}
+            ]
+        })),
+    ));
+    let Some(ToolResultDetails::Subagent(details)) = tool_result.details else {
+        panic!("expected Subagent details")
+    };
+    assert_eq!(details.mode, "parallel");
+    assert_eq!(details.results.len(), 2);
+    assert_eq!(details.results[0].agent.as_deref(), Some("alpha"));
+    assert_eq!(details.results[1].agent.as_deref(), Some("beta"));
 }

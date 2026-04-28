@@ -1,10 +1,40 @@
 //! Strongly typed serde models for pi session log lines.
 //!
 //! A pi session log file is newline-delimited JSON. Each line is a
-//! [`PiLogLine`] keyed by the top-level `type` field. All nested payloads are
+//! [`PiLogLine`] keyed by the top-level `type` field. Most nested payloads are
 //! modeled as tagged enums or concrete structs with
 //! `#[serde(deny_unknown_fields)]` so that upstream format changes surface as
 //! parse errors rather than silent data loss.
+//!
+//! Two categories of structure legitimately deviate from the strict default:
+//!
+//! * **`serde(flatten)` of an internally-tagged enum** — when the flattened
+//!   target is an internally-tagged enum (one with `#[serde(tag = "...")]`
+//!   and no `content`), serde's flatten codegen does not register the tag
+//!   field as "claimed" by the inner enum, so a strict outer struct rejects
+//!   it as unknown. The only struct in this category is
+//!   [`WebSearchResultsData`], which therefore omits `deny_unknown_fields`
+//!   and relies on the closed-enum discriminator of the flattened payload
+//!   plus per-variant strict structs to catch field-level drift. Adjacently
+//!   tagged flatten targets (those with both `tag` and `content`) do *not*
+//!   suffer this collision, so [`CustomLine`], [`CustomMessageLine`], and
+//!   [`ToolCallContent`] all keep `deny_unknown_fields` despite flattening.
+//!
+//! * **Corrupt-stream tolerance** — some payloads are absorbed via
+//!   permissive structs or untagged fallback enums so a single corrupted
+//!   record cannot abort an entire log file. Three flavors exist:
+//!     1. Tool-argument structs ([`EditArgs`], [`EditReplacement`],
+//!        [`GrepArgs`]) that omit `deny_unknown_fields` to ignore
+//!        hallucinated sibling keys (e.g. `:path` on grep).
+//!     2. Array-element fallback enums ([`EditEntry`]) whose `Fragment`
+//!        variant captures raw JSON tokens (`,`, `},{`) interspersed
+//!        between real entries when the model truncates mid-stream.
+//!     3. Value-level fallback enums ([`MaybeU32`]) whose `Garbage` variant
+//!        absorbs string-typed corruption (e.g. `"limit": "limit"` where
+//!        the model echoed the schema field name as the value).
+//!
+//! Each corrupt-stream exception carries an inline comment naming the
+//! observed failure mode.
 
 use std::{
     fs::File,
@@ -47,6 +77,10 @@ pub struct SessionLine {
     pub id: Uuid,
     pub timestamp: DateTime<Utc>,
     pub cwd: PathBuf,
+    /// Path to the parent session jsonl when this session was spawned as a
+    /// subagent run; absent for top-level sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -94,14 +128,14 @@ pub struct CompactionDetails {
 // Both of these have a discriminator (`customType`) that lives at the outer
 // level alongside `id`, `parentId`, and `timestamp`. We keep those as normal
 // fields and `#[serde(flatten)]` an adjacently-tagged enum so that the
-// discriminator selects a strongly typed payload. Serde rejects
-// `deny_unknown_fields` on a struct that also uses `flatten`, so the outer
-// wrapper cannot be fully strict here; only the flattened payload enum stays
-// tightly typed.
+// discriminator selects a strongly typed payload. Because the flattened
+// enums use both `tag` and `content`, the discriminator and the variant
+// body live in their own JSON keys, so the outer wrappers stay strict via
+// `deny_unknown_fields` and catch any unknown sibling keys.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CustomLine {
     pub id: String,
     pub parent_id: String,
@@ -126,7 +160,7 @@ pub enum CustomPayload {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CustomMessageLine {
     pub id: String,
     pub parent_id: String,
@@ -145,6 +179,9 @@ pub struct CustomMessageLine {
 pub enum CustomMessagePayload {
     #[serde(rename = "pi-loaded-tools")]
     PiLoadedTools(PiLoadedToolsDetails),
+    /// Marker emitted by the plannotator extension when planning finishes;
+    /// the human-readable summary lives in the outer `content` field and no
+    /// structured `details` payload is attached.
     #[serde(rename = "plannotator-complete")]
     PlannotatorComplete,
     /// Synthetic message injected by the DCP loop asking the assistant to
@@ -152,6 +189,12 @@ pub enum CustomMessagePayload {
     /// human-readable prompt lives in the outer `content` field.
     #[serde(rename = "dcp-compress-trigger")]
     DcpCompressTrigger,
+    /// Surface-level notification emitted by the subagent harness when a
+    /// background run finishes (success or failure). Carries no `details`
+    /// payload; the human-readable summary lives in the outer `content`
+    /// field.
+    #[serde(rename = "subagent-notify")]
+    SubagentNotify,
 }
 
 // ---------------------------------------------------------------------------
@@ -225,6 +268,10 @@ pub struct BashExecutionMessage {
     pub truncated: bool,
     pub timestamp: i64,
     pub exclude_from_context: bool,
+    /// When the response would exceed pi's in-message byte cap, pi spills
+    /// the raw command output to a temp file and exposes the path here so a
+    /// caller can read the untruncated output without re-running the
+    /// command. `None` means no overflow occurred.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full_output_path: Option<PathBuf>,
 }
@@ -338,6 +385,7 @@ pub enum Provider {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ThinkingLevel {
+    Off,
     Medium,
     High,
 }
@@ -393,6 +441,60 @@ pub enum ToolName {
     Todo,
     WebSearch,
     Write,
+    // Tools provided by the pi-lean-ctx extension. They appear in the
+    // `pi-loaded-tools` manifest of sessions where lean-ctx is loaded; we
+    // do not model their argument schemas because we never invoke them
+    // directly.
+    CtxAgent,
+    CtxAnalyze,
+    CtxArchitecture,
+    CtxBenchmark,
+    CtxCache,
+    CtxCallees,
+    CtxCallers,
+    CtxCompress,
+    CtxCompressMemory,
+    CtxContext,
+    CtxCost,
+    CtxDedup,
+    CtxDelta,
+    CtxDiscover,
+    CtxEdit,
+    CtxExecute,
+    CtxExpand,
+    CtxFeedback,
+    CtxFill,
+    CtxGain,
+    CtxGraph,
+    CtxGraphDiagram,
+    CtxHandoff,
+    CtxHeatmap,
+    CtxImpact,
+    CtxIntent,
+    CtxKnowledge,
+    CtxMetrics,
+    CtxOutline,
+    CtxOverview,
+    CtxPrefetch,
+    CtxPreload,
+    CtxResponse,
+    CtxRoutes,
+    CtxSemanticSearch,
+    CtxSession,
+    CtxShare,
+    CtxSmartRead,
+    CtxSymbol,
+    CtxTask,
+    CtxWorkflow,
+    CtxWrapped,
+    // MCP-server tools surfaced as flat top-level names by the
+    // pi-tool-display extension (rather than going through the generic
+    // `mcp` tool). They appear in the `pi-loaded-tools` manifest and as
+    // direct toolCalls in assistant messages.
+    GitReadOnlyDiff,
+    GitReadOnlyLog,
+    GitReadOnlyShow,
+    GitReadOnlyStatus,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -464,6 +566,11 @@ pub enum ToolCallArguments {
     Bash(BashArgs),
     CodeSearch(CodeSearchArgs),
     Compress(CompressArgs),
+    // `ctx_cache` is the only `ctx_*` extension tool the assistant invokes
+    // directly; the other 30+ `Ctx*` variants in `ToolName` are surfaced only
+    // through the `pi-loaded-tools` manifest and never appear as tool calls,
+    // so we deliberately do not model their argument schemas here.
+    CtxCache(CtxCacheArgs),
     Edit(EditArgs),
     FactDelete(FactDeleteArgs),
     FactList(FactListArgs),
@@ -488,6 +595,10 @@ pub enum ToolCallArguments {
     Todo(TodoArgs),
     WebSearch(WebSearchArgs),
     Write(WriteArgs),
+    GitReadOnlyDiff(GitReadOnlyArgs),
+    GitReadOnlyLog(GitReadOnlyArgs),
+    GitReadOnlyShow(GitReadOnlyArgs),
+    GitReadOnlyStatus(GitReadOnlyArgs),
 }
 
 impl ToolCallArguments {
@@ -497,6 +608,7 @@ impl ToolCallArguments {
             Self::Bash(_) => ToolName::Bash,
             Self::CodeSearch(_) => ToolName::CodeSearch,
             Self::Compress(_) => ToolName::Compress,
+            Self::CtxCache(_) => ToolName::CtxCache,
             Self::Edit(_) => ToolName::Edit,
             Self::FactDelete(_) => ToolName::FactDelete,
             Self::FactList(_) => ToolName::FactList,
@@ -521,8 +633,28 @@ impl ToolCallArguments {
             Self::Todo(_) => ToolName::Todo,
             Self::WebSearch(_) => ToolName::WebSearch,
             Self::Write(_) => ToolName::Write,
+            Self::GitReadOnlyDiff(_) => ToolName::GitReadOnlyDiff,
+            Self::GitReadOnlyLog(_) => ToolName::GitReadOnlyLog,
+            Self::GitReadOnlyShow(_) => ToolName::GitReadOnlyShow,
+            Self::GitReadOnlyStatus(_) => ToolName::GitReadOnlyStatus,
         }
     }
+}
+
+/// Common shape for the `git_read_only_*` MCP tools surfaced by
+/// `pi-tool-display`. Every variant takes the same `{project_dir, args}`
+/// pair, so we share a single struct.
+///
+/// Unlike most arg structs in this file, `GitReadOnlyArgs` deliberately does
+/// not declare `rename_all = "camelCase"`. The MCP tool definitions emit
+/// arguments in snake_case (`project_dir`), so the field names already match
+/// the wire format verbatim.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GitReadOnlyArgs {
+    pub project_dir: PathBuf,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -579,20 +711,43 @@ pub struct TodoArgs {
     pub include_deleted: Option<bool>,
 }
 
+/// Numeric tool-call arguments that pi normally records as integers, but
+/// which corrupted model streams have been observed to emit as the
+/// JSON-Schema field name as a string value (e.g. `"limit": "limit"`).
+///
+/// `Garbage` only absorbs JSON-string-typed corruption. Other malformed
+/// shapes — booleans (`true`), `null`, floats, or out-of-range integers —
+/// still produce a hard parse error because they match neither variant.
+/// We constrain the fallback this narrowly so unexpected new corruption
+/// modes stay loud at parse time.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MaybeU32 {
+    Number(u32),
+    Garbage(String),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReadArgs {
-    pub path: PathBuf,
+    /// Optional because aborted toolCalls (`stopReason: "aborted"`) can
+    /// land in the log with `arguments: {}` before the model finished
+    /// streaming a path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub offset: Option<u32>,
+    pub path: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limit: Option<u32>,
+    pub offset: Option<MaybeU32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<MaybeU32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BashArgs {
-    pub command: String,
+    /// Optional because aborted toolCalls can record `arguments: {}` when
+    /// the model never finished emitting the command string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u64>,
 }
@@ -604,22 +759,84 @@ pub struct WriteArgs {
     pub content: String,
 }
 
+/// Pi has emitted two shapes for `edit` tool arguments over time:
+/// 1. Modern multi-edit form: `{path, edits: [{oldText, newText}, ...]}`.
+/// 2. Older single-edit shorthand: `{path, oldText, newText}` with no
+///    `edits` array.
+/// Both `edits` and the `(old_text, new_text)` pair are therefore
+/// optional, with the invariant that exactly one shape is populated for a
+/// well-formed call. `path` is also optional because aborted toolCalls
+/// can land here with `arguments: {}`.
+///
+/// `deny_unknown_fields` is intentionally NOT applied here: completed-but-
+/// corrupted model streams have been observed emitting hallucinated
+/// top-level sibling keys such as `},{` whose values are also garbage
+/// fragments. We silently drop those rather than fail the whole log.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct EditArgs {
-    pub path: PathBuf,
-    pub edits: Vec<EditReplacement>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edits: Option<Vec<EditEntry>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_text: Option<String>,
 }
 
+/// One element of the `edits` array. Normally a structured replacement,
+/// but completed-but-corrupted model streams sometimes intersperse raw
+/// JSON fragments (e.g. `","`, `"},"`) between real entries; we capture
+/// those as `Fragment` so the surrounding call still parses.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(untagged)]
+pub enum EditEntry {
+    Full(EditReplacement),
+    Fragment(String),
+}
+
+/// All fields are optional to tolerate truncated / errored streaming
+/// where the assistant message has `stopReason: "error"` and one of the
+/// entries in `edits` is missing a half before the JSON parser gave up.
+/// `description` is a recently-added free-form annotation pi attaches to
+/// each replacement (e.g. "Encode the user's two decisions...").
+///
+/// `deny_unknown_fields` is intentionally absent: models occasionally
+/// emit hallucinated sibling keys (e.g. `newText_TYPO_GUARD`) or stream
+/// out structurally-valid objects with garbage keys like `},` / `]` /
+/// `:` mid-edit. Tolerating unknown keys keeps those completed-but-
+/// corrupt tool calls parseable instead of poisoning whole sessions.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EditReplacement {
-    pub old_text: String,
-    pub new_text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
+/// `ctx_cache` is the only `ctx_*` extension tool we model with typed
+/// argument structs. Unlike its siblings (which only ever appear in the
+/// `pi-loaded-tools` manifest), `ctx_cache` is invoked directly by the
+/// assistant in real session logs, so we need its argument schema to
+/// deserialize those tool calls cleanly.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CtxCacheArgs {
+    pub action: String,
+    pub path: PathBuf,
+}
+
+/// `deny_unknown_fields` is intentionally omitted. Models occasionally
+/// hallucinate sibling keys here — we've observed gpt-5.4 emitting
+/// `:path` alongside `path`, and Sonnet emitting an `offset` parameter
+/// that grep does not support. Tolerating unknown fields keeps these
+/// otherwise-valid tool calls parseable.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GrepArgs {
     pub pattern: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -765,6 +982,13 @@ pub struct OptionalScopeIdArgs {
 
 pub type FactDeleteArgs = OptionalScopeIdArgs;
 
+/// Both `url` and `urls` are optional because the caller passes one or the
+/// other (single fetch vs batch); aborted tool calls may also land with
+/// neither set. Both being `Some` is malformed but parses without error
+/// because we cannot express "exactly one of" in serde without a custom
+/// deserializer; downstream analysis is responsible for flagging that case.
+/// `prompt` is Gemini-specific (used to direct video/page analysis) and is
+/// absent for plain Readability extraction.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FetchContentArgs {
@@ -784,6 +1008,14 @@ pub struct FetchContentArgs {
     pub model: Option<String>,
 }
 
+/// `response_id` is the only required field because it is the cache key
+/// referencing the prior `fetch_content` / `web_search` call whose body is
+/// being replayed; without it there is nothing to look up. The four
+/// optional fields form two independent selection axes for picking a
+/// specific entry inside that cached response: `query`/`query_index` for
+/// search results, `url`/`url_index` for fetched pages. Mixing axes is
+/// caller error but parses successfully; with all four absent the entire
+/// cached response is returned.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GetSearchContentArgs {
@@ -888,6 +1120,10 @@ pub struct McpArgs {
     pub args: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
+    /// Server name passed when the caller wants to force a connect rather
+    /// than just listing tools (`mcp({connect: "..."})`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -999,13 +1235,81 @@ pub enum ToolResultDetails {
     AskUser(AskUserDetails),
     CodeSearch(CodeSearchDetails),
     WebSearch(WebSearchDetails),
-    Read(ReadDetails),
+    // Grep precedes Read because both share `matchLimitReached` and
+    // `linesTruncated`, and ReadDetails is now permissive enough (its
+    // `truncation` field is optional to support lean-ctx augmentations) that
+    // a bare `{matchLimitReached, linesTruncated}` payload would otherwise
+    // be matched by ReadDetails first.
+    //
+    // Reciprocal-risk note: this ordering is asymmetric. A legitimate
+    // pattern-mode `read` result whose details payload only carries
+    // `{matchLimitReached, linesTruncated}` will silently classify as
+    // `Grep(GrepDetails)` rather than `Read(ReadDetails)`. The two structs
+    // share those exact fields, so no data is lost — and `tool_name` on
+    // the surrounding message disambiguates the originating tool — but
+    // typed-enum routing alone cannot tell them apart from this payload
+    // shape. Consumers that branch on the enum variant (rather than on
+    // `tool_name`) must treat `Grep` as covering both cases.
     Grep(GrepDetails),
+    Read(ReadDetails),
     Mcp(McpDetails),
     Bash(BashDetails),
     PlannotatorSubmitPlan(PlannotatorSubmitPlanDetails),
     Todo(TodoDetails),
     Compress(CompressDetails),
+    // Ls precedes Find because their lean-ctx augmentation shapes overlap on
+    // path/source/truncated/compression. The discriminator is `pattern`:
+    // find's lean-ctx output always carries it, ls never does. With Ls first,
+    // a payload without `pattern` matches Ls; a payload with `pattern` is
+    // rejected by LsDetails (deny_unknown_fields) and falls through to Find.
+    Ls(LsDetails),
+    Find(FindDetails),
+    // The remaining three variants have no shape overlap with anything
+    // above (each carries fields no other variant declares), so their
+    // ordering is arbitrary; they are appended in the order they were
+    // added.
+    GitReadOnly(GitReadOnlyDetails),
+    FetchContent(FetchContentDetails),
+    GetSearchContent(GetSearchContentDetails),
+}
+
+/// Compression breadcrumb appended to tool results that flowed through the
+/// `lean-ctx` extension. The extension records how many tokens it saved
+/// versus the raw tool output.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CompressionInfo {
+    pub original_tokens: u32,
+    pub compressed_tokens: u32,
+    /// Signed because pathological inputs can grow under compression.
+    pub percent_saved: i32,
+}
+
+/// Closed enum so any new `source` value introduced upstream surfaces as a
+/// loud parse error rather than silently being dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ToolResultSource {
+    LeanCtx,
+}
+
+/// `ls` tool results are always either a plain listing (no `details`) or a
+/// lean-ctx augmented listing with this shape. `entry_limit_reached` is
+/// orthogonal to the lean-ctx augmentation and reports the truncation cap
+/// when the directory had more entries than the tool was willing to emit.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LsDetails {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<ToolResultSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression: Option<CompressionInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_limit_reached: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -1023,6 +1327,39 @@ pub struct SubagentResultDetails {
     pub results: Vec<SubagentResultSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifacts: Option<SubagentArtifacts>,
+    /// Inheritance mode the parent passed to the subagent (for example
+    /// "fork" when the child inherits the parent conversation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+    /// Per-result progress snapshots reported while the subagent was still
+    /// running. Present for streaming runs and elided when the agent ran
+    /// to completion before any progress event was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<Vec<SubagentProgressEntry>>,
+    /// Run id assigned to an `async` subagent invocation; absent for
+    /// synchronous runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub async_id: Option<String>,
+    /// Working directory where the async run is staging its artifacts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub async_dir: Option<PathBuf>,
+}
+
+/// One streaming progress record per subagent result. The pi runtime emits
+/// these while the child is still active so the parent can surface activity
+/// without waiting for completion.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SubagentProgressEntry {
+    pub index: u32,
+    pub agent: String,
+    pub status: String,
+    pub task: String,
+    pub tool_count: u32,
+    pub tokens: u64,
+    pub duration_ms: u64,
+    pub recent_tools: Vec<String>,
+    pub recent_output: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -1134,6 +1471,10 @@ pub enum AskUserResponse {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         comment: Option<String>,
     },
+    /// User typed a freeform answer instead of picking an option. Pi
+    /// records the entered text under `text`.
+    #[serde(rename = "freeform")]
+    Freeform { text: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -1159,19 +1500,115 @@ pub struct WebSearchDetails {
     pub queries: Vec<String>,
 }
 
+/// `read` emits two sub-shapes for `details` that classify here: a plain
+/// truncation block when raw byte/line caps fired, or a lean-ctx augmented
+/// summary describing how the extension compressed the response. All fields
+/// are optional because either may be present alone, both together, or
+/// neither (for plain successful reads).
+///
+/// A third shape — the pattern-scoped match summary `read` emits when it
+/// performed grep-style filtering and hit its match or line cap — carries
+/// only `{matchLimitReached, linesTruncated}`, which `GrepDetails` declares
+/// with the same field names. Because `Grep` precedes `Read` in the
+/// untagged `ToolResultDetails` enum (see the ordering comment there),
+/// pattern-mode read results land in `Grep(GrepDetails)`, never here. The
+/// `lines_truncated` and `match_limit_reached` fields below remain only to
+/// keep this struct accepting any payload that contains them, so an
+/// unexpected variant ordering change does not silently start failing
+/// parses; in practice they are unreachable through the enum dispatch.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReadDetails {
-    pub truncation: TruncationInfo,
+    /// Present when raw `read` truncated by line/byte caps. Absent for
+    /// lean-ctx augmented reads because the extension reports its own
+    /// compression metrics in `compression` instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncation: Option<TruncationInfo>,
+    /// Pattern-scoped read mode reuses grep's `linesTruncated` /
+    /// `matchLimitReached` caps; the field names mirror `GrepDetails`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lines_truncated: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub match_limit_reached: Option<u32>,
+    /// Lean-ctx augmentation: path the read was scoped to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<ToolResultSource>,
+    /// Lean-ctx selected read mode (e.g. "full", "map", "signatures").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// Number of lines lean-ctx returned after compression.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lines: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression: Option<CompressionInfo>,
 }
 
-/// Either or both of `matchLimitReached` and `linesTruncated` may be
-/// present depending on which limit (or both) was hit, with at least one
-/// always present when `details` is emitted.
+/// `find` emits two shapes for `details`: a plain `{resultLimitReached}`
+/// when the result list was capped, or a lean-ctx augmented shape carrying
+/// the queried path/pattern plus a `compression` breadcrumb. All fields are
+/// optional because either shape may appear independently.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FindDetails {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_limit_reached: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<ToolResultSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression: Option<CompressionInfo>,
+}
+
+/// Tool-result details emitted by the flat `git_read_only_*` MCP tools.
+/// The pi-tool-display extension just records which MCP `server` and `tool`
+/// the call was dispatched to.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GitReadOnlyDetails {
+    pub server: String,
+    pub tool: String,
+}
+
+/// Summary metadata recorded by the `fetch_content` tool. `prompt` is only
+/// present when the caller passed an explicit Gemini prompt for video / page
+/// analysis; the rest of the fields are always emitted.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FetchContentDetails {
+    pub urls: Vec<String>,
+    pub url_count: u32,
+    pub successful: u32,
+    pub total_chars: u64,
+    pub title: String,
+    pub response_id: String,
+    pub truncated: bool,
+    pub has_image: bool,
+    pub image_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+}
+
+/// Replaying a single previously-fetched URL via `get_search_content`
+/// emits a small breadcrumb describing which URL was returned and how
+/// large the cached body is.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GetSearchContentDetails {
+    pub url: String,
+    pub title: String,
+    pub content_length: u64,
+}
+
+/// Either of `matchLimitReached` / `linesTruncated` may be present when
+/// raw grep hit its caps. Lean-ctx augmented grep results add the queried
+/// `path`/`pattern` plus a `compression` breadcrumb instead.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GrepDetails {
@@ -1182,6 +1619,14 @@ pub struct GrepDetails {
     /// Whether output was further truncated because line/byte caps were hit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lines_truncated: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<ToolResultSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression: Option<CompressionInfo>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -1198,6 +1643,37 @@ pub struct McpDetails {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// Set on `mode: "call"` errors of kind `tool_not_found`; names the
+    /// missing MCP tool the caller asked for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_tool: Option<String>,
+    /// `mode: "status"` snapshot of every configured MCP server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub servers: Option<Vec<McpServerStatus>>,
+    /// Total tools available across connected servers (status mode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_tools: Option<u32>,
+    /// How many of `servers` are currently connected (status mode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connected_count: Option<u32>,
+    /// `mode: "list"` of tools exposed by a single server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<String>>,
+    /// Number of tools in `tools` (list mode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct McpServerStatus {
+    pub name: String,
+    pub status: String,
+    pub tool_count: u32,
+    /// Seconds since the last failed connection attempt; `null` when the
+    /// server has not failed since startup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_ago: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -1222,12 +1698,19 @@ pub struct McpStructuredContent {
 pub struct BashDetails {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub truncation: Option<TruncationInfo>,
-    /// Path to a temp file containing the full untruncated bash output.
+    /// When the response would exceed pi's in-message byte cap, pi spills
+    /// the raw command output to a temp file and exposes the path here so a
+    /// caller can read the untruncated output without re-running the
+    /// command. `None` means no overflow occurred.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full_output_path: Option<PathBuf>,
+    /// Lean-ctx augmentation: only `compression` is present for bash because
+    /// the extension does not record path/pattern for shell output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression: Option<CompressionInfo>,
 }
 
-/// Truncation metadata shared between `read` and `bash` tool results.
+/// Shared between `read` and `bash` tool results.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TruncationInfo {
@@ -1308,7 +1791,33 @@ pub struct PlannotatorData {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_submitted_path: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub saved_state: Option<String>,
+    pub saved_state: Option<PlannotatorSavedState>,
+}
+
+/// Plannotator originally serialised `savedState` as an opaque marker
+/// string (e.g. `"draft"`); newer pi versions snapshot the active
+/// session settings as a structured object. We accept both shapes via
+/// an untagged enum so old logs continue to parse.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PlannotatorSavedState {
+    Legacy(String),
+    Snapshot(PlannotatorSavedStateSnapshot),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PlannotatorSavedStateSnapshot {
+    pub active_tools: Vec<ToolName>,
+    pub model: PlannotatorModelRef,
+    pub thinking_level: ThinkingLevel,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PlannotatorModelRef {
+    pub provider: Provider,
+    pub id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -1345,20 +1854,42 @@ pub struct CompressionBlock {
     pub created_at: i64,
 }
 
+/// `web-search-results` payload. The `type` discriminator selects between
+/// search results (`queries`) and direct URL fetches (`urls`); the shared
+/// `id` and `timestamp` live on the outer struct alongside the flattened
+/// payload. `deny_unknown_fields` cannot be used here because
+/// `WebSearchResultsPayload` is an *internally* tagged enum (`tag = "type"`
+/// without `content`), so its `type` discriminator appears at the same JSON
+/// level as the outer struct's fields. Serde's flatten codegen does not
+/// register the discriminator as "claimed", and the strict outer struct then
+/// rejects it as unknown. The inner payload variants stay strict via their
+/// own structs, which is enough to catch field-level drift inside `data`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct WebSearchResultsData {
     pub id: String,
     pub timestamp: i64,
-    #[serde(rename = "type")]
-    pub kind: WebSearchResultsKind,
+    #[serde(flatten)]
+    pub payload: WebSearchResultsPayload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WebSearchResultsPayload {
+    Search(WebSearchResultsSearch),
+    Fetch(WebSearchResultsFetch),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WebSearchResultsSearch {
     pub queries: Vec<WebSearchQueryResult>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WebSearchResultsKind {
-    Search,
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WebSearchResultsFetch {
+    pub urls: Vec<WebFetchResult>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -1369,7 +1900,10 @@ pub struct WebSearchQueryResult {
     pub results: Vec<WebSearchResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    pub provider: String,
+    /// Optional because aborted queries (with `error: "This operation was
+    /// aborted"`) can be recorded before the provider was selected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -1378,6 +1912,20 @@ pub struct WebSearchResult {
     pub title: String,
     pub url: String,
     pub snippet: String,
+}
+
+/// Single URL result from a `fetch_content` call. The protocol always emits
+/// `error` (as `null` on success or a string describing the failure), so the
+/// field is required-but-nullable: omitting it from the JSON is a parse error
+/// because that would indicate a real protocol regression rather than a
+/// success.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WebFetchResult {
+    pub url: String,
+    pub title: String,
+    pub content: String,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -1407,6 +1955,10 @@ pub struct LoadedTool {
     pub source: ToolSource,
     pub scope: ToolScope,
     pub origin: ToolOrigin,
+    /// Set only when `source` is [`ToolSource::Extension`]; gives the
+    /// on-disk location of the extension that registered the tool.
+    /// Built-in and MCP-registered tools record `None` because they have
+    /// no extension file to report.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extension_path: Option<String>,
 }

@@ -338,6 +338,22 @@ struct Example {
 **Important**: Always use `#[serde(deny_unknown_fields)]` when deserializing Claude Code protocol messages (hooks, log
 parsing) to catch when Claude Code updates have added new fields that this codebase doesn't yet handle.
 
+**Exceptions**: in `pi_logs`, two categories of struct legitimately omit `deny_unknown_fields`:
+
+1. **`serde(flatten)` of an internally-tagged enum**: when a struct flattens an enum that uses `#[serde(tag = "...")]`
+   without a `content` field, the inner tag appears at the same JSON level as the outer struct's fields and serde's
+   flatten codegen does not register it as claimed; a strict outer struct then rejects it as unknown at runtime. The
+   only struct in this category is `WebSearchResultsData`, which therefore omits `deny_unknown_fields` and relies on
+   the closed-enum discriminator of the flattened payload plus per-variant strict structs to catch field-level drift.
+   *Adjacently* tagged flatten targets (those with both `tag` and `content`) do not hit this collision, so structs like
+   `CustomLine`, `CustomMessageLine`, and `ToolCallContent` keep `deny_unknown_fields` despite flattening. Each
+   exception must carry an inline comment naming the limitation.
+2. **Corrupt-stream tolerance**: tool-argument structs (e.g. `EditArgs`, `EditReplacement`, `GrepArgs`) deliberately
+   omit it to tolerate completed-but-corrupted or hallucinated assistant streams that emit malformed sibling keys. The
+   same goal is also met at finer granularity by untagged fallback enums (`EditEntry::Fragment` absorbs raw JSON tokens
+   in an `edits` array; `MaybeU32::Garbage` absorbs string-typed corruption of numeric tool-call arguments). Each such
+   exception must carry an inline comment naming the observed failure mode.
+
 ## Suggesting Updates to CLAUDE.md
 
 When you make significant changes to the codebase that introduce new patterns, conventions, or architectural decisions,
