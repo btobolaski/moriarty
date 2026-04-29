@@ -2112,6 +2112,20 @@ fn read_tool_call_accepts_string_garbage_for_numeric_args() {
 }
 
 #[test]
+fn find_tool_call_accepts_dotted_limit_key() {
+    let tool_call = parse_tool_call(
+        "find",
+        json!({"pattern": "src/**/*.rs", "path": ".", ".limit": 200}),
+    );
+    let ToolCallArguments::Find(args) = tool_call.tool else {
+        panic!("expected Find tool call")
+    };
+    assert_eq!(args.pattern, "src/**/*.rs");
+    assert_eq!(args.path.as_deref(), Some(std::path::Path::new(".")));
+    assert_eq!(args.limit, Some(200));
+}
+
+#[test]
 fn bash_tool_call_accepts_empty_arguments_when_aborted() {
     let tool_call = parse_tool_call("bash", json!({}));
     let ToolCallArguments::Bash(args) = tool_call.tool else {

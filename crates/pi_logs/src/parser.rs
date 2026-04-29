@@ -21,15 +21,19 @@
 //!   [`ToolCallContent`] all keep `deny_unknown_fields` despite flattening.
 //!
 //! * **Corrupt-stream tolerance** — some payloads are absorbed via
-//!   permissive structs or untagged fallback enums so a single corrupted
-//!   record cannot abort an entire log file. Three flavors exist:
+//!   permissive structs, targeted field aliases, or untagged fallback enums
+//!   so a single corrupted record cannot abort an entire log file. Four
+//!   flavors exist:
 //!     1. Tool-argument structs ([`EditArgs`], [`EditReplacement`],
 //!        [`GrepArgs`]) that omit `deny_unknown_fields` to ignore
 //!        hallucinated sibling keys (e.g. `:path` on grep).
-//!     2. Array-element fallback enums ([`EditEntry`]) whose `Fragment`
+//!     2. Field-level aliases (for example on [`FindArgs`]) that map an
+//!        observed punctuated key corruption like `.limit` back onto the
+//!        intended schema field without relaxing the whole struct.
+//!     3. Array-element fallback enums ([`EditEntry`]) whose `Fragment`
 //!        variant captures raw JSON tokens (`,`, `},{`) interspersed
 //!        between real entries when the model truncates mid-stream.
-//!     3. Value-level fallback enums ([`MaybeU32`]) whose `Garbage` variant
+//!     4. Value-level fallback enums ([`MaybeU32`]) whose `Garbage` variant
 //!        absorbs string-typed corruption (e.g. `"limit": "limit"` where
 //!        the model echoed the schema field name as the value).
 //!
@@ -854,13 +858,17 @@ pub struct GrepArgs {
     pub limit: Option<u32>,
 }
 
+/// `limit` accepts the observed `.limit` corruption as an alias. Some
+/// completed tool calls have emitted a leading `.` in the key, and we want
+/// that single malformed argument to stay tied to the intended field instead
+/// of poisoning the whole log line.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FindArgs {
     pub pattern: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, alias = ".limit", skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
 }
 
