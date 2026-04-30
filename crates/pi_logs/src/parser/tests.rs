@@ -1863,19 +1863,81 @@ fn fetch_content_tool_result_accepts_details() {
 }
 
 #[test]
-fn get_search_content_tool_result_accepts_details() {
+fn get_search_content_tool_result_accepts_success_details() {
     let tool_result = parse_tool_result_message(tool_result_message_json(
         "get_search_content",
         vec![json!({"type": "text", "text": "cached body"})],
         false,
         Some(json!({"url": "https://example.com", "title": "Example", "contentLength": 4096u64})),
     ));
-    let Some(ToolResultDetails::GetSearchContent(details)) = tool_result.details else {
-        panic!("expected GetSearchContent details")
+    let Some(ToolResultDetails::GetSearchContent(GetSearchContentDetails::Success(details))) =
+        tool_result.details
+    else {
+        panic!("expected GetSearchContent success details")
     };
     assert_eq!(details.url, "https://example.com");
     assert_eq!(details.title, "Example");
     assert_eq!(details.content_length, 4096);
+}
+
+#[test]
+fn get_search_content_tool_result_accepts_error_details() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "get_search_content",
+        vec![json!({"type": "text", "text": "URL not found. Available:\n  https://example.com"})],
+        false,
+        Some(json!({"error": "URL not found"})),
+    ));
+    let Some(ToolResultDetails::GetSearchContent(GetSearchContentDetails::Error(details))) =
+        tool_result.details
+    else {
+        panic!("expected GetSearchContent error details")
+    };
+    assert_eq!(details.error, "URL not found");
+}
+
+// Pins the strict-variant invariant of GetSearchContentDetails: a payload
+// that mixes success fields with the error field must not be silently
+// accepted by either inner variant. Both inner structs use
+// `deny_unknown_fields`, so the untagged enum has no valid match.
+#[test]
+fn get_search_content_tool_result_rejects_mixed_success_and_error_details() {
+    assert_parse_error_contains_any(
+        "rejects mixed get_search_content details",
+        tool_result_message_json(
+            "get_search_content",
+            vec![json!({"type": "text", "text": "ambiguous"})],
+            false,
+            Some(json!({
+                "url": "https://example.com",
+                "title": "Example",
+                "contentLength": 4096u64,
+                "error": "URL not found",
+            })),
+        ),
+        &["did not match any variant", "unknown field", "error"],
+    );
+}
+
+// Pins that GetSearchContentErrorDetails honors the project-wide
+// `deny_unknown_fields` strictness contract so a future protocol
+// extension surfaces as a loud parse error rather than silently dropping
+// fields.
+#[test]
+fn get_search_content_tool_result_rejects_unknown_error_detail_field() {
+    assert_parse_error_contains_any(
+        "rejects unknown get_search_content error detail field",
+        tool_result_message_json(
+            "get_search_content",
+            vec![json!({"type": "text", "text": "URL not found"})],
+            false,
+            Some(json!({
+                "error": "URL not found",
+                "code": "not_found",
+            })),
+        ),
+        &["did not match any variant", "unknown field", "code"],
+    );
 }
 
 // `fullOutputPath` is the bash-specific discriminator that distinguishes

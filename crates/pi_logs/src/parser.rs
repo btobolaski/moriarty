@@ -1265,10 +1265,18 @@ pub enum ToolResultDetails {
     // rejected by LsDetails (deny_unknown_fields) and falls through to Find.
     Ls(LsDetails),
     Find(FindDetails),
-    // The remaining three variants have no shape overlap with anything
-    // above (each carries fields no other variant declares), so their
-    // ordering is arbitrary; they are appended in the order they were
-    // added.
+    // GitReadOnly and FetchContent have no shape overlap with anything
+    // above (each carries fields no other variant declares).
+    //
+    // GetSearchContent is dual-shape: its Success arm is uniquely
+    // identified by `{url, title, contentLength}`, and its Error arm is
+    // a bare `{error}` payload. Earlier variants that also declare an
+    // `error` field (CodeSearchDetails, McpDetails, TodoDetails,
+    // SubagentResultDetails-via-Subagent, WebSearchDetails) all require
+    // additional discriminator fields (e.g. `query`+`maxTokens`,
+    // `mode`, `action`+`params`+`nextId`, `mode`+`results`,
+    // `queryCount`+`successfulQueries`+...), so a bare `{error}` cannot
+    // be absorbed by any of them and safely falls through here.
     GitReadOnly(GitReadOnlyDetails),
     FetchContent(FetchContentDetails),
     GetSearchContent(GetSearchContentDetails),
@@ -1598,13 +1606,29 @@ pub struct FetchContentDetails {
 
 /// Replaying a single previously-fetched URL via `get_search_content`
 /// emits a small breadcrumb describing which URL was returned and how
-/// large the cached body is.
+/// large the cached body is. When the requested URL is not in the cache
+/// the tool emits an error breadcrumb instead, with the available URLs
+/// listed in the textual content; we model both shapes via an untagged
+/// enum so the strict variants stay tight.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum GetSearchContentDetails {
+    Success(GetSearchContentSuccessDetails),
+    Error(GetSearchContentErrorDetails),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct GetSearchContentDetails {
+pub struct GetSearchContentSuccessDetails {
     pub url: String,
     pub title: String,
     pub content_length: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GetSearchContentErrorDetails {
+    pub error: String,
 }
 
 /// Either of `matchLimitReached` / `linesTruncated` may be present when
