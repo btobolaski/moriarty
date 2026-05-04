@@ -12,21 +12,21 @@
 //!   target is an internally-tagged enum (one with `#[serde(tag = "...")]`
 //!   and no `content`), serde's flatten codegen does not register the tag
 //!   field as "claimed" by the inner enum, so a strict outer struct rejects
-//!   it as unknown. The only struct in this category is
-//!   [`WebSearchResultsData`], which therefore omits `deny_unknown_fields`
-//!   and relies on the closed-enum discriminator of the flattened payload
-//!   plus per-variant strict structs to catch field-level drift. Adjacently
+//!   it as unknown. [`WebSearchResultsData`] is the only struct in this
+//!   category; it keeps the flattened internally tagged shape, but restores
+//!   strict outer-key validation with a manual deserializer. Adjacently
 //!   tagged flatten targets (those with both `tag` and `content`) do *not*
 //!   suffer this collision, so [`CustomLine`], [`CustomMessageLine`], and
-//!   [`ToolCallContent`] all keep `deny_unknown_fields` despite flattening.
+//!   [`ToolCallContent`] all keep derived `deny_unknown_fields` handling.
 //!
 //! * **Corrupt-stream tolerance** — some payloads are absorbed via
 //!   permissive structs, targeted field aliases, or untagged fallback enums
 //!   so a single corrupted record cannot abort an entire log file. Four
 //!   flavors exist:
-//!     1. Tool-argument structs ([`EditArgs`], [`EditReplacement`],
-//!        [`GrepArgs`]) that omit `deny_unknown_fields` to ignore
-//!        hallucinated sibling keys (e.g. `:path` on grep).
+//!     1. Permissive argument/payload structs ([`EditArgs`], nested edit
+//!        payloads like [`EditReplacement`], and [`GrepArgs`]) that omit
+//!        `deny_unknown_fields` to ignore hallucinated sibling keys (e.g.
+//!        `:path` on grep).
 //!     2. Field-level aliases (for example on [`FindArgs`]) that map an
 //!        observed punctuated key corruption like `.limit` back onto the
 //!        intended schema field without relaxing the whole struct.
@@ -41,18 +41,57 @@
 //! observed failure mode.
 
 use std::{
+    cmp::Ordering,
     fs::File,
+    hash::{Hash, Hasher},
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
 };
 
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize};
+use serde_json::{Map, Value};
 use uuid::Uuid;
 
 #[cfg(test)]
 mod tests;
+
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct JsonBlob(pub Value);
+
+impl JsonBlob {
+    fn canonical_json(&self) -> String {
+        serde_json::to_string(&self.0).expect("json values should always serialize")
+    }
+}
+
+impl From<Value> for JsonBlob {
+    fn from(value: Value) -> Self {
+        Self(value)
+    }
+}
+
+impl Hash for JsonBlob {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.canonical_json().hash(state);
+    }
+}
+
+impl PartialOrd for JsonBlob {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for JsonBlob {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.canonical_json().cmp(&other.canonical_json())
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Top-level line
@@ -199,6 +238,10 @@ pub enum CustomMessagePayload {
     /// field.
     #[serde(rename = "subagent-notify")]
     SubagentNotify,
+    /// Richer subagent notice that repeats the rendered notice text and the
+    /// underlying control event that triggered it.
+    #[serde(rename = "subagent_control_notice")]
+    SubagentControlNotice(SubagentControlNoticeDetails),
 }
 
 // ---------------------------------------------------------------------------
@@ -250,8 +293,8 @@ pub struct AssistantMessage {
     pub error_message: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ToolResultMessage {
     pub tool_call_id: String,
     pub tool_name: ToolName,
@@ -260,6 +303,43 @@ pub struct ToolResultMessage {
     pub timestamp: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<ToolResultDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RawToolResultMessage {
+    pub tool_call_id: String,
+    pub tool_name: ToolName,
+    pub content: Vec<TextContentItem>,
+    pub is_error: bool,
+    pub timestamp: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<Value>,
+}
+
+impl<'de> Deserialize<'de> for ToolResultMessage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawToolResultMessage::deserialize(deserializer)?;
+        let details = raw
+            .details
+            .filter(|details| !matches!(details, Value::Null))
+            .filter(|details| !matches!(details, Value::Object(map) if map.is_empty()))
+            .map(|details| parse_tool_result_details(&raw.tool_name, details))
+            .transpose()
+            .map_err(de::Error::custom)?;
+
+        Ok(Self {
+            tool_call_id: raw.tool_call_id,
+            tool_name: raw.tool_name,
+            content: raw.content,
+            is_error: raw.is_error,
+            timestamp: raw.timestamp,
+            details,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -290,33 +370,37 @@ pub enum UserContentItem {
     Text { text: String },
 }
 
-/// `Text` and `Thinking` are inline variants of an internally tagged enum, so
-/// serde cannot enforce `deny_unknown_fields` on them. `ToolCall` stays strict
-/// because it delegates to the `ToolCallContent` struct, which can carry that
-/// attribute.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum AssistantContentItem {
-    #[serde(rename = "text", rename_all = "camelCase")]
-    Text {
-        text: String,
-        /// Opaque provider-supplied signature. Sometimes an opaque token,
-        /// sometimes a JSON-encoded object stored as a string. Kept as a
-        /// plain string so we never have to speculate about its contents.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        text_signature: Option<String>,
-    },
-    #[serde(rename = "thinking", rename_all = "camelCase")]
-    Thinking {
-        thinking: String,
-        /// Absent on aborted assistant turns where the model produced no
-        /// thinking content (and therefore no signature to attest to).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        thinking_signature: Option<ThinkingSignature>,
-    },
+    #[serde(rename = "text")]
+    Text(TextAssistantContent),
+    #[serde(rename = "thinking")]
+    Thinking(ThinkingAssistantContent),
     // Boxed because ToolCallContent is much larger than Text or Thinking.
     #[serde(rename = "toolCall")]
     ToolCall(Box<ToolCallContent>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TextAssistantContent {
+    pub text: String,
+    /// Opaque provider-supplied signature. Sometimes an opaque token,
+    /// sometimes a JSON-encoded object stored as a string. Kept as a
+    /// plain string so we never have to speculate about its contents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_signature: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ThinkingAssistantContent {
+    pub thinking: String,
+    /// Absent on aborted assistant turns where the model produced no
+    /// thinking content (and therefore no signature to attest to).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_signature: Option<ThinkingSignature>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -716,19 +800,64 @@ pub struct TodoArgs {
 }
 
 /// Numeric tool-call arguments that pi normally records as integers, but
-/// which corrupted model streams have been observed to emit as the
-/// JSON-Schema field name as a string value (e.g. `"limit": "limit"`).
+/// which corrupted model streams have been observed to echo back the field
+/// name as a string value (`"limit": "limit"`, `"offset": "offset"`).
 ///
-/// `Garbage` only absorbs JSON-string-typed corruption. Other malformed
-/// shapes — booleans (`true`), `null`, floats, or out-of-range integers —
-/// still produce a hard parse error because they match neither variant.
-/// We constrain the fallback this narrowly so unexpected new corruption
-/// modes stay loud at parse time.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(untagged)]
+/// `Garbage` is therefore only valid when a field-specific deserializer sees
+/// that exact echoed name for its own field. Other strings stay loud so new
+/// corruption modes do not silently become part of the accepted schema.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub enum MaybeU32 {
     Number(u32),
     Garbage(String),
+}
+
+fn parse_named_maybe_u32_value(
+    value: Value,
+    field_name: &'static str,
+) -> Result<MaybeU32, serde_json::Error> {
+    match value {
+        Value::String(string) if string == field_name => Ok(MaybeU32::Garbage(string)),
+        Value::String(string) => Err(serde_json::Error::io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid string value `{string}` for `{field_name}`; expected `{field_name}`"),
+        ))),
+        other => serde_json::from_value::<u32>(other).map(MaybeU32::Number),
+    }
+}
+
+fn deserialize_named_maybe_u32_field<'de, D>(
+    deserializer: D,
+    field_name: &'static str,
+) -> Result<Option<MaybeU32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    parse_named_maybe_u32_value(value, field_name)
+        .map(Some)
+        .map_err(de::Error::custom)
+}
+
+fn deserialize_offset_field<'de, D>(deserializer: D) -> Result<Option<MaybeU32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_named_maybe_u32_field(deserializer, "offset")
+}
+
+fn deserialize_limit_field<'de, D>(deserializer: D) -> Result<Option<MaybeU32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_named_maybe_u32_field(deserializer, "limit")
+}
+
+fn deserialize_required_nullable_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -739,9 +868,17 @@ pub struct ReadArgs {
     /// streaming a path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_offset_field",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub offset: Option<MaybeU32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_limit_field",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub limit: Option<MaybeU32>,
 }
 
@@ -903,11 +1040,15 @@ pub struct AskUserArgs {
 #[serde(untagged)]
 pub enum AskUserOption {
     Title(String),
-    Detailed {
-        title: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        description: Option<String>,
-    },
+    Detailed(AskUserDetailedOption),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AskUserDetailedOption {
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -1161,6 +1302,8 @@ pub struct SubagentArgs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concurrency: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chain: Option<Vec<SubagentChainStep>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<String>,
@@ -1180,16 +1323,18 @@ pub struct SubagentArgs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clarify: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control: Option<SubagentControlArgs>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<SubagentOutput>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub skill: Option<String>,
+    pub skill: Option<SubagentSkill>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<PathBuf>,
     /// JSON-encoded agent or chain configuration passed to `subagent` management
-    /// actions (`create`, `update`). Kept as a string because pi serializes the
-    /// full config blob as a string argument.
+    /// actions (`create`, `update`). Kept as a string because pi historically
+    /// serialized the full config blob as a string argument.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config: Option<String>,
     /// Scope filter for agent management subcommands (`list`, `get`).
@@ -1207,9 +1352,15 @@ pub struct SubagentTask {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub count: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<SubagentOutput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reads: Option<SubagentReads>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub skill: Option<String>,
+    pub skill: Option<SubagentSkill>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -1220,21 +1371,141 @@ pub enum SubagentOutput {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SubagentReads {
+    Files(Vec<String>),
+    Enabled(bool),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SubagentSkill {
+    Names(Vec<String>),
+    Enabled(bool),
+    Name(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SubagentControlArgs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub needs_attention_after_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_notice_after_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_notice_after_turns: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_notice_after_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_tool_attempts_before_attention: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify_on: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify_channels: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SubagentChainStep {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<SubagentOutput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reads: Option<SubagentReads>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill: Option<SubagentSkill>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel: Option<Vec<SubagentParallelTask>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fail_fast: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SubagentParallelTask {
+    pub agent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<SubagentOutput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reads: Option<SubagentReads>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill: Option<SubagentSkill>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
 // Tool result details
 //
-// `details` on a toolResult message varies by tool. We use an untagged enum
-// where each variant is a struct that `deny_unknown_fields`. This preserves
-// strict parsing while matching the flat JSON layout produced by pi.
+// `details` on a toolResult message varies by tool. `ToolResultMessage`
+// deserializes the raw JSON through the surrounding `tool_name` first so
+// ambiguous all-optional shapes like bash's `{compression}` breadcrumb stay
+// attached to the originating tool. The untagged enum remains as a strict
+// fallback for tools whose detail payloads are shared or still shape-routed.
 // ---------------------------------------------------------------------------
+
+fn parse_tool_result_details(
+    tool_name: &ToolName,
+    details: Value,
+) -> Result<ToolResultDetails, serde_json::Error> {
+    match tool_name {
+        ToolName::AskUser => serde_json::from_value(details).map(ToolResultDetails::AskUser),
+        ToolName::Bash => serde_json::from_value(details).map(ToolResultDetails::Bash),
+        ToolName::CodeSearch => serde_json::from_value(details).map(ToolResultDetails::CodeSearch),
+        ToolName::Compress => serde_json::from_value(details).map(ToolResultDetails::Compress),
+        ToolName::Edit => serde_json::from_value(details).map(ToolResultDetails::Edit),
+        ToolName::FetchContent => {
+            serde_json::from_value(details).map(ToolResultDetails::FetchContent)
+        }
+        ToolName::Find => serde_json::from_value(details).map(ToolResultDetails::Find),
+        ToolName::GetSearchContent => {
+            serde_json::from_value(details).map(ToolResultDetails::GetSearchContent)
+        }
+        ToolName::Grep => serde_json::from_value(details).map(ToolResultDetails::Grep),
+        ToolName::GitReadOnlyDiff
+        | ToolName::GitReadOnlyLog
+        | ToolName::GitReadOnlyShow
+        | ToolName::GitReadOnlyStatus => {
+            serde_json::from_value(details).map(ToolResultDetails::GitReadOnly)
+        }
+        ToolName::InstinctWrite => {
+            serde_json::from_value(details).map(ToolResultDetails::InstinctWrite)
+        }
+        ToolName::Ls => serde_json::from_value(details).map(ToolResultDetails::Ls),
+        ToolName::Mcp => serde_json::from_value(details).map(ToolResultDetails::Mcp),
+        ToolName::PlannotatorSubmitPlan => {
+            serde_json::from_value(details).map(ToolResultDetails::PlannotatorSubmitPlan)
+        }
+        ToolName::Read => serde_json::from_value(details).map(ToolResultDetails::Read),
+        ToolName::Subagent => serde_json::from_value(details).map(ToolResultDetails::Subagent),
+        ToolName::Todo => serde_json::from_value(details).map(ToolResultDetails::Todo),
+        ToolName::WebSearch => serde_json::from_value(details).map(ToolResultDetails::WebSearch),
+        _ => serde_json::from_value(details),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -1244,21 +1515,13 @@ pub enum ToolResultDetails {
     AskUser(AskUserDetails),
     CodeSearch(CodeSearchDetails),
     WebSearch(WebSearchDetails),
-    // Grep precedes Read because both share `matchLimitReached` and
-    // `linesTruncated`, and ReadDetails is now permissive enough (its
-    // `truncation` field is optional to support lean-ctx augmentations) that
-    // a bare `{matchLimitReached, linesTruncated}` payload would otherwise
-    // be matched by ReadDetails first.
-    //
-    // Reciprocal-risk note: this ordering is asymmetric. A legitimate
-    // pattern-mode `read` result whose details payload only carries
-    // `{matchLimitReached, linesTruncated}` will silently classify as
-    // `Grep(GrepDetails)` rather than `Read(ReadDetails)`. The two structs
-    // share those exact fields, so no data is lost — and `tool_name` on
-    // the surrounding message disambiguates the originating tool — but
-    // typed-enum routing alone cannot tell them apart from this payload
-    // shape. Consumers that branch on the enum variant (rather than on
-    // `tool_name`) must treat `Grep` as covering both cases.
+    // Grep precedes Read for direct `ToolResultDetails` shape matching
+    // because both accept `{matchLimitReached, linesTruncated}` and
+    // ReadDetails is permissive enough to absorb that payload too. Normal
+    // `ToolResultMessage` parsing routes `tool_name: "grep"` and
+    // `tool_name: "read"` explicitly before it ever falls back to this
+    // untagged enum, but we keep the ordering deterministic for direct enum
+    // deserialization and unknown-tool fallback paths.
     Grep(GrepDetails),
     Read(ReadDetails),
     Mcp(McpDetails),
@@ -1266,6 +1529,9 @@ pub enum ToolResultDetails {
     PlannotatorSubmitPlan(PlannotatorSubmitPlanDetails),
     Todo(TodoDetails),
     Compress(CompressDetails),
+    // InstinctWriteDetails has shape {id, action}; no other variant in this
+    // enum declares both fields, so untagged dispatch routes uniquely.
+    InstinctWrite(InstinctWriteDetails),
     // Ls precedes Find because their lean-ctx augmentation shapes overlap on
     // path/source/truncated/compression. The discriminator is `pattern`:
     // find's lean-ctx output always carries it, ls never does. With Ls first,
@@ -1337,10 +1603,19 @@ pub struct EditDetails {
     pub first_changed_line: Option<u32>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SubagentResultMode {
+    Async,
+    Management,
+    Parallel,
+    Single,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SubagentResultDetails {
-    pub mode: String,
+    pub mode: SubagentResultMode,
     pub results: Vec<SubagentResultSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifacts: Option<SubagentArtifacts>,
@@ -1412,6 +1687,69 @@ pub struct SubagentResultSummary {
     pub session_file: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<SubagentToolCallSummary>>,
+    /// Control-channel events emitted by the pi subagent runtime while the
+    /// child was running (for example the `active_long_running` notice). The
+    /// parent surfaces these so downstream consumers can correlate notices
+    /// with the per-result usage and timing summary above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_events: Option<Vec<SubagentControlEvent>>,
+}
+
+/// Internally-tagged on `type` because pi's subagent runtime emits each
+/// control event with a closed set of discriminator values; if a new
+/// variant ships upstream we want a loud parse failure rather than a
+/// silent drop, matching the rest of this parser's strict-by-default
+/// posture.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SubagentControlEvent {
+    ActiveLongRunning(SubagentActiveLongRunningEvent),
+    NeedsAttention(SubagentNeedsAttentionEvent),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SubagentActiveLongRunningEvent {
+    /// Transition target reported by the runtime state machine. Currently
+    /// observed to equal the event type, but kept as a separate field
+    /// because the runtime models it as a distinct concept.
+    pub to: String,
+    /// Wall-clock timestamp of the event in milliseconds since the Unix epoch.
+    pub ts: u64,
+    pub run_id: String,
+    pub agent: String,
+    /// Index of the parallel result this event is attributed to; matches the
+    /// position of the owning entry in `SubagentResultDetails::results`.
+    pub index: u32,
+    pub message: String,
+    /// Free-form reason string (for example `turn_threshold`,
+    /// `tokens_threshold`, `time_threshold`). Left as `String` because the
+    /// runtime threshold knobs are user-configurable and the full set of
+    /// reasons is not documented as a closed protocol enum.
+    pub reason: String,
+    pub turns: u32,
+    pub tokens: u64,
+    pub tool_count: u32,
+    pub elapsed_ms: u64,
+}
+
+/// Same payload shape as `active_long_running`, but emitted when the runtime
+/// wants the parent to inspect or interrupt a child run rather than merely
+/// note that it crossed a long-running threshold.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SubagentNeedsAttentionEvent {
+    pub to: String,
+    pub ts: u64,
+    pub run_id: String,
+    pub agent: String,
+    pub index: u32,
+    pub message: String,
+    pub reason: String,
+    pub turns: u32,
+    pub tokens: u64,
+    pub tool_count: u32,
+    pub elapsed_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -1432,6 +1770,14 @@ pub struct SubagentArtifactPaths {
     pub output_path: PathBuf,
     pub jsonl_path: PathBuf,
     pub metadata_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SubagentControlNoticeDetails {
+    pub event: SubagentControlEvent,
+    pub source: String,
+    pub notice_text: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -1523,16 +1869,14 @@ pub struct WebSearchDetails {
 /// are optional because either may be present alone, both together, or
 /// neither (for plain successful reads).
 ///
-/// A third shape — the pattern-scoped match summary `read` emits when it
-/// performed grep-style filtering and hit its match or line cap — carries
-/// only `{matchLimitReached, linesTruncated}`, which `GrepDetails` declares
-/// with the same field names. Because `Grep` precedes `Read` in the
-/// untagged `ToolResultDetails` enum (see the ordering comment there),
-/// pattern-mode read results land in `Grep(GrepDetails)`, never here. The
-/// `lines_truncated` and `match_limit_reached` fields below remain only to
-/// keep this struct accepting any payload that contains them, so an
-/// unexpected variant ordering change does not silently start failing
-/// parses; in practice they are unreachable through the enum dispatch.
+/// A third shape - the pattern-scoped match summary `read` emits when it
+/// performed grep-style filtering and hit its match or line cap - carries
+/// only `{matchLimitReached, linesTruncated}`. `ToolResultMessage`
+/// deserializes `tool_name: "read"` directly into this struct, so those two
+/// fields are part of the real routed contract for read results. The same
+/// payload also fits `GrepDetails`, which is why `Grep` still precedes
+/// `Read` in the raw untagged `ToolResultDetails` enum used for direct
+/// shape matching and fallback parsing.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReadDetails {
@@ -1593,9 +1937,9 @@ pub struct GitReadOnlyDetails {
     pub tool: String,
 }
 
-/// Summary metadata recorded by the `fetch_content` tool. `prompt` is only
-/// present when the caller passed an explicit Gemini prompt for video / page
-/// analysis; the rest of the fields are always emitted.
+/// Summary metadata recorded by the `fetch_content` tool on successful runs.
+/// Empty / null error payloads are normalized to `None` earlier in
+/// `ToolResultMessage` deserialization, so this struct can stay strict.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FetchContentDetails {
@@ -1641,7 +1985,9 @@ pub struct GetSearchContentErrorDetails {
 
 /// Either of `matchLimitReached` / `linesTruncated` may be present when
 /// raw grep hit its caps. Lean-ctx augmented grep results add the queried
-/// `path`/`pattern` plus a `compression` breadcrumb instead.
+/// `path`/`pattern` plus a `compression` breadcrumb instead. Some historical
+/// grep results also carried the same raw-output `truncation` block that read
+/// uses, so we accept that here too.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GrepDetails {
@@ -1653,6 +1999,8 @@ pub struct GrepDetails {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lines_truncated: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncation: Option<TruncationInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pattern: Option<String>,
@@ -1662,10 +2010,18 @@ pub struct GrepDetails {
     pub compression: Option<CompressionInfo>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum McpMode {
+    Call,
+    List,
+    Status,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct McpDetails {
-    pub mode: String,
+    pub mode: McpMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_result: Option<McpCallResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1680,6 +2036,10 @@ pub struct McpDetails {
     /// missing MCP tool the caller asked for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_tool: Option<String>,
+    /// Newer tool-not-found errors also identify the server that exposed the
+    /// suggestion list when the requested tool name was ambiguous or wrong.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint_server: Option<String>,
     /// `mode: "status"` snapshot of every configured MCP server.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub servers: Option<Vec<McpServerStatus>>,
@@ -1712,18 +2072,12 @@ pub struct McpServerStatus {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct McpCallResult {
-    pub content: Vec<TextContentItem>,
+    /// Generic MCP call payloads are server-defined, so preserve them as raw
+    /// JSON instead of hard-coding Moriarty's command-result schema.
+    pub content: Vec<JsonBlob>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub structured_content: Option<McpStructuredContent>,
+    pub structured_content: Option<JsonBlob>,
     pub is_error: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct McpStructuredContent {
-    pub exit_code: i32,
-    pub stderr: String,
-    pub stdout: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -1782,6 +2136,27 @@ pub struct PlannotatorSubmitPlanDetails {
 pub struct CompressDetails {
     pub block_ids: Vec<u32>,
     pub topic: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub superseded_block_ids: Vec<u32>,
+}
+
+/// `instinct_write` returns a result-details payload identifying the
+/// instinct that was upserted and whether it was newly created or
+/// updated. Modeled as a closed enum on `action` so any new outcome the
+/// pi runtime introduces (for example `unchanged`) surfaces as a parse
+/// error rather than being silently dropped.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InstinctWriteDetails {
+    pub id: String,
+    pub action: InstinctWriteAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstinctWriteAction {
+    Created,
+    Updated,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -1885,25 +2260,110 @@ pub struct CompressionBlock {
     pub active: bool,
     pub summary_token_estimate: u32,
     pub created_at: i64,
+    /// Newer pi builds mark whether this block came from a compression that
+    /// reported token savings. Older snapshots omit the field entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub savings_applied: Option<bool>,
+    /// When DCP later replaces this block with a newer summary, the state
+    /// snapshot records the successor block id and the supersede timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by_block_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_at: Option<i64>,
+    /// Newer DCP snapshots also record which older blocks were folded into
+    /// this summary block. Older snapshots omit the field entirely.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supersedes_block_ids: Vec<u32>,
 }
 
 /// `web-search-results` payload. The `type` discriminator selects between
 /// search results (`queries`) and direct URL fetches (`urls`); the shared
-/// `id` and `timestamp` live on the outer struct alongside the flattened
-/// payload. `deny_unknown_fields` cannot be used here because
-/// `WebSearchResultsPayload` is an *internally* tagged enum (`tag = "type"`
-/// without `content`), so its `type` discriminator appears at the same JSON
-/// level as the outer struct's fields. Serde's flatten codegen does not
-/// register the discriminator as "claimed", and the strict outer struct then
-/// rejects it as unknown. The inner payload variants stay strict via their
-/// own structs, which is enough to catch field-level drift inside `data`.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+/// `id` and `timestamp` live on the outer struct alongside the variant body.
+/// Serde cannot enforce `deny_unknown_fields` on this shape with a flattened
+/// internally tagged enum, so we deserialize manually to keep the outer key
+/// set strict while still routing on the shared `type` field.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WebSearchResultsData {
     pub id: String,
     pub timestamp: i64,
     #[serde(flatten)]
     pub payload: WebSearchResultsPayload,
+}
+
+impl<'de> Deserialize<'de> for WebSearchResultsData {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| de::Error::custom("web-search-results payload must be an object"))?;
+
+        let kind = object
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| de::Error::missing_field("type"))?;
+
+        let expected_fields = match kind {
+            "search" => &["id", "timestamp", "type", "queries"][..],
+            "fetch" => &["id", "timestamp", "type", "urls"][..],
+            other => {
+                return Err(de::Error::unknown_variant(other, &["search", "fetch"]));
+            }
+        };
+
+        reject_unknown_object_fields(object, expected_fields).map_err(de::Error::custom)?;
+
+        let id = object_field(object, "id").map_err(de::Error::custom)?;
+        let timestamp = object_field(object, "timestamp").map_err(de::Error::custom)?;
+        let payload = match kind {
+            "search" => WebSearchResultsPayload::Search(WebSearchResultsSearch {
+                queries: object_field(object, "queries").map_err(de::Error::custom)?,
+            }),
+            "fetch" => WebSearchResultsPayload::Fetch(WebSearchResultsFetch {
+                urls: object_field(object, "urls").map_err(de::Error::custom)?,
+            }),
+            _ => unreachable!("kind validated above"),
+        };
+
+        Ok(Self {
+            id,
+            timestamp,
+            payload,
+        })
+    }
+}
+
+fn reject_unknown_object_fields(
+    object: &Map<String, Value>,
+    expected_fields: &[&str],
+) -> Result<(), String> {
+    for key in object.keys() {
+        if !expected_fields.contains(&key.as_str()) {
+            return Err(format!(
+                "unknown field `{key}`, expected one of {}",
+                expected_fields
+                    .iter()
+                    .map(|field| format!("`{field}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn object_field<T>(object: &Map<String, Value>, field: &'static str) -> Result<T, serde_json::Error>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let value = object.get(field).cloned().ok_or_else(|| {
+        serde_json::Error::io(std::io::Error::other(format!("missing field `{field}`")))
+    })?;
+    serde_json::from_value(value)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -1958,6 +2418,7 @@ pub struct WebFetchResult {
     pub url: String,
     pub title: String,
     pub content: String,
+    #[serde(deserialize_with = "deserialize_required_nullable_string")]
     pub error: Option<String>,
 }
 
@@ -2056,7 +2517,7 @@ pub fn parse_file(path: impl AsRef<Path>) -> Result<Vec<PiLogLine>, ParseError> 
             path: path.to_path_buf(),
             source,
         })?;
-        if line.is_empty() {
+        if line.trim().is_empty() {
             continue;
         }
         let parsed =

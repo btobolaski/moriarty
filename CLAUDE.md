@@ -7,7 +7,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Moriarty is a Rust CLI tool for analyzing Claude Code logs and API usage. It provides:
 
 - **Claude API pricing analyzer**: Analyzes Claude API usage from log directories and generates detailed cost reports
-- **Pi cost analyzer**: Analyzes pi session logs and generates daily or per-conversation cost reports grouped by provider and model
+- **Pi cost analyzer**: Analyzes pi session logs and generates daily or per-conversation cost reports grouped by
+  provider and model
 - **MCP servers**: Provides Model Context Protocol servers for git operations and project tools
 - **Hooks system**: Security integration for validating commands before execution (bash rules, project checks)
 - **Project approval TUI**: Interactive interface for approving project tools before execution
@@ -68,13 +69,17 @@ test in a separate process, making this safe and preventing tests from clobberin
 **`claude_logs/`** - Claude Code log parsing:
 
 - Independent workspace crate for parsing Claude Code JSONL logs into strongly typed serde models
-- The `LogLine` enum represents different message types (User, Assistant, FileHistorySnapshot, Summary, System)
+- The `LogLine` enum covers both core conversation records and newer metadata/event records, including user/assistant
+  turns, file-history snapshots, summaries, system entries, queue operations, progress updates, custom titles, agent
+  names, last prompts, permission-mode changes, and attachments
 - Used by `moriarty`'s `api_pricing` module to analyze Claude Code conversation logs
 
 **`cost_report/`** - Shared cost report rendering and filtering:
 
-- Holds shared time filtering, grouped-table rendering, money formatting, and report warning helpers used by both cost-report backends
-- Keeps the output behavior for `api-pricing` and `pi cost` aligned without forcing the backends into a dynamic-column abstraction
+- Holds shared time filtering, grouped-table rendering, money formatting, and report warning helpers used by both
+  cost-report backends
+- Keeps the output behavior for `api-pricing` and `pi cost` aligned without forcing the backends into a dynamic-column
+  abstraction
 
 **`api_pricing/`** - Claude API usage cost analysis:
 
@@ -86,15 +91,19 @@ test in a separate process, making this safe and preventing tests from clobberin
 
 **`pi_cost/`** - Pi session cost analysis:
 
-- Aggregates pre-priced `LlmCost` values from `cost_analyzer` into daily buckets or per-conversation buckets keyed by normalized session ID
-- Uses raw pi `(provider, model)` pairs for row grouping, with deterministic ordering from a `BTreeMap<PiModel, ...>` accumulator
-- Conversation mode depends on `cost_analyzer::LineWithCost.session_id`, which is attached during the single-pass parse from either Claude assistant lines or pi `SessionLine` headers
+- Aggregates pre-priced `LlmCost` values from `cost_analyzer` into daily buckets or per-conversation buckets keyed by
+  normalized session ID
+- Uses raw pi `(provider, model)` pairs for row grouping, with deterministic ordering from a `BTreeMap<PiModel, ...>`
+  accumulator
+- Conversation mode depends on `cost_analyzer::LineWithCost.session_id`, which is attached during the single-pass parse
+  from either Claude assistant lines or pi `SessionLine` headers
 - Entry point: `pi cost` subcommand in `main.rs`
 
 **`pi_logs/`** - Pi session log parsing:
 
 - Independent workspace crate for parsing pi session JSONL logs into strongly typed serde models
-- Mirrors the main log parser's strictness with pervasive `#[serde(deny_unknown_fields)]` and path-aware parse errors
+- Strict by default with `#[serde(deny_unknown_fields)]`, path-aware parse errors, and narrowly documented exceptions
+  for shapes that require custom deserialization or specific corrupt-stream tolerance
 - Includes a `parse_pi_sessions` binary that recursively smoke-tests a sessions tree by parsing every `*.jsonl` file
 
 **`cost_analyzer/`** - Generic cost-analysis library:
@@ -107,9 +116,10 @@ test in a separate process, making this safe and preventing tests from clobberin
 - Concrete implementations currently support `pi_logs::PiLogLine` and `claude_logs::LogLine`. Claude log costs are
   calculated in `cost_analyzer` with local Decimal-based Claude pricing helpers rather than by depending on
   `moriarty::api_pricing` internals.
-- `moriarty::api_pricing` and `moriarty::pi_cost` both delegate all log loading, deduplication, and pricing to this crate; they only aggregate the
-  returned `LlmCost` values into report buckets
-- `LineWithCost.session_id` is normalized during parsing so backends can group by conversation without re-reading log files; Claude assistant lines provide it inline and pi logs inherit it from the file's `SessionLine`
+- `moriarty::api_pricing` and `moriarty::pi_cost` both delegate all log loading, deduplication, and pricing to this
+  crate; they only aggregate the returned `LlmCost` values into report buckets
+- `LineWithCost.session_id` is normalized during parsing so backends can group by conversation without re-reading log
+  files; Claude assistant lines provide it inline and pi logs inherit it from the file's `SessionLine`
 - Deduplication keeps the highest-cost duplicate for a `(ModelId, LogId)` pair and breaks equal-cost ties by keeping the
   earliest timestamped entry
 - Public entry point: `cost_analyzer::analyze_directory(path)`
@@ -358,35 +368,32 @@ parsing) to catch when Claude Code updates have added new fields that this codeb
 
 **Exceptions**: in `pi_logs`, two categories of struct legitimately omit `deny_unknown_fields`:
 
+Also, do not force `rename_all = "camelCase"` onto parser structs whose upstream wire schema is not camelCase. Preserve
+the on-disk protocol exactly, even when that means snake_case fields like `GitReadOnlyArgs.project_dir`.
+
 1. **`serde(flatten)` of an internally-tagged enum**: when a struct flattens an enum that uses `#[serde(tag = "...")]`
    without a `content` field, the inner tag appears at the same JSON level as the outer struct's fields and serde's
-   flatten codegen does not register it as claimed; a strict outer struct then rejects it as unknown at runtime. The
-   only struct in this category is `WebSearchResultsData`, which therefore omits `deny_unknown_fields` and relies on
-   the closed-enum discriminator of the flattened payload plus per-variant strict structs to catch field-level drift.
-   *Adjacently* tagged flatten targets (those with both `tag` and `content`) do not hit this collision, so structs like
-   `CustomLine`, `CustomMessageLine`, and `ToolCallContent` keep `deny_unknown_fields` despite flattening. Each
-   exception must carry an inline comment naming the limitation.
+   flatten codegen does not register it as claimed; a strict outer struct then rejects it as unknown at runtime.
+   `WebSearchResultsData` is the only struct in this category. It keeps the flattened internally tagged wire shape, but
+   restores strict outer-key validation with a manual deserializer. _Adjacently_ tagged flatten targets (those with both
+   `tag` and `content`) do not hit this collision, so structs like `CustomLine`, `CustomMessageLine`, and
+   `ToolCallContent` keep derived `deny_unknown_fields` handling. Each exception must carry an inline comment naming the
+   limitation.
 2. **Corrupt-stream tolerance**: tool-argument structs (e.g. `EditArgs`, `EditReplacement`, `GrepArgs`) deliberately
    omit it to tolerate completed-but-corrupted or hallucinated assistant streams that emit malformed sibling keys. The
-   same goal is also met at finer granularity by untagged fallback enums (`EditEntry::Fragment` absorbs raw JSON tokens
-   in an `edits` array; `MaybeU32::Garbage` absorbs string-typed corruption of numeric tool-call arguments). Each such
-   exception must carry an inline comment naming the observed failure mode.
+   same goal is also met at finer granularity by field-level aliases (for example `FindArgs.limit` accepting malformed
+   `.limit` while keeping the rest of the struct strict) and untagged fallback enums (`EditEntry::Fragment` absorbs raw
+   JSON tokens in an `edits` array; `MaybeU32::Garbage` absorbs string-typed corruption of numeric tool-call arguments).
+   Each such exception must carry an inline comment naming the observed failure mode.
 
 ## Suggesting Updates to CLAUDE.md
 
 When you make significant changes to the codebase that introduce new patterns, conventions, or architectural decisions,
 you MUST suggest updates to this file.
 
-**CRITICAL**: You MUST use the actual Edit TOOL to make the changes. Do NOT just suggest text - actually invoke the Edit
-tool with the old and new strings. Format your suggestion like this:
-
-```
-> I think we should add/update information about [topic]:
->
-> Edit(file_path="CLAUDE.md", old_string="...", new_string="...")
-```
-
-Then immediately follow it by actually calling the Edit tool with those exact parameters.
+**CRITICAL**: You MUST make the change with the real edit tool, not just propose prose. When suggesting a CLAUDE.md
+update in your response, clearly name the topic you think should be documented, then immediately apply the matching edit
+to `CLAUDE.md` with the actual tool call.
 
 **Examples of significant changes that warrant CLAUDE.md updates**:
 
@@ -410,5 +417,5 @@ across sessions.
 ## Finishing
 
 After you have modified code, you are not allowed to stop until all of the quality checks have passed. If you need to
-ask the user a question, you must use the tool to do so, instead of writing the question and then awaiting the user's
-next input.
+ask the user a question, use the dedicated user-question tool rather than writing the question in plain text and then
+waiting for the user's next input.
