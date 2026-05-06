@@ -995,13 +995,14 @@ pub struct GrepArgs {
     pub limit: Option<u32>,
 }
 
-/// `limit` accepts the observed `.limit` corruption as an alias. Some
-/// completed tool calls have emitted a leading `.` in the key, and we want
-/// that single malformed argument to stay tied to the intended field instead
+/// `pattern` and `limit` accept the observed dotted-key corruption aliases.
+/// Some completed tool calls have emitted a leading `.` in those keys, and we
+/// want the malformed arguments to stay tied to their intended fields instead
 /// of poisoning the whole log line.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FindArgs {
+    #[serde(alias = ".pattern")]
     pub pattern: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
@@ -1939,7 +1940,9 @@ pub struct GitReadOnlyDetails {
 
 /// Summary metadata recorded by the `fetch_content` tool on successful runs.
 /// Empty / null error payloads are normalized to `None` earlier in
-/// `ToolResultMessage` deserialization, so this struct can stay strict.
+/// `ToolResultMessage` deserialization, so this struct can stay strict while
+/// still tolerating older success payloads that predate the title and image /
+/// truncation breadcrumbs.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FetchContentDetails {
@@ -1947,10 +1950,14 @@ pub struct FetchContentDetails {
     pub url_count: u32,
     pub successful: u32,
     pub total_chars: u64,
-    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     pub response_id: String,
+    #[serde(default)]
     pub truncated: bool,
+    #[serde(default)]
     pub has_image: bool,
+    #[serde(default)]
     pub image_count: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,

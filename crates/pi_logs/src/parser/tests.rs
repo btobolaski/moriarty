@@ -2590,7 +2590,36 @@ fn fetch_content_tool_result_accepts_details() {
     assert_eq!(details.url_count, 2);
     assert_eq!(details.successful, 2);
     assert_eq!(details.total_chars, 12000);
-    assert_eq!(details.title, "Example");
+    assert_eq!(details.title.as_deref(), Some("Example"));
+    assert_eq!(details.response_id, "resp_1");
+    assert!(!details.truncated);
+    assert!(!details.has_image);
+    assert_eq!(details.image_count, 0);
+    assert!(details.prompt.is_none());
+}
+
+#[test]
+fn fetch_content_tool_result_accepts_missing_optional_metadata() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "fetch_content",
+        vec![json!({"type": "text", "text": "fetched"})],
+        false,
+        Some(json!({
+            "urls": ["https://example.com/a"],
+            "urlCount": 1,
+            "successful": 1,
+            "totalChars": 12000u64,
+            "responseId": "resp_1"
+        })),
+    ));
+    let Some(ToolResultDetails::FetchContent(details)) = tool_result.details else {
+        panic!("expected FetchContent details")
+    };
+    assert_eq!(details.urls, ["https://example.com/a"]);
+    assert_eq!(details.url_count, 1);
+    assert_eq!(details.successful, 1);
+    assert_eq!(details.total_chars, 12000);
+    assert!(details.title.is_none());
     assert_eq!(details.response_id, "resp_1");
     assert!(!details.truncated);
     assert!(!details.has_image);
@@ -2977,6 +3006,20 @@ fn find_tool_call_accepts_dotted_limit_key() {
     let tool_call = parse_tool_call(
         "find",
         json!({"pattern": "src/**/*.rs", "path": ".", ".limit": 200}),
+    );
+    let ToolCallArguments::Find(args) = tool_call.tool else {
+        panic!("expected Find tool call")
+    };
+    assert_eq!(args.pattern, "src/**/*.rs");
+    assert_eq!(args.path.as_deref(), Some(Path::new(".")));
+    assert_eq!(args.limit, Some(200));
+}
+
+#[test]
+fn find_tool_call_accepts_dotted_pattern_key() {
+    let tool_call = parse_tool_call(
+        "find",
+        json!({".pattern": "src/**/*.rs", "path": ".", "limit": 200}),
     );
     let ToolCallArguments::Find(args) = tool_call.tool else {
         panic!("expected Find tool call")
