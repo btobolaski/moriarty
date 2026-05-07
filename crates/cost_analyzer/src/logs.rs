@@ -487,6 +487,7 @@ impl AnalyzableLog for PiLogLine {
             PiLogLine::Message(message) => message.id.clone(),
             PiLogLine::ModelChange(model_change) => model_change.id.clone(),
             PiLogLine::Session(session) => session.id.to_string(),
+            PiLogLine::SessionInfo(session_info) => session_info.id.clone(),
             PiLogLine::ThinkingLevelChange(thinking_level) => thinking_level.id.clone(),
         }
     }
@@ -506,12 +507,16 @@ impl AnalyzableLog for PiLogLine {
             PiLogLine::Message(message) => message.timestamp,
             PiLogLine::ModelChange(model_change) => model_change.timestamp,
             PiLogLine::Session(session) => session.timestamp,
+            PiLogLine::SessionInfo(session_info) => session_info.timestamp,
             PiLogLine::ThinkingLevelChange(thinking_level) => thinking_level.timestamp,
         }
     }
 
     fn session_id(&self) -> Option<String> {
         match self {
+            // `session_info` announces nested run labels (for example subagent
+            // banners), but `pi cost --conversations` should stay grouped by
+            // the top-level session header that owns the whole transcript.
             PiLogLine::Session(session) => Some(session.id.to_string()),
             _ => None,
         }
@@ -635,6 +640,16 @@ mod tests {
             "id": CLAUDE_SESSION_ID,
             "timestamp": CLAUDE_TIMESTAMP,
             "cwd": CLAUDE_CWD,
+        })
+    }
+
+    fn session_info_json() -> serde_json::Value {
+        json!({
+            "type": "session_info",
+            "id": "info1",
+            "parentId": "session-parent-1",
+            "timestamp": CLAUDE_TIMESTAMP,
+            "name": "subagent-reviewer",
         })
     }
 
@@ -1195,28 +1210,27 @@ mod tests {
                 "019dc252-e50e-766c-8182-d654b46881af",
                 false,
                 false,
+                Some(CLAUDE_SESSION_ID),
             ),
-            (model_change_json(), "m1", false, false),
-            (thinking_level_change_json(), "t1", false, false),
-            (compaction_json(), "cmp1", false, false),
-            (custom_json(), "c1", false, false),
-            (custom_message_json(), "cm1", false, false),
-            (user_message_json(), "u1", false, false),
-            (tool_result_message_json(), "tr1", false, false),
-            (assistant_message_json(), "a1", true, true),
+            (session_info_json(), "info1", false, false, None),
+            (model_change_json(), "m1", false, false, None),
+            (thinking_level_change_json(), "t1", false, false, None),
+            (compaction_json(), "cmp1", false, false, None),
+            (custom_json(), "c1", false, false, None),
+            (custom_message_json(), "cm1", false, false, None),
+            (user_message_json(), "u1", false, false, None),
+            (tool_result_message_json(), "tr1", false, false, None),
+            (assistant_message_json(), "a1", true, true, None),
         ];
 
-        for (value, expected_id, expect_cost, expect_model) in cases {
+        for (value, expected_id, expect_cost, expect_model, expected_session_id) in cases {
             let line = parse_pi_log(value);
 
             assert_eq!(line.identifier(), expected_id);
             assert_eq!(line.timestamp(), timestamp());
             assert_eq!(line.cost().is_some(), expect_cost);
             assert_eq!(line.model().is_some(), expect_model);
-            assert_eq!(
-                line.session_id().is_some(),
-                matches!(line, PiLogLine::Session(_))
-            );
+            assert_eq!(line.session_id().as_deref(), expected_session_id);
         }
     }
 

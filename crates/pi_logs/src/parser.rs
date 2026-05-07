@@ -101,6 +101,7 @@ impl Ord for JsonBlob {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PiLogLine {
     Session(SessionLine),
+    SessionInfo(SessionInfoLine),
     ModelChange(ModelChangeLine),
     ThinkingLevelChange(ThinkingLevelChangeLine),
     Compaction(CompactionLine),
@@ -124,6 +125,19 @@ pub struct SessionLine {
     /// subagent run; absent for top-level sessions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session: Option<PathBuf>,
+}
+
+/// Child subagent session logs now emit a short `session_info` banner after
+/// the root `session` header so parents can label nested runs without reusing
+/// the UUID-shaped top-level session payload.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionInfoLine {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+    pub timestamp: DateTime<Utc>,
+    pub name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -200,6 +214,8 @@ pub enum CustomPayload {
     WebSearchResults(WebSearchResultsData),
     #[serde(rename = "plannotator-execute")]
     PlannotatorExecute(PlannotatorExecuteData),
+    #[serde(rename = "intercom_sent")]
+    IntercomSent(IntercomSentData),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -238,6 +254,10 @@ pub enum CustomMessagePayload {
     /// field.
     #[serde(rename = "subagent-notify")]
     SubagentNotify,
+    /// Intercom relays render as custom messages so the UI can show the rich
+    /// sender banner without teaching the top-level log format about inboxes.
+    #[serde(rename = "intercom_message")]
+    IntercomMessage(IntercomMessageDetails),
     /// Richer subagent notice that repeats the rendered notice text and the
     /// underlying control event that triggered it.
     #[serde(rename = "subagent_control_notice")]
@@ -505,6 +525,7 @@ pub enum ToolName {
     Bash,
     CodeSearch,
     Compress,
+    ContactSupervisor,
     Edit,
     FactDelete,
     FactList,
@@ -654,6 +675,7 @@ pub enum ToolCallArguments {
     Bash(BashArgs),
     CodeSearch(CodeSearchArgs),
     Compress(CompressArgs),
+    ContactSupervisor(ContactSupervisorArgs),
     // `ctx_cache` is the only `ctx_*` extension tool the assistant invokes
     // directly; the other 30+ `Ctx*` variants in `ToolName` are surfaced only
     // through the `pi-loaded-tools` manifest and never appear as tool calls,
@@ -696,6 +718,7 @@ impl ToolCallArguments {
             Self::Bash(_) => ToolName::Bash,
             Self::CodeSearch(_) => ToolName::CodeSearch,
             Self::Compress(_) => ToolName::Compress,
+            Self::ContactSupervisor(_) => ToolName::ContactSupervisor,
             Self::CtxCache(_) => ToolName::CtxCache,
             Self::Edit(_) => ToolName::Edit,
             Self::FactDelete(_) => ToolName::FactDelete,
@@ -797,6 +820,11 @@ pub struct TodoArgs {
     pub remove_blocked_by: Option<Vec<u64>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub include_deleted: Option<bool>,
+    /// Some assistant-side todo updates attach extra blocker context under a
+    /// free-form `metadata` object even though the user-facing tool schema does
+    /// not advertise it; preserve that payload instead of failing the log line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<JsonBlob>,
 }
 
 /// Numeric tool-call arguments that pi normally records as integers, but
@@ -974,12 +1002,14 @@ pub struct CtxCacheArgs {
 
 /// `deny_unknown_fields` is intentionally omitted. Models occasionally
 /// hallucinate sibling keys here — we've observed gpt-5.4 emitting
-/// `:path` alongside `path`, and Sonnet emitting an `offset` parameter
-/// that grep does not support. Tolerating unknown fields keeps these
-/// otherwise-valid tool calls parseable.
+/// `:path` alongside `path`, Sonnet emitting an `offset` parameter that grep
+/// does not support, and aborted tool-call streams landing as an empty `{}`.
+/// Tolerating unknown fields and defaulting `pattern` keeps those partial
+/// traces parseable without pretending grep's real runtime schema is looser.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GrepArgs {
+    #[serde(default)]
     pub pattern: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
@@ -1098,13 +1128,29 @@ pub type FactReadArgs = IdArgs;
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ObservationCountersArgs {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "observation_count",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub observation_count: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "confirmed_count",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub confirmed_count: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "contradicted_count",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub contradicted_count: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "inactive_count",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub inactive_count: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<Vec<String>>,
@@ -1233,6 +1279,13 @@ pub struct ScopedInstinctDelete {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ContactSupervisorArgs {
+    pub reason: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct IntercomArgs {
     pub action: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1291,6 +1344,27 @@ pub struct PlannotatorSubmitPlanArgs {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct IntercomSentData {
+    pub to: String,
+    pub message: JsonBlob,
+    pub message_id: String,
+    pub timestamp: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent: Option<JsonBlob>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct IntercomMessageDetails {
+    pub from: JsonBlob,
+    pub message: JsonBlob,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_command: Option<String>,
+    pub body_text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SubagentArgs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
@@ -1298,6 +1372,16 @@ pub struct SubagentArgs {
     pub agent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tasks: Option<Vec<SubagentTask>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1328,6 +1412,8 @@ pub struct SubagentArgs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<SubagentOutput>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skill: Option<SubagentSkill>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -1355,6 +1441,8 @@ pub struct SubagentTask {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<SubagentOutput>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reads: Option<SubagentReads>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress: Option<bool>,
@@ -1364,6 +1452,9 @@ pub struct SubagentTask {
     pub skill: Option<SubagentSkill>,
 }
 
+/// Pi reuses booleans here as feature toggles and strings as explicit output
+/// paths, so the parser has to accept both wire shapes without inventing a new
+/// tagged wrapper that never appears in session logs.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum SubagentOutput {
@@ -1371,6 +1462,8 @@ pub enum SubagentOutput {
     Enabled(bool),
 }
 
+/// `reads` follows the same boolean-or-array convention as `output`: `false`
+/// disables pre-reads, while a string array records the exact files pi loaded.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum SubagentReads {
@@ -1378,6 +1471,8 @@ pub enum SubagentReads {
     Enabled(bool),
 }
 
+/// `skill` is the most permissive subagent selector because pi can serialize it
+/// as a feature toggle, a single skill name, or a list of names.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum SubagentSkill {
@@ -1419,6 +1514,8 @@ pub struct SubagentChainStep {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<SubagentOutput>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reads: Option<SubagentReads>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress: Option<bool>,
@@ -1449,6 +1546,8 @@ pub struct SubagentParallelTask {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<SubagentOutput>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reads: Option<SubagentReads>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress: Option<bool>,
@@ -1477,9 +1576,15 @@ fn parse_tool_result_details(
         ToolName::Bash => serde_json::from_value(details).map(ToolResultDetails::Bash),
         ToolName::CodeSearch => serde_json::from_value(details).map(ToolResultDetails::CodeSearch),
         ToolName::Compress => serde_json::from_value(details).map(ToolResultDetails::Compress),
+        ToolName::ContactSupervisor => {
+            serde_json::from_value(details).map(ToolResultDetails::ContactSupervisor)
+        }
         ToolName::Edit => serde_json::from_value(details).map(ToolResultDetails::Edit),
         ToolName::FetchContent => {
             serde_json::from_value(details).map(ToolResultDetails::FetchContent)
+        }
+        ToolName::FactList | ToolName::InstinctList => {
+            serde_json::from_value(details).map(ToolResultDetails::Count)
         }
         ToolName::Find => serde_json::from_value(details).map(ToolResultDetails::Find),
         ToolName::GetSearchContent => {
@@ -1495,6 +1600,7 @@ fn parse_tool_result_details(
         ToolName::InstinctWrite => {
             serde_json::from_value(details).map(ToolResultDetails::InstinctWrite)
         }
+        ToolName::Intercom => serde_json::from_value(details).map(ToolResultDetails::Intercom),
         ToolName::Ls => serde_json::from_value(details).map(ToolResultDetails::Ls),
         ToolName::Mcp => serde_json::from_value(details).map(ToolResultDetails::Mcp),
         ToolName::PlannotatorSubmitPlan => {
@@ -1515,6 +1621,7 @@ pub enum ToolResultDetails {
     Subagent(SubagentResultDetails),
     AskUser(AskUserDetails),
     CodeSearch(CodeSearchDetails),
+    ContactSupervisor(ContactSupervisorResultDetails),
     WebSearch(WebSearchDetails),
     // Grep precedes Read for direct `ToolResultDetails` shape matching
     // because both accept `{matchLimitReached, linesTruncated}` and
@@ -1525,6 +1632,8 @@ pub enum ToolResultDetails {
     // deserialization and unknown-tool fallback paths.
     Grep(GrepDetails),
     Read(ReadDetails),
+    Count(CountDetails),
+    Intercom(IntercomResultDetails),
     Mcp(McpDetails),
     Bash(BashDetails),
     PlannotatorSubmitPlan(PlannotatorSubmitPlanDetails),
@@ -1577,6 +1686,15 @@ pub enum ToolResultSource {
     LeanCtx,
 }
 
+/// `contact_supervisor` results currently only route an `error` marker in
+/// `details`; the human-readable outcome remains in the tool-result text.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ContactSupervisorResultDetails {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<bool>,
+}
+
 /// `ls` tool results are always either a plain listing (no `details`) or a
 /// lean-ctx augmented listing with this shape. `entry_limit_reached` is
 /// orthogonal to the lean-ctx augmentation and reports the truncation cap
@@ -1617,6 +1735,8 @@ pub enum SubagentResultMode {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SubagentResultDetails {
     pub mode: SubagentResultMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     pub results: Vec<SubagentResultSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifacts: Option<SubagentArtifacts>,
@@ -1681,6 +1801,10 @@ pub struct SubagentResultSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub saved_output_path: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_reference: Option<SubagentOutputReference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attempted_models: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_attempts: Option<Vec<SubagentModelAttempt>>,
@@ -1694,6 +1818,15 @@ pub struct SubagentResultSummary {
     /// with the per-result usage and timing summary above.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_events: Option<Vec<SubagentControlEvent>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SubagentOutputReference {
+    pub path: PathBuf,
+    pub bytes: u64,
+    pub lines: u64,
+    pub message: String,
 }
 
 /// Internally-tagged on `type` because pi's subagent runtime emits each
@@ -1731,6 +1864,10 @@ pub struct SubagentActiveLongRunningEvent {
     pub turns: u32,
     pub tokens: u64,
     pub tool_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_tool: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_tool_duration_ms: Option<u64>,
     pub elapsed_ms: u64,
 }
 
@@ -1750,6 +1887,10 @@ pub struct SubagentNeedsAttentionEvent {
     pub turns: u32,
     pub tokens: u64,
     pub tool_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_tool: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_tool_duration_ms: Option<u64>,
     pub elapsed_ms: u64,
 }
 
@@ -1778,6 +1919,8 @@ pub struct SubagentArtifactPaths {
 pub struct SubagentControlNoticeDetails {
     pub event: SubagentControlEvent,
     pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_intercom_target: Option<String>,
     pub notice_text: String,
 }
 
@@ -2021,8 +2164,42 @@ pub struct GrepDetails {
 #[serde(rename_all = "lowercase")]
 pub enum McpMode {
     Call,
+    Describe,
     List,
     Status,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum McpTool {
+    Name(String),
+    Described(McpDescribedTool),
+}
+
+impl McpTool {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Name(name) => name,
+            Self::Described(tool) => &tool.name,
+        }
+    }
+
+    pub fn described(&self) -> Option<&McpDescribedTool> {
+        match self {
+            Self::Name(_) => None,
+            Self::Described(tool) => Some(tool),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct McpDescribedTool {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_name: Option<String>,
+    pub description: String,
+    pub input_schema: JsonBlob,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -2034,7 +2211,7 @@ pub struct McpDetails {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool: Option<String>,
+    pub tool: Option<McpTool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2168,6 +2345,25 @@ pub enum InstinctWriteAction {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CountDetails {
+    pub count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct IntercomResultDetails {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivered: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TodoDetails {
     pub action: String,
     pub params: TodoArgs,
@@ -2191,6 +2387,8 @@ pub struct TodoTask {
     pub blocked_by: Option<Vec<u64>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<JsonBlob>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2267,6 +2465,10 @@ pub struct CompressionBlock {
     pub active: bool,
     pub summary_token_estimate: u32,
     pub created_at: i64,
+    /// Newer DCP snapshots estimate how many raw tokens the block replaced;
+    /// older snapshots omit the field entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_saved_estimate: Option<u64>,
     /// Newer pi builds mark whether this block came from a compression that
     /// reported token savings. Older snapshots omit the field entirely.
     #[serde(default, skip_serializing_if = "Option::is_none")]

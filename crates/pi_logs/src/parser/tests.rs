@@ -1,8 +1,9 @@
 //! Unit tests for the pi session log parser.
 //!
-//! These tests pin the current on-disk format. Each test feeds a small,
-//! representative JSON snippet through [`parse_line`] and asserts on the
-//! typed result.
+//! These tests pin the current on-disk format and related serde contracts.
+//! Most feed a small, representative JSON snippet through [`parse_line`] and
+//! assert on the typed result, while others pin serialization behavior or
+//! shape-routing assumptions that the parser relies on.
 
 use std::path::{Path, PathBuf};
 
@@ -81,6 +82,16 @@ fn session_json(cwd: &str) -> Value {
         "id": SESSION_ID,
         "timestamp": FIXED_TIMESTAMP,
         "cwd": cwd,
+    })
+}
+
+fn session_info_json(name: &str) -> Value {
+    json!({
+        "type": "session_info",
+        "id": "child-info-1",
+        "parentId": "parent-message-1",
+        "timestamp": FIXED_TIMESTAMP,
+        "name": name,
     })
 }
 
@@ -458,6 +469,141 @@ fn session_line() {
 }
 
 #[test]
+fn session_info_line() {
+    let line = parse(session_info_json("subagent-code-quality-reviewer-run-1"));
+
+    match line {
+        PiLogLine::SessionInfo(session_info) => {
+            assert_eq!(session_info.id, "child-info-1");
+            assert_eq!(session_info.parent_id.as_deref(), Some("parent-message-1"));
+            assert_eq!(session_info.name, "subagent-code-quality-reviewer-run-1");
+        }
+        other => panic!("expected SessionInfo, got {other:?}"),
+    }
+}
+
+#[test]
+fn session_info_line_accepts_missing_parent_id() {
+    let line = parse(json!({
+        "type": "session_info",
+        "id": "child-info-2",
+        "timestamp": FIXED_TIMESTAMP,
+        "name": "subagent-test-quality-reviewer-run-1"
+    }));
+
+    let PiLogLine::SessionInfo(session_info) = line else {
+        panic!("expected SessionInfo")
+    };
+    assert_eq!(session_info.id, "child-info-2");
+    assert_eq!(session_info.parent_id, None);
+    assert_eq!(session_info.name, "subagent-test-quality-reviewer-run-1");
+}
+
+#[test]
+fn compatibility_smoke_set_parses_through_entry_point() {
+    let lines = [
+        session_info_json("subagent-documentation-reviewer-run-1"),
+        assistant_message_json(
+            vec![assistant_tool_call_json(
+                "fact_write",
+                json!({
+                    "id": "parser-compatibility",
+                    "title": "Parser compatibility",
+                    "content": "Newer schemas parse successfully",
+                    "confidence": 0.8,
+                    "domain": "logs",
+                    "scope": "project",
+                    "observation_count": 3,
+                    "confirmed_count": 2,
+                    "contradicted_count": 1,
+                    "inactive_count": 0
+                }),
+            )],
+            AssistantFixture::new("openai-responses", "openai", "gpt-5.5", "stop"),
+        ),
+        assistant_message_json(
+            vec![assistant_tool_call_json(
+                "todo",
+                json!({
+                    "action": "create",
+                    "subject": "Track feedback",
+                    "description": "Follow up on review items",
+                    "metadata": {
+                        "source": "reviewer",
+                        "priority": "medium"
+                    }
+                }),
+            )],
+            AssistantFixture::new("openai-responses", "openai", "gpt-5.5", "stop"),
+        ),
+        assistant_message_json(
+            vec![assistant_tool_call_json("grep", json!({}))],
+            AssistantFixture::new("openai-responses", "openai", "gpt-5.5", "stop"),
+        ),
+        custom_json(
+            "intercom_sent",
+            json!({
+                "to": "subagent-chat-019dfe82",
+                "messageId": "msg-1",
+                "timestamp": 1_746_000_000,
+                "message": {
+                    "text": "Blocked on output requirement",
+                    "reason": "need_decision"
+                },
+                "subagent": {
+                    "name": "documentation-reviewer"
+                }
+            }),
+        ),
+        custom_message_json(
+            "subagent needs attention",
+            "intercom_message",
+            Some(json!({
+                "from": {
+                    "type": "session",
+                    "id": "subagent-chat-019dfe82"
+                },
+                "message": {
+                    "text": "Need tool access"
+                },
+                "replyCommand": "pi intercom reply subagent-chat-019dfe82",
+                "bodyText": "Need tool access"
+            })),
+        ),
+        tool_result_message_json(
+            "subagent",
+            vec![json!({"type": "text", "text": "subagent completed"})],
+            false,
+            Some(json!({
+                "mode": "single",
+                "results": [{
+                    "agent": "scout",
+                    "task": "Inspect parser compatibility",
+                    "response": "No issues found"
+                }],
+                "runId": "run-1"
+            })),
+        ),
+        tool_result_message_json(
+            "fact_list",
+            vec![json!({"type": "text", "text": "1 fact(s)"})],
+            false,
+            Some(json!({"count": 1})),
+        ),
+        tool_result_message_json(
+            "intercom",
+            vec![json!({"type": "text", "text": "Failed: no reply within 10 minutes"})],
+            true,
+            Some(json!({"error": true})),
+        ),
+    ];
+
+    for value in lines {
+        parse(value);
+    }
+}
+
+#[test]
 fn model_change_optional_parent() {
     let line = parse(model_change_json(None, "anthropic", "claude-sonnet-4-5"));
 
@@ -686,6 +832,11 @@ fn subagent_args_serialize_async_as_camel_case() {
         action: None,
         agent: Some("scout".to_string()),
         task: Some("Inspect the parser".to_string()),
+        id: None,
+        run_id: None,
+        dir: None,
+        index: None,
+        message: None,
         tasks: None,
         concurrency: None,
         worktree: None,
@@ -700,6 +851,7 @@ fn subagent_args_serialize_async_as_camel_case() {
         clarify: None,
         control: None,
         output: None,
+        output_mode: None,
         skill: None,
         model: None,
         cwd: None,
@@ -870,11 +1022,161 @@ fn subagent_status_tool_call_accepts_action() {
 }
 
 #[test]
+fn subagent_tasks_accept_output_mode() {
+    let tool_call = parse_tool_call(
+        "subagent",
+        json!({
+            "tasks": [{
+                "agent": "documentation-reviewer",
+                "task": "Review docs",
+                "outputMode": "inline"
+            }]
+        }),
+    );
+
+    let ToolCallArguments::Subagent(args) = tool_call.tool else {
+        panic!("expected Subagent args")
+    };
+    let tasks = args.tasks.expect("expected tasks");
+    assert_eq!(tasks[0].output_mode.as_deref(), Some("inline"));
+}
+
+#[test]
+fn subagent_status_action_accepts_id() {
+    let args = parse_subagent_args(json!({
+        "action": "status",
+        "id": "4194b4bf"
+    }));
+
+    assert_eq!(args.action.as_deref(), Some("status"));
+    assert_eq!(args.id.as_deref(), Some("4194b4bf"));
+}
+
+#[test]
+fn subagent_top_level_accepts_output_mode() {
+    let args = parse_subagent_args(json!({
+        "tasks": [{
+            "agent": "documentation-reviewer",
+            "task": "Review docs"
+        }],
+        "outputMode": "inline"
+    }));
+
+    assert_eq!(args.output_mode.as_deref(), Some("inline"));
+}
+
+#[test]
 fn fact_list_tool_call_stays_tied_to_tool_name() {
     let tool_call = parse_tool_call("fact_list", json!({}));
 
     assert_eq!(tool_call.name(), ToolName::FactList);
     assert!(matches!(tool_call.tool, ToolCallArguments::FactList(_)));
+}
+
+#[test]
+fn grep_tool_call_accepts_empty_arguments() {
+    let tool_call = parse_tool_call("grep", json!({}));
+
+    assert_eq!(tool_call.name(), ToolName::Grep);
+    let ToolCallArguments::Grep(args) = tool_call.tool else {
+        panic!("expected Grep args")
+    };
+    assert_eq!(args.pattern, "");
+}
+
+#[test]
+fn instinct_write_tool_call_accepts_snake_case_counters() {
+    let tool_call = parse_tool_call(
+        "instinct_write",
+        json!({
+            "id": "no-review-agents-without-file-modifications",
+            "title": "Do not run review agents when no files changed",
+            "trigger": "Before invoking review agents",
+            "action": "Skip reviewers when nothing changed",
+            "confidence": "0.9",
+            "domain": "workflow",
+            "scope": "project",
+            "observation_count": 1,
+            "confirmed_count": 1,
+            "inactive_count": 0
+        }),
+    );
+
+    let ToolCallArguments::InstinctWrite(args) = tool_call.tool else {
+        panic!("expected InstinctWrite args")
+    };
+    assert_eq!(args.counters.observation_count, Some(1));
+    assert_eq!(args.counters.confirmed_count, Some(1));
+    assert_eq!(args.counters.inactive_count, Some(0));
+}
+
+#[test]
+fn fact_write_tool_call_accepts_snake_case_counters() {
+    let tool_call = parse_tool_call(
+        "fact_write",
+        json!({
+            "id": "parser-compatibility",
+            "title": "Parser compatibility",
+            "content": "Newer schemas parse successfully",
+            "confidence": 0.8,
+            "domain": "logs",
+            "scope": "project",
+            "observation_count": 3,
+            "confirmed_count": 2,
+            "contradicted_count": 1,
+            "inactive_count": 0
+        }),
+    );
+
+    let ToolCallArguments::FactWrite(args) = tool_call.tool else {
+        panic!("expected FactWrite args")
+    };
+    assert_eq!(args.counters.observation_count, Some(3));
+    assert_eq!(args.counters.confirmed_count, Some(2));
+    assert_eq!(args.counters.contradicted_count, Some(1));
+    assert_eq!(args.counters.inactive_count, Some(0));
+}
+
+#[test]
+fn todo_tool_call_accepts_metadata() {
+    let tool_call = parse_tool_call(
+        "todo",
+        json!({
+            "action": "update",
+            "id": 2,
+            "status": "pending",
+            "metadata": {
+                "blocker": "needs rewrite"
+            }
+        }),
+    );
+
+    let ToolCallArguments::Todo(args) = tool_call.tool else {
+        panic!("expected Todo args")
+    };
+    assert_eq!(
+        args.metadata.as_ref().map(|value| value.0.clone()),
+        Some(json!({"blocker": "needs rewrite"}))
+    );
+}
+
+#[test]
+fn contact_supervisor_tool_call_accepts_reason_and_message() {
+    let tool_call = parse_tool_call(
+        "contact_supervisor",
+        json!({
+            "reason": "need_decision",
+            "message": "Need approval to proceed"
+        }),
+    );
+
+    assert_eq!(tool_call.name(), ToolName::ContactSupervisor);
+    let ToolCallArguments::ContactSupervisor(args) = tool_call.tool else {
+        panic!("expected ContactSupervisor args")
+    };
+
+    assert_eq!(args.reason, "need_decision");
+    assert_eq!(args.message, "Need approval to proceed");
 }
 
 #[test]
@@ -1216,6 +1518,11 @@ fn subagent_tool_result_accepts_error_fields() {
         details.results[0].tool_calls.as_ref().unwrap()[0].text,
         "grep {\"pattern\":\"duplication\"}"
     );
+    assert_eq!(
+        details.results[0].task.as_deref(),
+        Some("Inspect duplication hotspots")
+    );
+    assert_eq!(details.results[0].final_output.as_deref(), Some(""));
 
     // The wire fixture carries a non-zero `durationMs`, so asserting
     // `progress_summary` value-by-value pins both the camelCase rename and the
@@ -1229,6 +1536,35 @@ fn subagent_tool_result_accepts_error_fields() {
     assert_eq!(progress_summary.tool_count, 0);
     assert_eq!(progress_summary.tokens, 0);
     assert_eq!(progress_summary.duration_ms, 4136);
+}
+
+#[test]
+fn subagent_tool_result_accepts_result_response() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "subagent",
+        vec![json!({"type": "text", "text": "subagent completed"})],
+        false,
+        Some(json!({
+            "mode": "single",
+            "results": [{
+                "agent": "scout",
+                "task": "Inspect parser compatibility",
+                "response": "No issues found"
+            }]
+        })),
+    ));
+
+    let Some(ToolResultDetails::Subagent(details)) = tool_result.details else {
+        panic!("expected Subagent details")
+    };
+    assert_eq!(
+        details.results[0].task.as_deref(),
+        Some("Inspect parser compatibility")
+    );
+    assert_eq!(
+        details.results[0].response.as_deref(),
+        Some("No issues found")
+    );
 }
 
 #[test]
@@ -1250,7 +1586,8 @@ fn todo_tool_result_accepts_error_field() {
                 "subject": "Run review agents",
                 "status": "in_progress",
                 "description": "Invoke review agents",
-                "activeForm": "running review agents"
+                "activeForm": "running review agents",
+                "metadata": {"source": "review"}
             }],
             "nextId": 6,
             "error": "addBlockedBy: #6 not found"
@@ -1263,6 +1600,96 @@ fn todo_tool_result_accepts_error_field() {
 
     assert_eq!(details.error.as_deref(), Some("addBlockedBy: #6 not found"));
     assert_eq!(details.params.add_blocked_by, Some(vec![6]));
+    assert_eq!(
+        details.tasks[0]
+            .metadata
+            .as_ref()
+            .map(|value| value.0.clone()),
+        Some(json!({"source": "review"}))
+    );
+}
+
+#[test]
+fn fact_list_tool_result_accepts_count() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "fact_list",
+        vec![json!({"type": "text", "text": "No facts found matching the given filters."})],
+        false,
+        Some(json!({
+            "count": 0
+        })),
+    ));
+
+    let Some(ToolResultDetails::Count(details)) = tool_result.details else {
+        panic!("expected Count details")
+    };
+    assert_eq!(details.count, 0);
+}
+
+#[test]
+fn intercom_tool_result_accepts_delivery_status() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "intercom",
+        vec![json!({
+            "type": "text",
+            "text": "Reply to \"subagent-documentation-reviewer-4194b4bf-3\" was not delivered: Session not found"
+        })],
+        false,
+        Some(json!({
+            "messageId": "ca42f2de-5fe9-4920-be2f-396cb2917bb8",
+            "delivered": false,
+            "reason": "Session not found"
+        })),
+    ));
+
+    let Some(ToolResultDetails::Intercom(details)) = tool_result.details else {
+        panic!("expected Intercom details")
+    };
+    assert_eq!(
+        details.message_id.as_deref(),
+        Some("ca42f2de-5fe9-4920-be2f-396cb2917bb8")
+    );
+    assert_eq!(details.delivered, Some(false));
+    assert_eq!(details.reason.as_deref(), Some("Session not found"));
+    assert_eq!(details.error, None);
+}
+
+#[test]
+fn intercom_tool_result_accepts_error_flag() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "intercom",
+        vec![json!({
+            "type": "text",
+            "text": "Failed to reply: No active intercom context to reply to"
+        })],
+        false,
+        Some(json!({"error": true})),
+    ));
+
+    let Some(ToolResultDetails::Intercom(details)) = tool_result.details else {
+        panic!("expected Intercom details")
+    };
+    assert_eq!(details.error, Some(true));
+    assert_eq!(details.message_id, None);
+    assert_eq!(details.delivered, None);
+    assert_eq!(details.reason, None);
+}
+
+#[test]
+fn instinct_list_tool_result_accepts_count() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "instinct_list",
+        vec![json!({"type": "text", "text": "1 instinct(s)"})],
+        false,
+        Some(json!({
+            "count": 1
+        })),
+    ));
+
+    let Some(ToolResultDetails::Count(details)) = tool_result.details else {
+        panic!("expected Count details")
+    };
+    assert_eq!(details.count, 1);
 }
 
 #[test]
@@ -1357,6 +1784,22 @@ fn ask_user_tool_result_rejects_unknown_option_field() {
 }
 
 #[test]
+fn contact_supervisor_tool_result_accepts_error_flag() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "contact_supervisor",
+        vec![json!({"type": "text", "text": "Failed: no reply within 10 minutes"})],
+        false,
+        Some(json!({"error": true})),
+    ));
+
+    let Some(ToolResultDetails::ContactSupervisor(details)) = tool_result.details else {
+        panic!("expected ContactSupervisor details")
+    };
+
+    assert_eq!(details.error, Some(true));
+}
+
+#[test]
 fn mcp_tool_result_accepts_call_result() {
     let details = parse_mcp_details(
         vec![json!({
@@ -1384,7 +1827,7 @@ fn mcp_tool_result_accepts_call_result() {
 
     assert_eq!(details.mode, McpMode::Call);
     assert_eq!(details.server.as_deref(), Some("git-read-only"));
-    assert_eq!(details.tool.as_deref(), Some("status"));
+    assert_eq!(details.tool.as_ref().map(McpTool::name), Some("status"));
 
     let mcp_result = details.mcp_result.expect("expected mcp result");
     assert!(!mcp_result.is_error);
@@ -1472,7 +1915,54 @@ fn mcp_tool_result_accepts_missing_structured_content() {
     assert!(!mcp_result.is_error);
     assert!(mcp_result.structured_content.is_none());
     assert_eq!(details.server.as_deref(), Some("project-tools"));
-    assert_eq!(details.tool.as_deref(), Some("run_tests"));
+    assert_eq!(details.tool.as_ref().map(McpTool::name), Some("run_tests"));
+}
+
+#[test]
+fn mcp_tool_result_accepts_describe_mode() {
+    let details = parse_mcp_details(
+        vec![json!({
+            "type": "text",
+            "text": "jj_read_only_run\nServer: jj-read-only"
+        })],
+        json!({
+            "mode": "describe",
+            "server": "jj-read-only",
+            "tool": {
+                "name": "jj_read_only_run",
+                "originalName": "run",
+                "description": "Runs a jj command",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_dir": {"type": "string"}
+                    },
+                    "required": ["project_dir"]
+                }
+            }
+        }),
+    );
+
+    assert_eq!(details.mode, McpMode::Describe);
+    assert_eq!(details.server.as_deref(), Some("jj-read-only"));
+    let described = details
+        .tool
+        .as_ref()
+        .and_then(McpTool::described)
+        .expect("expected described tool");
+    assert_eq!(described.name, "jj_read_only_run");
+    assert_eq!(described.original_name.as_deref(), Some("run"));
+    assert_eq!(described.description, "Runs a jj command");
+    assert_eq!(
+        described.input_schema,
+        JsonBlob::from(json!({
+            "type": "object",
+            "properties": {
+                "project_dir": {"type": "string"}
+            },
+            "required": ["project_dir"]
+        }))
+    );
 }
 
 #[test]
@@ -1850,6 +2340,7 @@ fn custom_dcp_state() {
                 "active": true,
                 "summaryTokenEstimate": 100,
                 "createdAt": 1777084924500_i64,
+                "tokensSavedEstimate": 4096,
                 "savingsApplied": true,
                 "supersededByBlockId": 2,
                 "supersededAt": 1777084925000_i64,
@@ -1870,6 +2361,10 @@ fn custom_dcp_state() {
             assert!(!state.manual_mode);
             assert_eq!(state.compression_blocks.len(), 1);
             assert_eq!(state.compression_blocks[0].id, 1);
+            assert_eq!(
+                state.compression_blocks[0].tokens_saved_estimate,
+                Some(4096)
+            );
             assert_eq!(state.compression_blocks[0].topic, "Test topic");
             assert_eq!(state.compression_blocks[0].summary, "Test summary");
             assert_eq!(state.compression_blocks[0].savings_applied, Some(true));
@@ -1910,6 +2405,49 @@ fn custom_dcp_state() {
             assert_eq!(state.compression_blocks[0].created_at, 1777084924500);
         }
         other => panic!("expected DcpState, got {other:?}"),
+    }
+}
+
+#[test]
+fn custom_intercom_sent() {
+    match parse_custom_payload(
+        "intercom_sent",
+        json!({
+            "to": "subagent-chat-019dfe82",
+            "message": {
+                "text": "Blocked on output requirement",
+                "reason": "need_decision"
+            },
+            "messageId": "722b737e-1077-4be3-9d4e-9615d74a236d",
+            "timestamp": 1778091848539_i64,
+            "subagent": {
+                "runId": "c14f72b8",
+                "agent": "documentation-reviewer",
+                "index": "2"
+            }
+        }),
+    ) {
+        CustomPayload::IntercomSent(details) => {
+            assert_eq!(details.to, "subagent-chat-019dfe82");
+            assert_eq!(details.message_id, "722b737e-1077-4be3-9d4e-9615d74a236d");
+            assert_eq!(details.timestamp, 1778091848539);
+            assert_eq!(
+                details.message.0,
+                json!({
+                    "text": "Blocked on output requirement",
+                    "reason": "need_decision"
+                })
+            );
+            assert_eq!(
+                details.subagent.as_ref().expect("expected subagent").0,
+                json!({
+                    "runId": "c14f72b8",
+                    "agent": "documentation-reviewer",
+                    "index": "2"
+                })
+            );
+        }
+        other => panic!("expected IntercomSent, got {other:?}"),
     }
 }
 
@@ -3226,6 +3764,63 @@ fn custom_message_subagent_notify_rejects_details() {
 }
 
 #[test]
+fn custom_message_intercom_message() {
+    let payload = parse_custom_message_payload(
+        "subagent needs attention",
+        "intercom_message",
+        Some(json!({
+            "from": {
+                "id": "subagent-control",
+                "name": "subagent-control",
+                "cwd": "/Users/brendan/src/hydrogen-cloud",
+                "model": "subagent-control",
+                "pid": 78321,
+                "startedAt": 1778087846388_i64,
+                "lastActivity": 1778087846388_i64,
+                "status": "needs_attention"
+            },
+            "message": {
+                "id": "0fde0e5d-9914-4cc0-b203-54dedc736a3c",
+                "timestamp": 1778087846388_i64,
+                "content": { "text": "subagent needs attention" }
+            },
+            "replyCommand": "intercom({ action: \"reply\", message: \"...\" })",
+            "bodyText": "subagent needs attention"
+        })),
+    );
+
+    let CustomMessagePayload::IntercomMessage(details) = payload else {
+        panic!("expected IntercomMessage payload")
+    };
+    assert_eq!(
+        details.from.0,
+        json!({
+            "id": "subagent-control",
+            "name": "subagent-control",
+            "cwd": "/Users/brendan/src/hydrogen-cloud",
+            "model": "subagent-control",
+            "pid": 78321,
+            "startedAt": 1778087846388_i64,
+            "lastActivity": 1778087846388_i64,
+            "status": "needs_attention"
+        })
+    );
+    assert_eq!(
+        details.message.0,
+        json!({
+            "id": "0fde0e5d-9914-4cc0-b203-54dedc736a3c",
+            "timestamp": 1778087846388_i64,
+            "content": { "text": "subagent needs attention" }
+        })
+    );
+    assert_eq!(
+        details.reply_command.as_deref(),
+        Some("intercom({ action: \"reply\", message: \"...\" })")
+    );
+    assert_eq!(details.body_text, "subagent needs attention");
+}
+
+#[test]
 fn custom_message_subagent_control_notice_accepts_needs_attention_event() {
     match parse_custom_message_payload(
         "Subagent needs attention: documentation-reviewer",
@@ -3246,11 +3841,16 @@ fn custom_message_subagent_control_notice_accepts_needs_attention_event() {
                 "elapsedMs": 60887
             },
             "source": "foreground",
+            "childIntercomTarget": "subagent-documentation-reviewer-8784581c-3",
             "noticeText": "Subagent needs attention: documentation-reviewer"
         })),
     ) {
         CustomMessagePayload::SubagentControlNotice(details) => {
             assert_eq!(details.source, "foreground");
+            assert_eq!(
+                details.child_intercom_target.as_deref(),
+                Some("subagent-documentation-reviewer-8784581c-3")
+            );
             assert_eq!(
                 details.notice_text,
                 "Subagent needs attention: documentation-reviewer"
@@ -3365,6 +3965,7 @@ fn custom_message_subagent_control_notice_requires_details() {
 #[test]
 fn custom_message_pi_loaded_tools_accepts_modeled_manifest_names() {
     let builtin_cases = [("read", ToolName::Read)];
+    let intercom_cases = [("contact_supervisor", ToolName::ContactSupervisor)];
     let lean_ctx_cases = [
         ("ctx_agent", ToolName::CtxAgent),
         ("ctx_analyze", ToolName::CtxAnalyze),
@@ -3427,6 +4028,17 @@ fn custom_message_pi_loaded_tools_accepts_modeled_manifest_names() {
             "origin": "top-level"
         }));
     }
+    for (wire_name, _) in &intercom_cases {
+        tools.push(json!({
+            "name": wire_name,
+            "description": "intercom tool",
+            "active": true,
+            "source": "extension",
+            "scope": "user",
+            "origin": "package",
+            "extensionPath": "npm:pi-intercom@0.6.0"
+        }));
+    }
     for (wire_name, _) in &lean_ctx_cases {
         tools.push(json!({
             "name": wire_name,
@@ -3466,6 +4078,19 @@ fn custom_message_pi_loaded_tools_accepts_modeled_manifest_names() {
             }
 
             let mut index = builtin_cases.len();
+            for (_, expected_name) in &intercom_cases {
+                let tool = &details.tools[index];
+                assert_eq!(tool.name, *expected_name);
+                assert_eq!(tool.source, ToolSource::Extension);
+                assert_eq!(tool.scope, ToolScope::User);
+                assert_eq!(tool.origin, ToolOrigin::Package);
+                assert_eq!(
+                    tool.extension_path.as_deref(),
+                    Some("npm:pi-intercom@0.6.0")
+                );
+                index += 1;
+            }
+
             for (_, expected_name) in &lean_ctx_cases {
                 let tool = &details.tools[index];
                 assert_eq!(tool.name, *expected_name);
@@ -3710,7 +4335,7 @@ fn mcp_tool_result_accepts_tool_not_found_error() {
     };
     assert_eq!(details.mode, McpMode::Call);
     assert_eq!(details.server.as_deref(), Some("git-read-only"));
-    assert_eq!(details.tool.as_deref(), Some("rebase"));
+    assert_eq!(details.tool.as_ref().map(McpTool::name), Some("rebase"));
     assert_eq!(details.error.as_deref(), Some("tool_not_found"));
     assert_eq!(details.requested_tool.as_deref(), Some("rebase"));
     assert_eq!(details.hint_server.as_deref(), Some("git-read-only"));
@@ -3725,7 +4350,7 @@ fn mcp_details_serialize_hint_server_as_camel_case() {
         mode: McpMode::Call,
         mcp_result: None,
         server: Some("git-read-only".to_string()),
-        tool: Some("rebase".to_string()),
+        tool: Some(McpTool::Name("rebase".to_string())),
         error: Some("tool_not_found".to_string()),
         message: Some("missing tool".to_string()),
         requested_tool: Some("rebase".to_string()),
@@ -4114,6 +4739,44 @@ fn instinct_write_tool_result_rejects_unknown_detail_field() {
 
 /// Pins the camelCase field names on serialized control events.
 #[test]
+fn subagent_tool_result_accepts_output_reference() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "subagent",
+        vec![json!({"type": "text", "text": "saved output"})],
+        false,
+        Some(json!({
+            "mode": "parallel",
+            "runId": "e6e4aed9",
+            "results": [{
+                "agent": "code-quality-reviewer",
+                "outputMode": "inline",
+                "outputReference": {
+                    "path": "/tmp/review.md",
+                    "bytes": 3179,
+                    "lines": 62,
+                    "message": "Output saved to: /tmp/review.md"
+                }
+            }]
+        })),
+    ));
+    let Some(ToolResultDetails::Subagent(details)) = tool_result.details else {
+        panic!("expected Subagent details")
+    };
+    assert_eq!(details.run_id.as_deref(), Some("e6e4aed9"));
+    let summary = &details.results[0];
+    assert_eq!(summary.output_mode.as_deref(), Some("inline"));
+    assert_eq!(
+        summary.output_reference,
+        Some(SubagentOutputReference {
+            path: PathBuf::from("/tmp/review.md"),
+            bytes: 3179,
+            lines: 62,
+            message: "Output saved to: /tmp/review.md".to_string(),
+        })
+    );
+}
+
+#[test]
 fn subagent_tool_result_accepts_active_long_running_control_event() {
     let tool_result = parse_tool_result_message(tool_result_message_json(
         "subagent",
@@ -4135,6 +4798,8 @@ fn subagent_tool_result_accepts_active_long_running_control_event() {
                     "turns": 15,
                     "tokens": 121069,
                     "toolCount": 44,
+                    "currentTool": "read",
+                    "currentToolDurationMs": 1500,
                     "elapsedMs": 97198
                 }]
             }]
@@ -4164,6 +4829,8 @@ fn subagent_tool_result_accepts_active_long_running_control_event() {
     assert_eq!(event.turns, 15);
     assert_eq!(event.tokens, 121069);
     assert_eq!(event.tool_count, 44);
+    assert_eq!(event.current_tool.as_deref(), Some("read"));
+    assert_eq!(event.current_tool_duration_ms, Some(1500));
     assert_eq!(event.elapsed_ms, 97198);
 }
 
@@ -4189,6 +4856,8 @@ fn subagent_tool_result_accepts_needs_attention_control_event() {
                     "turns": 12,
                     "tokens": 71740,
                     "toolCount": 54,
+                    "currentTool": "intercom",
+                    "currentToolDurationMs": 60617,
                     "elapsedMs": 60887
                 }]
             }]
@@ -4218,6 +4887,8 @@ fn subagent_tool_result_accepts_needs_attention_control_event() {
     assert_eq!(event.turns, 12);
     assert_eq!(event.tokens, 71740);
     assert_eq!(event.tool_count, 54);
+    assert_eq!(event.current_tool.as_deref(), Some("intercom"));
+    assert_eq!(event.current_tool_duration_ms, Some(60617));
     assert_eq!(event.elapsed_ms, 60887);
 }
 
@@ -4235,6 +4906,8 @@ fn subagent_result_summary_serializes_control_events_as_camel_case() {
         progress_summary: None,
         final_output: None,
         saved_output_path: None,
+        output_mode: None,
+        output_reference: None,
         attempted_models: None,
         model_attempts: None,
         session_file: None,
@@ -4251,6 +4924,8 @@ fn subagent_result_summary_serializes_control_events_as_camel_case() {
                 turns: 15,
                 tokens: 121069,
                 tool_count: 44,
+                current_tool: None,
+                current_tool_duration_ms: None,
                 elapsed_ms: 97198,
             },
         )]),
