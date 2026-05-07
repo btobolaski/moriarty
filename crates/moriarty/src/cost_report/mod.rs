@@ -1,6 +1,8 @@
+mod charts;
 mod render;
 mod time_filter;
 
+pub(crate) use charts::{render_stacked_charts, ChartBucket, ChartSegment};
 pub(crate) use render::{
     build_grouped_rows, format_duration, format_session_id, format_time_range, grouped_label,
     push_nonzero_metric_rows, render_grouped_metrics, render_or_empty, CostComponents,

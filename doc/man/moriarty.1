@@ -16,6 +16,22 @@
 .Op Fl \-start\-time Ar DATETIME
 .Op Fl \-end\-time Ar DATETIME
 .Nm
+.Cm graphs claude
+.Fl d Ar dir
+.Op Fl \-timezone Ar local|utc
+.Op Fl \-conversations
+.Op Fl \-tokens
+.Op Fl \-start\-time Ar DATETIME
+.Op Fl \-end\-time Ar DATETIME
+.Nm
+.Cm graphs pi
+.Op Fl d Ar dir
+.Op Fl \-timezone Ar local|utc
+.Op Fl \-conversations
+.Op Fl \-tokens
+.Op Fl \-start\-time Ar DATETIME
+.Op Fl \-end\-time Ar DATETIME
+.Nm
 .Cm pi cost
 .Op Fl d Ar dir
 .Op Fl \-timezone Ar local|utc
@@ -45,9 +61,9 @@
 .Sh DESCRIPTION
 .Nm
 is a Rust CLI tool for working with Claude Code and pi session logs.
-It provides API and pi usage analysis, MCP servers,
-and a security hook system for controlling which tools and commands
-Claude Code can execute.
+It provides API and pi usage analysis, chart-focused graph commands,
+MCP servers, and a security hook system for controlling which tools
+and commands Claude Code can execute.
 .Ss API Pricing
 The
 .Cm api\-pricing
@@ -96,6 +112,25 @@ Start time filter in ISO 8601 format.
 UTC is assumed if no timezone is specified.
 .It Fl \-end\-time Ar DATETIME
 End time filter in ISO 8601 format.
+.El
+.Ss Graphs
+The
+.Cm graphs claude
+and
+.Cm graphs pi
+subcommands render chart-focused stacked summaries for Claude/API and pi usage.
+They accept the same timezone, conversation, token, and time-filter flags
+as the corresponding table reports.
+.Bl -tag -width Ds
+.It Cm graphs claude Fl d Ar dir
+Render Claude/API usage graphs from the given log directory.
+.It Cm graphs pi Op Fl d Ar dir
+Render pi usage graphs from the given session directory.
+Defaults to
+.Pa ~/.pi/agent/sessions
+when
+.Fl \-dir
+is omitted.
 .El
 .Ss MCP Servers
 The

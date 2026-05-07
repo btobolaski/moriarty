@@ -95,6 +95,20 @@ fn assert_token_columns(stdout: &str) {
     assert!(!stdout.contains('$'));
 }
 
+fn assert_has_graph_bar(stdout: &str, row_prefix: &str) {
+    let line = stdout
+        .lines()
+        .find(|line| line.starts_with(row_prefix))
+        .unwrap_or_else(|| panic!("missing graph row {row_prefix:?} in:\n{stdout}"));
+
+    assert!(
+        ['█', '▓', '▒', '░', '▇', '▆']
+            .into_iter()
+            .any(|glyph| line.contains(glyph)),
+        "expected graph row {row_prefix:?} to include a bar in:\n{line}"
+    );
+}
+
 #[test]
 fn api_pricing_cli_renders_daily_token_report() {
     let dir = TempDir::new().unwrap();
@@ -166,4 +180,208 @@ fn api_pricing_cli_renders_conversation_token_report() {
     assert!(stdout.contains("2026-04-16"));
     assert!(stdout.contains("7,014"));
     assert!(!stdout.contains('$'));
+}
+
+#[test]
+fn api_pricing_cli_renders_daily_graphs() {
+    let dir = TempDir::new().unwrap();
+    let session = "019dc252-e50e-766c-8182-d654b46881af";
+    write_log(
+        dir.path(),
+        "tokens.jsonl",
+        &[
+            assistant_line(
+                session,
+                timestamp(2026, 4, 16, 9, 0),
+                "claude-sonnet-4-20250514",
+                "req-token-1",
+                usage_json(1_234, 5_678, 90, 12),
+            ),
+            assistant_line(
+                session,
+                timestamp(2026, 4, 17, 9, 0),
+                "claude-opus-4-20250514",
+                "req-token-2",
+                usage_json(100, 200, 0, 0),
+            ),
+        ],
+    );
+
+    let output = moriarty_command()
+        .args(["graphs", "claude", "--dir"])
+        .arg(dir.path())
+        .args(["--timezone", "utc", "--tokens"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    assert!(stdout.contains("API Token Graphs"));
+    assert!(stdout.contains("Daily total tokens by model"));
+    assert!(stdout.contains("Token share by model"));
+    assert!(stdout.contains("Legend:"));
+    assert!(stdout.contains("Sonnet"));
+    assert!(stdout.contains("Opus 4"));
+    assert!(stdout.contains("2026-04-16"));
+    assert!(stdout.contains("2026-04-17"));
+    assert!(stdout.contains("Grand Total: 7,314"));
+    assert_has_graph_bar(&stdout, "2026-04-16");
+}
+
+#[test]
+fn api_pricing_cli_renders_conversation_cost_graphs() {
+    let dir = TempDir::new().unwrap();
+    let session = "019dc252-e50e-766c-8182-d654b46881af";
+    write_log(
+        dir.path(),
+        "costs.jsonl",
+        &[
+            assistant_line(
+                session,
+                timestamp(2026, 4, 16, 9, 0),
+                "claude-sonnet-4-20250514",
+                "req-cost-1",
+                usage_json(1_000, 500, 0, 0),
+            ),
+            assistant_line(
+                session,
+                timestamp(2026, 4, 16, 10, 0),
+                "claude-opus-4-20250514",
+                "req-cost-2",
+                usage_json(250, 125, 0, 0),
+            ),
+        ],
+    );
+
+    let output = moriarty_command()
+        .args(["graphs", "claude", "--dir"])
+        .arg(dir.path())
+        .args(["--timezone", "utc", "--conversations"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    assert!(stdout.contains("API Cost Graphs by Conversation"));
+    assert!(stdout.contains("Conversation total cost by model"));
+    assert!(stdout.contains("Cost share by model"));
+    assert!(stdout.contains("019dc252"));
+    assert!(stdout.contains("Sonnet"));
+    assert!(stdout.contains("Opus 4"));
+    assert!(stdout.contains("Grand Total: $"));
+    assert_has_graph_bar(&stdout, "019dc252");
+}
+
+#[test]
+fn api_pricing_cli_graphs_apply_time_filter() {
+    let dir = TempDir::new().unwrap();
+    let session = "019dc252-e50e-766c-8182-d654b46881af";
+    write_log(
+        dir.path(),
+        "tokens.jsonl",
+        &[
+            assistant_line(
+                session,
+                timestamp(2026, 4, 16, 9, 0),
+                "claude-sonnet-4-20250514",
+                "req-token-1",
+                usage_json(1_234, 5_678, 90, 12),
+            ),
+            assistant_line(
+                session,
+                timestamp(2026, 4, 17, 9, 0),
+                "claude-opus-4-20250514",
+                "req-token-2",
+                usage_json(100, 200, 0, 0),
+            ),
+        ],
+    );
+
+    let output = moriarty_command()
+        .args(["graphs", "claude", "--dir"])
+        .arg(dir.path())
+        .args([
+            "--timezone",
+            "utc",
+            "--tokens",
+            "--start-time",
+            "2026-04-17",
+            "--end-time",
+            "2026-04-17",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    assert!(stdout.contains("Applying time range filter:"));
+    assert!(stdout.contains("Start: 2026-04-17T00:00:00+00:00"));
+    assert!(stdout.contains("End:   2026-04-18T00:00:00+00:00"));
+    assert!(!stdout.contains("2026-04-16"));
+    assert!(stdout.contains("2026-04-17"));
+    assert!(stdout.contains("Grand Total: 300"));
+    assert_has_graph_bar(&stdout, "2026-04-17");
+}
+
+#[test]
+fn api_pricing_cli_graphs_print_empty_state_and_warning() {
+    let dir = TempDir::new().unwrap();
+    let session = "019dc252-e50e-766c-8182-d654b46881af";
+    write_log(
+        dir.path(),
+        "tokens.jsonl",
+        &[assistant_line(
+            session,
+            timestamp(2026, 4, 16, 9, 0),
+            "claude-sonnet-4-20250514",
+            "req-token-1",
+            usage_json(1_234, 5_678, 90, 12),
+        )],
+    );
+    fs::write(dir.path().join("invalid.jsonl"), "not json at all").unwrap();
+
+    let output = moriarty_command()
+        .args(["graphs", "claude", "--dir"])
+        .arg(dir.path())
+        .args([
+            "--timezone",
+            "utc",
+            "--tokens",
+            "--start-time",
+            "2026-04-17",
+            "--end-time",
+            "2026-04-17",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+
+    assert!(stdout.contains("No usage data found."));
+    assert!(stderr.contains("Warning: some log files could not be read or parsed"));
 }

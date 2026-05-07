@@ -19,12 +19,8 @@ fn test_date(year: i32, month: u32, day: u32) -> NaiveDate {
     NaiveDate::from_ymd_opt(year, month, day).unwrap()
 }
 
-/// Build a `DailyCosts` with the given date and an empty cost map.
-///
-/// The builder helpers below add per-model costs through `ModelCostsMap::add`.
-/// Because each builder targets a distinct `ModelType` bucket and the map
-/// starts empty, `add` is equivalent to a wholesale set in this context
-/// while keeping the production aggregation path the only public API.
+// These builders keep tests on the same `ModelCostsMap::add` path that
+// production aggregation uses instead of constructing per-model maps directly.
 fn costs_on(year: i32, month: u32, day: u32) -> DailyCosts {
     DailyCosts {
         date: test_date(year, month, day),
@@ -78,13 +74,8 @@ impl DailyCostsExt for DailyCosts {
     }
 }
 
-/// Assert the four currency columns and the subtotal of a row match the
-/// expected token-cost components.
-///
-/// Takes the embedded `FormattedCostColumns` substruct shared by both `CostRow`
-/// and `SessionCostRow`, so parallel daily/session formatting tests can
-/// collapse to a single helper call instead of repeating five `assert_eq!`
-/// lines apiece.
+// Both daily and session rows embed the same `FormattedCostColumns`, so one
+// helper keeps the formatting assertions aligned across the parallel tests.
 fn assert_money_columns(money: &FormattedCostColumns, components: (f64, f64, f64, f64)) {
     let (e_input, e_output, e_cache_write, e_cache_read) = components;
     assert_eq!(money.input, fmt_money(e_input), "input column");
@@ -103,10 +94,8 @@ fn assert_money_columns(money: &FormattedCostColumns, components: (f64, f64, f64
     assert_eq!(money.subtotal, fmt_money(subtotal_total), "subtotal column");
 }
 
-/// Assert that the four token-cost component columns are blank, as on the
-/// trailing `Total` row in both the daily and session cost tables. The
-/// `subtotal` column is intentionally NOT checked here — callers assert it
-/// directly because it carries the row's only meaningful value.
+// `Total` rows leave the component columns blank; callers assert the subtotal
+// separately because it is the row's only meaningful value.
 fn assert_blank_money_component_columns(money: &FormattedCostColumns) {
     assert_eq!(money.input, "", "input column");
     assert_eq!(money.output, "", "output column");
@@ -207,7 +196,6 @@ fn cost_row_formats_currency_columns() {
         "2025-10-23",
         "Sonnet",
         ComponentTotals::new(1.2345, 2.3456, 0.5, 0.25),
-        ReportMode::Cost,
     );
 
     assert_eq!(row.date, "2025-10-23");
@@ -221,7 +209,6 @@ fn cost_row_formats_token_columns() {
         "2025-10-23",
         "Sonnet",
         MetricComponents::Tokens(TokenCounts::new(1_234, 5_678, 90, 12)),
-        ReportMode::Tokens,
     );
 
     assert_eq!(row.metrics.input, "1,234");
@@ -237,7 +224,6 @@ fn cost_row_formats_large_token_columns_exactly() {
         "2025-10-23",
         "Sonnet",
         MetricComponents::Tokens(TokenCounts::new(9_007_199_254_740_993, 8, 90, 12)),
-        ReportMode::Tokens,
     );
 
     assert_eq!(row.metrics.input, "9,007,199,254,740,993");
@@ -249,12 +235,7 @@ fn cost_row_formats_large_token_columns_exactly() {
 
 #[test]
 fn cost_row_zero_values_format_as_zero_currency() {
-    let row = CostRow::new(
-        "",
-        "Haiku",
-        ComponentTotals::new(0.0, 0.0, 0.0, 0.0),
-        ReportMode::Cost,
-    );
+    let row = CostRow::new("", "Haiku", ComponentTotals::new(0.0, 0.0, 0.0, 0.0));
 
     assert_eq!(row.metrics.input, "$0.0000");
     assert_eq!(row.metrics.subtotal, "$0.0000");
@@ -262,7 +243,7 @@ fn cost_row_zero_values_format_as_zero_currency() {
 
 #[test]
 fn cost_row_total_row_uses_blank_component_columns() {
-    let row = CostRow::new_total_row(56.789, ReportMode::Cost);
+    let row = CostRow::new_total_row(MetricTotal::Cost(56.789));
 
     assert_eq!(row.date, "");
     assert_eq!(row.model, "Total");
@@ -278,7 +259,7 @@ fn cost_row_total_row_variants() {
     ];
 
     for (label, total, expected_subtotal) in cases {
-        let row = CostRow::new_total_row(total, ReportMode::Cost);
+        let row = CostRow::new_total_row(MetricTotal::Cost(total));
         assert_eq!(row.model, "Total", "case {label}");
         assert_eq!(row.metrics.subtotal, expected_subtotal, "case {label}");
     }
@@ -435,9 +416,8 @@ fn create_grouped_table_variants() {
                     "2025-10-23",
                     "Sonnet",
                     ComponentTotals::new(1.0, 1.0, 0.0, 0.0),
-                    ReportMode::Cost,
                 ),
-                CostRow::new_total_row(2.0, ReportMode::Cost),
+                CostRow::new_total_row(MetricTotal::Cost(2.0)),
             ],
             total_row_indices: vec![1],
             expected_substrings: vec!["Sonnet", "Total"],
@@ -450,16 +430,14 @@ fn create_grouped_table_variants() {
                     "2025-10-23",
                     "Sonnet",
                     ComponentTotals::new(1.0, 1.0, 0.0, 0.0),
-                    ReportMode::Cost,
                 ),
-                CostRow::new_total_row(2.0, ReportMode::Cost),
+                CostRow::new_total_row(MetricTotal::Cost(2.0)),
                 CostRow::new(
                     "2025-10-24",
                     "Haiku",
                     ComponentTotals::new(0.5, 0.5, 0.0, 0.0),
-                    ReportMode::Cost,
                 ),
-                CostRow::new_total_row(1.0, ReportMode::Cost),
+                CostRow::new_total_row(MetricTotal::Cost(1.0)),
             ],
             total_row_indices: vec![1, 3],
             expected_substrings: vec!["2025-10-23", "2025-10-24", "Sonnet", "Haiku"],
@@ -503,7 +481,6 @@ fn apply_width_config_handles_boundary_widths() {
         "2025-10-23",
         "Sonnet",
         ComponentTotals::new(1.0, 1.0, 0.0, 0.0),
-        ReportMode::Cost,
     )];
 
     for width in [99, 100, 101] {
@@ -599,7 +576,6 @@ fn session_cost_row_formats_currency_columns() {
         "1 hr 30 min",
         "Sonnet",
         ComponentTotals::new(1.2345, 2.3456, 0.5, 0.25),
-        ReportMode::Cost,
     );
 
     assert_eq!(row.session, "019dc252");
@@ -611,7 +587,7 @@ fn session_cost_row_formats_currency_columns() {
 
 #[test]
 fn session_cost_row_total_uses_blank_component_columns() {
-    let row = SessionCostRow::new_total_row(7.5, ReportMode::Cost);
+    let row = SessionCostRow::new_total_row(MetricTotal::Cost(7.5));
 
     assert_eq!(row.session, "");
     assert_eq!(row.time_range, "");

@@ -44,6 +44,39 @@ async fn main() -> miette::Result<()> {
             )
             .await?;
         }
+        Command::Graphs { subcommand } => match subcommand {
+            GraphsCommand::Claude { dir, cost_args } => {
+                init_cost_report_tracing();
+                let timezone = parse_date_timezone(&cost_args.timezone)?;
+                let filter = cost_args.time_filter()?;
+                let report_mode = cost_args.report_mode();
+                print_time_range_filter(&filter);
+                api_pricing::run_graphs(
+                    &dir,
+                    timezone,
+                    cost_args.conversations,
+                    &filter,
+                    report_mode,
+                )
+                .await?;
+            }
+            GraphsCommand::Pi { dir, cost_args } => {
+                init_cost_report_tracing();
+                let dir = resolve_pi_sessions_dir(dir)?;
+                let timezone = parse_date_timezone(&cost_args.timezone)?;
+                let filter = cost_args.time_filter()?;
+                let report_mode = cost_args.report_mode();
+                print_time_range_filter(&filter);
+                pi_cost::run_graphs(
+                    &dir,
+                    timezone,
+                    cost_args.conversations,
+                    &filter,
+                    report_mode,
+                )
+                .await?;
+            }
+        },
         Command::Pi { subcommand } => match subcommand {
             PiCommand::Cost { dir, cost_args } => {
                 init_cost_report_tracing();
@@ -66,17 +99,12 @@ async fn main() -> miette::Result<()> {
             server.run().await?;
         }
         Command::ApproveProject { project_dir } => {
-            // Initialize the terminal
             let terminal = ratatui::init();
-
-            // Create and run the approval app
             let app = approval_tui::ApprovalApp::new(project_dir).await?;
             let approved = app.run(terminal).await;
 
-            // Restore the terminal
             ratatui::restore();
 
-            // Exit with appropriate code
             match approved {
                 Ok(true) => {
                     println!("✓ Project tools approved successfully!");
@@ -225,6 +253,11 @@ enum Command {
         #[command(flatten)]
         cost_args: CostCommandArgs,
     },
+    /// Render chart-focused cost/token graphs
+    Graphs {
+        #[command(subcommand)]
+        subcommand: GraphsCommand,
+    },
     /// Analyze pi session logs
     Pi {
         #[command(subcommand)]
@@ -249,6 +282,26 @@ enum Command {
     Test {
         #[command(subcommand)]
         subcommand: TestCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum GraphsCommand {
+    /// Render Claude/API usage graphs
+    Claude {
+        /// The directory to analyze for API usage
+        #[arg(short, long)]
+        dir: PathBuf,
+        #[command(flatten)]
+        cost_args: CostCommandArgs,
+    },
+    /// Render pi session usage graphs
+    Pi {
+        /// The directory to analyze for pi session usage
+        #[arg(short, long)]
+        dir: Option<PathBuf>,
+        #[command(flatten)]
+        cost_args: CostCommandArgs,
     },
 }
 
@@ -310,7 +363,9 @@ mod tests {
     use clap::Parser;
     use tempfile::TempDir;
 
-    use super::{parse_date_timezone, resolve_pi_sessions_dir, Cli, Command, PiCommand};
+    use super::{
+        parse_date_timezone, resolve_pi_sessions_dir, Cli, Command, GraphsCommand, PiCommand,
+    };
     use crate::cost_report::DateTimezone;
 
     struct HomeGuard {
@@ -479,6 +534,57 @@ mod tests {
                 assert_eq!(cost_args.end_time.as_deref(), Some("2025-01-02"));
             }
             other => panic!("expected nested pi cost command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_graphs_claude_command() {
+        let cli = Cli::try_parse_from([
+            "moriarty",
+            "graphs",
+            "claude",
+            "--dir",
+            "logs/api",
+            "--timezone",
+            "utc",
+            "--tokens",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Command::Graphs {
+                subcommand: GraphsCommand::Claude { dir, cost_args },
+            } => {
+                assert_eq!(dir, PathBuf::from("logs/api"));
+                assert_eq!(cost_args.timezone, "utc");
+                assert!(cost_args.tokens);
+                assert!(!cost_args.conversations);
+            }
+            other => panic!("expected graphs claude command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_graphs_pi_command() {
+        let cli = Cli::try_parse_from([
+            "moriarty",
+            "graphs",
+            "pi",
+            "--dir",
+            "logs/pi",
+            "--conversations",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Command::Graphs {
+                subcommand: GraphsCommand::Pi { dir, cost_args },
+            } => {
+                assert_eq!(dir, Some(PathBuf::from("logs/pi")));
+                assert!(cost_args.conversations);
+                assert!(!cost_args.tokens);
+            }
+            other => panic!("expected graphs pi command, got {other:?}"),
         }
     }
 

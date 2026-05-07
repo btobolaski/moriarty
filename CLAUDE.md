@@ -9,6 +9,8 @@ Moriarty is a Rust CLI tool for analyzing Claude Code logs and API usage. It pro
 - **Claude API pricing analyzer**: Analyzes Claude API usage from log directories and generates detailed cost or token reports
 - **Pi cost analyzer**: Analyzes pi session logs and generates daily or per-conversation cost or token reports grouped by
   provider and model
+- **Terminal graphs**: Renders chart-focused stacked-bar summaries for Claude/API and pi usage via `graphs claude` and
+  `graphs pi`
 - **MCP servers**: Provides Model Context Protocol servers for git operations and project tools
 - **Hooks system**: Security integration for validating commands before execution (bash rules, project checks)
 - **Project approval TUI**: Interactive interface for approving project tools before execution
@@ -32,6 +34,10 @@ cargo run -- api-pricing -d <directory> --tokens
 cargo run -- pi cost --timezone local|utc
 cargo run -- pi cost --dir <pi-sessions-directory> --conversations
 cargo run -- pi cost --dir <pi-sessions-directory> --tokens
+
+# Render chart-focused usage graphs
+cargo run -- graphs claude --dir <directory> --timezone local|utc
+cargo run -- graphs pi --dir <pi-sessions-directory> --conversations --tokens
 
 # Run MCP servers
 cargo run -- mcp git-read-only
@@ -78,13 +84,15 @@ test in a separate process, making this safe and preventing tests from clobberin
 
 **`cost_report/`** - Shared cost report rendering and filtering:
 
-- Holds shared time filtering, grouped-table rendering, `ReportMode`, `CostComponents`, `TokenCounts`,
-  `MetricComponents`, and report warning helpers used by both cost-report backends
+- Holds shared time filtering, grouped-table rendering, stacked-chart rendering, `ReportMode`, `CostComponents`,
+  `TokenCounts`, `MetricComponents`, and report warning helpers used by both cost-report backends
 - `FormattedMetricColumns`, `GrandTotalRow`, and `render_grouped_metrics` are mode-aware: cost mode formats dollars,
   token mode formats integer token counts with thousands separators, while preserving the same table shape for both
   backends
-- Keeps the output behavior for `api-pricing` and `pi cost` aligned without forcing the backends into a dynamic-column
-  abstraction
+- `charts.rs` renders deterministic horizontal stacked bars for both time-series and share views, including top-N plus
+  `Other`, stable glyph/color assignment, and narrow-terminal truncation without changing the table-report path
+- Keeps the output behavior for `api-pricing`, `pi cost`, and the graph commands aligned without forcing the backends
+  into a dynamic-column abstraction
 
 **`api_pricing/`** - Claude API usage cost analysis:
 
@@ -93,7 +101,9 @@ test in a separate process, making this safe and preventing tests from clobberin
 - Per-model aggregation uses `ModelMetricsMap` to accumulate exact-mode `MetricComponents` into Claude-family buckets;
   token mode stays integer-exact end-to-end instead of passing through floating-point helpers
 - Unknown Claude models surface as stderr tracing errors via `cost_analyzer`; they are not rendered in the report
-- Entry point: `api-pricing` subcommand in `main.rs`
+- Also prepares `ChartBucket` data for `graphs claude`, reusing the same analyzer output while keeping the existing
+  detailed table report unchanged
+- Entry points: `api-pricing` and `graphs claude` subcommands in `main.rs`
 
 **`pi_cost/`** - Pi session cost analysis:
 
@@ -103,7 +113,9 @@ test in a separate process, making this safe and preventing tests from clobberin
   `BTreeMap<PiModel, MetricComponents>` accumulator inside `PiModelMetricsMap`
 - Conversation mode depends on `cost_analyzer::LineWithCost.session_id`, which is attached during the single-pass parse
   from either Claude assistant lines or pi `SessionLine` headers
-- Entry point: `pi cost` subcommand in `main.rs`
+- Also prepares provider/model `ChartBucket` data for `graphs pi`, reusing the same analyzer output while keeping the
+  existing detailed table report unchanged
+- Entry points: `pi cost` and `graphs pi` subcommands in `main.rs`
 
 **`pi_logs/`** - Pi session log parsing:
 

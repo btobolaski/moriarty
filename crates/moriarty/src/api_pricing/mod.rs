@@ -7,57 +7,11 @@ use tabled::Tabled;
 
 use crate::cost_report::{
     build_grouped_rows, format_duration, format_session_id, format_time_range, grouped_label,
-    push_nonzero_metric_rows, render_grouped_metrics, render_or_empty, DateTimezone,
-    FormattedMetricColumns, MetricComponents, MetricTotal, ReportMode, TimeRangeFilter,
+    push_nonzero_metric_rows, render_grouped_metrics, render_or_empty, render_stacked_charts,
+    ChartBucket, ChartSegment, DateTimezone, FormattedMetricColumns, MetricComponents, MetricTotal,
+    ReportMode, TimeRangeFilter,
 };
-#[cfg(test)]
-use crate::cost_report::{CostComponents, TokenCounts};
 use analyzer::{DailyMetrics, SessionMetrics};
-
-trait IntoMetricComponentsForMode {
-    fn into_metric_components(self, report_mode: ReportMode) -> MetricComponents;
-}
-
-trait IntoMetricTotalForMode {
-    fn into_metric_total(self, report_mode: ReportMode) -> MetricTotal;
-}
-
-impl IntoMetricComponentsForMode for MetricComponents {
-    fn into_metric_components(self, _report_mode: ReportMode) -> MetricComponents {
-        self
-    }
-}
-
-#[cfg(test)]
-impl IntoMetricComponentsForMode for CostComponents {
-    fn into_metric_components(self, report_mode: ReportMode) -> MetricComponents {
-        match report_mode {
-            ReportMode::Cost => MetricComponents::Cost(self),
-            ReportMode::Tokens => MetricComponents::Tokens(TokenCounts::new(
-                self.input.round() as u64,
-                self.output.round() as u64,
-                self.cache_write.round() as u64,
-                self.cache_read.round() as u64,
-            )),
-        }
-    }
-}
-
-impl IntoMetricTotalForMode for MetricTotal {
-    fn into_metric_total(self, _report_mode: ReportMode) -> MetricTotal {
-        self
-    }
-}
-
-#[cfg(test)]
-impl IntoMetricTotalForMode for f64 {
-    fn into_metric_total(self, report_mode: ReportMode) -> MetricTotal {
-        match report_mode {
-            ReportMode::Cost => MetricTotal::Cost(self),
-            ReportMode::Tokens => MetricTotal::Tokens(self.round() as u128),
-        }
-    }
-}
 
 #[derive(Tabled)]
 struct ApiMetricRow {
@@ -70,34 +24,23 @@ struct ApiMetricRow {
 }
 
 impl ApiMetricRow {
-    fn new(
-        date: &str,
-        model: &str,
-        metrics: impl IntoMetricComponentsForMode,
-        report_mode: ReportMode,
-    ) -> Self {
+    fn new(date: &str, model: &str, metrics: impl Into<MetricComponents>) -> Self {
         Self {
             date: date.to_string(),
             model: model.to_string(),
-            metrics: FormattedMetricColumns::from_metrics(
-                metrics.into_metric_components(report_mode),
-            ),
+            metrics: FormattedMetricColumns::from_metrics(metrics.into()),
         }
     }
 
-    fn new_total_row(total: impl IntoMetricTotalForMode, report_mode: ReportMode) -> Self {
-        Self::new_labeled_total_row("", total, report_mode)
+    fn new_total_row(total: MetricTotal) -> Self {
+        Self::new_labeled_total_row("", total)
     }
 
-    fn new_labeled_total_row(
-        date: &str,
-        total: impl IntoMetricTotalForMode,
-        report_mode: ReportMode,
-    ) -> Self {
+    fn new_labeled_total_row(date: &str, total: MetricTotal) -> Self {
         Self {
             date: date.to_string(),
             model: "Total".to_string(),
-            metrics: FormattedMetricColumns::from_total(total.into_metric_total(report_mode)),
+            metrics: FormattedMetricColumns::from_total(total),
         }
     }
 }
@@ -122,37 +65,33 @@ impl ApiSessionMetricRow {
         time_range: &str,
         duration: &str,
         model: &str,
-        metrics: impl IntoMetricComponentsForMode,
-        report_mode: ReportMode,
+        metrics: impl Into<MetricComponents>,
     ) -> Self {
         Self {
             session: session.to_string(),
             time_range: time_range.to_string(),
             duration: duration.to_string(),
             model: model.to_string(),
-            metrics: FormattedMetricColumns::from_metrics(
-                metrics.into_metric_components(report_mode),
-            ),
+            metrics: FormattedMetricColumns::from_metrics(metrics.into()),
         }
     }
 
-    fn new_total_row(total: impl IntoMetricTotalForMode, report_mode: ReportMode) -> Self {
-        Self::new_labeled_total_row("", "", "", total, report_mode)
+    fn new_total_row(total: MetricTotal) -> Self {
+        Self::new_labeled_total_row("", "", "", total)
     }
 
     fn new_labeled_total_row(
         session: &str,
         time_range: &str,
         duration: &str,
-        total: impl IntoMetricTotalForMode,
-        report_mode: ReportMode,
+        total: MetricTotal,
     ) -> Self {
         Self {
             session: session.to_string(),
             time_range: time_range.to_string(),
             duration: duration.to_string(),
             model: "Total".to_string(),
-            metrics: FormattedMetricColumns::from_total(total.into_metric_total(report_mode)),
+            metrics: FormattedMetricColumns::from_total(total),
         }
     }
 }
@@ -171,6 +110,73 @@ fn session_title(report_mode: ReportMode) -> &'static str {
     }
 }
 
+fn graph_title(report_mode: ReportMode, by_conversation: bool) -> &'static str {
+    match (report_mode, by_conversation) {
+        (ReportMode::Cost, false) => "API Cost Graphs",
+        (ReportMode::Tokens, false) => "API Token Graphs",
+        (ReportMode::Cost, true) => "API Cost Graphs by Conversation",
+        (ReportMode::Tokens, true) => "API Token Graphs by Conversation",
+    }
+}
+
+fn time_series_chart_title(report_mode: ReportMode, by_conversation: bool) -> &'static str {
+    match (report_mode, by_conversation) {
+        (ReportMode::Cost, false) => "Daily total cost by model",
+        (ReportMode::Tokens, false) => "Daily total tokens by model",
+        (ReportMode::Cost, true) => "Conversation total cost by model",
+        (ReportMode::Tokens, true) => "Conversation total tokens by model",
+    }
+}
+
+fn share_chart_title(report_mode: ReportMode) -> &'static str {
+    match report_mode {
+        ReportMode::Cost => "Cost share by model",
+        ReportMode::Tokens => "Token share by model",
+    }
+}
+
+fn build_daily_chart_buckets(
+    daily_metrics: &[DailyMetrics],
+    report_mode: ReportMode,
+) -> Vec<ChartBucket> {
+    daily_metrics
+        .iter()
+        .map(|metrics| ChartBucket {
+            label: metrics.date.to_string(),
+            segments: metrics
+                .per_model
+                .model_metrics(report_mode)
+                .into_iter()
+                .map(|(model_name, metric_components)| ChartSegment {
+                    label: model_name.to_string(),
+                    total: metric_components.total(),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+fn build_session_chart_buckets(
+    session_metrics: &[SessionMetrics],
+    report_mode: ReportMode,
+) -> Vec<ChartBucket> {
+    session_metrics
+        .iter()
+        .map(|metrics| ChartBucket {
+            label: format_session_id(&metrics.session_id),
+            segments: metrics
+                .per_model
+                .model_metrics(report_mode)
+                .into_iter()
+                .map(|(model_name, metric_components)| ChartSegment {
+                    label: model_name.to_string(),
+                    total: metric_components.total(),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
 fn build_daily_rows(
     daily_metrics: &[DailyMetrics],
     report_mode: ReportMode,
@@ -187,7 +193,6 @@ fn build_daily_rows(
                         grouped_label(first_row, &date_str),
                         model_name,
                         metric_components,
-                        report_mode,
                     )
                 },
             );
@@ -195,12 +200,11 @@ fn build_daily_rows(
         },
         |rows, metrics, has_detail_rows| {
             rows.push(if has_detail_rows {
-                ApiMetricRow::new_total_row(metrics.total(report_mode)?, report_mode)
+                ApiMetricRow::new_total_row(metrics.total(report_mode)?)
             } else {
                 ApiMetricRow::new_labeled_total_row(
                     &metrics.date.to_string(),
                     metrics.total(report_mode)?,
-                    report_mode,
                 )
             });
             Ok(())
@@ -229,7 +233,6 @@ fn build_session_rows(
                         grouped_label(first_row, &duration),
                         model_name,
                         metric_components,
-                        report_mode,
                     )
                 },
             );
@@ -237,14 +240,13 @@ fn build_session_rows(
         },
         |rows, metrics, has_detail_rows| {
             rows.push(if has_detail_rows {
-                ApiSessionMetricRow::new_total_row(metrics.total(report_mode)?, report_mode)
+                ApiSessionMetricRow::new_total_row(metrics.total(report_mode)?)
             } else {
                 ApiSessionMetricRow::new_labeled_total_row(
                     &format_session_id(&metrics.session_id),
                     &format_time_range(timezone, metrics.start_time, metrics.end_time),
                     &format_duration(metrics.duration_minutes()),
                     metrics.total(report_mode)?,
-                    report_mode,
                 )
             });
             Ok(())
@@ -279,6 +281,32 @@ fn display_session_metrics(
     )
 }
 
+fn display_daily_graphs(
+    daily_metrics: &[DailyMetrics],
+    report_mode: ReportMode,
+) -> miette::Result<()> {
+    render_stacked_charts(
+        graph_title(report_mode, false),
+        time_series_chart_title(report_mode, false),
+        share_chart_title(report_mode),
+        &build_daily_chart_buckets(daily_metrics, report_mode),
+        report_mode,
+    )
+}
+
+fn display_session_graphs(
+    session_metrics: &[SessionMetrics],
+    report_mode: ReportMode,
+) -> miette::Result<()> {
+    render_stacked_charts(
+        graph_title(report_mode, true),
+        time_series_chart_title(report_mode, true),
+        share_chart_title(report_mode),
+        &build_session_chart_buckets(session_metrics, report_mode),
+        report_mode,
+    )
+}
+
 pub async fn run_by_session(
     dir: &Path,
     timezone: DateTimezone,
@@ -288,6 +316,17 @@ pub async fn run_by_session(
     let result = analyzer::analyze_directory_by_session(dir, filter, report_mode).await?;
     render_or_empty(&result.session_metrics, result.had_errors, |items| {
         display_session_metrics(items, timezone, report_mode)
+    })
+}
+
+pub async fn run_graphs_by_session(
+    dir: &Path,
+    filter: &TimeRangeFilter,
+    report_mode: ReportMode,
+) -> miette::Result<()> {
+    let result = analyzer::analyze_directory_by_session(dir, filter, report_mode).await?;
+    render_or_empty(&result.session_metrics, result.had_errors, |items| {
+        display_session_graphs(items, report_mode)
     })
 }
 
@@ -305,6 +344,23 @@ pub async fn run(
     let result = analyzer::analyze_directory(dir, timezone, filter, report_mode).await?;
     render_or_empty(&result.daily_metrics, result.had_errors, |items| {
         display_daily_metrics(items, report_mode)
+    })
+}
+
+pub async fn run_graphs(
+    dir: &Path,
+    timezone: DateTimezone,
+    by_conversation: bool,
+    filter: &TimeRangeFilter,
+    report_mode: ReportMode,
+) -> miette::Result<()> {
+    if by_conversation {
+        return run_graphs_by_session(dir, filter, report_mode).await;
+    }
+
+    let result = analyzer::analyze_directory(dir, timezone, filter, report_mode).await?;
+    render_or_empty(&result.daily_metrics, result.had_errors, |items| {
+        display_daily_graphs(items, report_mode)
     })
 }
 

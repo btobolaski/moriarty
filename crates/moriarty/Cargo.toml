@@ -27,6 +27,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 fs2 = "0.4"
 toml = "0.9.8"
+unicode-width = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2"
 tui-scrollview = "0.5.1"

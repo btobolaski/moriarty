@@ -1154,6 +1154,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "tui-scrollview",
+ "unicode-width 0.2.0",
  "which",
  "xdg",
 ]

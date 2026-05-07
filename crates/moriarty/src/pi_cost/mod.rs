@@ -7,58 +7,12 @@ use tabled::Tabled;
 
 use crate::cost_report::{
     build_grouped_rows, format_duration, format_session_id, format_time_range, grouped_label,
-    push_nonzero_metric_rows, render_grouped_metrics, render_or_empty, DateTimezone,
-    FormattedMetricColumns, MetricComponents, MetricTotal, ReportMode, TimeRangeFilter,
+    push_nonzero_metric_rows, render_grouped_metrics, render_or_empty, render_stacked_charts,
+    ChartBucket, ChartSegment, DateTimezone, FormattedMetricColumns, MetricComponents, MetricTotal,
+    ReportMode, TimeRangeFilter,
 };
-#[cfg(test)]
-use crate::cost_report::{CostComponents, TokenCounts};
 use analyzer::{DailyMetrics, SessionMetrics};
 use pi_logs::Provider;
-
-trait IntoMetricComponentsForMode {
-    fn into_metric_components(self, report_mode: ReportMode) -> MetricComponents;
-}
-
-trait IntoMetricTotalForMode {
-    fn into_metric_total(self, report_mode: ReportMode) -> MetricTotal;
-}
-
-impl IntoMetricComponentsForMode for MetricComponents {
-    fn into_metric_components(self, _report_mode: ReportMode) -> MetricComponents {
-        self
-    }
-}
-
-#[cfg(test)]
-impl IntoMetricComponentsForMode for CostComponents {
-    fn into_metric_components(self, report_mode: ReportMode) -> MetricComponents {
-        match report_mode {
-            ReportMode::Cost => MetricComponents::Cost(self),
-            ReportMode::Tokens => MetricComponents::Tokens(TokenCounts::new(
-                self.input.round() as u64,
-                self.output.round() as u64,
-                self.cache_write.round() as u64,
-                self.cache_read.round() as u64,
-            )),
-        }
-    }
-}
-
-impl IntoMetricTotalForMode for MetricTotal {
-    fn into_metric_total(self, _report_mode: ReportMode) -> MetricTotal {
-        self
-    }
-}
-
-#[cfg(test)]
-impl IntoMetricTotalForMode for f64 {
-    fn into_metric_total(self, report_mode: ReportMode) -> MetricTotal {
-        match report_mode {
-            ReportMode::Cost => MetricTotal::Cost(self),
-            ReportMode::Tokens => MetricTotal::Tokens(self.round() as u128),
-        }
-    }
-}
 
 #[derive(Tabled)]
 struct PiMetricRow {
@@ -73,37 +27,25 @@ struct PiMetricRow {
 }
 
 impl PiMetricRow {
-    fn new(
-        date: &str,
-        provider: &str,
-        model: &str,
-        metrics: impl IntoMetricComponentsForMode,
-        report_mode: ReportMode,
-    ) -> Self {
+    fn new(date: &str, provider: &str, model: &str, metrics: impl Into<MetricComponents>) -> Self {
         Self {
             date: date.to_string(),
             provider: provider.to_string(),
             model: model.to_string(),
-            metrics: FormattedMetricColumns::from_metrics(
-                metrics.into_metric_components(report_mode),
-            ),
+            metrics: FormattedMetricColumns::from_metrics(metrics.into()),
         }
     }
 
-    fn new_total_row(total: impl IntoMetricTotalForMode, report_mode: ReportMode) -> Self {
-        Self::new_labeled_total_row("", total, report_mode)
+    fn new_total_row(total: MetricTotal) -> Self {
+        Self::new_labeled_total_row("", total)
     }
 
-    fn new_labeled_total_row(
-        date: &str,
-        total: impl IntoMetricTotalForMode,
-        report_mode: ReportMode,
-    ) -> Self {
+    fn new_labeled_total_row(date: &str, total: MetricTotal) -> Self {
         Self {
             date: date.to_string(),
             provider: String::new(),
             model: "Total".to_string(),
-            metrics: FormattedMetricColumns::from_total(total.into_metric_total(report_mode)),
+            metrics: FormattedMetricColumns::from_total(total),
         }
     }
 }
@@ -131,8 +73,7 @@ impl PiSessionMetricRow {
         duration: &str,
         provider: &str,
         model: &str,
-        metrics: impl IntoMetricComponentsForMode,
-        report_mode: ReportMode,
+        metrics: impl Into<MetricComponents>,
     ) -> Self {
         Self {
             session: session.to_string(),
@@ -140,22 +81,19 @@ impl PiSessionMetricRow {
             duration: duration.to_string(),
             provider: provider.to_string(),
             model: model.to_string(),
-            metrics: FormattedMetricColumns::from_metrics(
-                metrics.into_metric_components(report_mode),
-            ),
+            metrics: FormattedMetricColumns::from_metrics(metrics.into()),
         }
     }
 
-    fn new_total_row(total: impl IntoMetricTotalForMode, report_mode: ReportMode) -> Self {
-        Self::new_labeled_total_row("", "", "", total, report_mode)
+    fn new_total_row(total: MetricTotal) -> Self {
+        Self::new_labeled_total_row("", "", "", total)
     }
 
     fn new_labeled_total_row(
         session: &str,
         time_range: &str,
         duration: &str,
-        total: impl IntoMetricTotalForMode,
-        report_mode: ReportMode,
+        total: MetricTotal,
     ) -> Self {
         Self {
             session: session.to_string(),
@@ -163,7 +101,7 @@ impl PiSessionMetricRow {
             duration: duration.to_string(),
             provider: String::new(),
             model: "Total".to_string(),
-            metrics: FormattedMetricColumns::from_total(total.into_metric_total(report_mode)),
+            metrics: FormattedMetricColumns::from_total(total),
         }
     }
 }
@@ -187,6 +125,69 @@ fn session_title(report_mode: ReportMode) -> &'static str {
         ReportMode::Cost => "Pi Cost Report by Conversation",
         ReportMode::Tokens => "Pi Token Report by Conversation",
     }
+}
+
+fn graph_title(report_mode: ReportMode, by_conversation: bool) -> &'static str {
+    match (report_mode, by_conversation) {
+        (ReportMode::Cost, false) => "Pi Cost Graphs",
+        (ReportMode::Tokens, false) => "Pi Token Graphs",
+        (ReportMode::Cost, true) => "Pi Cost Graphs by Conversation",
+        (ReportMode::Tokens, true) => "Pi Token Graphs by Conversation",
+    }
+}
+
+fn time_series_chart_title(report_mode: ReportMode, by_conversation: bool) -> &'static str {
+    match (report_mode, by_conversation) {
+        (ReportMode::Cost, false) => "Daily total cost by provider/model",
+        (ReportMode::Tokens, false) => "Daily total tokens by provider/model",
+        (ReportMode::Cost, true) => "Conversation total cost by provider/model",
+        (ReportMode::Tokens, true) => "Conversation total tokens by provider/model",
+    }
+}
+
+fn share_chart_title(report_mode: ReportMode) -> &'static str {
+    match report_mode {
+        ReportMode::Cost => "Cost share by provider/model",
+        ReportMode::Tokens => "Token share by provider/model",
+    }
+}
+
+fn segment_label(provider: Provider, model: &str) -> String {
+    format!("{} / {}", provider_label(provider), model)
+}
+
+fn build_daily_chart_buckets(daily_metrics: &[DailyMetrics]) -> Vec<ChartBucket> {
+    daily_metrics
+        .iter()
+        .map(|metrics| ChartBucket {
+            label: metrics.date.to_string(),
+            segments: metrics
+                .per_model
+                .model_metrics()
+                .map(|(model, metric_components)| ChartSegment {
+                    label: segment_label(model.provider, &model.model),
+                    total: metric_components.total(),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+fn build_session_chart_buckets(session_metrics: &[SessionMetrics]) -> Vec<ChartBucket> {
+    session_metrics
+        .iter()
+        .map(|metrics| ChartBucket {
+            label: format_session_id(&metrics.session_id),
+            segments: metrics
+                .per_model
+                .model_metrics()
+                .map(|(model, metric_components)| ChartSegment {
+                    label: segment_label(model.provider, &model.model),
+                    total: metric_components.total(),
+                })
+                .collect(),
+        })
+        .collect()
 }
 
 fn build_daily_rows(
@@ -214,7 +215,6 @@ fn build_daily_rows(
                         provider,
                         model,
                         metric_components,
-                        report_mode,
                     )
                 },
             );
@@ -222,12 +222,11 @@ fn build_daily_rows(
         },
         |rows, metrics, has_detail_rows| {
             rows.push(if has_detail_rows {
-                PiMetricRow::new_total_row(metrics.total(report_mode)?, report_mode)
+                PiMetricRow::new_total_row(metrics.total(report_mode)?)
             } else {
                 PiMetricRow::new_labeled_total_row(
                     &metrics.date.to_string(),
                     metrics.total(report_mode)?,
-                    report_mode,
                 )
             });
             Ok(())
@@ -265,7 +264,6 @@ fn build_session_rows(
                         provider,
                         model,
                         metric_components,
-                        report_mode,
                     )
                 },
             );
@@ -273,14 +271,13 @@ fn build_session_rows(
         },
         |rows, metrics, has_detail_rows| {
             rows.push(if has_detail_rows {
-                PiSessionMetricRow::new_total_row(metrics.total(report_mode)?, report_mode)
+                PiSessionMetricRow::new_total_row(metrics.total(report_mode)?)
             } else {
                 PiSessionMetricRow::new_labeled_total_row(
                     &format_session_id(&metrics.session_id),
                     &format_time_range(timezone, metrics.start_time, metrics.end_time),
                     &format_duration(metrics.duration_minutes()),
                     metrics.total(report_mode)?,
-                    report_mode,
                 )
             });
             Ok(())
@@ -315,6 +312,32 @@ fn display_session_metrics(
     )
 }
 
+fn display_daily_graphs(
+    daily_metrics: &[DailyMetrics],
+    report_mode: ReportMode,
+) -> miette::Result<()> {
+    render_stacked_charts(
+        graph_title(report_mode, false),
+        time_series_chart_title(report_mode, false),
+        share_chart_title(report_mode),
+        &build_daily_chart_buckets(daily_metrics),
+        report_mode,
+    )
+}
+
+fn display_session_graphs(
+    session_metrics: &[SessionMetrics],
+    report_mode: ReportMode,
+) -> miette::Result<()> {
+    render_stacked_charts(
+        graph_title(report_mode, true),
+        time_series_chart_title(report_mode, true),
+        share_chart_title(report_mode),
+        &build_session_chart_buckets(session_metrics),
+        report_mode,
+    )
+}
+
 pub async fn run_by_session(
     dir: &Path,
     timezone: DateTimezone,
@@ -324,6 +347,17 @@ pub async fn run_by_session(
     let result = analyzer::analyze_directory_by_session(dir, filter, report_mode).await?;
     render_or_empty(&result.session_metrics, result.had_errors, |items| {
         display_session_metrics(items, timezone, report_mode)
+    })
+}
+
+pub async fn run_graphs_by_session(
+    dir: &Path,
+    filter: &TimeRangeFilter,
+    report_mode: ReportMode,
+) -> miette::Result<()> {
+    let result = analyzer::analyze_directory_by_session(dir, filter, report_mode).await?;
+    render_or_empty(&result.session_metrics, result.had_errors, |items| {
+        display_session_graphs(items, report_mode)
     })
 }
 
@@ -341,6 +375,23 @@ pub async fn run(
     let result = analyzer::analyze_directory(dir, timezone, filter, report_mode).await?;
     render_or_empty(&result.daily_metrics, result.had_errors, |items| {
         display_daily_metrics(items, report_mode)
+    })
+}
+
+pub async fn run_graphs(
+    dir: &Path,
+    timezone: DateTimezone,
+    by_conversation: bool,
+    filter: &TimeRangeFilter,
+    report_mode: ReportMode,
+) -> miette::Result<()> {
+    if by_conversation {
+        return run_graphs_by_session(dir, filter, report_mode).await;
+    }
+
+    let result = analyzer::analyze_directory(dir, timezone, filter, report_mode).await?;
+    render_or_empty(&result.daily_metrics, result.had_errors, |items| {
+        display_daily_graphs(items, report_mode)
     })
 }
 
@@ -476,7 +527,6 @@ mod tests {
             "Anthropic",
             "claude-sonnet-4-5",
             ComponentTotals::new(1.25, 2.5, 0.5, 0.25),
-            ReportMode::Cost,
         );
 
         assert_eq!(row.date, "2025-10-23");
@@ -487,7 +537,7 @@ mod tests {
 
     #[test]
     fn pi_cost_row_total_uses_blank_component_columns() {
-        let row = PiCostRow::new_total_row(7.5, ReportMode::Cost);
+        let row = PiCostRow::new_total_row(MetricTotal::Cost(7.5));
 
         assert_eq!(row.date, "");
         assert_eq!(row.provider, "");
@@ -503,7 +553,6 @@ mod tests {
             "Anthropic",
             "claude-sonnet-4-5",
             MetricComponents::Tokens(TokenCounts::new(1_234, 5_678, 90, 12)),
-            ReportMode::Tokens,
         );
 
         assert_eq!(row.metrics.input, "1,234");
@@ -547,7 +596,7 @@ mod tests {
 
     #[test]
     fn pi_session_cost_row_total_uses_blank_component_columns() {
-        let row = PiSessionCostRow::new_total_row(4.0, ReportMode::Cost);
+        let row = PiSessionCostRow::new_total_row(MetricTotal::Cost(4.0));
 
         assert_eq!(row.session, "");
         assert_eq!(row.time_range, "");
