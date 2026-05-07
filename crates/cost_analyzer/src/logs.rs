@@ -62,12 +62,23 @@ fn parse_json_backed_log<T: DeserializeOwned>(value: &str) -> miette::Result<T> 
     parse_json_line(value, LOG_LINE_PARSE_CONTEXT)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TokenType {
+    Input,
+    Output,
+    CacheWrite,
+    CacheRead,
+}
+
 pub trait AnalyzableLog: std::fmt::Debug + Clone + Send + Sync + 'static {
     type LogId: Identifier;
     type ModelId: Identifier;
 
     /// cost returns Option<LlmCost> because not all entries in the log have a cost i.e. entries from users
     fn cost(&self) -> Option<LlmCost>;
+    /// Returns the per-component token count when the parsed log line carries
+    /// assistant usage metadata.
+    fn token_count(&self, token_type: TokenType) -> Option<u64>;
     fn timestamp(&self) -> DateTime<Utc>;
     fn identifier(&self) -> Self::LogId;
     /// model is only set on messages from the LLM so, this returns option
@@ -280,6 +291,31 @@ fn claude_token_counts_from_usage(usage: &ClaudeAssistantUsage) -> ClaudeTokenCo
     }
 }
 
+fn token_count_from_claude_usage(
+    usage: &ClaudeAssistantUsage,
+    token_type: TokenType,
+) -> Option<u64> {
+    let counts = claude_token_counts_from_usage(usage);
+    match token_type {
+        TokenType::Input => counts.input_tokens.try_into().ok(),
+        TokenType::Output => counts.output_tokens.try_into().ok(),
+        TokenType::CacheWrite => counts.cache_write_tokens.try_into().ok(),
+        TokenType::CacheRead => counts.cache_read_tokens.try_into().ok(),
+    }
+}
+
+fn token_count_from_pi_usage(
+    usage: &pi_logs::AssistantUsage,
+    token_type: TokenType,
+) -> Option<u64> {
+    match token_type {
+        TokenType::Input => Some(usage.input),
+        TokenType::Output => Some(usage.output),
+        TokenType::CacheWrite => Some(usage.cache_write),
+        TokenType::CacheRead => Some(usage.cache_read),
+    }
+}
+
 fn priced_claude_assistant(
     line: &ClaudeLogLine,
 ) -> Option<(&ClaudeAssistantLogLine, ClaudeModelPricing)> {
@@ -392,6 +428,11 @@ impl AnalyzableLog for ClaudeLogLine {
         Some(pricing.calculate_cost(&token_counts))
     }
 
+    fn token_count(&self, token_type: TokenType) -> Option<u64> {
+        let assistant = claude_assistant_line(self)?;
+        token_count_from_claude_usage(&assistant.message.usage, token_type)
+    }
+
     fn timestamp(&self) -> DateTime<Utc> {
         match self {
             ClaudeLogLine::User(line) => line.timestamp,
@@ -477,6 +518,11 @@ impl AnalyzableLog for PiLogLine {
             cache_write: assistant.usage.cost.cache_write,
             output: assistant.usage.cost.output,
         })
+    }
+
+    fn token_count(&self, token_type: TokenType) -> Option<u64> {
+        let assistant = pi_assistant_message(self)?;
+        token_count_from_pi_usage(&assistant.usage, token_type)
     }
 
     fn identifier(&self) -> String {
@@ -1145,6 +1191,10 @@ mod tests {
 
         fn cost(&self) -> Option<LlmCost> {
             self.cost
+        }
+
+        fn token_count(&self, _token_type: TokenType) -> Option<u64> {
+            Some(0)
         }
 
         fn identifier(&self) -> Self::LogId {

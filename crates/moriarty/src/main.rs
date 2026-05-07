@@ -33,8 +33,16 @@ async fn main() -> miette::Result<()> {
             init_cost_report_tracing();
             let timezone = parse_date_timezone(&cost_args.timezone)?;
             let filter = cost_args.time_filter()?;
+            let report_mode = cost_args.report_mode();
             print_time_range_filter(&filter);
-            api_pricing::run(&dir, timezone, cost_args.conversations, &filter).await?;
+            api_pricing::run(
+                &dir,
+                timezone,
+                cost_args.conversations,
+                &filter,
+                report_mode,
+            )
+            .await?;
         }
         Command::Pi { subcommand } => match subcommand {
             PiCommand::Cost { dir, cost_args } => {
@@ -42,8 +50,16 @@ async fn main() -> miette::Result<()> {
                 let dir = resolve_pi_sessions_dir(dir)?;
                 let timezone = parse_date_timezone(&cost_args.timezone)?;
                 let filter = cost_args.time_filter()?;
+                let report_mode = cost_args.report_mode();
                 print_time_range_filter(&filter);
-                pi_cost::run(&dir, timezone, cost_args.conversations, &filter).await?;
+                pi_cost::run(
+                    &dir,
+                    timezone,
+                    cost_args.conversations,
+                    &filter,
+                    report_mode,
+                )
+                .await?;
             }
         },
         Command::Mcp { server } => {
@@ -92,6 +108,9 @@ struct CostCommandArgs {
     /// Aggregate by conversation/session instead of by date
     #[arg(long)]
     conversations: bool,
+    /// Show token counts instead of dollar costs
+    #[arg(long)]
+    tokens: bool,
     /// Start time for filtering messages (ISO 8601 format, e.g., "2025-01-01T00:00:00Z" or "2025-01-01")
     /// If no timezone specified, UTC is assumed
     #[arg(long, value_name = "DATETIME")]
@@ -105,6 +124,14 @@ struct CostCommandArgs {
 impl CostCommandArgs {
     fn time_filter(&self) -> miette::Result<cost_report::TimeRangeFilter> {
         cost_report::TimeRangeFilter::new(self.start_time.clone(), self.end_time.clone())
+    }
+
+    fn report_mode(&self) -> cost_report::ReportMode {
+        if self.tokens {
+            cost_report::ReportMode::Tokens
+        } else {
+            cost_report::ReportMode::Cost
+        }
     }
 }
 
@@ -432,6 +459,7 @@ mod tests {
             "--timezone",
             "utc",
             "--conversations",
+            "--tokens",
             "--start-time",
             "2025-01-01",
             "--end-time",
@@ -446,6 +474,7 @@ mod tests {
                 assert_eq!(dir, Some(PathBuf::from("logs/pi")));
                 assert_eq!(cost_args.timezone, "utc");
                 assert!(cost_args.conversations);
+                assert!(cost_args.tokens);
                 assert_eq!(cost_args.start_time.as_deref(), Some("2025-01-01"));
                 assert_eq!(cost_args.end_time.as_deref(), Some("2025-01-02"));
             }

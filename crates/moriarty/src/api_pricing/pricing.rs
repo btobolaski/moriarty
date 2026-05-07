@@ -1,5 +1,7 @@
 use std::{collections::HashMap, fmt};
 
+use crate::cost_report::{MetricComponents, MetricTotal, ReportMode};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ModelType {
     Sonnet,
@@ -53,77 +55,97 @@ impl fmt::Display for ModelType {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct TokenCosts {
-    pub input: f64,
-    pub output: f64,
-    pub cache_write: f64,
-    pub cache_read: f64,
-}
-
-impl TokenCosts {
-    pub fn new(input: f64, output: f64, cache_write: f64, cache_read: f64) -> Self {
-        Self {
-            input,
-            output,
-            cache_write,
-            cache_read,
-        }
-    }
-
-    pub fn total(&self) -> f64 {
-        self.input + self.output + self.cache_write + self.cache_read
-    }
-
-    pub fn as_components(&self) -> (f64, f64, f64, f64) {
-        (self.input, self.output, self.cache_write, self.cache_read)
-    }
-
-    pub fn add(&mut self, other: &TokenCosts) {
-        self.input += other.input;
-        self.output += other.output;
-        self.cache_write += other.cache_write;
-        self.cache_read += other.cache_read;
-    }
-}
-
 #[derive(Debug, Clone, Default)]
-pub struct ModelCostsMap {
-    costs: HashMap<ModelType, TokenCosts>,
+pub struct ModelMetricsMap {
+    metrics: HashMap<ModelType, MetricComponents>,
 }
 
-impl ModelCostsMap {
+impl ModelMetricsMap {
     /// Unknown Claude models are dropped here because `cost_analyzer` already
     /// logged the pricing problem upstream and the report only has stable rows
     /// for the four named display buckets.
-    pub fn add(&mut self, model_type: ModelType, costs: TokenCosts) {
+    pub fn add(
+        &mut self,
+        model_type: ModelType,
+        metrics: impl Into<MetricComponents>,
+    ) -> miette::Result<()> {
         if model_type == ModelType::Unknown {
-            return;
+            return Ok(());
         }
 
-        self.costs.entry(model_type).or_default().add(&costs);
+        let metrics = metrics.into();
+
+        match self.metrics.entry(model_type) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(metrics);
+                Ok(())
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => entry
+                .get_mut()
+                .checked_add_assign(metrics)
+                .map_err(|error| {
+                    error.wrap_err(format!("failed to aggregate {model_type} metrics"))
+                }),
+        }
     }
 
     #[cfg(test)]
-    pub fn get(&self, model_type: ModelType) -> TokenCosts {
-        self.costs.get(&model_type).copied().unwrap_or_default()
+    pub fn get_metric(&self, model_type: ModelType, report_mode: ReportMode) -> MetricComponents {
+        self.metrics
+            .get(&model_type)
+            .copied()
+            .unwrap_or_else(|| MetricComponents::zero(report_mode))
     }
 
-    pub fn total(&self) -> f64 {
-        self.costs.values().map(TokenCosts::total).sum()
+    pub fn total(&self, report_mode: ReportMode) -> miette::Result<MetricTotal> {
+        self.metrics
+            .values()
+            .try_fold(MetricTotal::zero(report_mode), |acc, metrics| {
+                acc.checked_add(metrics.total())
+            })
     }
 
-    fn get_or_default(&self, model_type: ModelType) -> TokenCosts {
-        self.costs.get(&model_type).copied().unwrap_or_default()
+    fn get_or_default(&self, model_type: ModelType, report_mode: ReportMode) -> MetricComponents {
+        self.metrics
+            .get(&model_type)
+            .copied()
+            .unwrap_or_else(|| MetricComponents::zero(report_mode))
     }
 
-    pub fn model_costs(&self) -> [(&'static str, TokenCosts); 4] {
-        ModelType::DISPLAY_ORDER.map(|(model_type, name)| (name, self.get_or_default(model_type)))
+    pub fn model_metrics(&self, report_mode: ReportMode) -> [(&'static str, MetricComponents); 4] {
+        ModelType::DISPLAY_ORDER
+            .map(|(model_type, name)| (name, self.get_or_default(model_type, report_mode)))
     }
 }
 
 #[cfg(test)]
+impl ModelMetricsMap {
+    pub fn get(&self, model_type: ModelType) -> crate::cost_report::CostComponents {
+        match self.get_metric(model_type, ReportMode::Cost) {
+            MetricComponents::Cost(costs) => costs,
+            MetricComponents::Tokens(_) => unreachable!("cost tests requested token metrics"),
+        }
+    }
+
+    pub fn get_tokens(&self, model_type: ModelType) -> crate::cost_report::TokenCounts {
+        match self.get_metric(model_type, ReportMode::Tokens) {
+            MetricComponents::Cost(_) => unreachable!("token tests requested cost metrics"),
+            MetricComponents::Tokens(tokens) => tokens,
+        }
+    }
+
+    pub fn model_costs(&self) -> [(&'static str, crate::cost_report::CostComponents); 4] {
+        ModelType::DISPLAY_ORDER.map(|(model_type, name)| (name, self.get(model_type)))
+    }
+}
+
+#[cfg(test)]
+pub type ModelCostsMap = ModelMetricsMap;
+
+#[cfg(test)]
 mod tests {
+    use crate::cost_report::{CostComponents, TokenCounts};
+
     use super::*;
 
     #[test]
@@ -195,77 +217,189 @@ mod tests {
     }
 
     #[test]
-    fn token_costs_total_sums_components() {
-        let costs = TokenCosts::new(1.5, 2.5, 0.5, 0.25);
-
-        assert!((costs.total() - 4.75).abs() < 1e-10);
-    }
-
-    #[test]
-    fn token_costs_add_accumulates_each_component() {
-        let mut costs = TokenCosts::new(1.0, 2.0, 0.5, 0.25);
-        let other = TokenCosts::new(0.5, 1.0, 0.25, 0.1);
-
-        costs.add(&other);
-
-        assert!((costs.input - 1.5).abs() < 1e-10);
-        assert!((costs.output - 3.0).abs() < 1e-10);
-        assert!((costs.cache_write - 0.75).abs() < 1e-10);
-        assert!((costs.cache_read - 0.35).abs() < 1e-10);
-    }
-
-    #[test]
-    fn model_costs_map_add_accumulates_per_bucket() {
-        let mut map = ModelCostsMap::default();
-        map.add(ModelType::Sonnet, TokenCosts::new(1.0, 2.0, 0.0, 0.0));
-        map.add(ModelType::Sonnet, TokenCosts::new(0.5, 0.5, 0.25, 0.0));
+    fn model_metrics_map_add_accumulates_costs_per_bucket() {
+        let mut map = ModelMetricsMap::default();
+        map.add(
+            ModelType::Sonnet,
+            MetricComponents::Cost(CostComponents::new(1.0, 2.0, 0.0, 0.0)),
+        )
+        .unwrap();
+        map.add(
+            ModelType::Sonnet,
+            MetricComponents::Cost(CostComponents::new(0.5, 0.5, 0.25, 0.0)),
+        )
+        .unwrap();
 
         let sonnet = map.get(ModelType::Sonnet);
-        assert!((sonnet.input - 1.5).abs() < 1e-10);
-        assert!((sonnet.output - 2.5).abs() < 1e-10);
-        assert!((sonnet.cache_write - 0.25).abs() < 1e-10);
+        assert_eq!(sonnet, CostComponents::new(1.5, 2.5, 0.25, 0.0));
     }
 
     #[test]
-    fn model_costs_map_get_absent_returns_default() {
-        let costs = ModelCostsMap::default();
-        assert_eq!(costs.get(ModelType::Sonnet).total(), 0.0);
+    fn model_metrics_map_add_accumulates_tokens_per_bucket() {
+        let mut map = ModelMetricsMap::default();
+        map.add(
+            ModelType::Sonnet,
+            MetricComponents::Tokens(TokenCounts::new(1, 2, 0, 0)),
+        )
+        .unwrap();
+        map.add(
+            ModelType::Sonnet,
+            MetricComponents::Tokens(TokenCounts::new(3, 4, 5, 6)),
+        )
+        .unwrap();
+
+        let sonnet = map.get_tokens(ModelType::Sonnet);
+        assert_eq!(sonnet, TokenCounts::new(4, 6, 5, 6));
     }
 
     #[test]
-    fn model_costs_map_total_sums_all_entries() {
-        let mut costs = ModelCostsMap::default();
-        costs.add(ModelType::Sonnet, TokenCosts::new(1.0, 2.0, 0.0, 0.0));
-        costs.add(ModelType::Haiku, TokenCosts::new(0.5, 1.0, 0.0, 0.0));
+    fn model_metrics_map_rejects_mixed_metric_modes() {
+        let mut map = ModelMetricsMap::default();
+        map.add(
+            ModelType::Sonnet,
+            MetricComponents::Cost(CostComponents::new(1.0, 0.0, 0.0, 0.0)),
+        )
+        .unwrap();
 
-        assert!((costs.total() - 4.5).abs() < 1e-10);
+        let error = map
+            .add(
+                ModelType::Sonnet,
+                MetricComponents::Tokens(TokenCounts::new(1, 0, 0, 0)),
+            )
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("failed to aggregate Sonnet metrics"));
     }
 
     #[test]
-    fn model_costs_map_ignores_unknown_buckets() {
-        let mut costs = ModelCostsMap::default();
-        costs.add(ModelType::Unknown, TokenCosts::new(9.0, 8.0, 7.0, 6.0));
-
-        assert_eq!(costs.total(), 0.0);
-        assert_eq!(costs.model_costs().len(), 4);
+    fn model_metrics_map_get_absent_returns_zero_for_mode() {
+        let metrics = ModelMetricsMap::default();
+        assert_eq!(metrics.get(ModelType::Sonnet), CostComponents::default());
+        assert_eq!(
+            metrics.get_tokens(ModelType::Sonnet),
+            TokenCounts::default()
+        );
     }
 
     #[test]
-    fn model_costs_map_model_costs_zero_fills_absent_entries() {
-        let costs = ModelCostsMap::default();
-        let entries = costs.model_costs();
+    fn model_metrics_map_total_sums_all_cost_entries() {
+        let mut metrics = ModelMetricsMap::default();
+        metrics
+            .add(
+                ModelType::Sonnet,
+                MetricComponents::Cost(CostComponents::new(1.0, 2.0, 0.0, 0.0)),
+            )
+            .unwrap();
+        metrics
+            .add(
+                ModelType::Haiku,
+                MetricComponents::Cost(CostComponents::new(0.5, 1.0, 0.0, 0.0)),
+            )
+            .unwrap();
+
+        assert_eq!(
+            metrics.total(ReportMode::Cost).unwrap(),
+            MetricTotal::Cost(4.5)
+        );
+    }
+
+    #[test]
+    fn model_metrics_map_total_sums_all_token_entries() {
+        let mut metrics = ModelMetricsMap::default();
+        metrics
+            .add(
+                ModelType::Sonnet,
+                MetricComponents::Tokens(TokenCounts::new(1, 2, 3, 4)),
+            )
+            .unwrap();
+        metrics
+            .add(
+                ModelType::Haiku,
+                MetricComponents::Tokens(TokenCounts::new(5, 6, 7, 8)),
+            )
+            .unwrap();
+
+        assert_eq!(
+            metrics.total(ReportMode::Tokens).unwrap(),
+            MetricTotal::Tokens(36)
+        );
+    }
+
+    #[test]
+    fn model_metrics_map_total_preserves_large_token_counts_exactly() {
+        let mut metrics = ModelMetricsMap::default();
+        metrics
+            .add(
+                ModelType::Sonnet,
+                MetricComponents::Tokens(TokenCounts::new(9_007_199_254_740_993, 1, 0, 0)),
+            )
+            .unwrap();
+        metrics
+            .add(
+                ModelType::Haiku,
+                MetricComponents::Tokens(TokenCounts::new(2, 0, 0, 0)),
+            )
+            .unwrap();
+
+        assert_eq!(
+            metrics.total(ReportMode::Tokens).unwrap(),
+            MetricTotal::Tokens(9_007_199_254_740_996)
+        );
+    }
+
+    #[test]
+    fn model_metrics_map_rejects_token_component_overflow() {
+        let mut metrics = ModelMetricsMap::default();
+        metrics
+            .add(
+                ModelType::Sonnet,
+                MetricComponents::Tokens(TokenCounts::new(u64::MAX, 0, 0, 0)),
+            )
+            .unwrap();
+
+        let error = metrics
+            .add(
+                ModelType::Sonnet,
+                MetricComponents::Tokens(TokenCounts::new(1, 0, 0, 0)),
+            )
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("failed to aggregate Sonnet metrics"));
+        assert!(format!("{error:?}").contains("token input total exceeded u64"));
+    }
+
+    #[test]
+    fn model_metrics_map_ignores_unknown_buckets() {
+        let mut metrics = ModelMetricsMap::default();
+        metrics
+            .add(
+                ModelType::Unknown,
+                MetricComponents::Cost(CostComponents::new(9.0, 8.0, 7.0, 6.0)),
+            )
+            .unwrap();
+
+        assert_eq!(
+            metrics.total(ReportMode::Cost).unwrap(),
+            MetricTotal::Cost(0.0)
+        );
+        assert_eq!(metrics.model_metrics(ReportMode::Cost).len(), 4);
+    }
+
+    #[test]
+    fn model_metrics_map_model_metrics_zero_fills_absent_entries() {
+        let metrics = ModelMetricsMap::default();
+        let entries = metrics.model_metrics(ReportMode::Tokens);
 
         assert_eq!(entries.len(), 4);
-        for (_, model_costs) in &entries {
-            assert_eq!(model_costs.total(), 0.0);
+        for (_, model_metrics) in &entries {
+            assert_eq!(
+                *model_metrics,
+                MetricComponents::Tokens(TokenCounts::default())
+            );
         }
-    }
-
-    #[test]
-    fn model_costs_map_model_costs_returns_display_order() {
-        let entries = ModelCostsMap::default().model_costs();
-
-        let names: Vec<&str> = entries.iter().map(|(name, _)| *name).collect();
-        assert_eq!(names, vec!["Opus 4", "Opus", "Sonnet", "Haiku"]);
     }
 }

@@ -261,7 +261,7 @@ mod tests {
     use std::{collections::HashSet, path::Path};
 
     use chrono::{DateTime, TimeZone, Utc};
-    use rust_decimal::Decimal;
+    use rust_decimal::{prelude::ToPrimitive, Decimal};
     use serde::Deserialize;
     use serde_json::json;
     use tempfile::TempDir;
@@ -298,6 +298,15 @@ mod tests {
                 cache_read: Decimal::ZERO,
                 output: Decimal::ZERO,
             })
+        }
+
+        fn token_count(&self, token_type: crate::logs::TokenType) -> Option<u64> {
+            match token_type {
+                crate::logs::TokenType::Input => self.input_cost.to_u64(),
+                crate::logs::TokenType::Output
+                | crate::logs::TokenType::CacheWrite
+                | crate::logs::TokenType::CacheRead => Some(0),
+            }
         }
 
         fn timestamp(&self) -> DateTime<Utc> {

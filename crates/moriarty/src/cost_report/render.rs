@@ -1,5 +1,6 @@
 use chrono::{DateTime, Local, Utc};
 use crossterm::terminal;
+use miette::miette;
 use tabled::{
     settings::{
         object::Rows,
@@ -12,11 +13,208 @@ use tabled::{
 
 use super::time_filter::DateTimezone;
 
-pub(crate) type CostComponents = (f64, f64, f64, f64);
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct CostComponents {
+    pub(crate) input: f64,
+    pub(crate) output: f64,
+    pub(crate) cache_write: f64,
+    pub(crate) cache_read: f64,
+}
+
+impl CostComponents {
+    pub(crate) fn new(input: f64, output: f64, cache_write: f64, cache_read: f64) -> Self {
+        Self {
+            input,
+            output,
+            cache_write,
+            cache_read,
+        }
+    }
+
+    pub(crate) fn total(&self) -> f64 {
+        self.input + self.output + self.cache_write + self.cache_read
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct TokenCounts {
+    pub(crate) input: u64,
+    pub(crate) output: u64,
+    pub(crate) cache_write: u64,
+    pub(crate) cache_read: u64,
+}
+
+impl TokenCounts {
+    pub(crate) fn new(input: u64, output: u64, cache_write: u64, cache_read: u64) -> Self {
+        Self {
+            input,
+            output,
+            cache_write,
+            cache_read,
+        }
+    }
+
+    pub(crate) fn total(&self) -> u128 {
+        self.input as u128
+            + self.output as u128
+            + self.cache_write as u128
+            + self.cache_read as u128
+    }
+
+    fn checked_add_assign(&mut self, other: Self) -> miette::Result<()> {
+        self.input = self
+            .input
+            .checked_add(other.input)
+            .ok_or_else(|| miette!("token input total exceeded u64"))?;
+        self.output = self
+            .output
+            .checked_add(other.output)
+            .ok_or_else(|| miette!("token output total exceeded u64"))?;
+        self.cache_write = self
+            .cache_write
+            .checked_add(other.cache_write)
+            .ok_or_else(|| miette!("token cache-write total exceeded u64"))?;
+        self.cache_read = self
+            .cache_read
+            .checked_add(other.cache_read)
+            .ok_or_else(|| miette!("token cache-read total exceeded u64"))?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum MetricComponents {
+    Cost(CostComponents),
+    Tokens(TokenCounts),
+}
+
+impl From<CostComponents> for MetricComponents {
+    fn from(value: CostComponents) -> Self {
+        Self::Cost(value)
+    }
+}
+
+impl From<TokenCounts> for MetricComponents {
+    fn from(value: TokenCounts) -> Self {
+        Self::Tokens(value)
+    }
+}
+
+impl MetricComponents {
+    pub(crate) fn zero(report_mode: ReportMode) -> Self {
+        match report_mode {
+            ReportMode::Cost => Self::Cost(CostComponents::default()),
+            ReportMode::Tokens => Self::Tokens(TokenCounts::default()),
+        }
+    }
+
+    pub(crate) fn is_zero(&self) -> bool {
+        match self {
+            Self::Cost(costs) => costs.total() == 0.0,
+            Self::Tokens(counts) => counts.total() == 0,
+        }
+    }
+
+    pub(crate) fn total(&self) -> MetricTotal {
+        match self {
+            Self::Cost(costs) => MetricTotal::Cost(costs.total()),
+            Self::Tokens(counts) => MetricTotal::Tokens(counts.total()),
+        }
+    }
+
+    pub(crate) fn checked_add_assign(&mut self, other: Self) -> miette::Result<()> {
+        match (self, other) {
+            (Self::Cost(current), Self::Cost(other)) => {
+                current.input += other.input;
+                current.output += other.output;
+                current.cache_write += other.cache_write;
+                current.cache_read += other.cache_read;
+                Ok(())
+            }
+            (Self::Tokens(current), Self::Tokens(other)) => current.checked_add_assign(other),
+            (Self::Cost(_), Self::Tokens(_)) => Err(miette!(
+                "attempted to add token metrics into a cost accumulator"
+            )),
+            (Self::Tokens(_), Self::Cost(_)) => Err(miette!(
+                "attempted to add cost metrics into a token accumulator"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum MetricTotal {
+    Cost(f64),
+    Tokens(u128),
+}
+
+impl MetricTotal {
+    pub(crate) fn zero(report_mode: ReportMode) -> Self {
+        match report_mode {
+            ReportMode::Cost => Self::Cost(0.0),
+            ReportMode::Tokens => Self::Tokens(0),
+        }
+    }
+
+    pub(crate) fn report_mode(self) -> ReportMode {
+        match self {
+            Self::Cost(_) => ReportMode::Cost,
+            Self::Tokens(_) => ReportMode::Tokens,
+        }
+    }
+
+    pub(crate) fn checked_add(self, other: Self) -> miette::Result<Self> {
+        match (self, other) {
+            (Self::Cost(left), Self::Cost(right)) => Ok(Self::Cost(left + right)),
+            (Self::Tokens(left), Self::Tokens(right)) => {
+                Ok(Self::Tokens(left.checked_add(right).ok_or_else(|| {
+                    miette!("grand token total exceeded u128")
+                })?))
+            }
+            (Self::Cost(_), Self::Tokens(_)) => Err(miette!(
+                "attempted to add token totals into a cost grand total"
+            )),
+            (Self::Tokens(_), Self::Cost(_)) => Err(miette!(
+                "attempted to add cost totals into a token grand total"
+            )),
+        }
+    }
+
+    fn format(self) -> String {
+        match self {
+            Self::Cost(amount) => fmt_money(amount),
+            Self::Tokens(amount) => fmt_tokens(amount),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReportMode {
+    Cost,
+    Tokens,
+}
 
 pub(crate) fn fmt_money(amount: f64) -> String {
     let normalized = if amount == 0.0 { 0.0 } else { amount };
     format!("${normalized:.4}")
+}
+
+pub(crate) fn fmt_tokens(amount: u128) -> String {
+    format_integer_with_separators(amount)
+}
+
+fn format_integer_with_separators(value: u128) -> String {
+    let digits = value.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(ch);
+    }
+
+    grouped
 }
 
 pub(crate) fn grouped_label(first_row: bool, value: &str) -> &str {
@@ -30,7 +228,7 @@ pub(crate) fn grouped_label(first_row: bool, value: &str) -> &str {
 const MIN_WIDTH_FOR_WRAPPING: usize = 100;
 
 #[derive(Tabled)]
-pub(crate) struct FormattedCostColumns {
+pub(crate) struct FormattedMetricColumns {
     #[tabled(rename = "Input")]
     pub(crate) input: String,
     #[tabled(rename = "Output")]
@@ -43,27 +241,75 @@ pub(crate) struct FormattedCostColumns {
     pub(crate) subtotal: String,
 }
 
-impl FormattedCostColumns {
-    pub(crate) fn from_components(components: CostComponents) -> Self {
-        let (input, output, cache_write, cache_read) = components;
-        Self {
-            input: fmt_money(input),
-            output: fmt_money(output),
-            cache_write: fmt_money(cache_write),
-            cache_read: fmt_money(cache_read),
-            subtotal: fmt_money(input + output + cache_write + cache_read),
+impl FormattedMetricColumns {
+    pub(crate) fn from_metrics(metrics: MetricComponents) -> Self {
+        match metrics {
+            MetricComponents::Cost(costs) => Self {
+                input: fmt_money(costs.input),
+                output: fmt_money(costs.output),
+                cache_write: fmt_money(costs.cache_write),
+                cache_read: fmt_money(costs.cache_read),
+                subtotal: fmt_money(costs.total()),
+            },
+            MetricComponents::Tokens(counts) => Self {
+                input: fmt_tokens(counts.input as u128),
+                output: fmt_tokens(counts.output as u128),
+                cache_write: fmt_tokens(counts.cache_write as u128),
+                cache_read: fmt_tokens(counts.cache_read as u128),
+                subtotal: fmt_tokens(counts.total()),
+            },
         }
     }
 
     /// Leaving the per-component cells blank prevents the footer from looking
     /// like another model row whose subtotal should be added again.
-    pub(crate) fn from_total(total_cost: f64) -> Self {
+    pub(crate) fn from_total(total: MetricTotal) -> Self {
         Self {
             input: String::new(),
             output: String::new(),
             cache_write: String::new(),
             cache_read: String::new(),
-            subtotal: fmt_money(total_cost),
+            subtotal: total.format(),
+        }
+    }
+}
+
+pub(crate) trait IntoMetricTotalForMode {
+    fn into_metric_total(self, report_mode: ReportMode) -> MetricTotal;
+}
+
+impl IntoMetricTotalForMode for MetricTotal {
+    fn into_metric_total(self, _report_mode: ReportMode) -> MetricTotal {
+        self
+    }
+}
+
+#[cfg(test)]
+impl IntoMetricTotalForMode for f64 {
+    fn into_metric_total(self, report_mode: ReportMode) -> MetricTotal {
+        match report_mode {
+            ReportMode::Cost => MetricTotal::Cost(self),
+            ReportMode::Tokens => MetricTotal::Tokens(self.round() as u128),
+        }
+    }
+}
+
+#[cfg(test)]
+impl IntoMetricTotalForMode for u64 {
+    fn into_metric_total(self, report_mode: ReportMode) -> MetricTotal {
+        match report_mode {
+            ReportMode::Cost => MetricTotal::Cost(self as f64),
+            ReportMode::Tokens => MetricTotal::Tokens(self as u128),
+        }
+    }
+}
+
+#[cfg(test)]
+impl IntoMetricTotalForMode for u128 {
+    fn into_metric_total(self, report_mode: ReportMode) -> MetricTotal {
+        match report_mode {
+            ReportMode::Cost => MetricTotal::Cost(self as f64),
+            ReportMode::Tokens => MetricTotal::Tokens(self),
         }
     }
 }
@@ -75,9 +321,9 @@ pub(crate) struct GrandTotalRow {
 }
 
 impl GrandTotalRow {
-    pub(crate) fn new(grand_total: f64) -> Self {
+    pub(crate) fn new(report_mode: ReportMode, grand_total: impl IntoMetricTotalForMode) -> Self {
         Self {
-            grand_total: fmt_money(grand_total),
+            grand_total: grand_total.into_metric_total(report_mode).format(),
         }
     }
 }
@@ -102,19 +348,18 @@ pub(crate) fn apply_width_config(table: &mut Table, term_width: usize) {
     }
 }
 
-pub(crate) fn push_nonzero_cost_rows<Row, Key, Items>(
+pub(crate) fn push_nonzero_metric_rows<Row, Key, Items>(
     rows: &mut Vec<Row>,
     items: Items,
-    mut make_row: impl FnMut(bool, Key, CostComponents) -> Row,
+    mut make_row: impl FnMut(bool, Key, MetricComponents) -> Row,
 ) where
-    Items: IntoIterator<Item = (Key, CostComponents)>,
+    Items: IntoIterator<Item = (Key, MetricComponents)>,
 {
     let mut first_row = true;
 
-    for (key, components) in items {
-        let subtotal = components.0 + components.1 + components.2 + components.3;
-        if subtotal > 0.0 {
-            rows.push(make_row(first_row, key, components));
+    for (key, metrics) in items {
+        if !metrics.is_zero() {
+            rows.push(make_row(first_row, key, metrics));
             first_row = false;
         }
     }
@@ -124,21 +369,21 @@ pub(crate) fn push_nonzero_cost_rows<Row, Key, Items>(
 /// accidentally render indices against a different row vector.
 pub(crate) fn build_grouped_rows<Item, Row>(
     items: &[Item],
-    mut push_item_rows: impl FnMut(&mut Vec<Row>, &Item),
-    mut push_total_row: impl FnMut(&mut Vec<Row>, &Item, bool),
-) -> (Vec<Row>, Vec<usize>) {
+    mut push_item_rows: impl FnMut(&mut Vec<Row>, &Item) -> miette::Result<()>,
+    mut push_total_row: impl FnMut(&mut Vec<Row>, &Item, bool) -> miette::Result<()>,
+) -> miette::Result<(Vec<Row>, Vec<usize>)> {
     let mut rows = Vec::new();
     let mut total_row_indices = Vec::new();
 
     for item in items {
         let rows_before_group = rows.len();
-        push_item_rows(&mut rows, item);
+        push_item_rows(&mut rows, item)?;
         let has_detail_rows = rows.len() > rows_before_group;
-        push_total_row(&mut rows, item, has_detail_rows);
+        push_total_row(&mut rows, item, has_detail_rows)?;
         total_row_indices.push(rows.len() - 1);
     }
 
-    (rows, total_row_indices)
+    Ok((rows, total_row_indices))
 }
 
 pub(crate) fn create_grouped_table<T: Tabled>(rows: &[T], total_row_indices: &[usize]) -> Table {
@@ -222,11 +467,11 @@ pub(crate) fn format_duration(minutes: i64) -> String {
     }
 }
 
-pub(crate) fn render_cost_report<T: Tabled>(
+pub(crate) fn render_metric_report<T: Tabled>(
     title: &str,
     rows: &[T],
     total_row_indices: &[usize],
-    grand_total: f64,
+    grand_total: MetricTotal,
 ) {
     let term_width = get_terminal_width();
     println!("{}", divider(term_width));
@@ -240,27 +485,38 @@ pub(crate) fn render_cost_report<T: Tabled>(
     println!("{}", table);
     println!();
 
-    display_grand_total(grand_total);
+    display_grand_total(grand_total.report_mode(), grand_total);
 }
 
-pub(crate) fn render_grouped_costs<Item, Row: Tabled>(
+pub(crate) fn render_grouped_metrics<Item, Row: Tabled>(
     title: &str,
     items: &[Item],
-    build_rows: impl Fn(&[Item]) -> (Vec<Row>, Vec<usize>),
-    total: impl Fn(&Item) -> f64,
-) {
-    let (rows, total_row_indices) = build_rows(items);
-    let grand_total: f64 = items.iter().map(total).sum();
-    render_cost_report(title, &rows, &total_row_indices, grand_total);
+    report_mode: ReportMode,
+    build_rows: impl Fn(&[Item]) -> miette::Result<(Vec<Row>, Vec<usize>)>,
+    total: impl Fn(&Item, ReportMode) -> miette::Result<MetricTotal>,
+) -> miette::Result<()> {
+    let (rows, total_row_indices) = build_rows(items)?;
+    let grand_total = items
+        .iter()
+        .try_fold(MetricTotal::zero(report_mode), |acc, item| {
+            acc.checked_add(total(item, report_mode)?)
+        })?;
+    render_metric_report(title, &rows, &total_row_indices, grand_total);
+    Ok(())
 }
 
-pub(crate) fn render_or_empty<T>(items: &[T], had_errors: bool, display: impl FnOnce(&[T])) {
+pub(crate) fn render_or_empty<T>(
+    items: &[T],
+    had_errors: bool,
+    display: impl FnOnce(&[T]) -> miette::Result<()>,
+) -> miette::Result<()> {
     if items.is_empty() {
         println!("\nNo usage data found.");
     } else {
-        display(items);
+        display(items)?;
     }
     warn_if_incomplete(had_errors);
+    Ok(())
 }
 
 /// The detailed per-file parse errors already went to tracing; this summary is
@@ -274,14 +530,17 @@ pub(crate) fn warn_if_incomplete(had_errors: bool) {
     }
 }
 
-pub(crate) fn display_grand_total(grand_total: f64) {
+pub(crate) fn display_grand_total(
+    report_mode: ReportMode,
+    grand_total: impl IntoMetricTotalForMode,
+) {
     let term_width = get_terminal_width();
     println!("{}", divider(term_width));
     println!("Summary");
     println!("{}", divider(term_width));
     println!();
 
-    let row = GrandTotalRow::new(grand_total);
+    let row = GrandTotalRow::new(report_mode, grand_total);
     let mut table = Table::new(vec![row]);
 
     table.with(Style::rounded());

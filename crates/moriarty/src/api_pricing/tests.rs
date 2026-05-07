@@ -5,12 +5,13 @@ use super::*;
 use crate::{
     api_pricing::{
         analyzer::{DailyCosts, SessionCosts},
-        pricing::{ModelCostsMap, ModelType, TokenCosts},
+        pricing::{ModelCostsMap, ModelType},
     },
     cost_report::{
         apply_width_config, create_grouped_table, display_grand_total, divider, fmt_money,
-        format_duration, format_session_id, format_time_range, DateTimezone, FormattedCostColumns,
-        GrandTotalRow,
+        format_duration, format_session_id, format_time_range, ComponentTotals, DateTimezone,
+        FormattedCostColumns, GrandTotalRow, MetricComponents, MetricTotal, ReportMode,
+        TokenCounts,
     },
 };
 
@@ -40,31 +41,39 @@ trait DailyCostsExt {
 
 impl DailyCostsExt for DailyCosts {
     fn with_sonnet(mut self, input: f64, output: f64, cache_write: f64, cache_read: f64) -> Self {
-        self.per_model.add(
-            ModelType::Sonnet,
-            TokenCosts::new(input, output, cache_write, cache_read),
-        );
+        self.per_model
+            .add(
+                ModelType::Sonnet,
+                ComponentTotals::new(input, output, cache_write, cache_read),
+            )
+            .unwrap();
         self
     }
     fn with_haiku(mut self, input: f64, output: f64, cache_write: f64, cache_read: f64) -> Self {
-        self.per_model.add(
-            ModelType::Haiku,
-            TokenCosts::new(input, output, cache_write, cache_read),
-        );
+        self.per_model
+            .add(
+                ModelType::Haiku,
+                ComponentTotals::new(input, output, cache_write, cache_read),
+            )
+            .unwrap();
         self
     }
     fn with_opus(mut self, input: f64, output: f64, cache_write: f64, cache_read: f64) -> Self {
-        self.per_model.add(
-            ModelType::Opus,
-            TokenCosts::new(input, output, cache_write, cache_read),
-        );
+        self.per_model
+            .add(
+                ModelType::Opus,
+                ComponentTotals::new(input, output, cache_write, cache_read),
+            )
+            .unwrap();
         self
     }
     fn with_opus4(mut self, input: f64, output: f64, cache_write: f64, cache_read: f64) -> Self {
-        self.per_model.add(
-            ModelType::Opus4,
-            TokenCosts::new(input, output, cache_write, cache_read),
-        );
+        self.per_model
+            .add(
+                ModelType::Opus4,
+                ComponentTotals::new(input, output, cache_write, cache_read),
+            )
+            .unwrap();
         self
     }
 }
@@ -158,7 +167,7 @@ fn display_costs_smoke_variants() {
     ];
 
     for (label, daily_costs) in cases {
-        match std::panic::catch_unwind(|| display_costs(&daily_costs)) {
+        match std::panic::catch_unwind(|| display_costs(&daily_costs, ReportMode::Cost)) {
             Ok(()) => {}
             Err(_) => panic!("display_costs panicked on case {label}"),
         }
@@ -185,7 +194,7 @@ fn display_costs_single_day_variants() {
     ];
 
     for (label, daily) in cases {
-        match std::panic::catch_unwind(|| display_costs(&[daily])) {
+        match std::panic::catch_unwind(|| display_costs(&[daily], ReportMode::Cost)) {
             Ok(()) => {}
             Err(_) => panic!("display_costs panicked on case {label}"),
         }
@@ -194,29 +203,71 @@ fn display_costs_single_day_variants() {
 
 #[test]
 fn cost_row_formats_currency_columns() {
-    let row = CostRow::new("2025-10-23", "Sonnet", (1.2345, 2.3456, 0.5, 0.25));
+    let row = CostRow::new(
+        "2025-10-23",
+        "Sonnet",
+        ComponentTotals::new(1.2345, 2.3456, 0.5, 0.25),
+        ReportMode::Cost,
+    );
 
     assert_eq!(row.date, "2025-10-23");
     assert_eq!(row.model, "Sonnet");
-    assert_money_columns(&row.money, (1.2345, 2.3456, 0.5, 0.25));
+    assert_money_columns(&row.metrics, (1.2345, 2.3456, 0.5, 0.25));
+}
+
+#[test]
+fn cost_row_formats_token_columns() {
+    let row = CostRow::new(
+        "2025-10-23",
+        "Sonnet",
+        MetricComponents::Tokens(TokenCounts::new(1_234, 5_678, 90, 12)),
+        ReportMode::Tokens,
+    );
+
+    assert_eq!(row.metrics.input, "1,234");
+    assert_eq!(row.metrics.output, "5,678");
+    assert_eq!(row.metrics.cache_write, "90");
+    assert_eq!(row.metrics.cache_read, "12");
+    assert_eq!(row.metrics.subtotal, "7,014");
+}
+
+#[test]
+fn cost_row_formats_large_token_columns_exactly() {
+    let row = CostRow::new(
+        "2025-10-23",
+        "Sonnet",
+        MetricComponents::Tokens(TokenCounts::new(9_007_199_254_740_993, 8, 90, 12)),
+        ReportMode::Tokens,
+    );
+
+    assert_eq!(row.metrics.input, "9,007,199,254,740,993");
+    assert_eq!(row.metrics.output, "8");
+    assert_eq!(row.metrics.cache_write, "90");
+    assert_eq!(row.metrics.cache_read, "12");
+    assert_eq!(row.metrics.subtotal, "9,007,199,254,741,103");
 }
 
 #[test]
 fn cost_row_zero_values_format_as_zero_currency() {
-    let row = CostRow::new("", "Haiku", (0.0, 0.0, 0.0, 0.0));
+    let row = CostRow::new(
+        "",
+        "Haiku",
+        ComponentTotals::new(0.0, 0.0, 0.0, 0.0),
+        ReportMode::Cost,
+    );
 
-    assert_eq!(row.money.input, "$0.0000");
-    assert_eq!(row.money.subtotal, "$0.0000");
+    assert_eq!(row.metrics.input, "$0.0000");
+    assert_eq!(row.metrics.subtotal, "$0.0000");
 }
 
 #[test]
 fn cost_row_total_row_uses_blank_component_columns() {
-    let row = CostRow::new_total_row(56.789);
+    let row = CostRow::new_total_row(56.789, ReportMode::Cost);
 
     assert_eq!(row.date, "");
     assert_eq!(row.model, "Total");
-    assert_blank_money_component_columns(&row.money);
-    assert_eq!(row.money.subtotal, "$56.7890");
+    assert_blank_money_component_columns(&row.metrics);
+    assert_eq!(row.metrics.subtotal, "$56.7890");
 }
 
 #[test]
@@ -227,9 +278,9 @@ fn cost_row_total_row_variants() {
     ];
 
     for (label, total, expected_subtotal) in cases {
-        let row = CostRow::new_total_row(total);
+        let row = CostRow::new_total_row(total, ReportMode::Cost);
         assert_eq!(row.model, "Total", "case {label}");
-        assert_eq!(row.money.subtotal, expected_subtotal, "case {label}");
+        assert_eq!(row.metrics.subtotal, expected_subtotal, "case {label}");
     }
 }
 
@@ -248,9 +299,26 @@ fn fmt_money_normalizes_negative_zero() {
 
 #[test]
 fn grand_total_row_formats_currency() {
-    let row = GrandTotalRow::new(143.7082);
+    let row = GrandTotalRow::new(ReportMode::Cost, 143.7082);
 
     assert_eq!(row.grand_total, "$143.7082");
+}
+
+#[test]
+fn grand_total_row_formats_tokens() {
+    let row = GrandTotalRow::new(ReportMode::Tokens, MetricTotal::Tokens(1_437_082));
+
+    assert_eq!(row.grand_total, "1,437,082");
+}
+
+#[test]
+fn grand_total_row_formats_large_tokens_exactly() {
+    let row = GrandTotalRow::new(
+        ReportMode::Tokens,
+        MetricTotal::Tokens(9_007_199_254_741_103),
+    );
+
+    assert_eq!(row.grand_total, "9,007,199,254,741,103");
 }
 
 #[test]
@@ -261,7 +329,7 @@ fn grand_total_row_variants() {
     ];
 
     for (label, grand_total, expected) in cases {
-        let row = GrandTotalRow::new(grand_total);
+        let row = GrandTotalRow::new(ReportMode::Cost, grand_total);
         assert_eq!(row.grand_total, expected, "case {label}");
     }
 }
@@ -271,8 +339,19 @@ fn grand_total_row_variants() {
 #[test]
 fn display_grand_total_smoke_variants() {
     for grand_total in [0.0, 143.7082, 12_345.6789, 0.0001] {
-        display_grand_total(grand_total);
+        display_grand_total(ReportMode::Cost, grand_total);
     }
+}
+
+#[test]
+fn metric_total_checked_add_rejects_token_overflow() {
+    let error = MetricTotal::Tokens(u128::MAX)
+        .checked_add(MetricTotal::Tokens(1))
+        .unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("grand token total exceeded u128"));
 }
 
 #[test]
@@ -324,7 +403,7 @@ fn build_cost_rows_variants() {
     ];
 
     for (label, daily_costs, expected_total_row_indices, expected_rows) in cases {
-        let (rows, total_row_indices) = build_cost_rows(&daily_costs);
+        let (rows, total_row_indices) = build_cost_rows(&daily_costs, ReportMode::Cost);
 
         assert_eq!(
             total_row_indices, expected_total_row_indices,
@@ -352,8 +431,13 @@ fn create_grouped_table_variants() {
         Case {
             label: "single group",
             rows: vec![
-                CostRow::new("2025-10-23", "Sonnet", (1.0, 1.0, 0.0, 0.0)),
-                CostRow::new_total_row(2.0),
+                CostRow::new(
+                    "2025-10-23",
+                    "Sonnet",
+                    ComponentTotals::new(1.0, 1.0, 0.0, 0.0),
+                    ReportMode::Cost,
+                ),
+                CostRow::new_total_row(2.0, ReportMode::Cost),
             ],
             total_row_indices: vec![1],
             expected_substrings: vec!["Sonnet", "Total"],
@@ -362,10 +446,20 @@ fn create_grouped_table_variants() {
         Case {
             label: "multiple groups with separator",
             rows: vec![
-                CostRow::new("2025-10-23", "Sonnet", (1.0, 1.0, 0.0, 0.0)),
-                CostRow::new_total_row(2.0),
-                CostRow::new("2025-10-24", "Haiku", (0.5, 0.5, 0.0, 0.0)),
-                CostRow::new_total_row(1.0),
+                CostRow::new(
+                    "2025-10-23",
+                    "Sonnet",
+                    ComponentTotals::new(1.0, 1.0, 0.0, 0.0),
+                    ReportMode::Cost,
+                ),
+                CostRow::new_total_row(2.0, ReportMode::Cost),
+                CostRow::new(
+                    "2025-10-24",
+                    "Haiku",
+                    ComponentTotals::new(0.5, 0.5, 0.0, 0.0),
+                    ReportMode::Cost,
+                ),
+                CostRow::new_total_row(1.0, ReportMode::Cost),
             ],
             total_row_indices: vec![1, 3],
             expected_substrings: vec!["2025-10-23", "2025-10-24", "Sonnet", "Haiku"],
@@ -405,7 +499,12 @@ fn create_grouped_table_variants() {
 // width boundary defined by `MIN_WIDTH_FOR_WRAPPING`.
 #[test]
 fn apply_width_config_handles_boundary_widths() {
-    let rows = vec![CostRow::new("2025-10-23", "Sonnet", (1.0, 1.0, 0.0, 0.0))];
+    let rows = vec![CostRow::new(
+        "2025-10-23",
+        "Sonnet",
+        ComponentTotals::new(1.0, 1.0, 0.0, 0.0),
+        ReportMode::Cost,
+    )];
 
     for width in [99, 100, 101] {
         let mut table = Table::new(&rows);
@@ -499,33 +598,36 @@ fn session_cost_row_formats_currency_columns() {
         "2025-10-23 09:00 \u{2192} 10:30",
         "1 hr 30 min",
         "Sonnet",
-        (1.2345, 2.3456, 0.5, 0.25),
+        ComponentTotals::new(1.2345, 2.3456, 0.5, 0.25),
+        ReportMode::Cost,
     );
 
     assert_eq!(row.session, "019dc252");
     assert_eq!(row.time_range, "2025-10-23 09:00 \u{2192} 10:30");
     assert_eq!(row.duration, "1 hr 30 min");
     assert_eq!(row.model, "Sonnet");
-    assert_money_columns(&row.money, (1.2345, 2.3456, 0.5, 0.25));
+    assert_money_columns(&row.metrics, (1.2345, 2.3456, 0.5, 0.25));
 }
 
 #[test]
 fn session_cost_row_total_uses_blank_component_columns() {
-    let row = SessionCostRow::new_total_row(7.5);
+    let row = SessionCostRow::new_total_row(7.5, ReportMode::Cost);
 
     assert_eq!(row.session, "");
     assert_eq!(row.time_range, "");
     assert_eq!(row.duration, "");
     assert_eq!(row.model, "Total");
-    assert_blank_money_component_columns(&row.money);
-    assert_eq!(row.money.subtotal, "$7.5000");
+    assert_blank_money_component_columns(&row.metrics);
+    assert_eq!(row.metrics.subtotal, "$7.5000");
 }
 
 fn session_costs_fixture(session_id: &str) -> SessionCosts {
     let start = Utc.with_ymd_and_hms(2025, 10, 23, 9, 0, 0).unwrap();
     let end = Utc.with_ymd_and_hms(2025, 10, 23, 10, 30, 0).unwrap();
     let mut per_model = ModelCostsMap::default();
-    per_model.add(ModelType::Sonnet, TokenCosts::new(1.0, 2.0, 0.0, 0.0));
+    per_model
+        .add(ModelType::Sonnet, ComponentTotals::new(1.0, 2.0, 0.0, 0.0))
+        .unwrap();
     SessionCosts {
         session_id: session_id.to_string(),
         start_time: start,
@@ -536,7 +638,8 @@ fn session_costs_fixture(session_id: &str) -> SessionCosts {
 
 #[test]
 fn build_session_cost_rows_empty_input_returns_empty_rows() {
-    let (rows, total_row_indices) = build_session_cost_rows(&[], DateTimezone::Utc);
+    let (rows, total_row_indices) =
+        build_session_cost_rows(&[], DateTimezone::Utc, ReportMode::Cost);
 
     assert!(rows.is_empty());
     assert!(total_row_indices.is_empty());
@@ -546,8 +649,11 @@ fn build_session_cost_rows_empty_input_returns_empty_rows() {
 fn build_session_cost_rows_emits_per_model_row_then_total() {
     let session = session_costs_fixture("019dc252-e50e-766c");
 
-    let (rows, total_row_indices) =
-        build_session_cost_rows(std::slice::from_ref(&session), DateTimezone::Utc);
+    let (rows, total_row_indices) = build_session_cost_rows(
+        std::slice::from_ref(&session),
+        DateTimezone::Utc,
+        ReportMode::Cost,
+    );
 
     assert_eq!(total_row_indices, vec![1]);
     assert_eq!(rows.len(), 2);
@@ -560,7 +666,7 @@ fn build_session_cost_rows_emits_per_model_row_then_total() {
     assert_eq!(rows[1].time_range, "");
     assert_eq!(rows[1].duration, "");
     assert_eq!(rows[1].model, "Total");
-    assert_eq!(rows[1].money.subtotal, "$3.0000");
+    assert_eq!(rows[1].metrics.subtotal, "$3.0000");
 }
 
 #[test]
@@ -572,7 +678,8 @@ fn build_session_cost_rows_zero_cost_session_keeps_identifying_columns() {
         per_model: ModelCostsMap::default(),
     };
 
-    let (rows, total_row_indices) = build_session_cost_rows(&[session], DateTimezone::Utc);
+    let (rows, total_row_indices) =
+        build_session_cost_rows(&[session], DateTimezone::Utc, ReportMode::Cost);
 
     assert_eq!(total_row_indices, vec![0]);
     assert_eq!(rows.len(), 1);
@@ -589,7 +696,8 @@ fn build_session_cost_rows_inserts_separator_indices_per_session() {
         session_costs_fixture("bbbbbbbb-bbbb"),
     ];
 
-    let (rows, total_row_indices) = build_session_cost_rows(&sessions, DateTimezone::Utc);
+    let (rows, total_row_indices) =
+        build_session_cost_rows(&sessions, DateTimezone::Utc, ReportMode::Cost);
 
     assert_eq!(total_row_indices, vec![1, 3]);
     assert_eq!(rows.len(), 4);

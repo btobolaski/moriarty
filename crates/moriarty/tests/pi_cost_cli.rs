@@ -42,6 +42,38 @@ fn assistant_line(
     cache_write: &str,
     cache_read: &str,
 ) -> Value {
+    assistant_line_with_tokens(
+        id,
+        timestamp,
+        provider,
+        api,
+        model,
+        input,
+        output,
+        cache_write,
+        cache_read,
+        10,
+        5,
+        1,
+        2,
+    )
+}
+
+fn assistant_line_with_tokens(
+    id: &str,
+    timestamp: &str,
+    provider: &str,
+    api: &str,
+    model: &str,
+    input: &str,
+    output: &str,
+    cache_write: &str,
+    cache_read: &str,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_write_tokens: i64,
+    cache_read_tokens: i64,
+) -> Value {
     let total = decimal_total(input, output, cache_write, cache_read);
     json!({
         "type": "message",
@@ -55,11 +87,11 @@ fn assistant_line(
             "provider": provider,
             "model": model,
             "usage": {
-                "input": 10,
-                "output": 5,
-                "cacheRead": 2,
-                "cacheWrite": 1,
-                "totalTokens": 18,
+                "input": input_tokens,
+                "output": output_tokens,
+                "cacheRead": cache_read_tokens,
+                "cacheWrite": cache_write_tokens,
+                "totalTokens": input_tokens + output_tokens + cache_write_tokens + cache_read_tokens,
                 "cost": {
                     "input": input,
                     "output": output,
@@ -104,6 +136,16 @@ fn openai_line(id: &str, timestamp: &str, model: &str, input: &str, output: &str
 
 fn moriarty_command() -> Command {
     Command::new(env!("CARGO_BIN_EXE_moriarty"))
+}
+
+fn assert_daily_token_columns(stdout: &str) {
+    for expected in ["123", "456", "90", "12", "681"] {
+        assert!(
+            stdout.contains(expected),
+            "missing token value {expected} in:\n{stdout}"
+        );
+    }
+    assert!(!stdout.contains('$'));
 }
 
 #[test]
@@ -151,6 +193,101 @@ fn pi_cost_cli_renders_daily_report_and_incomplete_warning() {
     assert!(stdout.contains("Grand Total"));
     assert!(stdout.contains("$4.0000"));
     assert!(stderr.contains("Warning: some log files could not be read or parsed"));
+}
+
+#[test]
+fn pi_cost_cli_renders_daily_token_report() {
+    let dir = TempDir::new().unwrap();
+    let session = "019dc252-e50e-766c-8182-d654b46881b0";
+    write_log(
+        dir.path(),
+        "session.jsonl",
+        &[
+            session_line(session, "2026-04-16T00:00:00Z"),
+            assistant_line_with_tokens(
+                "openai-1",
+                "2026-04-16T09:00:00Z",
+                "openai",
+                "openai-responses",
+                "x",
+                "1.0",
+                "2.0",
+                "0",
+                "0",
+                123,
+                456,
+                90,
+                12,
+            ),
+        ],
+    );
+
+    let output = moriarty_command()
+        .args(["pi", "cost", "--dir"])
+        .arg(dir.path())
+        .args(["--timezone", "utc", "--tokens"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    assert!(stdout.contains("Pi Token Report"));
+    assert!(stdout.contains("Grand Total"));
+    assert_daily_token_columns(&stdout);
+}
+
+#[test]
+fn pi_cost_cli_renders_conversation_token_report_in_utc() {
+    let dir = TempDir::new().unwrap();
+    let session = "019dc252-e50e-766c-8182-d654b46881b0";
+    write_log(
+        dir.path(),
+        "session.jsonl",
+        &[
+            session_line(session, "2026-04-16T00:00:00Z"),
+            assistant_line_with_tokens(
+                "openai-1",
+                "2026-04-16T09:00:00Z",
+                "openai",
+                "openai-responses",
+                "x",
+                "1.0",
+                "2.0",
+                "0",
+                "0",
+                1_234,
+                5_678,
+                90,
+                12,
+            ),
+        ],
+    );
+
+    let output = moriarty_command()
+        .args(["pi", "cost", "--dir"])
+        .arg(dir.path())
+        .args(["--timezone", "utc", "--conversations", "--tokens"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    assert!(stdout.contains("Pi Token Report by Conversation"));
+    assert!(stdout.contains("2026-04-16"));
+    assert!(stdout.contains("7,014"));
+    assert!(!stdout.contains('$'));
 }
 
 #[test]

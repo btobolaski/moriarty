@@ -3,17 +3,22 @@ use std::{collections::BTreeMap, path::Path};
 use chrono::{DateTime, NaiveDate, Utc};
 use rust_decimal::prelude::ToPrimitive;
 
-use super::pricing::{ModelCostsMap, ModelType, TokenCosts};
-use crate::cost_report::{DateTimezone, TimeRangeFilter};
+use super::pricing::{ModelMetricsMap, ModelType};
+use crate::cost_report::{
+    CostComponents, DateTimezone, MetricComponents, MetricTotal, ReportMode, TimeRangeFilter,
+    TokenCounts,
+};
 use claude_logs::LogLine;
-use cost_analyzer::{analyze_directory as cost_analyze_directory, LineWithCost, LlmCost};
+use cost_analyzer::{
+    analyze_directory as cost_analyze_directory, AnalyzableLog, LineWithCost, LlmCost, TokenType,
+};
 
 /// `had_errors` is propagated from `cost_analyzer::analyze_directory` so the
 /// report layer can warn that totals may be incomplete after per-file details
 /// have already gone to tracing.
 #[derive(Debug, Default)]
 pub struct AnalysisResult {
-    pub daily_costs: Vec<DailyCosts>,
+    pub daily_metrics: Vec<DailyMetrics>,
     pub had_errors: bool,
 }
 
@@ -21,35 +26,35 @@ pub struct AnalysisResult {
 /// daily report so callers do not need a separate warning path.
 #[derive(Debug, Default)]
 pub struct SessionAnalysisResult {
-    pub session_costs: Vec<SessionCosts>,
+    pub session_metrics: Vec<SessionMetrics>,
     pub had_errors: bool,
 }
 
 #[derive(Debug)]
-pub struct DailyCosts {
+pub struct DailyMetrics {
     pub date: NaiveDate,
-    pub per_model: ModelCostsMap,
+    pub per_model: ModelMetricsMap,
 }
 
-impl DailyCosts {
-    pub fn total(&self) -> f64 {
-        self.per_model.total()
+impl DailyMetrics {
+    pub fn total(&self, report_mode: ReportMode) -> miette::Result<MetricTotal> {
+        self.per_model.total(report_mode)
     }
 }
 
 /// `start_time` and `end_time` bracket only the kept billable lines, so the
 /// rendered duration matches any caller-supplied time filter.
 #[derive(Debug)]
-pub struct SessionCosts {
+pub struct SessionMetrics {
     pub session_id: String,
     pub start_time: DateTime<Utc>,
     pub end_time: DateTime<Utc>,
-    pub per_model: ModelCostsMap,
+    pub per_model: ModelMetricsMap,
 }
 
-impl SessionCosts {
-    pub fn total(&self) -> f64 {
-        self.per_model.total()
+impl SessionMetrics {
+    pub fn total(&self, report_mode: ReportMode) -> miette::Result<MetricTotal> {
+        self.per_model.total(report_mode)
     }
 
     pub fn duration_minutes(&self) -> i64 {
@@ -57,75 +62,125 @@ impl SessionCosts {
     }
 }
 
-fn token_costs_from_llm_cost(cost: &LlmCost) -> TokenCosts {
-    TokenCosts::new(
-        cost.input.to_f64().unwrap_or(0.0),
-        cost.output.to_f64().unwrap_or(0.0),
-        cost.cache_write.to_f64().unwrap_or(0.0),
-        cost.cache_read.to_f64().unwrap_or(0.0),
-    )
+fn cost_components_from_llm_cost(cost: &LlmCost) -> miette::Result<CostComponents> {
+    Ok(CostComponents::new(
+        cost.input
+            .to_f64()
+            .ok_or_else(|| miette::miette!("input cost could not be represented as f64"))?,
+        cost.output
+            .to_f64()
+            .ok_or_else(|| miette::miette!("output cost could not be represented as f64"))?,
+        cost.cache_write
+            .to_f64()
+            .ok_or_else(|| miette::miette!("cache-write cost could not be represented as f64"))?,
+        cost.cache_read
+            .to_f64()
+            .ok_or_else(|| miette::miette!("cache-read cost could not be represented as f64"))?,
+    ))
+}
+
+fn required_token_count(
+    line: &LineWithCost<LogLine>,
+    token_type: TokenType,
+    component_name: &str,
+) -> miette::Result<u64> {
+    line.log.token_count(token_type).ok_or_else(|| {
+        miette::miette!(
+            "Claude billable line '{}' for model '{}' is missing {component_name} token usage.",
+            line.id,
+            line.model,
+        )
+    })
+}
+
+fn token_counts_from_line(line: &LineWithCost<LogLine>) -> miette::Result<TokenCounts> {
+    Ok(TokenCounts::new(
+        required_token_count(line, TokenType::Input, "input")?,
+        required_token_count(line, TokenType::Output, "output")?,
+        required_token_count(line, TokenType::CacheWrite, "cache-write")?,
+        required_token_count(line, TokenType::CacheRead, "cache-read")?,
+    ))
+}
+
+fn metric_components(
+    line: &LineWithCost<LogLine>,
+    report_mode: ReportMode,
+) -> miette::Result<MetricComponents> {
+    match report_mode {
+        ReportMode::Cost => Ok(MetricComponents::Cost(cost_components_from_llm_cost(
+            &line.cost,
+        )?)),
+        ReportMode::Tokens => Ok(MetricComponents::Tokens(token_counts_from_line(line)?)),
+    }
 }
 
 /// Loads all dedup-resolved, time-filtered billable entries from `dir`.
 ///
 /// Both `analyze_directory` and `analyze_directory_by_session` start by
 /// fetching `cost_analyzer`'s deduplicated lines and pairing each surviving
-/// line with its `(ModelType, TokenCosts)`. Sharing that prelude in one
+/// line with its `(ModelType, MetricComponents)`. Sharing that prelude in one
 /// helper keeps the two entry points from drifting in load semantics (e.g.,
 /// dedup-then-filter ordering, future cost adjustments) and lets each entry
 /// point own only its bucketing logic.
 async fn load_billable_lines(
     dir: &Path,
     filter: &TimeRangeFilter,
-) -> (Vec<(LineWithCost<LogLine>, ModelType, TokenCosts)>, bool) {
+    report_mode: ReportMode,
+) -> miette::Result<(
+    Vec<(LineWithCost<LogLine>, ModelType, MetricComponents)>,
+    bool,
+)> {
     let result = cost_analyze_directory::<LogLine>(dir.to_path_buf()).await;
-    let entries = result
-        .lines
-        .into_iter()
-        .filter_map(|line| {
-            billable_entry(&line, filter).map(|(model_type, costs)| (line, model_type, costs))
-        })
-        .collect();
-    (entries, result.had_errors)
+    let mut entries = Vec::new();
+
+    for line in result.lines {
+        if let Some((model_type, metrics)) = billable_entry(&line, filter, report_mode)? {
+            entries.push((line, model_type, metrics));
+        }
+    }
+
+    Ok((entries, result.had_errors))
 }
 
-/// Centralizing the post-dedup filter check + model classification + Decimal
-/// → f64 conversion keeps both aggregation entry points aligned if the shared
-/// prelude ever gains another step.
+/// Centralizing the post-dedup filter check + model classification + metric
+/// extraction keeps both aggregation entry points aligned if the shared prelude
+/// ever gains another step.
 fn billable_entry(
     line: &LineWithCost<LogLine>,
     filter: &TimeRangeFilter,
-) -> Option<(ModelType, TokenCosts)> {
+    report_mode: ReportMode,
+) -> miette::Result<Option<(ModelType, MetricComponents)>> {
     if !filter.contains(&line.timestamp) {
-        return None;
+        return Ok(None);
     }
-    Some((
+    Ok(Some((
         ModelType::from_model_string(&line.model),
-        token_costs_from_llm_cost(&line.cost),
-    ))
+        metric_components(line, report_mode)?,
+    )))
 }
 
 pub async fn analyze_directory(
     dir: &Path,
     timezone: DateTimezone,
     filter: &TimeRangeFilter,
+    report_mode: ReportMode,
 ) -> miette::Result<AnalysisResult> {
-    let (entries, had_errors) = load_billable_lines(dir, filter).await;
+    let (entries, had_errors) = load_billable_lines(dir, filter, report_mode).await?;
 
-    let mut buckets: BTreeMap<NaiveDate, ModelCostsMap> = BTreeMap::new();
+    let mut buckets: BTreeMap<NaiveDate, ModelMetricsMap> = BTreeMap::new();
 
-    for (line, model_type, costs) in entries {
+    for (line, model_type, metrics) in entries {
         let date = timezone.to_date(&line.timestamp);
-        buckets.entry(date).or_default().add(model_type, costs);
+        buckets.entry(date).or_default().add(model_type, metrics)?;
     }
 
-    let daily_costs = buckets
+    let daily_metrics = buckets
         .into_iter()
-        .map(|(date, per_model)| DailyCosts { date, per_model })
+        .map(|(date, per_model)| DailyMetrics { date, per_model })
         .collect();
 
     Ok(AnalysisResult {
-        daily_costs,
+        daily_metrics,
         had_errors,
     })
 }
@@ -133,24 +188,25 @@ pub async fn analyze_directory(
 pub async fn analyze_directory_by_session(
     dir: &Path,
     filter: &TimeRangeFilter,
+    report_mode: ReportMode,
 ) -> miette::Result<SessionAnalysisResult> {
-    let (entries, had_errors) = load_billable_lines(dir, filter).await;
+    let (entries, had_errors) = load_billable_lines(dir, filter, report_mode).await?;
     session_analysis_from_entries(entries, had_errors)
 }
 
 fn session_analysis_from_entries(
-    entries: Vec<(LineWithCost<LogLine>, ModelType, TokenCosts)>,
+    entries: Vec<(LineWithCost<LogLine>, ModelType, MetricComponents)>,
     had_errors: bool,
 ) -> miette::Result<SessionAnalysisResult> {
     struct SessionAccumulator {
         start_time: DateTime<Utc>,
         end_time: DateTime<Utc>,
-        per_model: ModelCostsMap,
+        per_model: ModelMetricsMap,
     }
 
     let mut buckets: BTreeMap<String, SessionAccumulator> = BTreeMap::new();
 
-    for (line, model_type, costs) in entries {
+    for (line, model_type, metrics) in entries {
         let session_id = line.session_id.clone().ok_or_else(|| {
             miette::miette!(
                 "Claude billable line '{}' for model '{}' is missing a session id. \
@@ -165,7 +221,7 @@ fn session_analysis_from_entries(
             .or_insert_with(|| SessionAccumulator {
                 start_time: line.timestamp,
                 end_time: line.timestamp,
-                per_model: ModelCostsMap::default(),
+                per_model: ModelMetricsMap::default(),
             });
 
         if line.timestamp < acc.start_time {
@@ -174,12 +230,12 @@ fn session_analysis_from_entries(
         if line.timestamp > acc.end_time {
             acc.end_time = line.timestamp;
         }
-        acc.per_model.add(model_type, costs);
+        acc.per_model.add(model_type, metrics)?;
     }
 
-    let mut session_costs: Vec<SessionCosts> = buckets
+    let mut session_metrics: Vec<SessionMetrics> = buckets
         .into_iter()
-        .map(|(session_id, acc)| SessionCosts {
+        .map(|(session_id, acc)| SessionMetrics {
             session_id,
             start_time: acc.start_time,
             end_time: acc.end_time,
@@ -187,12 +243,24 @@ fn session_analysis_from_entries(
         })
         .collect();
 
-    session_costs.sort_by_key(|s| s.start_time);
+    session_metrics.sort_by_key(|session| session.start_time);
 
     Ok(SessionAnalysisResult {
-        session_costs,
+        session_metrics,
         had_errors,
     })
+}
+
+#[cfg(test)]
+pub type DailyCosts = DailyMetrics;
+#[cfg(test)]
+pub type SessionCosts = SessionMetrics;
+#[cfg(test)]
+pub type ModelCostsMap = ModelMetricsMap;
+
+#[cfg(test)]
+fn component_totals_from_llm_cost(cost: &LlmCost) -> CostComponents {
+    cost_components_from_llm_cost(cost).expect("cost components convert")
 }
 
 #[cfg(test)]
@@ -292,7 +360,7 @@ mod tests {
         );
         // Exact 0.0 is safe here without an epsilon: when the only kept line
         // contributes output tokens, `costs.input` is the unmodified default
-        // from `TokenCosts::default()` rather than the result of any
+        // from `ComponentTotals::default()` rather than the result of any
         // floating-point accumulation.
         assert_eq!(
             costs.input, 0.0,
@@ -390,14 +458,14 @@ mod tests {
     }
 
     #[test]
-    fn token_costs_from_llm_cost_handles_zero_and_nonzero_components() {
+    fn component_totals_from_llm_cost_handles_zero_and_nonzero_components() {
         let zero = LlmCost {
             input: Decimal::ZERO,
             output: Decimal::ZERO,
             cache_write: Decimal::ZERO,
             cache_read: Decimal::ZERO,
         };
-        let zero_costs = token_costs_from_llm_cost(&zero);
+        let zero_costs = component_totals_from_llm_cost(&zero);
         assert_eq!(zero_costs.input, 0.0);
         assert_eq!(zero_costs.output, 0.0);
         assert_eq!(zero_costs.cache_write, 0.0);
@@ -409,7 +477,7 @@ mod tests {
             cache_write: Decimal::new(50, 2), // 0.50
             cache_read: Decimal::new(125, 3), // 0.125
         };
-        let converted = token_costs_from_llm_cost(&cost);
+        let converted = component_totals_from_llm_cost(&cost);
         assert!((converted.input - 1.50).abs() < 1e-9);
         assert!((converted.output - 2.75).abs() < 1e-9);
         assert!((converted.cache_write - 0.50).abs() < 1e-9);
@@ -431,11 +499,14 @@ mod tests {
         .unwrap()
         .unwrap();
         let model_type = ModelType::from_model_string(&line.model);
-        let costs = token_costs_from_llm_cost(&line.cost);
+        let costs = component_totals_from_llm_cost(&line.cost);
         line.session_id = None;
 
-        let error =
-            session_analysis_from_entries(vec![(line, model_type, costs)], false).unwrap_err();
+        let error = session_analysis_from_entries(
+            vec![(line, model_type, MetricComponents::Cost(costs))],
+            false,
+        )
+        .unwrap_err();
 
         assert!(
             error.to_string().contains("missing a session id"),
@@ -447,11 +518,16 @@ mod tests {
     async fn analyze_directory_returns_empty_for_directory_with_no_logs() {
         let dir = TempDir::new().unwrap();
 
-        let result = analyze_directory(dir.path(), DateTimezone::Utc, &unrestricted_filter())
-            .await
-            .unwrap();
+        let result = analyze_directory(
+            dir.path(),
+            DateTimezone::Utc,
+            &unrestricted_filter(),
+            ReportMode::Cost,
+        )
+        .await
+        .unwrap();
 
-        assert!(result.daily_costs.is_empty());
+        assert!(result.daily_metrics.is_empty());
         assert!(!result.had_errors);
     }
 
@@ -493,25 +569,74 @@ mod tests {
             ],
         );
 
-        let result = analyze_directory(dir.path(), DateTimezone::Utc, &unrestricted_filter())
-            .await
-            .unwrap();
+        let result = analyze_directory(
+            dir.path(),
+            DateTimezone::Utc,
+            &unrestricted_filter(),
+            ReportMode::Cost,
+        )
+        .await
+        .unwrap();
 
-        assert_eq!(result.daily_costs.len(), 2);
+        assert_eq!(result.daily_metrics.len(), 2);
         assert!(!result.had_errors);
 
-        let day_1 = &result.daily_costs[0];
+        let day_1 = &result.daily_metrics[0];
         assert_eq!(day_1.date, NaiveDate::from_ymd_opt(2026, 4, 16).unwrap());
         let sonnet_day_1 = day_1.per_model.get(ModelType::Sonnet);
         assert!((sonnet_day_1.input - SONNET_INPUT_PER_MILLION).abs() < 1e-9);
         assert!((sonnet_day_1.output - SONNET_OUTPUT_PER_MILLION).abs() < 1e-9);
         assert_eq!(day_1.per_model.get(ModelType::Haiku).total(), 0.0);
 
-        let day_2 = &result.daily_costs[1];
+        let day_2 = &result.daily_metrics[1];
         assert_eq!(day_2.date, NaiveDate::from_ymd_opt(2026, 4, 17).unwrap());
         let haiku_day_2 = day_2.per_model.get(ModelType::Haiku);
         assert!((haiku_day_2.input - HAIKU_INPUT_PER_MILLION).abs() < 1e-9);
         assert!((haiku_day_2.output - HAIKU_OUTPUT_PER_MILLION).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn analyze_directory_tokens_uses_raw_usage_counts() {
+        let dir = TempDir::new().unwrap();
+        let session = "019dc252-e50e-766c-8182-d654b46881af";
+        write_log(
+            dir.path(),
+            "tokens.jsonl",
+            &[
+                assistant_line(
+                    session,
+                    timestamp(2026, 4, 16, 1, 0),
+                    "claude-sonnet-4-20250514",
+                    "req-token-1",
+                    usage_json(1_234, 5_678, 90, 12),
+                ),
+                assistant_line(
+                    session,
+                    timestamp(2026, 4, 16, 2, 0),
+                    "claude-sonnet-4-20250514",
+                    "req-token-2",
+                    usage_json(10, 20, 30, 40),
+                ),
+            ],
+        );
+
+        let result = analyze_directory(
+            dir.path(),
+            DateTimezone::Utc,
+            &unrestricted_filter(),
+            ReportMode::Tokens,
+        )
+        .await
+        .unwrap();
+
+        let costs = result.daily_metrics[0]
+            .per_model
+            .get_tokens(ModelType::Sonnet);
+        assert_eq!(costs.input, 1_244);
+        assert_eq!(costs.output, 5_698);
+        assert_eq!(costs.cache_write, 120);
+        assert_eq!(costs.cache_read, 52);
+        assert_eq!(costs.total(), 7_114);
     }
 
     #[tokio::test]
@@ -520,12 +645,17 @@ mod tests {
         let session = "019dc252-e50e-766c-8182-d654b46881af";
         write_filter_window_fixture(dir.path(), "all.jsonl", session, session);
 
-        let result = analyze_directory(dir.path(), DateTimezone::Utc, &april_16_only_filter())
-            .await
-            .unwrap();
+        let result = analyze_directory(
+            dir.path(),
+            DateTimezone::Utc,
+            &april_16_only_filter(),
+            ReportMode::Cost,
+        )
+        .await
+        .unwrap();
 
-        assert_eq!(result.daily_costs.len(), 1);
-        let kept = &result.daily_costs[0];
+        assert_eq!(result.daily_metrics.len(), 1);
+        let kept = &result.daily_metrics[0];
         assert_eq!(kept.date, NaiveDate::from_ymd_opt(2026, 4, 16).unwrap());
         // Only the in-window line should contribute its output cost; the
         // out-of-window line's input cost must not appear.
@@ -568,18 +698,23 @@ mod tests {
             ],
         );
 
-        let result = analyze_directory(dir.path(), DateTimezone::Utc, &april_16_only_filter())
-            .await
-            .unwrap();
+        let result = analyze_directory(
+            dir.path(),
+            DateTimezone::Utc,
+            &april_16_only_filter(),
+            ReportMode::Cost,
+        )
+        .await
+        .unwrap();
 
         assert!(!result.had_errors);
         assert!(
-            result.daily_costs.is_empty(),
+            result.daily_metrics.is_empty(),
             "dedup must keep the higher-cost out-of-window line and let the time filter \
              discard it; if filtering ran first, the in-window line would survive dedup \
              as the only candidate. Got dates: {:?}",
             result
-                .daily_costs
+                .daily_metrics
                 .iter()
                 .map(|d| d.date)
                 .collect::<Vec<_>>(),
@@ -621,14 +756,15 @@ mod tests {
             ],
         );
 
-        let result = analyze_directory_by_session(dir.path(), &unrestricted_filter())
-            .await
-            .unwrap();
+        let result =
+            analyze_directory_by_session(dir.path(), &unrestricted_filter(), ReportMode::Cost)
+                .await
+                .unwrap();
 
-        assert_eq!(result.session_costs.len(), 2);
+        assert_eq!(result.session_metrics.len(), 2);
         assert!(!result.had_errors);
 
-        let first = &result.session_costs[0];
+        let first = &result.session_metrics[0];
         assert_eq!(first.session_id, session_a);
         assert_eq!(first.start_time, timestamp(2026, 4, 16, 9, 0));
         assert_eq!(first.end_time, timestamp(2026, 4, 16, 10, 30));
@@ -637,10 +773,54 @@ mod tests {
         assert!((costs.input - SONNET_INPUT_PER_MILLION).abs() < 1e-9);
         assert!((costs.output - SONNET_OUTPUT_PER_MILLION).abs() < 1e-9);
 
-        let second = &result.session_costs[1];
+        let second = &result.session_metrics[1];
         assert_eq!(second.session_id, session_b);
         assert_eq!(second.start_time, timestamp(2026, 4, 16, 12, 0));
         assert_eq!(second.end_time, timestamp(2026, 4, 16, 12, 0));
+    }
+
+    #[tokio::test]
+    async fn analyze_directory_by_session_tokens_group_by_session_and_preserve_time_range() {
+        let dir = TempDir::new().unwrap();
+        let session = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        write_log(
+            dir.path(),
+            "session-tokens.jsonl",
+            &[
+                assistant_line(
+                    session,
+                    timestamp(2026, 4, 16, 9, 0),
+                    "claude-sonnet-4-20250514",
+                    "req-token-a1",
+                    usage_json(1_234, 5_678, 90, 12),
+                ),
+                assistant_line(
+                    session,
+                    timestamp(2026, 4, 16, 10, 30),
+                    "claude-sonnet-4-20250514",
+                    "req-token-a2",
+                    usage_json(10, 20, 30, 40),
+                ),
+            ],
+        );
+
+        let result =
+            analyze_directory_by_session(dir.path(), &unrestricted_filter(), ReportMode::Tokens)
+                .await
+                .unwrap();
+
+        assert_eq!(result.session_metrics.len(), 1);
+        let session_metrics = &result.session_metrics[0];
+        assert_eq!(session_metrics.session_id, session);
+        assert_eq!(session_metrics.start_time, timestamp(2026, 4, 16, 9, 0));
+        assert_eq!(session_metrics.end_time, timestamp(2026, 4, 16, 10, 30));
+        assert_eq!(session_metrics.duration_minutes(), 90);
+        let costs = session_metrics.per_model.get_tokens(ModelType::Sonnet);
+        assert_eq!(costs.input, 1_244);
+        assert_eq!(costs.output, 5_698);
+        assert_eq!(costs.cache_write, 120);
+        assert_eq!(costs.cache_read, 52);
+        assert_eq!(costs.total(), 7_114);
     }
 
     #[tokio::test]
@@ -650,13 +830,14 @@ mod tests {
         let session_out = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
         write_filter_window_fixture(dir.path(), "sessions.jsonl", session_out, session_in);
 
-        let result = analyze_directory_by_session(dir.path(), &april_16_only_filter())
-            .await
-            .unwrap();
+        let result =
+            analyze_directory_by_session(dir.path(), &april_16_only_filter(), ReportMode::Cost)
+                .await
+                .unwrap();
 
-        assert_eq!(result.session_costs.len(), 1);
+        assert_eq!(result.session_metrics.len(), 1);
         assert!(!result.had_errors);
-        let kept = &result.session_costs[0];
+        let kept = &result.session_metrics[0];
         assert_eq!(kept.session_id, session_in);
         assert_only_in_window_sonnet_output(&kept.per_model);
     }
@@ -679,11 +860,16 @@ mod tests {
             )],
         );
 
-        let result = analyze_directory(dir.path(), DateTimezone::Utc, &unrestricted_filter())
-            .await
-            .unwrap();
+        let result = analyze_directory(
+            dir.path(),
+            DateTimezone::Utc,
+            &unrestricted_filter(),
+            ReportMode::Cost,
+        )
+        .await
+        .unwrap();
 
-        let costs = result.daily_costs[0].per_model.get(ModelType::Sonnet);
+        let costs = result.daily_metrics[0].per_model.get(ModelType::Sonnet);
         assert!((costs.input - SONNET_INPUT_PER_MILLION).abs() < 1e-9);
         assert!((costs.output - SONNET_OUTPUT_PER_MILLION).abs() < 1e-9);
         assert!((costs.cache_write - SONNET_CACHE_WRITE_PER_MILLION).abs() < 1e-9);

@@ -5,6 +5,6 @@ pub(crate) mod test_support;
 
 pub use logs::{
     AnalyzableLog, ClaudeModelPricing, ClaudeModelType, ClaudeTokenCounts, Identifier,
-    LineWithCost, LlmCost, PiModel,
+    LineWithCost, LlmCost, PiModel, TokenType,
 };
 pub use reader::{analyze_directory, AnalysisResult};

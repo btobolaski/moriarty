@@ -6,8 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Moriarty is a Rust CLI tool for analyzing Claude Code logs and API usage. It provides:
 
-- **Claude API pricing analyzer**: Analyzes Claude API usage from log directories and generates detailed cost reports
-- **Pi cost analyzer**: Analyzes pi session logs and generates daily or per-conversation cost reports grouped by
+- **Claude API pricing analyzer**: Analyzes Claude API usage from log directories and generates detailed cost or token reports
+- **Pi cost analyzer**: Analyzes pi session logs and generates daily or per-conversation cost or token reports grouped by
   provider and model
 - **MCP servers**: Provides Model Context Protocol servers for git operations and project tools
 - **Hooks system**: Security integration for validating commands before execution (bash rules, project checks)
@@ -26,10 +26,12 @@ cargo build
 ```bash
 # Run Claude API pricing analyzer
 cargo run -- api-pricing -d <directory> --timezone local|utc
+cargo run -- api-pricing -d <directory> --tokens
 
 # Run pi cost analyzer
 cargo run -- pi cost --timezone local|utc
 cargo run -- pi cost --dir <pi-sessions-directory> --conversations
+cargo run -- pi cost --dir <pi-sessions-directory> --tokens
 
 # Run MCP servers
 cargo run -- mcp git-read-only
@@ -76,25 +78,29 @@ test in a separate process, making this safe and preventing tests from clobberin
 
 **`cost_report/`** - Shared cost report rendering and filtering:
 
-- Holds shared time filtering, grouped-table rendering, money formatting, and report warning helpers used by both
-  cost-report backends
+- Holds shared time filtering, grouped-table rendering, `ReportMode`, `CostComponents`, `TokenCounts`,
+  `MetricComponents`, and report warning helpers used by both cost-report backends
+- `FormattedMetricColumns`, `GrandTotalRow`, and `render_grouped_metrics` are mode-aware: cost mode formats dollars,
+  token mode formats integer token counts with thousands separators, while preserving the same table shape for both
+  backends
 - Keeps the output behavior for `api-pricing` and `pi cost` aligned without forcing the backends into a dynamic-column
   abstraction
 
 **`api_pricing/`** - Claude API usage cost analysis:
 
-- Aggregates pre-priced `LlmCost` values from `cost_analyzer` into daily buckets (keyed by timezone-adjusted date) or
-  per-conversation buckets (keyed by session ID)
-- Per-model aggregation uses `ModelCostsMap` to accumulate already-priced cost components into Claude-family buckets
+- Aggregates either pre-priced `LlmCost` values or raw token counts from `cost_analyzer` into daily buckets (keyed by
+  timezone-adjusted date) or per-conversation buckets (keyed by session ID)
+- Per-model aggregation uses `ModelMetricsMap` to accumulate exact-mode `MetricComponents` into Claude-family buckets;
+  token mode stays integer-exact end-to-end instead of passing through floating-point helpers
 - Unknown Claude models surface as stderr tracing errors via `cost_analyzer`; they are not rendered in the report
 - Entry point: `api-pricing` subcommand in `main.rs`
 
 **`pi_cost/`** - Pi session cost analysis:
 
-- Aggregates pre-priced `LlmCost` values from `cost_analyzer` into daily buckets or per-conversation buckets keyed by
-  normalized session ID
-- Uses raw pi `(provider, model)` pairs for row grouping, with deterministic ordering from a `BTreeMap<PiModel, ...>`
-  accumulator
+- Aggregates either pre-priced `LlmCost` values or raw token counts from `cost_analyzer` into daily buckets or
+  per-conversation buckets keyed by normalized session ID
+- Uses raw pi `(provider, model)` pairs for row grouping, with deterministic ordering from a
+  `BTreeMap<PiModel, MetricComponents>` accumulator inside `PiModelMetricsMap`
 - Conversation mode depends on `cost_analyzer::LineWithCost.session_id`, which is attached during the single-pass parse
   from either Claude assistant lines or pi `SessionLine` headers
 - Entry point: `pi cost` subcommand in `main.rs`
@@ -111,13 +117,14 @@ test in a separate process, making this safe and preventing tests from clobberin
 - Workspace crate for recursively scanning JSONL directories, parsing logs in parallel, and deduplicating billable model
   responses
 - Core abstractions: `AnalyzableLog` for pluggable log formats, `LlmCost` for input/cache/output cost breakdowns,
-  `LineWithCost` for normalized billable entries, and `AnalysisResult` for returning those deduplicated lines alongside
-  a partial-failure flag
+  `TokenType` plus `AnalyzableLog::token_count(...) -> Option<u64>` for raw token extraction, `LineWithCost` for
+  normalized billable entries, and `AnalysisResult` for returning those deduplicated lines alongside a
+  partial-failure flag
 - Concrete implementations currently support `pi_logs::PiLogLine` and `claude_logs::LogLine`. Claude log costs are
   calculated in `cost_analyzer` with local Decimal-based Claude pricing helpers rather than by depending on
   `moriarty::api_pricing` internals.
-- `moriarty::api_pricing` and `moriarty::pi_cost` both delegate all log loading, deduplication, and pricing to this
-  crate; they only aggregate the returned `LlmCost` values into report buckets
+- `moriarty::api_pricing` and `moriarty::pi_cost` both delegate all log loading, deduplication, pricing, and raw
+  token extraction to this crate; the backends only bucket the returned billable lines into cost or token report rows
 - `LineWithCost.session_id` is normalized during parsing so backends can group by conversation without re-reading log
   files; Claude assistant lines provide it inline and pi logs inherit it from the file's `SessionLine`
 - Deduplication keeps the highest-cost duplicate for a `(ModelId, LogId)` pair and breaks equal-cost ties by keeping the
@@ -307,7 +314,7 @@ use std::{collections::{HashSet, HashMap}, fmt::Display};
 use chrono::{Datelike, NaiveDate, TimeZone, Utc};
 
 // local / workspace deps
-use super::{analyzer::*, pricing::{ModelType, TokenCosts, TokenCounts}, time_filter::TimeRangeFilter};
+use super::{analyzer::*, pricing::{ModelMetricsMap, ModelType}, time_filter::TimeRangeFilter};
 ```
 
 #### Avoid qualified usages
