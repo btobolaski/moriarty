@@ -57,24 +57,110 @@ pub mod parser;
 pub mod tool_rules;
 pub mod tracing;
 
-use crate::project_config::{approvals::ProjectApprovals, config::load_project_settings};
-use crate::user_config::load_user_config;
-use crate::HooksCommand;
+use std::{io::Read, path::PathBuf};
+
 use ::tracing::{debug, error, info, warn};
 use futures::stream::StreamExt;
 use miette::Result;
+use serde_json::{Map, Value};
+
+use crate::project_config::{approvals::ProjectApprovals, config::load_project_settings};
+use crate::user_config::load_user_config;
+use crate::HooksCommand;
 use parser::{
-    HookDecision, HookEventData, HookOutput, HookSpecificOutput, PermissionDecision,
+    HookDecision, HookEventData, HookInput, HookOutput, HookSpecificOutput, PermissionDecision,
     PreToolUseOutput,
 };
-use std::io::Read;
-use std::path::PathBuf;
+
+const TOOL_ARGS_LOG_TRUNCATE_SIZE: usize = 50_000;
+const SAFE_LOG_STRING_TRUNCATE_SIZE: usize = 4_096;
+const REDACTED_LOG_VALUE: &str = "[redacted]";
 
 /// Execute hooks command
 pub async fn exec_hooks(cmd: HooksCommand) -> Result<()> {
     match cmd {
         HooksCommand::Exec => exec_hook().await,
     }
+}
+
+fn hook_input_for_log(hook_input: &HookInput) -> String {
+    match serde_json::to_value(hook_input) {
+        Ok(value) => json_value_for_log(&value),
+        Err(_) => "[hook input unavailable]".to_string(),
+    }
+}
+
+fn tool_args_for_log(tool_input: &Value) -> String {
+    json_value_for_log(tool_input)
+}
+
+fn json_value_for_log(value: &Value) -> String {
+    let sanitized_input = sanitize_log_value(None, value);
+    let serialized =
+        serde_json::to_string(&sanitized_input).unwrap_or_else(|_| sanitized_input.to_string());
+
+    truncate_log_field(&serialized, TOOL_ARGS_LOG_TRUNCATE_SIZE)
+}
+
+fn sanitize_log_value(key: Option<&str>, value: &Value) -> Value {
+    if key.is_some_and(is_sensitive_log_key) {
+        return Value::String(REDACTED_LOG_VALUE.to_string());
+    }
+
+    match value {
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| sanitize_log_value(None, item))
+                .collect(),
+        ),
+        Value::Object(map) => Value::Object(sanitize_log_object(map)),
+        Value::String(text) if key.is_some_and(is_safe_log_string_key) => {
+            Value::String(truncate_log_field(text, SAFE_LOG_STRING_TRUNCATE_SIZE))
+        }
+        Value::String(text) => Value::String(format!("[string {} bytes]", text.len())),
+        _ => value.clone(),
+    }
+}
+
+fn sanitize_log_object(map: &Map<String, Value>) -> Map<String, Value> {
+    map.iter()
+        .map(|(key, value)| (key.clone(), sanitize_log_value(Some(key), value)))
+        .collect()
+}
+
+fn is_sensitive_log_key(key: &str) -> bool {
+    let uppercase_key = key.to_ascii_uppercase();
+    ["TOKEN", "SECRET", "KEY", "PASSWORD"]
+        .iter()
+        .any(|pattern| uppercase_key.contains(pattern))
+}
+
+fn is_safe_log_string_key(key: &str) -> bool {
+    matches!(
+        key,
+        "cwd" | "file_path" | "hook_event_name" | "permission_mode" | "session_id" | "tool_name"
+    ) || key.ends_with("_path")
+        || key == "path"
+}
+
+fn truncate_log_field(field: &str, max_size: usize) -> String {
+    if field.len() <= max_size {
+        return field.to_string();
+    }
+
+    let safe_truncate = field
+        .char_indices()
+        .map(|(index, _)| index)
+        .take_while(|index| *index <= max_size)
+        .last()
+        .unwrap_or(0);
+
+    format!(
+        "{}... [truncated {} bytes]",
+        &field[..safe_truncate],
+        field.len() - safe_truncate
+    )
 }
 
 /// Execute a single hook by reading input from stdin and logging all parsed data
@@ -159,16 +245,8 @@ async fn exec_hook_impl<R: Read>(reader: R) -> Result<()> {
         miette::miette!("Failed to parse hook input: {}", e)
     })?;
 
-    // Log hook_input as JSON for better structured logging. The fallback to Debug format
-    // is defensive - HookInput derives Serialize and should always serialize successfully.
-    if let Ok(json) = serde_json::to_string(&hook_input) {
-        info!(hook_input = %json, "Successfully parsed hook input");
-    } else {
-        info!(
-            ?hook_input,
-            "Successfully parsed hook input (JSON serialization failed)"
-        );
-    }
+    let hook_input_log = hook_input_for_log(&hook_input);
+    info!(hook_input = %hook_input_log, "Successfully parsed hook input");
 
     if let HookEventData::PreToolUse {
         ref tool_name,
@@ -182,7 +260,13 @@ async fn exec_hook_impl<R: Read>(reader: R) -> Result<()> {
 
         println!("{}", json_output);
 
-        info!(?hook_output, "PreToolUse hook completed");
+        let tool_args = tool_args_for_log(tool_input);
+        info!(
+            tool_name = %tool_name,
+            tool_args = %tool_args,
+            ?hook_output,
+            "PreToolUse hook completed"
+        );
         return Ok(());
     }
 

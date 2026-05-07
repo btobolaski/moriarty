@@ -1,7 +1,8 @@
 //! Tests for hooks module
 
-use std::io::Cursor;
+use std::{fs, io::Cursor};
 
+use serde_json::Value;
 use tempfile::TempDir;
 
 use super::*;
@@ -264,6 +265,21 @@ async fn run_exec_hook_expect_ok(input: &str, ctx: &str) {
     exec_hook_impl(cursor).await.expect(ctx);
 }
 
+async fn read_hooks_log_file() -> String {
+    let log_path = crate::hooks::tracing::get_current_log_path()
+        .await
+        .expect("Log path should resolve");
+    let log_dir = log_path.parent().expect("Log path should have parent");
+
+    let log_entry = fs::read_dir(log_dir)
+        .expect("Log directory should be readable")
+        .filter_map(|entry| entry.ok())
+        .find(|entry| entry.file_name().to_string_lossy().starts_with("hooks.log"))
+        .expect("Hooks log file should exist");
+
+    fs::read_to_string(log_entry.path()).expect("Hooks log file should be readable")
+}
+
 #[tokio::test]
 async fn test_exec_hook_empty_input_returns_error() {
     let _xdg_dir = setup_isolated_xdg_state();
@@ -306,6 +322,95 @@ async fn test_exec_hook_valid_input_succeeds() {
     let result = exec_hook_impl(cursor).await;
 
     result.unwrap(); // Panics with full error details if it fails
+}
+
+#[tokio::test]
+async fn test_exec_hook_pretool_completion_log_includes_tool_context() {
+    let _xdg_state = setup_isolated_xdg_state();
+    let _xdg_config = setup_isolated_xdg_config();
+
+    let input = r#"{
+        "session_id": "test-session",
+        "transcript_path": "/tmp/transcript.json",
+        "cwd": "/tmp/project",
+        "permission_mode": "default",
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Read",
+        "tool_input": {
+            "file_path": "/tmp/foo.rs",
+            "api_key": "secret-value",
+            "command": "echo secret-value"
+        }
+    }"#;
+
+    exec_hook_impl(Cursor::new(input))
+        .await
+        .expect("PreToolUse Read event should succeed");
+
+    let content = read_hooks_log_file().await;
+    let completion_event = content
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|event| {
+            event.pointer("/fields/message").and_then(Value::as_str)
+                == Some("PreToolUse hook completed")
+        })
+        .expect("PreToolUse completion log event should be present");
+    let fields = completion_event
+        .get("fields")
+        .expect("Tracing JSON event should contain fields");
+
+    assert_eq!(
+        fields.get("tool_name").and_then(Value::as_str),
+        Some("Read")
+    );
+
+    let tool_args = fields
+        .get("tool_args")
+        .and_then(Value::as_str)
+        .expect("tool_args should be logged as a string field");
+    let parsed_tool_args: Value =
+        serde_json::from_str(tool_args).expect("tool_args should be valid JSON text");
+
+    assert_eq!(
+        parsed_tool_args.get("file_path").and_then(Value::as_str),
+        Some("/tmp/foo.rs")
+    );
+    assert_eq!(
+        parsed_tool_args.get("api_key").and_then(Value::as_str),
+        Some(REDACTED_LOG_VALUE)
+    );
+    assert_eq!(
+        parsed_tool_args.get("command").and_then(Value::as_str),
+        Some("[string 17 bytes]")
+    );
+    assert!(!tool_args.contains("secret-value"));
+    assert!(!content.contains("secret-value"));
+    assert!(
+        fields.get("hook_output").is_some(),
+        "hook_output should remain present on completion log events"
+    );
+}
+
+#[test]
+fn test_tool_args_for_log_truncates_large_input() {
+    let mut paths = serde_json::Map::new();
+    for index in 0..20 {
+        paths.insert(
+            format!("file_{index}_path"),
+            Value::String(format!(
+                "/tmp/{}",
+                "x".repeat(SAFE_LOG_STRING_TRUNCATE_SIZE + 100)
+            )),
+        );
+    }
+    let tool_input = Value::Object(paths);
+    let full_input = serde_json::to_string(&tool_input).expect("Tool input should serialize");
+
+    let tool_args = tool_args_for_log(&tool_input);
+
+    assert!(tool_args.len() < full_input.len());
+    assert!(tool_args.contains("... [truncated "));
 }
 
 #[tokio::test]
