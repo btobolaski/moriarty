@@ -50,7 +50,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
-use serde::{de, Deserialize, Deserializer, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
 use uuid::Uuid;
 
@@ -343,13 +343,14 @@ impl<'de> Deserialize<'de> for ToolResultMessage {
         D: Deserializer<'de>,
     {
         let raw = RawToolResultMessage::deserialize(deserializer)?;
-        let details = raw
-            .details
-            .filter(|details| !matches!(details, Value::Null))
-            .filter(|details| !matches!(details, Value::Object(map) if map.is_empty()))
-            .map(|details| parse_tool_result_details(&raw.tool_name, details))
-            .transpose()
-            .map_err(de::Error::custom)?;
+        let details = match raw.details {
+            Some(Value::Null) => None,
+            Some(Value::Object(map)) if map.is_empty() && raw.is_error => None,
+            Some(details) => Some(parse_tool_result_details(&raw.tool_name, details))
+                .transpose()
+                .map_err(de::Error::custom)?,
+            None => None,
+        };
 
         Ok(Self {
             tool_call_id: raw.tool_call_id,
@@ -494,6 +495,7 @@ pub enum Provider {
 #[serde(rename_all = "lowercase")]
 pub enum ThinkingLevel {
     Off,
+    Minimal,
     Medium,
     High,
 }
@@ -834,10 +836,22 @@ pub struct TodoArgs {
 /// `Garbage` is therefore only valid when a field-specific deserializer sees
 /// that exact echoed name for its own field. Other strings stay loud so new
 /// corruption modes do not silently become part of the accepted schema.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum MaybeU32 {
     Number(u32),
     Garbage(String),
+}
+
+impl Serialize for MaybeU32 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Number(value) => serializer.serialize_u32(*value),
+            Self::Garbage(value) => serializer.serialize_str(value),
+        }
+    }
 }
 
 fn parse_named_maybe_u32_value(
@@ -1065,6 +1079,19 @@ pub struct AskUserArgs {
     pub allow_comment: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_mode: Option<AskUserDisplayMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay_toggle_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment_toggle_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AskUserDisplayMode {
+    Overlay,
+    Inline,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -1837,13 +1864,16 @@ pub struct SubagentOutputReference {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SubagentControlEvent {
-    ActiveLongRunning(SubagentActiveLongRunningEvent),
-    NeedsAttention(SubagentNeedsAttentionEvent),
+    ActiveLongRunning(SubagentControlEventPayload),
+    NeedsAttention(SubagentControlEventPayload),
 }
 
+/// Both currently observed control-event variants share one payload schema;
+/// keeping that shape in one struct prevents the two arms from drifting as the
+/// runtime adds optional observability fields like `currentPath`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct SubagentActiveLongRunningEvent {
+pub struct SubagentControlEventPayload {
     /// Transition target reported by the runtime state machine. Currently
     /// observed to equal the event type, but kept as a separate field
     /// because the runtime models it as a distinct concept.
@@ -1868,29 +1898,8 @@ pub struct SubagentActiveLongRunningEvent {
     pub current_tool: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_tool_duration_ms: Option<u64>,
-    pub elapsed_ms: u64,
-}
-
-/// Same payload shape as `active_long_running`, but emitted when the runtime
-/// wants the parent to inspect or interrupt a child run rather than merely
-/// note that it crossed a long-running threshold.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct SubagentNeedsAttentionEvent {
-    pub to: String,
-    pub ts: u64,
-    pub run_id: String,
-    pub agent: String,
-    pub index: u32,
-    pub message: String,
-    pub reason: String,
-    pub turns: u32,
-    pub tokens: u64,
-    pub tool_count: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub current_tool: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub current_tool_duration_ms: Option<u64>,
+    pub current_path: Option<PathBuf>,
     pub elapsed_ms: u64,
 }
 
@@ -1989,6 +1998,11 @@ pub enum AskUserResponse {
 pub struct CodeSearchDetails {
     pub query: String,
     pub max_tokens: u32,
+    /// Search strategy label emitted by the runtime (for example
+    /// `"web-search-fallback"`). This is left open-ended because the set of
+    /// fallback modes is not part of a documented closed protocol.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }

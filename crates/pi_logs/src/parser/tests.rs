@@ -661,6 +661,18 @@ fn thinking_level_change_medium() {
 }
 
 #[test]
+fn thinking_level_change_minimal() {
+    let line = parse(thinking_level_change_json("m1", "minimal"));
+
+    match line {
+        PiLogLine::ThinkingLevelChange(thinking_level) => {
+            assert_eq!(thinking_level.thinking_level, ThinkingLevel::Minimal);
+        }
+        other => panic!("expected ThinkingLevelChange, got {other:?}"),
+    }
+}
+
+#[test]
 fn compaction_line() {
     let line = parse(compaction_json(false));
 
@@ -1022,6 +1034,28 @@ fn subagent_status_tool_call_accepts_action() {
 }
 
 #[test]
+fn subagent_status_tool_call_accepts_id_run_id_and_dir() {
+    let tool_call = parse_tool_call(
+        "subagent_status",
+        json!({
+            "action": "status",
+            "id": "4194b4bf",
+            "runId": "run-1",
+            "dir": "/tmp/subagent-run"
+        }),
+    );
+
+    assert_eq!(tool_call.name(), ToolName::SubagentStatus);
+    let ToolCallArguments::SubagentStatus(args) = tool_call.tool else {
+        panic!("expected SubagentStatus args")
+    };
+    assert_eq!(args.action.as_deref(), Some("status"));
+    assert_eq!(args.id.as_deref(), Some("4194b4bf"));
+    assert_eq!(args.run_id.as_deref(), Some("run-1"));
+    assert_eq!(args.dir, Some(PathBuf::from("/tmp/subagent-run")));
+}
+
+#[test]
 fn subagent_tasks_accept_output_mode() {
     let tool_call = parse_tool_call(
         "subagent",
@@ -1042,7 +1076,7 @@ fn subagent_tasks_accept_output_mode() {
 }
 
 #[test]
-fn subagent_status_action_accepts_id() {
+fn subagent_action_accepts_id() {
     let args = parse_subagent_args(json!({
         "action": "status",
         "id": "4194b4bf"
@@ -1180,6 +1214,90 @@ fn contact_supervisor_tool_call_accepts_reason_and_message() {
 }
 
 #[test]
+fn intercom_tool_call_accepts_message_and_attachments() {
+    let tool_call = parse_tool_call(
+        "intercom",
+        json!({
+            "action": "send",
+            "to": "subagent-chat-123",
+            "message": "Please review this",
+            "replyTo": "msg-1",
+            "attachments": [{
+                "type": "text",
+                "name": "context.md",
+                "content": "# Context",
+                "language": "markdown"
+            }]
+        }),
+    );
+
+    assert_eq!(tool_call.name(), ToolName::Intercom);
+    let ToolCallArguments::Intercom(args) = tool_call.tool else {
+        panic!("expected Intercom args")
+    };
+
+    assert_eq!(args.action, "send");
+    assert_eq!(args.to.as_deref(), Some("subagent-chat-123"));
+    assert_eq!(args.message.as_deref(), Some("Please review this"));
+    assert_eq!(args.reply_to.as_deref(), Some("msg-1"));
+
+    let attachments = args.attachments.expect("expected attachments");
+    assert_eq!(attachments.len(), 1);
+    assert_eq!(attachments[0].kind, "text");
+    assert_eq!(attachments[0].name, "context.md");
+    assert_eq!(attachments[0].content, "# Context");
+    assert_eq!(attachments[0].language.as_deref(), Some("markdown"));
+}
+
+#[test]
+fn intercom_attachment_rejects_unknown_field() {
+    assert_parse_error_contains_any(
+        "intercom attachment rejects unknown field",
+        assistant_message_json(
+            vec![assistant_tool_call_json(
+                "intercom",
+                json!({
+                    "action": "send",
+                    "attachments": [{
+                        "type": "text",
+                        "name": "context.md",
+                        "content": "body",
+                        "unexpected": true
+                    }]
+                }),
+            )],
+            AssistantFixture::new("openai-responses", "openai", "gpt-5.4", "toolUse"),
+        ),
+        &["unknown field", "unexpected"],
+    );
+}
+
+#[test]
+fn mcp_tool_call_accepts_connect_and_call_fields() {
+    let tool_call = parse_tool_call(
+        "mcp",
+        json!({
+            "server": "git-read-only",
+            "tool": "status",
+            "args": "{\"project_dir\":\".\"}",
+            "action": "call",
+            "connect": "git-read-only"
+        }),
+    );
+
+    assert_eq!(tool_call.name(), ToolName::Mcp);
+    let ToolCallArguments::Mcp(args) = tool_call.tool else {
+        panic!("expected Mcp args")
+    };
+
+    assert_eq!(args.server.as_deref(), Some("git-read-only"));
+    assert_eq!(args.tool.as_deref(), Some("status"));
+    assert_eq!(args.args.as_deref(), Some("{\"project_dir\":\".\"}"));
+    assert_eq!(args.action.as_deref(), Some("call"));
+    assert_eq!(args.connect.as_deref(), Some("git-read-only"));
+}
+
+#[test]
 fn ask_user_tool_call_accepts_title_option() {
     let tool_call = parse_tool_call(
         "ask_user",
@@ -1197,6 +1315,27 @@ fn ask_user_tool_call_accepts_title_option() {
         args.options,
         Some(vec![AskUserOption::Title("Continue".to_string())])
     );
+}
+
+#[test]
+fn ask_user_tool_call_accepts_display_configuration() {
+    let tool_call = parse_tool_call(
+        "ask_user",
+        json!({
+            "question": "Continue?",
+            "displayMode": "inline",
+            "overlayToggleKey": "alt+o",
+            "commentToggleKey": "ctrl+g"
+        }),
+    );
+
+    let ToolCallArguments::AskUser(args) = tool_call.tool else {
+        panic!("expected AskUser args")
+    };
+
+    assert_eq!(args.display_mode, Some(AskUserDisplayMode::Inline));
+    assert_eq!(args.overlay_toggle_key.as_deref(), Some("alt+o"));
+    assert_eq!(args.comment_toggle_key.as_deref(), Some("ctrl+g"));
 }
 
 #[test]
@@ -2028,10 +2167,37 @@ fn code_search_tool_result_accepts_error_details() {
         "jscpd ignore comment syntax ignore-start ignore-end"
     );
     assert_eq!(details.max_tokens, 2000);
+    assert_eq!(details.mode, None);
     assert_eq!(
         details.error.as_deref(),
         Some("MCP error -32602: Tool get_code_context_exa not found")
     );
+}
+
+#[test]
+fn code_search_tool_result_accepts_fallback_mode_details() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "code_search",
+        vec![json!({
+            "type": "text",
+            "text": "code search fallback results"
+        })],
+        false,
+        Some(json!({
+            "query": "sidecar ordering fallback",
+            "maxTokens": 3000,
+            "mode": "web-search-fallback"
+        })),
+    ));
+
+    let Some(ToolResultDetails::CodeSearch(details)) = tool_result.details else {
+        panic!("expected CodeSearch details")
+    };
+
+    assert_eq!(details.query, "sidecar ordering fallback");
+    assert_eq!(details.max_tokens, 3000);
+    assert_eq!(details.mode.as_deref(), Some("web-search-fallback"));
+    assert_eq!(details.error, None);
 }
 
 #[test]
@@ -3118,7 +3284,7 @@ fn fetch_content_tool_result_accepts_details() {
             "truncated": false,
             "hasImage": false,
             "imageCount": 0,
-            "prompt": null
+            "prompt": "Summarize this page"
         })),
     ));
     let Some(ToolResultDetails::FetchContent(details)) = tool_result.details else {
@@ -3133,7 +3299,7 @@ fn fetch_content_tool_result_accepts_details() {
     assert!(!details.truncated);
     assert!(!details.has_image);
     assert_eq!(details.image_count, 0);
-    assert!(details.prompt.is_none());
+    assert_eq!(details.prompt.as_deref(), Some("Summarize this page"));
 }
 
 #[test]
@@ -3166,28 +3332,63 @@ fn fetch_content_tool_result_accepts_missing_optional_metadata() {
 }
 
 #[test]
-fn empty_or_null_tool_result_details_are_treated_as_absent() {
-    for details in [json!({}), Value::Null] {
-        for tool_name in [
-            "compress",
-            "edit",
-            "fetch_content",
-            "git_read_only_log",
-            "mcp",
-            "web_search",
-        ] {
-            let tool_result = parse_tool_result_message(tool_result_message_json(
-                tool_name,
-                vec![json!({"type": "text", "text": "permission denied"})],
-                true,
-                Some(details.clone()),
-            ));
-            assert!(
-                tool_result.details.is_none(),
-                "expected structurally empty details to be dropped for {tool_name}: {details}"
-            );
-        }
+fn null_tool_result_details_are_treated_as_absent() {
+    for tool_name in [
+        "compress",
+        "edit",
+        "fetch_content",
+        "git_read_only_log",
+        "mcp",
+        "web_search",
+    ] {
+        let tool_result = parse_tool_result_message(tool_result_message_json(
+            tool_name,
+            vec![json!({"type": "text", "text": "permission denied"})],
+            true,
+            Some(Value::Null),
+        ));
+        assert!(
+            tool_result.details.is_none(),
+            "expected null details to be dropped for {tool_name}"
+        );
     }
+}
+
+#[test]
+fn empty_error_tool_result_details_are_treated_as_absent() {
+    for tool_name in [
+        "compress",
+        "edit",
+        "fetch_content",
+        "git_read_only_log",
+        "mcp",
+        "web_search",
+    ] {
+        let tool_result = parse_tool_result_message(tool_result_message_json(
+            tool_name,
+            vec![json!({"type": "text", "text": "permission denied"})],
+            true,
+            Some(json!({})),
+        ));
+        assert!(
+            tool_result.details.is_none(),
+            "expected empty error details to be dropped for {tool_name}"
+        );
+    }
+}
+
+#[test]
+fn empty_success_tool_result_details_stay_strict() {
+    assert_parse_error_contains_any(
+        "empty success details stay strict",
+        tool_result_message_json(
+            "compress",
+            vec![json!({"type": "text", "text": "Compressed 1 range"})],
+            false,
+            Some(json!({})),
+        ),
+        &["did not match any variant", "required field", "blockIds"],
+    );
 }
 
 #[test]
@@ -3326,6 +3527,7 @@ fn read_tool_result_accepts_lean_ctx_only() {
             "path": "src/lib.rs",
             "source": "lean-ctx",
             "mode": "full",
+            "lines": 123,
             "compression": {"originalTokens": 800, "compressedTokens": 600, "percentSaved": 25}
         })),
     ));
@@ -3336,6 +3538,7 @@ fn read_tool_result_accepts_lean_ctx_only() {
     assert_eq!(details.path, Some(PathBuf::from("src/lib.rs")));
     assert_eq!(details.source, Some(ToolResultSource::LeanCtx));
     assert_eq!(details.mode.as_deref(), Some("full"));
+    assert_eq!(details.lines, Some(123));
     assert!(details.compression.is_some());
 }
 
@@ -3540,6 +3743,37 @@ fn maybe_u32_helper_only_accepts_the_matching_echoed_field_name() {
 }
 
 #[test]
+fn maybe_u32_serializes_back_to_wire_shape() {
+    assert_eq!(
+        serde_json::to_value(MaybeU32::Number(2)).expect("serialize number"),
+        Value::from(2)
+    );
+    assert_eq!(
+        serde_json::to_value(MaybeU32::Garbage("limit".to_string())).expect("serialize garbage"),
+        Value::from("limit")
+    );
+}
+
+#[test]
+fn read_args_serialize_maybe_u32_fields_without_enum_tags() {
+    let value = serde_json::to_value(ReadArgs {
+        path: Some(PathBuf::from("crates/pi_logs/src/parser.rs")),
+        offset: Some(MaybeU32::Number(1)),
+        limit: Some(MaybeU32::Garbage("limit".to_string())),
+    })
+    .expect("serialize read args");
+
+    assert_eq!(
+        value,
+        json!({
+            "path": "crates/pi_logs/src/parser.rs",
+            "offset": 1,
+            "limit": "limit"
+        })
+    );
+}
+
+#[test]
 fn find_tool_call_accepts_dotted_limit_key() {
     let tool_call = parse_tool_call(
         "find",
@@ -3739,6 +3973,32 @@ fn custom_plannotator_accepts_snapshot_saved_state() {
 }
 
 #[test]
+fn custom_plannotator_accepts_snapshot_saved_state_with_minimal_thinking() {
+    match parse_custom_payload(
+        "plannotator",
+        json!({
+            "phase": "planning",
+            "savedState": {
+                "activeTools": ["read"],
+                "model": {"provider": "openai", "id": "gpt-5.5"},
+                "thinkingLevel": "minimal"
+            }
+        }),
+    ) {
+        CustomPayload::Plannotator(details) => {
+            let Some(PlannotatorSavedState::Snapshot(snapshot)) = details.saved_state else {
+                panic!("expected snapshot saved_state")
+            };
+            assert_eq!(snapshot.active_tools, vec![ToolName::Read]);
+            assert_eq!(snapshot.model.provider, Provider::OpenAi);
+            assert_eq!(snapshot.model.id, "gpt-5.5");
+            assert_eq!(snapshot.thinking_level, ThinkingLevel::Minimal);
+        }
+        other => panic!("expected Plannotator, got {other:?}"),
+    }
+}
+
+#[test]
 fn custom_message_subagent_notify_has_no_details() {
     assert!(matches!(
         parse_custom_message_payload("Background task failed: timeout", "subagent-notify", None,),
@@ -3838,6 +4098,7 @@ fn custom_message_subagent_control_notice_accepts_needs_attention_event() {
                 "turns": 12,
                 "tokens": 71740,
                 "toolCount": 54,
+                "currentPath": "review-documentation-3.md",
                 "elapsedMs": 60887
             },
             "source": "foreground",
@@ -3871,6 +4132,10 @@ fn custom_message_subagent_control_notice_accepts_needs_attention_event() {
             assert_eq!(event.turns, 12);
             assert_eq!(event.tokens, 71740);
             assert_eq!(event.tool_count, 54);
+            assert_eq!(
+                event.current_path,
+                Some(PathBuf::from("review-documentation-3.md"))
+            );
             assert_eq!(event.elapsed_ms, 60887);
         }
         other => panic!("expected SubagentControlNotice, got {other:?}"),
@@ -4205,9 +4470,9 @@ fn grep_tool_result_accepts_full_lean_ctx_augmentation() {
     assert_eq!(compression.percent_saved, 75);
 }
 
-/// ThinkingLevel::Off is a real wire value (`"off"`). High and Medium
-/// already have coverage; this pins the third arm so a typo in the rename
-/// (e.g. `"none"`/`"disabled"`) fails noisily.
+/// ThinkingLevel::Off is a real wire value (`"off"`). High, Medium, and
+/// Minimal already have coverage; this pins the fourth arm so a typo in the
+/// rename (e.g. `"none"`/`"disabled"`) fails noisily.
 #[test]
 fn thinking_level_change_off() {
     let line = parse(thinking_level_change_json("m1", "off"));
@@ -4737,7 +5002,7 @@ fn instinct_write_tool_result_rejects_unknown_detail_field() {
     );
 }
 
-/// Pins the camelCase field names on serialized control events.
+/// Pins the camelCase `outputReference` field name on subagent tool results.
 #[test]
 fn subagent_tool_result_accepts_output_reference() {
     let tool_result = parse_tool_result_message(tool_result_message_json(
@@ -4800,6 +5065,7 @@ fn subagent_tool_result_accepts_active_long_running_control_event() {
                     "toolCount": 44,
                     "currentTool": "read",
                     "currentToolDurationMs": 1500,
+                    "currentPath": "charts/temporal/values.yaml",
                     "elapsedMs": 97198
                 }]
             }]
@@ -4831,6 +5097,10 @@ fn subagent_tool_result_accepts_active_long_running_control_event() {
     assert_eq!(event.tool_count, 44);
     assert_eq!(event.current_tool.as_deref(), Some("read"));
     assert_eq!(event.current_tool_duration_ms, Some(1500));
+    assert_eq!(
+        event.current_path,
+        Some(PathBuf::from("charts/temporal/values.yaml"))
+    );
     assert_eq!(event.elapsed_ms, 97198);
 }
 
@@ -4858,6 +5128,7 @@ fn subagent_tool_result_accepts_needs_attention_control_event() {
                     "toolCount": 54,
                     "currentTool": "intercom",
                     "currentToolDurationMs": 60617,
+                    "currentPath": "/Users/brendan/src/hydrogen-cloud/review-documentation-3.md",
                     "elapsedMs": 60887
                 }]
             }]
@@ -4889,6 +5160,12 @@ fn subagent_tool_result_accepts_needs_attention_control_event() {
     assert_eq!(event.tool_count, 54);
     assert_eq!(event.current_tool.as_deref(), Some("intercom"));
     assert_eq!(event.current_tool_duration_ms, Some(60617));
+    assert_eq!(
+        event.current_path,
+        Some(PathBuf::from(
+            "/Users/brendan/src/hydrogen-cloud/review-documentation-3.md"
+        ))
+    );
     assert_eq!(event.elapsed_ms, 60887);
 }
 
@@ -4913,7 +5190,7 @@ fn subagent_result_summary_serializes_control_events_as_camel_case() {
         session_file: None,
         tool_calls: None,
         control_events: Some(vec![SubagentControlEvent::ActiveLongRunning(
-            SubagentActiveLongRunningEvent {
+            SubagentControlEventPayload {
                 to: "active_long_running".to_string(),
                 ts: 1777657840252,
                 run_id: "b48327c8".to_string(),
@@ -4926,6 +5203,7 @@ fn subagent_result_summary_serializes_control_events_as_camel_case() {
                 tool_count: 44,
                 current_tool: None,
                 current_tool_duration_ms: None,
+                current_path: Some(PathBuf::from("charts/temporal/values.yaml")),
                 elapsed_ms: 97198,
             },
         )]),
@@ -4938,10 +5216,14 @@ fn subagent_result_summary_serializes_control_events_as_camel_case() {
         .expect("expected controlEvents array");
     assert_eq!(events[0].get("runId"), Some(&Value::from("b48327c8")));
     assert_eq!(events[0].get("toolCount"), Some(&Value::from(44)));
+    assert_eq!(
+        events[0].get("currentPath"),
+        Some(&Value::from("charts/temporal/values.yaml"))
+    );
     assert!(value.get("control_events").is_none());
 }
 
-/// Pins strict rejection of extra fields on `SubagentActiveLongRunningEvent`.
+/// Pins strict rejection of extra fields on `SubagentControlEventPayload`.
 #[test]
 fn subagent_tool_result_rejects_unknown_active_long_running_control_event_field() {
     assert_parse_error_contains_any(
