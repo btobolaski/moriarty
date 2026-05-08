@@ -502,6 +502,7 @@ pub enum Provider {
 pub enum ThinkingLevel {
     Off,
     Minimal,
+    Low,
     Medium,
     High,
 }

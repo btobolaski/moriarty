@@ -629,6 +629,16 @@ fn provider_order_is_stable() {
 }
 
 #[test]
+fn thinking_level_order_is_stable() {
+    // `ThinkingLevel` derives `Ord` through multiple parser structs, so reordering variants would
+    // silently change any persisted or sorted comparisons that depend on the intensity ladder.
+    assert!(ThinkingLevel::Off < ThinkingLevel::Minimal);
+    assert!(ThinkingLevel::Minimal < ThinkingLevel::Low);
+    assert!(ThinkingLevel::Low < ThinkingLevel::Medium);
+    assert!(ThinkingLevel::Medium < ThinkingLevel::High);
+}
+
+#[test]
 fn thinking_level_change() {
     let line = parse(thinking_level_change_json("m1", "high"));
 
@@ -659,6 +669,18 @@ fn thinking_level_change_minimal() {
     match line {
         PiLogLine::ThinkingLevelChange(thinking_level) => {
             assert_eq!(thinking_level.thinking_level, ThinkingLevel::Minimal);
+        }
+        other => panic!("expected ThinkingLevelChange, got {other:?}"),
+    }
+}
+
+#[test]
+fn thinking_level_change_low() {
+    let line = parse(thinking_level_change_json("m1", "low"));
+
+    match line {
+        PiLogLine::ThinkingLevelChange(thinking_level) => {
+            assert_eq!(thinking_level.thinking_level, ThinkingLevel::Low);
         }
         other => panic!("expected ThinkingLevelChange, got {other:?}"),
     }
@@ -3537,8 +3559,8 @@ fn grep_tool_result_accepts_full_lean_ctx_augmentation() {
     assert_eq!(compression.percent_saved, 75);
 }
 
-/// ThinkingLevel::Off is a real wire value (`"off"`). High, Medium, and
-/// Minimal already have coverage; this pins the fourth arm so a typo in the
+/// ThinkingLevel::Off is a real wire value (`"off"`). High, Medium, Minimal,
+/// and Low already have coverage; this pins the fifth arm so a typo in the
 /// rename (e.g. `"none"`/`"disabled"`) fails noisily.
 #[test]
 fn thinking_level_change_off() {
