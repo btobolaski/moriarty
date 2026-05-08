@@ -3177,6 +3177,7 @@ fn custom_message_subagent_control_notice_accepts_needs_attention_event() {
         Some(json!({
             "event": {
                 "type": "needs_attention",
+                "from": "active_long_running",
                 "to": "needs_attention",
                 "ts": 1777921594147_u64,
                 "runId": "8784581c",
@@ -3208,6 +3209,7 @@ fn custom_message_subagent_control_notice_accepts_needs_attention_event() {
             let SubagentControlEvent::NeedsAttention(event) = details.event else {
                 panic!("expected needs_attention event")
             };
+            assert_eq!(event.from.as_deref(), Some("active_long_running"));
             assert_eq!(event.to, "needs_attention");
             assert_eq!(event.ts, 1777921594147);
             assert_eq!(event.run_id, "8784581c");
@@ -3264,6 +3266,7 @@ fn custom_message_subagent_control_notice_accepts_active_long_running_event() {
             let SubagentControlEvent::ActiveLongRunning(event) = details.event else {
                 panic!("expected active_long_running event")
             };
+            assert_eq!(event.from, None);
             assert_eq!(event.run_id, "b48327c8");
             assert_eq!(event.agent, "code-quality-reviewer");
             assert_eq!(event.reason, "turn_threshold");
@@ -4118,6 +4121,7 @@ fn subagent_tool_result_accepts_active_long_running_control_event() {
     let SubagentControlEvent::ActiveLongRunning(event) = &events[0] else {
         panic!("expected active_long_running event")
     };
+    assert_eq!(event.from, None);
     assert_eq!(event.to, "active_long_running");
     assert_eq!(event.ts, 1777657840252);
     assert_eq!(event.run_id, "b48327c8");
@@ -4152,6 +4156,7 @@ fn subagent_tool_result_accepts_needs_attention_control_event() {
                 "agent": "documentation-reviewer",
                 "controlEvents": [{
                     "type": "needs_attention",
+                    "from": "active_long_running",
                     "to": "needs_attention",
                     "ts": 1777921594147_u64,
                     "runId": "8784581c",
@@ -4181,6 +4186,7 @@ fn subagent_tool_result_accepts_needs_attention_control_event() {
     let SubagentControlEvent::NeedsAttention(event) = &events[0] else {
         panic!("expected needs_attention event")
     };
+    assert_eq!(event.from.as_deref(), Some("active_long_running"));
     assert_eq!(event.to, "needs_attention");
     assert_eq!(event.ts, 1777921594147);
     assert_eq!(event.run_id, "8784581c");
@@ -4228,6 +4234,7 @@ fn subagent_result_summary_serializes_control_events_as_camel_case() {
         control_events: Some(vec![SubagentControlEvent::ActiveLongRunning(
             SubagentControlEventPayload {
                 to: "active_long_running".to_string(),
+                from: None,
                 ts: 1777657840252,
                 run_id: "b48327c8".to_string(),
                 agent: "code-quality-reviewer".to_string(),
@@ -4251,6 +4258,7 @@ fn subagent_result_summary_serializes_control_events_as_camel_case() {
         .and_then(Value::as_array)
         .expect("expected controlEvents array");
     assert_eq!(events[0].get("runId"), Some(&Value::from("b48327c8")));
+    assert!(events[0].get("from").is_none());
     assert_eq!(events[0].get("toolCount"), Some(&Value::from(44)));
     assert_eq!(
         events[0].get("currentPath"),

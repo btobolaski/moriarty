@@ -1797,7 +1797,8 @@ pub enum SubagentControlEvent {
 
 /// Both currently observed control-event variants share one payload schema;
 /// keeping that shape in one struct prevents the two arms from drifting as the
-/// runtime adds optional observability fields like `currentPath`.
+/// runtime adds optional observability fields like `currentPath` and newer
+/// state-transition metadata.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SubagentControlEventPayload {
@@ -1805,6 +1806,11 @@ pub struct SubagentControlEventPayload {
     /// observed to equal the event type, but kept as a separate field
     /// because the runtime models it as a distinct concept.
     pub to: String,
+    /// Newer runtimes report the previous control state when an event reflects
+    /// a state transition (for example `active_long_running` →
+    /// `needs_attention`). Older logs omit it entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
     /// Wall-clock timestamp of the event in milliseconds since the Unix epoch.
     pub ts: u64,
     pub run_id: String,
