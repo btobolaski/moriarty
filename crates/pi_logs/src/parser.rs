@@ -6,6 +6,11 @@
 //! `#[serde(deny_unknown_fields)]` so that upstream format changes surface as
 //! parse errors rather than silent data loss.
 //!
+//! Tool-call envelopes stay typed and strict, but [`ToolCallContent`]
+//! deliberately preserves the inner `arguments` object as raw JSON. Pi logs the
+//! model-emitted payload before the runtime validates it, so hard-coding tool
+//! schemas into the parser would reject or misrepresent real sessions.
+//!
 //! Two categories of structure legitimately deviate from the strict default:
 //!
 //! * **`serde(flatten)` of an internally-tagged enum** — when the flattened
@@ -16,8 +21,8 @@
 //!   category; it keeps the flattened internally tagged shape, but restores
 //!   strict outer-key validation with a manual deserializer. Adjacently
 //!   tagged flatten targets (those with both `tag` and `content`) do *not*
-//!   suffer this collision, so [`CustomLine`], [`CustomMessageLine`], and
-//!   [`ToolCallContent`] all keep derived `deny_unknown_fields` handling.
+//!   suffer this collision, so [`CustomLine`] and [`CustomMessageLine`] keep
+//!   derived `deny_unknown_fields` handling.
 //!
 //! * **Corrupt-stream tolerance** — some payloads are absorbed via
 //!   permissive structs, targeted field aliases, or untagged fallback enums
@@ -42,6 +47,7 @@
 
 use std::{
     cmp::Ordering,
+    collections::BTreeMap,
     fs::File,
     hash::{Hash, Hasher},
     io::{BufRead, BufReader},
@@ -442,15 +448,15 @@ pub enum TextContentKind {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ToolCallContent {
     pub id: String,
-    #[serde(flatten)]
-    pub tool: ToolCallArguments,
+    pub name: ToolName,
+    pub arguments: ToolCallArguments,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partial_json: Option<String>,
 }
 
 impl ToolCallContent {
     pub fn name(&self) -> ToolName {
-        self.tool.name()
+        self.name.clone()
     }
 }
 
@@ -663,96 +669,16 @@ pub struct StructuredThinkingSignature {
 
 // ---------------------------------------------------------------------------
 // Tool call arguments
-//
-// Each tool has a well known argument schema. We model tool calls as a tagged
-// enum keyed by the sibling `name` field so zero-argument tools stay tied to
-// their declared tool name instead of falling through to whichever all-optional
-// struct happens to appear first.
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(tag = "name", content = "arguments", rename_all = "snake_case")]
-pub enum ToolCallArguments {
-    AskUser(AskUserArgs),
-    Bash(BashArgs),
-    CodeSearch(CodeSearchArgs),
-    Compress(CompressArgs),
-    ContactSupervisor(ContactSupervisorArgs),
-    // `ctx_cache` is the only `ctx_*` extension tool the assistant invokes
-    // directly; the other 30+ `Ctx*` variants in `ToolName` are surfaced only
-    // through the `pi-loaded-tools` manifest and never appear as tool calls,
-    // so we deliberately do not model their argument schemas here.
-    CtxCache(CtxCacheArgs),
-    Edit(EditArgs),
-    FactDelete(FactDeleteArgs),
-    FactList(FactListArgs),
-    FactRead(FactReadArgs),
-    FactWrite(FactWriteArgs),
-    FetchContent(FetchContentArgs),
-    Find(FindArgs),
-    GetSearchContent(GetSearchContentArgs),
-    Grep(GrepArgs),
-    InstinctDelete(InstinctDeleteArgs),
-    InstinctList(InstinctListArgs),
-    InstinctMerge(InstinctMergeArgs),
-    InstinctRead(InstinctReadArgs),
-    InstinctWrite(InstinctWriteArgs),
-    Intercom(IntercomArgs),
-    Ls(LsArgs),
-    Mcp(McpArgs),
-    PlannotatorSubmitPlan(PlannotatorSubmitPlanArgs),
-    Read(ReadArgs),
-    Subagent(SubagentArgs),
-    SubagentStatus(SubagentStatusArgs),
-    Todo(TodoArgs),
-    WebSearch(WebSearchArgs),
-    Write(WriteArgs),
-    GitReadOnlyDiff(GitReadOnlyArgs),
-    GitReadOnlyLog(GitReadOnlyArgs),
-    GitReadOnlyShow(GitReadOnlyArgs),
-    GitReadOnlyStatus(GitReadOnlyArgs),
-}
+/// Pi records the model-emitted `arguments` object before the tool runtime has
+/// a chance to validate it, so the parser preserves the raw JSON map instead of
+/// hard-coding per-tool schemas into `ToolCallContent`.
+pub type ToolCallArguments = BTreeMap<String, JsonBlob>;
 
-impl ToolCallArguments {
-    pub fn name(&self) -> ToolName {
-        match self {
-            Self::AskUser(_) => ToolName::AskUser,
-            Self::Bash(_) => ToolName::Bash,
-            Self::CodeSearch(_) => ToolName::CodeSearch,
-            Self::Compress(_) => ToolName::Compress,
-            Self::ContactSupervisor(_) => ToolName::ContactSupervisor,
-            Self::CtxCache(_) => ToolName::CtxCache,
-            Self::Edit(_) => ToolName::Edit,
-            Self::FactDelete(_) => ToolName::FactDelete,
-            Self::FactList(_) => ToolName::FactList,
-            Self::FactRead(_) => ToolName::FactRead,
-            Self::FactWrite(_) => ToolName::FactWrite,
-            Self::FetchContent(_) => ToolName::FetchContent,
-            Self::Find(_) => ToolName::Find,
-            Self::GetSearchContent(_) => ToolName::GetSearchContent,
-            Self::Grep(_) => ToolName::Grep,
-            Self::InstinctDelete(_) => ToolName::InstinctDelete,
-            Self::InstinctList(_) => ToolName::InstinctList,
-            Self::InstinctMerge(_) => ToolName::InstinctMerge,
-            Self::InstinctRead(_) => ToolName::InstinctRead,
-            Self::InstinctWrite(_) => ToolName::InstinctWrite,
-            Self::Intercom(_) => ToolName::Intercom,
-            Self::Ls(_) => ToolName::Ls,
-            Self::Mcp(_) => ToolName::Mcp,
-            Self::PlannotatorSubmitPlan(_) => ToolName::PlannotatorSubmitPlan,
-            Self::Read(_) => ToolName::Read,
-            Self::Subagent(_) => ToolName::Subagent,
-            Self::SubagentStatus(_) => ToolName::SubagentStatus,
-            Self::Todo(_) => ToolName::Todo,
-            Self::WebSearch(_) => ToolName::WebSearch,
-            Self::Write(_) => ToolName::Write,
-            Self::GitReadOnlyDiff(_) => ToolName::GitReadOnlyDiff,
-            Self::GitReadOnlyLog(_) => ToolName::GitReadOnlyLog,
-            Self::GitReadOnlyShow(_) => ToolName::GitReadOnlyShow,
-            Self::GitReadOnlyStatus(_) => ToolName::GitReadOnlyStatus,
-        }
-    }
-}
+// ---------------------------------------------------------------------------
+// Typed helper structs for known tool schemas
+// ---------------------------------------------------------------------------
 
 /// Common shape for the `git_read_only_*` MCP tools surfaced by
 /// `pi-tool-display`. Every variant takes the same `{project_dir, args}`

@@ -5,7 +5,7 @@
 //! assert on the typed result, while others pin serialization behavior or
 //! shape-routing assumptions that the parser relies on.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde_json::{json, Value};
 
@@ -355,14 +355,6 @@ fn parse_tool_call(tool_name: &str, arguments: Value) -> ToolCallContent {
     };
 
     *tool_call
-}
-
-fn parse_subagent_args(arguments: Value) -> SubagentArgs {
-    let tool_call = parse_tool_call("subagent", arguments);
-    let ToolCallArguments::Subagent(args) = tool_call.tool else {
-        panic!("expected Subagent args")
-    };
-    args
 }
 
 fn parse_mcp_details(content: Vec<Value>, details: Value) -> McpDetails {
@@ -755,641 +747,51 @@ fn bash_execution_message() {
 }
 
 #[test]
-fn subagent_tool_call_accepts_output_variants() {
-    let cases = [
-        (
-            json!({
-                "agent": "scout",
-                "task": "Inspect duplication hotspots",
-                "cwd": "/home/brendan/src/moriarty",
-                "output": false
-            }),
-            Some("scout"),
-            Some("Inspect duplication hotspots"),
-            Some(SubagentOutput::Enabled(false)),
-        ),
-        (
-            json!({
-                "agent": "writer",
-                "task": "Draft reviewer summary",
-                "output": "artifacts/review.md"
-            }),
-            Some("writer"),
-            Some("Draft reviewer summary"),
-            Some(SubagentOutput::Path("artifacts/review.md".to_string())),
-        ),
-    ];
-
-    for (arguments, expected_agent, expected_task, expected_output) in cases {
-        let args = parse_subagent_args(arguments);
-        assert_eq!(args.agent.as_deref(), expected_agent);
-        assert_eq!(args.task.as_deref(), expected_task);
-        assert_eq!(args.output, expected_output);
-    }
-}
-
-#[test]
-fn subagent_tool_call_accepts_artifacts_flag() {
-    let args = parse_subagent_args(json!({
-        "tasks": [{
-            "agent": "code-quality-reviewer",
-            "task": "Review the change"
-        }],
-        "concurrency": 3,
-        "context": "fresh",
-        "cwd": "/home/brendan/.flk",
-        "artifacts": true,
-        "includeProgress": false
-    }));
-
-    assert_eq!(args.artifacts, Some(true));
-    assert_eq!(args.include_progress, Some(false));
-    assert_eq!(args.concurrency, Some(3));
-}
-
-#[test]
-fn subagent_tool_call_accepts_top_level_execution_fields() {
-    let args = parse_subagent_args(json!({
-        "agent": "scout",
-        "task": "Inspect the parser",
-        "async": true,
-        "share": true,
-        "sessionDir": "/tmp/subagent-session",
-        "clarify": false,
-        "config": "{\"name\":\"strict-review\"}",
-        "agentScope": "project",
-        "skill": "rust-review",
-        "model": "anthropic/claude-sonnet-4-5"
-    }));
-
-    assert_eq!(args.async_, Some(true));
-    assert_eq!(args.share, Some(true));
-    assert_eq!(
-        args.session_dir,
-        Some(PathBuf::from("/tmp/subagent-session"))
-    );
-    assert_eq!(args.clarify, Some(false));
-    assert_eq!(args.config.as_deref(), Some("{\"name\":\"strict-review\"}"));
-    assert_eq!(args.agent_scope.as_deref(), Some("project"));
-    assert_eq!(
-        args.skill,
-        Some(SubagentSkill::Name("rust-review".to_string()))
-    );
-    assert_eq!(args.model.as_deref(), Some("anthropic/claude-sonnet-4-5"));
-}
-
-#[test]
-fn subagent_args_serialize_async_as_camel_case() {
-    let value = serde_json::to_value(SubagentArgs {
-        action: None,
-        agent: Some("scout".to_string()),
-        task: Some("Inspect the parser".to_string()),
-        id: None,
-        run_id: None,
-        dir: None,
-        index: None,
-        message: None,
-        tasks: None,
-        concurrency: None,
-        worktree: None,
-        chain: None,
-        context: None,
-        chain_dir: None,
-        async_: Some(true),
-        artifacts: None,
-        include_progress: None,
-        share: None,
-        session_dir: None,
-        clarify: None,
-        control: None,
-        output: None,
-        output_mode: None,
-        skill: None,
-        model: None,
-        cwd: None,
-        config: None,
-        agent_scope: None,
-    })
-    .expect("serialize subagent args");
-
-    assert_eq!(value.get("async"), Some(&Value::from(true)));
-    assert!(value.get("async_").is_none());
-}
-
-#[test]
-fn subagent_parallel_tasks_accept_output_reads_progress_and_skill_variants() {
-    let args = parse_subagent_args(json!({
-        "tasks": [{
-            "agent": "code-quality-reviewer",
-            "task": "Review the change",
-            "count": 2,
-            "output": "/tmp/review.md",
-            "reads": ["src/lib.rs", "README.md"],
-            "progress": true,
-            "skill": ["rust", "review"],
-            "model": "google/gemini-3-pro"
-        }],
-        "worktree": true,
-        "control": {
-            "enabled": true,
-            "notifyOn": ["needs_attention"],
-            "notifyChannels": ["async", "intercom"]
-        }
-    }));
-
-    assert_eq!(args.worktree, Some(true));
-    assert_eq!(
-        args.control,
-        Some(SubagentControlArgs {
-            enabled: Some(true),
-            needs_attention_after_ms: None,
-            active_notice_after_ms: None,
-            active_notice_after_turns: None,
-            active_notice_after_tokens: None,
-            failed_tool_attempts_before_attention: None,
-            notify_on: Some(vec!["needs_attention".to_string()]),
-            notify_channels: Some(vec!["async".to_string(), "intercom".to_string()]),
-        })
-    );
-
-    let task = &args.tasks.expect("expected tasks")[0];
-    assert_eq!(
-        task.output,
-        Some(SubagentOutput::Path("/tmp/review.md".to_string()))
-    );
-    assert_eq!(
-        task.reads,
-        Some(SubagentReads::Files(vec![
-            "src/lib.rs".to_string(),
-            "README.md".to_string()
-        ]))
-    );
-    assert_eq!(task.progress, Some(true));
-    assert_eq!(
-        task.skill,
-        Some(SubagentSkill::Names(vec![
-            "rust".to_string(),
-            "review".to_string()
-        ]))
-    );
-    assert_eq!(task.model.as_deref(), Some("google/gemini-3-pro"));
-}
-
-#[test]
-fn subagent_tool_call_accepts_control_threshold_fields() {
-    let args = parse_subagent_args(json!({
-        "agent": "code-quality-reviewer",
-        "task": "Review the change",
-        "control": {
-            "enabled": true,
-            "needsAttentionAfterMs": 60000,
-            "activeNoticeAfterMs": 300000,
-            "activeNoticeAfterTurns": 15,
-            "activeNoticeAfterTokens": 150000,
-            "failedToolAttemptsBeforeAttention": 3,
-            "notifyOn": ["needs_attention", "active_long_running"],
-            "notifyChannels": ["event", "async", "intercom"]
-        }
-    }));
-
-    assert_eq!(
-        args.control,
-        Some(SubagentControlArgs {
-            enabled: Some(true),
-            needs_attention_after_ms: Some(60000),
-            active_notice_after_ms: Some(300000),
-            active_notice_after_turns: Some(15),
-            active_notice_after_tokens: Some(150000),
-            failed_tool_attempts_before_attention: Some(3),
-            notify_on: Some(vec![
-                "needs_attention".to_string(),
-                "active_long_running".to_string()
-            ]),
-            notify_channels: Some(vec![
-                "event".to_string(),
-                "async".to_string(),
-                "intercom".to_string()
-            ]),
-        })
-    );
-}
-
-#[test]
-fn subagent_chain_steps_accept_parallel_task_fields() {
-    let args = parse_subagent_args(json!({
-        "chain": [{
-            "agent": "planner",
-            "task": "Plan the work",
-            "output": false,
-            "reads": false,
-            "progress": true,
-            "skill": true,
-            "parallel": [{
-                "agent": "reviewer",
-                "output": "artifacts/review.md",
-                "reads": ["src/lib.rs"],
-                "progress": true,
-                "skill": "docs"
-            }],
-            "concurrency": 2,
-            "failFast": true,
-            "worktree": true
-        }]
-    }));
-
-    let step = &args.chain.expect("expected chain")[0];
-    assert_eq!(step.output, Some(SubagentOutput::Enabled(false)));
-    assert_eq!(step.reads, Some(SubagentReads::Enabled(false)));
-    assert_eq!(step.progress, Some(true));
-    assert_eq!(step.skill, Some(SubagentSkill::Enabled(true)));
-    assert_eq!(step.concurrency, Some(2));
-    assert_eq!(step.fail_fast, Some(true));
-    assert_eq!(step.worktree, Some(true));
-
-    let parallel = &step.parallel.as_ref().expect("expected parallel tasks")[0];
-    assert_eq!(
-        parallel.output,
-        Some(SubagentOutput::Path("artifacts/review.md".to_string()))
-    );
-    assert_eq!(
-        parallel.reads,
-        Some(SubagentReads::Files(vec!["src/lib.rs".to_string()]))
-    );
-    assert_eq!(parallel.progress, Some(true));
-    assert_eq!(
-        parallel.skill,
-        Some(SubagentSkill::Name("docs".to_string()))
-    );
-}
-
-#[test]
-fn subagent_status_tool_call_accepts_action() {
-    let tool_call = parse_tool_call("subagent_status", json!({ "action": "list" }));
-
-    assert_eq!(tool_call.name(), ToolName::SubagentStatus);
-    let ToolCallArguments::SubagentStatus(args) = tool_call.tool else {
-        panic!("expected SubagentStatus args")
-    };
-    assert_eq!(args.action.as_deref(), Some("list"));
-}
-
-#[test]
-fn subagent_status_tool_call_accepts_id_run_id_and_dir() {
-    let tool_call = parse_tool_call(
-        "subagent_status",
-        json!({
-            "action": "status",
-            "id": "4194b4bf",
-            "runId": "run-1",
-            "dir": "/tmp/subagent-run"
-        }),
-    );
-
-    assert_eq!(tool_call.name(), ToolName::SubagentStatus);
-    let ToolCallArguments::SubagentStatus(args) = tool_call.tool else {
-        panic!("expected SubagentStatus args")
-    };
-    assert_eq!(args.action.as_deref(), Some("status"));
-    assert_eq!(args.id.as_deref(), Some("4194b4bf"));
-    assert_eq!(args.run_id.as_deref(), Some("run-1"));
-    assert_eq!(args.dir, Some(PathBuf::from("/tmp/subagent-run")));
-}
-
-#[test]
-fn subagent_tasks_accept_output_mode() {
-    let tool_call = parse_tool_call(
-        "subagent",
-        json!({
-            "tasks": [{
-                "agent": "documentation-reviewer",
-                "task": "Review docs",
-                "outputMode": "inline"
-            }]
-        }),
-    );
-
-    let ToolCallArguments::Subagent(args) = tool_call.tool else {
-        panic!("expected Subagent args")
-    };
-    let tasks = args.tasks.expect("expected tasks");
-    assert_eq!(tasks[0].output_mode.as_deref(), Some("inline"));
-}
-
-#[test]
-fn subagent_action_accepts_id() {
-    let args = parse_subagent_args(json!({
-        "action": "status",
-        "id": "4194b4bf"
-    }));
-
-    assert_eq!(args.action.as_deref(), Some("status"));
-    assert_eq!(args.id.as_deref(), Some("4194b4bf"));
-}
-
-#[test]
-fn subagent_top_level_accepts_output_mode() {
-    let args = parse_subagent_args(json!({
-        "tasks": [{
-            "agent": "documentation-reviewer",
-            "task": "Review docs"
-        }],
-        "outputMode": "inline"
-    }));
-
-    assert_eq!(args.output_mode.as_deref(), Some("inline"));
-}
-
-#[test]
 fn fact_list_tool_call_stays_tied_to_tool_name() {
     let tool_call = parse_tool_call("fact_list", json!({}));
 
     assert_eq!(tool_call.name(), ToolName::FactList);
-    assert!(matches!(tool_call.tool, ToolCallArguments::FactList(_)));
 }
 
 #[test]
-fn grep_tool_call_accepts_empty_arguments() {
-    let tool_call = parse_tool_call("grep", json!({}));
+fn tool_call_preserves_arguments_as_a_raw_json_map() {
+    let raw_arguments = json!({
+        "arbitraryString": "value",
+        "arbitraryNumber": 42,
+        "arbitraryBool": true,
+        "arbitraryNull": null,
+        "arbitraryArray": [1, {"nested": false}],
+        "arbitraryObject": {
+            "inner": {"stillRaw": true}
+        }
+    });
+    let tool_call = parse_tool_call("bash", raw_arguments.clone());
 
-    assert_eq!(tool_call.name(), ToolName::Grep);
-    let ToolCallArguments::Grep(args) = tool_call.tool else {
-        panic!("expected Grep args")
-    };
-    assert_eq!(args.pattern, "");
-}
-
-#[test]
-fn instinct_write_tool_call_accepts_snake_case_counters() {
-    let tool_call = parse_tool_call(
-        "instinct_write",
-        json!({
-            "id": "no-review-agents-without-file-modifications",
-            "title": "Do not run review agents when no files changed",
-            "trigger": "Before invoking review agents",
-            "action": "Skip reviewers when nothing changed",
-            "confidence": "0.9",
-            "domain": "workflow",
-            "scope": "project",
-            "observation_count": 1,
-            "confirmed_count": 1,
-            "inactive_count": 0
-        }),
-    );
-
-    let ToolCallArguments::InstinctWrite(args) = tool_call.tool else {
-        panic!("expected InstinctWrite args")
-    };
-    assert_eq!(args.counters.observation_count, Some(1));
-    assert_eq!(args.counters.confirmed_count, Some(1));
-    assert_eq!(args.counters.inactive_count, Some(0));
-}
-
-#[test]
-fn fact_write_tool_call_accepts_snake_case_counters() {
-    let tool_call = parse_tool_call(
-        "fact_write",
-        json!({
-            "id": "parser-compatibility",
-            "title": "Parser compatibility",
-            "content": "Newer schemas parse successfully",
-            "confidence": 0.8,
-            "domain": "logs",
-            "scope": "project",
-            "observation_count": 3,
-            "confirmed_count": 2,
-            "contradicted_count": 1,
-            "inactive_count": 0
-        }),
-    );
-
-    let ToolCallArguments::FactWrite(args) = tool_call.tool else {
-        panic!("expected FactWrite args")
-    };
-    assert_eq!(args.counters.observation_count, Some(3));
-    assert_eq!(args.counters.confirmed_count, Some(2));
-    assert_eq!(args.counters.contradicted_count, Some(1));
-    assert_eq!(args.counters.inactive_count, Some(0));
-}
-
-#[test]
-fn todo_tool_call_accepts_metadata() {
-    let tool_call = parse_tool_call(
-        "todo",
-        json!({
-            "action": "update",
-            "id": 2,
-            "status": "pending",
-            "metadata": {
-                "blocker": "needs rewrite"
-            }
-        }),
-    );
-
-    let ToolCallArguments::Todo(args) = tool_call.tool else {
-        panic!("expected Todo args")
-    };
+    assert_eq!(tool_call.name(), ToolName::Bash);
     assert_eq!(
-        args.metadata.as_ref().map(|value| value.0.clone()),
-        Some(json!({"blocker": "needs rewrite"}))
+        serde_json::to_value(&tool_call.arguments).expect("serialize raw arguments"),
+        raw_arguments
     );
 }
 
 #[test]
-fn contact_supervisor_tool_call_accepts_reason_and_message() {
-    let tool_call = parse_tool_call(
-        "contact_supervisor",
-        json!({
-            "reason": "need_decision",
-            "message": "Need approval to proceed"
-        }),
+fn tool_call_rejects_non_object_arguments() {
+    let line = assistant_message_json(
+        vec![json!({
+            "type": "toolCall",
+            "id": "call_1",
+            "name": "bash",
+            "arguments": ["not", "an", "object"]
+        })],
+        AssistantFixture::new("openai-responses", "openai", "gpt-5.4", "toolUse"),
     );
 
-    assert_eq!(tool_call.name(), ToolName::ContactSupervisor);
-    let ToolCallArguments::ContactSupervisor(args) = tool_call.tool else {
-        panic!("expected ContactSupervisor args")
-    };
-
-    assert_eq!(args.reason, "need_decision");
-    assert_eq!(args.message, "Need approval to proceed");
-}
-
-#[test]
-fn intercom_tool_call_accepts_message_and_attachments() {
-    let tool_call = parse_tool_call(
-        "intercom",
-        json!({
-            "action": "send",
-            "to": "subagent-chat-123",
-            "message": "Please review this",
-            "replyTo": "msg-1",
-            "attachments": [{
-                "type": "text",
-                "name": "context.md",
-                "content": "# Context",
-                "language": "markdown"
-            }]
-        }),
+    let err = parse_err(line);
+    let msg = err.to_string();
+    assert!(
+        msg.contains("invalid type") || msg.contains("map"),
+        "expected non-object arguments to be rejected, got: {msg}"
     );
-
-    assert_eq!(tool_call.name(), ToolName::Intercom);
-    let ToolCallArguments::Intercom(args) = tool_call.tool else {
-        panic!("expected Intercom args")
-    };
-
-    assert_eq!(args.action, "send");
-    assert_eq!(args.to.as_deref(), Some("subagent-chat-123"));
-    assert_eq!(args.message.as_deref(), Some("Please review this"));
-    assert_eq!(args.reply_to.as_deref(), Some("msg-1"));
-
-    let attachments = args.attachments.expect("expected attachments");
-    assert_eq!(attachments.len(), 1);
-    assert_eq!(attachments[0].kind, "text");
-    assert_eq!(attachments[0].name, "context.md");
-    assert_eq!(attachments[0].content, "# Context");
-    assert_eq!(attachments[0].language.as_deref(), Some("markdown"));
-}
-
-#[test]
-fn intercom_attachment_rejects_unknown_field() {
-    assert_parse_error_contains_any(
-        "intercom attachment rejects unknown field",
-        assistant_message_json(
-            vec![assistant_tool_call_json(
-                "intercom",
-                json!({
-                    "action": "send",
-                    "attachments": [{
-                        "type": "text",
-                        "name": "context.md",
-                        "content": "body",
-                        "unexpected": true
-                    }]
-                }),
-            )],
-            AssistantFixture::new("openai-responses", "openai", "gpt-5.4", "toolUse"),
-        ),
-        &["unknown field", "unexpected"],
-    );
-}
-
-#[test]
-fn mcp_tool_call_accepts_connect_and_call_fields() {
-    let tool_call = parse_tool_call(
-        "mcp",
-        json!({
-            "server": "git-read-only",
-            "tool": "status",
-            "args": "{\"project_dir\":\".\"}",
-            "action": "call",
-            "connect": "git-read-only"
-        }),
-    );
-
-    assert_eq!(tool_call.name(), ToolName::Mcp);
-    let ToolCallArguments::Mcp(args) = tool_call.tool else {
-        panic!("expected Mcp args")
-    };
-
-    assert_eq!(args.server.as_deref(), Some("git-read-only"));
-    assert_eq!(args.tool.as_deref(), Some("status"));
-    assert_eq!(args.args.as_deref(), Some("{\"project_dir\":\".\"}"));
-    assert_eq!(args.action.as_deref(), Some("call"));
-    assert_eq!(args.connect.as_deref(), Some("git-read-only"));
-}
-
-#[test]
-fn ask_user_tool_call_accepts_title_option() {
-    let tool_call = parse_tool_call(
-        "ask_user",
-        json!({
-            "question": "Continue?",
-            "options": ["Continue"]
-        }),
-    );
-
-    let ToolCallArguments::AskUser(args) = tool_call.tool else {
-        panic!("expected AskUser args")
-    };
-
-    assert_eq!(
-        args.options,
-        Some(vec![AskUserOption::Title("Continue".to_string())])
-    );
-}
-
-#[test]
-fn ask_user_tool_call_accepts_display_configuration() {
-    let tool_call = parse_tool_call(
-        "ask_user",
-        json!({
-            "question": "Continue?",
-            "displayMode": "inline",
-            "overlayToggleKey": "alt+o",
-            "commentToggleKey": "ctrl+g"
-        }),
-    );
-
-    let ToolCallArguments::AskUser(args) = tool_call.tool else {
-        panic!("expected AskUser args")
-    };
-
-    assert_eq!(args.display_mode, Some(AskUserDisplayMode::Inline));
-    assert_eq!(args.overlay_toggle_key.as_deref(), Some("alt+o"));
-    assert_eq!(args.comment_toggle_key.as_deref(), Some("ctrl+g"));
-}
-
-#[test]
-fn compress_tool_call_accepts_ranges() {
-    let tool_call = parse_tool_call(
-        "compress",
-        json!({
-            "topic": "Auth system exploration",
-            "ranges": [
-                {
-                    "startId": "m001",
-                    "endId": "m010",
-                    "summary": "Explored OAuth flow"
-                },
-                {
-                    "startId": "m015",
-                    "endId": "m020",
-                    "summary": "Reviewed token refresh"
-                }
-            ]
-        }),
-    );
-
-    assert_eq!(tool_call.name(), ToolName::Compress);
-    let ToolCallArguments::Compress(args) = tool_call.tool else {
-        panic!("expected Compress args")
-    };
-
-    assert_eq!(args.topic, "Auth system exploration");
-    assert_eq!(args.ranges.len(), 2);
-    assert_eq!(args.ranges[0].start_id, "m001");
-    assert_eq!(args.ranges[0].end_id, "m010");
-    assert_eq!(args.ranges[1].summary, "Reviewed token refresh");
-}
-
-#[test]
-fn code_search_tool_call_accepts_max_tokens() {
-    let tool_call = parse_tool_call(
-        "code_search",
-        json!({
-            "query": "jscpd ignore comment syntax ignore-start ignore-end",
-            "maxTokens": 2000
-        }),
-    );
-
-    let ToolCallArguments::CodeSearch(args) = &tool_call.tool else {
-        panic!("expected CodeSearch args")
-    };
-
-    assert_eq!(
-        args.query,
-        "jscpd ignore comment syntax ignore-start ignore-end"
-    );
-    assert_eq!(args.max_tokens, 2000);
 }
 
 #[test]
@@ -1430,7 +832,6 @@ fn assistant_message_with_text_and_tool_call() {
     match &assistant.content[1] {
         AssistantContentItem::ToolCall(tool_call) => {
             assert_eq!(tool_call.name(), ToolName::Read);
-            assert!(matches!(tool_call.tool, ToolCallArguments::Read(_)));
         }
         other => panic!("expected ToolCall, got {other:?}"),
     }
@@ -3041,28 +2442,6 @@ fn rejects_unknown_loaded_tool_name() {
 }
 
 #[test]
-fn rejects_malformed_tool_call_arguments() {
-    assert_parse_error_contains_any(
-        "rejects malformed tool-call arguments",
-        assistant_message_json(
-            vec![json!({
-                "type": "toolCall",
-                "id": "call_1",
-                "name": "bash",
-                "arguments": {"unknown_field": "x"},
-            })],
-            AssistantFixture::new(
-                "anthropic-messages",
-                "anthropic",
-                "claude-sonnet-4-5",
-                "toolUse",
-            ),
-        ),
-        &["did not match any variant", "unknown field"],
-    );
-}
-
-#[test]
 fn parse_file_smoke_parses_multiple_line_types() {
     let tmp = std::env::temp_dir().join(format!("pi_logs_smoke_{}.jsonl", uuid::Uuid::new_v4()));
     std::fs::write(
@@ -3594,7 +2973,7 @@ fn bare_limit_shape_lands_in_grep_during_direct_details_deserialization() {
 }
 
 #[test]
-fn ctx_cache_tool_call_accepts_action_and_path() {
+fn ctx_cache_tool_call_keeps_declared_name() {
     let tool_call = parse_tool_call(
         "ctx_cache",
         json!({
@@ -3602,37 +2981,17 @@ fn ctx_cache_tool_call_accepts_action_and_path() {
             "path": "crates/moriarty/src/api_pricing/analyzer_tests.rs"
         }),
     );
-    let ToolCallArguments::CtxCache(ref args) = tool_call.tool else {
-        panic!("expected CtxCache tool call")
-    };
-    assert_eq!(args.action, "invalidate");
-    assert_eq!(
-        args.path,
-        PathBuf::from("crates/moriarty/src/api_pricing/analyzer_tests.rs")
-    );
+
     assert_eq!(tool_call.name(), ToolName::CtxCache);
 }
 
 #[test]
-fn git_read_only_log_tool_call_accepts_snake_case_args() {
-    let tool_call = parse_tool_call(
-        "git_read_only_log",
-        json!({"project_dir": "/tmp/repo", "args": ["--oneline", "-n", "5"]}),
-    );
-    let ToolCallArguments::GitReadOnlyLog(ref args) = tool_call.tool else {
-        panic!("expected GitReadOnlyLog tool call")
-    };
-    assert_eq!(args.project_dir, PathBuf::from("/tmp/repo"));
-    assert_eq!(args.args, vec!["--oneline", "-n", "5"]);
-    assert_eq!(tool_call.name(), ToolName::GitReadOnlyLog);
-}
-
-#[test]
-fn git_read_only_diff_status_show_share_argument_struct() {
+fn git_read_only_tool_calls_keep_declared_names() {
     for (tool_name, expected) in [
         ("git_read_only_diff", ToolName::GitReadOnlyDiff),
-        ("git_read_only_status", ToolName::GitReadOnlyStatus),
+        ("git_read_only_log", ToolName::GitReadOnlyLog),
         ("git_read_only_show", ToolName::GitReadOnlyShow),
+        ("git_read_only_status", ToolName::GitReadOnlyStatus),
     ] {
         let tool_call = parse_tool_call(tool_name, json!({"project_dir": "/tmp/repo", "args": []}));
         assert_eq!(tool_call.name(), expected);
@@ -3640,309 +2999,17 @@ fn git_read_only_diff_status_show_share_argument_struct() {
 }
 
 #[test]
-fn read_tool_call_accepts_empty_arguments_when_aborted() {
-    let tool_call = parse_tool_call("read", json!({}));
-    let ToolCallArguments::Read(args) = tool_call.tool else {
-        panic!("expected Read tool call")
-    };
-    assert!(args.path.is_none());
-    assert!(args.offset.is_none());
-    assert!(args.limit.is_none());
-}
+fn git_read_only_tool_call_preserves_raw_snake_case_arguments() {
+    let raw_arguments = json!({
+        "project_dir": "/tmp/repo",
+        "args": ["--oneline", "-n", "5"]
+    });
+    let tool_call = parse_tool_call("git_read_only_log", raw_arguments.clone());
 
-// Pins tolerance for the observed corruption mode where the model echoed
-// the JSON-Schema field name as the value (`"limit": "limit"`) for a
-// numeric argument. We must keep parsing instead of aborting the file.
-#[test]
-fn read_tool_call_accepts_string_garbage_for_numeric_args() {
-    let tool_call = parse_tool_call(
-        "read",
-        json!({"path": "src/lib.rs", "offset": 1, "limit": "limit"}),
-    );
-    let ToolCallArguments::Read(args) = tool_call.tool else {
-        panic!("expected Read tool call")
-    };
-    assert_eq!(args.offset, Some(MaybeU32::Number(1)));
-    assert!(matches!(args.limit, Some(MaybeU32::Garbage(ref s)) if s == "limit"));
-}
-
-#[test]
-fn read_tool_call_accepts_string_garbage_for_offset() {
-    let tool_call = parse_tool_call(
-        "read",
-        json!({"path": "src/lib.rs", "offset": "offset", "limit": 2}),
-    );
-    let ToolCallArguments::Read(args) = tool_call.tool else {
-        panic!("expected Read tool call")
-    };
-    assert!(matches!(args.offset, Some(MaybeU32::Garbage(ref s)) if s == "offset"));
-    assert_eq!(args.limit, Some(MaybeU32::Number(2)));
-}
-
-#[test]
-fn read_tool_call_rejects_non_string_invalid_numeric_args() {
-    for limit in [
-        json!(true),
-        json!(null),
-        json!(1.5),
-        json!(-1),
-        json!(4294967296_u64),
-    ] {
-        let err = parse_err(assistant_message_json(
-            vec![assistant_tool_call_json(
-                "read",
-                json!({"path": "src/lib.rs", "limit": limit}),
-            )],
-            AssistantFixture::new("openai-responses", "openai", "gpt-5.4", "toolUse"),
-        ));
-        let msg = err.to_string();
-        assert!(
-            msg.contains("limit"),
-            "expected invalid limit payload to mention limit, got: {msg}"
-        );
-    }
-}
-
-#[test]
-fn read_tool_call_rejects_wrong_echoed_field_name_for_numeric_args() {
-    for (field, value) in [("offset", json!("limit")), ("limit", json!("offset"))] {
-        let err = parse_err(assistant_message_json(
-            vec![assistant_tool_call_json(
-                "read",
-                json!({"path": "src/lib.rs", field: value}),
-            )],
-            AssistantFixture::new("openai-responses", "openai", "gpt-5.4", "toolUse"),
-        ));
-        let msg = err.to_string();
-        assert!(
-            msg.contains(field),
-            "expected invalid {field} payload to mention {field}, got: {msg}"
-        );
-    }
-}
-
-#[test]
-fn maybe_u32_helper_only_accepts_the_matching_echoed_field_name() {
+    assert_eq!(tool_call.name(), ToolName::GitReadOnlyLog);
     assert_eq!(
-        parse_named_maybe_u32_value(json!(3), "offset").expect("expected number"),
-        MaybeU32::Number(3)
-    );
-    assert_eq!(
-        parse_named_maybe_u32_value(json!("offset"), "offset")
-            .expect("expected matching echoed field name"),
-        MaybeU32::Garbage("offset".to_string())
-    );
-
-    let err = parse_named_maybe_u32_value(json!("limit"), "offset")
-        .expect_err("expected mismatched echoed field name to fail");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("offset"),
-        "expected error to mention offset, got: {msg}"
-    );
-}
-
-#[test]
-fn maybe_u32_serializes_back_to_wire_shape() {
-    assert_eq!(
-        serde_json::to_value(MaybeU32::Number(2)).expect("serialize number"),
-        Value::from(2)
-    );
-    assert_eq!(
-        serde_json::to_value(MaybeU32::Garbage("limit".to_string())).expect("serialize garbage"),
-        Value::from("limit")
-    );
-}
-
-#[test]
-fn read_args_serialize_maybe_u32_fields_without_enum_tags() {
-    let value = serde_json::to_value(ReadArgs {
-        path: Some(PathBuf::from("crates/pi_logs/src/parser.rs")),
-        offset: Some(MaybeU32::Number(1)),
-        limit: Some(MaybeU32::Garbage("limit".to_string())),
-    })
-    .expect("serialize read args");
-
-    assert_eq!(
-        value,
-        json!({
-            "path": "crates/pi_logs/src/parser.rs",
-            "offset": 1,
-            "limit": "limit"
-        })
-    );
-}
-
-#[test]
-fn find_tool_call_accepts_dotted_limit_key() {
-    let tool_call = parse_tool_call(
-        "find",
-        json!({"pattern": "src/**/*.rs", "path": ".", ".limit": 200}),
-    );
-    let ToolCallArguments::Find(args) = tool_call.tool else {
-        panic!("expected Find tool call")
-    };
-    assert_eq!(args.pattern, "src/**/*.rs");
-    assert_eq!(args.path.as_deref(), Some(Path::new(".")));
-    assert_eq!(args.limit, Some(200));
-}
-
-#[test]
-fn find_tool_call_accepts_dotted_pattern_key() {
-    let tool_call = parse_tool_call(
-        "find",
-        json!({".pattern": "src/**/*.rs", "path": ".", "limit": 200}),
-    );
-    let ToolCallArguments::Find(args) = tool_call.tool else {
-        panic!("expected Find tool call")
-    };
-    assert_eq!(args.pattern, "src/**/*.rs");
-    assert_eq!(args.path.as_deref(), Some(Path::new(".")));
-    assert_eq!(args.limit, Some(200));
-}
-
-#[test]
-fn bash_tool_call_accepts_empty_arguments_when_aborted() {
-    let tool_call = parse_tool_call("bash", json!({}));
-    let ToolCallArguments::Bash(args) = tool_call.tool else {
-        panic!("expected Bash tool call")
-    };
-    assert!(args.command.is_none());
-}
-
-#[test]
-fn edit_tool_call_accepts_fragment_entries_in_corrupt_stream() {
-    let tool_call = parse_tool_call(
-        "edit",
-        json!({
-            "path": "src/lib.rs",
-            "edits": [
-                {"oldText": "alpha", "newText": "beta"},
-                ",",
-                {"oldText": "gamma", "newText": "delta"}
-            ]
-        }),
-    );
-    let ToolCallArguments::Edit(args) = tool_call.tool else {
-        panic!("expected Edit tool call")
-    };
-    let edits = args.edits.expect("expected edits");
-    assert_eq!(edits.len(), 3);
-    // EditReplacement omits `deny_unknown_fields` so the inner fields are
-    // asserted explicitly; otherwise a future field rename in EditReplacement
-    // would silently start emitting `Full(EditReplacement{None, None, None})`
-    // and this test would still pass.
-    let EditEntry::Full(first) = &edits[0] else {
-        panic!("expected Full edit at index 0")
-    };
-    assert_eq!(first.old_text.as_deref(), Some("alpha"));
-    assert_eq!(first.new_text.as_deref(), Some("beta"));
-    assert!(matches!(edits[1], EditEntry::Fragment(ref s) if s == ","));
-    let EditEntry::Full(third) = &edits[2] else {
-        panic!("expected Full edit at index 2")
-    };
-    assert_eq!(third.old_text.as_deref(), Some("gamma"));
-    assert_eq!(third.new_text.as_deref(), Some("delta"));
-}
-
-#[test]
-fn edit_tool_call_accepts_shorthand_format() {
-    let tool_call = parse_tool_call(
-        "edit",
-        json!({"path": "src/lib.rs", "oldText": "alpha", "newText": "beta"}),
-    );
-    let ToolCallArguments::Edit(args) = tool_call.tool else {
-        panic!("expected Edit tool call")
-    };
-    assert!(args.edits.is_none());
-    assert_eq!(args.old_text.as_deref(), Some("alpha"));
-    assert_eq!(args.new_text.as_deref(), Some("beta"));
-}
-
-#[test]
-fn grep_tool_call_accepts_unknown_sibling_keys_in_corrupt_stream() {
-    let tool_call = parse_tool_call(
-        "grep",
-        json!({
-            "pattern": "TODO",
-            "path": "src",
-            ":path": "hallucinated",
-            "offset": 20
-        }),
-    );
-    let ToolCallArguments::Grep(args) = tool_call.tool else {
-        panic!("expected Grep tool call")
-    };
-    assert_eq!(args.pattern, "TODO");
-    assert_eq!(args.path, Some(PathBuf::from("src")));
-}
-
-#[test]
-fn edit_tool_call_accepts_unknown_top_level_garbage_keys() {
-    let tool_call = parse_tool_call(
-        "edit",
-        json!({
-            "path": "src/lib.rs",
-            "oldText": "alpha",
-            "newText": "beta",
-            "},": "garbage"
-        }),
-    );
-    let ToolCallArguments::Edit(args) = tool_call.tool else {
-        panic!("expected Edit tool call")
-    };
-    assert_eq!(args.path, Some(PathBuf::from("src/lib.rs")));
-    assert_eq!(args.old_text.as_deref(), Some("alpha"));
-    assert_eq!(args.new_text.as_deref(), Some("beta"));
-}
-
-#[test]
-fn edit_tool_call_accepts_unknown_replacement_keys() {
-    let tool_call = parse_tool_call(
-        "edit",
-        json!({
-            "path": "src/lib.rs",
-            "edits": [{
-                "oldText": "alpha",
-                "newText": "beta",
-                "newText_TYPO_GUARD": "ignored"
-            }]
-        }),
-    );
-    let ToolCallArguments::Edit(args) = tool_call.tool else {
-        panic!("expected Edit tool call")
-    };
-    let EditEntry::Full(edit) = &args.edits.expect("expected edits")[0] else {
-        panic!("expected Full edit")
-    };
-    assert_eq!(edit.old_text.as_deref(), Some("alpha"));
-    assert_eq!(edit.new_text.as_deref(), Some("beta"));
-}
-
-#[test]
-fn edit_tool_call_accepts_replacement_description() {
-    let tool_call = parse_tool_call(
-        "edit",
-        json!({
-            "path": "src/lib.rs",
-            "edits": [{
-                "oldText": "alpha",
-                "newText": "beta",
-                "description": "Explain why the replacement is needed"
-            }]
-        }),
-    );
-    let ToolCallArguments::Edit(args) = tool_call.tool else {
-        panic!("expected Edit tool call")
-    };
-    let EditEntry::Full(edit) = &args.edits.expect("expected edits")[0] else {
-        panic!("expected Full edit")
-    };
-    assert_eq!(edit.old_text.as_deref(), Some("alpha"));
-    assert_eq!(edit.new_text.as_deref(), Some("beta"));
-    assert_eq!(
-        edit.description.as_deref(),
-        Some("Explain why the replacement is needed")
+        serde_json::to_value(&tool_call.arguments).expect("serialize raw arguments"),
+        raw_arguments
     );
 }
 
@@ -4717,10 +3784,8 @@ fn session_line_serializes_parent_session_as_camel_case() {
     assert!(value.get("parent_session").is_none());
 }
 
-// Pins the empirical contract documented at the crate level: a struct that
-// `#[serde(flatten)]`s an *adjacently*-tagged enum (here ToolCallArguments,
-// `tag = "name", content = "arguments"`) can still carry
-// `deny_unknown_fields` and reject sibling-key drift.
+// Pins the strict outer envelope on ToolCallContent: raw `arguments` do not
+// relax `deny_unknown_fields` for sibling keys like `extraUnknown`.
 #[test]
 fn tool_call_content_rejects_unknown_top_level_field() {
     let line = assistant_message_json(
@@ -4739,57 +3804,6 @@ fn tool_call_content_rejects_unknown_top_level_field() {
         msg.contains("extraUnknown"),
         "expected parse error to mention extraUnknown, got: {msg}"
     );
-}
-
-/// GitReadOnlyArgs.args defaults to an empty Vec when the key is
-/// absent. Pins `#[serde(default)]` against accidental removal.
-#[test]
-fn git_read_only_tool_call_accepts_absent_args_key() {
-    let tool_call = parse_tool_call("git_read_only_status", json!({"project_dir": "/tmp/repo"}));
-    let ToolCallArguments::GitReadOnlyStatus(args) = tool_call.tool else {
-        panic!("expected GitReadOnlyStatus tool call")
-    };
-    assert!(args.args.is_empty());
-    assert_eq!(args.project_dir, PathBuf::from("/tmp/repo"));
-}
-
-#[test]
-fn git_read_only_tool_call_rejects_project_dir_camel_case() {
-    assert_parse_error_contains_any(
-        "rejects camelCase git read only args",
-        assistant_message_json(
-            vec![assistant_tool_call_json(
-                "git_read_only_log",
-                json!({"projectDir": "/tmp/repo", "args": []}),
-            )],
-            AssistantFixture::new("openai-responses", "openai", "gpt-5.4", "toolUse"),
-        ),
-        &["projectDir", "project_dir"],
-    );
-}
-
-#[test]
-fn git_read_only_args_reject_unknown_fields() {
-    let err = serde_json::from_value::<GitReadOnlyArgs>(
-        json!({"project_dir": "/tmp/repo", "args": [], "unexpected": true}),
-    )
-    .expect_err("expected GitReadOnlyArgs to reject unknown fields")
-    .to_string();
-    assert!(
-        err.contains("unknown field") || err.contains("unexpected"),
-        "expected unknown-field parse error, got: {err}"
-    );
-}
-
-#[test]
-fn git_read_only_args_serialize_project_dir_in_snake_case() {
-    let value = serde_json::to_value(GitReadOnlyArgs {
-        project_dir: PathBuf::from("/tmp/repo"),
-        args: vec!["--stat".to_string()],
-    })
-    .expect("expected GitReadOnlyArgs to serialize");
-    assert_eq!(value.get("project_dir"), Some(&Value::from("/tmp/repo")));
-    assert!(value.get("projectDir").is_none());
 }
 
 /// Pins each assistant usage field so same-typed token and cost fields cannot

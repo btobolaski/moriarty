@@ -120,6 +120,9 @@ test in a separate process, making this safe and preventing tests from clobberin
 **`pi_logs/`** - Pi session log parsing:
 
 - Independent workspace crate for parsing pi session JSONL logs into strongly typed serde models
+- `ToolCallContent` keeps the outer tool-call envelope typed (`id`, `name`, `partial_json`) but preserves
+  `arguments` as a raw `BTreeMap<String, JsonBlob>` because pi logs the model-emitted JSON object before tool-side
+  validation; typed tool-argument structs are optional post-parse helpers, not the parser's source of truth
 - Strict by default with `#[serde(deny_unknown_fields)]`, path-aware parse errors, and narrowly documented exceptions
   for shapes that require custom deserialization or specific corrupt-stream tolerance
 - Includes a `parse_pi_sessions` binary that recursively smoke-tests a sessions tree by parsing every `*.jsonl` file
@@ -395,9 +398,8 @@ the on-disk protocol exactly, even when that means snake_case fields like `GitRe
    flatten codegen does not register it as claimed; a strict outer struct then rejects it as unknown at runtime.
    `WebSearchResultsData` is the only struct in this category. It keeps the flattened internally tagged wire shape, but
    restores strict outer-key validation with a manual deserializer. _Adjacently_ tagged flatten targets (those with both
-   `tag` and `content`) do not hit this collision, so structs like `CustomLine`, `CustomMessageLine`, and
-   `ToolCallContent` keep derived `deny_unknown_fields` handling. Each exception must carry an inline comment naming the
-   limitation.
+   `tag` and `content`) do not hit this collision, so structs like `CustomLine` and `CustomMessageLine` keep derived
+   `deny_unknown_fields` handling. Each exception must carry an inline comment naming the limitation.
 2. **Corrupt-stream tolerance**: tool-argument structs (e.g. `EditArgs`, `EditReplacement`, `GrepArgs`) deliberately
    omit it to tolerate completed-but-corrupted or hallucinated assistant streams that emit malformed sibling keys. The
    same goal is also met at finer granularity by field-level aliases (for example `FindArgs.limit` accepting malformed
