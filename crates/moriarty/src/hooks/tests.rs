@@ -378,14 +378,13 @@ async fn test_exec_hook_pretool_completion_log_includes_tool_context() {
     );
     assert_eq!(
         parsed_tool_args.get("api_key").and_then(Value::as_str),
-        Some(REDACTED_LOG_VALUE)
+        Some("secret-value")
     );
     assert_eq!(
         parsed_tool_args.get("command").and_then(Value::as_str),
-        Some("[string 17 bytes]")
+        Some("echo secret-value")
     );
-    assert!(!tool_args.contains("secret-value"));
-    assert!(!content.contains("secret-value"));
+    assert!(tool_args.contains("secret-value"));
     assert!(
         fields.get("hook_output").is_some(),
         "hook_output should remain present on completion log events"

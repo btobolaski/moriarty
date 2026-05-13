@@ -91,7 +91,7 @@ fn hook_input_for_log(hook_input: &HookInput) -> String {
 }
 
 fn tool_args_for_log(tool_input: &Value) -> String {
-    json_value_for_log(tool_input)
+    truncate_log_field(&tool_input.to_string(), TOOL_ARGS_LOG_TRUNCATE_SIZE)
 }
 
 fn json_value_for_log(value: &Value) -> String {
