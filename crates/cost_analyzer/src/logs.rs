@@ -527,6 +527,7 @@ impl AnalyzableLog for PiLogLine {
 
     fn identifier(&self) -> String {
         match self {
+            PiLogLine::BranchSummary(branch_summary) => branch_summary.id.clone(),
             PiLogLine::Compaction(compaction) => compaction.id.clone(),
             PiLogLine::Custom(custom) => custom.id.clone(),
             PiLogLine::CustomMessage(message) => message.id.clone(),
@@ -547,6 +548,7 @@ impl AnalyzableLog for PiLogLine {
 
     fn timestamp(&self) -> DateTime<Utc> {
         match self {
+            PiLogLine::BranchSummary(branch_summary) => branch_summary.timestamp,
             PiLogLine::Compaction(compaction) => compaction.timestamp,
             PiLogLine::Custom(custom) => custom.timestamp,
             PiLogLine::CustomMessage(message) => message.timestamp,
@@ -760,6 +762,22 @@ mod tests {
             "details": {
                 "readFiles": ["src/main.rs"],
                 "modifiedFiles": ["crates/pi_logs/src/parser.rs"]
+            },
+            "fromHook": false,
+        })
+    }
+
+    fn branch_summary_json() -> serde_json::Value {
+        json!({
+            "type": "branch_summary",
+            "id": "bs1",
+            "parentId": "p1",
+            "timestamp": CLAUDE_TIMESTAMP,
+            "fromId": "branch-root-1",
+            "summary": "The user explored a different branch before returning here.",
+            "details": {
+                "readFiles": ["references/hydrogen-rtc/Dockerfile"],
+                "modifiedFiles": ["plans/ci-cd-monorepo.md"]
             },
             "fromHook": false,
         })
@@ -1164,6 +1182,7 @@ mod tests {
             session_json(),
             model_change_json(),
             thinking_level_change_json(),
+            branch_summary_json(),
             custom_json(),
             custom_message_json(),
         ];
@@ -1176,6 +1195,18 @@ mod tests {
                 "case {index} should return None: {value}"
             );
         }
+    }
+
+    #[test]
+    fn branch_summary_has_no_cost_model_or_tokens() {
+        let line = parse_pi_log(branch_summary_json());
+
+        assert!(line.cost().is_none());
+        assert!(line.model().is_none());
+        assert!(line.token_count(TokenType::Input).is_none());
+        assert!(line.token_count(TokenType::Output).is_none());
+        assert!(line.token_count(TokenType::CacheWrite).is_none());
+        assert!(line.token_count(TokenType::CacheRead).is_none());
     }
 
     #[derive(Debug, Clone)]
@@ -1266,6 +1297,7 @@ mod tests {
             (model_change_json(), "m1", false, false, None),
             (thinking_level_change_json(), "t1", false, false, None),
             (compaction_json(), "cmp1", false, false, None),
+            (branch_summary_json(), "bs1", false, false, None),
             (custom_json(), "c1", false, false, None),
             (custom_message_json(), "cm1", false, false, None),
             (user_message_json(), "u1", false, false, None),

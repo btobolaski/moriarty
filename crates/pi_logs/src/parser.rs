@@ -111,6 +111,7 @@ pub enum PiLogLine {
     ModelChange(ModelChangeLine),
     ThinkingLevelChange(ThinkingLevelChangeLine),
     Compaction(CompactionLine),
+    BranchSummary(BranchSummaryLine),
     Custom(CustomLine),
     CustomMessage(CustomMessageLine),
     Message(MessageLine),
@@ -174,6 +175,20 @@ pub struct CompactionLine {
     pub summary: String,
     pub first_kept_entry_id: String,
     pub tokens_before: u64,
+    pub details: CompactionDetails,
+    pub from_hook: bool,
+}
+
+/// Branch summaries snapshot the detour taken on another conversation branch
+/// so the active branch can reference it without replaying every message.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BranchSummaryLine {
+    pub id: String,
+    pub parent_id: String,
+    pub timestamp: DateTime<Utc>,
+    pub from_id: String,
+    pub summary: String,
     pub details: CompactionDetails,
     pub from_hook: bool,
 }

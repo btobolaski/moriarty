@@ -7,6 +7,7 @@
 
 use std::path::PathBuf;
 
+use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 
 use super::*;
@@ -128,6 +129,22 @@ fn compaction_json(from_hook: bool) -> Value {
         "details": {
             "readFiles": ["src/main.rs", "/tmp/output.log"],
             "modifiedFiles": ["crates/pi_logs/src/parser.rs"]
+        },
+        "fromHook": from_hook,
+    })
+}
+
+fn branch_summary_json(from_hook: bool) -> Value {
+    json!({
+        "type": "branch_summary",
+        "id": "b1",
+        "parentId": "p1",
+        "timestamp": FIXED_TIMESTAMP,
+        "fromId": "branch-root-1",
+        "summary": "The user explored a different branch before returning here.",
+        "details": {
+            "readFiles": ["references/hydrogen-rtc/Dockerfile"],
+            "modifiedFiles": ["plans/ci-cd-monorepo.md"]
         },
         "fromHook": from_hook,
     })
@@ -720,6 +737,64 @@ fn compaction_line_from_hook() {
         PiLogLine::Compaction(compaction) => assert!(compaction.from_hook),
         other => panic!("expected Compaction, got {other:?}"),
     }
+}
+
+#[test]
+fn branch_summary_line() {
+    let line = parse(branch_summary_json(false));
+
+    match line {
+        PiLogLine::BranchSummary(branch_summary) => {
+            assert_eq!(branch_summary.id, "b1");
+            assert_eq!(branch_summary.parent_id, "p1");
+            assert_eq!(
+                branch_summary.timestamp,
+                FIXED_TIMESTAMP
+                    .parse::<DateTime<Utc>>()
+                    .expect("valid timestamp")
+            );
+            assert_eq!(branch_summary.from_id, "branch-root-1");
+            assert_eq!(
+                branch_summary.summary,
+                "The user explored a different branch before returning here."
+            );
+            assert_eq!(
+                branch_summary.details.read_files,
+                vec![PathBuf::from("references/hydrogen-rtc/Dockerfile")]
+            );
+            assert_eq!(
+                branch_summary.details.modified_files,
+                vec![PathBuf::from("plans/ci-cd-monorepo.md")]
+            );
+            assert!(!branch_summary.from_hook);
+        }
+        other => panic!("expected BranchSummary, got {other:?}"),
+    }
+}
+
+#[test]
+fn branch_summary_line_from_hook() {
+    let line = parse(branch_summary_json(true));
+
+    match line {
+        PiLogLine::BranchSummary(branch_summary) => assert!(branch_summary.from_hook),
+        other => panic!("expected BranchSummary, got {other:?}"),
+    }
+}
+
+#[test]
+fn rejects_unknown_branch_summary_field() {
+    let mut bad_branch_summary = branch_summary_json(false);
+    bad_branch_summary
+        .as_object_mut()
+        .unwrap()
+        .insert("bogus".to_string(), json!("value"));
+
+    assert_parse_error_contains_any(
+        "rejects unknown branch_summary field",
+        bad_branch_summary,
+        &["bogus"],
+    );
 }
 
 #[test]
@@ -2469,9 +2544,10 @@ fn parse_file_smoke_parses_multiple_line_types() {
     std::fs::write(
         &tmp,
         format!(
-            "{}\n{}\n{}\n",
+            "{}\n{}\n{}\n{}\n",
             session_json("/tmp"),
             model_change_json(Some("session"), "anthropic", "claude-sonnet-4-5"),
+            branch_summary_json(false),
             user_message_json("hello")
         ),
     )
@@ -2480,10 +2556,11 @@ fn parse_file_smoke_parses_multiple_line_types() {
     let parsed = parse_file(&tmp).expect("expected parse success");
     let _ = std::fs::remove_file(&tmp);
 
-    assert_eq!(parsed.len(), 3);
+    assert_eq!(parsed.len(), 4);
     assert!(matches!(parsed[0], PiLogLine::Session(_)));
     assert!(matches!(parsed[1], PiLogLine::ModelChange(_)));
-    assert!(matches!(parsed[2], PiLogLine::Message(_)));
+    assert!(matches!(parsed[2], PiLogLine::BranchSummary(_)));
+    assert!(matches!(parsed[3], PiLogLine::Message(_)));
 }
 
 #[test]
