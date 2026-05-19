@@ -366,7 +366,13 @@ impl<'de> Deserialize<'de> for ToolResultMessage {
         let raw = RawToolResultMessage::deserialize(deserializer)?;
         let details = match raw.details {
             Some(Value::Null) => None,
-            Some(Value::Object(map)) if map.is_empty() && raw.is_error => None,
+            Some(Value::Object(map))
+                if map.is_empty()
+                    && raw.is_error
+                    && !preserves_empty_error_details(&raw.tool_name) =>
+            {
+                None
+            }
             Some(details) => Some(parse_tool_result_details(&raw.tool_name, details))
                 .transpose()
                 .map_err(de::Error::custom)?,
@@ -566,9 +572,13 @@ pub enum ToolName {
     InstinctWrite,
     Intercom,
     Ls,
+    Memory,
+    MemorySearch,
     Mcp,
     PlannotatorSubmitPlan,
     Read,
+    SessionSearch,
+    Skill,
     Subagent,
     SubagentStatus,
     Todo,
@@ -1536,6 +1546,14 @@ pub struct SubagentParallelTask {
 // fallback for tools whose detail payloads are shared or still shape-routed.
 // ---------------------------------------------------------------------------
 
+fn is_empty_details_object(details: &Value) -> bool {
+    matches!(details, Value::Object(map) if map.is_empty())
+}
+
+fn preserves_empty_error_details(tool_name: &ToolName) -> bool {
+    matches!(tool_name, ToolName::Memory | ToolName::Skill)
+}
+
 fn parse_tool_result_details(
     tool_name: &ToolName,
     details: Value,
@@ -1571,11 +1589,28 @@ fn parse_tool_result_details(
         }
         ToolName::Intercom => serde_json::from_value(details).map(ToolResultDetails::Intercom),
         ToolName::Ls => serde_json::from_value(details).map(ToolResultDetails::Ls),
+        ToolName::Memory => {
+            if is_empty_details_object(&details) {
+                Ok(ToolResultDetails::Empty(EmptyDetails {}))
+            } else {
+                serde_json::from_value(details).map(ToolResultDetails::Memory)
+            }
+        }
+        ToolName::MemorySearch | ToolName::SessionSearch => {
+            serde_json::from_value(details).map(ToolResultDetails::SearchResult)
+        }
         ToolName::Mcp => serde_json::from_value(details).map(ToolResultDetails::Mcp),
         ToolName::PlannotatorSubmitPlan => {
             serde_json::from_value(details).map(ToolResultDetails::PlannotatorSubmitPlan)
         }
         ToolName::Read => serde_json::from_value(details).map(ToolResultDetails::Read),
+        ToolName::Skill => {
+            if is_empty_details_object(&details) {
+                Ok(ToolResultDetails::Empty(EmptyDetails {}))
+            } else {
+                serde_json::from_value(details).map(ToolResultDetails::Skill)
+            }
+        }
         ToolName::Subagent => serde_json::from_value(details).map(ToolResultDetails::Subagent),
         ToolName::Todo => serde_json::from_value(details).map(ToolResultDetails::Todo),
         ToolName::WebSearch => serde_json::from_value(details).map(ToolResultDetails::WebSearch),
@@ -1602,6 +1637,10 @@ pub enum ToolResultDetails {
     Grep(GrepDetails),
     Read(ReadDetails),
     Count(CountDetails),
+    // `memory_search` and `session_search` share the same compact
+    // success/count/message envelope, so one typed variant avoids duplicating
+    // their parser surface.
+    SearchResult(SearchResultDetails),
     Intercom(IntercomResultDetails),
     Mcp(McpDetails),
     Bash(BashDetails),
@@ -1633,6 +1672,13 @@ pub enum ToolResultDetails {
     GitReadOnly(GitReadOnlyDetails),
     FetchContent(FetchContentDetails),
     GetSearchContent(GetSearchContentDetails),
+    // Hermes `memory` and `skill` are intentionally parsed by `tool_name`
+    // first because their error shapes can collapse to `{}` or a bare
+    // `{error}` and would otherwise be ambiguous in direct untagged
+    // deserialization.
+    Empty(EmptyDetails),
+    Memory(MemoryDetails),
+    Skill(SkillDetails),
 }
 
 /// Compression breadcrumb appended to tool results that flowed through the
@@ -2311,6 +2357,117 @@ pub enum InstinctWriteAction {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CountDetails {
     pub count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchResultDetails {
+    pub success: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmptyDetails {}
+
+/// Hermes memory writes emit a small snake_case result envelope whose exact
+/// optional fields depend on the action (`add`, `replace`, `remove`). The log
+/// parser only needs the shared shape so cost analysis can keep scanning.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryDetails {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub success: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warnings: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entries: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evicted_entries: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evicted_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matches: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SkillIndexDetails {
+    pub skill_id: String,
+    pub scope: String,
+    pub file_name: String,
+    pub path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_name: Option<String>,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    pub description: String,
+}
+
+/// Hermes skill results mix an index listing (`{skills:[...]}`), document
+/// reads (`{success, skillId, body, ...}`), and mutation summaries
+/// (`{success, message, skillId, ...}`). Capturing the shared key set keeps
+/// session parsing resilient without mirroring the extension's full control
+/// flow inside the log parser.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SkillDetails {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub success: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conflict_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub similar_skill_ids: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggested_action: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills: Option<Vec<SkillIndexDetails>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

@@ -123,6 +123,14 @@ test in a separate process, making this safe and preventing tests from clobberin
 - `ToolCallContent` keeps the outer tool-call envelope typed (`id`, `name`, `partial_json`) but preserves
   `arguments` as a raw `BTreeMap<String, JsonBlob>` because pi logs the model-emitted JSON object before tool-side
   validation; typed tool-argument structs are optional post-parse helpers, not the parser's source of truth
+- `ToolName` is the shared compatibility gate for assistant tool calls, tool results, and `pi-loaded-tools` manifests;
+  when pi adds new top-level tools (for example Hermes `memory`, `memory_search`, `session_search`, or `skill`), extend
+  this enum first or `pi cost` / `graphs pi` will drop entire session files as parse failures
+- Hermes memory/session-search result details are modeled by their shared envelopes rather than per-action sub-schemas:
+  search tools use the `success/count/message/output` summary shape, while `memory` and `skill` are routed by
+  `tool_name` first because their error details can collapse to either `{}` or a bare `{error}`; once routed, the
+  parser accepts their observed action-agnostic fields plus the real `{}` validation-error payload used by the
+  extension
 - Strict by default with `#[serde(deny_unknown_fields)]`, path-aware parse errors, and narrowly documented exceptions
   for shapes that require custom deserialization or specific corrupt-stream tolerance
 - Includes a `parse_pi_sessions` binary that recursively smoke-tests a sessions tree by parsing every `*.jsonl` file

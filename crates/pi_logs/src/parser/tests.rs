@@ -3144,6 +3144,19 @@ fn git_read_only_tool_calls_keep_declared_names() {
 }
 
 #[test]
+fn hermes_memory_tool_calls_keep_declared_names() {
+    for (tool_name, expected) in [
+        ("memory", ToolName::Memory),
+        ("memory_search", ToolName::MemorySearch),
+        ("session_search", ToolName::SessionSearch),
+        ("skill", ToolName::Skill),
+    ] {
+        let tool_call = parse_tool_call(tool_name, json!({"query": "auth"}));
+        assert_eq!(tool_call.name(), expected);
+    }
+}
+
+#[test]
 fn git_read_only_tool_call_preserves_raw_snake_case_arguments() {
     let raw_arguments = json!({
         "project_dir": "/tmp/repo",
@@ -3496,6 +3509,12 @@ fn custom_message_pi_loaded_tools_accepts_modeled_manifest_names() {
         ("git_read_only_show", ToolName::GitReadOnlyShow),
         ("git_read_only_status", ToolName::GitReadOnlyStatus),
     ];
+    let hermes_cases = [
+        ("memory", ToolName::Memory),
+        ("memory_search", ToolName::MemorySearch),
+        ("session_search", ToolName::SessionSearch),
+        ("skill", ToolName::Skill),
+    ];
 
     let mut tools = Vec::new();
     for (wire_name, _) in &builtin_cases {
@@ -3539,6 +3558,17 @@ fn custom_message_pi_loaded_tools_accepts_modeled_manifest_names() {
             "scope": "user",
             "origin": "package",
             "extensionPath": "npm:pi-mcp-adapter@2.5.1"
+        }));
+    }
+    for (wire_name, _) in &hermes_cases {
+        tools.push(json!({
+            "name": wire_name,
+            "description": "hermes tool",
+            "active": true,
+            "source": "extension",
+            "scope": "user",
+            "origin": "package",
+            "extensionPath": "npm:pi-hermes-memory@0.7.10"
         }));
     }
 
@@ -3593,6 +3623,19 @@ fn custom_message_pi_loaded_tools_accepts_modeled_manifest_names() {
                 assert_eq!(
                     tool.extension_path.as_deref(),
                     Some("npm:pi-mcp-adapter@2.5.1")
+                );
+                index += 1;
+            }
+
+            for (_, expected_name) in &hermes_cases {
+                let tool = &details.tools[index];
+                assert_eq!(tool.name, *expected_name);
+                assert_eq!(tool.source, ToolSource::Extension);
+                assert_eq!(tool.scope, ToolScope::User);
+                assert_eq!(tool.origin, ToolOrigin::Package);
+                assert_eq!(
+                    tool.extension_path.as_deref(),
+                    Some("npm:pi-hermes-memory@0.7.10")
                 );
                 index += 1;
             }
@@ -4006,6 +4049,260 @@ fn ask_user_tool_result_accepts_cancelled() {
     assert!(details.response.is_none());
     assert!(details.context.is_none());
     assert_eq!(details.options.len(), 2);
+}
+
+#[test]
+fn memory_search_tool_result_accepts_search_summary() {
+    for (tool_name, output) in [
+        ("memory_search", None),
+        ("session_search", Some("session-123")),
+    ] {
+        let tool_result = parse_tool_result_message(tool_result_message_json(
+            tool_name,
+            vec![json!({"type": "text", "text": "no results"})],
+            false,
+            Some(json!({
+                "success": true,
+                "count": 0,
+                "message": "No results found.",
+                "output": output
+            })),
+        ));
+        let Some(ToolResultDetails::SearchResult(details)) = tool_result.details else {
+            panic!("expected SearchResult details for {tool_name}")
+        };
+        assert!(details.success);
+        assert_eq!(details.count, Some(0));
+        assert_eq!(details.message.as_deref(), Some("No results found."));
+        assert_eq!(details.output.as_deref(), output);
+    }
+}
+
+#[test]
+fn direct_tool_result_details_bare_error_stays_get_search_content() {
+    let details = serde_json::from_value::<ToolResultDetails>(json!({
+        "error": "URL not found"
+    }))
+    .expect("expected bare error payload to deserialize");
+
+    let ToolResultDetails::GetSearchContent(GetSearchContentDetails::Error(error)) = details else {
+        panic!("expected GetSearchContent error details")
+    };
+    assert_eq!(error.error, "URL not found");
+}
+
+#[test]
+fn memory_tool_result_accepts_hermes_result_details() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "memory",
+        vec![json!({"type": "text", "text": "Entry added."})],
+        false,
+        Some(json!({
+            "success": true,
+            "target": "user",
+            "entries": ["Remember this."],
+            "usage": "6% — 303/5000 chars",
+            "entry_count": 1,
+            "message": "Entry added."
+        })),
+    ));
+    let Some(ToolResultDetails::Memory(details)) = tool_result.details else {
+        panic!("expected Memory details")
+    };
+    assert_eq!(details.success, Some(true));
+    assert_eq!(details.target.as_deref(), Some("user"));
+    assert_eq!(details.entry_count, Some(1));
+    assert_eq!(details.message.as_deref(), Some("Entry added."));
+}
+
+#[test]
+fn memory_tool_result_routes_bare_error_to_memory_details() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "memory",
+        vec![json!({"type": "text", "text": "memory failed"})],
+        true,
+        Some(json!({
+            "error": "Content is required."
+        })),
+    ));
+    let Some(ToolResultDetails::Memory(details)) = tool_result.details else {
+        panic!("expected Memory details")
+    };
+    assert_eq!(details.error.as_deref(), Some("Content is required."));
+}
+
+#[test]
+fn memory_tool_result_accepts_empty_details() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "memory",
+        vec![json!({"type": "text", "text": "Content is required."})],
+        false,
+        Some(json!({})),
+    ));
+    assert!(matches!(
+        tool_result.details,
+        Some(ToolResultDetails::Empty(_))
+    ));
+}
+
+#[test]
+fn memory_tool_result_preserves_empty_error_details() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "memory",
+        vec![json!({"type": "text", "text": "Content is required."})],
+        true,
+        Some(json!({})),
+    ));
+    assert!(matches!(
+        tool_result.details,
+        Some(ToolResultDetails::Empty(_))
+    ));
+}
+
+#[test]
+fn skill_tool_result_accepts_skill_index_details() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "skill",
+        vec![json!({"type": "text", "text": "{\"success\":true,\"skills\":[]}"})],
+        false,
+        Some(json!({
+            "skills": [
+                {
+                    "skillId": "global:debug-typescript-errors",
+                    "scope": "global",
+                    "fileName": "SKILL.md",
+                    "path": "/tmp/skills/debug-typescript-errors/SKILL.md",
+                    "name": "debug-typescript-errors",
+                    "description": "Use when TypeScript errors need debugging"
+                }
+            ]
+        })),
+    ));
+    let Some(ToolResultDetails::Skill(details)) = tool_result.details else {
+        panic!("expected Skill details")
+    };
+    let skills = details.skills.expect("expected skills");
+    assert_eq!(skills.len(), 1);
+    assert_eq!(skills[0].skill_id, "global:debug-typescript-errors");
+    assert_eq!(skills[0].scope, "global");
+    assert_eq!(skills[0].name, "debug-typescript-errors");
+}
+
+#[test]
+fn skill_tool_result_routes_bare_error_to_skill_details() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "skill",
+        vec![json!({"type": "text", "text": "skill failed"})],
+        true,
+        Some(json!({
+            "error": "skill_id is required."
+        })),
+    ));
+    let Some(ToolResultDetails::Skill(details)) = tool_result.details else {
+        panic!("expected Skill details")
+    };
+    assert_eq!(details.error.as_deref(), Some("skill_id is required."));
+}
+
+#[test]
+fn skill_tool_result_accepts_document_details() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "skill",
+        vec![json!({"type": "text", "text": "skill document"})],
+        false,
+        Some(json!({
+            "success": true,
+            "skillId": "project:moriarty:parse-pi-sessions",
+            "scope": "project",
+            "fileName": "SKILL.md",
+            "path": "/tmp/skills/parse-pi-sessions/SKILL.md",
+            "projectName": "moriarty",
+            "name": "parse-pi-sessions",
+            "displayName": "Parse Pi Sessions",
+            "description": "Use when replaying pi session fixtures",
+            "body": "## When to Use\nWhen parsing pi sessions.",
+            "version": 3,
+            "created": "2026-05-19T00:00:00.000Z",
+            "updated": "2026-05-19T01:00:00.000Z"
+        })),
+    ));
+    let Some(ToolResultDetails::Skill(details)) = tool_result.details else {
+        panic!("expected Skill details")
+    };
+    assert_eq!(details.success, Some(true));
+    assert_eq!(
+        details.skill_id.as_deref(),
+        Some("project:moriarty:parse-pi-sessions")
+    );
+    assert_eq!(details.file_name.as_deref(), Some("SKILL.md"));
+    assert_eq!(details.project_name.as_deref(), Some("moriarty"));
+    assert_eq!(details.version, Some(3));
+    assert_eq!(
+        details.body.as_deref(),
+        Some("## When to Use\nWhen parsing pi sessions.")
+    );
+}
+
+#[test]
+fn skill_tool_result_accepts_conflict_error_details() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "skill",
+        vec![json!({"type": "text", "text": "conflict"})],
+        true,
+        Some(json!({
+            "success": false,
+            "error": "Similar skill already exists.",
+            "skillId": "global:parse-pi-sessions",
+            "scope": "global",
+            "fileName": "SKILL.md",
+            "path": "/tmp/skills/parse-pi-sessions/SKILL.md",
+            "conflictType": "similar-name",
+            "similarSkillIds": ["global:parse-pi-sessions-v2"],
+            "suggestedAction": "patch"
+        })),
+    ));
+    let Some(ToolResultDetails::Skill(details)) = tool_result.details else {
+        panic!("expected Skill details")
+    };
+    assert_eq!(details.success, Some(false));
+    assert_eq!(
+        details.error.as_deref(),
+        Some("Similar skill already exists.")
+    );
+    assert_eq!(details.conflict_type.as_deref(), Some("similar-name"));
+    assert_eq!(
+        details.similar_skill_ids,
+        Some(vec!["global:parse-pi-sessions-v2".to_string()])
+    );
+    assert_eq!(details.suggested_action.as_deref(), Some("patch"));
+}
+
+#[test]
+fn skill_tool_result_accepts_empty_details() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "skill",
+        vec![json!({"type": "text", "text": "skill_id is required."})],
+        false,
+        Some(json!({})),
+    ));
+    assert!(matches!(
+        tool_result.details,
+        Some(ToolResultDetails::Empty(_))
+    ));
+}
+
+#[test]
+fn skill_tool_result_preserves_empty_error_details() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "skill",
+        vec![json!({"type": "text", "text": "skill_id is required."})],
+        true,
+        Some(json!({})),
+    ));
+    assert!(matches!(
+        tool_result.details,
+        Some(ToolResultDetails::Empty(_))
+    ));
 }
 
 #[test]
