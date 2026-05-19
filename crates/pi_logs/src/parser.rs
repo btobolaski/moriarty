@@ -2043,17 +2043,17 @@ pub struct GitReadOnlyDetails {
     pub tool: String,
 }
 
-/// Summary metadata recorded by the `fetch_content` tool on successful runs.
-/// Empty / null error payloads are normalized to `None` earlier in
-/// `ToolResultMessage` deserialization, so this struct can stay strict while
-/// still tolerating older success payloads that predate the title and image /
-/// truncation breadcrumbs.
+/// Summary metadata recorded by the `fetch_content` tool. Newer failed
+/// fetches can still emit the same breadcrumb shape with an added top-level
+/// error summary, so the field stays optional to preserve compatibility with
+/// both older success payloads and newer partial / failed runs.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FetchContentDetails {
     pub urls: Vec<String>,
     pub url_count: u32,
     pub successful: u32,
+    #[serde(default)]
     pub total_chars: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
@@ -2066,6 +2066,8 @@ pub struct FetchContentDetails {
     pub image_count: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// Replaying a single previously-fetched URL via `get_search_content`

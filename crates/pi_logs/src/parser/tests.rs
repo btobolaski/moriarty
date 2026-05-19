@@ -2807,6 +2807,52 @@ fn fetch_content_tool_result_accepts_missing_optional_metadata() {
     assert!(!details.has_image);
     assert_eq!(details.image_count, 0);
     assert!(details.prompt.is_none());
+    assert!(details.error.is_none());
+}
+
+#[test]
+fn fetch_content_tool_result_accepts_top_level_error_summary() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "fetch_content",
+        vec![json!({"type": "text", "text": "Error: fetch failed"})],
+        true,
+        Some(json!({
+            "urls": ["file:///tmp/example.html"],
+            "urlCount": 1,
+            "successful": 0,
+            "responseId": "resp_1",
+            "error": "fetch failed"
+        })),
+    ));
+    let Some(ToolResultDetails::FetchContent(details)) = tool_result.details else {
+        panic!("expected FetchContent details")
+    };
+    assert_eq!(details.urls, ["file:///tmp/example.html"]);
+    assert_eq!(details.url_count, 1);
+    assert_eq!(details.successful, 0);
+    assert_eq!(details.total_chars, 0);
+    assert_eq!(details.response_id, "resp_1");
+    assert_eq!(details.error.as_deref(), Some("fetch failed"));
+}
+
+#[test]
+fn fetch_content_tool_result_rejects_unknown_details_field() {
+    assert_parse_error_contains_any(
+        "fetch_content rejects unknown details field",
+        tool_result_message_json(
+            "fetch_content",
+            vec![json!({"type": "text", "text": "fetched"})],
+            false,
+            Some(json!({
+                "urls": ["https://example.com/a"],
+                "urlCount": 1,
+                "successful": 1,
+                "responseId": "resp_1",
+                "unexpected": true
+            })),
+        ),
+        &["unexpected", "unknown field"],
+    );
 }
 
 #[test]
