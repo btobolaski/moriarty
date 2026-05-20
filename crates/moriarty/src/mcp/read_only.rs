@@ -1,15 +1,15 @@
 //! Shared helpers for read-only VCS MCP servers (git, jj).
 //!
 //! Both [`super::git_read_only`] and [`super::jj_read_only`] expose a tiny set of
-//! read-only commands that execute an external binary inside a validated project
-//! directory. The validation, process spawning, UTF-8 loss-tolerant output handling,
-//! and error shaping are identical. This module centralizes those concerns so each
+//! read-only commands that execute an external binary inside a validated directory.
+//! The validation, process spawning, UTF-8 loss-tolerant output handling, and
+//! error shaping are identical. This module centralizes those concerns so each
 //! server only needs to describe its MCP tool surface.
 
 // standard library imports
 use std::{
     ffi::OsStr,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 // 3rd party crates
@@ -27,12 +27,29 @@ pub struct CommandResult {
     pub exit_code: i32,
 }
 
-/// Canonicalizes `project_dir` and ensures it looks like a valid Moriarty project
-/// directory by checking for `.config/tools.toml`.
+/// Rejects syntactic parent traversal and canonicalizes `project_dir` so the
+/// VCS process cannot be pointed outside the caller's requested directory by an
+/// indirect path that later resolves elsewhere.
 ///
 /// Returns `INVALID_PARAMS` errors suitable for direct use in MCP tool responses.
 pub fn validate_project_dir(project_dir: &Path) -> Result<PathBuf, McpError> {
-    // Canonicalize path to prevent traversal attacks and resolve symlinks
+    // Reject `..` before canonicalization so the caller cannot spell a valid
+    // escape hatch that later resolves outside the requested directory.
+    if project_dir
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(McpError {
+            code: ErrorCode::INVALID_PARAMS,
+            message: format!(
+                "Invalid project directory: {} (parent traversal is not allowed)",
+                project_dir.display()
+            )
+            .into(),
+            data: None,
+        });
+    }
+
     let canonical_dir = project_dir.canonicalize().map_err(|e| McpError {
         code: ErrorCode::INVALID_PARAMS,
         message: format!(
@@ -44,13 +61,11 @@ pub fn validate_project_dir(project_dir: &Path) -> Result<PathBuf, McpError> {
         data: None,
     })?;
 
-    // Verify this is a valid project directory by checking for .config/tools.toml
-    let config_path = canonical_dir.join(".config").join("tools.toml");
-    if !config_path.exists() {
+    if !canonical_dir.is_dir() {
         return Err(McpError {
             code: ErrorCode::INVALID_PARAMS,
             message: format!(
-                "Invalid project directory: {} (missing .config/tools.toml)",
+                "Invalid project directory: {} (not a directory)",
                 canonical_dir.display()
             )
             .into(),
@@ -61,15 +76,12 @@ pub fn validate_project_dir(project_dir: &Path) -> Result<PathBuf, McpError> {
     Ok(canonical_dir)
 }
 
-/// Runs a read-only command (e.g., `git`, `jj`) inside `project_dir`.
+/// Runs a fixed VCS subcommand in a validated directory without shell
+/// interpretation.
 ///
-/// - Validates `project_dir` via [`validate_project_dir`].
-/// - Spawns the command directly (no shell) using `subcommand_args` followed by `args`.
-///   `subcommand_args` are the fixed subcommand tokens (e.g., `["status"]` for `git status`,
-///   or `["op", "log"]` for `jj op log`); `args` are user-supplied extra flags forwarded
-///   verbatim.
-/// - Converts stdout/stderr using lossy UTF-8 so invalid encodings never crash the server.
-/// - Maps spawn failures to [`ErrorCode::INTERNAL_ERROR`] using `label` in the message.
+/// `subcommand_args` are trusted tokens chosen by the server wrapper, while
+/// `args` are the already-validated user arguments that should appear after the
+/// fixed subcommand.
 pub async fn run_read_only_command<S1, S2, I1, I2>(
     program: &str,
     label: &str,
@@ -118,19 +130,19 @@ where
 /// Each backend's unit tests instantiate [`path_safety_tests!`] with a setup
 /// function that returns a ready-to-use repo `TempDir` and a `run` closure
 /// that executes a typical read-only command through the backend's validated
-/// entry point. The macro emits four `#[tokio::test]` cases covering path
-/// traversal, symlink resolution, the missing-config rejection branch, and
-/// the nonexistent-directory rejection branch.
+/// entry point. The macro emits five `#[tokio::test]` cases covering parent
+/// traversal rejection, symlink resolution, acceptance of directories without
+/// project config, regular-file rejection, and the nonexistent-directory
+/// rejection branch.
 #[cfg(test)]
 pub(crate) mod test_support {
-    /// Generates the four path-safety `#[tokio::test]`s against the provided
+    /// Generates the five path-safety `#[tokio::test]`s against the provided
     /// `$run` closure (async, taking `PathBuf` and `Vec<String>`).
     ///
     /// - `$setup_repo` is an `async` expression (e.g. `setup_git_repo()`) that
-    ///   is awaited once per generated test to stand up an initialised repo
-    ///   with `.config/tools.toml`.
-    /// - `$init_bare_repo` initializes the VCS inside a fresh `TempDir` without
-    ///   writing `.config/tools.toml`, used by the missing-config test.
+    ///   is awaited once per generated test to stand up an initialised repo.
+    /// - `$init_bare_repo` initializes the VCS inside a fresh `TempDir`, used by
+    ///   the no-project-config test.
     macro_rules! path_safety_tests {
         ($run:expr, $setup_repo:expr, $init_bare_repo:expr $(,)?) => {
             #[tokio::test]
@@ -160,18 +172,28 @@ pub(crate) mod test_support {
             }
 
             #[tokio::test]
-            async fn test_rejects_directory_without_config_file() {
+            async fn test_accepts_directory_without_config_file() {
                 let run = $run;
                 let init_bare_repo = $init_bare_repo;
                 let temp_dir = ::tempfile::TempDir::new().unwrap();
                 init_bare_repo(temp_dir.path());
-                let Err(error) = run(temp_dir.path().to_path_buf(), Vec::<String>::new()).await
-                else {
-                    panic!("Expected error for directory without .config/tools.toml");
+                let cmd_result = run(temp_dir.path().to_path_buf(), Vec::<String>::new())
+                    .await
+                    .unwrap();
+                assert_eq!(cmd_result.0.exit_code, 0);
+            }
+
+            #[tokio::test]
+            async fn test_rejects_regular_file() {
+                let run = $run;
+                let temp_dir = ::tempfile::TempDir::new().unwrap();
+                let file_path = temp_dir.path().join("not-a-directory");
+                std::fs::write(&file_path, "content").unwrap();
+                let Err(error) = run(file_path, Vec::<String>::new()).await else {
+                    panic!("Expected error for regular file path");
                 };
                 assert_eq!(error.code, ::rmcp::model::ErrorCode::INVALID_PARAMS);
-                assert!(error.message.contains("Invalid project directory"));
-                assert!(error.message.contains("missing .config/tools.toml"));
+                assert!(error.message.contains("not a directory"));
             }
 
             #[tokio::test]

@@ -11,9 +11,9 @@ Moriarty is a Rust CLI tool for analyzing Claude Code logs and API usage. It pro
   provider and model
 - **Terminal graphs**: Renders chart-focused stacked-bar summaries for Claude/API and pi usage via `graphs claude` and
   `graphs pi`
-- **MCP servers**: Provides Model Context Protocol servers for git operations and project tools
+- **MCP servers**: Provides Model Context Protocol servers for read-only git operations, read-only jj operations, and project tools
 - **Hooks system**: Security integration for validating commands before execution (bash rules, project checks)
-- **Project approval TUI**: Interactive interface for approving project tools before execution
+- **Project approval TUI**: Interactive interface for approving project-tools commands and checks before execution
 
 ## Essential Commands
 
@@ -165,8 +165,11 @@ test in a separate process, making this safe and preventing tests from clobberin
 - Three MCP servers: `git_read_only` (status, diff, log, show), `jj_read_only` (status, diff, log, show, op log), and
   `tool_runner` (lint, test, build, format)
 - `read_only`: Shared infrastructure used by both `git_read_only` and `jj_read_only`. Provides `CommandResult`,
-  `validate_project_dir`, and the generic `run_read_only_command`. Neither server implements its own process spawning,
-  UTF-8 loss-tolerant output handling, or project-dir validation; both delegate to this module.
+  `validate_project_dir`, and the generic `run_read_only_command`. It rejects parent-traversal and non-directory
+  targets before canonicalizing the working directory, while the per-server wrappers add command-specific flag
+  restrictions (`git` forces `--no-optional-locks`, `--no-ext-diff`, and `--no-textconv` while rejecting output-file /
+  no-index escape flags; `jj` forces `--ignore-working-copy` and rejects external-tool, config-injection, and
+  repository-override flags). Neither server consults `.config/tools.toml` approvals; only `tool_runner` does.
 - Uses rmcp library with stdio transport for Claude Code integration
 - All servers run as stdin/stdout servers that Claude Code can invoke
 - `install` command configures all servers in Claude Code's MCP registry

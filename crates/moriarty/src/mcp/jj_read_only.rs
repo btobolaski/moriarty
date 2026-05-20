@@ -13,10 +13,10 @@
 //!
 //! - **Shell injection protection**: Commands are executed directly without shell
 //!   interpretation, preventing injection via shell metacharacters (`&&`, `||`, `|`, etc.)
-//! - **Path validation**: Only operates on valid project directories (verified by
-//!   checking for `.config/tools.toml` marker file)
-//! - **Read-only operations**: All exposed jj commands are read-only; no modifications
-//!   to the repository are possible
+//! - **Path validation**: Rejects parent traversal and canonicalizes an existing
+//!   directory before execution
+//! - **Read-only operations**: Forces `--ignore-working-copy` and rejects
+//!   external-tool, config-injection, and repository-override flags
 
 // standard library imports
 use std::path::PathBuf;
@@ -36,15 +36,10 @@ use super::read_only::{run_read_only_command, CommandResult};
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum JjCommand {
-    /// Run `jj status` to show the working copy status
     Status,
-    /// Run `jj diff` to show changes in the working copy
     Diff,
-    /// Run `jj log` to show the commit history
     Log,
-    /// Run `jj show` to show a specific revision
     Show,
-    /// Run `jj op log` to show the operation history
     OpLog,
 }
 
@@ -74,11 +69,8 @@ impl JjCommand {
 /// Arguments for executing jj commands.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct JjArgs {
-    /// The directory of the project (must contain `.config/tools.toml`)
     pub project_dir: PathBuf,
-    /// The jj command to execute
     pub command: JjCommand,
-    /// Additional arguments to pass to the command (e.g., `["--summary"]` for diff)
     pub args: Vec<String>,
 }
 
@@ -94,21 +86,54 @@ pub struct JjArgs {
 ///
 /// # Security
 ///
-/// All operations validate that the project directory contains `.config/tools.toml`
-/// to prevent execution in arbitrary system directories.
+/// All operations reject parent traversal, canonicalize the target directory,
+/// force `--ignore-working-copy`, and block jj flags that would expand the
+/// server beyond repository-focused inspection.
 #[derive(Debug, Clone)]
 pub struct JjReadOnly {
     pub tool_router: ToolRouter<Self>,
 }
 
 impl JjReadOnly {
+    fn validate_args(command: &JjCommand, args: &[String]) -> Result<(), McpError> {
+        let rejected_arg = args.iter().find(|arg| {
+            matches!(
+                arg.as_str(),
+                "--tool" | "-R" | "--repository" | "--config" | "--config-file" | "--config-toml"
+            ) || arg.starts_with("--tool=")
+                || arg.starts_with("-R")
+                || arg.starts_with("--repository=")
+                || arg.starts_with("--config=")
+                || arg.starts_with("--config-file=")
+                || arg.starts_with("--config-toml=")
+        });
+
+        if let Some(arg) = rejected_arg {
+            return Err(McpError {
+                code: ErrorCode::INVALID_PARAMS,
+                message: format!(
+                    "Invalid jj arguments for {}: {arg} is not allowed in read-only mode",
+                    command.name()
+                )
+                .into(),
+                data: None,
+            });
+        }
+
+        Ok(())
+    }
+
     async fn run_jj_command(
         command: JjCommand,
         project_dir: PathBuf,
         args: Vec<String>,
     ) -> Result<Json<CommandResult>, McpError> {
+        Self::validate_args(&command, &args)?;
+
         let label = command.name().to_string();
-        run_read_only_command("jj", &label, project_dir, command.as_args(), args).await
+        let mut subcommand_args = vec!["--ignore-working-copy"];
+        subcommand_args.extend(command.as_args());
+        run_read_only_command("jj", &label, project_dir, subcommand_args, args).await
     }
 }
 
@@ -155,23 +180,17 @@ impl Default for JjReadOnly {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_helpers::write_tools_config;
     use tempfile::TempDir;
 
     async fn setup_jj_repo() -> TempDir {
         let temp_dir = TempDir::new().unwrap();
 
-        // Initialize jj repository
-        std::process::Command::new("jj")
+        let status = std::process::Command::new("jj")
             .args(["git", "init", "--colocate"])
             .current_dir(temp_dir.path())
             .status()
             .unwrap();
-
-        write_tools_config(
-            temp_dir.path(),
-            "[commands]\nlint = [\"cargo\", \"clippy\"]\n",
-        );
+        assert!(status.success(), "jj git init failed: {status:?}");
 
         temp_dir
     }
@@ -282,34 +301,39 @@ mod tests {
         },
         setup_jj_repo(),
         |path: &std::path::Path| {
-            std::process::Command::new("jj")
+            let status = std::process::Command::new("jj")
                 .args(["git", "init", "--colocate"])
                 .current_dir(path)
                 .status()
                 .unwrap();
+            assert!(status.success(), "jj git init failed: {status:?}");
         },
     );
 
     #[tokio::test]
     async fn test_diff_command() {
         let temp_dir = setup_jj_repo().await;
-
-        // Create a file to have something in the diff
         std::fs::write(temp_dir.path().join("test.txt"), "test content").unwrap();
+
+        let status = std::process::Command::new("jj")
+            .args(["commit", "-m", "Test change"])
+            .current_dir(temp_dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "jj commit failed: {status:?}");
 
         let server = JjReadOnly::default();
         let args = JjArgs {
             project_dir: temp_dir.path().to_path_buf(),
             command: JjCommand::Diff,
-            args: vec!["--summary".to_string()],
+            args: vec!["-r".to_string(), "@-".to_string(), "--summary".to_string()],
         };
 
         let cmd_result = server.run(Parameters(args)).await.unwrap();
         assert_eq!(cmd_result.0.exit_code, 0);
-        // Should show the new file in the diff summary
         assert!(
             cmd_result.0.stdout.contains("test.txt") || cmd_result.0.stdout.contains("A test.txt"),
-            "diff --summary should show the new file"
+            "diff --summary should show the committed file"
         );
     }
 
@@ -317,13 +341,13 @@ mod tests {
     async fn test_log_command() {
         let temp_dir = setup_jj_repo().await;
 
-        // Create a file and describe the change to have something in the log
         std::fs::write(temp_dir.path().join("test.txt"), "content").unwrap();
-        std::process::Command::new("jj")
+        let status = std::process::Command::new("jj")
             .args(["describe", "-m", "Test commit"])
             .current_dir(temp_dir.path())
             .status()
             .unwrap();
+        assert!(status.success(), "jj describe failed: {status:?}");
 
         let server = JjReadOnly::default();
         let args = JjArgs {
@@ -341,13 +365,13 @@ mod tests {
     async fn test_show_command() {
         let temp_dir = setup_jj_repo().await;
 
-        // Create a file and describe the change to have something to show
         std::fs::write(temp_dir.path().join("test.txt"), "test content").unwrap();
-        std::process::Command::new("jj")
+        let status = std::process::Command::new("jj")
             .args(["describe", "-m", "Test change"])
             .current_dir(temp_dir.path())
             .status()
             .unwrap();
+        assert!(status.success(), "jj describe failed: {status:?}");
 
         let server = JjReadOnly::default();
         let args = JjArgs {
@@ -387,9 +411,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_handles_not_a_jj_repository() {
-        // Create a directory with .config/tools.toml but no jj repo
+        // Create a directory with no jj repo; read-only MCP should still run
+        // the command and let jj report that the directory is not a repository.
         let temp_dir = TempDir::new().unwrap();
-        write_tools_config(temp_dir.path(), "[commands]\n");
 
         let args = JjArgs {
             project_dir: temp_dir.path().to_path_buf(),
@@ -408,5 +432,55 @@ mod tests {
                 || cmd_result.0.stderr.contains("no workspace")
                 || cmd_result.0.stderr.contains("There is no jj repo")
         );
+    }
+
+    #[tokio::test]
+    async fn test_status_ignores_malformed_tools_config() {
+        let temp_dir = setup_jj_repo().await;
+        std::fs::create_dir_all(temp_dir.path().join(".config")).unwrap();
+        std::fs::write(
+            temp_dir.path().join(".config/tools.toml"),
+            "this is not valid toml [[[[",
+        )
+        .unwrap();
+
+        let cmd_result =
+            JjReadOnly::run_jj_command(JjCommand::Status, temp_dir.path().to_path_buf(), vec![])
+                .await
+                .unwrap();
+        assert_eq!(cmd_result.0.exit_code, 0);
+    }
+
+    #[tokio::test]
+    async fn test_diff_rejects_read_only_escape_flags() {
+        let temp_dir = setup_jj_repo().await;
+
+        for args in [
+            vec!["--tool".to_string(), ":git".to_string()],
+            vec!["--tool=:git".to_string()],
+            vec!["-R".to_string(), ".".to_string()],
+            vec!["-R.".to_string()],
+            vec!["--repository".to_string(), ".".to_string()],
+            vec!["--repository=.".to_string()],
+            vec!["--config".to_string(), "ui.diff.tool=':git'".to_string()],
+            vec!["--config=ui.diff.tool=':git'".to_string()],
+            vec!["--config-file".to_string(), "config.toml".to_string()],
+            vec!["--config-file=config.toml".to_string()],
+            vec![
+                "--config-toml".to_string(),
+                "ui.diff.tool=':git'".to_string(),
+            ],
+            vec!["--config-toml=ui.diff.tool=':git'".to_string()],
+        ] {
+            let rejected = args[0].clone();
+            let Err(error) =
+                JjReadOnly::run_jj_command(JjCommand::Diff, temp_dir.path().to_path_buf(), args)
+                    .await
+            else {
+                panic!("Expected invalid params for {rejected}");
+            };
+            assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
+            assert!(error.message.contains(&rejected));
+        }
     }
 }

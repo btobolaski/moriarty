@@ -7,10 +7,11 @@
 //!
 //! - **Shell injection protection**: Commands are executed directly without shell
 //!   interpretation, preventing injection via shell metacharacters (`&&`, `||`, `|`, etc.)
-//! - **Path validation**: Only operates on valid project directories (verified by
-//!   checking for `.config/tools.toml` marker file)
-//! - **Read-only operations**: All exposed git commands are read-only; no modifications
-//!   to the repository are possible
+//! - **Path validation**: Rejects parent traversal and canonicalizes an existing
+//!   directory before execution
+//! - **Read-only operations**: Forces git's no-lock/no-ext-diff/no-textconv
+//!   modes and rejects flags that widen the command beyond repository-focused
+//!   inspection
 
 use std::path::{Path, PathBuf};
 
@@ -28,33 +29,25 @@ use super::read_only::{run_read_only_command, CommandResult};
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct StatusArgs {
-    /// The directory of the project (must contain `.config/tools.toml`)
     pub project_dir: PathBuf,
-    /// Additional arguments (e.g., `["--short"]`)
     pub args: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DiffArgs {
-    /// The directory of the project (must contain `.config/tools.toml`)
     pub project_dir: PathBuf,
-    /// Additional arguments (e.g., `["--cached"]`)
     pub args: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct LogArgs {
-    /// The directory of the project (must contain `.config/tools.toml`)
     pub project_dir: PathBuf,
-    /// Additional arguments (e.g., `["--oneline", "-10"]`)
     pub args: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ShowArgs {
-    /// The directory of the project (must contain `.config/tools.toml`)
     pub project_dir: PathBuf,
-    /// Additional arguments (e.g., `["HEAD"]`)
     pub args: Vec<String>,
 }
 
@@ -68,8 +61,9 @@ pub struct ShowArgs {
 ///
 /// # Security
 ///
-/// All operations validate that the project directory contains `.config/tools.toml`
-/// to prevent execution in arbitrary system directories.
+/// All operations reject parent traversal, canonicalize the target directory,
+/// and pin git to the non-locking, internal-diff code paths so the server stays
+/// within repository-focused inspection.
 #[derive(Debug, Clone)]
 pub struct GitReadOnly {
     pub tool_router: ToolRouter<Self>,
@@ -77,12 +71,42 @@ pub struct GitReadOnly {
 }
 
 impl GitReadOnly {
+    fn validate_args(subcommand: &str, args: &[String]) -> Result<(), McpError> {
+        let rejected_arg = args.iter().find(|arg| {
+            arg.as_str() == "--output"
+                || arg.starts_with("--output=")
+                || arg.as_str() == "--ext-diff"
+                || arg.as_str() == "--textconv"
+                || (subcommand == "diff" && arg.as_str() == "--no-index")
+        });
+
+        if let Some(arg) = rejected_arg {
+            return Err(McpError {
+                code: ErrorCode::INVALID_PARAMS,
+                message: format!(
+                    "Invalid git arguments for {subcommand}: {arg} is not allowed in read-only mode"
+                )
+                .into(),
+                data: None,
+            });
+        }
+
+        Ok(())
+    }
+
     async fn run_git_command(
         subcommand: &str,
         project_dir: PathBuf,
         args: Vec<String>,
     ) -> Result<Json<CommandResult>, McpError> {
-        run_read_only_command("git", subcommand, project_dir, [subcommand], args).await
+        Self::validate_args(subcommand, &args)?;
+
+        let mut subcommand_args = vec!["--no-optional-locks", subcommand];
+        if matches!(subcommand, "diff" | "log" | "show") {
+            subcommand_args.extend(["--no-ext-diff", "--no-textconv"]);
+        }
+
+        run_read_only_command("git", subcommand, project_dir, subcommand_args, args).await
     }
 }
 
@@ -232,33 +256,31 @@ impl Default for GitReadOnly {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_helpers::write_tools_config;
     use tempfile::TempDir;
 
     async fn setup_git_repo() -> TempDir {
         let temp_dir = TempDir::new().unwrap();
 
-        // Initialize git repository
-        std::process::Command::new("git")
+        let status = std::process::Command::new("git")
             .args(["init"])
             .current_dir(temp_dir.path())
             .status()
             .unwrap();
-        std::process::Command::new("git")
+        assert!(status.success(), "git init failed: {status:?}");
+
+        let status = std::process::Command::new("git")
             .args(["config", "user.email", "test@example.com"])
             .current_dir(temp_dir.path())
             .status()
             .unwrap();
-        std::process::Command::new("git")
+        assert!(status.success(), "git config user.email failed: {status:?}");
+
+        let status = std::process::Command::new("git")
             .args(["config", "user.name", "Test User"])
             .current_dir(temp_dir.path())
             .status()
             .unwrap();
-
-        write_tools_config(
-            temp_dir.path(),
-            "[commands]\nlint = [\"cargo\", \"clippy\"]\n",
-        );
+        assert!(status.success(), "git config user.name failed: {status:?}");
 
         temp_dir
     }
@@ -337,21 +359,22 @@ mod tests {
         assert_eq!(cmd_result.0.exit_code, 0);
     }
 
-    // Shared path-safety tests (traversal, symlink resolution, missing config,
-    // nonexistent directory) live in `crate::mcp::read_only::test_support`
-    // because `git_read_only` and `jj_read_only` validate the project dir via
-    // the same helper.
+    // Shared path-safety tests (traversal, symlink resolution, directories
+    // without project config, nonexistent directory) live in
+    // `crate::mcp::read_only::test_support` because `git_read_only` and
+    // `jj_read_only` validate the project dir via the same helper.
     crate::mcp::read_only::test_support::path_safety_tests!(
         |dir: std::path::PathBuf, args: Vec<String>| async move {
             GitReadOnly::run_git_command("status", dir, args).await
         },
         setup_git_repo(),
         |path: &std::path::Path| {
-            std::process::Command::new("git")
+            let status = std::process::Command::new("git")
                 .args(["init"])
                 .current_dir(path)
                 .status()
                 .unwrap();
+            assert!(status.success(), "git init failed: {status:?}");
         },
     );
 
@@ -373,18 +396,20 @@ mod tests {
     async fn test_log_tool_handler() {
         let temp_dir = setup_git_repo().await;
 
-        // Create a commit so log has output
         std::fs::write(temp_dir.path().join("test.txt"), "content").unwrap();
-        std::process::Command::new("git")
+        let status = std::process::Command::new("git")
             .args(["add", "."])
             .current_dir(temp_dir.path())
             .status()
             .unwrap();
-        std::process::Command::new("git")
+        assert!(status.success(), "git add failed: {status:?}");
+
+        let status = std::process::Command::new("git")
             .args(["commit", "-m", "Test commit"])
             .current_dir(temp_dir.path())
             .status()
             .unwrap();
+        assert!(status.success(), "git commit failed: {status:?}");
 
         let server = GitReadOnly::default();
         let args = LogArgs {
@@ -486,9 +511,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_handles_not_a_git_repository() {
-        // Create a directory with .config/tools.toml but no git repo
+        // Create a directory with no git repo; read-only MCP should still run
+        // the command and let git report that the directory is not a repository.
         let temp_dir = TempDir::new().unwrap();
-        write_tools_config(temp_dir.path(), "[commands]\n");
 
         let args = StatusArgs {
             project_dir: temp_dir.path().to_path_buf(),
@@ -504,5 +529,53 @@ mod tests {
             cmd_result.0.stderr.contains("not a git repository")
                 || cmd_result.0.stderr.contains("not a git repo")
         );
+    }
+
+    #[tokio::test]
+    async fn test_status_ignores_malformed_tools_config() {
+        let temp_dir = setup_git_repo().await;
+        std::fs::create_dir_all(temp_dir.path().join(".config")).unwrap();
+        std::fs::write(
+            temp_dir.path().join(".config/tools.toml"),
+            "this is not valid toml [[[[",
+        )
+        .unwrap();
+
+        let cmd_result = GitReadOnly::run_git_command(
+            "status",
+            temp_dir.path().to_path_buf(),
+            vec!["--short".to_string()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(cmd_result.0.exit_code, 0);
+    }
+
+    #[tokio::test]
+    async fn test_diff_rejects_read_only_escape_flags() {
+        let temp_dir = setup_git_repo().await;
+        let output_path = temp_dir.path().join("leak.patch");
+        let output_path_string = output_path.to_string_lossy().into_owned();
+
+        for args in [
+            vec!["--output".to_string(), output_path_string.clone()],
+            vec![format!("--output={output_path_string}")],
+            vec!["--no-index".to_string()],
+            vec!["--ext-diff".to_string()],
+            vec!["--textconv".to_string()],
+        ] {
+            let rejected = args[0].clone();
+            let Err(error) =
+                GitReadOnly::run_git_command("diff", temp_dir.path().to_path_buf(), args).await
+            else {
+                panic!("Expected invalid params for {rejected}");
+            };
+            assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
+            assert!(error.message.contains(&rejected));
+            assert!(
+                !output_path.exists(),
+                "rejected git args created output file"
+            );
+        }
     }
 }

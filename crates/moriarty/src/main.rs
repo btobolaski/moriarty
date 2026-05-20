@@ -268,7 +268,7 @@ enum Command {
         #[command(subcommand)]
         server: McpServers,
     },
-    /// Approve project tools for MCP server execution
+    /// Approve project-configured tools and checks for the project-tools MCP server
     ApproveProject {
         /// The project directory containing .config/tools.toml
         project_dir: PathBuf,
