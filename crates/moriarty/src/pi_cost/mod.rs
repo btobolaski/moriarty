@@ -110,6 +110,7 @@ fn provider_label(provider: Provider) -> &'static str {
     match provider {
         Provider::Anthropic => "Anthropic",
         Provider::OpenAi => "OpenAI",
+        Provider::OpenRouter => "OpenRouter",
     }
 }
 

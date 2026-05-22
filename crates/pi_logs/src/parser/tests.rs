@@ -23,6 +23,7 @@ struct AssistantFixture<'a> {
     model: &'a str,
     stop_reason: &'a str,
     response_id: Option<&'a str>,
+    response_model: Option<&'a str>,
     error_message: Option<&'a str>,
 }
 
@@ -34,6 +35,7 @@ impl<'a> AssistantFixture<'a> {
             model,
             stop_reason,
             response_id: None,
+            response_model: None,
             error_message: None,
         }
     }
@@ -41,6 +43,13 @@ impl<'a> AssistantFixture<'a> {
     fn with_response_id(self, response_id: &'a str) -> Self {
         Self {
             response_id: Some(response_id),
+            ..self
+        }
+    }
+
+    fn with_response_model(self, response_model: &'a str) -> Self {
+        Self {
+            response_model: Some(response_model),
             ..self
         }
     }
@@ -209,6 +218,11 @@ fn assistant_message_json(content: Vec<Value>, fixture: AssistantFixture<'_>) ->
         &mut message,
         "errorMessage",
         fixture.error_message.map(Value::from),
+    );
+    insert_optional_field(
+        &mut message,
+        "responseModel",
+        fixture.response_model.map(Value::from),
     );
 
     message_line_json("a1", "u1", message)
@@ -639,10 +653,24 @@ fn model_change_with_parent() {
 }
 
 #[test]
+fn model_change_with_openrouter() {
+    let line = parse(model_change_json(Some("session-root"), "openrouter", "openai/gpt-5.4"));
+
+    match line {
+        PiLogLine::ModelChange(model_change) => {
+            assert_eq!(model_change.parent_id.as_deref(), Some("session-root"));
+            assert_eq!(model_change.provider, Provider::OpenRouter);
+        }
+        other => panic!("expected ModelChange, got {other:?}"),
+    }
+}
+
+#[test]
 fn provider_order_is_stable() {
     // `cost_analyzer::logs::PiModel` derives `Ord`, so reordering `Provider` variants would
     // silently change model ordering and any APIs that rely on that derived sort behavior.
     assert!(Provider::Anthropic < Provider::OpenAi);
+    assert!(Provider::OpenAi < Provider::OpenRouter);
 }
 
 #[test]
@@ -916,6 +944,7 @@ fn assistant_message_with_text_and_tool_call() {
     assert_eq!(assistant.provider, Provider::Anthropic);
     assert_eq!(assistant.stop_reason, AssistantStopReason::ToolUse);
     assert_eq!(assistant.response_id.as_deref(), Some("resp_1"));
+    assert_eq!(assistant.response_model, None);
     assert_eq!(assistant.content.len(), 2);
 
     match &assistant.content[0] {
@@ -932,6 +961,43 @@ fn assistant_message_with_text_and_tool_call() {
         }
         other => panic!("expected ToolCall, got {other:?}"),
     }
+}
+
+#[test]
+fn assistant_message_accepts_openrouter_openai_completions_response_model() {
+    let assistant = parse_assistant_message(
+        vec![json!({"type": "text", "text": "done"})],
+        AssistantFixture::new(
+            "openai-completions",
+            "openrouter",
+            "openai/gpt-5.4",
+            "stop",
+        )
+        .with_response_model("openai/gpt-5.4-20260305"),
+    );
+
+    assert_eq!(assistant.api, AssistantApi::OpenAiCompletions);
+    assert_eq!(assistant.provider, Provider::OpenRouter);
+    assert_eq!(assistant.model, "openai/gpt-5.4");
+    assert_eq!(
+        assistant.response_model.as_deref(),
+        Some("openai/gpt-5.4-20260305")
+    );
+}
+
+#[test]
+fn assistant_message_without_response_model_defaults_to_none() {
+    let assistant = parse_assistant_message(
+        vec![json!({"type": "text", "text": "hello"})],
+        AssistantFixture::new(
+            "anthropic-messages",
+            "anthropic",
+            "claude-sonnet-4-5",
+            "stop",
+        ),
+    );
+
+    assert_eq!(assistant.response_model, None);
 }
 
 #[test]
@@ -3218,6 +3284,32 @@ fn custom_plannotator_accepts_snapshot_saved_state_with_minimal_thinking() {
             assert_eq!(snapshot.model.provider, Provider::OpenAi);
             assert_eq!(snapshot.model.id, "gpt-5.5");
             assert_eq!(snapshot.thinking_level, ThinkingLevel::Minimal);
+        }
+        other => panic!("expected Plannotator, got {other:?}"),
+    }
+}
+
+#[test]
+fn custom_plannotator_accepts_snapshot_saved_state_with_openrouter() {
+    match parse_custom_payload(
+        "plannotator",
+        json!({
+            "phase": "planning",
+            "savedState": {
+                "activeTools": ["read", "bash"],
+                "model": {"provider": "openrouter", "id": "openai/gpt-5.4"},
+                "thinkingLevel": "medium"
+            }
+        }),
+    ) {
+        CustomPayload::Plannotator(details) => {
+            let Some(PlannotatorSavedState::Snapshot(snapshot)) = details.saved_state else {
+                panic!("expected snapshot saved_state")
+            };
+            assert_eq!(snapshot.active_tools, vec![ToolName::Read, ToolName::Bash]);
+            assert_eq!(snapshot.model.provider, Provider::OpenRouter);
+            assert_eq!(snapshot.model.id, "openai/gpt-5.4");
+            assert_eq!(snapshot.thinking_level, ThinkingLevel::Medium);
         }
         other => panic!("expected Plannotator, got {other:?}"),
     }

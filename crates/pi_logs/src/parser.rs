@@ -331,6 +331,8 @@ pub struct AssistantMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
 }
 
@@ -516,6 +518,8 @@ pub enum Provider {
     Anthropic,
     #[serde(rename = "openai")]
     OpenAi,
+    #[serde(rename = "openrouter")]
+    OpenRouter,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -534,6 +538,8 @@ pub enum AssistantApi {
     AnthropicMessages,
     #[serde(rename = "openai-responses")]
     OpenAiResponses,
+    #[serde(rename = "openai-completions")]
+    OpenAiCompletions,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
