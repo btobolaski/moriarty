@@ -590,10 +590,17 @@ pub enum ToolName {
     Todo,
     WebSearch,
     Write,
-    // Tools provided by the pi-lean-ctx extension. They appear in the
-    // `pi-loaded-tools` manifest of sessions where lean-ctx is loaded; we
-    // do not model their argument schemas because we never invoke them
-    // directly.
+    // Tools provided by the pi-lens extension. They appear in
+    // `pi-loaded-tools` manifests and Plannotator saved-state snapshots even
+    // when sessions never invoke them directly.
+    AstGrepSearch,
+    AstGrepReplace,
+    LspDiagnostics,
+    LspNavigation,
+    // Tools provided by the pi-lean-ctx extension. Most only appear in the
+    // `pi-loaded-tools` manifest of sessions where lean-ctx is loaded, but
+    // `ctx_cache` is also invoked directly in assistant tool calls and has a
+    // dedicated typed argument struct below.
     CtxAgent,
     CtxAnalyze,
     CtxArchitecture,
@@ -960,11 +967,12 @@ pub struct EditReplacement {
     pub description: Option<String>,
 }
 
-/// `ctx_cache` is the only `ctx_*` extension tool we model with typed
-/// argument structs. Unlike its siblings (which only ever appear in the
+/// `ctx_cache` is the only `ctx_*` extension tool we keep a typed helper
+/// schema for. Unlike its siblings (which only ever appear in the
 /// `pi-loaded-tools` manifest), `ctx_cache` is invoked directly by the
-/// assistant in real session logs, so we need its argument schema to
-/// deserialize those tool calls cleanly.
+/// assistant in real session logs, so documenting its observed argument
+/// shape is useful for post-parse consumers even though tool-call
+/// arguments stay raw JSON in `ToolCallContent`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CtxCacheArgs {

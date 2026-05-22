@@ -654,7 +654,11 @@ fn model_change_with_parent() {
 
 #[test]
 fn model_change_with_openrouter() {
-    let line = parse(model_change_json(Some("session-root"), "openrouter", "openai/gpt-5.4"));
+    let line = parse(model_change_json(
+        Some("session-root"),
+        "openrouter",
+        "openai/gpt-5.4",
+    ));
 
     match line {
         PiLogLine::ModelChange(model_change) => {
@@ -967,13 +971,8 @@ fn assistant_message_with_text_and_tool_call() {
 fn assistant_message_accepts_openrouter_openai_completions_response_model() {
     let assistant = parse_assistant_message(
         vec![json!({"type": "text", "text": "done"})],
-        AssistantFixture::new(
-            "openai-completions",
-            "openrouter",
-            "openai/gpt-5.4",
-            "stop",
-        )
-        .with_response_model("openai/gpt-5.4-20260305"),
+        AssistantFixture::new("openai-completions", "openrouter", "openai/gpt-5.4", "stop")
+            .with_response_model("openai/gpt-5.4-20260305"),
     );
 
     assert_eq!(assistant.api, AssistantApi::OpenAiCompletions);
@@ -3223,6 +3222,19 @@ fn hermes_memory_tool_calls_keep_declared_names() {
 }
 
 #[test]
+fn pi_lens_tool_calls_keep_declared_names() {
+    for (tool_name, expected) in [
+        ("ast_grep_search", ToolName::AstGrepSearch),
+        ("ast_grep_replace", ToolName::AstGrepReplace),
+        ("lsp_diagnostics", ToolName::LspDiagnostics),
+        ("lsp_navigation", ToolName::LspNavigation),
+    ] {
+        let tool_call = parse_tool_call(tool_name, json!({"path": "src/main.rs"}));
+        assert_eq!(tool_call.name(), expected);
+    }
+}
+
+#[test]
 fn git_read_only_tool_call_preserves_raw_snake_case_arguments() {
     let raw_arguments = json!({
         "project_dir": "/tmp/repo",
@@ -3310,6 +3322,47 @@ fn custom_plannotator_accepts_snapshot_saved_state_with_openrouter() {
             assert_eq!(snapshot.model.provider, Provider::OpenRouter);
             assert_eq!(snapshot.model.id, "openai/gpt-5.4");
             assert_eq!(snapshot.thinking_level, ThinkingLevel::Medium);
+        }
+        other => panic!("expected Plannotator, got {other:?}"),
+    }
+}
+
+#[test]
+fn custom_plannotator_accepts_snapshot_saved_state_with_pi_lens_tools() {
+    match parse_custom_payload(
+        "plannotator",
+        json!({
+            "phase": "planning",
+            "savedState": {
+                "activeTools": [
+                    "read",
+                    "ast_grep_search",
+                    "ast_grep_replace",
+                    "lsp_diagnostics",
+                    "lsp_navigation"
+                ],
+                "model": {"provider": "anthropic", "id": "claude-sonnet-4-5"},
+                "thinkingLevel": "high"
+            }
+        }),
+    ) {
+        CustomPayload::Plannotator(details) => {
+            let Some(PlannotatorSavedState::Snapshot(snapshot)) = details.saved_state else {
+                panic!("expected snapshot saved_state")
+            };
+            assert_eq!(
+                snapshot.active_tools,
+                vec![
+                    ToolName::Read,
+                    ToolName::AstGrepSearch,
+                    ToolName::AstGrepReplace,
+                    ToolName::LspDiagnostics,
+                    ToolName::LspNavigation,
+                ]
+            );
+            assert_eq!(snapshot.model.provider, Provider::Anthropic);
+            assert_eq!(snapshot.model.id, "claude-sonnet-4-5");
+            assert_eq!(snapshot.thinking_level, ThinkingLevel::High);
         }
         other => panic!("expected Plannotator, got {other:?}"),
     }
@@ -3607,6 +3660,12 @@ fn custom_message_pi_loaded_tools_accepts_modeled_manifest_names() {
         ("session_search", ToolName::SessionSearch),
         ("skill", ToolName::Skill),
     ];
+    let pi_lens_cases = [
+        ("ast_grep_search", ToolName::AstGrepSearch),
+        ("ast_grep_replace", ToolName::AstGrepReplace),
+        ("lsp_diagnostics", ToolName::LspDiagnostics),
+        ("lsp_navigation", ToolName::LspNavigation),
+    ];
 
     let mut tools = Vec::new();
     for (wire_name, _) in &builtin_cases {
@@ -3661,6 +3720,17 @@ fn custom_message_pi_loaded_tools_accepts_modeled_manifest_names() {
             "scope": "user",
             "origin": "package",
             "extensionPath": "npm:pi-hermes-memory@0.7.10"
+        }));
+    }
+    for (wire_name, _) in &pi_lens_cases {
+        tools.push(json!({
+            "name": wire_name,
+            "description": "pi lens tool",
+            "active": true,
+            "source": "extension",
+            "scope": "user",
+            "origin": "package",
+            "extensionPath": "npm:pi-lens@3.8.44"
         }));
     }
 
@@ -3729,6 +3799,16 @@ fn custom_message_pi_loaded_tools_accepts_modeled_manifest_names() {
                     tool.extension_path.as_deref(),
                     Some("npm:pi-hermes-memory@0.7.10")
                 );
+                index += 1;
+            }
+
+            for (_, expected_name) in &pi_lens_cases {
+                let tool = &details.tools[index];
+                assert_eq!(tool.name, *expected_name);
+                assert_eq!(tool.source, ToolSource::Extension);
+                assert_eq!(tool.scope, ToolScope::User);
+                assert_eq!(tool.origin, ToolOrigin::Package);
+                assert_eq!(tool.extension_path.as_deref(), Some("npm:pi-lens@3.8.44"));
                 index += 1;
             }
         }
