@@ -111,6 +111,7 @@ fn provider_label(provider: Provider) -> &'static str {
         Provider::Anthropic => "Anthropic",
         Provider::OpenAi => "OpenAI",
         Provider::OpenRouter => "OpenRouter",
+        Provider::Faux => "Faux",
     }
 }
 

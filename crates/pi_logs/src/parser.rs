@@ -3,15 +3,15 @@
 //! A pi session log file is newline-delimited JSON. Each line is a
 //! [`PiLogLine`] keyed by the top-level `type` field. Most nested payloads are
 //! modeled as tagged enums or concrete structs with
-//! `#[serde(deny_unknown_fields)]` so that upstream format changes surface as
-//! parse errors rather than silent data loss.
+//! `#[serde(deny_unknown_fields)]` so that most upstream format changes surface
+//! as parse errors rather than silent data loss.
 //!
 //! Tool-call envelopes stay typed and strict, but [`ToolCallContent`]
 //! deliberately preserves the inner `arguments` object as raw JSON. Pi logs the
 //! model-emitted payload before the runtime validates it, so hard-coding tool
 //! schemas into the parser would reject or misrepresent real sessions.
 //!
-//! Two categories of structure legitimately deviate from the strict default:
+//! Three categories of structure legitimately deviate from the strict default:
 //!
 //! * **`serde(flatten)` of an internally-tagged enum** — when the flattened
 //!   target is an internally-tagged enum (one with `#[serde(tag = "...")]`
@@ -41,6 +41,14 @@
 //!     4. Value-level fallback enums ([`MaybeU32`]) whose `Garbage` variant
 //!        absorbs string-typed corruption (e.g. `"limit": "limit"` where
 //!        the model echoed the schema field name as the value).
+//!
+//! * **Open-ended protocol discriminators** — [`AssistantApi`] uses a custom
+//!   deserializer that accepts a small set of well-known API identifiers
+//!   (`anthropic-messages`, `openai-responses`, `openai-completions`) plus
+//!   `faux:`-prefixed routing strings emitted by the faux AI provider. Any
+//!   other string value still fails loudly. This is intentionally narrower
+//!   than a fully open `String` but wider than a strict enum, because faux
+//!   session IDs are dynamic and cannot be enumerated ahead of time.
 //!
 //! Each corrupt-stream exception carries an inline comment naming the
 //! observed failure mode.
@@ -506,10 +514,14 @@ pub struct UsageCost {
     pub cache_read: Decimal,
     pub cache_write: Decimal,
     pub total: Decimal,
+    /// Origin of the cost values (e.g. "provider", "pi"). Pi adds this field;
+    /// optional for backward compatibility with older log files that lack it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
-// Closed discriminator enums
+// Discriminator enums
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -520,6 +532,8 @@ pub enum Provider {
     OpenAi,
     #[serde(rename = "openrouter")]
     OpenRouter,
+    #[serde(rename = "faux")]
+    Faux,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -532,9 +546,55 @@ pub enum ThinkingLevel {
     High,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum AssistantApi {
-    #[serde(rename = "anthropic-messages")]
+    /// One of the well-known API protocol identifiers (anthropic-messages,
+    /// openai-responses, openai-completions).
+    Known(ApiKind),
+    /// Faux-internal API routing identifier of the form
+    /// `"faux:<session-id>:<worker-id>"`. This is not a standard API protocol
+    /// but a pi internal routing label that should be preserved rather than
+    /// rejected, so faux sessions produce usable reports.
+    Faux(String),
+}
+
+// Custom serde to keep the wire format as a plain string rather than an
+// externally tagged JSON object. Deserialize enforces the narrow set of
+// accepted strings; Serialize preserves the same shape for round-tripping.
+impl serde::Serialize for AssistantApi {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            AssistantApi::Known(kind) => kind.serialize(serializer),
+            AssistantApi::Faux(api) => serializer.serialize_str(api),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for AssistantApi {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        match s.as_str() {
+            "anthropic-messages" => return Ok(AssistantApi::Known(ApiKind::AnthropicMessages)),
+            "openai-responses" => return Ok(AssistantApi::Known(ApiKind::OpenAiResponses)),
+            "openai-completions" => return Ok(AssistantApi::Known(ApiKind::OpenAiCompletions)),
+            _ if s.starts_with("faux:") => return Ok(AssistantApi::Faux(s)),
+            _ => {}
+        }
+        Err(serde::de::Error::unknown_variant(
+            &s,
+            &[
+                "anthropic-messages",
+                "openai-responses",
+                "openai-completions",
+                "faux:*",
+            ],
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ApiKind {
     AnthropicMessages,
     #[serde(rename = "openai-responses")]
     OpenAiResponses,
@@ -1747,6 +1807,10 @@ pub struct LsDetails {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EditDetails {
     pub diff: String,
+    /// Ni emits this alongside `diff`; keep it optional so upstream pi logs
+    /// without the fork-specific field still parse strictly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub patch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_changed_line: Option<u32>,
 }

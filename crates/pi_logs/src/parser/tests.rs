@@ -675,6 +675,43 @@ fn provider_order_is_stable() {
     // silently change model ordering and any APIs that rely on that derived sort behavior.
     assert!(Provider::Anthropic < Provider::OpenAi);
     assert!(Provider::OpenAi < Provider::OpenRouter);
+    assert!(Provider::OpenRouter < Provider::Faux);
+}
+
+#[test]
+fn model_change_with_faux() {
+    let line = parse(model_change_json(Some("session-root"), "faux", "faux-1"));
+
+    match line {
+        PiLogLine::ModelChange(model_change) => {
+            assert_eq!(model_change.parent_id.as_deref(), Some("session-root"));
+            assert_eq!(model_change.provider, Provider::Faux);
+            assert_eq!(model_change.model_id, "faux-1");
+        }
+        other => panic!("expected ModelChange, got {other:?}"),
+    }
+}
+
+#[test]
+fn model_change_rejects_unknown_provider() {
+    let err = parse_err(model_change_json(Some("session-root"), "unknown-provider", "model-1"));
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("unknown variant `unknown-provider`") || msg.contains("unknown-provider"),
+        "expected rejection of unknown provider, got: {msg}"
+    );
+}
+
+#[test]
+fn model_change_asserts_model_id() {
+    let line = parse(model_change_json(None, "anthropic", "claude-sonnet-4-5"));
+
+    match line {
+        PiLogLine::ModelChange(model_change) => {
+            assert_eq!(model_change.model_id, "claude-sonnet-4-5");
+        }
+        other => panic!("expected ModelChange, got {other:?}"),
+    }
 }
 
 #[test]
@@ -944,7 +981,7 @@ fn assistant_message_with_text_and_tool_call() {
         .with_response_id("resp_1"),
     );
 
-    assert_eq!(assistant.api, AssistantApi::AnthropicMessages);
+    assert_eq!(assistant.api, AssistantApi::Known(ApiKind::AnthropicMessages));
     assert_eq!(assistant.provider, Provider::Anthropic);
     assert_eq!(assistant.stop_reason, AssistantStopReason::ToolUse);
     assert_eq!(assistant.response_id.as_deref(), Some("resp_1"));
@@ -975,7 +1012,7 @@ fn assistant_message_accepts_openrouter_openai_completions_response_model() {
             .with_response_model("openai/gpt-5.4-20260305"),
     );
 
-    assert_eq!(assistant.api, AssistantApi::OpenAiCompletions);
+    assert_eq!(assistant.api, AssistantApi::Known(ApiKind::OpenAiCompletions));
     assert_eq!(assistant.provider, Provider::OpenRouter);
     assert_eq!(assistant.model, "openai/gpt-5.4");
     assert_eq!(
@@ -997,6 +1034,166 @@ fn assistant_message_without_response_model_defaults_to_none() {
     );
 
     assert_eq!(assistant.response_model, None);
+}
+
+#[test]
+fn assistant_api_known_values_parse_as_known_variants() {
+    let cases = [
+        ("anthropic-messages", ApiKind::AnthropicMessages),
+        ("openai-responses", ApiKind::OpenAiResponses),
+        ("openai-completions", ApiKind::OpenAiCompletions),
+    ];
+
+    for (api, expected) in cases {
+        let assistant = parse_assistant_message(
+            vec![json!({"type": "text", "text": "ok"})],
+            AssistantFixture::new(api, "openai", "gpt-5.4", "stop"),
+        );
+        assert_eq!(
+            assistant.api,
+            AssistantApi::Known(expected),
+            "expected Known({expected:?}) for api={api:?}"
+        );
+    }
+}
+
+#[test]
+fn assistant_message_accepts_faux_api_identifier() {
+    let assistant = parse_assistant_message(
+        vec![json!({"type": "text", "text": "simulated"})],
+        AssistantFixture::new(
+            "faux:1779726916919:3u6tax2mqmp",
+            "faux",
+            "faux-1",
+            "stop",
+        ),
+    );
+
+    assert_eq!(
+        assistant.api,
+        AssistantApi::Faux("faux:1779726916919:3u6tax2mqmp".to_string())
+    );
+    assert_eq!(assistant.provider, Provider::Faux);
+    assert_eq!(assistant.model, "faux-1");
+}
+
+#[test]
+fn assistant_api_rejects_unknown_identifier() {
+    let err = parse_err(assistant_message_json(
+        vec![json!({"type": "text", "text": "ok"})],
+        AssistantFixture::new("unknown-api", "openai", "gpt-5.4", "stop"),
+    ));
+    let msg = format!("{err}");
+    assert!(msg.contains("unknown variant `unknown-api`"), "{msg}");
+}
+
+#[test]
+fn usage_cost_accepts_source_field() {
+    // Pi now emits a `source` field inside the cost object.
+    let line = r#"{"type":"message","id":"m1","parentId":"root","timestamp":"2026-04-25T01:48:25.742Z","message":{"role":"assistant","content":[{"type":"text","text":"ok"}],"api":"anthropic-messages","provider":"anthropic","model":"claude-sonnet-4-5","usage":{"input":10,"output":20,"cacheRead":0,"cacheWrite":0,"totalTokens":30,"cost":{"input":0.001,"output":0.002,"cacheRead":0,"cacheWrite":0,"total":0.003,"source":"provider"}},"stopReason":"stop","timestamp":1700000000}}"#;
+    let parsed: PiLogLine = serde_json::from_str(line).unwrap();
+    match parsed {
+        PiLogLine::Message(m) => match &m.message {
+            RoleMessage::Assistant(msg) => {
+                let source = &msg.usage.cost.source;
+                assert_eq!(source.as_deref(), Some("provider"), "unexpected source: {source:?}");
+            }
+            other => panic!("expected Assistant, got {other:?}"),
+        },
+        other => panic!("expected Message, got {other:?}"),
+    }
+}
+
+#[test]
+fn usage_cost_omits_source_when_absent() {
+    // Old log files without `source` should still parse.
+    let line = r#"{"type":"message","id":"m1","parentId":"root","timestamp":"2026-04-25T01:48:25.742Z","message":{"role":"assistant","content":[{"type":"text","text":"ok"}],"api":"anthropic-messages","provider":"anthropic","model":"claude-sonnet-4-5","usage":{"input":10,"output":20,"cacheRead":0,"cacheWrite":0,"totalTokens":30,"cost":{"input":0.001,"output":0.002,"cacheRead":0,"cacheWrite":0,"total":0.003}},"stopReason":"stop","timestamp":1700000000}}"#;
+    let parsed: PiLogLine = serde_json::from_str(line).unwrap();
+    match parsed {
+        PiLogLine::Message(m) => match &m.message {
+            RoleMessage::Assistant(msg) => {
+                let source = &msg.usage.cost.source;
+                assert_eq!(source, &None, "unexpected source: {source:?}");
+            }
+            other => panic!("expected Assistant, got {other:?}"),
+        },
+        other => panic!("expected Message, got {other:?}"),
+    }
+}
+
+#[test]
+fn edit_details_accepts_patch_field() {
+    // Ni emits a `patch` field alongside `diff` in edit tool results.
+    let line = r#"{"type":"message","id":"m1","parentId":"root","timestamp":"2026-04-25T01:48:25.742Z","message":{"role":"toolResult","toolCallId":"tc1","toolName":"edit","content":[{"type":"text","text":"ok"}],"details":{"diff":"--- a\n+++ b\n@@ -1 +1 @@\n-old\n+new\n","patch":"--- a\n+++ b\n@@ -1 +1 @@\n-foo\n+bar\n","firstChangedLine":1},"isError":false,"timestamp":1700000000}}"#;
+    let parsed: PiLogLine = serde_json::from_str(line).unwrap();
+    match parsed {
+        PiLogLine::Message(m) => match m.message {
+            RoleMessage::ToolResult(tool_result) => {
+                let details = tool_result.details.unwrap();
+                match details {
+                    ToolResultDetails::Edit(edit) => {
+                        assert!(edit.patch.is_some(), "expected patch to be present");
+                        assert!(edit.patch.as_deref().unwrap().contains("@@ -1 +1 @@"));
+                        assert_eq!(edit.first_changed_line, Some(1));
+                    }
+                    other => panic!("expected Edit, got {other:?}"),
+                }
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        },
+        other => panic!("expected Message, got {other:?}"),
+    }
+}
+
+#[test]
+fn edit_details_patch_absent_by_default() {
+    // Upstream pi logs without `patch` should still parse.
+    let line = r#"{"type":"message","id":"m1","parentId":"root","timestamp":"2026-04-25T01:48:25.742Z","message":{"role":"toolResult","toolCallId":"tc1","toolName":"edit","content":[{"type":"text","text":"ok"}],"details":{"diff":"--- a\n+++ b\n@@ -1 +1 @@\n-old\n+new\n","firstChangedLine":1},"isError":false,"timestamp":1700000000}}"#;
+    let parsed: PiLogLine = serde_json::from_str(line).unwrap();
+    match parsed {
+        PiLogLine::Message(m) => match m.message {
+            RoleMessage::ToolResult(tool_result) => {
+                let details = tool_result.details.unwrap();
+                match details {
+                    ToolResultDetails::Edit(edit) => {
+                        assert_eq!(edit.patch, None);
+                        assert_eq!(edit.first_changed_line, Some(1));
+                    }
+                    other => panic!("expected Edit, got {other:?}"),
+                }
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        },
+        other => panic!("expected Message, got {other:?}"),
+    }
+}
+
+#[test]
+fn assistant_api_round_trips_known_variants() {
+    let cases = [
+        ("anthropic-messages", ApiKind::AnthropicMessages),
+        ("openai-responses", ApiKind::OpenAiResponses),
+        ("openai-completions", ApiKind::OpenAiCompletions),
+    ];
+    for (expected_str, kind) in cases {
+        let api = AssistantApi::Known(kind);
+        let serialized = serde_json::to_value(&api).unwrap();
+        assert_eq!(serialized, json!(expected_str), "Known({kind:?})");
+
+        let deserialized: AssistantApi = serde_json::from_value(serialized).unwrap();
+        assert_eq!(deserialized, api, "round-trip for Known({kind:?})");
+    }
+}
+
+#[test]
+fn assistant_api_round_trips_faux() {
+    let id = "faux:session-id:worker-id";
+    let api = AssistantApi::Faux(id.to_string());
+    let serialized = serde_json::to_value(&api).unwrap();
+    assert_eq!(serialized, json!(id));
+
+    let deserialized: AssistantApi = serde_json::from_value(serialized).unwrap();
+    assert_eq!(deserialized, api);
 }
 
 #[test]
