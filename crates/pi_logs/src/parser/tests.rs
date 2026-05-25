@@ -2027,6 +2027,298 @@ fn web_search_tool_result_accepts_details() {
     assert_eq!(details.fetch_id.as_deref(), Some("fetch_1"));
     assert_eq!(details.total_results, 3);
     assert!(details.include_content);
+
+    assert!(!details.curated);
+    assert_eq!(details.curated_from, None);
+    assert_eq!(details.curated_queries, None);
+    assert_eq!(details.summary, None);
+}
+
+#[test]
+fn web_search_tool_result_accepts_curated_details() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "web_search",
+        vec![json!({"type": "text", "text": "Found curated results"})],
+        false,
+        Some(json!({
+            "searchId": "search_curated",
+            "fetchId": "fetch_curated",
+            "queryCount": 3,
+            "successfulQueries": 2,
+            "totalResults": 10,
+            "includeContent": true,
+            "queries": ["initial query", "follow up", "third query"],
+            "curated": true,
+            "curatedFrom": 3,
+            "curatedQueries": [{
+                "query": "curated query one",
+                "provider": "exa",
+                "answer": "Curated answer one",
+                "sources": [{
+                    "title": "Example Source",
+                    "url": "https://example.com/source1"
+                }]
+            }, {
+                "query": "curated query two",
+                "provider": "perplexity",
+                "answer": "Curated answer two",
+                "sources": [{
+                    "title": "Another Source",
+                    "url": "https://example.com/source2"
+                }, {
+                    "title": "Third Source",
+                    "url": "https://example.com/source3"
+                }]
+            }],
+            "summary": {
+                "text": "Curated search summary text",
+                "workflow": "curated-search",
+                "model": "claude-sonnet-4-5",
+                "durationMs": 1234,
+                "tokenEstimate": 567,
+                "fallbackUsed": true,
+                "edited": true
+            }
+        })),
+    ));
+
+    let Some(ToolResultDetails::WebSearch(details)) = tool_result.details else {
+        panic!("expected WebSearch details")
+    };
+
+    assert!(details.curated);
+    assert_eq!(details.curated_from, Some(3));
+
+    let curated_queries = details
+        .curated_queries
+        .as_ref()
+        .expect("expected curated queries");
+    assert_eq!(curated_queries.len(), 2);
+
+    assert_eq!(curated_queries[0].query, "curated query one");
+    assert_eq!(curated_queries[0].provider.as_deref(), Some("exa"));
+    assert_eq!(curated_queries[0].answer.as_deref(), Some("Curated answer one"));
+    let sources_0 = curated_queries[0]
+        .sources
+        .as_ref()
+        .expect("expected sources");
+    assert_eq!(sources_0.len(), 1);
+    assert_eq!(sources_0[0].title, "Example Source");
+    assert_eq!(sources_0[0].url, "https://example.com/source1");
+    assert_eq!(curated_queries[0].error, None);
+
+    assert_eq!(curated_queries[1].query, "curated query two");
+    assert_eq!(curated_queries[1].provider.as_deref(), Some("perplexity"));
+    assert_eq!(curated_queries[1].answer.as_deref(), Some("Curated answer two"));
+    let sources_1 = curated_queries[1]
+        .sources
+        .as_ref()
+        .expect("expected sources");
+    assert_eq!(sources_1.len(), 2);
+    assert_eq!(sources_1[0].title, "Another Source");
+    assert_eq!(sources_1[1].title, "Third Source");
+    assert_eq!(curated_queries[1].error, None);
+
+    let summary = details.summary.as_ref().expect("expected summary");
+    assert_eq!(summary.text, "Curated search summary text");
+    assert_eq!(summary.workflow, "curated-search");
+    assert_eq!(summary.model.as_deref(), Some("claude-sonnet-4-5"));
+    assert_eq!(summary.duration_ms, Some(1234));
+    assert_eq!(summary.token_estimate, Some(567));
+    assert!(summary.fallback_used);
+    assert!(summary.edited);
+}
+
+#[test]
+fn web_search_tool_result_summary_defaults() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "web_search",
+        vec![json!({"type": "text", "text": "Found results"})],
+        false,
+        Some(json!({
+            "searchId": "search_1",
+            "queryCount": 1,
+            "successfulQueries": 1,
+            "totalResults": 5,
+            "includeContent": false,
+            "queries": ["rust serde"],
+            "curated": true,
+            "summary": {
+                "text": "Summary text",
+                "workflow": "curated-web-search"
+            }
+        })),
+    ));
+
+    let Some(ToolResultDetails::WebSearch(details)) = tool_result.details else {
+        panic!("expected WebSearch details")
+    };
+
+    let summary = details.summary.as_ref().expect("expected summary");
+    assert_eq!(summary.text, "Summary text");
+    assert_eq!(summary.workflow, "curated-web-search");
+    assert_eq!(summary.model, None);
+    assert_eq!(summary.duration_ms, None);
+    assert_eq!(summary.token_estimate, None);
+    assert!(!summary.fallback_used);
+    assert!(!summary.edited);
+}
+
+#[test]
+fn web_search_tool_result_rejects_unknown_curated_query_source_field() {
+    let err = parse_err(tool_result_message_json(
+        "web_search",
+        vec![json!({"type": "text", "text": "curated"})],
+        false,
+        Some(json!({
+            "searchId": "search_1",
+            "queryCount": 1,
+            "successfulQueries": 1,
+            "totalResults": 1,
+            "includeContent": false,
+            "queries": ["query"],
+            "curated": true,
+            "curatedQueries": [{
+                "query": "q",
+                "sources": [{
+                    "title": "Test",
+                    "url": "https://example.com",
+                    "unexpected": true
+                }]
+            }]
+        })),
+    ))
+    .to_string();
+
+    assert!(
+        err.contains("unknown field") || err.contains("unexpected"),
+        "expected parse error mentioning unknown source field, got: {err}"
+    );
+}
+
+#[test]
+fn web_search_tool_result_rejects_unknown_curated_query_field() {
+    let err = parse_err(tool_result_message_json(
+        "web_search",
+        vec![json!({"type": "text", "text": "curated"})],
+        false,
+        Some(json!({
+            "searchId": "search_1",
+            "queryCount": 1,
+            "successfulQueries": 1,
+            "totalResults": 1,
+            "includeContent": false,
+            "queries": ["query"],
+            "curated": true,
+            "curatedQueries": [{
+                "query": "q",
+                "unexpected": true
+            }]
+        })),
+    ))
+    .to_string();
+
+    assert!(
+        err.contains("unknown field") || err.contains("unexpected"),
+        "expected parse error mentioning unknown curated query field, got: {err}"
+    );
+}
+
+#[test]
+fn web_search_tool_result_rejects_unknown_summary_field() {
+    let err = parse_err(tool_result_message_json(
+        "web_search",
+        vec![json!({"type": "text", "text": "curated"})],
+        false,
+        Some(json!({
+            "searchId": "search_1",
+            "queryCount": 1,
+            "successfulQueries": 1,
+            "totalResults": 1,
+            "includeContent": false,
+            "queries": ["query"],
+            "curated": true,
+            "summary": {
+                "text": "summary",
+                "workflow": "search",
+                "unexpected": true
+            }
+        })),
+    ))
+    .to_string();
+
+    assert!(
+        err.contains("unknown field") || err.contains("unexpected"),
+        "expected parse error mentioning unknown summary field, got: {err}"
+    );
+}
+
+#[test]
+fn web_search_tool_result_accepts_curated_query_error_entry() {
+    // A curated query with only query + error (no provider/answer/sources)
+    // exercises the optional success-only fields on CuratedQueryInfo.
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "web_search",
+        vec![json!({"type": "text", "text": "Found partial curated results"})],
+        false,
+        Some(json!({
+            "searchId": "search_1",
+            "fetchId": "fetch_1",
+            "queryCount": 1,
+            "successfulQueries": 0,
+            "totalResults": 0,
+            "includeContent": true,
+            "queries": ["failed query"],
+            "curated": true,
+            "curatedFrom": 1,
+            "curatedQueries": [{
+                "query": "failed query",
+                "error": "This operation was aborted"
+            }]
+        })),
+    ));
+
+    let Some(ToolResultDetails::WebSearch(details)) = tool_result.details else {
+        panic!("expected WebSearch details")
+    };
+
+    let curated_queries = details
+        .curated_queries
+        .as_ref()
+        .expect("expected curated queries");
+
+    assert_eq!(curated_queries.len(), 1);
+    assert_eq!(curated_queries[0].query, "failed query");
+    assert_eq!(
+        curated_queries[0].error.as_deref(),
+        Some("This operation was aborted")
+    );
+    assert_eq!(curated_queries[0].provider, None);
+    assert_eq!(curated_queries[0].answer, None);
+    assert_eq!(curated_queries[0].sources, None);
+}
+
+#[test]
+fn web_search_tool_result_rejects_unknown_details_field() {
+    assert_parse_error_contains_any(
+        "web_search rejects unknown details field",
+        tool_result_message_json(
+            "web_search",
+            vec![json!({"type": "text", "text": "Found results"})],
+            false,
+            Some(json!({
+                "searchId": "search_1",
+                "queryCount": 1,
+                "successfulQueries": 1,
+                "totalResults": 1,
+                "includeContent": false,
+                "queries": ["query"],
+                "curated": true,
+                "unexpected": true
+            })),
+        ),
+        &["unknown field", "unexpected"],
+    );
 }
 
 #[test]

@@ -2081,6 +2081,44 @@ pub struct CodeSearchDetails {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CuratedQuerySource {
+    pub title: String,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CuratedQueryInfo {
+    pub query: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sources: Option<Vec<CuratedQuerySource>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SearchSummary {
+    pub text: String,
+    pub workflow: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_estimate: Option<u64>,
+    #[serde(default)]
+    pub fallback_used: bool,
+    #[serde(default)]
+    pub edited: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WebSearchDetails {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fetch_id: Option<String>,
@@ -2091,6 +2129,14 @@ pub struct WebSearchDetails {
     pub total_results: u32,
     pub include_content: bool,
     pub queries: Vec<String>,
+    #[serde(default)]
+    pub curated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub curated_from: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub curated_queries: Option<Vec<CuratedQueryInfo>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<SearchSummary>,
 }
 
 /// `read` emits two sub-shapes for `details` that classify here: a plain
