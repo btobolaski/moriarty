@@ -3241,6 +3241,82 @@ fn find_tool_result_accepts_legacy_result_limit() {
         panic!("expected Find details")
     };
     assert_eq!(details.result_limit_reached, Some(250));
+    assert!(details.truncation.is_none());
+    assert!(details.compression.is_none());
+}
+
+#[test]
+fn find_tool_result_accepts_result_limit_and_truncation_details() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "find",
+        vec![json!({"type": "text", "text": "sessions/..."})],
+        false,
+        Some(json!({
+            "resultLimitReached": 500,
+            "truncation": {
+                "content": "sessions/...",
+                "truncated": true,
+                "truncatedBy": "bytes",
+                "totalLines": 500,
+                "totalBytes": 59789,
+                "outputLines": 427,
+                "outputBytes": 51147,
+                "lastLinePartial": false,
+                "firstLineExceedsLimit": false,
+                "maxLines": 9007199254740991u64,
+                "maxBytes": 51200
+            }
+        })),
+    ));
+    let Some(ToolResultDetails::Find(details)) = tool_result.details else {
+        panic!("expected Find details")
+    };
+    assert_eq!(details.result_limit_reached, Some(500));
+    let truncation = details
+        .truncation
+        .as_ref()
+        .expect("expected truncation details");
+    assert!(truncation.truncated);
+    assert_eq!(truncation.truncated_by, TruncatedBy::Bytes);
+    assert_eq!(truncation.total_bytes, 59789);
+    assert_eq!(truncation.output_bytes, 51147);
+    assert!(details.compression.is_none());
+}
+
+#[test]
+fn find_tool_result_accepts_truncation_details_without_result_limit() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "find",
+        vec![json!({"type": "text", "text": "sessions/..."})],
+        false,
+        Some(json!({
+            "truncation": {
+                "content": "sessions/...",
+                "truncated": true,
+                "truncatedBy": "bytes",
+                "totalLines": 500,
+                "totalBytes": 59789,
+                "outputLines": 427,
+                "outputBytes": 51147,
+                "lastLinePartial": false,
+                "firstLineExceedsLimit": false,
+                "maxLines": 9007199254740991u64,
+                "maxBytes": 51200
+            }
+        })),
+    ));
+    let Some(ToolResultDetails::Find(details)) = tool_result.details else {
+        panic!("expected Find details")
+    };
+    assert!(details.result_limit_reached.is_none());
+    let truncation = details
+        .truncation
+        .as_ref()
+        .expect("expected truncation details");
+    assert!(truncation.truncated);
+    assert_eq!(truncation.truncated_by, TruncatedBy::Bytes);
+    assert_eq!(truncation.content, "sessions/...");
+    assert_eq!(truncation.output_bytes, 51147);
     assert!(details.compression.is_none());
 }
 
@@ -4420,6 +4496,28 @@ fn ls_shaped_payload_lands_in_ls_during_direct_details_deserialization() {
     }))
     .expect("expected direct ToolResultDetails parse");
     assert!(matches!(details, ToolResultDetails::Ls(_)));
+}
+
+#[test]
+fn find_truncation_payload_lands_in_find_during_direct_details_deserialization() {
+    let details: ToolResultDetails = serde_json::from_value(json!({
+        "resultLimitReached": 500,
+        "truncation": {
+            "content": "sessions/...",
+            "truncated": true,
+            "truncatedBy": "bytes",
+            "totalLines": 500,
+            "totalBytes": 59789,
+            "outputLines": 427,
+            "outputBytes": 51147,
+            "lastLinePartial": false,
+            "firstLineExceedsLimit": false,
+            "maxLines": 9007199254740991u64,
+            "maxBytes": 51200
+        }
+    }))
+    .expect("expected direct ToolResultDetails parse");
+    assert!(matches!(details, ToolResultDetails::Find(_)));
 }
 
 /// McpDetails carries strict `deny_unknown_fields`, so a silent rename

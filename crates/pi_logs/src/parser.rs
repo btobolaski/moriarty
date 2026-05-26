@@ -2182,15 +2182,19 @@ pub struct ReadDetails {
     pub compression: Option<CompressionInfo>,
 }
 
-/// `find` emits two shapes for `details`: a plain `{resultLimitReached}`
-/// when the result list was capped, or a lean-ctx augmented shape carrying
-/// the queried path/pattern plus a `compression` breadcrumb. All fields are
-/// optional because either shape may appear independently.
+/// `find` emits three shapes for `details`: a plain `{resultLimitReached}`
+/// when the result list was capped, a raw-output `{truncation}` block when
+/// the serialized match list exceeded pi's message byte cap, or a lean-ctx
+/// augmented shape carrying the queried path/pattern plus a `compression`
+/// breadcrumb. All fields are optional because any combination of those
+/// breadcrumbs may appear together.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FindDetails {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_limit_reached: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncation: Option<TruncationInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
