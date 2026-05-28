@@ -4262,10 +4262,37 @@ fn test_parse_last_prompt_log_line() {
     let log_line: LogLine = serde_json::from_str(json).unwrap();
     match log_line {
         LogLine::LastPrompt(lp) => {
-            assert_eq!(lp.last_prompt, "Fix the bug");
+            assert_eq!(lp.last_prompt.as_deref(), Some("Fix the bug"));
+            assert_eq!(lp.leaf_uuid, None);
             assert_eq!(
                 lp.session_id,
                 "550e8400-e29b-41d4-a716-446655440000"
+                    .parse::<Uuid>()
+                    .unwrap()
+            );
+        }
+        other => panic!("Expected LastPrompt, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_last_prompt_log_line_with_leaf_uuid() {
+    let json = r#"{"type":"last-prompt","leafUuid":"4629e822-f089-4f87-aa1f-7d93ebe10d81","sessionId":"d1226c8d-4fe8-441b-95a0-bbfa8aae1a59"}"#;
+    let log_line: LogLine = serde_json::from_str(json).unwrap();
+    match log_line {
+        LogLine::LastPrompt(lp) => {
+            assert_eq!(lp.last_prompt, None);
+            assert_eq!(
+                lp.leaf_uuid,
+                Some(
+                    "4629e822-f089-4f87-aa1f-7d93ebe10d81"
+                        .parse::<Uuid>()
+                        .unwrap()
+                )
+            );
+            assert_eq!(
+                lp.session_id,
+                "d1226c8d-4fe8-441b-95a0-bbfa8aae1a59"
                     .parse::<Uuid>()
                     .unwrap()
             );
@@ -4428,14 +4455,795 @@ fn test_parse_attachment_deferred_tools_delta() {
     });
     let log_line: LogLine = serde_json::from_value(json).unwrap();
     match log_line {
+        LogLine::Attachment(att) => match att.attachment {
+            AttachmentData::DeferredToolsDelta(delta) => {
+                assert_eq!(delta.added_names, vec!["WebFetch", "WebSearch"]);
+                assert!(delta.readded_names.is_empty());
+                assert!(delta.pending_mcp_servers.is_empty());
+                assert_eq!(att.entrypoint, Some("cli".to_string()));
+            }
+            other => panic!("Expected DeferredToolsDelta, got {:?}", other),
+        },
+        other => panic!("Expected Attachment, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_attachment_deferred_tools_delta_with_readded_and_pending() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": null,
+        "isSidechain": false,
+        "attachment": {
+            "type": "deferred_tools_delta",
+            "addedNames": ["WebFetch"],
+            "addedLines": ["WebFetch"],
+            "removedNames": ["OldTool"],
+            "readdedNames": ["PreviouslyRemoved"],
+            "pendingMcpServers": ["server-a", "server-b"]
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440000",
+        "timestamp": "2026-05-28T00:00:00Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.141",
+        "gitBranch": "main",
+        "slug": null
+    });
+    let log_line: LogLine = serde_json::from_value(json).unwrap();
+    match log_line {
+        LogLine::Attachment(att) => match att.attachment {
+            AttachmentData::DeferredToolsDelta(delta) => {
+                assert_eq!(delta.removed_names, vec!["OldTool"]);
+                assert_eq!(delta.readded_names, vec!["PreviouslyRemoved"]);
+                assert_eq!(delta.pending_mcp_servers, vec!["server-a", "server-b"]);
+            }
+            other => panic!("Expected DeferredToolsDelta, got {:?}", other),
+        },
+        other => panic!("Expected Attachment, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_attachment_file() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": null,
+        "isSidechain": true,
+        "agentId": "agent-1",
+        "attachment": {
+            "type": "file",
+            "filename": "/abs/path/to/file.md",
+            "content": {
+                "type": "text",
+                "file": {
+                    "filePath": "/abs/path/to/file.md",
+                    "content": "hello",
+                    "numLines": 1,
+                    "startLine": 1,
+                    "totalLines": 1
+                }
+            },
+            "displayPath": "to/file.md"
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440000",
+        "timestamp": "2026-05-28T00:00:00Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.141",
+        "gitBranch": "main",
+        "slug": null
+    });
+    let log_line: LogLine = serde_json::from_value(json).unwrap();
+    match log_line {
         LogLine::Attachment(att) => {
-            assert!(matches!(
-                att.attachment,
-                AttachmentData::DeferredToolsDelta(_)
-            ));
-            assert_eq!(att.entrypoint, Some("cli".to_string()));
+            assert_eq!(att.agent_id, Some("agent-1".to_string()));
+            match att.attachment {
+                AttachmentData::File(file) => {
+                    assert_eq!(file.filename, "/abs/path/to/file.md");
+                    assert_eq!(file.display_path, "to/file.md");
+                    let FileAttachmentContent::Text { file: body } = file.content;
+                    assert_eq!(body.file_path, "/abs/path/to/file.md");
+                    assert_eq!(body.content, "hello");
+                    assert_eq!(body.num_lines, 1);
+                    assert_eq!(body.start_line, 1);
+                    assert_eq!(body.total_lines, 1);
+                }
+                other => panic!("Expected File attachment, got {:?}", other),
+            }
         }
         other => panic!("Expected Attachment, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_attachment_nested_memory() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": null,
+        "isSidechain": false,
+        "attachment": {
+            "type": "nested_memory",
+            "path": "/abs/CLAUDE.md",
+            "content": {
+                "path": "/abs/CLAUDE.md",
+                "type": "Project",
+                "content": "# Hello",
+                "contentDiffersFromDisk": false
+            },
+            "displayPath": "CLAUDE.md"
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440000",
+        "timestamp": "2026-05-28T00:00:00Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.141",
+        "gitBranch": "main",
+        "slug": null
+    });
+    let log_line: LogLine = serde_json::from_value(json).unwrap();
+    match log_line {
+        LogLine::Attachment(att) => {
+            assert_eq!(att.agent_id, None);
+            match att.attachment {
+                AttachmentData::NestedMemory(memory) => {
+                    assert_eq!(memory.path, "/abs/CLAUDE.md");
+                    assert_eq!(memory.display_path, "CLAUDE.md");
+                    assert_eq!(memory.content.r#type, "Project");
+                    assert_eq!(memory.content.content, "# Hello");
+                    assert!(!memory.content.content_differs_from_disk);
+                }
+                other => panic!("Expected NestedMemory attachment, got {:?}", other),
+            }
+        }
+        other => panic!("Expected Attachment, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_attachment_file_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": null,
+        "isSidechain": false,
+        "attachment": {
+            "type": "file",
+            "filename": "/abs/file.md",
+            "content": {
+                "type": "text",
+                "file": {
+                    "filePath": "/abs/file.md",
+                    "content": "hi",
+                    "numLines": 1,
+                    "startLine": 1,
+                    "totalLines": 1
+                }
+            },
+            "displayPath": "file.md",
+            "extraField": "should fail"
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440000",
+        "timestamp": "2026-05-28T00:00:00Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.141",
+        "gitBranch": "main",
+        "slug": null
+    });
+    let err = serde_json::from_value::<LogLine>(json)
+        .expect_err("Should reject unknown fields on FileAttachment");
+    assert!(
+        err.to_string().contains("unknown field"),
+        "Error should mention unknown field, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_parse_attachment_file_body_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": null,
+        "isSidechain": false,
+        "attachment": {
+            "type": "file",
+            "filename": "/abs/file.md",
+            "content": {
+                "type": "text",
+                "file": {
+                    "filePath": "/abs/file.md",
+                    "content": "hi",
+                    "numLines": 1,
+                    "startLine": 1,
+                    "totalLines": 1,
+                    "extraField": "should fail"
+                }
+            },
+            "displayPath": "file.md"
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440000",
+        "timestamp": "2026-05-28T00:00:00Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.141",
+        "gitBranch": "main",
+        "slug": null
+    });
+    let err = serde_json::from_value::<LogLine>(json)
+        .expect_err("Should reject unknown fields on FileAttachmentTextBody");
+    assert!(
+        err.to_string().contains("unknown field"),
+        "Error should mention unknown field, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_parse_attachment_nested_memory_content_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": null,
+        "isSidechain": false,
+        "attachment": {
+            "type": "nested_memory",
+            "path": "/abs/CLAUDE.md",
+            "content": {
+                "path": "/abs/CLAUDE.md",
+                "type": "Project",
+                "content": "# Hello",
+                "contentDiffersFromDisk": false,
+                "extraField": "should fail"
+            },
+            "displayPath": "CLAUDE.md"
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440000",
+        "timestamp": "2026-05-28T00:00:00Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.141",
+        "gitBranch": "main",
+        "slug": null
+    });
+    let err = serde_json::from_value::<LogLine>(json)
+        .expect_err("Should reject unknown fields on NestedMemoryContent");
+    assert!(
+        err.to_string().contains("unknown field"),
+        "Error should mention unknown field, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_parse_ai_title_log_line() {
+    let json = serde_json::json!({
+        "type": "ai-title",
+        "aiTitle": "Port Pi extension functionality to Claude",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000"
+    });
+    let line: LogLine = serde_json::from_value(json).expect("Should parse ai-title");
+    match line {
+        LogLine::AiTitle(at) => {
+            assert_eq!(at.ai_title, "Port Pi extension functionality to Claude");
+            assert_eq!(
+                at.session_id,
+                "550e8400-e29b-41d4-a716-446655440000"
+                    .parse::<Uuid>()
+                    .unwrap()
+            );
+        }
+        _ => panic!("Expected AiTitle variant"),
+    }
+}
+
+#[test]
+fn test_parse_ai_title_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "type": "ai-title",
+        "aiTitle": "Title",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "extraField": "should fail"
+    });
+    let err = serde_json::from_value::<LogLine>(json).expect_err("Should reject unknown fields");
+    assert!(
+        err.to_string().contains("unknown field"),
+        "Error should mention unknown field, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_parse_assistant_log_line_with_attribution_agent() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": true,
+        "agentId": "agent-1",
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "test-session",
+        "version": "2.1.141",
+        "gitBranch": "main",
+        "message": {
+            "id": "msg-1",
+            "type": "message",
+            "role": "assistant",
+            "content": "response",
+            "model": "claude-haiku-4-5-20251001",
+            "stop_reason": null,
+            "usage": {
+                "input_tokens": 3,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": 0,
+                    "ephemeral_1h_input_tokens": 0
+                },
+                "output_tokens": 1
+            }
+        },
+        "requestId": "req-1",
+        "attributionAgent": "code-quality-reviewer",
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2026-05-28T00:00:00Z"
+    });
+    let line: AssistantLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(
+        line.attribution_agent,
+        Some("code-quality-reviewer".to_string())
+    );
+}
+
+#[test]
+fn test_parse_assistant_log_line_with_attribution_skill() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "test-session",
+        "version": "2.1.141",
+        "gitBranch": "main",
+        "message": {
+            "id": "msg-1",
+            "type": "message",
+            "role": "assistant",
+            "content": "response",
+            "model": "claude-opus-4-7",
+            "stop_reason": null,
+            "usage": {
+                "input_tokens": 3,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": 0,
+                    "ephemeral_1h_input_tokens": 0
+                },
+                "output_tokens": 1
+            }
+        },
+        "requestId": "req-1",
+        "attributionSkill": "plannotator-review",
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2026-05-28T00:00:00Z"
+    });
+    let line: AssistantLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(
+        line.attribution_skill,
+        Some("plannotator-review".to_string())
+    );
+    assert_eq!(line.attribution_agent, None);
+}
+
+#[test]
+fn test_parse_assistant_log_line_without_attribution_agent() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "test-session",
+        "version": "2.1.141",
+        "gitBranch": "main",
+        "message": {
+            "id": "msg-1",
+            "type": "message",
+            "role": "assistant",
+            "content": "response",
+            "model": "claude-haiku-4-5-20251001",
+            "stop_reason": null,
+            "usage": {
+                "input_tokens": 3,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": 0,
+                    "ephemeral_1h_input_tokens": 0
+                },
+                "output_tokens": 1
+            }
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2026-05-28T00:00:00Z"
+    });
+    let line: AssistantLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(line.attribution_agent, None);
+    assert_eq!(line.attribution_skill, None);
+}
+
+#[test]
+fn test_parse_assistant_message_with_messages_changed_diagnostics() {
+    let json = serde_json::json!({
+        "id": "msg-1",
+        "type": "message",
+        "role": "assistant",
+        "content": "response",
+        "model": "claude-opus-4-7",
+        "stop_reason": "tool_use",
+        "usage": {
+            "input_tokens": 6,
+            "cache_creation_input_tokens": 300010,
+            "cache_read_input_tokens": 17819,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": 0,
+                "ephemeral_1h_input_tokens": 300010
+            },
+            "output_tokens": 224
+        },
+        "diagnostics": {
+            "cache_miss_reason": {
+                "type": "messages_changed",
+                "cache_missed_input_tokens": 239706
+            }
+        }
+    });
+    let message: AssistantLogMessage = serde_json::from_value(json).unwrap();
+    match message.diagnostics {
+        Some(Diagnostics {
+            cache_miss_reason:
+                Some(CacheMissReason::MessagesChanged {
+                    cache_missed_input_tokens,
+                }),
+        }) => assert_eq!(cache_missed_input_tokens, 239706),
+        other => panic!("Expected MessagesChanged diagnostics, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_assistant_message_with_system_changed_diagnostics() {
+    let json = serde_json::json!({
+        "id": "msg-1",
+        "type": "message",
+        "role": "assistant",
+        "content": "response",
+        "model": "claude-opus-4-7",
+        "stop_reason": "tool_use",
+        "usage": {
+            "input_tokens": 6,
+            "cache_creation_input_tokens": 277136,
+            "cache_read_input_tokens": 0,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": 0,
+                "ephemeral_1h_input_tokens": 277136
+            },
+            "output_tokens": 200
+        },
+        "diagnostics": {
+            "cache_miss_reason": {
+                "type": "system_changed",
+                "cache_missed_input_tokens": 277136
+            }
+        }
+    });
+    let message: AssistantLogMessage = serde_json::from_value(json).unwrap();
+    match message.diagnostics {
+        Some(Diagnostics {
+            cache_miss_reason:
+                Some(CacheMissReason::SystemChanged {
+                    cache_missed_input_tokens,
+                }),
+        }) => assert_eq!(cache_missed_input_tokens, 277136),
+        other => panic!("Expected SystemChanged diagnostics, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_assistant_message_with_tools_changed_diagnostics() {
+    let json = serde_json::json!({
+        "id": "msg-1",
+        "type": "message",
+        "role": "assistant",
+        "content": "response",
+        "model": "claude-opus-4-7",
+        "stop_reason": "end_turn",
+        "usage": {
+            "input_tokens": 6,
+            "cache_creation_input_tokens": 45701,
+            "cache_read_input_tokens": 0,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": 0,
+                "ephemeral_1h_input_tokens": 45701
+            },
+            "output_tokens": 285
+        },
+        "diagnostics": {
+            "cache_miss_reason": {
+                "type": "tools_changed",
+                "cache_missed_input_tokens": 39797
+            }
+        }
+    });
+    let message: AssistantLogMessage = serde_json::from_value(json).unwrap();
+    match message.diagnostics {
+        Some(Diagnostics {
+            cache_miss_reason:
+                Some(CacheMissReason::ToolsChanged {
+                    cache_missed_input_tokens,
+                }),
+        }) => assert_eq!(cache_missed_input_tokens, 39797),
+        other => panic!("Expected ToolsChanged diagnostics, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_assistant_message_with_previous_message_not_found_diagnostics() {
+    let json = serde_json::json!({
+        "id": "msg-1",
+        "type": "message",
+        "role": "assistant",
+        "content": "response",
+        "model": "claude-opus-4-7",
+        "stop_reason": "end_turn",
+        "usage": {
+            "input_tokens": 1,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": 0,
+                "ephemeral_1h_input_tokens": 0
+            },
+            "output_tokens": 1
+        },
+        "diagnostics": {
+            "cache_miss_reason": {
+                "type": "previous_message_not_found"
+            }
+        }
+    });
+    let message: AssistantLogMessage = serde_json::from_value(json).unwrap();
+    assert_eq!(
+        message.diagnostics,
+        Some(Diagnostics {
+            cache_miss_reason: Some(CacheMissReason::PreviousMessageNotFound),
+        })
+    );
+}
+
+#[test]
+fn test_parse_assistant_message_with_unavailable_cache_miss_reason() {
+    let json = serde_json::json!({
+        "id": "msg-1",
+        "type": "message",
+        "role": "assistant",
+        "content": "response",
+        "model": "claude-opus-4-7",
+        "stop_reason": "end_turn",
+        "usage": {
+            "input_tokens": 1,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": 0,
+                "ephemeral_1h_input_tokens": 0
+            },
+            "output_tokens": 1
+        },
+        "diagnostics": {
+            "cache_miss_reason": {
+                "type": "unavailable"
+            }
+        }
+    });
+    let message: AssistantLogMessage = serde_json::from_value(json).unwrap();
+    assert_eq!(
+        message.diagnostics,
+        Some(Diagnostics {
+            cache_miss_reason: Some(CacheMissReason::Unavailable),
+        })
+    );
+}
+
+#[test]
+fn test_parse_assistant_message_with_null_diagnostics() {
+    let json = serde_json::json!({
+        "id": "msg-1",
+        "type": "message",
+        "role": "assistant",
+        "content": "response",
+        "model": "claude-opus-4-7",
+        "stop_reason": "end_turn",
+        "usage": {
+            "input_tokens": 1,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": 0,
+                "ephemeral_1h_input_tokens": 0
+            },
+            "output_tokens": 1
+        },
+        "diagnostics": null
+    });
+    let message: AssistantLogMessage = serde_json::from_value(json).unwrap();
+    assert_eq!(message.diagnostics, None);
+}
+
+#[test]
+fn test_parse_assistant_message_with_null_cache_miss_reason() {
+    let json = serde_json::json!({
+        "id": "msg-1",
+        "type": "message",
+        "role": "assistant",
+        "content": "response",
+        "model": "claude-opus-4-7",
+        "stop_reason": "end_turn",
+        "usage": {
+            "input_tokens": 1,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": 0,
+                "ephemeral_1h_input_tokens": 0
+            },
+            "output_tokens": 1
+        },
+        "diagnostics": {
+            "cache_miss_reason": null
+        }
+    });
+    let message: AssistantLogMessage = serde_json::from_value(json).unwrap();
+    assert_eq!(
+        message.diagnostics,
+        Some(Diagnostics {
+            cache_miss_reason: None,
+        })
+    );
+}
+
+#[test]
+fn test_parse_cache_miss_reason_rejects_unknown_fields_in_variant() {
+    let json = serde_json::json!({
+        "id": "msg-1",
+        "type": "message",
+        "role": "assistant",
+        "content": "response",
+        "model": "claude-opus-4-7",
+        "stop_reason": "end_turn",
+        "usage": {
+            "input_tokens": 1,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": 0,
+                "ephemeral_1h_input_tokens": 0
+            },
+            "output_tokens": 1
+        },
+        "diagnostics": {
+            "cache_miss_reason": {
+                "type": "messages_changed",
+                "cache_missed_input_tokens": 100,
+                "extraField": "should fail"
+            }
+        }
+    });
+    let err = serde_json::from_value::<AssistantLogMessage>(json)
+        .expect_err("Should reject unknown fields in CacheMissReason variant");
+    assert!(
+        err.to_string().contains("unknown field"),
+        "Error should mention unknown field, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_parse_diagnostics_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "id": "msg-1",
+        "type": "message",
+        "role": "assistant",
+        "content": "response",
+        "model": "claude-opus-4-7",
+        "stop_reason": "end_turn",
+        "usage": {
+            "input_tokens": 1,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": 0,
+                "ephemeral_1h_input_tokens": 0
+            },
+            "output_tokens": 1
+        },
+        "diagnostics": {
+            "cache_miss_reason": null,
+            "extraField": "should fail"
+        }
+    });
+    let err = serde_json::from_value::<AssistantLogMessage>(json)
+        .expect_err("Should reject unknown fields in diagnostics");
+    assert!(
+        err.to_string().contains("unknown field"),
+        "Error should mention unknown field, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_parse_attachment_deferred_tools_delta_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": null,
+        "isSidechain": false,
+        "attachment": {
+            "type": "deferred_tools_delta",
+            "addedNames": [],
+            "addedLines": [],
+            "removedNames": [],
+            "extraField": "should fail"
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440000",
+        "timestamp": "2026-05-28T00:00:00Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.141",
+        "gitBranch": "main",
+        "slug": null
+    });
+    let err = serde_json::from_value::<LogLine>(json)
+        .expect_err("Should reject unknown fields in deferred_tools_delta");
+    assert!(
+        err.to_string().contains("unknown field"),
+        "Error should mention unknown field, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_parse_last_prompt_log_line_with_both_fields() {
+    let json = r#"{"type":"last-prompt","lastPrompt":"Fix the bug","leafUuid":"4629e822-f089-4f87-aa1f-7d93ebe10d81","sessionId":"550e8400-e29b-41d4-a716-446655440000"}"#;
+    let log_line: LogLine = serde_json::from_str(json).unwrap();
+    match log_line {
+        LogLine::LastPrompt(lp) => {
+            assert_eq!(lp.last_prompt.as_deref(), Some("Fix the bug"));
+            assert_eq!(
+                lp.leaf_uuid,
+                Some(
+                    "4629e822-f089-4f87-aa1f-7d93ebe10d81"
+                        .parse::<Uuid>()
+                        .unwrap()
+                )
+            );
+            assert_eq!(
+                lp.session_id,
+                "550e8400-e29b-41d4-a716-446655440000"
+                    .parse::<Uuid>()
+                    .unwrap()
+            );
+        }
+        other => panic!("Expected LastPrompt, got {:?}", other),
     }
 }
 
@@ -4478,6 +5286,132 @@ fn test_parse_attachment_hook_success() {
         }
         other => panic!("Expected Attachment, got {:?}", other),
     }
+}
+
+#[test]
+fn test_parse_attachment_hook_permission_decision() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": null,
+        "isSidechain": false,
+        "attachment": {
+            "type": "hook_permission_decision",
+            "decision": "allow",
+            "toolUseID": "toolu_01CF2aDiUqw4Q9vvgSncRUz6",
+            "hookEvent": "PermissionRequest"
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440000",
+        "timestamp": "2026-05-28T22:02:12.611Z",
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.141",
+        "gitBranch": "HEAD"
+    });
+    let log_line: LogLine = serde_json::from_value(json).unwrap();
+    match log_line {
+        LogLine::Attachment(att) => {
+            if let AttachmentData::HookPermissionDecision(hook) = &att.attachment {
+                assert_eq!(hook.decision, PermissionDecisionKind::Allow);
+                assert_eq!(hook.tool_use_id, "toolu_01CF2aDiUqw4Q9vvgSncRUz6");
+                assert_eq!(hook.hook_event, "PermissionRequest");
+            } else {
+                panic!("Expected HookPermissionDecision, got {:?}", att.attachment);
+            }
+        }
+        other => panic!("Expected Attachment, got {:?}", other),
+    }
+}
+
+fn hook_permission_decision_envelope(attachment: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "type": "attachment",
+        "parentUuid": null,
+        "isSidechain": false,
+        "attachment": attachment,
+        "uuid": "550e8400-e29b-41d4-a716-446655440000",
+        "timestamp": "2026-05-28T22:02:12.611Z",
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.141",
+        "gitBranch": "HEAD"
+    })
+}
+
+#[test]
+fn test_parse_attachment_hook_permission_decision_deny() {
+    let json = hook_permission_decision_envelope(serde_json::json!({
+        "type": "hook_permission_decision",
+        "decision": "deny",
+        "toolUseID": "toolu_deny",
+        "hookEvent": "PermissionRequest"
+    }));
+    let log_line: LogLine = serde_json::from_value(json).unwrap();
+    match log_line {
+        LogLine::Attachment(att) => match &att.attachment {
+            AttachmentData::HookPermissionDecision(hook) => {
+                assert_eq!(hook.decision, PermissionDecisionKind::Deny);
+            }
+            other => panic!("Expected HookPermissionDecision, got {:?}", other),
+        },
+        other => panic!("Expected Attachment, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_attachment_hook_permission_decision_ask() {
+    let json = hook_permission_decision_envelope(serde_json::json!({
+        "type": "hook_permission_decision",
+        "decision": "ask",
+        "toolUseID": "toolu_ask",
+        "hookEvent": "PermissionRequest"
+    }));
+    let log_line: LogLine = serde_json::from_value(json).unwrap();
+    match log_line {
+        LogLine::Attachment(att) => match &att.attachment {
+            AttachmentData::HookPermissionDecision(hook) => {
+                assert_eq!(hook.decision, PermissionDecisionKind::Ask);
+            }
+            other => panic!("Expected HookPermissionDecision, got {:?}", other),
+        },
+        other => panic!("Expected Attachment, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_attachment_hook_permission_decision_rejects_unknown_decision() {
+    let json = hook_permission_decision_envelope(serde_json::json!({
+        "type": "hook_permission_decision",
+        "decision": "block",
+        "toolUseID": "toolu_block",
+        "hookEvent": "PermissionRequest"
+    }));
+    let err = serde_json::from_value::<LogLine>(json)
+        .expect_err("Should reject unknown PermissionDecisionKind values");
+    assert!(
+        err.to_string().contains("unknown variant"),
+        "Error should mention unknown variant, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_parse_attachment_hook_permission_decision_rejects_unknown_fields() {
+    let json = hook_permission_decision_envelope(serde_json::json!({
+        "type": "hook_permission_decision",
+        "decision": "allow",
+        "toolUseID": "toolu_extra",
+        "hookEvent": "PermissionRequest",
+        "extraField": "should fail"
+    }));
+    let err = serde_json::from_value::<LogLine>(json)
+        .expect_err("Should reject unknown fields in HookPermissionDecision");
+    assert!(
+        err.to_string().contains("unknown field"),
+        "Error should mention unknown field, got: {}",
+        err
+    );
 }
 
 #[test]

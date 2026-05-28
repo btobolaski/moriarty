@@ -3501,6 +3501,17 @@ fn fetch_content_tool_result_rejects_unknown_details_field() {
 }
 
 #[test]
+fn absent_tool_result_details_field_is_treated_as_none() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "compress",
+        vec![json!({"type": "text", "text": "done"})],
+        false,
+        None,
+    ));
+    assert!(tool_result.details.is_none());
+}
+
+#[test]
 fn null_tool_result_details_are_treated_as_absent() {
     for tool_name in [
         "compress",

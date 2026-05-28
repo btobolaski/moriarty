@@ -218,6 +218,8 @@ pub enum LogLine {
     Progress(ProgressLogLine),
     #[serde(rename = "custom-title")]
     CustomTitle(CustomTitle),
+    #[serde(rename = "ai-title")]
+    AiTitle(AiTitle),
     #[serde(rename = "agent-name")]
     AgentName(AgentName),
     #[serde(rename = "last-prompt")]
@@ -236,6 +238,17 @@ pub struct CustomTitle {
     pub session_id: Uuid,
 }
 
+/// AI-generated conversation title. Added in Claude Code 2.1.141+ alongside the existing
+/// `custom-title` records to capture titles Claude Code derives automatically from the
+/// conversation rather than ones the user provides.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct AiTitle {
+    pub ai_title: String,
+    pub session_id: Uuid,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
@@ -248,7 +261,10 @@ pub struct AgentName {
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct LastPrompt {
-    pub last_prompt: String,
+    /// Optional starting in Claude Code 2.1.141+ — newer entries can identify the prompt via
+    /// `leaf_uuid` alone without storing the prompt text.
+    pub last_prompt: Option<String>,
+    pub leaf_uuid: Option<Uuid>,
     pub session_id: Uuid,
 }
 
@@ -268,6 +284,8 @@ pub struct PermissionModeChange {
 pub struct AttachmentLogLine {
     pub parent_uuid: Option<Uuid>,
     pub is_sidechain: bool,
+    /// Identifier for the subagent that emitted this attachment. Only set on subagent transcripts.
+    pub agent_id: Option<String>,
     pub attachment: AttachmentData,
     pub uuid: Uuid,
     pub timestamp: DateTime<Utc>,
@@ -291,12 +309,15 @@ pub enum AttachmentData {
     CommandPermissions(CommandPermissions),
     DeferredToolsDelta(DeferredToolsDelta),
     EditedTextFile(EditedTextFile),
+    File(FileAttachment),
     HookBlockingError(HookBlockingError),
     HookCancelled(HookCancelled),
     HookNonBlockingError(HookNonBlockingError),
+    HookPermissionDecision(HookPermissionDecision),
     HookSuccess(HookSuccess),
     HookSystemMessage(HookSystemMessage),
     McpInstructionsDelta(McpInstructionsDelta),
+    NestedMemory(NestedMemory),
     PlanMode(PlanModeAttachment),
     PlanModeExit(PlanModeExitAttachment),
     PlanModeReentry(PlanModeReentryAttachment),
@@ -330,6 +351,10 @@ pub struct DeferredToolsDelta {
     pub added_names: Vec<String>,
     pub added_lines: Vec<String>,
     pub removed_names: Vec<String>,
+    #[serde(default)]
+    pub readded_names: Vec<String>,
+    #[serde(default)]
+    pub pending_mcp_servers: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -338,6 +363,34 @@ pub struct DeferredToolsDelta {
 pub struct EditedTextFile {
     pub filename: String,
     pub snippet: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct FileAttachment {
+    pub filename: String,
+    pub content: FileAttachmentContent,
+    pub display_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(tag = "type")]
+#[serde(rename_all = "snake_case")]
+pub enum FileAttachmentContent {
+    Text { file: FileAttachmentTextBody },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct FileAttachmentTextBody {
+    pub file_path: String,
+    pub content: String,
+    pub num_lines: u32,
+    pub start_line: u32,
+    pub total_lines: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -389,6 +442,24 @@ pub struct HookNonBlockingError {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
+pub struct HookPermissionDecision {
+    pub decision: PermissionDecisionKind,
+    #[serde(rename = "toolUseID")]
+    pub tool_use_id: String,
+    pub hook_event: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PermissionDecisionKind {
+    Allow,
+    Deny,
+    Ask,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct HookSuccess {
     pub hook_name: String,
     #[serde(rename = "toolUseID")]
@@ -420,6 +491,25 @@ pub struct McpInstructionsDelta {
     pub added_names: Vec<String>,
     pub added_blocks: Vec<String>,
     pub removed_names: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct NestedMemory {
+    pub path: String,
+    pub content: NestedMemoryContent,
+    pub display_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct NestedMemoryContent {
+    pub path: String,
+    pub r#type: String,
+    pub content: String,
+    pub content_differs_from_disk: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1009,6 +1099,14 @@ pub struct AssistantLogLine {
     pub error: Option<String>,
     /// Entry point that started the session (e.g., "cli"). Added in Claude Code 2.1.104+.
     pub entrypoint: Option<String>,
+    /// Named subagent attributed with producing this message (e.g., "code-quality-reviewer").
+    /// Present on subagent transcripts to associate the assistant turn with the spawning
+    /// agent type. Added in Claude Code 2.1.141+.
+    pub attribution_agent: Option<String>,
+    /// Named skill attributed with producing this message (e.g., "plannotator-review").
+    /// Present when the assistant turn was driven by a skill invocation.
+    /// Added in Claude Code 2.1.141+.
+    pub attribution_skill: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1025,6 +1123,27 @@ pub struct AssistantLogMessage {
     pub stop_details: Option<StopDetails>,
     pub usage: AssistantUsage,
     pub context_management: Option<serde_json::Value>,
+    /// Diagnostic details from Claude Code about the request (e.g., cache miss reason).
+    /// Added in Claude Code 2.1.141+.
+    pub diagnostics: Option<Diagnostics>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Diagnostics {
+    pub cache_miss_reason: Option<CacheMissReason>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(tag = "type")]
+#[serde(rename_all = "snake_case")]
+pub enum CacheMissReason {
+    PreviousMessageNotFound,
+    ToolsChanged { cache_missed_input_tokens: usize },
+    MessagesChanged { cache_missed_input_tokens: usize },
+    SystemChanged { cache_missed_input_tokens: usize },
+    Unavailable,
 }
 
 /// Stop details from the Anthropic Messages API. Added in Claude Code 2.1.77+.

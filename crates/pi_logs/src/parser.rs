@@ -121,7 +121,7 @@ pub enum PiLogLine {
     Compaction(CompactionLine),
     BranchSummary(BranchSummaryLine),
     Custom(CustomLine),
-    CustomMessage(CustomMessageLine),
+    CustomMessage(Box<CustomMessageLine>),
     Message(MessageLine),
 }
 
@@ -290,7 +290,7 @@ pub enum CustomMessagePayload {
     /// Richer subagent notice that repeats the rendered notice text and the
     /// underlying control event that triggered it.
     #[serde(rename = "subagent_control_notice")]
-    SubagentControlNotice(SubagentControlNoticeDetails),
+    SubagentControlNotice(Box<SubagentControlNoticeDetails>),
 }
 
 // ---------------------------------------------------------------------------
@@ -368,33 +368,54 @@ struct RawToolResultMessage {
     pub details: Option<Value>,
 }
 
+/// Pi can emit `null` or omit `details` entirely when no structured result is
+/// available; both map to `None` so callers see a uniform absent-details state.
+/// Empty error objects (`{}`) are dropped for most tools because pi uses them as
+/// a generic "error occurred" sentinel with no payload, but `memory` and `skill`
+/// are exceptions where `{}` is the real validation-error body the extension
+/// reads back — those tools are kept by [`preserves_empty_error_details`].
+fn resolve_tool_result_details(
+    raw_details: Option<Value>,
+    tool_name: &ToolName,
+    is_error: bool,
+) -> Result<Option<ToolResultDetails>, serde_json::Error> {
+    let details = match raw_details {
+        Some(value) => value,
+        None => return Ok(None),
+    };
+    if details.is_null() {
+        return Ok(None);
+    }
+    if let Value::Object(ref map) = details {
+        let drop_empty_error_object = is_error && !preserves_empty_error_details(tool_name);
+        if map.is_empty() && drop_empty_error_object {
+            return Ok(None);
+        }
+    }
+    parse_tool_result_details(tool_name, details).map(Some)
+}
+
 impl<'de> Deserialize<'de> for ToolResultMessage {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        let raw = RawToolResultMessage::deserialize(deserializer)?;
-        let details = match raw.details {
-            Some(Value::Null) => None,
-            Some(Value::Object(map))
-                if map.is_empty()
-                    && raw.is_error
-                    && !preserves_empty_error_details(&raw.tool_name) =>
-            {
-                None
-            }
-            Some(details) => Some(parse_tool_result_details(&raw.tool_name, details))
-                .transpose()
-                .map_err(de::Error::custom)?,
-            None => None,
-        };
-
+        let RawToolResultMessage {
+            tool_call_id,
+            tool_name,
+            content,
+            is_error,
+            timestamp,
+            details: raw_details,
+        } = RawToolResultMessage::deserialize(deserializer)?;
+        let resolved = resolve_tool_result_details(raw_details, &tool_name, is_error);
+        let details = resolved.map_err(de::Error::custom)?;
         Ok(Self {
-            tool_call_id: raw.tool_call_id,
-            tool_name: raw.tool_name,
-            content: raw.content,
-            is_error: raw.is_error,
-            timestamp: raw.timestamp,
+            tool_call_id,
+            tool_name,
+            content,
+            is_error,
+            timestamp,
             details,
         })
     }

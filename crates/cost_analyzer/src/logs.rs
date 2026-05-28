@@ -1,4 +1,4 @@
-use std::{cmp::Ordering, fmt, hash::Hash};
+use std::{cmp::Ordering, fmt, hash::Hash, path::Path};
 
 use chrono::{DateTime, Utc};
 use miette::{Context, IntoDiagnostic};
@@ -87,6 +87,13 @@ pub trait AnalyzableLog: std::fmt::Debug + Clone + Send + Sync + 'static {
     /// line exposes one.
     fn session_id(&self) -> Option<String>;
     fn parse(value: &str) -> miette::Result<Self>;
+
+    /// Whether to attempt parsing the given `.jsonl` file. The default scans every
+    /// discovered file; implementations can override to skip well-known sibling
+    /// files that share the `.jsonl` extension but follow a different schema.
+    fn should_parse_file(_path: &Path) -> bool {
+        true
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -443,6 +450,7 @@ impl AnalyzableLog for ClaudeLogLine {
             ClaudeLogLine::QueueOperation(line) => line.timestamp,
             ClaudeLogLine::Progress(line) => line.timestamp,
             ClaudeLogLine::CustomTitle(_) => claude_timestamp_sentinel(),
+            ClaudeLogLine::AiTitle(_) => claude_timestamp_sentinel(),
             ClaudeLogLine::AgentName(_) => claude_timestamp_sentinel(),
             ClaudeLogLine::LastPrompt(_) => claude_timestamp_sentinel(),
             ClaudeLogLine::PermissionModeChange(_) => claude_timestamp_sentinel(),
@@ -465,6 +473,7 @@ impl AnalyzableLog for ClaudeLogLine {
             }
             ClaudeLogLine::Progress(line) => line.uuid.to_string(),
             ClaudeLogLine::CustomTitle(line) => format!("custom-title:{}", line.session_id),
+            ClaudeLogLine::AiTitle(line) => format!("ai-title:{}", line.session_id),
             ClaudeLogLine::AgentName(line) => format!("agent-name:{}", line.session_id),
             ClaudeLogLine::LastPrompt(line) => format!("last-prompt:{}", line.session_id),
             ClaudeLogLine::PermissionModeChange(line) => {
@@ -488,6 +497,14 @@ impl AnalyzableLog for ClaudeLogLine {
 
     fn parse(value: &str) -> miette::Result<Self> {
         parse_json_backed_log(value)
+    }
+
+    fn should_parse_file(path: &Path) -> bool {
+        // `~/.claude/history.jsonl` shares the `.jsonl` extension with the per-session
+        // transcripts but stores command-history entries in a different schema. Scanning
+        // it produces a parse error and never contributes billable lines, so skip it when
+        // the directory walk crosses the well-known filename.
+        path.file_name().and_then(|name| name.to_str()) != Some("history.jsonl")
     }
 }
 
@@ -846,6 +863,10 @@ mod tests {
 
     fn claude_custom_title_json() -> serde_json::Value {
         claude_metadata_json("custom-title", "customTitle", "A title")
+    }
+
+    fn claude_ai_title_json() -> serde_json::Value {
+        claude_metadata_json("ai-title", "aiTitle", "An AI-generated title")
     }
 
     fn claude_agent_name_json() -> serde_json::Value {
@@ -1586,6 +1607,12 @@ mod tests {
                 value: claude_custom_title_json,
                 expected_timestamp: ExpectedClaudeTimestamp::Sentinel,
                 expected_id: claude_metadata_identifier("custom-title"),
+            },
+            ClaudeNonBillableCase {
+                name: "ai title",
+                value: claude_ai_title_json,
+                expected_timestamp: ExpectedClaudeTimestamp::Sentinel,
+                expected_id: claude_metadata_identifier("ai-title"),
             },
             ClaudeNonBillableCase {
                 name: "agent name",

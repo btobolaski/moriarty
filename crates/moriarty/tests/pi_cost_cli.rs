@@ -31,6 +31,7 @@ fn decimal_total(input: &str, output: &str, cache_write: &str, cache_read: &str)
     .to_string()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn assistant_line(
     id: &str,
     timestamp: &str,
@@ -59,6 +60,7 @@ fn assistant_line(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn assistant_line_with_tokens(
     id: &str,
     timestamp: &str,

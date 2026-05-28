@@ -52,7 +52,7 @@ where
 
 /// This ignores symlinks for now. That is an area for possible future improvement but, that would
 /// require tracking visited directories in order to prevent infinitely recursing.
-fn jsonl_files(path: PathBuf) -> mpsc::Receiver<miette::Result<PathBuf>> {
+fn jsonl_files<LogType: AnalyzableLog>(path: PathBuf) -> mpsc::Receiver<miette::Result<PathBuf>> {
     let (tx, rx) = mpsc::channel(10);
 
     tokio::spawn(async move {
@@ -86,6 +86,10 @@ fn jsonl_files(path: PathBuf) -> mpsc::Receiver<miette::Result<PathBuf>> {
                     if path.extension().and_then(|extension| extension.to_str())
                         != Some(JSONL_EXTENSION)
                     {
+                        continue;
+                    }
+
+                    if !LogType::should_parse_file(&path) {
                         continue;
                     }
 
@@ -223,7 +227,7 @@ fn deduplicate_lines<LogType: AnalyzableLog>(
 /// whether any file failed during the scan. Failure is per-file: a single parse error discards all
 /// lines from that file, while lines from other fully parsed files are still returned.
 pub async fn analyze_directory<LogType: AnalyzableLog>(path: PathBuf) -> AnalysisResult<LogType> {
-    let (line_map, had_errors) = ReceiverStream::new(jsonl_files(path))
+    let (line_map, had_errors) = ReceiverStream::new(jsonl_files::<LogType>(path))
         .map(|maybe_path| async move {
             match maybe_path {
                 Ok(path) => parse_file::<LogType>(path).await,
@@ -934,5 +938,34 @@ mod tests {
 
         assert!(result.had_errors);
         assert!(result.lines.is_empty());
+    }
+
+    #[tokio::test]
+    async fn analyze_directory_skips_claude_history_jsonl() {
+        let temp_dir = temp_dir();
+        let claude_log = claude_assistant_json(
+            None,
+            Some("req-1"),
+            "msg-1",
+            "22222222-2222-4222-8222-222222222222",
+            "claude-sonnet-4-20250514",
+            claude_usage_json(1, 0, 0, 0),
+        );
+        // `~/.claude/history.jsonl` follows a different schema than the per-session
+        // transcripts, so the Claude implementation must skip it entirely instead of
+        // reporting a parse error that would mark the whole scan as having had errors.
+        write_log_files(
+            temp_dir.path(),
+            &[
+                ("history.jsonl", "{\"display\":\"prompt\"}\n".to_string()),
+                ("session.jsonl", format!("{}\n", claude_log)),
+            ],
+        )
+        .await;
+
+        let result = analyze_directory::<ClaudeLogLine>(temp_dir.path().to_path_buf()).await;
+
+        assert!(!result.had_errors);
+        assert_eq!(result.lines.len(), 1);
     }
 }

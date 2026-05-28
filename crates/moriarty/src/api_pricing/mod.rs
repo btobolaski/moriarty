@@ -187,7 +187,7 @@ fn build_daily_rows(
             let date_str = metrics.date.to_string();
             push_nonzero_metric_rows(
                 rows,
-                metrics.per_model.model_metrics(report_mode).into_iter(),
+                metrics.per_model.model_metrics(report_mode),
                 |first_row, model_name, metric_components| {
                     ApiMetricRow::new(
                         grouped_label(first_row, &date_str),
@@ -225,7 +225,7 @@ fn build_session_rows(
             let duration = format_duration(metrics.duration_minutes());
             push_nonzero_metric_rows(
                 rows,
-                metrics.per_model.model_metrics(report_mode).into_iter(),
+                metrics.per_model.model_metrics(report_mode),
                 |first_row, model_name, metric_components| {
                     ApiSessionMetricRow::new(
                         grouped_label(first_row, &session_id),

@@ -282,6 +282,7 @@ mod tests {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn assistant_line(
         id: &str,
         timestamp: DateTime<Utc>,
@@ -310,6 +311,7 @@ mod tests {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn assistant_line_with_tokens(
         id: &str,
         timestamp: DateTime<Utc>,

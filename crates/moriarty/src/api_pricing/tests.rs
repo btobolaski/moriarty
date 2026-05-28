@@ -255,7 +255,7 @@ fn cost_row_total_row_uses_blank_component_columns() {
 fn cost_row_total_row_variants() {
     let cases = [
         ("zero", 0.0, "$0.0000"),
-        ("large value", 12_345.6789, "$12345.6789"),
+        ("large value", 12_345.678_9, "$12345.6789"),
     ];
 
     for (label, total, expected_subtotal) in cases {
@@ -306,7 +306,7 @@ fn grand_total_row_formats_large_tokens_exactly() {
 fn grand_total_row_variants() {
     let cases = [
         ("zero", 0.0, "$0.0000"),
-        ("large value", 99_999.9999, "$99999.9999"),
+        ("large value", 99_999.999_9, "$99999.9999"),
     ];
 
     for (label, grand_total, expected) in cases {
@@ -319,7 +319,7 @@ fn grand_total_row_variants() {
 // only verify that it does not panic across a representative range of inputs.
 #[test]
 fn display_grand_total_smoke_variants() {
-    for grand_total in [0.0, 143.7082, 12_345.6789, 0.0001] {
+    for grand_total in [0.0, 143.7082, 12_345.678_9, 0.0001] {
         display_grand_total(ReportMode::Cost, grand_total);
     }
 }
@@ -337,7 +337,13 @@ fn metric_total_checked_add_rejects_token_overflow() {
 
 #[test]
 fn build_cost_rows_variants() {
-    let cases: Vec<(_, Vec<DailyCosts>, Vec<usize>, Vec<(&str, &str)>)> = vec![
+    type CostRowCase = (
+        &'static str,
+        Vec<DailyCosts>,
+        Vec<usize>,
+        Vec<(&'static str, &'static str)>,
+    );
+    let cases: Vec<CostRowCase> = vec![
         (
             "single-model day",
             vec![costs_on(2025, 10, 23).with_sonnet(1.0, 2.0, 0.0, 0.0)],
