@@ -80,6 +80,9 @@ test in a separate process, making this safe and preventing tests from clobberin
 - The `LogLine` enum covers both core conversation records and newer metadata/event records, including user/assistant
   turns, file-history snapshots, summaries, system entries, queue operations, progress updates, custom titles, agent
   names, last prompts, permission-mode changes, and attachments
+- Also owns the structured view of the raw `model` string via `model::Model { family, version }` plus `ModelFamily` and
+  `ModelVersion`. Both `cost_analyzer` (for pricing) and `moriarty::api_pricing` (for grouping/display) consume this one
+  parser so family/version classification is not duplicated across crates
 - Used by `moriarty`'s `api_pricing` module to analyze Claude Code conversation logs
 
 **`cost_report/`** - Shared cost report rendering and filtering:
@@ -98,8 +101,11 @@ test in a separate process, making this safe and preventing tests from clobberin
 
 - Aggregates either pre-priced `LlmCost` values or raw token counts from `cost_analyzer` into daily buckets (keyed by
   timezone-adjusted date) or per-conversation buckets (keyed by session ID)
-- Per-model aggregation uses `ModelMetricsMap` to accumulate exact-mode `MetricComponents` into Claude-family buckets;
-  token mode stays integer-exact end-to-end instead of passing through floating-point helpers
+- Per-model aggregation uses `ModelMetricsMap` keyed by `claude_logs::Model` (family + parsed version) so report rows
+  and chart legend distinguish e.g. "Sonnet 4" from "Sonnet 4.5"; row/legend ordering is family-first
+  (Opus → Sonnet → Haiku) then version-desc via the local `model_sort_key` helper, so within-family Opus 4.x rows
+  sit above Opus 3 rows automatically. Token mode stays
+  integer-exact end-to-end instead of passing through floating-point helpers
 - Unknown Claude models surface as stderr tracing errors via `cost_analyzer`; they are not rendered in the report
 - Also prepares `ChartBucket` data for `graphs claude`, reusing the same analyzer output while keeping the existing
   detailed table report unchanged
@@ -145,8 +151,10 @@ test in a separate process, making this safe and preventing tests from clobberin
   normalized billable entries, and `AnalysisResult` for returning those deduplicated lines alongside a
   partial-failure flag
 - Concrete implementations currently support `pi_logs::PiLogLine` and `claude_logs::LogLine`. Claude log costs are
-  calculated in `cost_analyzer` with local Decimal-based Claude pricing helpers rather than by depending on
-  `moriarty::api_pricing` internals.
+  calculated in `cost_analyzer` with local Decimal-based Claude pricing helpers (`ClaudeModelPricing::for_model`) that
+  consume `&claude_logs::Model`; the family enum itself lives in `claude_logs` so the parser and pricing layer agree
+  on classification without depending on `moriarty::api_pricing` internals. Opus 3 vs Opus 4.x share `ModelFamily::Opus`
+  and the pricing dispatch reads the parsed `version.major` to pick the OPUS or OPUS_4 tier.
 - `moriarty::api_pricing` and `moriarty::pi_cost` both delegate all log loading, deduplication, pricing, and raw
   token extraction to this crate; the backends only bucket the returned billable lines into cost or token report rows
 - `LineWithCost.session_id` is normalized during parsing so backends can group by conversation without re-reading log

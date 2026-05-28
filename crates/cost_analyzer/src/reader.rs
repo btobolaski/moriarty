@@ -900,6 +900,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn claude_dedup_collapses_same_model_with_different_date_suffix() {
+        // Dedup keys on `(ModelId, LogId)`. Since `ClaudeLogLine::ModelId`
+        // is now `claude_logs::Model` (whose `Eq`/`Hash` skip the raw id), two
+        // entries sharing a request id but written with different
+        // release-date suffixes must collapse into a single bucket — the
+        // older raw form was a distinct ModelId under the previous String
+        // keying. This locks in the new collapse behavior.
+        let temp_dir = temp_dir();
+        let earlier = claude_assistant_json(
+            None,
+            Some("req-shared"),
+            "msg-shared",
+            "55555555-5555-4555-8555-555555555551",
+            "claude-sonnet-4-20250514",
+            claude_usage_json(1, 1, 0, 0),
+        );
+        let later = claude_assistant_json(
+            None,
+            Some("req-shared"),
+            "msg-shared",
+            "55555555-5555-4555-8555-555555555552",
+            "claude-sonnet-4-20250620",
+            claude_usage_json(2_000_000, 0, 0, 0),
+        );
+        let contents = format!("{}\n{}\n", earlier, later);
+
+        write_log_files(temp_dir.path(), &[("session.jsonl", contents)]).await;
+
+        let result = analyze_directory::<ClaudeLogLine>(temp_dir.path().to_path_buf()).await;
+
+        assert!(!result.had_errors);
+        assert_eq!(
+            result.lines.len(),
+            1,
+            "entries with the same parsed Model must dedup even with different raw date suffixes"
+        );
+        assert_eq!(result.lines[0].id, "req-shared");
+        assert_eq!(result.lines[0].cost, expected_claude_dedup_cost());
+    }
+
+    #[tokio::test]
     async fn analyze_directory_ignores_empty_files() {
         let result = analyze_with_files(&[("empty.jsonl", String::new())]).await;
 

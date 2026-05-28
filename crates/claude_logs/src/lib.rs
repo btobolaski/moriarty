@@ -4,6 +4,8 @@
 //! the `moriarty` binary crate so other workspace crates can depend on the
 //! shared log types directly.
 
+pub mod model;
 pub mod parser;
 
+pub use model::{Model, ModelFamily, ModelVersion, UnknownModelError};
 pub use parser::*;

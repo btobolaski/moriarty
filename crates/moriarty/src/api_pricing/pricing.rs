@@ -1,81 +1,70 @@
-use std::{collections::HashMap, fmt};
+use std::{cmp::Reverse, collections::HashMap};
+
+use claude_logs::{Model, ModelFamily};
 
 use crate::cost_report::{MetricComponents, MetricTotal, ReportMode};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ModelType {
-    Sonnet,
-    Haiku,
-    Opus,
-    Opus4,
-    Unknown,
-}
-
-impl ModelType {
-    pub const DISPLAY_ORDER: [(Self, &'static str); 4] = [
-        (Self::Opus4, "Opus 4"),
-        (Self::Opus, "Opus"),
-        (Self::Sonnet, "Sonnet"),
-        (Self::Haiku, "Haiku"),
-    ];
-
-    /// Report rows intentionally collapse concrete Claude model ids into the
-    /// four stable buckets shown in the table.
-    pub fn from_model_string(model: &str) -> Self {
-        let model_lower = model.to_lowercase();
-        if model_lower.contains("sonnet") {
-            Self::Sonnet
-        } else if model_lower.contains("haiku") {
-            Self::Haiku
-        } else if model_lower.contains("opus-4") {
-            // Check Opus 4 BEFORE the general opus check: every opus-4 model string
-            // also contains "opus", so reversing these arms would misclassify Opus 4 as Opus 3.
-            Self::Opus4
-        } else if model_lower.contains("opus") {
-            Self::Opus
-        } else {
-            Self::Unknown
-        }
-    }
-
-    fn display_name(&self) -> &'static str {
-        match self {
-            Self::Sonnet => "Sonnet",
-            Self::Haiku => "Haiku",
-            Self::Opus => "Opus",
-            Self::Opus4 => "Opus 4",
-            Self::Unknown => "Unknown",
-        }
+/// Exhaustive `match` (rather than a const lookup table) so adding a new
+/// `ModelFamily` variant fails to compile here until the ordering is
+/// updated, instead of panicking at runtime with the previous
+/// `expect("every ModelFamily variant must appear …")` shape. Newer /
+/// typically more expensive families come first; Opus 3 vs Opus 4.x share
+/// `ModelFamily::Opus` and are further ordered by the version-descending
+/// tiebreak in `model_sort_key`. `Synthetic` is placed last as a defensive
+/// fallback even though `priced_claude_assistant` keeps it out of
+/// `ModelMetricsMap` in practice.
+fn family_sort_key(family: ModelFamily) -> usize {
+    match family {
+        ModelFamily::Opus => 0,
+        ModelFamily::Sonnet => 1,
+        ModelFamily::Haiku => 2,
+        ModelFamily::Synthetic => 3,
     }
 }
 
-impl fmt::Display for ModelType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.display_name())
-    }
+/// Ordering tuple combining the family bucket order with descending version
+/// so the newest Opus 4.x appears above older 4.x variants. The
+/// `has_no_version` flag forces entries with no parsed digits to sort last
+/// inside their family so e.g. a bare `"SONNET"` row sits below
+/// `"Sonnet 4.5"` rather than ahead of it.
+fn model_sort_key(model: &Model) -> (usize, Reverse<(u32, u32)>, u8) {
+    let (major, minor, has_no_version) = match model.version {
+        Some(version) => (version.major, version.minor.unwrap_or(0), 0u8),
+        None => (0, 0, 1u8),
+    };
+    (
+        family_sort_key(model.family),
+        Reverse((major, minor)),
+        has_no_version,
+    )
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct ModelMetricsMap {
-    metrics: HashMap<ModelType, MetricComponents>,
+    metrics: HashMap<Model, MetricComponents>,
 }
 
 impl ModelMetricsMap {
-    /// Unknown Claude models are dropped here because `cost_analyzer` already
-    /// logged the pricing problem upstream and the report only has stable rows
-    /// for the four named display buckets.
+    /// Unknown models are dropped silently because `cost_analyzer` already
+    /// emitted a structured tracing error for them upstream; raising another
+    /// error here would double-report the same condition to the user.
     pub fn add(
         &mut self,
-        model_type: ModelType,
+        model: Model,
         metrics: impl Into<MetricComponents>,
     ) -> miette::Result<()> {
-        if model_type == ModelType::Unknown {
+        if model.family == ModelFamily::Synthetic {
+            // Synthetic assistant turns have no usage to bill; skip them
+            // before storing so the report never shows a `<synthetic>` row.
             return Ok(());
         }
 
         let metrics = metrics.into();
+        // Capture the display label before `entry(model)` consumes `model`,
+        // so the error path doesn't need to clone or borrow it back out.
+        let label = model.to_string();
 
-        match self.metrics.entry(model_type) {
+        match self.metrics.entry(model) {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(metrics);
                 Ok(())
@@ -83,16 +72,14 @@ impl ModelMetricsMap {
             std::collections::hash_map::Entry::Occupied(mut entry) => entry
                 .get_mut()
                 .checked_add_assign(metrics)
-                .map_err(|error| {
-                    error.wrap_err(format!("failed to aggregate {model_type} metrics"))
-                }),
+                .map_err(|error| error.wrap_err(format!("failed to aggregate {label} metrics"))),
         }
     }
 
     #[cfg(test)]
-    pub fn get_metric(&self, model_type: ModelType, report_mode: ReportMode) -> MetricComponents {
+    pub fn get_metric(&self, model: Model, report_mode: ReportMode) -> MetricComponents {
         self.metrics
-            .get(&model_type)
+            .get(&model)
             .copied()
             .unwrap_or_else(|| MetricComponents::zero(report_mode))
     }
@@ -105,37 +92,49 @@ impl ModelMetricsMap {
             })
     }
 
-    fn get_or_default(&self, model_type: ModelType, report_mode: ReportMode) -> MetricComponents {
-        self.metrics
-            .get(&model_type)
-            .copied()
-            .unwrap_or_else(|| MetricComponents::zero(report_mode))
-    }
-
-    pub fn model_metrics(&self, report_mode: ReportMode) -> [(&'static str, MetricComponents); 4] {
-        ModelType::DISPLAY_ORDER
-            .map(|(model_type, name)| (name, self.get_or_default(model_type, report_mode)))
+    /// Ordered view of every populated bucket. Empty buckets are not emitted,
+    /// so the report's row count tracks the number of distinct model versions
+    /// actually observed in the logs instead of a fixed family list.
+    pub fn model_metrics(&self) -> Vec<(String, MetricComponents)> {
+        let mut entries: Vec<(&Model, &MetricComponents)> = self.metrics.iter().collect();
+        entries.sort_by(|left, right| model_sort_key(left.0).cmp(&model_sort_key(right.0)));
+        entries
+            .into_iter()
+            .map(|(model, metrics)| (model.to_string(), *metrics))
+            .collect()
     }
 }
 
 #[cfg(test)]
 impl ModelMetricsMap {
-    pub fn get(&self, model_type: ModelType) -> crate::cost_report::CostComponents {
-        match self.get_metric(model_type, ReportMode::Cost) {
+    pub fn get(&self, model: Model) -> crate::cost_report::CostComponents {
+        match self.get_metric(model, ReportMode::Cost) {
             MetricComponents::Cost(costs) => costs,
-            MetricComponents::Tokens(_) => unreachable!("cost tests requested token metrics"),
+            MetricComponents::Tokens(_) => {
+                unreachable!("map contains token metrics but cost access was requested")
+            }
         }
     }
 
-    pub fn get_tokens(&self, model_type: ModelType) -> crate::cost_report::TokenCounts {
-        match self.get_metric(model_type, ReportMode::Tokens) {
-            MetricComponents::Cost(_) => unreachable!("token tests requested cost metrics"),
+    pub fn get_tokens(&self, model: Model) -> crate::cost_report::TokenCounts {
+        match self.get_metric(model, ReportMode::Tokens) {
+            MetricComponents::Cost(_) => {
+                unreachable!("map contains cost metrics but token access was requested")
+            }
             MetricComponents::Tokens(tokens) => tokens,
         }
     }
 
-    pub fn model_costs(&self) -> [(&'static str, crate::cost_report::CostComponents); 4] {
-        ModelType::DISPLAY_ORDER.map(|(model_type, name)| (name, self.get(model_type)))
+    pub fn model_costs(&self) -> Vec<(String, crate::cost_report::CostComponents)> {
+        self.model_metrics()
+            .into_iter()
+            .map(|(name, metrics)| match metrics {
+                MetricComponents::Cost(costs) => (name, costs),
+                MetricComponents::Tokens(_) => {
+                    unreachable!("map contains token metrics but cost access was requested")
+                }
+            })
+            .collect()
     }
 }
 
@@ -148,122 +147,61 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn model_type_from_string_sonnet_variations() {
-        assert_eq!(
-            ModelType::from_model_string("claude-sonnet-4"),
-            ModelType::Sonnet
-        );
-        assert_eq!(ModelType::from_model_string("SONNET"), ModelType::Sonnet);
-        assert_eq!(
-            ModelType::from_model_string("Claude-Sonnet-3.5"),
-            ModelType::Sonnet
-        );
+    fn sonnet() -> Model {
+        Model::family(ModelFamily::Sonnet)
     }
-
-    #[test]
-    fn model_type_from_string_haiku_variations() {
-        assert_eq!(
-            ModelType::from_model_string("claude-haiku-3"),
-            ModelType::Haiku
-        );
-        assert_eq!(ModelType::from_model_string("HAIKU"), ModelType::Haiku);
-    }
-
-    #[test]
-    fn model_type_from_string_opus_variations() {
-        assert_eq!(
-            ModelType::from_model_string("claude-3-opus-20240229"),
-            ModelType::Opus
-        );
-        assert_eq!(ModelType::from_model_string("OPUS"), ModelType::Opus);
-    }
-
-    #[test]
-    fn model_type_from_string_opus4_variations() {
-        // Opus 4 must win against the more general Opus arm; this guards the
-        // ordering inside `from_model_string`.
-        assert_eq!(
-            ModelType::from_model_string("claude-opus-4"),
-            ModelType::Opus4
-        );
-        assert_eq!(
-            ModelType::from_model_string("claude-opus-4-5"),
-            ModelType::Opus4
-        );
-        assert_eq!(
-            ModelType::from_model_string("CLAUDE-OPUS-4-20250514"),
-            ModelType::Opus4
-        );
-        assert_eq!(
-            ModelType::from_model_string("claude-opus-45"),
-            ModelType::Opus4
-        );
-    }
-
-    #[test]
-    fn model_type_from_string_unknown() {
-        assert_eq!(ModelType::from_model_string("gpt-4"), ModelType::Unknown);
-        assert_eq!(ModelType::from_model_string(""), ModelType::Unknown);
-    }
-
-    #[test]
-    fn model_type_display_matches_variant() {
-        assert_eq!(ModelType::Sonnet.to_string(), "Sonnet");
-        assert_eq!(ModelType::Haiku.to_string(), "Haiku");
-        assert_eq!(ModelType::Opus.to_string(), "Opus");
-        assert_eq!(ModelType::Opus4.to_string(), "Opus 4");
-        assert_eq!(ModelType::Unknown.to_string(), "Unknown");
+    fn haiku() -> Model {
+        Model::family(ModelFamily::Haiku)
     }
 
     #[test]
     fn model_metrics_map_add_accumulates_costs_per_bucket() {
         let mut map = ModelMetricsMap::default();
         map.add(
-            ModelType::Sonnet,
+            sonnet(),
             MetricComponents::Cost(CostComponents::new(1.0, 2.0, 0.0, 0.0)),
         )
         .unwrap();
         map.add(
-            ModelType::Sonnet,
+            sonnet(),
             MetricComponents::Cost(CostComponents::new(0.5, 0.5, 0.25, 0.0)),
         )
         .unwrap();
 
-        let sonnet = map.get(ModelType::Sonnet);
-        assert_eq!(sonnet, CostComponents::new(1.5, 2.5, 0.25, 0.0));
+        let sonnet_costs = map.get(sonnet());
+        assert_eq!(sonnet_costs, CostComponents::new(1.5, 2.5, 0.25, 0.0));
     }
 
     #[test]
     fn model_metrics_map_add_accumulates_tokens_per_bucket() {
         let mut map = ModelMetricsMap::default();
         map.add(
-            ModelType::Sonnet,
+            sonnet(),
             MetricComponents::Tokens(TokenCounts::new(1, 2, 0, 0)),
         )
         .unwrap();
         map.add(
-            ModelType::Sonnet,
+            sonnet(),
             MetricComponents::Tokens(TokenCounts::new(3, 4, 5, 6)),
         )
         .unwrap();
 
-        let sonnet = map.get_tokens(ModelType::Sonnet);
-        assert_eq!(sonnet, TokenCounts::new(4, 6, 5, 6));
+        let sonnet_tokens = map.get_tokens(sonnet());
+        assert_eq!(sonnet_tokens, TokenCounts::new(4, 6, 5, 6));
     }
 
     #[test]
     fn model_metrics_map_rejects_mixed_metric_modes() {
         let mut map = ModelMetricsMap::default();
         map.add(
-            ModelType::Sonnet,
+            sonnet(),
             MetricComponents::Cost(CostComponents::new(1.0, 0.0, 0.0, 0.0)),
         )
         .unwrap();
 
         let error = map
             .add(
-                ModelType::Sonnet,
+                sonnet(),
                 MetricComponents::Tokens(TokenCounts::new(1, 0, 0, 0)),
             )
             .unwrap_err();
@@ -276,11 +214,8 @@ mod tests {
     #[test]
     fn model_metrics_map_get_absent_returns_zero_for_mode() {
         let metrics = ModelMetricsMap::default();
-        assert_eq!(metrics.get(ModelType::Sonnet), CostComponents::default());
-        assert_eq!(
-            metrics.get_tokens(ModelType::Sonnet),
-            TokenCounts::default()
-        );
+        assert_eq!(metrics.get(sonnet()), CostComponents::default());
+        assert_eq!(metrics.get_tokens(sonnet()), TokenCounts::default());
     }
 
     #[test]
@@ -288,13 +223,13 @@ mod tests {
         let mut metrics = ModelMetricsMap::default();
         metrics
             .add(
-                ModelType::Sonnet,
+                sonnet(),
                 MetricComponents::Cost(CostComponents::new(1.0, 2.0, 0.0, 0.0)),
             )
             .unwrap();
         metrics
             .add(
-                ModelType::Haiku,
+                haiku(),
                 MetricComponents::Cost(CostComponents::new(0.5, 1.0, 0.0, 0.0)),
             )
             .unwrap();
@@ -310,13 +245,13 @@ mod tests {
         let mut metrics = ModelMetricsMap::default();
         metrics
             .add(
-                ModelType::Sonnet,
+                sonnet(),
                 MetricComponents::Tokens(TokenCounts::new(1, 2, 3, 4)),
             )
             .unwrap();
         metrics
             .add(
-                ModelType::Haiku,
+                haiku(),
                 MetricComponents::Tokens(TokenCounts::new(5, 6, 7, 8)),
             )
             .unwrap();
@@ -332,13 +267,13 @@ mod tests {
         let mut metrics = ModelMetricsMap::default();
         metrics
             .add(
-                ModelType::Sonnet,
+                sonnet(),
                 MetricComponents::Tokens(TokenCounts::new(9_007_199_254_740_993, 1, 0, 0)),
             )
             .unwrap();
         metrics
             .add(
-                ModelType::Haiku,
+                haiku(),
                 MetricComponents::Tokens(TokenCounts::new(2, 0, 0, 0)),
             )
             .unwrap();
@@ -354,14 +289,14 @@ mod tests {
         let mut metrics = ModelMetricsMap::default();
         metrics
             .add(
-                ModelType::Sonnet,
+                sonnet(),
                 MetricComponents::Tokens(TokenCounts::new(u64::MAX, 0, 0, 0)),
             )
             .unwrap();
 
         let error = metrics
             .add(
-                ModelType::Sonnet,
+                sonnet(),
                 MetricComponents::Tokens(TokenCounts::new(1, 0, 0, 0)),
             )
             .unwrap_err();
@@ -373,11 +308,14 @@ mod tests {
     }
 
     #[test]
-    fn model_metrics_map_ignores_unknown_buckets() {
+    fn model_metrics_map_ignores_synthetic_family() {
+        // `<synthetic>` is the only non-billable family that can reach
+        // `add` (unknown ids fail to parse upstream); the map must drop it
+        // silently so the report doesn't grow a phantom `<synthetic>` row.
         let mut metrics = ModelMetricsMap::default();
         metrics
             .add(
-                ModelType::Unknown,
+                Model::family(ModelFamily::Synthetic),
                 MetricComponents::Cost(CostComponents::new(9.0, 8.0, 7.0, 6.0)),
             )
             .unwrap();
@@ -386,20 +324,91 @@ mod tests {
             metrics.total(ReportMode::Cost).unwrap(),
             MetricTotal::Cost(0.0)
         );
-        assert_eq!(metrics.model_metrics(ReportMode::Cost).len(), 4);
+        assert!(metrics.model_metrics().is_empty());
     }
 
     #[test]
-    fn model_metrics_map_model_metrics_zero_fills_absent_entries() {
+    fn model_metrics_map_empty_returns_no_entries() {
         let metrics = ModelMetricsMap::default();
-        let entries = metrics.model_metrics(ReportMode::Tokens);
+        assert!(metrics.model_metrics().is_empty());
+    }
 
-        assert_eq!(entries.len(), 4);
-        for (_, model_metrics) in &entries {
-            assert_eq!(
-                *model_metrics,
-                MetricComponents::Tokens(TokenCounts::default())
-            );
+    #[test]
+    fn model_metrics_sorts_family_first_then_version_desc() {
+        let mut metrics = ModelMetricsMap::default();
+        let cases = [
+            "claude-3-5-sonnet-20241022",
+            "claude-sonnet-4-20250514",
+            "claude-sonnet-4-5-20250929",
+            "claude-opus-4-20250514",
+            "claude-opus-4-5",
+            "claude-opus-4-7",
+            // Opus 3.5 (hypothetical id, not shipped by Anthropic) pins the
+            // within-family ordering: a minor-bearing Opus 3 entry must sort
+            // between "Opus 4" and the bare "Opus 3" major-only row.
+            "claude-opus-3-5-20241022",
+            "claude-3-opus-20240229",
+            "claude-3-haiku-20240307",
+            "claude-haiku-4-5",
+        ];
+        for id in cases {
+            metrics
+                .add(
+                    Model::from_model_string(id).expect("fixture model id parses"),
+                    MetricComponents::Cost(CostComponents::new(1.0, 0.0, 0.0, 0.0)),
+                )
+                .unwrap();
         }
+
+        let labels: Vec<String> = metrics
+            .model_metrics()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+
+        assert_eq!(
+            labels,
+            vec![
+                "Opus 4.7",
+                "Opus 4.5",
+                "Opus 4",
+                "Opus 3.5",
+                "Opus 3",
+                "Sonnet 4.5",
+                "Sonnet 4",
+                "Sonnet 3.5",
+                "Haiku 4.5",
+                "Haiku 3",
+            ]
+        );
+    }
+
+    #[test]
+    fn model_metrics_sorts_unversioned_entry_last_within_family() {
+        // Exercises the `has_no_version` tiebreaker in `model_sort_key`: a
+        // bare-family entry (e.g. `"SONNET"`) must sort below versioned
+        // entries of the same family so reports group the "newest first"
+        // versions on top and leave the unparseable row at the bottom.
+        let mut metrics = ModelMetricsMap::default();
+        for id in [
+            "claude-sonnet-4-5-20250929",
+            "claude-sonnet-4-20250514",
+            "SONNET",
+        ] {
+            metrics
+                .add(
+                    Model::from_model_string(id).expect("fixture model id parses"),
+                    MetricComponents::Cost(CostComponents::new(1.0, 0.0, 0.0, 0.0)),
+                )
+                .unwrap();
+        }
+
+        let labels: Vec<String> = metrics
+            .model_metrics()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+
+        assert_eq!(labels, vec!["Sonnet 4.5", "Sonnet 4", "Sonnet"]);
     }
 }

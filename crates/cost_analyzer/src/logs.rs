@@ -4,12 +4,12 @@ use chrono::{DateTime, Utc};
 use miette::{Context, IntoDiagnostic};
 use rust_decimal::Decimal;
 use serde::de::DeserializeOwned;
-use tracing::error;
 use uuid::Uuid;
 
 use claude_logs::{
     AssistantLogLine as ClaudeAssistantLogLine, AssistantUsage as ClaudeAssistantUsage,
-    LogLine as ClaudeLogLine, SystemLogLine as ClaudeSystemLogLine,
+    LogLine as ClaudeLogLine, Model as ClaudeModel, ModelFamily as ClaudeModelFamily,
+    SystemLogLine as ClaudeSystemLogLine,
 };
 use pi_logs::{AssistantMessage, PiLogLine, Provider, RoleMessage};
 
@@ -196,74 +196,26 @@ impl ClaudeModelPricing {
             output: per_million_token_cost(usage.output_tokens, self.output),
         }
     }
-}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ClaudeModelType {
-    Sonnet,
-    Haiku,
-    Opus,
-    Opus4,
-    Unknown,
-}
-
-impl ClaudeModelType {
-    pub fn from_model_string(model: &str) -> Self {
-        let model_lower = model.to_lowercase();
-        if model_lower.contains("sonnet") {
-            Self::Sonnet
-        } else if model_lower.contains("haiku") {
-            Self::Haiku
-        } else if model_lower.contains("opus-4") {
-            // Check Opus 4 before the general Opus branch: every Opus 4 model string also
-            // contains "opus", so reversing these arms would misclassify Opus 4 as Opus 3.
-            Self::Opus4
-        } else if model_lower.contains("opus") {
-            Self::Opus
-        } else {
-            Self::Unknown
+    /// Returns `None` only for the `Synthetic` family — harness-fabricated
+    /// assistant turns have no real usage to bill.
+    ///
+    /// Opus pricing is version-tiered: ids whose major version is `>= 4` use
+    /// the Opus 4 rate (`$5/$25`); the rest, including bare/versionless
+    /// `"OPUS"` inputs, default to the Opus 3 rate (`$15/$75`) because that
+    /// is the only historical Opus pricing tier without explicit version
+    /// digits in the wire id.
+    pub fn for_model(model: &ClaudeModel) -> Option<Self> {
+        match model.family {
+            ClaudeModelFamily::Sonnet => Some(Self::SONNET),
+            ClaudeModelFamily::Haiku => Some(Self::HAIKU),
+            ClaudeModelFamily::Opus => Some(match model.version.map(|v| v.major) {
+                Some(major) if major >= 4 => Self::OPUS_4,
+                _ => Self::OPUS,
+            }),
+            ClaudeModelFamily::Synthetic => None,
         }
     }
-
-    fn info(&self) -> ClaudeModelInfo {
-        match self {
-            Self::Sonnet => ClaudeModelInfo {
-                pricing: Some(ClaudeModelPricing::SONNET),
-                display_name: "Sonnet",
-            },
-            Self::Haiku => ClaudeModelInfo {
-                pricing: Some(ClaudeModelPricing::HAIKU),
-                display_name: "Haiku",
-            },
-            Self::Opus => ClaudeModelInfo {
-                pricing: Some(ClaudeModelPricing::OPUS),
-                display_name: "Opus",
-            },
-            Self::Opus4 => ClaudeModelInfo {
-                pricing: Some(ClaudeModelPricing::OPUS_4),
-                display_name: "Opus 4",
-            },
-            Self::Unknown => ClaudeModelInfo {
-                pricing: None,
-                display_name: "Unknown",
-            },
-        }
-    }
-
-    pub fn pricing(&self) -> Option<ClaudeModelPricing> {
-        self.info().pricing
-    }
-}
-
-impl fmt::Display for ClaudeModelType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.info().display_name)
-    }
-}
-
-struct ClaudeModelInfo {
-    pricing: Option<ClaudeModelPricing>,
-    display_name: &'static str,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -283,10 +235,6 @@ fn claude_assistant_line(line: &ClaudeLogLine) -> Option<&ClaudeAssistantLogLine
         ClaudeLogLine::Assistant(assistant) => Some(assistant),
         _ => None,
     }
-}
-
-fn is_synthetic_claude_model(model: &str) -> bool {
-    model.eq_ignore_ascii_case("<synthetic>")
 }
 
 fn claude_token_counts_from_usage(usage: &ClaudeAssistantUsage) -> ClaudeTokenCounts {
@@ -327,30 +275,11 @@ fn priced_claude_assistant(
     line: &ClaudeLogLine,
 ) -> Option<(&ClaudeAssistantLogLine, ClaudeModelPricing)> {
     let assistant = claude_assistant_line(line)?;
-
-    if is_synthetic_claude_model(&assistant.message.model) {
-        return None;
-    }
-
-    let model_type = ClaudeModelType::from_model_string(&assistant.message.model);
-    let pricing = match model_type.pricing() {
-        Some(pricing) => pricing,
-        None => {
-            if assistant
-                .message
-                .model
-                .to_ascii_lowercase()
-                .starts_with("claude")
-            {
-                error!(
-                    model = %assistant.message.model,
-                    "unrecognized Claude model omitted from cost analysis"
-                );
-            }
-            return None;
-        }
-    };
-
+    // `for_model` returns `None` only for `Synthetic` (harness-fabricated
+    // assistant turns); ids that don't match any family fail earlier in
+    // `claude_logs::Model::from_model_string`, so there's no separate
+    // "unrecognized" branch to handle here.
+    let pricing = ClaudeModelPricing::for_model(&assistant.message.model)?;
     Some((assistant, pricing))
 }
 
@@ -427,7 +356,7 @@ fn claude_system_identifier(system: &ClaudeSystemLogLine) -> String {
 
 impl AnalyzableLog for ClaudeLogLine {
     type LogId = String;
-    type ModelId = String;
+    type ModelId = ClaudeModel;
 
     fn cost(&self) -> Option<LlmCost> {
         let (assistant, pricing) = priced_claude_assistant(self)?;
@@ -1352,37 +1281,48 @@ mod tests {
     }
 
     #[test]
-    fn claude_model_type_matches_api_pricing_families() {
+    fn claude_pricing_for_model_covers_every_family() {
+        // `for_model` is the one entry point cost computation uses to turn a
+        // parsed `claude_logs::Model` into a pricing constant; keeping each
+        // family wired here prevents a new family variant from silently
+        // dropping out of cost analysis.
         let cases = [
-            ("claude-sonnet-4-20250514", ClaudeModelType::Sonnet),
-            ("CLAUDE-3-5-SONNET-20241022", ClaudeModelType::Sonnet),
-            ("claude-3-haiku-20240307", ClaudeModelType::Haiku),
-            ("claude-3-opus-20240229", ClaudeModelType::Opus),
-            ("claude-opus-4-20250514", ClaudeModelType::Opus4),
-            ("claude-opus-45", ClaudeModelType::Opus4),
-            ("", ClaudeModelType::Unknown),
-            ("gpt-4", ClaudeModelType::Unknown),
-            ("claude-opus-4-sonnet-preview", ClaudeModelType::Sonnet),
+            ("claude-sonnet-4-5", ClaudeModelPricing::SONNET.input),
+            (
+                "claude-3-5-sonnet-20241022",
+                ClaudeModelPricing::SONNET.input,
+            ),
+            ("claude-haiku-4-5", ClaudeModelPricing::HAIKU.input),
+            ("claude-3-opus-20240229", ClaudeModelPricing::OPUS.input),
+            // Opus 3 with an explicit minor exercises the
+            // `Some(major) where major < 4` arm of the version dispatch —
+            // structurally distinct from both the `major >= 4` arm and the
+            // bare/versionless `None` arm covered below.
+            ("claude-opus-3-5-20241022", ClaudeModelPricing::OPUS.input),
+            ("claude-opus-4-20250514", ClaudeModelPricing::OPUS_4.input),
+            ("claude-opus-4-7", ClaudeModelPricing::OPUS_4.input),
         ];
-
-        for (model, expected) in cases {
-            assert_eq!(ClaudeModelType::from_model_string(model), expected);
+        for (id, expected_input) in cases {
+            let model = ClaudeModel::from_model_string(id).expect("fixture parses");
+            assert_eq!(
+                ClaudeModelPricing::for_model(&model).map(|p| p.input),
+                Some(expected_input),
+                "id {id:?}",
+            );
         }
-    }
 
-    #[test]
-    fn claude_model_type_display_matches_variant_names() {
-        let cases = [
-            (ClaudeModelType::Sonnet, "Sonnet"),
-            (ClaudeModelType::Haiku, "Haiku"),
-            (ClaudeModelType::Opus, "Opus"),
-            (ClaudeModelType::Opus4, "Opus 4"),
-            (ClaudeModelType::Unknown, "Unknown"),
-        ];
+        // Bare/versionless Opus defaults to the Opus 3 tier — the only
+        // historical Opus pricing without explicit version digits.
+        let versionless_opus = ClaudeModel::family(ClaudeModelFamily::Opus);
+        assert_eq!(
+            ClaudeModelPricing::for_model(&versionless_opus).map(|p| p.input),
+            Some(ClaudeModelPricing::OPUS.input),
+        );
 
-        for (model_type, expected) in cases {
-            assert_eq!(model_type.to_string(), expected);
-        }
+        // Synthetic is the only family for which pricing is `None` —
+        // assistant turns the harness fabricated have no real usage to bill.
+        let synthetic = ClaudeModel::family(ClaudeModelFamily::Synthetic);
+        assert!(ClaudeModelPricing::for_model(&synthetic).is_none());
     }
 
     #[test]
@@ -1432,7 +1372,7 @@ mod tests {
         ));
 
         assert_eq!(parsed.id, case.expected_id, "case {}", case.name);
-        assert_eq!(parsed.model, case.model, "case {}", case.name);
+        assert_eq!(parsed.model.raw(), case.model, "case {}", case.name);
         assert_eq!(parsed.timestamp, timestamp(), "case {}", case.name);
         assert_eq!(parsed.cost, case.expected_cost, "case {}", case.name);
     }
@@ -1712,37 +1652,46 @@ mod tests {
     }
 
     #[test]
-    fn claude_synthetic_and_unknown_models_are_non_billable() {
-        let cases = [
-            (
-                "synthetic model",
-                claude_assistant_json(
-                    Some(CLAUDE_PARENT_UUID),
-                    Some("req-synthetic"),
-                    "msg_synthetic",
-                    CLAUDE_ASSISTANT_UUID,
-                    "<SyNtHeTiC>",
-                    claude_usage_json(1_000_000, 1_000_000, 1_000_000, 1_000_000),
-                ),
-                "req-synthetic",
+    fn claude_synthetic_model_is_non_billable_but_parses() {
+        // `<synthetic>` is Claude Code's placeholder for fabricated assistant
+        // turns; it parses (as `ModelFamily::Synthetic`) but produces no cost.
+        // Case-insensitive matching guards against future changes to the
+        // sentinel casing.
+        assert_claude_non_billable_value(
+            "synthetic model",
+            claude_assistant_json(
+                Some(CLAUDE_PARENT_UUID),
+                Some("req-synthetic"),
+                "msg_synthetic",
+                CLAUDE_ASSISTANT_UUID,
+                "<SyNtHeTiC>",
+                claude_usage_json(1_000_000, 1_000_000, 1_000_000, 1_000_000),
             ),
-            (
-                "unknown model",
-                claude_assistant_json(
-                    Some(CLAUDE_PARENT_UUID),
-                    Some("req-unknown"),
-                    "msg_unknown",
-                    CLAUDE_ASSISTANT_UUID,
-                    "gpt-4",
-                    claude_usage_json(1_000_000, 1_000_000, 1_000_000, 1_000_000),
-                ),
-                "req-unknown",
-            ),
-        ];
+            timestamp(),
+            "req-synthetic",
+        );
+    }
 
-        for (name, value, expected_id) in cases {
-            assert_claude_non_billable_value(name, value, timestamp(), expected_id);
-        }
+    #[test]
+    fn claude_unknown_model_id_fails_to_parse() {
+        // Unrecognized model ids — including non-Claude ids and future
+        // Anthropic families this code doesn't know about — must surface as
+        // parse errors so cost data is never silently miscounted.
+        let value = claude_assistant_json(
+            Some(CLAUDE_PARENT_UUID),
+            Some("req-unknown"),
+            "msg_unknown",
+            CLAUDE_ASSISTANT_UUID,
+            "gpt-4",
+            claude_usage_json(1_000_000, 1_000_000, 1_000_000, 1_000_000),
+        );
+        let err = <ClaudeLogLine as AnalyzableLog>::parse(&value.to_string()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unrecognized Claude model id `gpt-4`")
+                || format!("{err:?}").contains("unrecognized Claude model id `gpt-4`"),
+            "expected error to name the unrecognized id, got: {err:?}"
+        );
     }
 
     #[test]

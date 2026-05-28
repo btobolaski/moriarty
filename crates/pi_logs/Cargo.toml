@@ -10,7 +10,7 @@ miette = { workspace = true }
 rust_decimal = { workspace = true, features = ["serde-with-str"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
-thiserror = "2.0"
+thiserror = { workspace = true }
 uuid = { workspace = true }
 walkdir = "2.5"
 my-workspace-hack = { version = "0.1", path = "../my-workspace-hack" }

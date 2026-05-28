@@ -1,11 +1,13 @@
 use chrono::{NaiveDate, TimeZone, Utc};
 use tabled::Table;
 
+use claude_logs::{Model, ModelFamily};
+
 use super::*;
 use crate::{
     api_pricing::{
         analyzer::{DailyCosts, SessionCosts},
-        pricing::{ModelCostsMap, ModelType},
+        pricing::ModelCostsMap,
     },
     cost_report::{
         apply_width_config, create_grouped_table, display_grand_total, divider, fmt_money,
@@ -39,7 +41,7 @@ impl DailyCostsExt for DailyCosts {
     fn with_sonnet(mut self, input: f64, output: f64, cache_write: f64, cache_read: f64) -> Self {
         self.per_model
             .add(
-                ModelType::Sonnet,
+                Model::family(ModelFamily::Sonnet),
                 ComponentTotals::new(input, output, cache_write, cache_read),
             )
             .unwrap();
@@ -48,7 +50,7 @@ impl DailyCostsExt for DailyCosts {
     fn with_haiku(mut self, input: f64, output: f64, cache_write: f64, cache_read: f64) -> Self {
         self.per_model
             .add(
-                ModelType::Haiku,
+                Model::family(ModelFamily::Haiku),
                 ComponentTotals::new(input, output, cache_write, cache_read),
             )
             .unwrap();
@@ -57,16 +59,20 @@ impl DailyCostsExt for DailyCosts {
     fn with_opus(mut self, input: f64, output: f64, cache_write: f64, cache_read: f64) -> Self {
         self.per_model
             .add(
-                ModelType::Opus,
+                Model::family(ModelFamily::Opus),
                 ComponentTotals::new(input, output, cache_write, cache_read),
             )
             .unwrap();
         self
     }
     fn with_opus4(mut self, input: f64, output: f64, cache_write: f64, cache_read: f64) -> Self {
+        // Opus 4 is `ModelFamily::Opus` with a parsed major-4 version; the
+        // raw id mirrors what production logs carry so this builder matches
+        // the bucket key produced by `Model::from_model_string`.
+        let model = Model::from_model_string("claude-opus-4-20250514").expect("fixture id parses");
         self.per_model
             .add(
-                ModelType::Opus4,
+                model,
                 ComponentTotals::new(input, output, cache_write, cache_read),
             )
             .unwrap();
@@ -503,14 +509,16 @@ fn iter_model_costs_returns_display_order() {
         .with_sonnet(2.0, 2.0, 0.0, 0.0)
         .with_haiku(0.5, 0.5, 0.0, 0.0);
 
-    let models: Vec<&str> = costs
+    let models: Vec<String> = costs
         .per_model
         .model_costs()
         .into_iter()
         .map(|(name, _)| name)
         .collect();
 
-    assert_eq!(models, vec!["Opus 4", "Opus", "Sonnet", "Haiku"]);
+    // Only populated families appear; absent buckets (Opus 4 here) are dropped
+    // by the new dynamic-sized aggregator.
+    assert_eq!(models, vec!["Opus", "Sonnet", "Haiku"]);
 }
 
 #[test]
@@ -608,7 +616,10 @@ fn session_costs_fixture(session_id: &str) -> SessionCosts {
     let end = Utc.with_ymd_and_hms(2025, 10, 23, 10, 30, 0).unwrap();
     let mut per_model = ModelCostsMap::default();
     per_model
-        .add(ModelType::Sonnet, ComponentTotals::new(1.0, 2.0, 0.0, 0.0))
+        .add(
+            Model::family(ModelFamily::Sonnet),
+            ComponentTotals::new(1.0, 2.0, 0.0, 0.0),
+        )
         .unwrap();
     SessionCosts {
         session_id: session_id.to_string(),

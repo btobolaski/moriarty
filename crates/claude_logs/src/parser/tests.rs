@@ -766,7 +766,7 @@ fn test_parse_assistant_with_web_fetch_and_context_management() {
 
     let line: LogLine = serde_json::from_value(json).expect("Should parse new format");
     if let LogLine::Assistant(assistant) = line {
-        assert_eq!(assistant.message.model, "<synthetic>");
+        assert_eq!(assistant.message.model.raw(), "<synthetic>");
         assert_eq!(assistant.message.context_management, None);
         assert_eq!(
             assistant
@@ -823,7 +823,7 @@ fn test_parse_assistant_without_web_fetch_requests() {
 
     let line: LogLine = serde_json::from_value(json).expect("Should parse old format");
     if let LogLine::Assistant(assistant) = line {
-        assert_eq!(assistant.message.model, "claude-3-5-sonnet");
+        assert_eq!(assistant.message.model.raw(), "claude-3-5-sonnet");
         assert_eq!(
             assistant
                 .message

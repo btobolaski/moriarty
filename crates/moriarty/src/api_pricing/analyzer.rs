@@ -3,12 +3,12 @@ use std::{collections::BTreeMap, path::Path};
 use chrono::{DateTime, NaiveDate, Utc};
 use rust_decimal::prelude::ToPrimitive;
 
-use super::pricing::{ModelMetricsMap, ModelType};
+use super::pricing::ModelMetricsMap;
 use crate::cost_report::{
     CostComponents, DateTimezone, MetricComponents, MetricTotal, ReportMode, TimeRangeFilter,
     TokenCounts,
 };
-use claude_logs::LogLine;
+use claude_logs::{LogLine, Model};
 use cost_analyzer::{
     analyze_directory as cost_analyze_directory, AnalyzableLog, LineWithCost, LlmCost, TokenType,
 };
@@ -118,7 +118,7 @@ fn metric_components(
 ///
 /// Both `analyze_directory` and `analyze_directory_by_session` start by
 /// fetching `cost_analyzer`'s deduplicated lines and pairing each surviving
-/// line with its `(ModelType, MetricComponents)`. Sharing that prelude in one
+/// line with its `(Model, MetricComponents)`. Sharing that prelude in one
 /// helper keeps the two entry points from drifting in load semantics (e.g.,
 /// dedup-then-filter ordering, future cost adjustments) and lets each entry
 /// point own only its bucketing logic.
@@ -126,10 +126,7 @@ async fn load_billable_lines(
     dir: &Path,
     filter: &TimeRangeFilter,
     report_mode: ReportMode,
-) -> miette::Result<(
-    Vec<(LineWithCost<LogLine>, ModelType, MetricComponents)>,
-    bool,
-)> {
+) -> miette::Result<(Vec<(LineWithCost<LogLine>, Model, MetricComponents)>, bool)> {
     let result = cost_analyze_directory::<LogLine>(dir.to_path_buf()).await;
     let mut entries = Vec::new();
 
@@ -149,12 +146,12 @@ fn billable_entry(
     line: &LineWithCost<LogLine>,
     filter: &TimeRangeFilter,
     report_mode: ReportMode,
-) -> miette::Result<Option<(ModelType, MetricComponents)>> {
+) -> miette::Result<Option<(Model, MetricComponents)>> {
     if !filter.contains(&line.timestamp) {
         return Ok(None);
     }
     Ok(Some((
-        ModelType::from_model_string(&line.model),
+        line.model.clone(),
         metric_components(line, report_mode)?,
     )))
 }
@@ -195,7 +192,7 @@ pub async fn analyze_directory_by_session(
 }
 
 fn session_analysis_from_entries(
-    entries: Vec<(LineWithCost<LogLine>, ModelType, MetricComponents)>,
+    entries: Vec<(LineWithCost<LogLine>, Model, MetricComponents)>,
     had_errors: bool,
 ) -> miette::Result<SessionAnalysisResult> {
     struct SessionAccumulator {
@@ -349,10 +346,22 @@ mod tests {
         );
     }
 
+    /// Bucket key that matches the parsed `Model` produced from the
+    /// fixture model id `claude-sonnet-4-20250514` so tests look up the same
+    /// `{family, version}` bucket that aggregation inserted.
+    fn sonnet_4_bucket() -> Model {
+        Model::from_model_string("claude-sonnet-4-20250514").expect("fixture model id parses")
+    }
+
+    /// Bucket key matching the fixture model id `claude-3-haiku-20240307`.
+    fn haiku_3_bucket() -> Model {
+        Model::from_model_string("claude-3-haiku-20240307").expect("fixture model id parses")
+    }
+
     /// Asserts that only the in-window line's output cost survived the filter:
     /// Sonnet output equals `SONNET_OUTPUT_PER_MILLION` and Sonnet input is 0.
     fn assert_only_in_window_sonnet_output(per_model: &ModelCostsMap) {
-        let costs = per_model.get(ModelType::Sonnet);
+        let costs = per_model.get(sonnet_4_bucket());
         assert!(
             (costs.output - SONNET_OUTPUT_PER_MILLION).abs() < 1e-9,
             "in-window Sonnet output cost should match SONNET_OUTPUT_PER_MILLION, got {}",
@@ -498,7 +507,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let model_type = ModelType::from_model_string(&line.model);
+        let model_type = line.model.clone();
         let costs = component_totals_from_llm_cost(&line.cost);
         line.session_id = None;
 
@@ -583,14 +592,14 @@ mod tests {
 
         let day_1 = &result.daily_metrics[0];
         assert_eq!(day_1.date, NaiveDate::from_ymd_opt(2026, 4, 16).unwrap());
-        let sonnet_day_1 = day_1.per_model.get(ModelType::Sonnet);
+        let sonnet_day_1 = day_1.per_model.get(sonnet_4_bucket());
         assert!((sonnet_day_1.input - SONNET_INPUT_PER_MILLION).abs() < 1e-9);
         assert!((sonnet_day_1.output - SONNET_OUTPUT_PER_MILLION).abs() < 1e-9);
-        assert_eq!(day_1.per_model.get(ModelType::Haiku).total(), 0.0);
+        assert_eq!(day_1.per_model.get(haiku_3_bucket()).total(), 0.0);
 
         let day_2 = &result.daily_metrics[1];
         assert_eq!(day_2.date, NaiveDate::from_ymd_opt(2026, 4, 17).unwrap());
-        let haiku_day_2 = day_2.per_model.get(ModelType::Haiku);
+        let haiku_day_2 = day_2.per_model.get(haiku_3_bucket());
         assert!((haiku_day_2.input - HAIKU_INPUT_PER_MILLION).abs() < 1e-9);
         assert!((haiku_day_2.output - HAIKU_OUTPUT_PER_MILLION).abs() < 1e-9);
     }
@@ -631,7 +640,7 @@ mod tests {
 
         let costs = result.daily_metrics[0]
             .per_model
-            .get_tokens(ModelType::Sonnet);
+            .get_tokens(sonnet_4_bucket());
         assert_eq!(costs.input, 1_244);
         assert_eq!(costs.output, 5_698);
         assert_eq!(costs.cache_write, 120);
@@ -769,7 +778,7 @@ mod tests {
         assert_eq!(first.start_time, timestamp(2026, 4, 16, 9, 0));
         assert_eq!(first.end_time, timestamp(2026, 4, 16, 10, 30));
         assert_eq!(first.duration_minutes(), 90);
-        let costs = first.per_model.get(ModelType::Sonnet);
+        let costs = first.per_model.get(sonnet_4_bucket());
         assert!((costs.input - SONNET_INPUT_PER_MILLION).abs() < 1e-9);
         assert!((costs.output - SONNET_OUTPUT_PER_MILLION).abs() < 1e-9);
 
@@ -815,7 +824,7 @@ mod tests {
         assert_eq!(session_metrics.start_time, timestamp(2026, 4, 16, 9, 0));
         assert_eq!(session_metrics.end_time, timestamp(2026, 4, 16, 10, 30));
         assert_eq!(session_metrics.duration_minutes(), 90);
-        let costs = session_metrics.per_model.get_tokens(ModelType::Sonnet);
+        let costs = session_metrics.per_model.get_tokens(sonnet_4_bucket());
         assert_eq!(costs.input, 1_244);
         assert_eq!(costs.output, 5_698);
         assert_eq!(costs.cache_write, 120);
@@ -869,7 +878,7 @@ mod tests {
         .await
         .unwrap();
 
-        let costs = result.daily_metrics[0].per_model.get(ModelType::Sonnet);
+        let costs = result.daily_metrics[0].per_model.get(sonnet_4_bucket());
         assert!((costs.input - SONNET_INPUT_PER_MILLION).abs() < 1e-9);
         assert!((costs.output - SONNET_OUTPUT_PER_MILLION).abs() < 1e-9);
         assert!((costs.cache_write - SONNET_CACHE_WRITE_PER_MILLION).abs() < 1e-9);

@@ -101,6 +101,7 @@ impl From<TokenCounts> for MetricComponents {
 }
 
 impl MetricComponents {
+    #[cfg(test)]
     pub(crate) fn zero(report_mode: ReportMode) -> Self {
         match report_mode {
             ReportMode::Cost => Self::Cost(CostComponents::default()),

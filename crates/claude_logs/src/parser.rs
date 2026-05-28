@@ -1115,7 +1115,7 @@ pub struct AssistantLogMessage {
     pub id: String,
     pub r#type: String,
     pub role: String,
-    pub model: String,
+    pub model: crate::model::Model,
     pub container: Option<String>,
     pub content: LogMessageContent,
     pub stop_reason: Option<String>,

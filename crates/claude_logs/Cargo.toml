@@ -5,11 +5,12 @@ edition.workspace = true
 
 [dependencies]
 chrono = { workspace = true }
+miette = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
 uuid = { workspace = true }
 my-workspace-hack = { version = "0.1", path = "../my-workspace-hack" }
 
 [dev-dependencies]
-miette = { workspace = true }
 tokio = { workspace = true }

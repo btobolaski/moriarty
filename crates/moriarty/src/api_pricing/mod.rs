@@ -135,20 +135,17 @@ fn share_chart_title(report_mode: ReportMode) -> &'static str {
     }
 }
 
-fn build_daily_chart_buckets(
-    daily_metrics: &[DailyMetrics],
-    report_mode: ReportMode,
-) -> Vec<ChartBucket> {
+fn build_daily_chart_buckets(daily_metrics: &[DailyMetrics]) -> Vec<ChartBucket> {
     daily_metrics
         .iter()
         .map(|metrics| ChartBucket {
             label: metrics.date.to_string(),
             segments: metrics
                 .per_model
-                .model_metrics(report_mode)
+                .model_metrics()
                 .into_iter()
                 .map(|(model_name, metric_components)| ChartSegment {
-                    label: model_name.to_string(),
+                    label: model_name,
                     total: metric_components.total(),
                 })
                 .collect(),
@@ -156,20 +153,17 @@ fn build_daily_chart_buckets(
         .collect()
 }
 
-fn build_session_chart_buckets(
-    session_metrics: &[SessionMetrics],
-    report_mode: ReportMode,
-) -> Vec<ChartBucket> {
+fn build_session_chart_buckets(session_metrics: &[SessionMetrics]) -> Vec<ChartBucket> {
     session_metrics
         .iter()
         .map(|metrics| ChartBucket {
             label: format_session_id(&metrics.session_id),
             segments: metrics
                 .per_model
-                .model_metrics(report_mode)
+                .model_metrics()
                 .into_iter()
                 .map(|(model_name, metric_components)| ChartSegment {
-                    label: model_name.to_string(),
+                    label: model_name,
                     total: metric_components.total(),
                 })
                 .collect(),
@@ -187,11 +181,11 @@ fn build_daily_rows(
             let date_str = metrics.date.to_string();
             push_nonzero_metric_rows(
                 rows,
-                metrics.per_model.model_metrics(report_mode),
+                metrics.per_model.model_metrics(),
                 |first_row, model_name, metric_components| {
                     ApiMetricRow::new(
                         grouped_label(first_row, &date_str),
-                        model_name,
+                        &model_name,
                         metric_components,
                     )
                 },
@@ -225,13 +219,13 @@ fn build_session_rows(
             let duration = format_duration(metrics.duration_minutes());
             push_nonzero_metric_rows(
                 rows,
-                metrics.per_model.model_metrics(report_mode),
+                metrics.per_model.model_metrics(),
                 |first_row, model_name, metric_components| {
                     ApiSessionMetricRow::new(
                         grouped_label(first_row, &session_id),
                         grouped_label(first_row, &time_range),
                         grouped_label(first_row, &duration),
-                        model_name,
+                        &model_name,
                         metric_components,
                     )
                 },
@@ -289,7 +283,7 @@ fn display_daily_graphs(
         graph_title(report_mode, false),
         time_series_chart_title(report_mode, false),
         share_chart_title(report_mode),
-        &build_daily_chart_buckets(daily_metrics, report_mode),
+        &build_daily_chart_buckets(daily_metrics),
         report_mode,
     )
 }
@@ -302,7 +296,7 @@ fn display_session_graphs(
         graph_title(report_mode, true),
         time_series_chart_title(report_mode, true),
         share_chart_title(report_mode),
-        &build_session_chart_buckets(session_metrics, report_mode),
+        &build_session_chart_buckets(session_metrics),
         report_mode,
     )
 }
