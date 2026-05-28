@@ -18,7 +18,7 @@ const DEFAULT_TIME_BAR_WIDTH: usize = 48;
 const DEFAULT_SHARE_BAR_WIDTH: usize = 40;
 const MIN_TIME_BAR_WIDTH: usize = 8;
 const MIN_SHARE_BAR_WIDTH: usize = 12;
-const MAX_LABEL_WIDTH: usize = 24;
+
 const MARKER_DISPLAY_WIDTH: usize = 1;
 const GLYPHS: [char; 6] = ['█', '▓', '▒', '░', '▇', '▆'];
 const COLORS: [Color; 6] = [
@@ -418,7 +418,7 @@ fn render_share_detail_line(
     let full_fixed_width =
         1 + MARKER_DISPLAY_WIDTH + 1 + 2 + display_width(&percent) + 2 + value_width;
     if full_fixed_width <= term_width {
-        let label_width = bounded_label_width(term_width.saturating_sub(full_fixed_width));
+        let label_width = term_width.saturating_sub(full_fixed_width);
         let label = truncate_to_width(&segment.label, label_width);
         return format!(
             " {} {}  {}  {}",
@@ -431,7 +431,7 @@ fn render_share_detail_line(
 
     let percent_fixed_width = 1 + MARKER_DISPLAY_WIDTH + 1 + 2 + display_width(&percent);
     if percent_fixed_width <= term_width {
-        let label_width = bounded_label_width(term_width.saturating_sub(percent_fixed_width));
+        let label_width = term_width.saturating_sub(percent_fixed_width);
         let label = truncate_to_width(&segment.label, label_width);
         return format!(
             " {} {}  {}",
@@ -443,7 +443,7 @@ fn render_share_detail_line(
 
     let value_fixed_width = 1 + MARKER_DISPLAY_WIDTH + 1 + 2 + display_width(&value);
     if value_fixed_width <= term_width {
-        let label_width = bounded_label_width(term_width.saturating_sub(value_fixed_width));
+        let label_width = term_width.saturating_sub(value_fixed_width);
         let label = truncate_to_width(&segment.label, label_width);
         return format!(" {} {}  {}", marker, pad_right(&label, label_width), value);
     }
@@ -509,6 +509,19 @@ fn render_legend_lines(
             lines.push(current_line);
             current_line = indent.clone();
             current_width = prefix_width;
+        }
+
+        // Prefer vertical space over truncation when a complete legend
+        // item can still fit on its own line.
+        if current_width > prefix_width {
+            let full_item_width = MARKER_DISPLAY_WIDTH + 1 + display_width(&segment.label);
+            let fits_on_current = current_width + 2 + full_item_width <= term_width;
+            let fits_on_fresh = prefix_width + full_item_width <= term_width;
+            if !fits_on_current && fits_on_fresh {
+                lines.push(current_line);
+                current_line = indent.clone();
+                current_width = prefix_width;
+            }
         }
 
         let separator_width = if current_width == prefix_width { 0 } else { 2 };
@@ -644,7 +657,7 @@ fn time_chart_layout(
     }
 
     let preferred_bar_width = DEFAULT_TIME_BAR_WIDTH.min(available.saturating_sub(1));
-    let mut label_width = max_label_width.min(MAX_LABEL_WIDTH);
+    let mut label_width = max_label_width;
     let min_bar_width = MIN_TIME_BAR_WIDTH.min(available);
 
     if label_width + preferred_bar_width > available {
@@ -692,16 +705,6 @@ fn unique_overflow_label(visible_segments: &[OrderedSegment]) -> String {
             return candidate;
         }
         index += 1;
-    }
-}
-
-fn bounded_label_width(available_width: usize) -> usize {
-    if available_width == 0 {
-        0
-    } else if available_width < 4 {
-        available_width
-    } else {
-        available_width.min(MAX_LABEL_WIDTH)
     }
 }
 
@@ -1139,5 +1142,91 @@ mod tests {
 
         assert_eq!(selected.segments[0].glyph, '█');
         assert_eq!(selected.segments[1].glyph, '▓');
+    }
+
+    #[test]
+    fn legend_wraps_item_when_full_label_fits_on_fresh_line() {
+        let lines = render_legend_lines(
+            &[
+                OrderedSegment {
+                    id: SegmentId::Label("Alpha".to_string()),
+                    label: "Alpha".to_string(),
+                    total: cost(10.0),
+                    glyph: '█',
+                    color: None,
+                },
+                OrderedSegment {
+                    id: SegmentId::Label("Beta".to_string()),
+                    label: "Beta".to_string(),
+                    total: cost(9.0),
+                    glyph: '▓',
+                    color: None,
+                },
+            ],
+            20,
+            false,
+        );
+
+        // "Legend: █ Alpha" is 15 wide, "        ▓ Beta" is 14 wide
+        assert_eq!(lines[0], "Legend: █ Alpha");
+        assert_eq!(lines[1], "        ▓ Beta");
+        assert!(!lines[1].contains('…'));
+    }
+
+    #[test]
+    fn legend_does_not_wrap_when_full_label_would_not_fit_on_fresh_line() {
+        let lines = render_legend_lines(
+            &[
+                OrderedSegment {
+                    id: SegmentId::Label("Alpha".to_string()),
+                    label: "Alpha".to_string(),
+                    total: cost(10.0),
+                    glyph: '█',
+                    color: None,
+                },
+                OrderedSegment {
+                    id: SegmentId::Label("VeryLongSegment".to_string()),
+                    label: "VeryLongSegment".to_string(),
+                    total: cost(9.0),
+                    glyph: '▓',
+                    color: None,
+                },
+            ],
+            24,
+            false,
+        );
+
+        // "Legend: █ Alpha  ▓ Very…" = exactly 24 wide, truncated on same line
+        assert_eq!(lines[0], "Legend: █ Alpha  ▓ Very…");
+        assert_eq!(display_width(&lines[0]), 24);
+        assert_eq!(lines[1], "");
+    }
+
+    #[test]
+    fn share_detail_line_uses_full_available_label_width() {
+        let long_label = "Anthropic / claude-opus-4-20250514-extra-long-model-name";
+
+        let output = build_stacked_charts_output(
+            "Graphs",
+            "Daily totals",
+            "Share",
+            &[bucket("2026-05-01", &[(long_label, cost(10.0))])],
+            ReportMode::Cost,
+            ChartRenderOptions {
+                terminal_width: Some(120),
+                color_mode: ChartColorMode::Never,
+                ..ChartRenderOptions::default()
+            },
+        )
+        .unwrap();
+
+        let share_line = output
+            .lines()
+            .find(|line| line.starts_with(" █ "))
+            .expect("share detail line should be rendered");
+
+        assert!(share_line.contains(long_label));
+        assert!(!share_line.contains('…'));
+        assert!(display_width(share_line) <= 120);
     }
 }

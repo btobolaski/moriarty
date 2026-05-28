@@ -694,7 +694,11 @@ fn model_change_with_faux() {
 
 #[test]
 fn model_change_rejects_unknown_provider() {
-    let err = parse_err(model_change_json(Some("session-root"), "unknown-provider", "model-1"));
+    let err = parse_err(model_change_json(
+        Some("session-root"),
+        "unknown-provider",
+        "model-1",
+    ));
     let msg = format!("{err}");
     assert!(
         msg.contains("unknown variant `unknown-provider`") || msg.contains("unknown-provider"),
@@ -981,7 +985,10 @@ fn assistant_message_with_text_and_tool_call() {
         .with_response_id("resp_1"),
     );
 
-    assert_eq!(assistant.api, AssistantApi::Known(ApiKind::AnthropicMessages));
+    assert_eq!(
+        assistant.api,
+        AssistantApi::Known(ApiKind::AnthropicMessages)
+    );
     assert_eq!(assistant.provider, Provider::Anthropic);
     assert_eq!(assistant.stop_reason, AssistantStopReason::ToolUse);
     assert_eq!(assistant.response_id.as_deref(), Some("resp_1"));
@@ -1012,7 +1019,10 @@ fn assistant_message_accepts_openrouter_openai_completions_response_model() {
             .with_response_model("openai/gpt-5.4-20260305"),
     );
 
-    assert_eq!(assistant.api, AssistantApi::Known(ApiKind::OpenAiCompletions));
+    assert_eq!(
+        assistant.api,
+        AssistantApi::Known(ApiKind::OpenAiCompletions)
+    );
     assert_eq!(assistant.provider, Provider::OpenRouter);
     assert_eq!(assistant.model, "openai/gpt-5.4");
     assert_eq!(
@@ -1061,12 +1071,7 @@ fn assistant_api_known_values_parse_as_known_variants() {
 fn assistant_message_accepts_faux_api_identifier() {
     let assistant = parse_assistant_message(
         vec![json!({"type": "text", "text": "simulated"})],
-        AssistantFixture::new(
-            "faux:1779726916919:3u6tax2mqmp",
-            "faux",
-            "faux-1",
-            "stop",
-        ),
+        AssistantFixture::new("faux:1779726916919:3u6tax2mqmp", "faux", "faux-1", "stop"),
     );
 
     assert_eq!(
@@ -1096,7 +1101,11 @@ fn usage_cost_accepts_source_field() {
         PiLogLine::Message(m) => match &m.message {
             RoleMessage::Assistant(msg) => {
                 let source = &msg.usage.cost.source;
-                assert_eq!(source.as_deref(), Some("provider"), "unexpected source: {source:?}");
+                assert_eq!(
+                    source.as_deref(),
+                    Some("provider"),
+                    "unexpected source: {source:?}"
+                );
             }
             other => panic!("expected Assistant, got {other:?}"),
         },
@@ -2097,7 +2106,10 @@ fn web_search_tool_result_accepts_curated_details() {
 
     assert_eq!(curated_queries[0].query, "curated query one");
     assert_eq!(curated_queries[0].provider.as_deref(), Some("exa"));
-    assert_eq!(curated_queries[0].answer.as_deref(), Some("Curated answer one"));
+    assert_eq!(
+        curated_queries[0].answer.as_deref(),
+        Some("Curated answer one")
+    );
     let sources_0 = curated_queries[0]
         .sources
         .as_ref()
@@ -2109,7 +2121,10 @@ fn web_search_tool_result_accepts_curated_details() {
 
     assert_eq!(curated_queries[1].query, "curated query two");
     assert_eq!(curated_queries[1].provider.as_deref(), Some("perplexity"));
-    assert_eq!(curated_queries[1].answer.as_deref(), Some("Curated answer two"));
+    assert_eq!(
+        curated_queries[1].answer.as_deref(),
+        Some("Curated answer two")
+    );
     let sources_1 = curated_queries[1]
         .sources
         .as_ref()
