@@ -28,18 +28,22 @@ cargo build
 **Running:**
 
 ```bash
-# Run Claude API pricing analyzer
-cargo run -- api-pricing -d <directory> --timezone local|utc
-cargo run -- api-pricing -d <directory> --tokens
+# Run Claude API pricing analyzer (--dir defaults to ~/.claude/projects)
+cargo run -- api-pricing --timezone local|utc
+cargo run -- api-pricing --tokens
+cargo run -- api-pricing --dir <directory>
 
-# Run pi cost analyzer
+# Run pi cost analyzer (--dir defaults to ~/.pi/agent/sessions)
 cargo run -- pi cost --timezone local|utc
-cargo run -- pi cost --dir <pi-sessions-directory> --conversations
-cargo run -- pi cost --dir <pi-sessions-directory> --tokens
+cargo run -- pi cost --conversations
+cargo run -- pi cost --tokens
+cargo run -- pi cost --dir <pi-sessions-directory>
 
 # Render chart-focused usage graphs
-cargo run -- graphs claude --dir <directory> --timezone local|utc
-cargo run -- graphs pi --dir <pi-sessions-directory> --conversations --tokens
+# (graphs claude --dir defaults to ~/.claude/projects; graphs pi --dir defaults to ~/.pi/agent/sessions)
+cargo run -- graphs claude --timezone local|utc
+cargo run -- graphs pi --conversations --tokens
+cargo run -- graphs pi --dir <pi-sessions-directory>
 
 # Run MCP servers
 cargo run -- mcp git-read-only

@@ -31,6 +31,7 @@ async fn main() -> miette::Result<()> {
     match cli.command {
         Command::ApiPricing { dir, cost_args } => {
             init_cost_report_tracing();
+            let dir = resolve_claude_logs_dir(dir)?;
             let timezone = parse_date_timezone(&cost_args.timezone)?;
             let filter = cost_args.time_filter()?;
             let report_mode = cost_args.report_mode();
@@ -47,6 +48,7 @@ async fn main() -> miette::Result<()> {
         Command::Graphs { subcommand } => match subcommand {
             GraphsCommand::Claude { dir, cost_args } => {
                 init_cost_report_tracing();
+                let dir = resolve_claude_logs_dir(dir)?;
                 let timezone = parse_date_timezone(&cost_args.timezone)?;
                 let filter = cost_args.time_filter()?;
                 let report_mode = cost_args.report_mode();
@@ -200,37 +202,49 @@ fn print_time_range_filter(filter: &cost_report::TimeRangeFilter) {
 }
 
 fn resolve_pi_sessions_dir(override_dir: Option<PathBuf>) -> miette::Result<PathBuf> {
+    resolve_logs_dir(override_dir, ".pi/agent/sessions", "pi sessions")
+}
+
+fn resolve_claude_logs_dir(override_dir: Option<PathBuf>) -> miette::Result<PathBuf> {
+    resolve_logs_dir(override_dir, ".claude/projects", "Claude logs")
+}
+
+fn resolve_logs_dir(
+    override_dir: Option<PathBuf>,
+    home_relative_default: &str,
+    kind: &str,
+) -> miette::Result<PathBuf> {
     let dir = if let Some(dir) = override_dir {
         dir
     } else {
         let Some(home) = env::var_os("HOME") else {
             return Err(miette::miette!(
-                "HOME is not set; pass --dir to specify the pi sessions directory"
+                "HOME is not set; pass --dir to specify the {kind} directory"
             ));
         };
 
-        PathBuf::from(home).join(".pi/agent/sessions")
+        PathBuf::from(home).join(home_relative_default)
     };
 
-    validate_pi_sessions_dir(&dir)?;
+    validate_logs_dir(&dir, kind)?;
     Ok(dir)
 }
 
-fn validate_pi_sessions_dir(dir: &Path) -> miette::Result<()> {
+fn validate_logs_dir(dir: &Path, kind: &str) -> miette::Result<()> {
     if !dir
         .try_exists()
         .into_diagnostic()
-        .wrap_err_with(|| format!("Failed to check pi sessions directory '{}'", dir.display()))?
+        .wrap_err_with(|| format!("Failed to check {kind} directory '{}'", dir.display()))?
     {
         return Err(miette::miette!(
-            "Pi sessions directory '{}' does not exist",
+            "{kind} directory '{}' does not exist",
             dir.display()
         ));
     }
 
     if !dir.is_dir() {
         return Err(miette::miette!(
-            "Pi sessions path '{}' is not a directory",
+            "{kind} path '{}' is not a directory",
             dir.display()
         ));
     }
@@ -247,9 +261,9 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     ApiPricing {
-        /// The directory to analyze for API usage
+        /// The directory to analyze for API usage (defaults to ~/.claude/projects)
         #[arg(short, long)]
-        dir: PathBuf,
+        dir: Option<PathBuf>,
         #[command(flatten)]
         cost_args: CostCommandArgs,
     },
@@ -289,9 +303,9 @@ enum Command {
 enum GraphsCommand {
     /// Render Claude/API usage graphs
     Claude {
-        /// The directory to analyze for API usage
+        /// The directory to analyze for API usage (defaults to ~/.claude/projects)
         #[arg(short, long)]
-        dir: PathBuf,
+        dir: Option<PathBuf>,
         #[command(flatten)]
         cost_args: CostCommandArgs,
     },
@@ -364,7 +378,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        parse_date_timezone, resolve_pi_sessions_dir, Cli, Command, GraphsCommand, PiCommand,
+        parse_date_timezone, resolve_claude_logs_dir, resolve_pi_sessions_dir, Cli, Command,
+        GraphsCommand, PiCommand,
     };
     use crate::cost_report::DateTimezone;
 
@@ -555,7 +570,7 @@ mod tests {
             Command::Graphs {
                 subcommand: GraphsCommand::Claude { dir, cost_args },
             } => {
-                assert_eq!(dir, PathBuf::from("logs/api"));
+                assert_eq!(dir, Some(PathBuf::from("logs/api")));
                 assert_eq!(cost_args.timezone, "utc");
                 assert!(cost_args.tokens);
                 assert!(!cost_args.conversations);
@@ -585,6 +600,126 @@ mod tests {
                 assert!(!cost_args.tokens);
             }
             other => panic!("expected graphs pi command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_claude_logs_dir_prefers_override() {
+        let temp = TempDir::new().unwrap();
+        let override_dir = temp.path().join("custom/claude/logs");
+        std::fs::create_dir_all(&override_dir).unwrap();
+
+        let resolved = with_home(None, || {
+            resolve_claude_logs_dir(Some(override_dir.clone())).unwrap()
+        });
+
+        assert_eq!(resolved, override_dir);
+    }
+
+    #[test]
+    fn resolve_claude_logs_dir_uses_home_default_path() {
+        let home = TempDir::new().unwrap();
+        let expected = home.path().join(".claude/projects");
+        std::fs::create_dir_all(&expected).unwrap();
+
+        let resolved = with_home(Some(home.path()), || resolve_claude_logs_dir(None).unwrap());
+
+        assert_eq!(resolved, expected);
+    }
+
+    #[test]
+    fn resolve_claude_logs_dir_errors_when_home_is_missing() {
+        let error = with_home(None, || resolve_claude_logs_dir(None).unwrap_err());
+
+        assert!(
+            error.to_string().contains("HOME is not set"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn resolve_claude_logs_dir_errors_when_default_is_missing() {
+        let home = TempDir::new().unwrap();
+        let expected = home.path().join(".claude/projects");
+
+        let error = with_home(Some(home.path()), || {
+            resolve_claude_logs_dir(None).unwrap_err()
+        });
+
+        assert!(
+            error.to_string().contains("does not exist"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.to_string().contains(&expected.display().to_string()),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn resolve_claude_logs_dir_errors_when_override_is_missing() {
+        let temp = TempDir::new().unwrap();
+        let missing = temp.path().join("missing");
+
+        let error = resolve_claude_logs_dir(Some(missing.clone())).unwrap_err();
+
+        assert!(
+            error.to_string().contains("does not exist"),
+            "unexpected error: {error}"
+        );
+        assert!(error.to_string().contains(&missing.display().to_string()));
+    }
+
+    #[test]
+    fn resolve_claude_logs_dir_errors_when_override_is_file() {
+        let temp = TempDir::new().unwrap();
+        let file = temp.path().join("history.jsonl");
+        std::fs::write(&file, "[]").unwrap();
+
+        let error = resolve_claude_logs_dir(Some(file.clone())).unwrap_err();
+
+        assert!(
+            error.to_string().contains("is not a directory"),
+            "unexpected error: {error}"
+        );
+        assert!(error.to_string().contains(&file.display().to_string()));
+    }
+
+    #[test]
+    fn cli_parses_api_pricing_without_dir() {
+        let cli = Cli::try_parse_from(["moriarty", "api-pricing"]).unwrap();
+
+        match cli.command {
+            Command::ApiPricing { dir, .. } => {
+                assert_eq!(dir, None);
+            }
+            other => panic!("expected api-pricing command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_api_pricing_with_dir() {
+        let cli = Cli::try_parse_from(["moriarty", "api-pricing", "--dir", "logs/api"]).unwrap();
+
+        match cli.command {
+            Command::ApiPricing { dir, .. } => {
+                assert_eq!(dir, Some(PathBuf::from("logs/api")));
+            }
+            other => panic!("expected api-pricing command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_graphs_claude_without_dir() {
+        let cli = Cli::try_parse_from(["moriarty", "graphs", "claude"]).unwrap();
+
+        match cli.command {
+            Command::Graphs {
+                subcommand: GraphsCommand::Claude { dir, .. },
+            } => {
+                assert_eq!(dir, None);
+            }
+            other => panic!("expected graphs claude command, got {other:?}"),
         }
     }
 
