@@ -1,6 +1,0 @@
-warning: /Users/brendan/src/moriarty/crates/my-workspace-hack/Cargo.toml: no edition set: defaulting to the 2015 edition while the latest is 2024
-   Compiling pi_logs v0.1.0 (/Users/brendan/src/moriarty/crates/pi_logs)
-   Compiling cost_analyzer v0.1.0 (/Users/brendan/src/moriarty/crates/cost_analyzer)
-   Compiling moriarty v0.1.0 (/Users/brendan/src/moriarty/crates/moriarty)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 10.13s
-     Running `target/debug/moriarty pi cost`
