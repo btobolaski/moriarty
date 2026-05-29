@@ -2,6 +2,7 @@
 name = "moriarty"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 chrono = { workspace = true }
@@ -9,9 +10,11 @@ clap = { workspace = true }
 claude_logs = { path = "../claude_logs" }
 cost_analyzer = { path = "../cost_analyzer" }
 crossterm = { version = "0.28.1", features = ["event-stream"] }
+fs2 = "0.4"
 futures = { workspace = true }
 hex = "0.4"
 miette = { workspace = true }
+my-workspace-hack = { version = "0.1", path = "../my-workspace-hack" }
 pi_logs = { path = "../pi_logs" }
 ratatui = "0.29.0"
 regex = { workspace = true }
@@ -24,16 +27,14 @@ sha2 = "0.10"
 shell-words = "1.1"
 tabled = { version = "0.20", features = ["derive"] }
 tokio = { workspace = true }
-tracing = { workspace = true }
-fs2 = "0.4"
 toml = "0.9.8"
-unicode-width = "0.2"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing = { workspace = true }
 tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tui-scrollview = "0.5.1"
+unicode-width = "0.2"
 which = "7.0"
 xdg = "3.0.0"
-my-workspace-hack = { version = "0.1", path = "../my-workspace-hack" }
 
 [dev-dependencies]
 tempfile = "3"

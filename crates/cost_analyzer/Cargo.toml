@@ -2,13 +2,15 @@
 name = "cost_analyzer"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 async-walkdir = { workspace = true }
 chrono = { workspace = true }
+claude_logs = { path = "../claude_logs" }
 futures = { workspace = true }
 miette = { workspace = true }
-claude_logs = { path = "../claude_logs" }
+my-workspace-hack = { version = "0.1", path = "../my-workspace-hack" }
 pi_logs = { path = "../pi_logs" }
 rust_decimal = { workspace = true }
 serde = { workspace = true }
@@ -17,7 +19,6 @@ tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
-my-workspace-hack = { version = "0.1", path = "../my-workspace-hack" }
 
 [dev-dependencies]
 tempfile = "3"

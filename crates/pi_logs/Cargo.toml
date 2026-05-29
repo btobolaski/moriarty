@@ -2,18 +2,19 @@
 name = "pi_logs"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 chrono = { workspace = true }
 clap = { workspace = true }
 miette = { workspace = true }
+my-workspace-hack = { version = "0.1", path = "../my-workspace-hack" }
 rust_decimal = { workspace = true, features = ["serde-with-str"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 walkdir = "2.5"
-my-workspace-hack = { version = "0.1", path = "../my-workspace-hack" }
 
 [[bin]]
 name = "parse_pi_sessions"

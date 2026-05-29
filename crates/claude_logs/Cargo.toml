@@ -2,15 +2,16 @@
 name = "claude_logs"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 chrono = { workspace = true }
 miette = { workspace = true }
+my-workspace-hack = { version = "0.1", path = "../my-workspace-hack" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
-my-workspace-hack = { version = "0.1", path = "../my-workspace-hack" }
 
 [dev-dependencies]
 tokio = { workspace = true }
