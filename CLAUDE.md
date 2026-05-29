@@ -6,12 +6,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Moriarty is a Rust CLI tool for analyzing Claude Code logs and API usage. It provides:
 
-- **Claude API pricing analyzer**: Analyzes Claude API usage from log directories and generates detailed cost or token reports
-- **Pi cost analyzer**: Analyzes pi session logs and generates daily or per-conversation cost or token reports grouped by
-  provider and model
+- **Claude API pricing analyzer**: Analyzes Claude API usage from log directories and generates detailed cost or token
+  reports
+- **Pi cost analyzer**: Analyzes pi session logs and generates daily or per-conversation cost or token reports grouped
+  by provider and model
 - **Terminal graphs**: Renders chart-focused stacked-bar summaries for Claude/API and pi usage via `graphs claude` and
   `graphs pi`
-- **MCP servers**: Provides Model Context Protocol servers for read-only git operations, read-only jj operations, and project tools
+- **MCP servers**: Provides Model Context Protocol servers for read-only git operations, read-only jj operations, and
+  project tools
 - **Hooks system**: Security integration for validating commands before execution (bash rules, project checks)
 - **Project approval TUI**: Interactive interface for approving project-tools commands and checks before execution
 
@@ -102,10 +104,9 @@ test in a separate process, making this safe and preventing tests from clobberin
 - Aggregates either pre-priced `LlmCost` values or raw token counts from `cost_analyzer` into daily buckets (keyed by
   timezone-adjusted date) or per-conversation buckets (keyed by session ID)
 - Per-model aggregation uses `ModelMetricsMap` keyed by `claude_logs::Model` (family + parsed version) so report rows
-  and chart legend distinguish e.g. "Sonnet 4" from "Sonnet 4.5"; row/legend ordering is family-first
-  (Opus → Sonnet → Haiku) then version-desc via the local `model_sort_key` helper, so within-family Opus 4.x rows
-  sit above Opus 3 rows automatically. Token mode stays
-  integer-exact end-to-end instead of passing through floating-point helpers
+  and chart legend distinguish e.g. "Sonnet 4" from "Sonnet 4.5"; row/legend ordering is family-first (Opus → Sonnet →
+  Haiku) then version-desc via the local `model_sort_key` helper, so within-family Opus 4.x rows sit above Opus 3 rows
+  automatically. Token mode stays integer-exact end-to-end instead of passing through floating-point helpers
 - Unknown Claude models surface as stderr tracing errors via `cost_analyzer`; they are not rendered in the report
 - Also prepares `ChartBucket` data for `graphs claude`, reusing the same analyzer output while keeping the existing
   detailed table report unchanged
@@ -126,18 +127,17 @@ test in a separate process, making this safe and preventing tests from clobberin
 **`pi_logs/`** - Pi session log parsing:
 
 - Independent workspace crate for parsing pi session JSONL logs into strongly typed serde models
-- `ToolCallContent` keeps the outer tool-call envelope typed (`id`, `name`, `partial_json`) but preserves
-  `arguments` as a raw `BTreeMap<String, JsonBlob>` because pi logs the model-emitted JSON object before tool-side
-  validation; typed tool-argument structs are optional post-parse helpers, not the parser's source of truth
+- `ToolCallContent` keeps the outer tool-call envelope typed (`id`, `name`, `partial_json`) but preserves `arguments` as
+  a raw `BTreeMap<String, JsonBlob>` because pi logs the model-emitted JSON object before tool-side validation; typed
+  tool-argument structs are optional post-parse helpers, not the parser's source of truth
 - `ToolName` is the shared compatibility gate for assistant tool calls, tool results, `pi-loaded-tools` manifests, and
   Plannotator saved-state `activeTools` snapshots; when pi adds new top-level tools (for example Hermes `memory`,
   `memory_search`, `session_search`, or `skill`, or pi-lens tools like `ast_grep_search`), extend this enum first or
   `pi cost` / `graphs pi` will drop entire session files as parse failures
 - Hermes memory/session-search result details are modeled by their shared envelopes rather than per-action sub-schemas:
   search tools use the `success/count/message/output` summary shape, while `memory` and `skill` are routed by
-  `tool_name` first because their error details can collapse to either `{}` or a bare `{error}`; once routed, the
-  parser accepts their observed action-agnostic fields plus the real `{}` validation-error payload used by the
-  extension
+  `tool_name` first because their error details can collapse to either `{}` or a bare `{error}`; once routed, the parser
+  accepts their observed action-agnostic fields plus the real `{}` validation-error payload used by the extension
 - Strict by default with `#[serde(deny_unknown_fields)]`, path-aware parse errors, and narrowly documented exceptions
   for shapes that require custom deserialization or specific corrupt-stream tolerance
 - Includes a `parse_pi_sessions` binary that recursively smoke-tests a sessions tree by parsing every `*.jsonl` file
@@ -148,15 +148,15 @@ test in a separate process, making this safe and preventing tests from clobberin
   responses
 - Core abstractions: `AnalyzableLog` for pluggable log formats, `LlmCost` for input/cache/output cost breakdowns,
   `TokenType` plus `AnalyzableLog::token_count(...) -> Option<u64>` for raw token extraction, `LineWithCost` for
-  normalized billable entries, and `AnalysisResult` for returning those deduplicated lines alongside a
-  partial-failure flag
+  normalized billable entries, and `AnalysisResult` for returning those deduplicated lines alongside a partial-failure
+  flag
 - Concrete implementations currently support `pi_logs::PiLogLine` and `claude_logs::LogLine`. Claude log costs are
   calculated in `cost_analyzer` with local Decimal-based Claude pricing helpers (`ClaudeModelPricing::for_model`) that
-  consume `&claude_logs::Model`; the family enum itself lives in `claude_logs` so the parser and pricing layer agree
-  on classification without depending on `moriarty::api_pricing` internals. Opus 3 vs Opus 4.x share `ModelFamily::Opus`
+  consume `&claude_logs::Model`; the family enum itself lives in `claude_logs` so the parser and pricing layer agree on
+  classification without depending on `moriarty::api_pricing` internals. Opus 3 vs Opus 4.x share `ModelFamily::Opus`
   and the pricing dispatch reads the parsed `version.major` to pick the OPUS or OPUS_4 tier.
-- `moriarty::api_pricing` and `moriarty::pi_cost` both delegate all log loading, deduplication, pricing, and raw
-  token extraction to this crate; the backends only bucket the returned billable lines into cost or token report rows
+- `moriarty::api_pricing` and `moriarty::pi_cost` both delegate all log loading, deduplication, pricing, and raw token
+  extraction to this crate; the backends only bucket the returned billable lines into cost or token report rows
 - `LineWithCost.session_id` is normalized during parsing so backends can group by conversation without re-reading log
   files; Claude assistant lines provide it inline and pi logs inherit it from the file's `SessionLine`
 - Deduplication keeps the highest-cost duplicate for a `(ModelId, LogId)` pair and breaks equal-cost ties by keeping the
@@ -174,11 +174,11 @@ test in a separate process, making this safe and preventing tests from clobberin
 - Three MCP servers: `git_read_only` (status, diff, log, show), `jj_read_only` (status, diff, log, show, op log), and
   `tool_runner` (lint, test, build, format)
 - `read_only`: Shared infrastructure used by both `git_read_only` and `jj_read_only`. Provides `CommandResult`,
-  `validate_project_dir`, and the generic `run_read_only_command`. It rejects parent-traversal and non-directory
-  targets before canonicalizing the working directory, while the per-server wrappers add command-specific flag
-  restrictions (`git` forces `--no-optional-locks`, `--no-ext-diff`, and `--no-textconv` while rejecting output-file /
-  no-index escape flags; `jj` forces `--ignore-working-copy` and rejects external-tool, config-injection, and
-  repository-override flags). Neither server consults `.config/tools.toml` approvals; only `tool_runner` does.
+  `validate_project_dir`, and the generic `run_read_only_command`. It rejects parent-traversal and non-directory targets
+  before canonicalizing the working directory, while the per-server wrappers add command-specific flag restrictions
+  (`git` forces `--no-optional-locks`, `--no-ext-diff`, and `--no-textconv` while rejecting output-file / no-index
+  escape flags; `jj` forces `--ignore-working-copy` and rejects external-tool, config-injection, and repository-override
+  flags). Neither server consults `.config/tools.toml` approvals; only `tool_runner` does.
 - Uses rmcp library with stdio transport for Claude Code integration
 - All servers run as stdin/stdout servers that Claude Code can invoke
 - `install` command configures all servers in Claude Code's MCP registry

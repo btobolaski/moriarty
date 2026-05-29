@@ -1,13 +1,17 @@
 # Moriarty, an assistant for an assistant
 
-A Rust CLI tool for analyzing Claude Code and pi session logs, reporting API costs or token usage, and enforcing security hooks for command validation.
+A Rust CLI tool for analyzing Claude Code and pi session logs, reporting API costs or token usage, and enforcing
+security hooks for command validation.
 
 ## Features
 
 - **API pricing analyzer**: Analyzes Claude API usage from log directories and generates detailed cost or token reports
-- **Pi cost analyzer**: Analyzes pi session logs and generates daily or per-conversation cost or token reports grouped by provider and model
-- **Terminal graphs**: Renders chart-focused stacked summaries for Claude/API and pi usage via `moriarty graphs claude` and `moriarty graphs pi`
-- **MCP servers**: Provides Model Context Protocol servers for read-only git operations, read-only jj operations, and project tools
+- **Pi cost analyzer**: Analyzes pi session logs and generates daily or per-conversation cost or token reports grouped
+  by provider and model
+- **Terminal graphs**: Renders chart-focused stacked summaries for Claude/API and pi usage via `moriarty graphs claude`
+  and `moriarty graphs pi`
+- **MCP servers**: Provides Model Context Protocol servers for read-only git operations, read-only jj operations, and
+  project tools
 - **Tool call permissioning**: Security hooks that control which tools and commands Claude Code can execute
   - **Tool rules**: Permission any tool call (Read, Write, Edit, Bash, etc.) with optional field-level regex matching
     and optional `allow_local` checks for `path` / `file_path` under the session's working directory. Absolute paths are
@@ -38,3 +42,8 @@ cargo install cargo-nextest
 ## Development
 
 See [CLAUDE.md](./CLAUDE.md) for detailed development instructions.
+
+# GitHub Mirror
+
+The GitHub mirror exists as a push mirror for my copy of the repository. I do monitor this repository however, my
+development activity will not be visible in the repository.
