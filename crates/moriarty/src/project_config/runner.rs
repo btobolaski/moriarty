@@ -86,7 +86,7 @@ pub async fn verify_and_load_project(project_dir: PathBuf) -> Result<VerifiedPro
     })
 }
 
-/// Formats the "Run: moriarty approve-project <dir>" fragment used by every
+/// Formats the `"Run: moriarty approve-project <dir>"` fragment used by every
 /// non-Approved verification error, so the advice stays worded the same way.
 fn approve_hint(canonical_dir: &Path) -> String {
     format!("Run: moriarty approve-project {}", canonical_dir.display())

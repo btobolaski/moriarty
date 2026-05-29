@@ -6,3 +6,9 @@ includes = ["*.md"]
 [formatter.nix]
 command = "alejandra"
 includes = ["*.nix"]
+
+[formatter.toml]
+command = "taplo"
+options = ["format"]
+includes = ["*.toml"]
+excludes = ["crates/my-workspace-hack/Cargo.toml"]

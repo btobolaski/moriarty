@@ -597,6 +597,11 @@ command = []
 #[tokio::test]
 async fn test_stop_hook_unapproved_check() {
     let _xdg_dir = setup_isolated_xdg_state();
+    // Approval lookups go through `FileType::Config.load`, which falls back
+    // to `$HOME/.config` when XDG_CONFIG_HOME is unset. Under the Nix sandbox
+    // that resolves to `/homeless-shelter/.config` and `place_config_file`
+    // returns `Permission denied`, so the assertion below never runs.
+    let _xdg_config = setup_isolated_xdg_config();
 
     // Create project with a check
     let _temp_dir = setup_project_with_config(

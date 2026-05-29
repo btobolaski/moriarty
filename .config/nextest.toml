@@ -1,2 +1,45 @@
 [profile.default]
 slow-timeout = { period = "15s", terminate-after = 4 }
+
+# Profile used by `nix flake check` (see flake.nix). The Nix build sandbox is
+# missing host state that several tests rely on, and rather than plumb every
+# one of those dependencies (system zoneinfo, git/jj binaries, writable $HOME,
+# JSONL fixtures past `cleanCargoSource`) we skip the affected tests here.
+# They still run under plain `cargo nextest run` outside Nix.
+#
+# Categories of skipped tests:
+#
+# - `pi_cost_cli_defaults_to_local_timezone`: chrono's `Local` reads
+#   `/usr/share/zoneinfo` to interpret `TZ=America/New_York`; the sandbox has
+#   no tzdata so chrono silently falls back to UTC.
+# - `mcp::git_read_only::tests::*` and `mcp::jj_read_only::tests::*`: invoke
+#   the real `git`/`jj` binaries, which are not on PATH inside the sandbox.
+# - `mcp::tool_runner::tests::test_full_approval_lifecycle` and
+#   `mcp::tool_runner::tests::test_approval_lifecycle_with_binary_modification`,
+#   plus `project_config::runner::tests::{test_canonicalize_path,
+#   test_run_command_with_successful_execution,
+#   test_run_all_commands_multiple_tools}`: persist approvals through
+#   `FileType::Config`, which falls back to `$HOME/.config` when
+#   XDG_CONFIG_HOME is unset; the sandbox sets `HOME=/homeless-shelter`, so
+#   `xdg::BaseDirectories::place_config_file` returns `Permission denied`.
+# - `project_config::approvals::tests::test_git_worktrees_share_approvals`
+#   and `test_jj_workspaces_share_approvals`: drive real git/jj workspaces.
+# - `pi_logs::parser_fixtures::parse_recent_fixture_file` and
+#   `pi_logs::parse_pi_sessions_binary::parse_pi_sessions_binary_succeeds_on_checked_in_fixture_dir`:
+#   read JSONL fixtures stripped by `craneLib.cleanCargoSource`.
+[profile.nix]
+fail-fast = false
+default-filter = """
+  not test(=pi_cost_cli_defaults_to_local_timezone)
+  and not test(/^mcp::git_read_only::tests::/)
+  and not test(/^mcp::jj_read_only::tests::/)
+  and not test(=mcp::tool_runner::tests::test_full_approval_lifecycle)
+  and not test(=mcp::tool_runner::tests::test_approval_lifecycle_with_binary_modification)
+  and not test(=project_config::approvals::tests::test_git_worktrees_share_approvals)
+  and not test(=project_config::approvals::tests::test_jj_workspaces_share_approvals)
+  and not test(=project_config::runner::tests::test_canonicalize_path)
+  and not test(=project_config::runner::tests::test_run_command_with_successful_execution)
+  and not test(=project_config::runner::tests::test_run_all_commands_multiple_tools)
+  and not test(=parse_recent_fixture_file)
+  and not test(=parse_pi_sessions_binary_succeeds_on_checked_in_fixture_dir)
+"""

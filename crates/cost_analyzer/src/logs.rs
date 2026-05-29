@@ -74,7 +74,7 @@ pub trait AnalyzableLog: std::fmt::Debug + Clone + Send + Sync + 'static {
     type LogId: Identifier;
     type ModelId: Identifier;
 
-    /// cost returns Option<LlmCost> because not all entries in the log have a cost i.e. entries from users
+    /// cost returns `Option<LlmCost>` because not all entries in the log have a cost i.e. entries from users
     fn cost(&self) -> Option<LlmCost>;
     /// Returns the per-component token count when the parsed log line carries
     /// assistant usage metadata.

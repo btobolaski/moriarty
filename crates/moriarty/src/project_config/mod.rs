@@ -3,7 +3,7 @@
 //! This module combines three related concerns:
 //!
 //! - **[`config`]**: Loading and parsing `.config/tools.toml` files into typed structures.
-//!   Provides [`ProjectConfig`] and [`Commands`] types, along with the [`load_project_settings`]
+//!   Provides [`ProjectConfig`] and [`config::Commands`] types, along with the [`load_project_settings`]
 //!   function for reading configuration files.
 //!
 //! - **[`approvals`]**: Security approval system for verifying that project tools haven't changed.

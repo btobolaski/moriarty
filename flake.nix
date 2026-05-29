@@ -143,12 +143,6 @@
             inherit src;
           };
 
-          my-workspace-toml-fmt = craneLib.taploFmt {
-            src = pkgs.lib.sources.sourceFilesBySuffices src [".toml"];
-            # taplo arguments can be further customized below as needed
-            # taploExtraArgs = "--config ./taplo.toml";
-          };
-
           # Audit dependencies
           my-workspace-audit = craneLib.cargoAudit {
             inherit src advisory-db;
@@ -159,16 +153,18 @@
             inherit src;
           };
 
-          # Run tests with cargo-nextest
-          # Consider setting `doCheck = false` on other crate derivations
-          # if you do not want the tests to run twice
+          # Run tests with cargo-nextest under the `nix` profile, which is
+          # defined in .config/nextest.toml and skips tests that depend on
+          # sandbox-incompatible host state (system zoneinfo, $HOME-based
+          # XDG fallbacks, etc.). Those tests still run under `cargo nextest
+          # run` locally where the host environment is available.
           my-workspace-nextest = craneLib.cargoNextest (
             commonArgs
             // {
               inherit cargoArtifacts;
               partitions = 1;
               partitionType = "count";
-              cargoNextestPartitionsExtraArgs = "--no-tests=pass";
+              cargoNextestPartitionsExtraArgs = "--no-tests=pass --profile nix";
             }
           );
 
