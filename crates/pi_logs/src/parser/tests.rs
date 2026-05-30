@@ -3603,6 +3603,24 @@ fn get_search_content_tool_result_accepts_error_details() {
         panic!("expected GetSearchContent error details")
     };
     assert_eq!(details.error, "URL not found");
+    assert!(details.response_id.is_none());
+}
+
+#[test]
+fn get_search_content_tool_result_accepts_error_details_with_response_id() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "get_search_content",
+        vec![json!({"type": "text", "text": "Error: No stored results for \"m011\""})],
+        false,
+        Some(json!({"error": "Not found", "responseId": "m011"})),
+    ));
+    let Some(ToolResultDetails::GetSearchContent(GetSearchContentDetails::Error(details))) =
+        tool_result.details
+    else {
+        panic!("expected GetSearchContent error details")
+    };
+    assert_eq!(details.error, "Not found");
+    assert_eq!(details.response_id.as_deref(), Some("m011"));
 }
 
 // Pins the strict-variant invariant of GetSearchContentDetails: a payload

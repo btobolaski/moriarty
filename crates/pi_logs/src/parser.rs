@@ -2290,6 +2290,12 @@ pub struct GetSearchContentSuccessDetails {
 #[serde(deny_unknown_fields)]
 pub struct GetSearchContentErrorDetails {
     pub error: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "responseId"
+    )]
+    pub response_id: Option<String>,
 }
 
 /// Either of `matchLimitReached` / `linesTruncated` may be present when
