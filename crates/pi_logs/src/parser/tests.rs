@@ -726,6 +726,7 @@ fn thinking_level_order_is_stable() {
     assert!(ThinkingLevel::Minimal < ThinkingLevel::Low);
     assert!(ThinkingLevel::Low < ThinkingLevel::Medium);
     assert!(ThinkingLevel::Medium < ThinkingLevel::High);
+    assert!(ThinkingLevel::High < ThinkingLevel::Xhigh);
 }
 
 #[test]
@@ -4512,6 +4513,17 @@ fn grep_tool_result_accepts_full_lean_ctx_augmentation() {
 /// ThinkingLevel::Off is a real wire value (`"off"`). High, Medium, Minimal,
 /// and Low already have coverage; this pins the fifth arm so a typo in the
 /// rename (e.g. `"none"`/`"disabled"`) fails noisily.
+#[test]
+fn thinking_level_change_xhigh() {
+    let line = parse(thinking_level_change_json("m1", "xhigh"));
+    match line {
+        PiLogLine::ThinkingLevelChange(thinking_level) => {
+            assert_eq!(thinking_level.thinking_level, ThinkingLevel::Xhigh);
+        }
+        other => panic!("expected ThinkingLevelChange, got {other:?}"),
+    }
+}
+
 #[test]
 fn thinking_level_change_off() {
     let line = parse(thinking_level_change_json("m1", "off"));

@@ -565,6 +565,7 @@ pub enum ThinkingLevel {
     Low,
     Medium,
     High,
+    Xhigh,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
