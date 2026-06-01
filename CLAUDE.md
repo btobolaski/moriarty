@@ -269,9 +269,11 @@ test in a separate process, making this safe and preventing tests from clobberin
 **Repository Root Detection**:
 
 - Approvals are keyed by repository root, not workspace directory
-- Detection order: reading `.jj/repo` file → `git rev-parse --git-common-dir` → canonicalized path
+- Detection order: resolving `.jj/repo` (store directory or pointer file) → `git rev-parse --git-common-dir` → canonicalized path
 - This allows approval sharing across jujutsu workspaces and git worktrees
-- For jj: reads `.jj/repo` file and resolves both absolute and relative paths
+- For jj: `.jj/repo` is the store directory itself in the main workspace and a pointer file in a secondary workspace.
+  Absolute pointers are used as-is; a relative pointer is resolved against the `.jj` directory (jj 0.41+) with a
+  fallback to the workspace directory (older jj), so both layouts share one repository root
 - For git: uses `--git-common-dir` which returns the shared `.git` directory for all worktrees
 - Module: `repository.rs` provides `detect_repository_root()` function
 
