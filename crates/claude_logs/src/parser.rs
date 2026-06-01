@@ -1022,6 +1022,24 @@ pub struct UserLogLine {
     /// (an Anthropic `msg_…` id, not a UUID). Can be `null` in the log, hence `Option`.
     /// Added in Claude Code 2.1.158+.
     pub interrupted_message_id: Option<String>,
+    /// Present only on user turns that deliver an MCP tool result; absent on ordinary turns and on
+    /// built-in (non-MCP) tool results, hence `Option`. Added in Claude Code 2.1.158+.
+    pub mcp_meta: Option<McpMeta>,
+}
+
+/// Strict envelope mirroring Claude Code's `mcpMeta` object. Kept `deny_unknown_fields` so a future
+/// sibling key (which would be Claude Code protocol) surfaces as a parse error rather than being
+/// silently dropped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct McpMeta {
+    /// MCP `structuredContent`, whose shape is defined by the responding MCP server rather than by
+    /// Claude Code; it therefore reuses the tool-defined [`ToolUseResult`] representation (as the
+    /// sibling `tool_use_result` does) instead of a fixed schema. `None` when the server returns no
+    /// structured content: the MCP spec makes it optional, and the untagged `ToolUseResult` cannot
+    /// itself represent a JSON `null`.
+    pub structured_content: Option<ToolUseResult>,
 }
 
 /// Origin metadata for a message. Added in Claude Code 2.1.104+.

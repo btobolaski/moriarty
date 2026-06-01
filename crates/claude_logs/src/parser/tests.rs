@@ -6648,6 +6648,197 @@ fn test_parse_message_origin_rejects_unknown_fields() {
 }
 
 #[test]
+fn test_parse_user_log_line_with_mcp_meta() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "version": "2.1.158",
+        "gitBranch": "main",
+        "message": {"role": "user", "content": "test"},
+        "uuid": "550e8400-e29b-41d4-a716-446655440001",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "mcpMeta": {
+            "structuredContent": {
+                "exit_code": 0,
+                "stderr": "",
+                "stdout": "diff output"
+            }
+        }
+    });
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    let mcp_meta = line.mcp_meta.expect("mcpMeta should be present");
+    let Some(ToolUseResult::Map(content)) = mcp_meta.structured_content else {
+        panic!("structuredContent from an MCP server is a JSON object");
+    };
+    assert_eq!(content["exit_code"], serde_json::json!(0));
+    assert_eq!(content["stderr"], serde_json::json!(""));
+    assert_eq!(content["stdout"], serde_json::json!("diff output"));
+}
+
+#[test]
+fn test_parse_user_log_line_without_mcp_meta() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "version": "2.1.158",
+        "gitBranch": "main",
+        "message": {"role": "user", "content": "test"},
+        "uuid": "550e8400-e29b-41d4-a716-446655440001",
+        "timestamp": "2025-01-01T00:00:00Z"
+    });
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(line.mcp_meta, None);
+}
+
+#[test]
+fn test_parse_mcp_meta_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "version": "2.1.158",
+        "gitBranch": "main",
+        "message": {"role": "user", "content": "test"},
+        "uuid": "550e8400-e29b-41d4-a716-446655440001",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "mcpMeta": {
+            "structuredContent": {"exit_code": 0},
+            "extraField": "should fail"
+        }
+    });
+    let err =
+        serde_json::from_value::<UserLogLine>(json).expect_err("Should reject unknown fields");
+    assert!(
+        err.to_string().contains("unknown field"),
+        "Error should mention unknown field, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_parse_user_log_line_with_mcp_meta_string_content() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "version": "2.1.158",
+        "gitBranch": "main",
+        "message": {"role": "user", "content": "test"},
+        "uuid": "550e8400-e29b-41d4-a716-446655440001",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "mcpMeta": {"structuredContent": "plain text result"}
+    });
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    let mcp_meta = line.mcp_meta.expect("mcpMeta should be present");
+    assert_eq!(
+        mcp_meta.structured_content,
+        Some(ToolUseResult::String("plain text result".to_string()))
+    );
+}
+
+#[test]
+fn test_parse_user_log_line_with_null_structured_content() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "version": "2.1.158",
+        "gitBranch": "main",
+        "message": {"role": "user", "content": "test"},
+        "uuid": "550e8400-e29b-41d4-a716-446655440001",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "mcpMeta": {"structuredContent": null}
+    });
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    let mcp_meta = line.mcp_meta.expect("mcpMeta should be present");
+    assert_eq!(mcp_meta.structured_content, None);
+}
+
+#[test]
+fn test_parse_user_log_line_with_null_mcp_meta() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "version": "2.1.158",
+        "gitBranch": "main",
+        "message": {"role": "user", "content": "test"},
+        "uuid": "550e8400-e29b-41d4-a716-446655440001",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "mcpMeta": null
+    });
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(line.mcp_meta, None);
+}
+
+#[test]
+fn test_parse_user_log_line_with_mcp_meta_and_tool_use_result() {
+    // The same MCP tool-result turn carries both the rendered string form (`toolUseResult`) and
+    // the structured object form (`mcpMeta.structuredContent`); both must decode independently.
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "version": "2.1.158",
+        "gitBranch": "main",
+        "message": {"role": "user", "content": "test"},
+        "uuid": "550e8400-e29b-41d4-a716-446655440001",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "toolUseResult": "rendered string result",
+        "mcpMeta": {"structuredContent": {"exit_code": 0}}
+    });
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(
+        line.tool_use_result,
+        Some(ToolUseResult::String("rendered string result".to_string()))
+    );
+    let mcp_meta = line.mcp_meta.expect("mcpMeta should be present");
+    let Some(ToolUseResult::Map(content)) = mcp_meta.structured_content else {
+        panic!("structuredContent from an MCP server is a JSON object");
+    };
+    assert_eq!(content["exit_code"], serde_json::json!(0));
+}
+
+#[test]
+fn test_parse_user_log_line_with_empty_mcp_meta() {
+    // An empty `mcpMeta` (no `structuredContent` key) must parse: serde defaults the absent
+    // `Option` field to `None` even under `deny_unknown_fields`, so an MCP result without
+    // structured content does not drop the whole log line.
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "version": "2.1.158",
+        "gitBranch": "main",
+        "message": {"role": "user", "content": "test"},
+        "uuid": "550e8400-e29b-41d4-a716-446655440001",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "mcpMeta": {}
+    });
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    let mcp_meta = line.mcp_meta.expect("mcpMeta should be present");
+    assert_eq!(mcp_meta.structured_content, None);
+}
+
+#[test]
 fn test_parse_assistant_log_line_with_null_entrypoint() {
     let json = serde_json::json!({
         "parentUuid": null,
