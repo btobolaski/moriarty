@@ -165,6 +165,9 @@ async fn parse_file<LogType: AnalyzableLog>(
                 continue;
             }
 
+            // Propagating (rather than skipping the line) discards the whole file by design (see
+            // `analyze_directory`): an unrecognized log shape surfaces as a partial-failure warning
+            // instead of silently undercounting cost, so the parser gets updated to model it.
             let log = parse_log_line::<LogType>(&path, line_number + 1, line)?;
 
             if let Some(session_id) = log.session_id() {
@@ -979,6 +982,37 @@ mod tests {
 
         assert!(result.had_errors);
         assert!(result.lines.is_empty());
+    }
+
+    // Complements the discard test above: a recognized metadata line (`mode`) parses cleanly, so the
+    // file is kept and its billable assistant line still counts. Only an *unparseable* line aborts a
+    // file, and `mode` lines contribute no cost of their own.
+    #[tokio::test]
+    async fn claude_analyze_directory_keeps_costs_when_file_has_mode_line() {
+        let temp_dir = temp_dir();
+        let mode_line =
+            format!(r#"{{"type":"mode","mode":"normal","sessionId":"{CLAUDE_SESSION_ID}"}}"#);
+        let assistant = claude_assistant_json(
+            None,
+            Some("req-1"),
+            "msg-1",
+            "55555555-5555-4555-8555-555555555555",
+            "claude-sonnet-4-20250514",
+            claude_usage_json(1, 0, 0, 0),
+        );
+        let contents = format!("{mode_line}\n{assistant}\n");
+
+        write_log_files(temp_dir.path(), &[("session.jsonl", contents)]).await;
+
+        let result = analyze_directory::<ClaudeLogLine>(temp_dir.path().to_path_buf()).await;
+
+        assert!(!result.had_errors);
+        assert_eq!(
+            result.lines.len(),
+            1,
+            "the `mode` line is non-billable and must not discard the assistant line"
+        );
+        assert_eq!(result.lines[0].id, "req-1");
     }
 
     #[tokio::test]

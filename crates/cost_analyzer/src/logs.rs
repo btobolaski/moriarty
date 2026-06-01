@@ -331,6 +331,10 @@ fn claude_system_fields(system: &ClaudeSystemLogLine) -> ClaudeSystemFields {
             timestamp: line.timestamp,
             uuid: line.uuid,
         },
+        ClaudeSystemLogLine::ScheduledTaskFire(line) => ClaudeSystemFields {
+            timestamp: line.timestamp,
+            uuid: line.uuid,
+        },
         ClaudeSystemLogLine::StopHookSummary(line) => ClaudeSystemFields {
             timestamp: line.timestamp,
             uuid: line.uuid,
@@ -383,6 +387,7 @@ impl AnalyzableLog for ClaudeLogLine {
             ClaudeLogLine::AgentName(_) => claude_timestamp_sentinel(),
             ClaudeLogLine::LastPrompt(_) => claude_timestamp_sentinel(),
             ClaudeLogLine::PermissionModeChange(_) => claude_timestamp_sentinel(),
+            ClaudeLogLine::Mode(_) => claude_timestamp_sentinel(),
             ClaudeLogLine::Attachment(line) => line.timestamp,
         }
     }
@@ -408,6 +413,7 @@ impl AnalyzableLog for ClaudeLogLine {
             ClaudeLogLine::PermissionModeChange(line) => {
                 format!("permission-mode:{}", line.session_id)
             }
+            ClaudeLogLine::Mode(line) => format!("mode:{}", line.session_id),
             ClaudeLogLine::Attachment(line) => line.uuid.to_string(),
         }
     }
@@ -808,6 +814,10 @@ mod tests {
 
     fn claude_permission_mode_json() -> serde_json::Value {
         claude_metadata_json("permission-mode", "permissionMode", "acceptEdits")
+    }
+
+    fn claude_mode_json() -> serde_json::Value {
+        claude_metadata_json("mode", "mode", "normal")
     }
 
     fn claude_system_json(
@@ -1571,6 +1581,12 @@ mod tests {
                 value: claude_permission_mode_json,
                 expected_timestamp: ExpectedClaudeTimestamp::Sentinel,
                 expected_id: claude_metadata_identifier("permission-mode"),
+            },
+            ClaudeNonBillableCase {
+                name: "mode",
+                value: claude_mode_json,
+                expected_timestamp: ExpectedClaudeTimestamp::Sentinel,
+                expected_id: claude_metadata_identifier("mode"),
             },
             ClaudeNonBillableCase {
                 name: "system informational",

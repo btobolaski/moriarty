@@ -850,6 +850,70 @@ fn test_parse_assistant_without_web_fetch_requests() {
 }
 
 #[test]
+fn test_parse_scheduled_task_fire() {
+    let json = serde_json::json!({
+        "parentUuid": "eee9f696-e699-4606-873c-3134cfe5a284",
+        "isSidechain": false,
+        "type": "system",
+        "subtype": "scheduled_task_fire",
+        "content": "Claude resuming /loop wakeup (Jun 1 10:45am)",
+        "isMeta": false,
+        "timestamp": "2026-06-01T15:45:52.142Z",
+        "uuid": "ac7c4318-679d-45c7-8d86-3ca6934f8611",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/Users/brendan/src/switchboard-jj",
+        "sessionId": "2883cea4-f496-44b6-a291-354d7e39bdc6",
+        "version": "2.1.141",
+        "gitBranch": "HEAD",
+        "slug": "we-need-to-build-mutable-hamming"
+    });
+
+    let line: LogLine =
+        serde_json::from_value(json).expect("Failed to parse scheduled_task_fire system message");
+
+    match line {
+        LogLine::System(SystemLogLine::ScheduledTaskFire(fire)) => {
+            assert_eq!(fire.content, "Claude resuming /loop wakeup (Jun 1 10:45am)");
+            assert_eq!(fire.entrypoint.as_deref(), Some("cli"));
+            assert!(!fire.is_meta);
+        }
+        _ => panic!("Expected System(ScheduledTaskFire) variant"),
+    }
+}
+
+#[test]
+fn test_parse_scheduled_task_fire_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "parentUuid": "eee9f696-e699-4606-873c-3134cfe5a284",
+        "isSidechain": false,
+        "type": "system",
+        "subtype": "scheduled_task_fire",
+        "content": "Claude resuming /loop wakeup (Jun 1 10:45am)",
+        "isMeta": false,
+        "timestamp": "2026-06-01T15:45:52.142Z",
+        "uuid": "ac7c4318-679d-45c7-8d86-3ca6934f8611",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/Users/brendan/src/switchboard-jj",
+        "sessionId": "2883cea4-f496-44b6-a291-354d7e39bdc6",
+        "version": "2.1.141",
+        "gitBranch": "HEAD",
+        "slug": "we-need-to-build-mutable-hamming",
+        "unknownField": "should be rejected"
+    });
+
+    let err_msg = serde_json::from_value::<LogLine>(json)
+        .expect_err("Should reject unknown fields due to deny_unknown_fields")
+        .to_string();
+    assert!(
+        err_msg.contains("unknown field") || err_msg.contains("unknownField"),
+        "Error should mention unknown field, got: {}",
+        err_msg
+    );
+}
+
+#[test]
 fn test_parse_stop_hook_summary() {
     let json = serde_json::json!({
         "parentUuid": "5445927e-82b0-4164-91f3-782fafd2a49e",
@@ -4376,6 +4440,54 @@ fn test_parse_permission_mode_change_rejects_unknown_fields() {
 }
 
 #[test]
+fn test_parse_mode_normal() {
+    let json =
+        r#"{"type":"mode","mode":"normal","sessionId":"550e8400-e29b-41d4-a716-446655440000"}"#;
+    let log_line: LogLine = serde_json::from_str(json).unwrap();
+    match log_line {
+        LogLine::Mode(line) => {
+            assert_eq!(line.mode, SessionMode::Normal);
+            assert_eq!(
+                line.session_id,
+                "550e8400-e29b-41d4-a716-446655440000"
+                    .parse::<Uuid>()
+                    .unwrap()
+            );
+        }
+        other => panic!("Expected Mode, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_mode_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "type": "mode",
+        "mode": "normal",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "extraField": "should fail"
+    });
+    let err = serde_json::from_value::<LogLine>(json).expect_err("Should reject unknown fields");
+    assert!(
+        err.to_string().contains("unknown field"),
+        "Error should mention unknown field, got: {}",
+        err
+    );
+}
+
+// Locks in the closed-enum design: an unmodeled mode must fail loud rather than parse silently, so
+// `cost_analyzer` surfaces the new mode (and the maintainer adds the variant) instead of ignoring it.
+#[test]
+fn test_parse_mode_rejects_unknown_mode() {
+    let json = r#"{"type":"mode","mode":"vim","sessionId":"550e8400-e29b-41d4-a716-446655440000"}"#;
+    let err = serde_json::from_str::<LogLine>(json).expect_err("Should reject unknown mode value");
+    assert!(
+        err.to_string().contains("unknown variant"),
+        "Error should mention unknown variant, got: {}",
+        err
+    );
+}
+
+#[test]
 fn test_parse_user_log_line_with_entrypoint() {
     let json = serde_json::json!({
         "parentUuid": null,
@@ -4602,6 +4714,116 @@ fn test_parse_attachment_nested_memory() {
                 other => panic!("Expected NestedMemory attachment, got {:?}", other),
             }
         }
+        other => panic!("Expected Attachment, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_attachment_directory() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": null,
+        "isSidechain": false,
+        "attachment": {
+            "type": "directory",
+            "path": "/Users/brendan/src/project",
+            "content": "src\nCargo.toml\nREADME.md",
+            "displayPath": "project"
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440000",
+        "timestamp": "2026-05-28T00:00:00Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.141",
+        "gitBranch": "main",
+        "slug": null
+    });
+    let log_line: LogLine = serde_json::from_value(json).unwrap();
+    match log_line {
+        LogLine::Attachment(att) => match att.attachment {
+            AttachmentData::Directory(dir) => {
+                assert_eq!(dir.path, "/Users/brendan/src/project");
+                assert_eq!(dir.content, "src\nCargo.toml\nREADME.md");
+                assert_eq!(dir.display_path, "project");
+            }
+            other => panic!("Expected Directory attachment, got {:?}", other),
+        },
+        other => panic!("Expected Attachment, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_attachment_skill_listing_with_names() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": null,
+        "isSidechain": false,
+        "attachment": {
+            "type": "skill_listing",
+            "content": "- a: does a\n- b: does b",
+            "skillCount": 2,
+            "isInitial": true,
+            "names": ["a", "b"]
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440000",
+        "timestamp": "2026-05-28T00:00:00Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.141",
+        "gitBranch": "main",
+        "slug": null
+    });
+    let log_line: LogLine = serde_json::from_value(json).unwrap();
+    match log_line {
+        LogLine::Attachment(att) => match att.attachment {
+            AttachmentData::SkillListing(listing) => {
+                assert_eq!(listing.skill_count, 2);
+                assert!(listing.is_initial);
+                assert_eq!(listing.names, Some(vec!["a".to_string(), "b".to_string()]));
+            }
+            other => panic!("Expected SkillListing attachment, got {:?}", other),
+        },
+        other => panic!("Expected Attachment, got {:?}", other),
+    }
+}
+
+// Older Claude Code logs emit `skill_listing` without `names`; the field must stay optional so those
+// transcripts still parse.
+#[test]
+fn test_parse_attachment_skill_listing_without_names() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": null,
+        "isSidechain": false,
+        "attachment": {
+            "type": "skill_listing",
+            "content": "- a: does a",
+            "skillCount": 1,
+            "isInitial": false
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440000",
+        "timestamp": "2026-05-28T00:00:00Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.141",
+        "gitBranch": "main",
+        "slug": null
+    });
+    let log_line: LogLine = serde_json::from_value(json).unwrap();
+    match log_line {
+        LogLine::Attachment(att) => match att.attachment {
+            AttachmentData::SkillListing(listing) => {
+                assert_eq!(listing.skill_count, 1);
+                assert_eq!(listing.names, None);
+            }
+            other => panic!("Expected SkillListing attachment, got {:?}", other),
+        },
         other => panic!("Expected Attachment, got {:?}", other),
     }
 }
@@ -4877,6 +5099,52 @@ fn test_parse_assistant_log_line_without_attribution_agent() {
         "timestamp": "2026-05-28T00:00:00Z"
     });
     let line: AssistantLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(line.attribution_agent, None);
+    assert_eq!(line.attribution_skill, None);
+    assert_eq!(line.attribution_mcp_server, None);
+    assert_eq!(line.attribution_mcp_tool, None);
+}
+
+#[test]
+fn test_parse_assistant_log_line_with_attribution_mcp() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "test-session",
+        "version": "2.1.141",
+        "gitBranch": "main",
+        "message": {
+            "id": "msg-1",
+            "type": "message",
+            "role": "assistant",
+            "content": "response",
+            "model": "claude-opus-4-7",
+            "stop_reason": null,
+            "usage": {
+                "input_tokens": 3,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": 0,
+                    "ephemeral_1h_input_tokens": 0
+                },
+                "output_tokens": 1
+            }
+        },
+        "requestId": "req-1",
+        "attributionMcpServer": "project-tools",
+        "attributionMcpTool": "run_tests",
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2026-05-28T00:00:00Z"
+    });
+    let line: AssistantLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(
+        line.attribution_mcp_server,
+        Some("project-tools".to_string())
+    );
+    assert_eq!(line.attribution_mcp_tool, Some("run_tests".to_string()));
     assert_eq!(line.attribution_agent, None);
     assert_eq!(line.attribution_skill, None);
 }
@@ -5884,6 +6152,72 @@ fn test_parse_attachment_command_permissions() {
 }
 
 #[test]
+fn test_parse_attachment_date_change() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": null,
+        "isSidechain": false,
+        "attachment": {
+            "type": "date_change",
+            "newDate": "2026-06-01"
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.141",
+        "gitBranch": "main",
+        "slug": "test-slug"
+    });
+    let log_line: LogLine = serde_json::from_value(json).unwrap();
+    match log_line {
+        LogLine::Attachment(att) => {
+            if let AttachmentData::DateChange(change) = &att.attachment {
+                assert_eq!(
+                    change.new_date,
+                    chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap()
+                );
+            } else {
+                panic!("Expected DateChange, got {:?}", att.attachment);
+            }
+        }
+        other => panic!("Expected Attachment, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_attachment_date_change_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": null,
+        "isSidechain": false,
+        "attachment": {
+            "type": "date_change",
+            "newDate": "2026-06-01",
+            "extraField": "should fail"
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.141",
+        "gitBranch": "main",
+        "slug": "test-slug"
+    });
+    let err = serde_json::from_value::<LogLine>(json)
+        .expect_err("Should reject unknown fields in date_change");
+    assert!(
+        err.to_string().contains("unknown field"),
+        "Error should mention unknown field, got: {}",
+        err
+    );
+}
+
+#[test]
 fn test_parse_attachment_edited_text_file() {
     let json = serde_json::json!({
         "type": "attachment",
@@ -6246,6 +6580,47 @@ fn test_parse_user_log_line_without_origin() {
     });
     let line: UserLogLine = serde_json::from_value(json).unwrap();
     assert_eq!(line.origin, None);
+}
+
+#[test]
+fn test_parse_user_log_line_with_interrupted_message_id() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "version": "2.1.104",
+        "gitBranch": "main",
+        "message": {"role": "user", "content": "test"},
+        "uuid": "550e8400-e29b-41d4-a716-446655440001",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "interruptedMessageId": "msg_01Hs25nR7X58UvPnVBqreDRB"
+    });
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(
+        line.interrupted_message_id,
+        Some("msg_01Hs25nR7X58UvPnVBqreDRB".to_string())
+    );
+}
+
+#[test]
+fn test_parse_user_log_line_with_null_interrupted_message_id() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "version": "2.1.104",
+        "gitBranch": "main",
+        "message": {"role": "user", "content": "test"},
+        "uuid": "550e8400-e29b-41d4-a716-446655440001",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "interruptedMessageId": null
+    });
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(line.interrupted_message_id, None);
 }
 
 #[test]

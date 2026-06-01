@@ -2,7 +2,7 @@ use std::collections::HashMap;
 #[cfg(test)]
 use std::path::Path;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 #[cfg(test)]
 use miette::IntoDiagnostic;
 use serde::{Deserialize, Serialize};
@@ -226,6 +226,8 @@ pub enum LogLine {
     LastPrompt(LastPrompt),
     #[serde(rename = "permission-mode")]
     PermissionModeChange(PermissionModeChange),
+    #[serde(rename = "mode")]
+    Mode(ModeLine),
     #[serde(rename = "attachment")]
     Attachment(Box<AttachmentLogLine>),
 }
@@ -277,6 +279,25 @@ pub struct PermissionModeChange {
     pub session_id: Uuid,
 }
 
+/// `mode` log line recording the session's operating mode. Added in Claude Code 2.1.158+.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct ModeLine {
+    pub mode: SessionMode,
+    pub session_id: Uuid,
+}
+
+/// Carried by the `mode` log line; `normal` is the only value observed so far. Kept a closed enum
+/// (no `#[serde(other)]` catch-all) so an unrecognized mode fails to parse instead of being silently
+/// accepted, matching the strict-parse convention this crate uses for Claude Code protocol data: a
+/// new mode surfaces as a parse error rather than passing unnoticed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionMode {
+    Normal,
+}
+
 /// Attachment log line for deferred tools, hooks, and other metadata. Added in Claude Code 2.1.104+.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -307,7 +328,9 @@ pub enum AttachmentData {
     AutoMode(AutoMode),
     AutoModeExit(AutoModeExit),
     CommandPermissions(CommandPermissions),
+    DateChange(DateChange),
     DeferredToolsDelta(DeferredToolsDelta),
+    Directory(DirectoryAttachment),
     EditedTextFile(EditedTextFile),
     File(FileAttachment),
     HookBlockingError(HookBlockingError),
@@ -347,6 +370,13 @@ pub struct CommandPermissions {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
+pub struct DateChange {
+    pub new_date: NaiveDate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct DeferredToolsDelta {
     pub added_names: Vec<String>,
     pub added_lines: Vec<String>,
@@ -355,6 +385,17 @@ pub struct DeferredToolsDelta {
     pub readded_names: Vec<String>,
     #[serde(default)]
     pub pending_mcp_servers: Vec<String>,
+}
+
+/// Directory contents attached to a turn (e.g. via an `@dir` reference); `content` is a
+/// newline-separated listing of the directory's immediate entries. Added in Claude Code 2.1.158+.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct DirectoryAttachment {
+    pub path: String,
+    pub content: String,
+    pub display_path: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -552,6 +593,9 @@ pub struct SkillListing {
     pub content: String,
     pub skill_count: u32,
     pub is_initial: bool,
+    /// Skill names summarized in `content`; absent in older Claude Code logs that listed only
+    /// `content`. Added in Claude Code 2.1.158+.
+    pub names: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -586,6 +630,7 @@ pub enum SystemLogLine {
     Informational(SystemLogInformational),
     ApiError(SystemLogError),
     LocalCommand(LocalCommandLog),
+    ScheduledTaskFire(ScheduledTaskFire),
     StopHookSummary(StopHookSummary),
     TurnDuration(TurnDuration),
 }
@@ -835,6 +880,27 @@ pub struct MicrocompactMetadata {
     pub cleared_attachment_uuids: Vec<Uuid>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct ScheduledTaskFire {
+    pub parent_uuid: Option<Uuid>,
+    pub is_sidechain: bool,
+    pub user_type: String,
+    pub cwd: String,
+    pub session_id: Uuid,
+    pub version: String,
+    pub git_branch: String,
+    /// Session slug identifier (e.g., "noble-floating-lemon"). Added in Claude Code 2.0.51.
+    pub slug: Option<String>,
+    pub content: String,
+    pub timestamp: DateTime<Utc>,
+    pub uuid: Uuid,
+    pub is_meta: bool,
+    /// Entry point that started the session (e.g., "cli"). Added in Claude Code 2.1.104+.
+    pub entrypoint: Option<String>,
+}
+
 /// Duration of a single turn (user message → assistant response cycle).
 /// Added in Claude Code 2.0.51+ for performance tracking.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -952,6 +1018,10 @@ pub struct UserLogLine {
     pub entrypoint: Option<String>,
     /// Origin of the message (e.g., task-notification). Added in Claude Code 2.1.104+.
     pub origin: Option<MessageOrigin>,
+    /// Set when this user turn interrupted a streaming assistant message; holds that message's id
+    /// (an Anthropic `msg_…` id, not a UUID). Can be `null` in the log, hence `Option`.
+    /// Added in Claude Code 2.1.158+.
+    pub interrupted_message_id: Option<String>,
 }
 
 /// Origin metadata for a message. Added in Claude Code 2.1.104+.
@@ -1107,6 +1177,11 @@ pub struct AssistantLogLine {
     /// Present when the assistant turn was driven by a skill invocation.
     /// Added in Claude Code 2.1.141+.
     pub attribution_skill: Option<String>,
+    /// MCP server and tool attributed with producing this message (e.g. server `project-tools`,
+    /// tool `run_tests`). Set together when the assistant turn was driven by an MCP tool call,
+    /// paralleling `attribution_agent`/`attribution_skill` above. Added in Claude Code 2.1.158+.
+    pub attribution_mcp_server: Option<String>,
+    pub attribution_mcp_tool: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

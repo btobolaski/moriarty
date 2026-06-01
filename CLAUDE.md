@@ -85,7 +85,7 @@ test in a separate process, making this safe and preventing tests from clobberin
 - Independent workspace crate for parsing Claude Code JSONL logs into strongly typed serde models
 - The `LogLine` enum covers both core conversation records and newer metadata/event records, including user/assistant
   turns, file-history snapshots, summaries, system entries, queue operations, progress updates, custom titles, agent
-  names, last prompts, permission-mode changes, and attachments
+  names, last prompts, permission-mode changes, session mode records, and attachments
 - Also owns the structured view of the raw `model` string via `model::Model { family, version }` plus `ModelFamily` and
   `ModelVersion`. Both `cost_analyzer` (for pricing) and `moriarty::api_pricing` (for grouping/display) consume this one
   parser so family/version classification is not duplicated across crates
