@@ -4710,6 +4710,7 @@ fn test_parse_attachment_nested_memory() {
                     assert_eq!(memory.content.r#type, "Project");
                     assert_eq!(memory.content.content, "# Hello");
                     assert!(!memory.content.content_differs_from_disk);
+                    assert_eq!(memory.content.raw_content, None);
                 }
                 other => panic!("Expected NestedMemory attachment, got {:?}", other),
             }
@@ -4908,6 +4909,92 @@ fn test_parse_attachment_file_body_rejects_unknown_fields() {
         "Error should mention unknown field, got: {}",
         err
     );
+}
+
+#[test]
+fn test_parse_attachment_nested_memory_with_raw_content() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": null,
+        "isSidechain": false,
+        "attachment": {
+            "type": "nested_memory",
+            "path": "/abs/CLAUDE.md",
+            "content": {
+                "path": "/abs/CLAUDE.md",
+                "type": "Project",
+                "content": "# Processed",
+                "contentDiffersFromDisk": true,
+                "rawContent": "<!-- template -->\n# Processed"
+            },
+            "displayPath": "CLAUDE.md"
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440000",
+        "timestamp": "2026-05-28T00:00:00Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.158",
+        "gitBranch": "main",
+        "slug": null
+    });
+    let log_line: LogLine = serde_json::from_value(json).unwrap();
+    match log_line {
+        LogLine::Attachment(att) => match att.attachment {
+            AttachmentData::NestedMemory(memory) => {
+                assert!(memory.content.content_differs_from_disk);
+                assert_eq!(
+                    memory.content.raw_content.as_deref(),
+                    Some("<!-- template -->\n# Processed")
+                );
+            }
+            other => panic!("Expected NestedMemory attachment, got {:?}", other),
+        },
+        other => panic!("Expected Attachment, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_attachment_nested_memory_content_differs_without_raw_content() {
+    // rawContent is documented as present only when contentDiffersFromDisk is
+    // true, but the field is optional so Claude Code may omit it even then.
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": null,
+        "isSidechain": false,
+        "attachment": {
+            "type": "nested_memory",
+            "path": "/abs/CLAUDE.md",
+            "content": {
+                "path": "/abs/CLAUDE.md",
+                "type": "Project",
+                "content": "# Processed",
+                "contentDiffersFromDisk": true
+            },
+            "displayPath": "CLAUDE.md"
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440000",
+        "timestamp": "2026-05-28T00:00:00Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.158",
+        "gitBranch": "main",
+        "slug": null
+    });
+    let log_line: LogLine = serde_json::from_value(json).unwrap();
+    match log_line {
+        LogLine::Attachment(att) => match att.attachment {
+            AttachmentData::NestedMemory(memory) => {
+                assert!(memory.content.content_differs_from_disk);
+                assert_eq!(memory.content.raw_content, None);
+            }
+            other => panic!("Expected NestedMemory attachment, got {:?}", other),
+        },
+        other => panic!("Expected Attachment, got {:?}", other),
+    }
 }
 
 #[test]

@@ -551,6 +551,11 @@ pub struct NestedMemoryContent {
     pub r#type: String,
     pub content: String,
     pub content_differs_from_disk: bool,
+    // Claude Code only populates this when content_differs_from_disk is true;
+    // it holds the unprocessed on-disk text before template/diff handling. The
+    // type does not enforce that pairing — it is an upstream protocol invariant.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_content: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
