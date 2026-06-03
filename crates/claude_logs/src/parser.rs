@@ -230,6 +230,8 @@ pub enum LogLine {
     Mode(ModeLine),
     #[serde(rename = "attachment")]
     Attachment(Box<AttachmentLogLine>),
+    #[serde(rename = "pr-link")]
+    PrLink(PrLink),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -296,6 +298,20 @@ pub struct ModeLine {
 #[serde(rename_all = "lowercase")]
 pub enum SessionMode {
     Normal,
+}
+
+/// Associates the session with a GitHub pull request Claude Code opened or updated; a session can
+/// emit several (one per PR it touches). Added in Claude Code 2.1.158+. `pr_number` is `u64` to
+/// avoid ever rejecting a large upstream value, even though real PR numbers stay small.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct PrLink {
+    pub session_id: Uuid,
+    pub pr_number: u64,
+    pub pr_url: String,
+    pub pr_repository: String,
+    pub timestamp: DateTime<Utc>,
 }
 
 /// Attachment log line for deferred tools, hooks, and other metadata. Added in Claude Code 2.1.104+.

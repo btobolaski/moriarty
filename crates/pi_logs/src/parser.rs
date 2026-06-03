@@ -1564,9 +1564,7 @@ fn parse_tool_result_details(
             serde_json::from_value(details).map(ToolResultDetails::ContactSupervisor)
         }
         "edit" => serde_json::from_value(details).map(ToolResultDetails::Edit),
-        "fetch_content" => {
-            serde_json::from_value(details).map(ToolResultDetails::FetchContent)
-        }
+        "fetch_content" => serde_json::from_value(details).map(ToolResultDetails::FetchContent),
         "fact_list" | "instinct_list" => {
             serde_json::from_value(details).map(ToolResultDetails::Count)
         }
@@ -1581,9 +1579,7 @@ fn parse_tool_result_details(
         | "git_read_only_status" => {
             serde_json::from_value(details).map(ToolResultDetails::GitReadOnly)
         }
-        "instinct_write" => {
-            serde_json::from_value(details).map(ToolResultDetails::InstinctWrite)
-        }
+        "instinct_write" => serde_json::from_value(details).map(ToolResultDetails::InstinctWrite),
         "intercom" => serde_json::from_value(details).map(ToolResultDetails::Intercom),
         "ls" => serde_json::from_value(details).map(ToolResultDetails::Ls),
         "memory" => {

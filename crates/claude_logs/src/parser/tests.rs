@@ -112,6 +112,54 @@ fn test_parse_user_log_line_with_in_progress_todo() {
 }
 
 #[test]
+fn test_parse_pr_link_log_line() {
+    let json = serde_json::json!({
+        "type": "pr-link",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "prNumber": 76,
+        "prUrl": "https://github.com/owner/repo/pull/76",
+        "prRepository": "owner/repo",
+        "timestamp": "2026-06-03T00:14:43.059Z"
+    });
+    let LogLine::PrLink(pr_link) = serde_json::from_value(json).unwrap() else {
+        panic!("expected a pr-link log line");
+    };
+    // The camelCase renames are the easy thing to get wrong, so assert each field round-trips.
+    assert_eq!(
+        pr_link.session_id,
+        "550e8400-e29b-41d4-a716-446655440000"
+            .parse::<Uuid>()
+            .unwrap()
+    );
+    assert_eq!(pr_link.pr_number, 76);
+    assert_eq!(pr_link.pr_url, "https://github.com/owner/repo/pull/76");
+    assert_eq!(pr_link.pr_repository, "owner/repo");
+    assert_eq!(
+        pr_link.timestamp,
+        "2026-06-03T00:14:43.059Z".parse::<DateTime<Utc>>().unwrap()
+    );
+}
+
+#[test]
+fn test_parse_pr_link_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "type": "pr-link",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "prNumber": 76,
+        "prUrl": "https://github.com/owner/repo/pull/76",
+        "prRepository": "owner/repo",
+        "timestamp": "2026-06-03T00:14:43.059Z",
+        "extraField": "should fail"
+    });
+    let err = serde_json::from_value::<LogLine>(json).expect_err("Should reject unknown fields");
+    assert!(
+        err.to_string().contains("unknown field"),
+        "Error should mention unknown field, got: {}",
+        err
+    );
+}
+
+#[test]
 fn test_parse_user_log_line_with_null_todos() {
     let json = serde_json::json!({
         "parentUuid": null,

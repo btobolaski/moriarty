@@ -3822,12 +3822,7 @@ fn git_read_only_tool_calls_keep_declared_names() {
 
 #[test]
 fn hermes_memory_tool_calls_keep_declared_names() {
-    for tool_name in [
-        "memory",
-        "memory_search",
-        "session_search",
-        "skill",
-    ] {
+    for tool_name in ["memory", "memory_search", "session_search", "skill"] {
         let tool_call = parse_tool_call(tool_name, json!({"query": "auth"}));
         assert_eq!(tool_call.name(), tool_name);
     }
@@ -3878,7 +3873,10 @@ fn custom_plannotator_accepts_snapshot_saved_state() {
             let Some(PlannotatorSavedState::Snapshot(snapshot)) = details.saved_state else {
                 panic!("expected snapshot saved_state")
             };
-            assert_eq!(snapshot.active_tools, vec!["read".to_string(), "bash".to_string()]);
+            assert_eq!(
+                snapshot.active_tools,
+                vec!["read".to_string(), "bash".to_string()]
+            );
             assert_eq!(snapshot.model.provider, Provider::Anthropic);
             assert_eq!(snapshot.model.id, "claude-opus-4-6");
             assert_eq!(snapshot.thinking_level, ThinkingLevel::Medium);
@@ -3930,7 +3928,10 @@ fn custom_plannotator_accepts_snapshot_saved_state_with_openrouter() {
             let Some(PlannotatorSavedState::Snapshot(snapshot)) = details.saved_state else {
                 panic!("expected snapshot saved_state")
             };
-            assert_eq!(snapshot.active_tools, vec!["read".to_string(), "bash".to_string()]);
+            assert_eq!(
+                snapshot.active_tools,
+                vec!["read".to_string(), "bash".to_string()]
+            );
             assert_eq!(snapshot.model.provider, Provider::OpenRouter);
             assert_eq!(snapshot.model.id, "openai/gpt-5.4");
             assert_eq!(snapshot.thinking_level, ThinkingLevel::Medium);
@@ -4266,12 +4267,7 @@ fn custom_message_pi_loaded_tools_accepts_modeled_manifest_names() {
         "git_read_only_show",
         "git_read_only_status",
     ];
-    let hermes_cases = [
-        "memory",
-        "memory_search",
-        "session_search",
-        "skill",
-    ];
+    let hermes_cases = ["memory", "memory_search", "session_search", "skill"];
     let pi_lens_cases = [
         "ast_grep_search",
         "ast_grep_replace",

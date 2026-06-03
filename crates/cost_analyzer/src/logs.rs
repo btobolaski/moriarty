@@ -389,6 +389,8 @@ impl AnalyzableLog for ClaudeLogLine {
             ClaudeLogLine::PermissionModeChange(_) => claude_timestamp_sentinel(),
             ClaudeLogLine::Mode(_) => claude_timestamp_sentinel(),
             ClaudeLogLine::Attachment(line) => line.timestamp,
+            // Unlike the other session-metadata records, `pr-link` carries a real timestamp.
+            ClaudeLogLine::PrLink(line) => line.timestamp,
         }
     }
 
@@ -415,6 +417,10 @@ impl AnalyzableLog for ClaudeLogLine {
             }
             ClaudeLogLine::Mode(line) => format!("mode:{}", line.session_id),
             ClaudeLogLine::Attachment(line) => line.uuid.to_string(),
+            // A session can link several PRs, so key on the PR number too rather than session alone.
+            ClaudeLogLine::PrLink(line) => {
+                format!("pr-link:{}:{}", line.session_id, line.pr_number)
+            }
         }
     }
 
@@ -818,6 +824,17 @@ mod tests {
 
     fn claude_mode_json() -> serde_json::Value {
         claude_metadata_json("mode", "mode", "normal")
+    }
+
+    fn claude_pr_link_json() -> serde_json::Value {
+        json!({
+            "type": "pr-link",
+            "sessionId": CLAUDE_SESSION_ID,
+            "prNumber": 76,
+            "prUrl": "https://github.com/owner/repo/pull/76",
+            "prRepository": "owner/repo",
+            "timestamp": CLAUDE_TIMESTAMP,
+        })
     }
 
     fn claude_system_json(
@@ -1659,6 +1676,12 @@ mod tests {
                 value: claude_attachment_json,
                 expected_timestamp: ExpectedClaudeTimestamp::Real,
                 expected_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".to_string(),
+            },
+            ClaudeNonBillableCase {
+                name: "pr link",
+                value: claude_pr_link_json,
+                expected_timestamp: ExpectedClaudeTimestamp::Real,
+                expected_id: format!("pr-link:{CLAUDE_SESSION_ID}:76"),
             },
         ];
 
