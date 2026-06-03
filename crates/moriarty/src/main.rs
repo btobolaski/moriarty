@@ -4,6 +4,7 @@ use std::{
 };
 
 use clap::{Args, Parser, Subcommand};
+use hooks::result::PreToolResult;
 use mcp::McpServers;
 use miette::{IntoDiagnostic, WrapErr};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -335,6 +336,27 @@ enum PiCommand {
 enum HooksCommand {
     /// Execute hook with input and log the results
     Exec,
+    /// Generate a JSON report of recorded PreToolUse hook results
+    Report(HooksReportArgs),
+}
+
+#[derive(Debug, Args)]
+struct HooksReportArgs {
+    /// Directory containing hook logs (defaults to ~/.local/state/moriarty/hooks)
+    #[arg(short, long)]
+    dir: Option<PathBuf>,
+    /// Only include results at or after this time (ISO 8601, e.g. "2026-01-01"; UTC if no offset)
+    #[arg(long, value_name = "DATETIME")]
+    start_time: Option<String>,
+    /// Only include results before this time (ISO 8601, e.g. "2026-01-01"; UTC if no offset)
+    #[arg(long, value_name = "DATETIME")]
+    end_time: Option<String>,
+    /// Only include calls to this tool (exact match)
+    #[arg(long)]
+    tool: Option<String>,
+    /// Only include results with this outcome
+    #[arg(long, value_enum)]
+    result: Option<PreToolResult>,
 }
 
 #[derive(Debug, Subcommand)]

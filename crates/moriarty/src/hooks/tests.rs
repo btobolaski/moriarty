@@ -389,6 +389,13 @@ async fn test_exec_hook_pretool_completion_log_includes_tool_context() {
         fields.get("hook_output").is_some(),
         "hook_output should remain present on completion log events"
     );
+    // An unconfigured non-Bash tool defers to Claude Code, so the clean result classification
+    // the report consumes should be recorded as "passthrough".
+    assert_eq!(
+        fields.get("result").and_then(Value::as_str),
+        Some("passthrough"),
+        "completion log should record the clean result classification"
+    );
 }
 
 #[test]

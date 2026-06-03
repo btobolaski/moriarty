@@ -48,6 +48,13 @@
 .Nm
 .Cm hooks exec
 .Nm
+.Cm hooks report
+.Op Fl d Ar dir
+.Op Fl \-start\-time Ar DATETIME
+.Op Fl \-end\-time Ar DATETIME
+.Op Fl \-tool Ar tool
+.Op Fl \-result Ar result
+.Nm
 .Cm test project\-tools
 .Op Ar project_dir
 .Nm
@@ -150,6 +157,24 @@ The
 subcommand executes Claude Code hooks, reading input from stdin
 and applying configured tool and bash rules.
 This is the entry point used by Claude Code's hook system.
+.Pp
+The
+.Cm hooks report
+subcommand reads the JSON-lines hook logs from
+.Pa ~/.local/state/moriarty/hooks/
+.Pq or the directory given by the \-d / \-\-dir option
+and prints a JSON report of recorded PreToolUse results, aggregated by the
+exact tool, arguments, and result triple with a count per group.
+The
+.Fl \-start\-time
+and
+.Fl \-end\-time
+options restrict the report to a time range (ISO 8601; UTC when no offset is given),
+.Fl \-tool
+restricts it to a single tool name, and
+.Fl \-result
+restricts it to one outcome
+.Pq Cm allow , deny , ask , modify , passthrough .
 .Ss Test Commands
 .Bl -tag -width Ds
 .It Cm test project\-tools Op Ar project_dir

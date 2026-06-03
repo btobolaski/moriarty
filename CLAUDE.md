@@ -56,6 +56,10 @@ cargo run -- approve-project <project-dir>
 
 # Execute hooks (for debugging)
 cargo run -- hooks exec
+
+# Report recorded PreToolUse hook results as JSON (filter by --start-time/--end-time, --tool, --result;
+# --dir defaults to ~/.local/state/moriarty/hooks)
+cargo run -- hooks report --tool Bash --result deny
 ```
 
 **Testing:**
@@ -203,7 +207,13 @@ test in a separate process, making this safe and preventing tests from clobberin
     ArgumentFilter. Checked when no tool_rule matches a Bash call.
   - Evaluation order: tool_rules → bash_rules (for Bash) → passthrough (for non-Bash, defers to Claude Code)
 - **Stop hook**: Runs project checks before allowing execution
-- Structured logging with tracing crate for debugging hook execution
+- Structured logging with tracing crate for debugging hook execution. The "PreToolUse hook completed" log event
+  records a clean `result` field (`allow`/`deny`/`ask`/`modify`/`passthrough`) classified from the typed `HookOutput`
+  by `hooks::result::pretool_result`, alongside the existing `tool_name` and `tool_args` fields
+- **`hooks report` subcommand**: `hooks/report.rs` reads the JSON-lines hook logs, keeps completed PreToolUse records
+  that carry the clean `result` field (legacy lines lacking it are skipped), and aggregates them by the exact
+  `(tool name, arguments, result)` triple into a JSON report with counts. Reuses `cost_report::TimeRangeFilter` for
+  `--start-time`/`--end-time` and supports `--tool` and `--result` filters
 - Security model: Defaults to "Ask" when unconfigured, fail-closed once configured (verification failures block
   execution)
 
@@ -265,7 +275,7 @@ test in a separate process, making this safe and preventing tests from clobberin
 - `~/.config/moriarty/tool_rules.toml` - Tool and Bash validation rules
 - `<project>/.config/tools.toml` - Project commands and checks
 - `~/.config/moriarty/project_approvals.toml` - SHA-256 approval hashes
-- `~/.local/state/moriarty/logs/` - Structured logs
+- `~/.local/state/moriarty/hooks/` - Hook execution logs (JSON lines, daily-rotated)
 
 **Repository Root Detection**:
 
@@ -287,8 +297,9 @@ test in a separate process, making this safe and preventing tests from clobberin
 `crates/moriarty/src/test_helpers.rs`. This module is compiled only in test builds (`#[cfg(test)]`). New test-only
 helpers needed in more than one module belong here rather than being duplicated.
 
-**Logging**: Structured logging via tracing to `~/.local/state/moriarty/logs/` (auto-rotated). Sensitive env vars
-(TOKEN, SECRET, KEY, PASSWORD) are redacted.
+**Logging**: Hook execution is logged via tracing as JSON lines to `~/.local/state/moriarty/hooks/` (daily-rotated);
+the `hooks report` command consumes these. Cost-report commands log to stderr instead. Sensitive env vars (TOKEN,
+SECRET, KEY, PASSWORD) are redacted.
 
 ### Doc Comments
 

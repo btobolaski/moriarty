@@ -54,6 +54,8 @@
 
 pub mod bash_rules;
 pub mod parser;
+pub mod report;
+pub mod result;
 pub mod tool_rules;
 pub mod tracing;
 
@@ -71,6 +73,7 @@ use parser::{
     HookDecision, HookEventData, HookInput, HookOutput, HookSpecificOutput, PermissionDecision,
     PreToolUseOutput,
 };
+use result::pretool_result;
 
 const TOOL_ARGS_LOG_TRUNCATE_SIZE: usize = 50_000;
 const SAFE_LOG_STRING_TRUNCATE_SIZE: usize = 4_096;
@@ -80,6 +83,16 @@ const REDACTED_LOG_VALUE: &str = "[redacted]";
 pub async fn exec_hooks(cmd: HooksCommand) -> Result<()> {
     match cmd {
         HooksCommand::Exec => exec_hook().await,
+        HooksCommand::Report(args) => {
+            report::run(
+                args.dir,
+                args.start_time,
+                args.end_time,
+                args.tool,
+                args.result,
+            )
+            .await
+        }
     }
 }
 
@@ -261,9 +274,11 @@ async fn exec_hook_impl<R: Read>(reader: R) -> Result<()> {
         println!("{}", json_output);
 
         let tool_args = tool_args_for_log(tool_input);
+        let result = pretool_result(&hook_output);
         info!(
             tool_name = %tool_name,
             tool_args = %tool_args,
+            result = result.as_str(),
             ?hook_output,
             "PreToolUse hook completed"
         );
