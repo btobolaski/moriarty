@@ -921,7 +921,7 @@ fn bash_execution_message() {
 fn fact_list_tool_call_stays_tied_to_tool_name() {
     let tool_call = parse_tool_call("fact_list", json!({}));
 
-    assert_eq!(tool_call.name(), ToolName::FactList);
+    assert_eq!(tool_call.name(), "fact_list");
 }
 
 #[test]
@@ -938,7 +938,7 @@ fn tool_call_preserves_arguments_as_a_raw_json_map() {
     });
     let tool_call = parse_tool_call("bash", raw_arguments.clone());
 
-    assert_eq!(tool_call.name(), ToolName::Bash);
+    assert_eq!(tool_call.name(), "bash");
     assert_eq!(
         serde_json::to_value(&tool_call.arguments).expect("serialize raw arguments"),
         raw_arguments
@@ -1006,7 +1006,7 @@ fn assistant_message_with_text_and_tool_call() {
 
     match &assistant.content[1] {
         AssistantContentItem::ToolCall(tool_call) => {
-            assert_eq!(tool_call.name(), ToolName::Read);
+            assert_eq!(tool_call.name(), "read");
         }
         other => panic!("expected ToolCall, got {other:?}"),
     }
@@ -2539,7 +2539,7 @@ fn tool_result_with_edit_details() {
                 })),
             ..
         } => {
-            assert_eq!(tool_name, ToolName::Edit);
+            assert_eq!(tool_name, "edit");
             assert!(!is_error);
             assert_eq!(first_changed_line, Some(3));
         }
@@ -3048,7 +3048,7 @@ fn custom_message_pi_loaded_tools() {
     ) {
         CustomMessagePayload::PiLoadedTools(details) => {
             assert_eq!(details.tools.len(), 1);
-            assert_eq!(details.tools[0].name, ToolName::Read);
+            assert_eq!(details.tools[0].name, "read");
             assert_eq!(details.tools[0].origin, ToolOrigin::TopLevel);
         }
         other => panic!("expected PiLoadedTools, got {other:?}"),
@@ -3092,20 +3092,22 @@ fn rejects_unknown_session_field() {
 }
 
 #[test]
-fn rejects_unknown_loaded_tool_name() {
+fn accepts_unknown_loaded_tool_name() {
     let unknown_loaded_tool = loaded_tool_json("mystery_tool");
 
-    assert_parse_error_contains_any(
-        "rejects unknown loaded tool name",
-        custom_message_json(
-            "loaded",
-            "pi-loaded-tools",
-            Some(json!({
-                "tools": [unknown_loaded_tool],
-            })),
-        ),
-        &["mystery_tool", "unknown variant"],
-    );
+    match parse_custom_message_payload(
+        "loaded",
+        "pi-loaded-tools",
+        Some(json!({
+            "tools": [unknown_loaded_tool],
+        })),
+    ) {
+        CustomMessagePayload::PiLoadedTools(details) => {
+            assert_eq!(details.tools.len(), 1);
+            assert_eq!(details.tools[0].name, "mystery_tool");
+        }
+        other => panic!("expected PiLoadedTools, got {other:?}"),
+    }
 }
 
 #[test]
@@ -3802,45 +3804,45 @@ fn ctx_cache_tool_call_keeps_declared_name() {
         }),
     );
 
-    assert_eq!(tool_call.name(), ToolName::CtxCache);
+    assert_eq!(tool_call.name(), "ctx_cache");
 }
 
 #[test]
 fn git_read_only_tool_calls_keep_declared_names() {
-    for (tool_name, expected) in [
-        ("git_read_only_diff", ToolName::GitReadOnlyDiff),
-        ("git_read_only_log", ToolName::GitReadOnlyLog),
-        ("git_read_only_show", ToolName::GitReadOnlyShow),
-        ("git_read_only_status", ToolName::GitReadOnlyStatus),
+    for tool_name in [
+        "git_read_only_diff",
+        "git_read_only_log",
+        "git_read_only_show",
+        "git_read_only_status",
     ] {
         let tool_call = parse_tool_call(tool_name, json!({"project_dir": "/tmp/repo", "args": []}));
-        assert_eq!(tool_call.name(), expected);
+        assert_eq!(tool_call.name(), tool_name);
     }
 }
 
 #[test]
 fn hermes_memory_tool_calls_keep_declared_names() {
-    for (tool_name, expected) in [
-        ("memory", ToolName::Memory),
-        ("memory_search", ToolName::MemorySearch),
-        ("session_search", ToolName::SessionSearch),
-        ("skill", ToolName::Skill),
+    for tool_name in [
+        "memory",
+        "memory_search",
+        "session_search",
+        "skill",
     ] {
         let tool_call = parse_tool_call(tool_name, json!({"query": "auth"}));
-        assert_eq!(tool_call.name(), expected);
+        assert_eq!(tool_call.name(), tool_name);
     }
 }
 
 #[test]
 fn pi_lens_tool_calls_keep_declared_names() {
-    for (tool_name, expected) in [
-        ("ast_grep_search", ToolName::AstGrepSearch),
-        ("ast_grep_replace", ToolName::AstGrepReplace),
-        ("lsp_diagnostics", ToolName::LspDiagnostics),
-        ("lsp_navigation", ToolName::LspNavigation),
+    for tool_name in [
+        "ast_grep_search",
+        "ast_grep_replace",
+        "lsp_diagnostics",
+        "lsp_navigation",
     ] {
         let tool_call = parse_tool_call(tool_name, json!({"path": "src/main.rs"}));
-        assert_eq!(tool_call.name(), expected);
+        assert_eq!(tool_call.name(), tool_name);
     }
 }
 
@@ -3852,7 +3854,7 @@ fn git_read_only_tool_call_preserves_raw_snake_case_arguments() {
     });
     let tool_call = parse_tool_call("git_read_only_log", raw_arguments.clone());
 
-    assert_eq!(tool_call.name(), ToolName::GitReadOnlyLog);
+    assert_eq!(tool_call.name(), "git_read_only_log");
     assert_eq!(
         serde_json::to_value(&tool_call.arguments).expect("serialize raw arguments"),
         raw_arguments
@@ -3876,7 +3878,7 @@ fn custom_plannotator_accepts_snapshot_saved_state() {
             let Some(PlannotatorSavedState::Snapshot(snapshot)) = details.saved_state else {
                 panic!("expected snapshot saved_state")
             };
-            assert_eq!(snapshot.active_tools, vec![ToolName::Read, ToolName::Bash]);
+            assert_eq!(snapshot.active_tools, vec!["read".to_string(), "bash".to_string()]);
             assert_eq!(snapshot.model.provider, Provider::Anthropic);
             assert_eq!(snapshot.model.id, "claude-opus-4-6");
             assert_eq!(snapshot.thinking_level, ThinkingLevel::Medium);
@@ -3902,7 +3904,7 @@ fn custom_plannotator_accepts_snapshot_saved_state_with_minimal_thinking() {
             let Some(PlannotatorSavedState::Snapshot(snapshot)) = details.saved_state else {
                 panic!("expected snapshot saved_state")
             };
-            assert_eq!(snapshot.active_tools, vec![ToolName::Read]);
+            assert_eq!(snapshot.active_tools, vec!["read".to_string()]);
             assert_eq!(snapshot.model.provider, Provider::OpenAi);
             assert_eq!(snapshot.model.id, "gpt-5.5");
             assert_eq!(snapshot.thinking_level, ThinkingLevel::Minimal);
@@ -3928,7 +3930,7 @@ fn custom_plannotator_accepts_snapshot_saved_state_with_openrouter() {
             let Some(PlannotatorSavedState::Snapshot(snapshot)) = details.saved_state else {
                 panic!("expected snapshot saved_state")
             };
-            assert_eq!(snapshot.active_tools, vec![ToolName::Read, ToolName::Bash]);
+            assert_eq!(snapshot.active_tools, vec!["read".to_string(), "bash".to_string()]);
             assert_eq!(snapshot.model.provider, Provider::OpenRouter);
             assert_eq!(snapshot.model.id, "openai/gpt-5.4");
             assert_eq!(snapshot.thinking_level, ThinkingLevel::Medium);
@@ -3963,11 +3965,11 @@ fn custom_plannotator_accepts_snapshot_saved_state_with_pi_lens_tools() {
             assert_eq!(
                 snapshot.active_tools,
                 vec![
-                    ToolName::Read,
-                    ToolName::AstGrepSearch,
-                    ToolName::AstGrepReplace,
-                    ToolName::LspDiagnostics,
-                    ToolName::LspNavigation,
+                    "read".to_string(),
+                    "ast_grep_search".to_string(),
+                    "ast_grep_replace".to_string(),
+                    "lsp_diagnostics".to_string(),
+                    "lsp_navigation".to_string(),
                 ]
             );
             assert_eq!(snapshot.model.provider, Provider::Anthropic);
@@ -4212,73 +4214,73 @@ fn custom_message_subagent_control_notice_requires_details() {
 
 #[test]
 fn custom_message_pi_loaded_tools_accepts_modeled_manifest_names() {
-    let builtin_cases = [("read", ToolName::Read)];
-    let intercom_cases = [("contact_supervisor", ToolName::ContactSupervisor)];
+    let builtin_cases = ["read"];
+    let intercom_cases = ["contact_supervisor"];
     let lean_ctx_cases = [
-        ("ctx_agent", ToolName::CtxAgent),
-        ("ctx_analyze", ToolName::CtxAnalyze),
-        ("ctx_architecture", ToolName::CtxArchitecture),
-        ("ctx_benchmark", ToolName::CtxBenchmark),
-        ("ctx_cache", ToolName::CtxCache),
-        ("ctx_callees", ToolName::CtxCallees),
-        ("ctx_callers", ToolName::CtxCallers),
-        ("ctx_compress", ToolName::CtxCompress),
-        ("ctx_compress_memory", ToolName::CtxCompressMemory),
-        ("ctx_context", ToolName::CtxContext),
-        ("ctx_cost", ToolName::CtxCost),
-        ("ctx_dedup", ToolName::CtxDedup),
-        ("ctx_delta", ToolName::CtxDelta),
-        ("ctx_discover", ToolName::CtxDiscover),
-        ("ctx_edit", ToolName::CtxEdit),
-        ("ctx_execute", ToolName::CtxExecute),
-        ("ctx_expand", ToolName::CtxExpand),
-        ("ctx_feedback", ToolName::CtxFeedback),
-        ("ctx_fill", ToolName::CtxFill),
-        ("ctx_gain", ToolName::CtxGain),
-        ("ctx_graph", ToolName::CtxGraph),
-        ("ctx_graph_diagram", ToolName::CtxGraphDiagram),
-        ("ctx_handoff", ToolName::CtxHandoff),
-        ("ctx_heatmap", ToolName::CtxHeatmap),
-        ("ctx_impact", ToolName::CtxImpact),
-        ("ctx_intent", ToolName::CtxIntent),
-        ("ctx_knowledge", ToolName::CtxKnowledge),
-        ("ctx_metrics", ToolName::CtxMetrics),
-        ("ctx_outline", ToolName::CtxOutline),
-        ("ctx_overview", ToolName::CtxOverview),
-        ("ctx_prefetch", ToolName::CtxPrefetch),
-        ("ctx_preload", ToolName::CtxPreload),
-        ("ctx_response", ToolName::CtxResponse),
-        ("ctx_routes", ToolName::CtxRoutes),
-        ("ctx_semantic_search", ToolName::CtxSemanticSearch),
-        ("ctx_session", ToolName::CtxSession),
-        ("ctx_share", ToolName::CtxShare),
-        ("ctx_smart_read", ToolName::CtxSmartRead),
-        ("ctx_symbol", ToolName::CtxSymbol),
-        ("ctx_task", ToolName::CtxTask),
-        ("ctx_workflow", ToolName::CtxWorkflow),
-        ("ctx_wrapped", ToolName::CtxWrapped),
+        "ctx_agent",
+        "ctx_analyze",
+        "ctx_architecture",
+        "ctx_benchmark",
+        "ctx_cache",
+        "ctx_callees",
+        "ctx_callers",
+        "ctx_compress",
+        "ctx_compress_memory",
+        "ctx_context",
+        "ctx_cost",
+        "ctx_dedup",
+        "ctx_delta",
+        "ctx_discover",
+        "ctx_edit",
+        "ctx_execute",
+        "ctx_expand",
+        "ctx_feedback",
+        "ctx_fill",
+        "ctx_gain",
+        "ctx_graph",
+        "ctx_graph_diagram",
+        "ctx_handoff",
+        "ctx_heatmap",
+        "ctx_impact",
+        "ctx_intent",
+        "ctx_knowledge",
+        "ctx_metrics",
+        "ctx_outline",
+        "ctx_overview",
+        "ctx_prefetch",
+        "ctx_preload",
+        "ctx_response",
+        "ctx_routes",
+        "ctx_semantic_search",
+        "ctx_session",
+        "ctx_share",
+        "ctx_smart_read",
+        "ctx_symbol",
+        "ctx_task",
+        "ctx_workflow",
+        "ctx_wrapped",
     ];
     let git_cases = [
-        ("git_read_only_diff", ToolName::GitReadOnlyDiff),
-        ("git_read_only_log", ToolName::GitReadOnlyLog),
-        ("git_read_only_show", ToolName::GitReadOnlyShow),
-        ("git_read_only_status", ToolName::GitReadOnlyStatus),
+        "git_read_only_diff",
+        "git_read_only_log",
+        "git_read_only_show",
+        "git_read_only_status",
     ];
     let hermes_cases = [
-        ("memory", ToolName::Memory),
-        ("memory_search", ToolName::MemorySearch),
-        ("session_search", ToolName::SessionSearch),
-        ("skill", ToolName::Skill),
+        "memory",
+        "memory_search",
+        "session_search",
+        "skill",
     ];
     let pi_lens_cases = [
-        ("ast_grep_search", ToolName::AstGrepSearch),
-        ("ast_grep_replace", ToolName::AstGrepReplace),
-        ("lsp_diagnostics", ToolName::LspDiagnostics),
-        ("lsp_navigation", ToolName::LspNavigation),
+        "ast_grep_search",
+        "ast_grep_replace",
+        "lsp_diagnostics",
+        "lsp_navigation",
     ];
 
     let mut tools = Vec::new();
-    for (wire_name, _) in &builtin_cases {
+    for &wire_name in &builtin_cases {
         tools.push(json!({
             "name": wire_name,
             "description": "builtin tool",
@@ -4288,7 +4290,7 @@ fn custom_message_pi_loaded_tools_accepts_modeled_manifest_names() {
             "origin": "top-level"
         }));
     }
-    for (wire_name, _) in &intercom_cases {
+    for &wire_name in &intercom_cases {
         tools.push(json!({
             "name": wire_name,
             "description": "intercom tool",
@@ -4299,7 +4301,7 @@ fn custom_message_pi_loaded_tools_accepts_modeled_manifest_names() {
             "extensionPath": "npm:pi-intercom@0.6.0"
         }));
     }
-    for (wire_name, _) in &lean_ctx_cases {
+    for &wire_name in &lean_ctx_cases {
         tools.push(json!({
             "name": wire_name,
             "description": "lean ctx tool",
@@ -4310,7 +4312,7 @@ fn custom_message_pi_loaded_tools_accepts_modeled_manifest_names() {
             "extensionPath": "npm:pi-lean-ctx@3.3.6"
         }));
     }
-    for (wire_name, _) in &git_cases {
+    for &wire_name in &git_cases {
         tools.push(json!({
             "name": wire_name,
             "description": "git tool",
@@ -4321,7 +4323,7 @@ fn custom_message_pi_loaded_tools_accepts_modeled_manifest_names() {
             "extensionPath": "npm:pi-mcp-adapter@2.5.1"
         }));
     }
-    for (wire_name, _) in &hermes_cases {
+    for &wire_name in &hermes_cases {
         tools.push(json!({
             "name": wire_name,
             "description": "hermes tool",
@@ -4332,7 +4334,7 @@ fn custom_message_pi_loaded_tools_accepts_modeled_manifest_names() {
             "extensionPath": "npm:pi-hermes-memory@0.7.10"
         }));
     }
-    for (wire_name, _) in &pi_lens_cases {
+    for &wire_name in &pi_lens_cases {
         tools.push(json!({
             "name": wire_name,
             "description": "pi lens tool",
@@ -4350,7 +4352,7 @@ fn custom_message_pi_loaded_tools_accepts_modeled_manifest_names() {
         Some(json!({"tools": tools})),
     ) {
         CustomMessagePayload::PiLoadedTools(details) => {
-            for (index, (_, expected_name)) in builtin_cases.iter().enumerate() {
+            for (index, expected_name) in builtin_cases.iter().enumerate() {
                 let tool = &details.tools[index];
                 assert_eq!(tool.name, *expected_name);
                 assert_eq!(tool.source, ToolSource::Builtin);
@@ -4360,7 +4362,7 @@ fn custom_message_pi_loaded_tools_accepts_modeled_manifest_names() {
             }
 
             let mut index = builtin_cases.len();
-            for (_, expected_name) in &intercom_cases {
+            for &expected_name in &intercom_cases {
                 let tool = &details.tools[index];
                 assert_eq!(tool.name, *expected_name);
                 assert_eq!(tool.source, ToolSource::Extension);
@@ -4373,7 +4375,7 @@ fn custom_message_pi_loaded_tools_accepts_modeled_manifest_names() {
                 index += 1;
             }
 
-            for (_, expected_name) in &lean_ctx_cases {
+            for &expected_name in &lean_ctx_cases {
                 let tool = &details.tools[index];
                 assert_eq!(tool.name, *expected_name);
                 assert_eq!(tool.source, ToolSource::Extension);
@@ -4386,7 +4388,7 @@ fn custom_message_pi_loaded_tools_accepts_modeled_manifest_names() {
                 index += 1;
             }
 
-            for (_, expected_name) in &git_cases {
+            for &expected_name in &git_cases {
                 let tool = &details.tools[index];
                 assert_eq!(tool.name, *expected_name);
                 assert_eq!(tool.source, ToolSource::Extension);
@@ -4399,7 +4401,7 @@ fn custom_message_pi_loaded_tools_accepts_modeled_manifest_names() {
                 index += 1;
             }
 
-            for (_, expected_name) in &hermes_cases {
+            for &expected_name in &hermes_cases {
                 let tool = &details.tools[index];
                 assert_eq!(tool.name, *expected_name);
                 assert_eq!(tool.source, ToolSource::Extension);
@@ -4412,7 +4414,7 @@ fn custom_message_pi_loaded_tools_accepts_modeled_manifest_names() {
                 index += 1;
             }
 
-            for (_, expected_name) in &pi_lens_cases {
+            for &expected_name in &pi_lens_cases {
                 let tool = &details.tools[index];
                 assert_eq!(tool.name, *expected_name);
                 assert_eq!(tool.source, ToolSource::Extension);
@@ -5605,4 +5607,72 @@ fn subagent_tool_result_rejects_unknown_control_event_type() {
         ),
         &["did not match any variant", "unknown variant", "paused"],
     );
+}
+
+// ---------------------------------------------------------------------------
+// Unknown tool-name acceptance — pi does not validate tool names.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn assistant_tool_call_accepts_unknown_name() {
+    let raw_arguments = json!({"opaque": true});
+    let tool_call = parse_tool_call("extra_argle_bargle", raw_arguments.clone());
+
+    assert_eq!(tool_call.name(), "extra_argle_bargle");
+    assert_eq!(
+        serde_json::to_value(&tool_call.arguments).expect("serialize raw arguments"),
+        raw_arguments
+    );
+}
+
+#[test]
+fn tool_result_accepts_unknown_name_without_details() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "extra_argle_bargle",
+        vec![json!({"type": "text", "text": "done"})],
+        false,
+        None,
+    ));
+
+    assert_eq!(tool_result.tool_name, "extra_argle_bargle");
+    assert!(tool_result.details.is_none());
+}
+
+#[test]
+fn tool_result_accepts_unknown_name_with_null_details() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "extra_argle_bargle",
+        vec![json!({"type": "text", "text": "done"})],
+        false,
+        Some(Value::Null),
+    ));
+
+    assert_eq!(tool_result.tool_name, "extra_argle_bargle");
+    assert!(tool_result.details.is_none());
+}
+
+#[test]
+fn custom_plannotator_accepts_unknown_active_tool_name() {
+    match parse_custom_payload(
+        "plannotator",
+        json!({
+            "phase": "planning",
+            "savedState": {
+                "activeTools": ["read", "extra_argle_bargle"],
+                "model": {"provider": "anthropic", "id": "claude-sonnet-4-5"},
+                "thinkingLevel": "medium"
+            }
+        }),
+    ) {
+        CustomPayload::Plannotator(details) => {
+            let Some(PlannotatorSavedState::Snapshot(snapshot)) = details.saved_state else {
+                panic!("expected snapshot saved_state")
+            };
+            assert_eq!(
+                snapshot.active_tools,
+                vec!["read".to_string(), "extra_argle_bargle".to_string()]
+            );
+        }
+        other => panic!("expected Plannotator, got {other:?}"),
+    }
 }

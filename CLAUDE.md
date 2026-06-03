@@ -134,10 +134,10 @@ test in a separate process, making this safe and preventing tests from clobberin
 - `ToolCallContent` keeps the outer tool-call envelope typed (`id`, `name`, `partial_json`) but preserves `arguments` as
   a raw `BTreeMap<String, JsonBlob>` because pi logs the model-emitted JSON object before tool-side validation; typed
   tool-argument structs are optional post-parse helpers, not the parser's source of truth
-- `ToolName` is the shared compatibility gate for assistant tool calls, tool results, `pi-loaded-tools` manifests, and
-  Plannotator saved-state `activeTools` snapshots; when pi adds new top-level tools (for example Hermes `memory`,
-  `memory_search`, `session_search`, or `skill`, or pi-lens tools like `ast_grep_search`), extend this enum first or
-  `pi cost` / `graphs pi` will drop entire session files as parse failures
+- Tool names are raw `String` fields — pi does not validate tool names at the protocol level, so the parser
+  accepts any string (including model-invented names like `task` or `remove`) rather than rejecting unknown tools.
+  Tool-specific result parsing still routes known tool names by string to their typed result-structs where
+  structured post-parse handling is needed; unknown tool results fall through to shape-based deserialization.
 - Hermes memory/session-search result details are modeled by their shared envelopes rather than per-action sub-schemas:
   search tools use the `success/count/message/output` summary shape, while `memory` and `skill` are routed by
   `tool_name` first because their error details can collapse to either `{}` or a bare `{error}`; once routed, the parser

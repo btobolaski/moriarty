@@ -348,7 +348,7 @@ pub struct AssistantMessage {
 #[serde(rename_all = "camelCase")]
 pub struct ToolResultMessage {
     pub tool_call_id: String,
-    pub tool_name: ToolName,
+    pub tool_name: String,
     pub content: Vec<TextContentItem>,
     pub is_error: bool,
     pub timestamp: i64,
@@ -360,7 +360,7 @@ pub struct ToolResultMessage {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RawToolResultMessage {
     pub tool_call_id: String,
-    pub tool_name: ToolName,
+    pub tool_name: String,
     pub content: Vec<TextContentItem>,
     pub is_error: bool,
     pub timestamp: i64,
@@ -376,7 +376,7 @@ struct RawToolResultMessage {
 /// reads back — those tools are kept by [`preserves_empty_error_details`].
 fn resolve_tool_result_details(
     raw_details: Option<Value>,
-    tool_name: &ToolName,
+    tool_name: &str,
     is_error: bool,
 ) -> Result<Option<ToolResultDetails>, serde_json::Error> {
     let details = match raw_details {
@@ -500,15 +500,15 @@ pub enum TextContentKind {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ToolCallContent {
     pub id: String,
-    pub name: ToolName,
+    pub name: String,
     pub arguments: ToolCallArguments,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partial_json: Option<String>,
 }
 
 impl ToolCallContent {
-    pub fn name(&self) -> ToolName {
-        self.name.clone()
+    pub fn name(&self) -> &str {
+        &self.name
     }
 }
 
@@ -634,105 +634,6 @@ pub enum AssistantStopReason {
     Aborted,
     #[serde(rename = "error")]
     Error,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolName {
-    AskUser,
-    Bash,
-    CodeSearch,
-    Compress,
-    ContactSupervisor,
-    Edit,
-    FactDelete,
-    FactList,
-    FactRead,
-    FactWrite,
-    FetchContent,
-    Find,
-    GetSearchContent,
-    Grep,
-    InstinctDelete,
-    InstinctList,
-    InstinctMerge,
-    InstinctRead,
-    InstinctWrite,
-    Intercom,
-    Ls,
-    Memory,
-    MemorySearch,
-    Mcp,
-    PlannotatorSubmitPlan,
-    Read,
-    SessionSearch,
-    Skill,
-    Subagent,
-    SubagentStatus,
-    Todo,
-    WebSearch,
-    Write,
-    // Tools provided by the pi-lens extension. They appear in
-    // `pi-loaded-tools` manifests and Plannotator saved-state snapshots even
-    // when sessions never invoke them directly.
-    AstGrepSearch,
-    AstGrepReplace,
-    LspDiagnostics,
-    LspNavigation,
-    // Tools provided by the pi-lean-ctx extension. Most only appear in the
-    // `pi-loaded-tools` manifest of sessions where lean-ctx is loaded, but
-    // `ctx_cache` is also invoked directly in assistant tool calls and has a
-    // dedicated typed argument struct below.
-    CtxAgent,
-    CtxAnalyze,
-    CtxArchitecture,
-    CtxBenchmark,
-    CtxCache,
-    CtxCallees,
-    CtxCallers,
-    CtxCompress,
-    CtxCompressMemory,
-    CtxContext,
-    CtxCost,
-    CtxDedup,
-    CtxDelta,
-    CtxDiscover,
-    CtxEdit,
-    CtxExecute,
-    CtxExpand,
-    CtxFeedback,
-    CtxFill,
-    CtxGain,
-    CtxGraph,
-    CtxGraphDiagram,
-    CtxHandoff,
-    CtxHeatmap,
-    CtxImpact,
-    CtxIntent,
-    CtxKnowledge,
-    CtxMetrics,
-    CtxOutline,
-    CtxOverview,
-    CtxPrefetch,
-    CtxPreload,
-    CtxResponse,
-    CtxRoutes,
-    CtxSemanticSearch,
-    CtxSession,
-    CtxShare,
-    CtxSmartRead,
-    CtxSymbol,
-    CtxTask,
-    CtxWorkflow,
-    CtxWrapped,
-    // MCP-server tools surfaced as flat top-level names by the
-    // pi-tool-display extension (rather than going through the generic
-    // `mcp` tool). They appear in the `pi-loaded-tools` manifest and as
-    // direct toolCalls in assistant messages.
-    GitReadOnlyDiff,
-    GitReadOnlyLog,
-    GitReadOnlyShow,
-    GitReadOnlyStatus,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -1646,70 +1547,70 @@ fn is_empty_details_object(details: &Value) -> bool {
     matches!(details, Value::Object(map) if map.is_empty())
 }
 
-fn preserves_empty_error_details(tool_name: &ToolName) -> bool {
-    matches!(tool_name, ToolName::Memory | ToolName::Skill)
+fn preserves_empty_error_details(tool_name: &str) -> bool {
+    matches!(tool_name, "memory" | "skill")
 }
 
 fn parse_tool_result_details(
-    tool_name: &ToolName,
+    tool_name: &str,
     details: Value,
 ) -> Result<ToolResultDetails, serde_json::Error> {
     match tool_name {
-        ToolName::AskUser => serde_json::from_value(details).map(ToolResultDetails::AskUser),
-        ToolName::Bash => serde_json::from_value(details).map(ToolResultDetails::Bash),
-        ToolName::CodeSearch => serde_json::from_value(details).map(ToolResultDetails::CodeSearch),
-        ToolName::Compress => serde_json::from_value(details).map(ToolResultDetails::Compress),
-        ToolName::ContactSupervisor => {
+        "ask_user" => serde_json::from_value(details).map(ToolResultDetails::AskUser),
+        "bash" => serde_json::from_value(details).map(ToolResultDetails::Bash),
+        "code_search" => serde_json::from_value(details).map(ToolResultDetails::CodeSearch),
+        "compress" => serde_json::from_value(details).map(ToolResultDetails::Compress),
+        "contact_supervisor" => {
             serde_json::from_value(details).map(ToolResultDetails::ContactSupervisor)
         }
-        ToolName::Edit => serde_json::from_value(details).map(ToolResultDetails::Edit),
-        ToolName::FetchContent => {
+        "edit" => serde_json::from_value(details).map(ToolResultDetails::Edit),
+        "fetch_content" => {
             serde_json::from_value(details).map(ToolResultDetails::FetchContent)
         }
-        ToolName::FactList | ToolName::InstinctList => {
+        "fact_list" | "instinct_list" => {
             serde_json::from_value(details).map(ToolResultDetails::Count)
         }
-        ToolName::Find => serde_json::from_value(details).map(ToolResultDetails::Find),
-        ToolName::GetSearchContent => {
+        "find" => serde_json::from_value(details).map(ToolResultDetails::Find),
+        "get_search_content" => {
             serde_json::from_value(details).map(ToolResultDetails::GetSearchContent)
         }
-        ToolName::Grep => serde_json::from_value(details).map(ToolResultDetails::Grep),
-        ToolName::GitReadOnlyDiff
-        | ToolName::GitReadOnlyLog
-        | ToolName::GitReadOnlyShow
-        | ToolName::GitReadOnlyStatus => {
+        "grep" => serde_json::from_value(details).map(ToolResultDetails::Grep),
+        "git_read_only_diff"
+        | "git_read_only_log"
+        | "git_read_only_show"
+        | "git_read_only_status" => {
             serde_json::from_value(details).map(ToolResultDetails::GitReadOnly)
         }
-        ToolName::InstinctWrite => {
+        "instinct_write" => {
             serde_json::from_value(details).map(ToolResultDetails::InstinctWrite)
         }
-        ToolName::Intercom => serde_json::from_value(details).map(ToolResultDetails::Intercom),
-        ToolName::Ls => serde_json::from_value(details).map(ToolResultDetails::Ls),
-        ToolName::Memory => {
+        "intercom" => serde_json::from_value(details).map(ToolResultDetails::Intercom),
+        "ls" => serde_json::from_value(details).map(ToolResultDetails::Ls),
+        "memory" => {
             if is_empty_details_object(&details) {
                 Ok(ToolResultDetails::Empty(EmptyDetails {}))
             } else {
                 serde_json::from_value(details).map(ToolResultDetails::Memory)
             }
         }
-        ToolName::MemorySearch | ToolName::SessionSearch => {
+        "memory_search" | "session_search" => {
             serde_json::from_value(details).map(ToolResultDetails::SearchResult)
         }
-        ToolName::Mcp => serde_json::from_value(details).map(ToolResultDetails::Mcp),
-        ToolName::PlannotatorSubmitPlan => {
+        "mcp" => serde_json::from_value(details).map(ToolResultDetails::Mcp),
+        "plannotator_submit_plan" => {
             serde_json::from_value(details).map(ToolResultDetails::PlannotatorSubmitPlan)
         }
-        ToolName::Read => serde_json::from_value(details).map(ToolResultDetails::Read),
-        ToolName::Skill => {
+        "read" => serde_json::from_value(details).map(ToolResultDetails::Read),
+        "skill" => {
             if is_empty_details_object(&details) {
                 Ok(ToolResultDetails::Empty(EmptyDetails {}))
             } else {
                 serde_json::from_value(details).map(ToolResultDetails::Skill)
             }
         }
-        ToolName::Subagent => serde_json::from_value(details).map(ToolResultDetails::Subagent),
-        ToolName::Todo => serde_json::from_value(details).map(ToolResultDetails::Todo),
-        ToolName::WebSearch => serde_json::from_value(details).map(ToolResultDetails::WebSearch),
+        "subagent" => serde_json::from_value(details).map(ToolResultDetails::Subagent),
+        "todo" => serde_json::from_value(details).map(ToolResultDetails::Todo),
+        "web_search" => serde_json::from_value(details).map(ToolResultDetails::WebSearch),
         _ => serde_json::from_value(details),
     }
 }
@@ -2698,7 +2599,7 @@ pub enum PlannotatorSavedState {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PlannotatorSavedStateSnapshot {
-    pub active_tools: Vec<ToolName>,
+    pub active_tools: Vec<String>,
     pub model: PlannotatorModelRef,
     pub thinking_level: ThinkingLevel,
 }
@@ -2929,7 +2830,7 @@ pub struct PiLoadedToolsDetails {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LoadedTool {
-    pub name: ToolName,
+    pub name: String,
     pub description: String,
     pub active: bool,
     pub source: ToolSource,
