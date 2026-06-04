@@ -2087,6 +2087,7 @@ fn web_search_tool_result_accepts_curated_details() {
                 "durationMs": 1234,
                 "tokenEstimate": 567,
                 "fallbackUsed": true,
+                "fallbackReason": "primary search failed",
                 "edited": true
             }
         })),
@@ -2142,6 +2143,10 @@ fn web_search_tool_result_accepts_curated_details() {
     assert_eq!(summary.duration_ms, Some(1234));
     assert_eq!(summary.token_estimate, Some(567));
     assert!(summary.fallback_used);
+    assert_eq!(
+        summary.fallback_reason.as_deref(),
+        Some("primary search failed")
+    );
     assert!(summary.edited);
 }
 
@@ -2177,7 +2182,29 @@ fn web_search_tool_result_summary_defaults() {
     assert_eq!(summary.duration_ms, None);
     assert_eq!(summary.token_estimate, None);
     assert!(!summary.fallback_used);
+    assert_eq!(summary.fallback_reason, None);
     assert!(!summary.edited);
+}
+
+#[test]
+fn web_search_summary_serializes_fallback_reason_as_camel_case() {
+    let value = serde_json::to_value(SearchSummary {
+        text: "Summary text".to_string(),
+        workflow: "curated-web-search".to_string(),
+        model: None,
+        duration_ms: None,
+        token_estimate: None,
+        fallback_used: true,
+        fallback_reason: Some("primary search failed".to_string()),
+        edited: false,
+    })
+    .expect("serialize search summary");
+
+    assert_eq!(
+        value.get("fallbackReason").and_then(Value::as_str),
+        Some("primary search failed")
+    );
+    assert!(value.get("fallback_reason").is_none());
 }
 
 #[test]

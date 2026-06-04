@@ -2032,6 +2032,8 @@ pub struct SearchSummary {
     pub token_estimate: Option<u64>,
     #[serde(default)]
     pub fallback_used: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
     #[serde(default)]
     pub edited: bool,
 }
