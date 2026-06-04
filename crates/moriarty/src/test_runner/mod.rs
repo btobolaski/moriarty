@@ -26,9 +26,9 @@ use serde_json::json;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 use crate::{
-    hooks::bash_rules::{BashRuleEngine, RuleResult},
+    hooks::bash_rules::{BashRuleEngine, CommandTrace, RuleResult},
     project_config::runner::{verify_and_load_project, CommandOutput, VerifiedProject},
-    user_config::{load_user_config, UserConfig},
+    user_config::load_user_config_from,
 };
 
 pub async fn exec_test(cmd: crate::TestCommand) -> Result<()> {
@@ -39,7 +39,9 @@ pub async fn exec_test(cmd: crate::TestCommand) -> Result<()> {
             command,
             config,
             json,
-        } => test_bash_rules(command, config, json).await,
+            explain,
+            cwd,
+        } => test_bash_rules(command, config, json, explain, cwd).await,
     }
 }
 
@@ -195,11 +197,17 @@ async fn run_checks(project_dir: PathBuf) -> Result<()> {
     .await
 }
 
-/// Test a bash command against configured rules
+/// Test a bash command against configured rules.
+///
+/// Without `explain`, output is the single-command rule result (unchanged historical behavior).
+/// With `explain`, it shows the compound split, each leaf's normalized text and matching rule, and
+/// the merged decision the hook would actually make for `cwd`.
 async fn test_bash_rules(
     command: Option<String>,
     config_path: Option<PathBuf>,
     json: bool,
+    explain: bool,
+    cwd: Option<PathBuf>,
 ) -> Result<()> {
     // Initialize tracing to stderr for debug output (RUST_LOG env var controls level)
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -227,17 +235,7 @@ async fn test_bash_rules(
     }
 
     // Load config from custom path or default
-    let config = if let Some(path) = config_path {
-        let contents = tokio::fs::read(&path)
-            .await
-            .into_diagnostic()
-            .wrap_err_with(|| format!("Failed to read config file: {}", path.display()))?;
-        toml::from_slice::<UserConfig>(&contents)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("Failed to parse config file: {}", path.display()))?
-    } else {
-        load_user_config().await?
-    };
+    let config = load_user_config_from(config_path.as_deref()).await?;
 
     // Extract bash rules
     let bash_rules = match config.bash_rules {
@@ -264,6 +262,20 @@ async fn test_bash_rules(
     // Create engine
     let engine = BashRuleEngine::from_config(bash_rules, config.pattern_fragments)?;
 
+    if explain {
+        let cwd = resolve_explain_cwd(cwd);
+        let trace = engine.explain(&command, &cwd);
+        if json {
+            let rendered = serde_json::to_string_pretty(&trace)
+                .into_diagnostic()
+                .wrap_err("Failed to serialize explain trace")?;
+            println!("{rendered}");
+        } else {
+            output_explain(&trace);
+        }
+        return Ok(());
+    }
+
     // Apply rules
     let result = engine.apply_rules(&command);
 
@@ -275,6 +287,72 @@ async fn test_bash_rules(
     }
 
     Ok(())
+}
+
+/// Resolves the simulated hook cwd for `--explain`: the explicit `--cwd`, else the process working
+/// directory, else empty (which disables path normalization).
+fn resolve_explain_cwd(cwd: Option<PathBuf>) -> String {
+    match cwd {
+        Some(path) => path.to_string_lossy().into_owned(),
+        None => std::env::current_dir()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+    }
+}
+
+fn output_explain(trace: &CommandTrace) {
+    println!("Command: {}", trace.original);
+
+    if let Some(reason) = &trace.bail {
+        println!(
+            "  Could not analyze ({reason:?}); only an explicit Deny on the whole command is honored."
+        );
+    } else {
+        for (index, sub) in trace.sub_commands.iter().enumerate() {
+            println!("  Leaf {}: {}", index + 1, sub.normalized);
+            if sub.original != sub.normalized {
+                println!("    (before cwd normalization: {})", sub.original);
+            }
+            if sub.real_file_write {
+                println!("    writes a real file → any Allow is capped at Ask");
+            }
+            match &sub.matched {
+                Some(explanation) => {
+                    println!(
+                        "    matched rule '{}'  [{}]",
+                        explanation.rule_name, explanation.action_summary
+                    );
+                    println!("      pattern: {}", explanation.expanded_pattern);
+                }
+                None => println!("    no rule matched"),
+            }
+        }
+    }
+
+    println!();
+    print!("Final decision: ");
+    print_result_line(&trace.final_result);
+}
+
+/// One-line rendering of a final decision for the `--explain` footer.
+fn print_result_line(result: &RuleResult) {
+    match result {
+        RuleResult::Allowed { rule_name } => println!("✓ ALLOWED by rule: {rule_name}"),
+        RuleResult::Denied { rule_name, reason } => {
+            println!("✗ DENIED by rule: {rule_name} ({reason})")
+        }
+        RuleResult::Modified {
+            rule_name,
+            new_command,
+        } => println!("→ MODIFIED by rule: {rule_name} → {new_command}"),
+        RuleResult::Asked { rule_name } => println!("? ASK by rule: {rule_name}"),
+        RuleResult::ArgumentFiltered {
+            rule_name,
+            new_command,
+            ..
+        } => println!("⚙ ARGUMENT FILTERED by rule: {rule_name} → {new_command}"),
+        RuleResult::NoMatch => println!("○ NO MATCH — would prompt the user"),
+    }
 }
 
 fn output_json(command: &str, result: &RuleResult) -> Result<()> {
@@ -406,7 +484,7 @@ mod tests {
     async fn run_once(rule: BashRule, command: &str, json: bool) -> miette::Result<()> {
         let dir = setup_isolated_xdg_config();
         let cfg = create_test_config(&dir, vec![rule]).await;
-        test_bash_rules(Some(command.to_string()), Some(cfg), json).await
+        test_bash_rules(Some(command.to_string()), Some(cfg), json, false, None).await
     }
 
     fn allow(name: &str, pattern: &str) -> BashRule {
@@ -566,7 +644,7 @@ mod tests {
             ],
         )
         .await;
-        test_bash_rules(Some("ls".to_string()), Some(cfg), false)
+        test_bash_rules(Some("ls".to_string()), Some(cfg), false, false, None)
             .await
             .unwrap();
     }
@@ -575,7 +653,7 @@ mod tests {
     async fn test_bash_rules_no_rules_configured() {
         let dir = setup_isolated_xdg_config();
         let cfg = create_test_config(&dir, vec![]).await;
-        test_bash_rules(Some("ls -la".to_string()), Some(cfg), false)
+        test_bash_rules(Some("ls -la".to_string()), Some(cfg), false, false, None)
             .await
             .unwrap();
     }
@@ -599,24 +677,36 @@ mod tests {
         .await;
 
         // Matches: every char in " -la" is permitted by safe_chars ([^|&;$`]).
-        test_bash_rules(Some("ls -la".to_string()), Some(cfg.clone()), false)
-            .await
-            .unwrap_or_else(|e| panic!("pattern_fragments ls -la: {e}"));
+        test_bash_rules(
+            Some("ls -la".to_string()),
+            Some(cfg.clone()),
+            false,
+            false,
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("pattern_fragments ls -la: {e}"));
 
         // Must NOT match: the pipe char is excluded by safe_chars, so the
         // expanded pattern `^ls[^|&;$`]*$` rejects "ls | grep foo".
         // test_bash_rules still returns Ok (no rule error); the hook simply
         // emits NO MATCH output, which is the behaviour under test.
-        test_bash_rules(Some("ls | grep foo".to_string()), Some(cfg), false)
-            .await
-            .unwrap_or_else(|e| panic!("pattern_fragments ls | grep foo: {e}"));
+        test_bash_rules(
+            Some("ls | grep foo".to_string()),
+            Some(cfg),
+            false,
+            false,
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("pattern_fragments ls | grep foo: {e}"));
     }
 
     #[tokio::test]
     async fn test_bash_rules_empty_command() {
         let dir = setup_isolated_xdg_config();
         let cfg = create_test_config(&dir, vec![allow("allow-ls", r"^ls")]).await;
-        let err = test_bash_rules(Some(String::new()), Some(cfg), false)
+        let err = test_bash_rules(Some(String::new()), Some(cfg), false, false, None)
             .await
             .expect_err("Should fail with empty command");
         assert!(err.to_string().contains("No command provided"));
@@ -628,6 +718,8 @@ mod tests {
             Some("ls".to_string()),
             Some(PathBuf::from("/nonexistent/path/config.toml")),
             false,
+            false,
+            None,
         )
         .await
         .expect_err("Should fail with invalid config path");
@@ -643,9 +735,31 @@ mod tests {
         tokio::fs::write(&cfg, "this is not valid [[[ toml")
             .await
             .unwrap();
-        let err = test_bash_rules(Some("ls".to_string()), Some(cfg), false)
+        let err = test_bash_rules(Some("ls".to_string()), Some(cfg), false, false, None)
             .await
             .expect_err("Should fail with malformed TOML");
         assert!(err.to_string().contains("Failed to parse config file"));
+    }
+
+    #[tokio::test]
+    async fn test_bash_rules_explain_mode_succeeds() {
+        let dir = setup_isolated_xdg_config();
+        let cfg = create_test_config(&dir, vec![allow("allow-ls", r"^ls")]).await;
+        // Render both pretty and JSON explain, over a compound command (per-leaf branch) and a
+        // command-substitution command (bail branch), so both rendering paths are exercised.
+        // The trace content itself is asserted by BashRuleEngine::explain's own tests.
+        for command in ["ls && echo hi", "ls $(curl x)"] {
+            for json in [false, true] {
+                test_bash_rules(
+                    Some(command.to_string()),
+                    Some(cfg.clone()),
+                    json,
+                    true,
+                    None,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("explain {command:?} json={json}: {e}"));
+            }
+        }
     }
 }

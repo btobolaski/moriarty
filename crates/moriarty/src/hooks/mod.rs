@@ -53,6 +53,7 @@
 //! require users to enable verbose mode to understand why hooks blocked their commands.
 
 pub mod bash_rules;
+mod command_split;
 pub mod parser;
 pub mod report;
 pub mod result;
@@ -278,6 +279,7 @@ async fn exec_hook_impl<R: Read>(reader: R) -> Result<()> {
         info!(
             tool_name = %tool_name,
             tool_args = %tool_args,
+            cwd = %hook_input.cwd,
             result = result.as_str(),
             ?hook_output,
             "PreToolUse hook completed"
@@ -450,7 +452,7 @@ async fn handle_pretool_hook(
     }
 
     if tool_name == "Bash" {
-        handle_bash_pretool_hook_with_config(tool_input, config).await
+        handle_bash_pretool_hook_with_config(tool_input, config, cwd).await
     } else {
         debug!(tool_name = %tool_name, "No tool rules matched for non-Bash tool, deferring to Claude Code");
         Ok(HookOutput::default())
@@ -462,18 +464,22 @@ async fn handle_pretool_hook(
 /// Production code routes through `handle_pretool_hook` instead. This wrapper is kept so
 /// existing bash-rule tests can call it directly without going through the tool_rules layer.
 #[cfg(test)]
-async fn handle_bash_pretool_hook(tool_input: &serde_json::Value) -> Result<HookOutput> {
+async fn handle_bash_pretool_hook(tool_input: &serde_json::Value, cwd: &str) -> Result<HookOutput> {
     let config = match load_config_or_ask().await {
         Ok(c) => c,
         Err(fallback) => return Ok(fallback),
     };
-    handle_bash_pretool_hook_with_config(tool_input, config).await
+    handle_bash_pretool_hook_with_config(tool_input, config, cwd).await
 }
 
 /// Apply bash_rules from a pre-loaded config to validate Bash commands.
+///
+/// `cwd` is the hook's working directory; it drives compound-command splitting and in-cwd
+/// absolute-path normalization in [`bash_rules::BashRuleEngine::apply_rules_compound`].
 async fn handle_bash_pretool_hook_with_config(
     tool_input: &serde_json::Value,
     config: crate::user_config::UserConfig,
+    cwd: &str,
 ) -> Result<HookOutput> {
     use bash_rules::{BashRuleEngine, RuleResult};
 
@@ -493,7 +499,7 @@ async fn handle_bash_pretool_hook_with_config(
     };
 
     let engine = BashRuleEngine::from_config(bash_rules, config.pattern_fragments)?;
-    let result = engine.apply_rules(command);
+    let result = engine.apply_rules_compound(command, cwd);
 
     match result {
         RuleResult::Allowed { rule_name } => {
@@ -553,7 +559,7 @@ async fn handle_bash_pretool_hook_with_config(
             );
 
             // CRITICAL: Re-validate filtered command for security
-            let recheck_result = engine.apply_rules(&new_command);
+            let recheck_result = engine.apply_rules_compound(&new_command, cwd);
 
             match recheck_result {
                 RuleResult::Allowed {

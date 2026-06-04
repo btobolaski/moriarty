@@ -19,6 +19,7 @@ mod persistence;
 mod pi_cost;
 mod project_config;
 mod repository;
+mod rules;
 #[cfg(test)]
 mod test_helpers;
 mod test_runner;
@@ -122,6 +123,9 @@ async fn main() -> miette::Result<()> {
         }
         Command::Hooks { subcommand } => {
             hooks::exec_hooks(subcommand).await?;
+        }
+        Command::Rules { subcommand } => {
+            rules::exec_rules(subcommand).await?;
         }
         Command::Test { subcommand } => {
             test_runner::exec_test(subcommand).await?;
@@ -293,10 +297,103 @@ enum Command {
         #[command(subcommand)]
         subcommand: HooksCommand,
     },
+    /// Inspect, validate, and author bash/tool permission rules
+    Rules {
+        #[command(subcommand)]
+        subcommand: RulesCommand,
+    },
     /// Run project tests and tools
     Test {
         #[command(subcommand)]
         subcommand: TestCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RulesCommand {
+    /// Report rules the hook silently ignores; with --strict, also likely-shadowed/over-broad rules
+    Lint {
+        /// Custom config file path (defaults to ~/.config/moriarty/tool_rules.toml)
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+        /// Output as JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+        /// Also warn about likely-shadowed rules and over-broad Allow rules
+        #[arg(long)]
+        strict: bool,
+    },
+    /// List the merged pattern fragments (built-in defaults plus user-defined) usable in patterns
+    ListFragments {
+        /// Custom config file path (defaults to ~/.config/moriarty/tool_rules.toml)
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+        /// Output as JSON instead of a table
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print a canonical example tool_rules.toml covering every rule and action variant
+    Schema {
+        /// Output the parsed config as JSON instead of TOML
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print a paste-ready starter pack of allow-rules for common read-only commands
+    Starter {
+        /// Output as JSON instead of TOML
+        #[arg(long)]
+        json: bool,
+    },
+    /// Suggest anchored rules for commands the hook frequently prompted on (from the hook logs)
+    Suggest {
+        /// Directory containing hook logs (defaults to ~/.local/state/moriarty/hooks)
+        #[arg(short, long)]
+        dir: Option<PathBuf>,
+        /// Only include results at or after this time (ISO 8601; UTC if no offset)
+        #[arg(long, value_name = "DATETIME")]
+        start_time: Option<String>,
+        /// Only include results before this time (ISO 8601; UTC if no offset)
+        #[arg(long, value_name = "DATETIME")]
+        end_time: Option<String>,
+        /// Which recorded outcome to mine for suggestions (ask or deny)
+        #[arg(long, value_enum, default_value = "ask")]
+        result: PreToolResult,
+        /// Maximum number of suggestions to emit
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        /// Only suggest commands seen at least this many times
+        #[arg(long, default_value_t = 2)]
+        min_count: u64,
+        /// Generated pattern shape: a fully-literal exact match, or a program-name prefix
+        #[arg(long = "match", value_enum, default_value = "exact")]
+        match_mode: rules::MatchMode,
+        /// Action for generated rules (defaults to ask, or deny when --result deny)
+        #[arg(long, value_enum)]
+        action: Option<rules::SuggestAction>,
+        /// Output as JSON ([{rule, count, observed_command}]) instead of TOML
+        #[arg(long)]
+        json: bool,
+    },
+    /// Re-evaluate recorded Bash decisions against a candidate config and report divergences
+    Replay {
+        /// Directory containing hook logs (defaults to ~/.local/state/moriarty/hooks)
+        #[arg(short, long)]
+        dir: Option<PathBuf>,
+        /// Candidate config to evaluate against (defaults to ~/.config/moriarty/tool_rules.toml)
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+        /// Only replay commands recorded at or after this time (ISO 8601; UTC if no offset)
+        #[arg(long, value_name = "DATETIME")]
+        start_time: Option<String>,
+        /// Only replay commands recorded before this time (ISO 8601; UTC if no offset)
+        #[arg(long, value_name = "DATETIME")]
+        end_time: Option<String>,
+        /// Only replay commands whose recorded outcome was this (e.g. allow to guard auto-approvals)
+        #[arg(long, value_enum)]
+        result: Option<PreToolResult>,
+        /// Output as JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -385,6 +482,14 @@ enum TestCommand {
         /// Output as JSON instead of pretty-printed
         #[arg(long)]
         json: bool,
+
+        /// Show how the command splits into leaves and which rule matched each, then the decision
+        #[arg(long)]
+        explain: bool,
+
+        /// Simulate the hook working directory for path normalization (defaults to the process cwd)
+        #[arg(long)]
+        cwd: Option<PathBuf>,
     },
 }
 

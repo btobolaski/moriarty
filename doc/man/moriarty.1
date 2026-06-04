@@ -64,7 +64,43 @@
 .Cm test bash\-rules
 .Op Fl c Ar config
 .Op Fl \-json
+.Op Fl \-explain
+.Op Fl \-cwd Ar dir
 .Op Ar command
+.Nm
+.Cm rules lint
+.Op Fl c Ar config
+.Op Fl \-strict
+.Op Fl \-json
+.Nm
+.Cm rules list\-fragments
+.Op Fl c Ar config
+.Op Fl \-json
+.Nm
+.Cm rules schema
+.Op Fl \-json
+.Nm
+.Cm rules starter
+.Op Fl \-json
+.Nm
+.Cm rules suggest
+.Op Fl d Ar dir
+.Op Fl \-start\-time Ar DATETIME
+.Op Fl \-end\-time Ar DATETIME
+.Op Fl \-result Ar ask|deny
+.Op Fl \-limit Ar n
+.Op Fl \-min\-count Ar n
+.Op Fl \-match Ar exact|prefix
+.Op Fl \-action Ar ask|deny|allow
+.Op Fl \-json
+.Nm
+.Cm rules replay
+.Op Fl d Ar dir
+.Op Fl c Ar config
+.Op Fl \-start\-time Ar DATETIME
+.Op Fl \-end\-time Ar DATETIME
+.Op Fl \-result Ar allow|ask|deny
+.Op Fl \-json
 .Sh DESCRIPTION
 .Nm
 is a Rust CLI tool for working with Claude Code and pi session logs.
@@ -192,7 +228,70 @@ Defaults to
 .Pa ~/.config/moriarty/tool_rules.toml .
 .It Fl \-json
 Output results as JSON instead of pretty\-printed text.
+.It Fl \-explain
+Show how the command splits into leaf commands, the normalized text and matching
+rule for each leaf, and the merged decision the hook would make.
+This reflects the real per\-leaf evaluation
+.Pq see Xr moriarty\-bash\-rules 5 ;
+the default
+.Pq non\-explain
+output reports the single\-command result and is unchanged.
+.It Fl \-cwd Ar dir
+Simulate the hook working directory for in\-cwd absolute\-path normalization.
+Defaults to the process working directory.
 .El
+.El
+.Ss Rules
+The
+.Cm rules
+subcommands inspect, validate, and author the bash and tool rules in
+.Pa ~/.config/moriarty/tool_rules.toml .
+They never run the hook.
+.Bl -tag -width Ds
+.It Cm rules lint Op Fl \-strict
+Report rules the hook silently ignores
+.Pq dropped because of an undefined fragment, invalid regex, or incomplete field/pattern pair ,
+exiting nonzero if any exist.
+With
+.Fl \-strict ,
+additionally warn about likely\-shadowed and over\-broad Allow rules.
+.It Cm rules list\-fragments
+List the merged pattern fragments
+.Pq built\-in defaults plus user\-defined ,
+marking the source of each.
+.It Cm rules schema
+Print a canonical example
+.Pa tool_rules.toml
+covering every rule and action variant.
+.It Cm rules starter
+Print a paste\-ready set of allow\-rules for common read\-only commands, designed for
+the per\-leaf engine.
+.It Cm rules suggest
+Suggest anchored rules for commands the hook frequently prompted on, mined from the
+hook logs.
+.Fl \-result
+selects the recorded outcome to mine
+.Pq Cm ask No or Cm deny ;
+.Fl \-match Cm exact|prefix
+chooses the generated pattern shape; and
+.Fl \-action Cm ask|deny|allow
+sets the action
+.Pq Cm allow No is refused unless Fl \-match Cm exact .
+.It Cm rules replay
+Re\-evaluate recorded Bash decisions against a candidate
+.Fl \-config
+and report divergences.
+With
+.Fl \-result Cm allow
+it exits nonzero if any previously auto\-approved command would no longer be allowed,
+guarding migrations against lost auto\-approvals.
+The
+.Fl \-start\-time
+and
+.Fl \-end\-time
+options bound the replay window
+.Pq ISO 8601; UTC when no offset is given ,
+so a long\-lived log need not be replayed in full.
 .El
 .Sh ENVIRONMENT
 .Bl -tag -width Ds
@@ -213,8 +312,8 @@ See
 .Xr moriarty\-tool\-rules 5
 and
 .Xr moriarty\-bash\-rules 5 .
-.It Pa ~/.local/state/moriarty/logs/
-Runtime log directory.
+.It Pa ~/.local/state/moriarty/hooks/
+Hook execution log directory (JSON lines, daily-rotated).
 .El
 .Sh SEE ALSO
 .Xr moriarty\-tool\-rules 5 ,

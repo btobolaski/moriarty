@@ -8,9 +8,9 @@
 //! the approval/hashing system since it represents the user's personal preferences
 //! rather than untrusted project settings.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, path::Path};
 
-use miette::{Context, Result};
+use miette::{Context, IntoDiagnostic, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::persistence::FileType;
@@ -67,6 +67,15 @@ pub struct UserConfig {
 }
 
 /// Rules evaluated in order with first-match-wins semantics.
+///
+/// # Compound commands
+///
+/// The hook splits each Bash command into leaf simple-commands and matches `pattern` against each
+/// leaf independently (see `hooks::command_split`), so a pattern only needs to describe one command
+/// — not a whole `a && b | c` pipeline. Operators are split off, command substitution/subshells bail
+/// to a prompt, and writes to real files are capped at Ask, so allow-rules can be simple prefixes
+/// (`^ls`) without spelling out pipes or shell-metacharacter exclusions. A pattern still guards a
+/// program's *own* dangerous flags (e.g. `find -exec`, `sed -i`), which are invisible to the splitter.
 ///
 /// # Security: Shell Injection Risk
 ///
@@ -206,6 +215,24 @@ pub async fn load_user_config() -> Result<UserConfig> {
             }
         }
     }
+}
+
+/// Loads user config from an explicit path, or the default XDG location when `path` is `None`.
+///
+/// Unlike [`load_user_config`], an explicit path that is missing or malformed is a hard error: the
+/// user named the file, so silently falling back to defaults would mask a typo.
+pub async fn load_user_config_from(path: Option<&Path>) -> Result<UserConfig> {
+    let Some(path) = path else {
+        return load_user_config().await;
+    };
+
+    let contents = tokio::fs::read(path)
+        .await
+        .into_diagnostic()
+        .wrap_err_with(|| format!("Failed to read config file: {}", path.display()))?;
+    toml::from_slice::<UserConfig>(&contents)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("Failed to parse config file: {}", path.display()))
 }
 
 #[cfg(test)]

@@ -19,7 +19,10 @@ use regex::Regex;
 use tokio::task::spawn_blocking;
 use tracing::{debug, warn};
 
-use super::bash_rules::{default_fragments, expand_fragments};
+use super::bash_rules::{
+    classify_fragment_error, default_fragments, expand_fragments, RuleDiagnostic,
+    RuleDiagnosticKind,
+};
 use crate::user_config::{ToolRule, ToolRuleAction};
 
 /// Runtime representation of a tool rule with pre-compiled regex for the field pattern.
@@ -161,11 +164,27 @@ fn is_missing_path_error(error: &io::Error) -> bool {
 }
 
 impl ToolRuleEngine {
-    /// Compiles tool rules with pattern fragment expansion.
-    ///
-    /// Rules with incomplete field/pattern pairs (only one present) are logged and skipped.
-    /// Invalid regex patterns (after fragment expansion) are logged and skipped.
+    /// Compiles tool rules with pattern fragment expansion, logging and skipping malformed rules
+    /// (incomplete `field`/`pattern` pairs, unexpandable fragments, or invalid regexes).
     pub fn from_config(rules: Vec<ToolRule>, fragments: Option<HashMap<String, String>>) -> Self {
+        let (engine, diagnostics) = Self::compile_with_diagnostics(rules, fragments);
+        for diagnostic in &diagnostics {
+            warn!(
+                rule_name = %diagnostic.rule_name,
+                pattern = %diagnostic.pattern,
+                error = %diagnostic.message,
+                "Skipping tool rule the hook cannot compile"
+            );
+        }
+        engine
+    }
+
+    /// Compiles tool rules, returning the engine and a diagnostic per dropped rule. Does not log;
+    /// the caller decides how to surface dropped rules (the hook warns; `rules lint` errors).
+    pub(crate) fn compile_with_diagnostics(
+        rules: Vec<ToolRule>,
+        fragments: Option<HashMap<String, String>>,
+    ) -> (Self, Vec<RuleDiagnostic>) {
         let mut merged_fragments = default_fragments();
         if let Some(user_frags) = fragments {
             merged_fragments.extend(user_frags);
@@ -174,6 +193,7 @@ impl ToolRuleEngine {
         let mut compiled = Vec::new();
         let mut allow_local_tools = HashSet::new();
         let mut has_wildcard_allow_local = false;
+        let mut diagnostics = Vec::new();
 
         for mut rule in rules {
             // Destructure the field/pattern by value so we can move `rule`
@@ -181,86 +201,69 @@ impl ToolRuleEngine {
             let field = rule.field.take();
             let pattern = rule.pattern.take();
             match (field, pattern) {
-                (Some(_), None) => {
-                    warn!(
-                        rule_name = %rule.name,
-                        "Tool rule has 'field' without 'pattern', skipping"
-                    );
-                    continue;
-                }
-                (None, Some(_)) => {
-                    warn!(
-                        rule_name = %rule.name,
-                        "Tool rule has 'pattern' without 'field', skipping"
-                    );
-                    continue;
-                }
+                (Some(_), None) => diagnostics.push(RuleDiagnostic {
+                    rule_name: rule.name,
+                    pattern: String::new(),
+                    kind: RuleDiagnosticKind::MissingFieldOrPattern,
+                    message: "Rule has 'field' without 'pattern'".to_string(),
+                }),
+                (None, Some(pattern)) => diagnostics.push(RuleDiagnostic {
+                    rule_name: rule.name,
+                    pattern,
+                    kind: RuleDiagnosticKind::MissingFieldOrPattern,
+                    message: "Rule has 'pattern' without 'field'".to_string(),
+                }),
                 (Some(field), Some(pattern)) => {
-                    // Expand fragments and compile regex
                     let expanded = match expand_fragments(&pattern, &merged_fragments) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            warn!(
-                                rule_name = %rule.name,
-                                pattern = %pattern,
-                                error = %e,
-                                "Failed to expand pattern fragments in tool rule, skipping"
-                            );
+                        Ok(expanded) => expanded,
+                        Err(error) => {
+                            let message = error.to_string();
+                            diagnostics.push(RuleDiagnostic {
+                                kind: classify_fragment_error(&message),
+                                rule_name: rule.name,
+                                pattern,
+                                message,
+                            });
                             continue;
                         }
                     };
 
                     match Regex::new(&expanded) {
-                        Ok(regex) => {
-                            debug!(
-                                rule_name = %rule.name,
-                                tool = %rule.tool,
-                                field = %field,
-                                pattern = %expanded,
-                                "Compiled tool rule with field pattern"
-                            );
-                            push_compiled_rule(
-                                &mut compiled,
-                                &mut allow_local_tools,
-                                &mut has_wildcard_allow_local,
-                                rule,
-                                Some(field),
-                                Some(regex),
-                            );
-                        }
-                        Err(e) => {
-                            warn!(
-                                rule_name = %rule.name,
-                                pattern = %expanded,
-                                error = %e,
-                                "Invalid regex in tool rule, skipping"
-                            );
-                        }
+                        Ok(regex) => push_compiled_rule(
+                            &mut compiled,
+                            &mut allow_local_tools,
+                            &mut has_wildcard_allow_local,
+                            rule,
+                            Some(field),
+                            Some(regex),
+                        ),
+                        Err(error) => diagnostics.push(RuleDiagnostic {
+                            rule_name: rule.name,
+                            pattern,
+                            kind: RuleDiagnosticKind::InvalidRegex,
+                            message: error.to_string(),
+                        }),
                     }
                 }
-                (None, None) => {
-                    debug!(
-                        rule_name = %rule.name,
-                        tool = %rule.tool,
-                        "Compiled tool rule (tool-name only)"
-                    );
-                    push_compiled_rule(
-                        &mut compiled,
-                        &mut allow_local_tools,
-                        &mut has_wildcard_allow_local,
-                        rule,
-                        None,
-                        None,
-                    );
-                }
+                (None, None) => push_compiled_rule(
+                    &mut compiled,
+                    &mut allow_local_tools,
+                    &mut has_wildcard_allow_local,
+                    rule,
+                    None,
+                    None,
+                ),
             }
         }
 
-        Self {
-            rules: compiled,
-            allow_local_tools,
-            has_wildcard_allow_local,
-        }
+        (
+            Self {
+                rules: compiled,
+                allow_local_tools,
+                has_wildcard_allow_local,
+            },
+            diagnostics,
+        )
     }
 
     fn has_matching_allow_local_rule(&self, tool_name: &str) -> bool {
@@ -581,7 +584,10 @@ fn extract_field_value(value: &serde_json::Value) -> Option<String> {
 ///
 /// Guards against partial directory name matches (e.g., cwd `/foo` does not strip from
 /// `/foobar/baz`) by requiring a `/` boundary or exact equality after the prefix.
-fn strip_cwd_prefix<'a>(value: &'a str, cwd: &str) -> &'a str {
+///
+/// Shared with [`super::command_split`] so Bash leaf commands normalize in-cwd absolute paths the
+/// same way tool-rule field matching does.
+pub(crate) fn strip_cwd_prefix<'a>(value: &'a str, cwd: &str) -> &'a str {
     let cwd = cwd.strip_suffix('/').unwrap_or(cwd);
 
     if cwd.is_empty() {
@@ -1738,6 +1744,41 @@ mod tests {
             serde_json::json!({"file_path": "/home/user/project/src/main.rs"}),
             "/home/user/project/",
         );
+    }
+
+    #[test]
+    fn test_compile_with_diagnostics_reports_dropped_rules_and_keeps_good_ones() {
+        let rules = vec![
+            make_rule(
+                "missing-pattern",
+                "Write",
+                Some("file_path"),
+                None,
+                ToolRuleAction::Allow,
+            ),
+            make_rule(
+                "bad-regex",
+                "Read",
+                Some("path"),
+                Some("[invalid("),
+                ToolRuleAction::Allow,
+            ),
+            make_rule("good", "Read", None, None, ToolRuleAction::Allow),
+        ];
+        let (engine, diagnostics) = ToolRuleEngine::compile_with_diagnostics(rules, None);
+
+        // The valid tool-name-only rule still compiled and is enforced.
+        assert_eq!(
+            engine.apply_rules_sync("Read", &serde_json::json!({}), ""),
+            ToolRuleResult::Allowed {
+                rule_name: "good".to_string()
+            }
+        );
+
+        let kinds: Vec<RuleDiagnosticKind> = diagnostics.iter().map(|d| d.kind).collect();
+        assert_eq!(diagnostics.len(), 2, "diagnostics: {diagnostics:?}");
+        assert!(kinds.contains(&RuleDiagnosticKind::MissingFieldOrPattern));
+        assert!(kinds.contains(&RuleDiagnosticKind::InvalidRegex));
     }
 
     #[test]
