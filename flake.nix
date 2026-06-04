@@ -208,7 +208,7 @@
           packages = with pkgs; [
             alejandra
             cargo-hakari
-            nodePackages.prettier
+            prettier
             treefmt
           ];
         };
