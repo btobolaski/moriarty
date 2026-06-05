@@ -792,7 +792,7 @@ pub struct SystemLogError {
     pub level: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cause: Option<serde_json::Value>,
-    pub error: SystemLogErrorError,
+    pub error: SystemErrorBody,
     pub retry_in_ms: f64,
     pub retry_attempt: usize,
     pub max_retries: usize,
@@ -800,6 +800,41 @@ pub struct SystemLogError {
     pub uuid: Uuid,
     /// Entry point that started the session (e.g., "cli"). Added in Claude Code 2.1.104+.
     pub entrypoint: Option<String>,
+}
+
+/// The `error` payload of a system `error`/`api_error` line arrives in two distinct
+/// envelopes with no discriminator field, so they are matched structurally. `Client`
+/// is listed first because its required `message`/`formatted` fields are absent from
+/// the SDK envelope; this makes disambiguation depend on differing *required* fields
+/// rather than on `deny_unknown_fields` being honored inside `#[serde(untagged)]`,
+/// which serde does not guarantee.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SystemErrorBody {
+    /// Claude Code's networking-layer error wrapper (seen from Claude Code 2.1.158):
+    /// a human-formatted message plus connection / rate-limit diagnostics.
+    Client(SystemLogClientError),
+    /// Anthropic SDK `APIError` shape: HTTP status with optional headers/requestID/cause.
+    Sdk(SystemLogErrorError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct SystemLogClientError {
+    pub message: String,
+    pub status: u16,
+    pub request_id: String,
+    pub formatted: String,
+    /// Only ever observed as JSON null, but always present on the wire, so (unlike the
+    /// genuinely-optional fields elsewhere) it is serialized as explicit null rather than
+    /// skipped. Typed as `Option<()>` rather than a guessed struct or `serde_json::Value`
+    /// so any future populated payload fails to parse, surfacing as a partial-failure
+    /// warning that forces us to model its real shape.
+    pub connection: Option<()>,
+    pub is_network_down: bool,
+    /// See `connection`: always present as null so far; a populated value must break parsing.
+    pub rate_limits: Option<()>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -810,6 +845,9 @@ pub struct SystemLogErrorError {
     pub status: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub headers: Option<HashMap<String, String>>,
+    /// This envelope's wire key is `requestID` (capital D), intentionally distinct from
+    /// `SystemLogClientError`'s `requestId` — they are different upstream shapes, so do not
+    /// "normalize" the capitalization or one of the two envelopes will stop parsing.
     #[serde(rename = "requestID")]
     pub request_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1245,6 +1283,9 @@ pub struct AssistantLogLine {
     pub is_api_error_message: Option<bool>,
     /// Error type when this is an API error message (e.g., "invalid_request").
     pub error: Option<String>,
+    /// Upstream HTTP status for an API-error message (e.g. 529), set alongside
+    /// `is_api_error_message`/`error` on synthetic error turns. Added in Claude Code 2.1.158+.
+    pub api_error_status: Option<u16>,
     /// Entry point that started the session (e.g., "cli"). Added in Claude Code 2.1.104+.
     pub entrypoint: Option<String>,
     /// Named subagent attributed with producing this message (e.g., "code-quality-reviewer").

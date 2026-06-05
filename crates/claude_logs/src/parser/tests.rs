@@ -816,6 +816,8 @@ fn test_parse_assistant_with_web_fetch_and_context_management() {
     if let LogLine::Assistant(assistant) = line {
         assert_eq!(assistant.message.model.raw(), "<synthetic>");
         assert_eq!(assistant.message.context_management, None);
+        // This turn predates Claude Code 2.1.158, so the new API-error status must be absent.
+        assert_eq!(assistant.api_error_status, None);
         assert_eq!(
             assistant
                 .message
@@ -828,6 +830,61 @@ fn test_parse_assistant_with_web_fetch_and_context_management() {
         );
     } else {
         panic!("Expected Assistant variant");
+    }
+}
+
+// Synthetic API-error assistant turn (Claude Code 2.1.158) carrying error type + HTTP status.
+#[test]
+fn test_parse_assistant_api_error_message_with_status() {
+    let json = serde_json::json!({
+        "parentUuid": "92511969-25ff-4e15-8b0e-705cb1a6df59",
+        "isSidechain": false,
+        "type": "assistant",
+        "uuid": "2201f52c-7e6a-4415-8a94-1bbafcbd3747",
+        "timestamp": "2026-06-05T15:39:29.956Z",
+        "message": {
+            "id": "b33613b3-4af5-4202-b471-0f290ba1a955",
+            "container": null,
+            "model": "<synthetic>",
+            "role": "assistant",
+            "stop_reason": "stop_sequence",
+            "stop_sequence": "",
+            "type": "message",
+            "usage": {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "server_tool_use": {"web_search_requests": 0, "web_fetch_requests": 0},
+                "service_tier": null,
+                "cache_creation": {"ephemeral_1h_input_tokens": 0, "ephemeral_5m_input_tokens": 0}
+            },
+            "content": [{"type": "text", "text": "API Error: 529 Overloaded."}],
+            "context_management": null
+        },
+        "requestId": "req_011CbkMobZe6EibUaraVrDUU",
+        "error": "server_error",
+        "isApiErrorMessage": true,
+        "apiErrorStatus": 529,
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "897f641d-35f9-4a70-8b47-f3c8f3d9e308",
+        "version": "2.1.158",
+        "gitBranch": "HEAD",
+        "slug": "synchronous-sparking-scone"
+    });
+
+    let line: LogLine =
+        serde_json::from_value(json).expect("Failed to parse api-error assistant message");
+
+    match line {
+        LogLine::Assistant(assistant) => {
+            assert_eq!(assistant.is_api_error_message, Some(true));
+            assert_eq!(assistant.error.as_deref(), Some("server_error"));
+            assert_eq!(assistant.api_error_status, Some(529));
+        }
+        _ => panic!("Expected Assistant variant"),
     }
 }
 
@@ -1439,7 +1496,12 @@ fn test_parse_system_log_error() {
             assert_eq!(error.retry_in_ms, 1000.0);
             assert_eq!(error.retry_attempt, 1);
             assert_eq!(error.max_retries, 3);
-            assert_eq!(error.error.request_id.as_deref(), Some("req_abc123"));
+            match &error.error {
+                SystemErrorBody::Sdk(sdk) => {
+                    assert_eq!(sdk.request_id.as_deref(), Some("req_abc123"));
+                }
+                other => panic!("Expected SDK error envelope, got {other:?}"),
+            }
             assert!(error.cause.is_some());
         }
         _ => panic!("Expected System(Error) variant"),
@@ -1459,7 +1521,7 @@ fn test_parse_system_log_api_error() {
         "version": "2.0.42",
         "gitBranch": "main",
         "level": "error",
-        "error": {"requestID": "req_api_123", "status": 429},
+        "error": {"requestID": "req_api_123", "status": 429, "headers": {"retry-after": "5"}},
         "retryInMs": 250.5,
         "retryAttempt": 2,
         "maxRetries": 5,
@@ -1475,10 +1537,227 @@ fn test_parse_system_log_api_error() {
             assert_eq!(error.retry_in_ms, 250.5);
             assert_eq!(error.retry_attempt, 2);
             assert_eq!(error.max_retries, 5);
-            assert_eq!(error.error.request_id.as_deref(), Some("req_api_123"));
-            assert_eq!(error.error.status, Some(429));
+            match &error.error {
+                SystemErrorBody::Sdk(sdk) => {
+                    assert_eq!(sdk.request_id.as_deref(), Some("req_api_123"));
+                    assert_eq!(sdk.status, Some(429));
+                    assert_eq!(
+                        sdk.headers
+                            .as_ref()
+                            .and_then(|headers| headers.get("retry-after"))
+                            .map(String::as_str),
+                        Some("5")
+                    );
+                }
+                other => panic!("Expected SDK error envelope, got {other:?}"),
+            }
         }
         _ => panic!("Expected System(ApiError) variant"),
+    }
+}
+
+// The networking-layer error envelope emitted by Claude Code 2.1.158 (real overloaded_error line).
+#[test]
+fn test_parse_system_log_api_error_client_envelope() {
+    let json = serde_json::json!({
+        "type": "system",
+        "subtype": "api_error",
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "non-uuid-session-id",
+        "version": "2.1.158",
+        "gitBranch": "HEAD",
+        "level": "error",
+        "error": {
+            "message": "529 {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"},\"request_id\":\"req_011CbkMooev8tewDZ9JGCJ92\"}",
+            "status": 529,
+            "requestId": "req_011CbkMooev8tewDZ9JGCJ92",
+            "formatted": "529 Overloaded",
+            "connection": null,
+            "isNetworkDown": false,
+            "rateLimits": null
+        },
+        "retryInMs": 511.07263673020685,
+        "retryAttempt": 1,
+        "maxRetries": 10,
+        "timestamp": "2026-06-05T15:36:05.139Z",
+        "uuid": "550e8400-e29b-41d4-a716-446655440009"
+    });
+
+    let line: LogLine =
+        serde_json::from_value(json).expect("Failed to parse api_error client envelope");
+
+    match line {
+        LogLine::System(SystemLogLine::ApiError(error)) => {
+            assert_eq!(error.retry_attempt, 1);
+            assert_eq!(error.max_retries, 10);
+            match &error.error {
+                SystemErrorBody::Client(client) => {
+                    assert_eq!(client.status, 529);
+                    assert_eq!(client.request_id, "req_011CbkMooev8tewDZ9JGCJ92");
+                    assert_eq!(client.formatted, "529 Overloaded");
+                    assert!(client.message.starts_with("529 "));
+                    assert!(!client.is_network_down);
+                    assert_eq!(client.connection, None);
+                    assert_eq!(client.rate_limits, None);
+                }
+                other => panic!("Expected client error envelope, got {other:?}"),
+            }
+        }
+        _ => panic!("Expected System(ApiError) variant"),
+    }
+}
+
+// Both `error` and `api_error` subtypes deserialize into `SystemLogError`, so the Client envelope
+// must route correctly under subtype "error" too — not only under "api_error".
+#[test]
+fn test_parse_system_log_error_client_envelope() {
+    let json = serde_json::json!({
+        "type": "system",
+        "subtype": "error",
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "non-uuid-session-id",
+        "version": "2.1.158",
+        "gitBranch": "HEAD",
+        "level": "error",
+        "error": {
+            "message": "529 Overloaded",
+            "status": 529,
+            "requestId": "req_err_123",
+            "formatted": "529 Overloaded",
+            "connection": null,
+            "isNetworkDown": false,
+            "rateLimits": null
+        },
+        "retryInMs": 511.0,
+        "retryAttempt": 1,
+        "maxRetries": 10,
+        "timestamp": "2026-06-05T15:36:05.139Z",
+        "uuid": "550e8400-e29b-41d4-a716-446655440009"
+    });
+
+    match serde_json::from_value::<LogLine>(json).expect("Failed to parse error client envelope") {
+        LogLine::System(SystemLogLine::Error(error)) => match &error.error {
+            SystemErrorBody::Client(client) => {
+                assert_eq!(client.status, 529);
+                assert_eq!(client.request_id, "req_err_123");
+            }
+            other => panic!("Expected client error envelope, got {other:?}"),
+        },
+        _ => panic!("Expected System(Error) variant"),
+    }
+}
+
+// The 1-occurrence SDK shape carrying only `cause` must still resolve to the SDK variant; this
+// also guards that listing `Client` first does not swallow envelopes lacking its required fields.
+#[test]
+fn test_parse_system_log_api_error_cause_only_envelope() {
+    let json = serde_json::json!({
+        "type": "system",
+        "subtype": "api_error",
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "non-uuid-session-id",
+        "version": "2.1.158",
+        "gitBranch": "HEAD",
+        "level": "error",
+        "error": {"cause": {"code": "ECONNRESET"}},
+        "retryInMs": 511.0,
+        "retryAttempt": 1,
+        "maxRetries": 10,
+        "timestamp": "2026-06-05T15:36:05.139Z",
+        "uuid": "550e8400-e29b-41d4-a716-446655440009"
+    });
+
+    let line: LogLine = serde_json::from_value(json).expect("Failed to parse cause-only api_error");
+
+    match line {
+        LogLine::System(SystemLogLine::ApiError(error)) => match &error.error {
+            SystemErrorBody::Sdk(sdk) => {
+                assert!(sdk.cause.is_some());
+                assert_eq!(sdk.status, None);
+                assert_eq!(sdk.request_id, None);
+                assert_eq!(sdk.headers, None);
+            }
+            other => panic!("Expected SDK error envelope, got {other:?}"),
+        },
+        _ => panic!("Expected System(ApiError) variant"),
+    }
+}
+
+// `connection` / `rateLimits` have only ever been observed as null; any populated value is an
+// unmodeled shape that must fail to parse (surfacing as a partial failure) rather than be dropped.
+#[test]
+fn test_parse_system_log_api_error_populated_diagnostics_break() {
+    // Wrap a given `error` payload in an otherwise-valid system api_error line.
+    let line_with = |error_obj: serde_json::Value| {
+        serde_json::json!({
+            "type": "system",
+            "subtype": "api_error",
+            "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+            "isSidechain": false,
+            "userType": "external",
+            "cwd": "/test",
+            "sessionId": "non-uuid-session-id",
+            "version": "2.1.158",
+            "gitBranch": "HEAD",
+            "level": "error",
+            "error": error_obj,
+            "retryInMs": 511.0,
+            "retryAttempt": 1,
+            "maxRetries": 10,
+            "timestamp": "2026-06-05T15:36:05.139Z",
+            "uuid": "550e8400-e29b-41d4-a716-446655440009"
+        })
+    };
+    let base_error = serde_json::json!({
+        "message": "503 Service Unavailable",
+        "status": 503,
+        "requestId": "req_x",
+        "formatted": "503 Service Unavailable",
+        "connection": null,
+        "isNetworkDown": true,
+        "rateLimits": null
+    });
+
+    // The all-null baseline parses (and exercises `isNetworkDown: true`); the only difference in the
+    // failing cases below is the populated field, which proves that field is what breaks parsing.
+    match serde_json::from_value::<LogLine>(line_with(base_error.clone()))
+        .expect("baseline client envelope should parse")
+    {
+        LogLine::System(SystemLogLine::ApiError(error)) => match error.error {
+            SystemErrorBody::Client(client) => assert!(client.is_network_down),
+            other => panic!("Expected client error envelope, got {other:?}"),
+        },
+        _ => panic!("Expected System(ApiError) variant"),
+    }
+
+    // Any non-null value — object, string, or number — for an always-null field must break parsing.
+    for field in ["connection", "rateLimits"] {
+        for value in [
+            serde_json::json!({"unexpected": "shape"}),
+            serde_json::json!("oops"),
+            serde_json::json!(1),
+        ] {
+            let mut error = base_error.clone();
+            error[field] = value;
+            let err = serde_json::from_value::<LogLine>(line_with(error))
+                .expect_err(&format!("populated {field} parsed but should have failed"))
+                .to_string();
+            // The populated value matches neither envelope, so disambiguation of the untagged
+            // `SystemErrorBody` is what fails — not some unrelated field.
+            assert!(
+                err.contains("SystemErrorBody"),
+                "populated {field} should fail SystemErrorBody disambiguation, got: {err}"
+            );
+        }
     }
 }
 
