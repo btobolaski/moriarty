@@ -344,6 +344,7 @@ pub enum AttachmentData {
     AutoMode(AutoMode),
     AutoModeExit(AutoModeExit),
     CommandPermissions(CommandPermissions),
+    CompactFileReference(CompactFileReference),
     DateChange(DateChange),
     DeferredToolsDelta(DeferredToolsDelta),
     Directory(DirectoryAttachment),
@@ -381,6 +382,16 @@ pub struct AutoModeExit {}
 #[serde(deny_unknown_fields)]
 pub struct CommandPermissions {
     pub allowed_tools: Vec<String>,
+}
+
+/// File whose prior reference is carried across a compaction so the post-compaction context still
+/// knows it was seen. Added in Claude Code 2.1.158+.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct CompactFileReference {
+    pub filename: String,
+    pub display_path: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -871,12 +882,40 @@ pub struct SystemLogInformational {
     pub entrypoint: Option<String>,
 }
 
+/// `trigger` and `pre_tokens` are the only fields present before Claude Code 2.1.158; the rest
+/// arrived in 2.1.158 with the preserved-segment feature and stay `Option` so the older two-field
+/// records still parse.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct CompactMetadata {
     pub trigger: String,
     pub pre_tokens: usize,
+    pub post_tokens: Option<usize>,
+    pub duration_ms: Option<u64>,
+    pub pre_compact_discovered_tools: Option<Vec<String>>,
+    pub preserved_segment: Option<PreservedSegment>,
+    pub preserved_messages: Option<PreservedMessages>,
+}
+
+/// Added in Claude Code 2.1.158+.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct PreservedSegment {
+    pub head_uuid: Uuid,
+    pub anchor_uuid: Uuid,
+    pub tail_uuid: Uuid,
+}
+
+/// Added in Claude Code 2.1.158+.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct PreservedMessages {
+    pub anchor_uuid: Uuid,
+    pub uuids: Vec<Uuid>,
+    pub all_uuids: Vec<Uuid>,
 }
 
 define_boundary_log! {

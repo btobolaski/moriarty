@@ -187,8 +187,10 @@ fn render_command_review(
     );
 
     let mut content_lines: u16 = 15;
-    if current.is_script && current.script_contents.is_some() {
-        content_lines += current.script_contents.as_ref().unwrap().lines().count() as u16 + 3;
+    if current.is_script {
+        if let Some(contents) = &current.script_contents {
+            content_lines += contents.lines().count() as u16 + 3;
+        }
     }
 
     let mut content = format!(

@@ -2677,10 +2677,199 @@ fn test_parse_compact_boundary() {
             assert!(!boundary.is_meta);
             assert_eq!(boundary.compact_metadata.trigger, "manual");
             assert_eq!(boundary.compact_metadata.pre_tokens, 100000);
+            // Pre-2.1.158 logs omit the preserved-segment metadata entirely.
+            assert_eq!(boundary.compact_metadata.post_tokens, None);
+            assert_eq!(boundary.compact_metadata.duration_ms, None);
+            assert_eq!(boundary.compact_metadata.pre_compact_discovered_tools, None);
+            assert_eq!(boundary.compact_metadata.preserved_segment, None);
+            assert_eq!(boundary.compact_metadata.preserved_messages, None);
             assert_eq!(boundary.slug.as_deref(), Some("noble-floating-lemon"));
         }
         _ => panic!("Expected System(CompactBoundary) variant"),
     }
+}
+
+#[test]
+fn test_parse_compact_boundary_with_preserved_metadata() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "logicalParentUuid": "6315c98b-3b35-4963-b061-a33490298c1e",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "897f641d-35f9-4a70-8b47-f3c8f3d9e308",
+        "version": "2.1.158",
+        "gitBranch": "HEAD",
+        "slug": "synchronous-sparking-scone",
+        "type": "system",
+        "subtype": "compact_boundary",
+        "content": "Conversation compacted",
+        "isMeta": false,
+        "timestamp": "2026-06-05T07:38:03.902Z",
+        "uuid": "dbec8794-4cb6-421b-8952-7dd0ac346d4f",
+        "level": "info",
+        "compactMetadata": {
+            "trigger": "manual",
+            "preTokens": 808766,
+            "durationMs": 96146,
+            "preCompactDiscoveredTools": ["TaskCreate", "TaskList", "TaskUpdate", "WebFetch"],
+            "preservedSegment": {
+                "headUuid": "f6a42fbc-3b1e-4588-8ad8-97b38b2db1b0",
+                "anchorUuid": "a48a8d61-431a-4c7a-9aa7-c986f0683bfc",
+                "tailUuid": "6315c98b-3b35-4963-b061-a33490298c1e"
+            },
+            "preservedMessages": {
+                "anchorUuid": "a48a8d61-431a-4c7a-9aa7-c986f0683bfc",
+                "uuids": ["f6a42fbc-3b1e-4588-8ad8-97b38b2db1b0", "6315c98b-3b35-4963-b061-a33490298c1e"],
+                "allUuids": ["f6a42fbc-3b1e-4588-8ad8-97b38b2db1b0", "4333f766-0f94-4bac-8e2a-f04908a7cb23", "6315c98b-3b35-4963-b061-a33490298c1e"]
+            },
+            "postTokens": 8676
+        }
+    });
+
+    let line: LogLine = serde_json::from_value(json)
+        .expect("Failed to parse compact_boundary with preserved metadata");
+
+    match line {
+        LogLine::System(SystemLogLine::CompactBoundary(boundary)) => {
+            let meta = boundary.compact_metadata;
+            assert_eq!(meta.trigger, "manual");
+            assert_eq!(meta.pre_tokens, 808766);
+            assert_eq!(meta.post_tokens, Some(8676));
+            assert_eq!(meta.duration_ms, Some(96146));
+            assert_eq!(
+                meta.pre_compact_discovered_tools,
+                Some(vec![
+                    "TaskCreate".to_string(),
+                    "TaskList".to_string(),
+                    "TaskUpdate".to_string(),
+                    "WebFetch".to_string(),
+                ])
+            );
+
+            let segment = meta.preserved_segment.expect("preserved_segment present");
+            assert_eq!(
+                segment.head_uuid,
+                Uuid::parse_str("f6a42fbc-3b1e-4588-8ad8-97b38b2db1b0").unwrap()
+            );
+            assert_eq!(
+                segment.anchor_uuid,
+                Uuid::parse_str("a48a8d61-431a-4c7a-9aa7-c986f0683bfc").unwrap()
+            );
+            assert_eq!(
+                segment.tail_uuid,
+                Uuid::parse_str("6315c98b-3b35-4963-b061-a33490298c1e").unwrap()
+            );
+
+            let messages = meta.preserved_messages.expect("preserved_messages present");
+            assert_eq!(
+                messages.anchor_uuid,
+                Uuid::parse_str("a48a8d61-431a-4c7a-9aa7-c986f0683bfc").unwrap()
+            );
+            assert_eq!(
+                messages.uuids,
+                vec![
+                    Uuid::parse_str("f6a42fbc-3b1e-4588-8ad8-97b38b2db1b0").unwrap(),
+                    Uuid::parse_str("6315c98b-3b35-4963-b061-a33490298c1e").unwrap(),
+                ]
+            );
+            // allUuids is a distinct superset of uuids, so this catches a uuids/allUuids swap.
+            assert_eq!(
+                messages.all_uuids,
+                vec![
+                    Uuid::parse_str("f6a42fbc-3b1e-4588-8ad8-97b38b2db1b0").unwrap(),
+                    Uuid::parse_str("4333f766-0f94-4bac-8e2a-f04908a7cb23").unwrap(),
+                    Uuid::parse_str("6315c98b-3b35-4963-b061-a33490298c1e").unwrap(),
+                ]
+            );
+        }
+        _ => panic!("Expected System(CompactBoundary) variant"),
+    }
+}
+
+#[test]
+fn test_parse_compact_boundary_with_partial_preserved_metadata() {
+    // An intermediate log shape: some 2.1.158 fields present, others absent. Each new field is
+    // independently optional, so a partial mix must parse with the absent fields as None.
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "logicalParentUuid": "6315c98b-3b35-4963-b061-a33490298c1e",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "897f641d-35f9-4a70-8b47-f3c8f3d9e308",
+        "version": "2.1.158",
+        "gitBranch": "HEAD",
+        "slug": null,
+        "type": "system",
+        "subtype": "compact_boundary",
+        "content": "Conversation compacted",
+        "isMeta": false,
+        "timestamp": "2026-06-05T07:38:03.902Z",
+        "uuid": "dbec8794-4cb6-421b-8952-7dd0ac346d4f",
+        "level": "info",
+        "compactMetadata": {
+            "trigger": "auto",
+            "preTokens": 808766,
+            "postTokens": 8676,
+            "durationMs": 96146
+        }
+    });
+
+    let line: LogLine = serde_json::from_value(json)
+        .expect("Failed to parse compact_boundary with partial preserved metadata");
+
+    match line {
+        LogLine::System(SystemLogLine::CompactBoundary(boundary)) => {
+            let meta = boundary.compact_metadata;
+            assert_eq!(meta.trigger, "auto");
+            assert_eq!(meta.pre_tokens, 808766);
+            assert_eq!(meta.post_tokens, Some(8676));
+            assert_eq!(meta.duration_ms, Some(96146));
+            assert_eq!(meta.pre_compact_discovered_tools, None);
+            assert_eq!(meta.preserved_segment, None);
+            assert_eq!(meta.preserved_messages, None);
+        }
+        _ => panic!("Expected System(CompactBoundary) variant"),
+    }
+}
+
+#[test]
+fn test_parse_preserved_segment_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "headUuid": "f6a42fbc-3b1e-4588-8ad8-97b38b2db1b0",
+        "anchorUuid": "a48a8d61-431a-4c7a-9aa7-c986f0683bfc",
+        "tailUuid": "6315c98b-3b35-4963-b061-a33490298c1e",
+        "extraField": "should be rejected"
+    });
+
+    let err_msg = serde_json::from_value::<PreservedSegment>(json)
+        .expect_err("Should reject unknown fields in PreservedSegment")
+        .to_string();
+    assert!(
+        err_msg.contains("unknown field") || err_msg.contains("extraField"),
+        "Error should mention unknown field, got: {}",
+        err_msg
+    );
+}
+
+#[test]
+fn test_parse_preserved_messages_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "anchorUuid": "a48a8d61-431a-4c7a-9aa7-c986f0683bfc",
+        "uuids": [],
+        "allUuids": [],
+        "extraField": "should be rejected"
+    });
+
+    let err_msg = serde_json::from_value::<PreservedMessages>(json)
+        .expect_err("Should reject unknown fields in PreservedMessages")
+        .to_string();
+    assert!(
+        err_msg.contains("unknown field") || err_msg.contains("extraField"),
+        "Error should mention unknown field, got: {}",
+        err_msg
+    );
 }
 
 #[test]
@@ -4801,6 +4990,61 @@ fn test_parse_attachment_directory() {
         },
         other => panic!("Expected Attachment, got {:?}", other),
     }
+}
+
+#[test]
+fn test_parse_attachment_compact_file_reference() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": "e394396c-27d0-4c3b-aabc-4e914bc70b1f",
+        "isSidechain": false,
+        "attachment": {
+            "type": "compact_file_reference",
+            "filename": "/Users/brendan/src/moriarty/crates/moriarty/src/hooks/tests.rs",
+            "displayPath": "crates/moriarty/src/hooks/tests.rs"
+        },
+        "uuid": "f441b451-1f8a-43cf-a0bc-69a5cc70b228",
+        "timestamp": "2026-06-05T07:38:04.385Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/Users/brendan/src/moriarty",
+        "sessionId": "897f641d-35f9-4a70-8b47-f3c8f3d9e308",
+        "version": "2.1.158",
+        "gitBranch": "HEAD",
+        "slug": "synchronous-sparking-scone"
+    });
+    let log_line: LogLine = serde_json::from_value(json).unwrap();
+    match log_line {
+        LogLine::Attachment(att) => match att.attachment {
+            AttachmentData::CompactFileReference(file_ref) => {
+                assert_eq!(
+                    file_ref.filename,
+                    "/Users/brendan/src/moriarty/crates/moriarty/src/hooks/tests.rs"
+                );
+                assert_eq!(file_ref.display_path, "crates/moriarty/src/hooks/tests.rs");
+            }
+            other => panic!("Expected CompactFileReference attachment, got {:?}", other),
+        },
+        other => panic!("Expected Attachment, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_attachment_compact_file_reference_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "type": "compact_file_reference",
+        "filename": "/Users/brendan/src/moriarty/src/main.rs",
+        "displayPath": "src/main.rs",
+        "extraField": "should be rejected"
+    });
+    let err_msg = serde_json::from_value::<AttachmentData>(json)
+        .expect_err("Should reject unknown fields in CompactFileReference")
+        .to_string();
+    assert!(
+        err_msg.contains("unknown field") || err_msg.contains("extraField"),
+        "Error should mention unknown field, got: {}",
+        err_msg
+    );
 }
 
 #[test]

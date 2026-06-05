@@ -97,7 +97,7 @@ impl ModelMetricsMap {
     /// actually observed in the logs instead of a fixed family list.
     pub fn model_metrics(&self) -> Vec<(String, MetricComponents)> {
         let mut entries: Vec<(&Model, &MetricComponents)> = self.metrics.iter().collect();
-        entries.sort_by(|left, right| model_sort_key(left.0).cmp(&model_sort_key(right.0)));
+        entries.sort_by_key(|left| model_sort_key(left.0));
         entries
             .into_iter()
             .map(|(model, metrics)| (model.to_string(), *metrics))
