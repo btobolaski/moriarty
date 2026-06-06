@@ -358,6 +358,7 @@ pub enum AttachmentData {
     HookSystemMessage(HookSystemMessage),
     McpInstructionsDelta(McpInstructionsDelta),
     NestedMemory(NestedMemory),
+    PlanFileReference(PlanFileReference),
     PlanMode(PlanModeAttachment),
     PlanModeExit(PlanModeExitAttachment),
     PlanModeReentry(PlanModeReentryAttachment),
@@ -583,6 +584,16 @@ pub struct NestedMemoryContent {
     // type does not enforce that pairing — it is an upstream protocol invariant.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_content: Option<String>,
+}
+
+/// Plan file surfaced into the conversation with its full text inlined in `plan_content`; the
+/// `plan_mode*` reminders identify their plan only by path. Added in Claude Code 2.1.158+.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct PlanFileReference {
+    pub plan_file_path: String,
+    pub plan_content: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]

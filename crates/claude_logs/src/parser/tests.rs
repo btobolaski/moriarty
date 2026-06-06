@@ -5327,6 +5327,95 @@ fn test_parse_attachment_compact_file_reference_rejects_unknown_fields() {
 }
 
 #[test]
+fn test_parse_attachment_plan_file_reference() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": "7db8acac-5341-4868-9486-59ec84f98fca",
+        "isSidechain": false,
+        "attachment": {
+            "type": "plan_file_reference",
+            "planFilePath": "/Users/test/.claude/plans/example-plan.md",
+            "planContent": "# Plan: Example feature\n\n## Context\n\nDo the thing.\n"
+        },
+        "uuid": "00225ffb-fbfa-4a32-82c9-4a9bfed9e6f3",
+        "timestamp": "2026-06-05T00:30:01.611Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/Users/test/src/example",
+        "sessionId": "45cb4ea8-fbef-4605-9e26-fcbfa729a305",
+        "version": "2.1.158",
+        "gitBranch": "HEAD",
+        "slug": "example-plan"
+    });
+    let log_line: LogLine = serde_json::from_value(json).unwrap();
+    match log_line {
+        LogLine::Attachment(att) => match att.attachment {
+            AttachmentData::PlanFileReference(plan_ref) => {
+                assert_eq!(
+                    plan_ref.plan_file_path,
+                    "/Users/test/.claude/plans/example-plan.md"
+                );
+                assert_eq!(
+                    plan_ref.plan_content,
+                    "# Plan: Example feature\n\n## Context\n\nDo the thing.\n"
+                );
+            }
+            other => panic!("Expected PlanFileReference attachment, got {:?}", other),
+        },
+        other => panic!("Expected Attachment, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_attachment_plan_file_reference_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "type": "plan_file_reference",
+        "planFilePath": "/Users/test/.claude/plans/example.md",
+        "planContent": "# Plan\n",
+        "extraField": "should be rejected"
+    });
+    let err_msg = serde_json::from_value::<AttachmentData>(json)
+        .expect_err("Should reject unknown fields in PlanFileReference")
+        .to_string();
+    assert!(
+        err_msg.contains("unknown field"),
+        "Error should mention unknown field, got: {}",
+        err_msg
+    );
+}
+
+// Both fields are required (no `Option`/`#[serde(default)]`); this guards against either silently
+// becoming optional, which would let underspecified attachments parse and drop their content.
+#[test]
+fn test_parse_attachment_plan_file_reference_rejects_missing_required_fields() {
+    let missing_content = serde_json::json!({
+        "type": "plan_file_reference",
+        "planFilePath": "/Users/test/.claude/plans/example.md"
+    });
+    let err_msg = serde_json::from_value::<AttachmentData>(missing_content)
+        .expect_err("Should reject PlanFileReference missing planContent")
+        .to_string();
+    assert!(
+        err_msg.contains("missing field") && err_msg.contains("planContent"),
+        "Error should name the missing planContent field, got: {}",
+        err_msg
+    );
+
+    let missing_path = serde_json::json!({
+        "type": "plan_file_reference",
+        "planContent": "# Plan\n"
+    });
+    let err_msg = serde_json::from_value::<AttachmentData>(missing_path)
+        .expect_err("Should reject PlanFileReference missing planFilePath")
+        .to_string();
+    assert!(
+        err_msg.contains("missing field") && err_msg.contains("planFilePath"),
+        "Error should name the missing planFilePath field, got: {}",
+        err_msg
+    );
+}
+
+#[test]
 fn test_parse_attachment_skill_listing_with_names() {
     let json = serde_json::json!({
         "type": "attachment",
