@@ -670,11 +670,30 @@ fn model_change_with_openrouter() {
 }
 
 #[test]
+fn model_change_with_openai_codex() {
+    let line = parse(model_change_json(
+        Some("session-root"),
+        "openai-codex",
+        "gpt-5.5",
+    ));
+
+    match line {
+        PiLogLine::ModelChange(model_change) => {
+            assert_eq!(model_change.parent_id.as_deref(), Some("session-root"));
+            assert_eq!(model_change.provider, Provider::OpenAiCodex);
+            assert_eq!(model_change.model_id, "gpt-5.5");
+        }
+        other => panic!("expected ModelChange, got {other:?}"),
+    }
+}
+
+#[test]
 fn provider_order_is_stable() {
     // `cost_analyzer::logs::PiModel` derives `Ord`, so reordering `Provider` variants would
     // silently change model ordering and any APIs that rely on that derived sort behavior.
     assert!(Provider::Anthropic < Provider::OpenAi);
-    assert!(Provider::OpenAi < Provider::OpenRouter);
+    assert!(Provider::OpenAi < Provider::OpenAiCodex);
+    assert!(Provider::OpenAiCodex < Provider::OpenRouter);
     assert!(Provider::OpenRouter < Provider::Faux);
 }
 
@@ -1048,11 +1067,27 @@ fn assistant_message_without_response_model_defaults_to_none() {
 }
 
 #[test]
+fn assistant_message_accepts_openai_codex_responses_api() {
+    let assistant = parse_assistant_message(
+        vec![json!({"type": "text", "text": "ok"})],
+        AssistantFixture::new("openai-codex-responses", "openai-codex", "gpt-5.5", "toolUse"),
+    );
+
+    assert_eq!(
+        assistant.api,
+        AssistantApi::Known(ApiKind::OpenAiCodexResponses)
+    );
+    assert_eq!(assistant.provider, Provider::OpenAiCodex);
+    assert_eq!(assistant.model, "gpt-5.5");
+}
+
+#[test]
 fn assistant_api_known_values_parse_as_known_variants() {
     let cases = [
         ("anthropic-messages", ApiKind::AnthropicMessages),
-        ("openai-responses", ApiKind::OpenAiResponses),
+        ("openai-codex-responses", ApiKind::OpenAiCodexResponses),
         ("openai-completions", ApiKind::OpenAiCompletions),
+        ("openai-responses", ApiKind::OpenAiResponses),
     ];
 
     for (api, expected) in cases {
@@ -1182,8 +1217,9 @@ fn edit_details_patch_absent_by_default() {
 fn assistant_api_round_trips_known_variants() {
     let cases = [
         ("anthropic-messages", ApiKind::AnthropicMessages),
-        ("openai-responses", ApiKind::OpenAiResponses),
+        ("openai-codex-responses", ApiKind::OpenAiCodexResponses),
         ("openai-completions", ApiKind::OpenAiCompletions),
+        ("openai-responses", ApiKind::OpenAiResponses),
     ];
     for (expected_str, kind) in cases {
         let api = AssistantApi::Known(kind);

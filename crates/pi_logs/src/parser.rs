@@ -551,6 +551,8 @@ pub enum Provider {
     Anthropic,
     #[serde(rename = "openai")]
     OpenAi,
+    #[serde(rename = "openai-codex")]
+    OpenAiCodex,
     #[serde(rename = "openrouter")]
     OpenRouter,
     #[serde(rename = "faux")]
@@ -597,8 +599,9 @@ impl<'de> Deserialize<'de> for AssistantApi {
         let s = String::deserialize(d)?;
         match s.as_str() {
             "anthropic-messages" => return Ok(AssistantApi::Known(ApiKind::AnthropicMessages)),
-            "openai-responses" => return Ok(AssistantApi::Known(ApiKind::OpenAiResponses)),
+            "openai-codex-responses" => return Ok(AssistantApi::Known(ApiKind::OpenAiCodexResponses)),
             "openai-completions" => return Ok(AssistantApi::Known(ApiKind::OpenAiCompletions)),
+            "openai-responses" => return Ok(AssistantApi::Known(ApiKind::OpenAiResponses)),
             _ if s.starts_with("faux:") => return Ok(AssistantApi::Faux(s)),
             _ => {}
         }
@@ -606,8 +609,9 @@ impl<'de> Deserialize<'de> for AssistantApi {
             &s,
             &[
                 "anthropic-messages",
-                "openai-responses",
+                "openai-codex-responses",
                 "openai-completions",
+                "openai-responses",
                 "faux:*",
             ],
         ))
@@ -618,10 +622,12 @@ impl<'de> Deserialize<'de> for AssistantApi {
 #[serde(rename_all = "kebab-case")]
 pub enum ApiKind {
     AnthropicMessages,
-    #[serde(rename = "openai-responses")]
-    OpenAiResponses,
+    #[serde(rename = "openai-codex-responses")]
+    OpenAiCodexResponses,
     #[serde(rename = "openai-completions")]
     OpenAiCompletions,
+    #[serde(rename = "openai-responses")]
+    OpenAiResponses,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
