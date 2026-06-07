@@ -260,7 +260,7 @@ fn tool_result_message_json(
 fn bash_execution_message_json(
     command: &str,
     output: &str,
-    exit_code: i32,
+    exit_code: Option<i32>,
     cancelled: bool,
     truncated: bool,
     exclude_from_context: bool,
@@ -270,13 +270,17 @@ fn bash_execution_message_json(
         "role": "bashExecution",
         "command": command,
         "output": output,
-        "exitCode": exit_code,
         "cancelled": cancelled,
         "truncated": truncated,
         "timestamp": MESSAGE_TIMESTAMP,
         "excludeFromContext": exclude_from_context,
     });
 
+    insert_optional_field(
+        &mut message,
+        "exitCode",
+        exit_code.map(|c| json!(c)),
+    );
     insert_optional_field(
         &mut message,
         "fullOutputPath",
@@ -914,7 +918,7 @@ fn bash_execution_message() {
     let bash_execution = parse_bash_execution_message(bash_execution_message_json(
         "cargo run --bin parse_pi_sessions",
         "parsed 595 line(s) across 87 file(s)",
-        1,
+        Some(1),
         false,
         true,
         false,
@@ -926,7 +930,7 @@ fn bash_execution_message() {
         bash_execution.output,
         "parsed 595 line(s) across 87 file(s)"
     );
-    assert_eq!(bash_execution.exit_code, 1);
+    assert_eq!(bash_execution.exit_code, Some(1));
     assert!(!bash_execution.cancelled);
     assert!(bash_execution.truncated);
     assert!(!bash_execution.exclude_from_context);
@@ -934,6 +938,27 @@ fn bash_execution_message() {
         bash_execution.full_output_path,
         Some(PathBuf::from("/tmp/pi-bash.log"))
     );
+}
+
+#[test]
+fn bash_execution_message_accepts_missing_exit_code_for_cancelled_command() {
+    let bash_execution = parse_bash_execution_message(bash_execution_message_json(
+        "sleep 60",
+        "Command cancelled",
+        None,
+        true,
+        false,
+        false,
+        None,
+    ));
+
+    assert_eq!(bash_execution.command, "sleep 60");
+    assert_eq!(bash_execution.output, "Command cancelled");
+    assert_eq!(bash_execution.exit_code, None);
+    assert!(bash_execution.cancelled);
+    assert!(!bash_execution.truncated);
+    assert!(!bash_execution.exclude_from_context);
+    assert_eq!(bash_execution.full_output_path, None);
 }
 
 #[test]

@@ -426,7 +426,9 @@ impl<'de> Deserialize<'de> for ToolResultMessage {
 pub struct BashExecutionMessage {
     pub command: String,
     pub output: String,
-    pub exit_code: i32,
+    /// `None` when the command was cancelled or interrupted before producing an exit code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
     pub cancelled: bool,
     pub truncated: bool,
     pub timestamp: i64,
