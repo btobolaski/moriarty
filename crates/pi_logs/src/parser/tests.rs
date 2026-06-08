@@ -5571,6 +5571,7 @@ fn subagent_result_summary_serializes_control_events_as_camel_case() {
                 elapsed_ms: 97198,
             },
         )]),
+        acceptance: None,
     })
     .expect("serialize subagent result summary");
 
@@ -5586,6 +5587,7 @@ fn subagent_result_summary_serializes_control_events_as_camel_case() {
         Some(&Value::from("charts/temporal/values.yaml"))
     );
     assert!(value.get("control_events").is_none());
+    assert!(value.get("acceptance").is_none());
 }
 
 /// Pins strict rejection of extra fields on `SubagentControlEventPayload`.
@@ -5759,4 +5761,256 @@ fn custom_plannotator_accepts_unknown_active_tool_name() {
         }
         other => panic!("expected Plannotator, got {other:?}"),
     }
+}
+
+// --- Acceptance ledger tests ---
+
+#[test]
+fn subagent_tool_result_parse_acceptance_ledger() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "subagent",
+        vec![json!({"type": "text", "text": "accepted"})],
+        false,
+        Some(json!({
+            "mode": "parallel",
+            "results": [{
+                "agent": "code-quality-reviewer",
+                "acceptance": {
+                    "status": "accepted",
+                    "explicit": true,
+                    "effectiveAcceptance": {
+                        "level": "strict",
+                        "explicit": true,
+                        "inferredReason": [],
+                        "criteria": [{
+                            "id": "tests",
+                            "must": "Tests cover the new behavior",
+                            "evidence": ["cargo nextest run"],
+                            "severity": "high"
+                        }],
+                        "evidence": ["tests"],
+                        "verify": [{
+                            "id": "nextest",
+                            "command": "cargo nextest run",
+                            "timeoutMs": 120000,
+                            "cwd": ".",
+                            "env": {"RUST_BACKTRACE": "1"},
+                            "allowFailure": false
+                        }],
+                        "review": {
+                            "agent": "test-quality-reviewer",
+                            "focus": "tests",
+                            "required": true
+                        },
+                        "stopRules": ["no critical"],
+                        "finalization": {
+                            "mode": "self-review-loop",
+                            "maxTurns": 3
+                        }
+                    },
+                    "inferredReason": [],
+                    "criteria": [{
+                        "id": "tests",
+                        "must": "Tests cover the new behavior",
+                        "evidence": ["cargo nextest run"],
+                        "severity": "high"
+                    }],
+                    "childReport": {
+                        "criteriaSatisfied": [{
+                            "id": "tests",
+                            "status": "satisfied",
+                            "evidence": "passed"
+                        }],
+                        "changedFiles": ["crates/pi_logs/src/parser.rs"],
+                        "commandsRun": [{
+                            "command": "cargo nextest run",
+                            "result": "passed",
+                            "summary": "ok"
+                        }]
+                    },
+                    "runtimeChecks": [{
+                        "id": "criteria",
+                        "status": "passed",
+                        "message": "all criteria satisfied"
+                    }],
+                    "verifyRuns": [{
+                        "id": "nextest",
+                        "command": "cargo nextest run",
+                        "cwd": ".",
+                        "exitCode": 0,
+                        "status": "passed",
+                        "stdout": "ok",
+                        "durationMs": 1234
+                    }],
+                    "reviewResult": {
+                        "status": "no-blockers",
+                        "findings": [{
+                            "severity": "non-blocking",
+                            "file": "tests.rs",
+                            "issue": "minor",
+                            "rationale": "covered"
+                        }]
+                    },
+                    "finalization": {
+                        "mode": "self-review-loop",
+                        "status": "completed",
+                        "maxTurns": 1,
+                        "turns": [{
+                            "turn": 1,
+                            "prompt": "review and fix",
+                            "status": "accepted",
+                            "report": {
+                                "criteriaSatisfied": [{
+                                    "id": "tests",
+                                    "status": "satisfied",
+                                    "evidence": "ok"
+                                }],
+                                "changedFiles": [],
+                                "commandsRun": [],
+                                "manualNotes": "done"
+                            },
+                            "runtimeChecks": [],
+                            "verifyRuns": []
+                        }]
+                    },
+                    "parentDecision": {
+                        "status": "accepted",
+                        "at": "2026-06-07T00:00:00Z",
+                        "reason": "all checks passed"
+                    }
+                }
+            }]
+        })),
+    ));
+
+    let Some(ToolResultDetails::Subagent(details)) = tool_result.details else {
+        panic!("expected Subagent details")
+    };
+
+    let acceptance = details.results[0]
+        .acceptance
+        .as_ref()
+        .expect("expected acceptance ledger");
+
+    assert_eq!(acceptance.status, "accepted");
+    assert!(acceptance.explicit);
+    assert_eq!(acceptance.effective_acceptance.level, "strict");
+    assert_eq!(acceptance.criteria[0].id, "tests");
+    assert_eq!(acceptance.runtime_checks[0].status, "passed");
+    assert_eq!(acceptance.verify_runs[0].cwd, Some(PathBuf::from(".")));
+    assert_eq!(acceptance.verify_runs[0].duration_ms, 1234);
+    assert_eq!(
+        acceptance.parent_decision.as_ref().unwrap().status,
+        "accepted"
+    );
+
+    let ea = &acceptance.effective_acceptance;
+    assert_eq!(ea.verify[0].id, "nextest");
+    assert_eq!(ea.verify[0].cwd, Some(PathBuf::from(".")));
+    assert_eq!(
+        ea.verify[0].env.as_ref().unwrap().get("RUST_BACKTRACE").unwrap(),
+        "1"
+    );
+    assert_eq!(ea.review.as_ref().unwrap().agent.as_deref(), Some("test-quality-reviewer"));
+    assert_eq!(ea.finalization.mode, "self-review-loop");
+    assert_eq!(ea.finalization.max_turns, 3);
+
+    let report = acceptance.child_report.as_ref().unwrap();
+    assert_eq!(report.criteria_satisfied.as_ref().unwrap()[0].status, "satisfied");
+    assert_eq!(
+        report.changed_files.as_deref(),
+        Some(&["crates/pi_logs/src/parser.rs".to_string()][..])
+    );
+
+    let review = acceptance.review_result.as_ref().unwrap();
+    assert_eq!(review.status, "no-blockers");
+    assert_eq!(review.findings[0].severity, "non-blocking");
+
+    let fin = acceptance.finalization.as_ref().unwrap();
+    assert_eq!(fin.status, "completed");
+    assert_eq!(fin.turns.len(), 1);
+    assert_eq!(fin.turns[0].turn, 1);
+    assert_eq!(fin.turns[0].status, "accepted");
+}
+
+#[test]
+fn subagent_tool_result_rejects_unknown_acceptance_field() {
+    assert_parse_error_contains_any(
+        "rejects unknown acceptance ledger field",
+        tool_result_message_json(
+            "subagent",
+            vec![json!({"type": "text", "text": "test"})],
+            false,
+            Some(json!({
+                "mode": "parallel",
+                "results": [{
+                    "agent": "code-quality-reviewer",
+                    "acceptance": {
+                        "status": "not-required",
+                        "explicit": false,
+                        "effectiveAcceptance": {
+                            "level": "none",
+                            "explicit": false,
+                            "inferredReason": [],
+                            "criteria": [],
+                            "evidence": [],
+                            "verify": [],
+                            "stopRules": [],
+                            "finalization": {
+                                "mode": "none",
+                                "maxTurns": 0
+                            }
+                        },
+                        "inferredReason": [],
+                        "criteria": [],
+                        "runtimeChecks": [],
+                        "verifyRuns": [],
+                        "unexpected": true
+                    }
+                }]
+            })),
+        ),
+        &["unknown field `unexpected`"],
+    );
+}
+
+#[test]
+fn subagent_tool_result_rejects_unknown_nested_acceptance_field() {
+    assert_parse_error_contains_any(
+        "rejects unknown nested acceptance field",
+        tool_result_message_json(
+            "subagent",
+            vec![json!({"type": "text", "text": "test"})],
+            false,
+            Some(json!({
+                "mode": "parallel",
+                "results": [{
+                    "agent": "code-quality-reviewer",
+                    "acceptance": {
+                        "status": "not-required",
+                        "explicit": false,
+                        "effectiveAcceptance": {
+                            "level": "none",
+                            "explicit": false,
+                            "inferredReason": [],
+                            "criteria": [],
+                            "evidence": [],
+                            "verify": [],
+                            "stopRules": [],
+                            "finalization": {
+                                "mode": "none",
+                                "maxTurns": 0
+                            },
+                            "unexpected": true
+                        },
+                        "inferredReason": [],
+                        "criteria": [],
+                        "runtimeChecks": [],
+                        "verifyRuns": []
+                    }
+                }]
+            })),
+        ),
+        &["unknown field `unexpected`"],
+    );
 }

@@ -1795,6 +1795,215 @@ pub struct SubagentProgressEntry {
     pub recent_output: Vec<String>,
 }
 
+// --- Acceptance ledger types ---
+
+/// Status values are free-form strings rather than a Rust enum because pi may
+/// add new statuses in future releases.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AcceptanceLedger {
+    pub status: String,
+    pub explicit: bool,
+    pub effective_acceptance: ResolvedAcceptanceConfig,
+    pub inferred_reason: Vec<String>,
+    pub criteria: Vec<ResolvedAcceptanceGate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_report: Option<AcceptanceReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_report_parse_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_child_report: Option<AcceptanceReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_child_report_parse_error: Option<String>,
+    pub runtime_checks: Vec<AcceptanceRuntimeCheck>,
+    pub verify_runs: Vec<AcceptanceVerifyResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_result: Option<AcceptanceReviewResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finalization: Option<AcceptanceFinalizationLedger>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_decision: Option<AcceptanceParentDecision>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResolvedAcceptanceConfig {
+    pub level: String,
+    pub explicit: bool,
+    pub inferred_reason: Vec<String>,
+    pub criteria: Vec<ResolvedAcceptanceGate>,
+    pub evidence: Vec<String>,
+    pub verify: Vec<AcceptanceVerifyCommand>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<AcceptanceReviewGate>,
+    pub stop_rules: Vec<String>,
+    pub finalization: AcceptanceFinalizationConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AcceptanceFinalizationConfig {
+    pub mode: String,
+    pub max_turns: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResolvedAcceptanceGate {
+    pub id: String,
+    pub must: String,
+    pub evidence: Vec<String>,
+    pub severity: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AcceptanceVerifyCommand {
+    pub id: String,
+    pub command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_failure: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AcceptanceReviewGate {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AcceptanceReport {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub criteria_satisfied: Option<Vec<AcceptanceCriterionResult>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changed_files: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tests_added_or_updated: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commands_run: Option<Vec<AcceptanceCommandResult>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation_output: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub residual_risks: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_staged_files: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_findings: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manual_notes: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AcceptanceCriterionResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub status: String,
+    pub evidence: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AcceptanceCommandResult {
+    pub command: String,
+    pub result: String,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AcceptanceRuntimeCheck {
+    pub id: String,
+    pub status: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AcceptanceVerifyResult {
+    pub id: String,
+    pub command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdout: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr: Option<String>,
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AcceptanceReviewResult {
+    pub status: String,
+    pub findings: Vec<AcceptanceFinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AcceptanceFinding {
+    pub severity: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    pub issue: String,
+    pub rationale: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AcceptanceFinalizationLedger {
+    pub mode: String,
+    pub status: String,
+    pub max_turns: u32,
+    pub turns: Vec<AcceptanceFinalizationTurn>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AcceptanceFinalizationTurn {
+    pub turn: u32,
+    pub prompt: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_output: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report: Option<AcceptanceReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parse_error: Option<String>,
+    pub runtime_checks: Vec<AcceptanceRuntimeCheck>,
+    pub verify_runs: Vec<AcceptanceVerifyResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AcceptanceParentDecision {
+    pub status: String,
+    pub at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SubagentResultSummary {
@@ -1838,6 +2047,12 @@ pub struct SubagentResultSummary {
     /// with the per-result usage and timing summary above.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_events: Option<Vec<SubagentControlEvent>>,
+    /// When a subagent runs with an explicit acceptance contract, the runtime
+    /// records the acceptance ledger including criteria status, runtime checks,
+    /// verify runs, and optional finalization turns. Absent when acceptance was
+    /// not configured for the run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acceptance: Option<AcceptanceLedger>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
