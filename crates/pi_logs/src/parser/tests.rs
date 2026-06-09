@@ -276,11 +276,7 @@ fn bash_execution_message_json(
         "excludeFromContext": exclude_from_context,
     });
 
-    insert_optional_field(
-        &mut message,
-        "exitCode",
-        exit_code.map(|c| json!(c)),
-    );
+    insert_optional_field(&mut message, "exitCode", exit_code.map(|c| json!(c)));
     insert_optional_field(
         &mut message,
         "fullOutputPath",
@@ -1095,7 +1091,12 @@ fn assistant_message_without_response_model_defaults_to_none() {
 fn assistant_message_accepts_openai_codex_responses_api() {
     let assistant = parse_assistant_message(
         vec![json!({"type": "text", "text": "ok"})],
-        AssistantFixture::new("openai-codex-responses", "openai-codex", "gpt-5.5", "toolUse"),
+        AssistantFixture::new(
+            "openai-codex-responses",
+            "openai-codex",
+            "gpt-5.5",
+            "toolUse",
+        ),
     );
 
     assert_eq!(
@@ -1337,6 +1338,112 @@ fn assistant_error_stop_reason_with_error_message() {
     assert_eq!(assistant.stop_reason, AssistantStopReason::Error);
     assert_eq!(assistant.response_id.as_deref(), Some("resp_1"));
     assert_eq!(assistant.error_message.as_deref(), Some("quota exceeded"));
+}
+
+#[test]
+fn assistant_message_parses_provider_diagnostics() {
+    let mut line = assistant_message_json(
+        vec![json!({"type": "thinking", "thinking": "..."})],
+        AssistantFixture::new("openai-codex-responses", "openai-codex", "gpt-5.5", "error")
+            .with_response_id("resp_1")
+            .with_error_message("WebSocket error"),
+    );
+
+    line["message"]["diagnostics"] = json!([{
+        "type": "provider_transport_failure",
+        "timestamp": 1780972201664_i64,
+        "error": {
+            "name": "Error",
+            "message": "WebSocket error",
+            "stack": "Error: WebSocket error\n    at foo"
+        },
+        "details": {
+            "configuredTransport": "auto",
+            "eventsEmitted": true,
+            "phase": "after_message_stream_start",
+            "requestBytes": 383050
+        }
+    }]);
+
+    let PiLogLine::Message(message) = parse(line) else {
+        panic!("expected message line");
+    };
+    let RoleMessage::Assistant(assistant) = message.message else {
+        panic!("expected assistant message");
+    };
+
+    assert_eq!(assistant.stop_reason, AssistantStopReason::Error);
+    assert_eq!(assistant.error_message.as_deref(), Some("WebSocket error"));
+    assert_eq!(assistant.diagnostics.len(), 1);
+    let d = &assistant.diagnostics[0];
+    assert_eq!(d.kind, "provider_transport_failure");
+    assert_eq!(d.timestamp, 1780972201664_i64);
+    assert_eq!(d.error.name, "Error");
+    assert_eq!(d.error.message, "WebSocket error");
+    assert!(d.error.stack.contains("Error: WebSocket error"));
+    assert_eq!(
+        d.details.0,
+        json!({
+            "configuredTransport": "auto",
+            "eventsEmitted": true,
+            "phase": "after_message_stream_start",
+            "requestBytes": 383050
+        })
+    );
+}
+
+#[test]
+fn assistant_message_defaults_diagnostics_to_empty() {
+    let assistant = parse_assistant_message(
+        vec![json!({"type": "text", "text": "done"})],
+        AssistantFixture::new("openai-responses", "openai", "gpt-5.4", "stop"),
+    );
+
+    assert!(assistant.diagnostics.is_empty());
+}
+
+#[test]
+fn diagnostic_item_rejects_unknown_field() {
+    let mut line = assistant_message_json(
+        Vec::new(),
+        AssistantFixture::new("openai-codex-responses", "openai-codex", "gpt-5.5", "error"),
+    );
+
+    line["message"]["diagnostics"] = json!([{
+        "type": "provider_transport_failure",
+        "timestamp": 1,
+        "error": {
+            "name": "Error",
+            "message": "boom",
+            "stack": "trace"
+        },
+        "details": {},
+        "bogus": true
+    }]);
+
+    assert_parse_error_contains_any("rejects unknown diagnostic field", line, &["bogus"]);
+}
+
+#[test]
+fn diagnostic_error_rejects_unknown_field() {
+    let mut line = assistant_message_json(
+        Vec::new(),
+        AssistantFixture::new("openai-codex-responses", "openai-codex", "gpt-5.5", "error"),
+    );
+
+    line["message"]["diagnostics"] = json!([{
+        "type": "provider_transport_failure",
+        "timestamp": 1,
+        "error": {
+            "name": "Error",
+            "message": "boom",
+            "stack": "trace",
+            "bogus": "nope"
+        },
+        "details": {}
+    }]);
+
+    assert_parse_error_contains_any("rejects unknown diagnostic error field", line, &["bogus"]);
 }
 
 #[test]
@@ -5908,15 +6015,26 @@ fn subagent_tool_result_parse_acceptance_ledger() {
     assert_eq!(ea.verify[0].id, "nextest");
     assert_eq!(ea.verify[0].cwd, Some(PathBuf::from(".")));
     assert_eq!(
-        ea.verify[0].env.as_ref().unwrap().get("RUST_BACKTRACE").unwrap(),
+        ea.verify[0]
+            .env
+            .as_ref()
+            .unwrap()
+            .get("RUST_BACKTRACE")
+            .unwrap(),
         "1"
     );
-    assert_eq!(ea.review.as_ref().unwrap().agent.as_deref(), Some("test-quality-reviewer"));
+    assert_eq!(
+        ea.review.as_ref().unwrap().agent.as_deref(),
+        Some("test-quality-reviewer")
+    );
     assert_eq!(ea.finalization.mode, "self-review-loop");
     assert_eq!(ea.finalization.max_turns, 3);
 
     let report = acceptance.child_report.as_ref().unwrap();
-    assert_eq!(report.criteria_satisfied.as_ref().unwrap()[0].status, "satisfied");
+    assert_eq!(
+        report.criteria_satisfied.as_ref().unwrap()[0].status,
+        "satisfied"
+    );
     assert_eq!(
         report.changed_files.as_deref(),
         Some(&["crates/pi_logs/src/parser.rs".to_string()][..])

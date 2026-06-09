@@ -342,6 +342,32 @@ pub struct AssistantMessage {
     pub response_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+    /// Provider diagnostics attached when the assistant turn fails due to
+    /// a transport error, rate limit, or similar provider-side issue.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<DiagnosticItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DiagnosticItem {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub timestamp: i64,
+    pub error: DiagnosticError,
+    /// Provider-specific diagnostic payload whose shape varies by the
+    /// diagnostic `type`:
+    /// * `provider_transport_failure` — `{configuredTransport, eventsEmitted, phase, requestBytes}`
+    pub details: JsonBlob,
+}
+
+/// Standard JavaScript Error shape embedded in provider diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DiagnosticError {
+    pub name: String,
+    pub message: String,
+    pub stack: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -601,7 +627,9 @@ impl<'de> Deserialize<'de> for AssistantApi {
         let s = String::deserialize(d)?;
         match s.as_str() {
             "anthropic-messages" => return Ok(AssistantApi::Known(ApiKind::AnthropicMessages)),
-            "openai-codex-responses" => return Ok(AssistantApi::Known(ApiKind::OpenAiCodexResponses)),
+            "openai-codex-responses" => {
+                return Ok(AssistantApi::Known(ApiKind::OpenAiCodexResponses))
+            }
             "openai-completions" => return Ok(AssistantApi::Known(ApiKind::OpenAiCompletions)),
             "openai-responses" => return Ok(AssistantApi::Known(ApiKind::OpenAiResponses)),
             _ if s.starts_with("faux:") => return Ok(AssistantApi::Faux(s)),
