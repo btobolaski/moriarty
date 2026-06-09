@@ -1,5 +1,5 @@
 {
-  description = "Build a cargo workspace";
+  description = "moriarty - Claude Code and pi log analysis CLI";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
@@ -7,6 +7,11 @@
     crane.url = "github:ipetkov/crane";
 
     flake-utils.url = "github:numtide/flake-utils";
+
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
 
     advisory-db = {
       url = "github:rustsec/advisory-db";
@@ -20,34 +25,66 @@
     crane,
     flake-utils,
     advisory-db,
+    rust-overlay,
     ...
   }:
     flake-utils.lib.eachDefaultSystem (
       system: let
-        pkgs = nixpkgs.legacyPackages.${system};
+        pkgs = import nixpkgs {
+          inherit system;
+          overlays = [(import rust-overlay)];
+        };
 
         inherit (pkgs) lib;
 
-        craneLib = crane.mkLib pkgs;
+        # On Linux, build against musl so the resulting binaries are fully
+        # statically linked. The dependency tree is pure Rust, so rustc's
+        # self-contained musl runtime suffices; no C cross toolchain needed.
+        # nixpkgs' rustc only ships the native target's std, hence rust-overlay.
+        muslTargets = {
+          "x86_64-linux" = "x86_64-unknown-linux-musl";
+          "aarch64-linux" = "aarch64-unknown-linux-musl";
+        };
+        muslTarget = muslTargets.${system} or null;
+
+        craneLib =
+          if muslTarget != null
+          then
+            (crane.mkLib pkgs).overrideToolchain (p:
+              p.rust-bin.stable.latest.default.override {
+                targets = [muslTarget];
+              })
+          else crane.mkLib pkgs;
         src = craneLib.cleanCargoSource ./.;
 
         # Common arguments can be set here to avoid repeating them later
-        commonArgs = {
-          inherit src;
-          strictDeps = true;
-
-          buildInputs =
-            [
-              # Add additional build inputs here
-            ]
-            ++ lib.optionals pkgs.stdenv.isDarwin [
-              # Additional darwin specific inputs can be set here
-              pkgs.libiconv
-            ];
-
-          # Additional environment variables can be set directly
-          # MY_CUSTOM_VAR = "some value";
-        };
+        commonArgs =
+          {
+            inherit src;
+            strictDeps = true;
+          }
+          # if/else rather than two optionalAttrs merges so the branches can
+          # never both set CARGO_BUILD_RUSTFLAGS: a later `//` merge would
+          # silently clobber the musl flags.
+          // (
+            if muslTarget != null
+            then {
+              CARGO_BUILD_TARGET = muslTarget;
+              # musl targets default to +crt-static; set it explicitly so the
+              # static-linking intent survives toolchain changes.
+              CARGO_BUILD_RUSTFLAGS = "-C target-feature=+crt-static";
+            }
+            else
+              lib.optionalAttrs pkgs.stdenv.isDarwin {
+                # Fully static binaries are impossible on macOS (libSystem must
+                # be dynamic), so the goal here is portability: no nix-store
+                # dylib references. rustc propagates a store libiconv onto
+                # every link line even though no symbol binds to it; dead-
+                # stripping unused dylibs removes that reference so the binary
+                # runs on any Mac.
+                CARGO_BUILD_RUSTFLAGS = "-C link-arg=-Wl,-dead_strip_dylibs";
+              }
+          );
 
         # Build *just* the cargo dependencies (of the entire workspace),
         # so we can reuse all of that work (e.g. via cachix) when running in CI
@@ -200,9 +237,6 @@
         devShells.default = craneLib.devShell {
           # Inherit inputs from checks.
           checks = self.checks.${system};
-
-          # Additional dev-shell environment variables can be set directly
-          # MY_CUSTOM_DEVELOPMENT_VAR = "something else";
 
           # Extra inputs can be added here; cargo and rustc are provided by default.
           packages = with pkgs; [
