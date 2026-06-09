@@ -884,23 +884,37 @@ pub struct SystemLogClientError {
     pub message: String,
     /// Absent when the failure happens before an HTTP response exists (e.g. a request
     /// timeout), so no status code or request id was ever assigned. Unlike `connection` /
-    /// `rate_limits` below (always present as explicit null), these keys are omitted from
-    /// the wire entirely on such failures, so serialization skips `None` to round-trip.
+    /// `rate_limits` below (always present, as explicit null or a payload), these keys are
+    /// omitted from the wire entirely on such failures, so serialization skips `None` to
+    /// round-trip.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<u16>,
     /// See `status`: absent on pre-response failures such as timeouts.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
     pub formatted: String,
-    /// Only ever observed as JSON null, but always present on the wire, so (unlike the
-    /// genuinely-optional fields elsewhere) it is serialized as explicit null rather than
-    /// skipped. Typed as `Option<()>` rather than a guessed struct or `serde_json::Value`
-    /// so any future populated payload fails to parse, surfacing as a partial-failure
-    /// warning that forces us to model its real shape.
-    pub connection: Option<()>,
+    /// Always present on the wire (so serialized as explicit null rather than skipped):
+    /// null for HTTP-level failures, populated with socket diagnostics for
+    /// connection-level failures (e.g. ECONNRESET; seen from Claude Code 2.1.170).
+    pub connection: Option<SystemErrorConnection>,
     pub is_network_down: bool,
-    /// See `connection`: always present as null so far; a populated value must break parsing.
+    /// Only ever observed as JSON null, but always present on the wire, so it is
+    /// serialized as explicit null rather than skipped. Typed as `Option<()>` rather than
+    /// a guessed struct or `serde_json::Value` so any future populated payload fails to
+    /// parse, surfacing as a partial-failure warning that forces us to model its real shape.
     pub rate_limits: Option<()>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct SystemErrorConnection {
+    pub code: String,
+    pub message: String,
+    /// The wire key is `isSSLError`, which `rename_all = "camelCase"` would expect as
+    /// `isSslError`, so the exact upstream capitalization is pinned explicitly.
+    #[serde(rename = "isSSLError")]
+    pub is_ssl_error: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

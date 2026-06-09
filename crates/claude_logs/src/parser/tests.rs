@@ -1915,8 +1915,9 @@ fn test_parse_system_log_api_error_cause_only_envelope() {
     }
 }
 
-// `connection` / `rateLimits` have only ever been observed as null; any populated value is an
-// unmodeled shape that must fail to parse (surfacing as a partial failure) rather than be dropped.
+// `rateLimits` has only ever been observed as null, and `connection` only as null or the modeled
+// socket-diagnostics shape; any other populated value is an unmodeled shape that must fail to
+// parse (surfacing as a partial failure) rather than be dropped.
 #[test]
 fn test_parse_system_log_api_error_populated_diagnostics_break() {
     // Wrap a given `error` payload in an otherwise-valid system api_error line.
@@ -1962,7 +1963,8 @@ fn test_parse_system_log_api_error_populated_diagnostics_break() {
         _ => panic!("Expected System(ApiError) variant"),
     }
 
-    // Any non-null value — object, string, or number — for an always-null field must break parsing.
+    // Any value other than null (or, for `connection`, the modeled socket-diagnostics shape)
+    // must break parsing.
     for field in ["connection", "rateLimits"] {
         for value in [
             serde_json::json!({"unexpected": "shape"}),
@@ -1982,6 +1984,103 @@ fn test_parse_system_log_api_error_populated_diagnostics_break() {
             );
         }
     }
+}
+
+// Connection-level failures (Claude Code 2.1.170+) populate `connection` with socket
+// diagnostics instead of null; the envelope must still resolve to the Client variant.
+#[test]
+fn test_parse_system_log_api_error_populated_connection() {
+    let json = serde_json::json!({
+        "type": "system",
+        "subtype": "api_error",
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "non-uuid-session-id",
+        "version": "2.1.170",
+        "gitBranch": "HEAD",
+        "level": "error",
+        "error": {
+            "message": "Connection error.",
+            "formatted": "Unable to connect to API (ECONNRESET)",
+            "connection": {
+                "code": "ECONNRESET",
+                "message": "The socket connection was closed unexpectedly. For more information, pass `verbose: true` in the second argument to fetch()",
+                "isSSLError": false
+            },
+            "isNetworkDown": false,
+            "rateLimits": null
+        },
+        "retryInMs": 588.0813039877115,
+        "retryAttempt": 1,
+        "maxRetries": 10,
+        "timestamp": "2026-06-09T20:47:11.941Z",
+        "uuid": "550e8400-e29b-41d4-a716-446655440009"
+    });
+
+    let line = serde_json::from_value::<LogLine>(json)
+        .expect("Failed to parse populated-connection client envelope");
+    match &line {
+        LogLine::System(SystemLogLine::ApiError(error)) => match &error.error {
+            SystemErrorBody::Client(client) => {
+                assert_eq!(client.message, "Connection error.");
+                assert_eq!(client.status, None);
+                assert_eq!(client.request_id, None);
+                let connection = client
+                    .connection
+                    .as_ref()
+                    .expect("connection diagnostics should be populated");
+                assert_eq!(connection.code, "ECONNRESET");
+                assert_eq!(
+                    connection.message,
+                    "The socket connection was closed unexpectedly. For more information, pass \
+                     `verbose: true` in the second argument to fetch()"
+                );
+                assert!(!connection.is_ssl_error);
+            }
+            other => panic!("Expected client error envelope, got {other:?}"),
+        },
+        _ => panic!("Expected System(ApiError) variant"),
+    }
+
+    // The camelCase renames are the easy thing to get wrong, and `isSSLError` needs an explicit
+    // `rename` because `rename_all = "camelCase"` would emit `isSslError`; pin the outbound key.
+    let reserialized = serde_json::to_value(&line).expect("reserialize should succeed");
+    let connection = &reserialized["error"]["connection"];
+    assert_eq!(connection["code"], "ECONNRESET");
+    assert_eq!(connection["isSSLError"], false);
+    assert!(
+        connection.get("isSslError").is_none(),
+        "outbound key must be the pinned `isSSLError`, not the rename_all default"
+    );
+}
+
+// SSL failures flip the only boolean in the diagnostics, so pin the `true` reading too, and pin
+// that an unknown sibling key still breaks parsing (the struct is strict like its peers).
+#[test]
+fn test_parse_system_error_connection_ssl_and_unknown_fields() {
+    let connection: SystemErrorConnection = serde_json::from_value(serde_json::json!({
+        "code": "ERR_TLS_CERT_ALTNAME_INVALID",
+        "message": "Hostname/IP does not match certificate's altnames",
+        "isSSLError": true
+    }))
+    .expect("SSL connection diagnostics should parse");
+    assert_eq!(connection.code, "ERR_TLS_CERT_ALTNAME_INVALID");
+    assert!(connection.is_ssl_error);
+
+    let err = serde_json::from_value::<SystemErrorConnection>(serde_json::json!({
+        "code": "ECONNRESET",
+        "message": "The socket connection was closed unexpectedly.",
+        "isSSLError": false,
+        "extraField": 1
+    }))
+    .expect_err("unknown connection field should fail to parse")
+    .to_string();
+    assert!(
+        err.contains("extraField"),
+        "error should name the unknown field, got: {err}"
+    );
 }
 
 #[test]
