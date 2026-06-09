@@ -15,10 +15,11 @@ use crate::cost_report::{MetricComponents, MetricTotal, ReportMode};
 /// `ModelMetricsMap` in practice.
 fn family_sort_key(family: ModelFamily) -> usize {
     match family {
-        ModelFamily::Opus => 0,
-        ModelFamily::Sonnet => 1,
-        ModelFamily::Haiku => 2,
-        ModelFamily::Synthetic => 3,
+        ModelFamily::Fable => 0,
+        ModelFamily::Opus => 1,
+        ModelFamily::Sonnet => 2,
+        ModelFamily::Haiku => 3,
+        ModelFamily::Synthetic => 4,
     }
 }
 
@@ -337,6 +338,7 @@ mod tests {
     fn model_metrics_sorts_family_first_then_version_desc() {
         let mut metrics = ModelMetricsMap::default();
         let cases = [
+            "claude-fable-5",
             "claude-3-5-sonnet-20241022",
             "claude-sonnet-4-20250514",
             "claude-sonnet-4-5-20250929",
@@ -369,6 +371,7 @@ mod tests {
         assert_eq!(
             labels,
             vec![
+                "Fable 5",
                 "Opus 4.7",
                 "Opus 4.5",
                 "Opus 4",

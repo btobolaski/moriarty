@@ -18,6 +18,11 @@ pub enum ModelFamily {
     Sonnet,
     Haiku,
     Opus,
+    /// Anthropic's premium tier introduced with `claude-fable-5` (2026).
+    /// Declaration order here only feeds the derived `Ord` used for stable
+    /// dedup keys; report/display ordering (where Fable sorts above Opus)
+    /// lives in `api_pricing`'s `family_sort_key`.
+    Fable,
     /// Claude Code's `<synthetic>` placeholder for harness-fabricated
     /// assistant turns that don't reach a real model. Carrying this as a real
     /// family variant lets the pricing layer skip it via the same match arm
@@ -35,6 +40,7 @@ impl ModelFamily {
             Self::Sonnet => Some("sonnet"),
             Self::Haiku => Some("haiku"),
             Self::Opus => Some("opus"),
+            Self::Fable => Some("fable"),
             Self::Synthetic => None,
         }
     }
@@ -47,6 +53,7 @@ impl ModelFamily {
             Self::Sonnet => "Sonnet",
             Self::Haiku => "Haiku",
             Self::Opus => "Opus",
+            Self::Fable => "Fable",
             Self::Synthetic => "<synthetic>",
         }
     }
@@ -207,6 +214,8 @@ fn classify_family(model_lower: &str) -> Option<ModelFamily> {
         Some(ModelFamily::Sonnet)
     } else if model_lower.contains("haiku") {
         Some(ModelFamily::Haiku)
+    } else if model_lower.contains("fable") {
+        Some(ModelFamily::Fable)
     } else if model_lower.contains("opus") {
         // Opus 3 and Opus 4.x share the same family; the version major
         // drives the pricing tier in `ClaudeModelPricing::for_model`.
@@ -311,6 +320,19 @@ mod tests {
         ] {
             assert_eq!(parse(id).family, ModelFamily::Opus, "id {id:?}");
         }
+    }
+
+    #[test]
+    fn from_model_string_classifies_fable_family() {
+        let model = parse("claude-fable-5");
+        assert_eq!(model.family, ModelFamily::Fable);
+        assert_eq!(
+            model.version,
+            Some(ModelVersion {
+                major: 5,
+                minor: None
+            })
+        );
     }
 
     #[test]
@@ -475,6 +497,7 @@ mod tests {
             (parse("claude-opus-4-5"), "Opus 4.5"),
             (parse("claude-opus-4-7"), "Opus 4.7"),
             (parse("claude-opus-45"), "Opus 45"),
+            (parse("claude-fable-5"), "Fable 5"),
             (parse("SONNET"), "Sonnet"),
             (parse("OPUS"), "Opus"),
             (parse("<synthetic>"), "<synthetic>"),

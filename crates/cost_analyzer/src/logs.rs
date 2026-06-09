@@ -188,6 +188,17 @@ impl ClaudeModelPricing {
         cache_read: decimal_rate(50, 2),
     };
 
+    /// Pricing for Fable models (effective as of 2026-05-26).
+    /// Applies to `claude-fable-*` model strings. Anthropic publishes only the
+    /// input/output rates for Fable; the cache rates derive from the standard
+    /// 1.25x-input write / 0.1x-input read multipliers.
+    pub const FABLE: Self = Self {
+        input: decimal_rate(10, 0),
+        output: decimal_rate(50, 0),
+        cache_write: decimal_rate(125, 1),
+        cache_read: decimal_rate(1, 0),
+    };
+
     pub fn calculate_cost(&self, usage: &ClaudeTokenCounts) -> LlmCost {
         LlmCost {
             input: per_million_token_cost(usage.input_tokens, self.input),
@@ -209,6 +220,7 @@ impl ClaudeModelPricing {
         match model.family {
             ClaudeModelFamily::Sonnet => Some(Self::SONNET),
             ClaudeModelFamily::Haiku => Some(Self::HAIKU),
+            ClaudeModelFamily::Fable => Some(Self::FABLE),
             ClaudeModelFamily::Opus => Some(match model.version.map(|v| v.major) {
                 Some(major) if major >= 4 => Self::OPUS_4,
                 _ => Self::OPUS,
@@ -340,6 +352,10 @@ fn claude_system_fields(system: &ClaudeSystemLogLine) -> ClaudeSystemFields {
             uuid: line.uuid,
         },
         ClaudeSystemLogLine::TurnDuration(line) => ClaudeSystemFields {
+            timestamp: line.timestamp,
+            uuid: line.uuid,
+        },
+        ClaudeSystemLogLine::ModelRefusalFallback(line) => ClaudeSystemFields {
             timestamp: line.timestamp,
             uuid: line.uuid,
         },
@@ -1328,6 +1344,7 @@ mod tests {
             ("claude-opus-3-5-20241022", ClaudeModelPricing::OPUS.input),
             ("claude-opus-4-20250514", ClaudeModelPricing::OPUS_4.input),
             ("claude-opus-4-7", ClaudeModelPricing::OPUS_4.input),
+            ("claude-fable-5", ClaudeModelPricing::FABLE.input),
         ];
         for (id, expected_input) in cases {
             let model = ClaudeModel::from_model_string(id).expect("fixture parses");
@@ -1346,6 +1363,14 @@ mod tests {
             Some(ClaudeModelPricing::OPUS.input),
         );
 
+        // Fable has a single flat tier, so even a versionless entry resolves
+        // to FABLE (no version dispatch like Opus).
+        let versionless_fable = ClaudeModel::family(ClaudeModelFamily::Fable);
+        assert_eq!(
+            ClaudeModelPricing::for_model(&versionless_fable).map(|p| p.input),
+            Some(ClaudeModelPricing::FABLE.input),
+        );
+
         // Synthetic is the only family for which pricing is `None` —
         // assistant turns the harness fabricated have no real usage to bill.
         let synthetic = ClaudeModel::family(ClaudeModelFamily::Synthetic);
@@ -1361,6 +1386,10 @@ mod tests {
         assert_eq!(ClaudeModelPricing::HAIKU.cache_read, Decimal::new(1, 1));
         assert_eq!(ClaudeModelPricing::OPUS.input, Decimal::new(15, 0));
         assert_eq!(ClaudeModelPricing::OPUS_4.cache_write, Decimal::new(625, 2));
+        assert_eq!(ClaudeModelPricing::FABLE.input, Decimal::new(10, 0));
+        assert_eq!(ClaudeModelPricing::FABLE.output, Decimal::new(50, 0));
+        assert_eq!(ClaudeModelPricing::FABLE.cache_write, Decimal::new(125, 1));
+        assert_eq!(ClaudeModelPricing::FABLE.cache_read, Decimal::new(1, 0));
     }
 
     #[test]
@@ -1545,6 +1574,21 @@ mod tests {
                     cache_write: Decimal::new(625, 2),
                     cache_read: Decimal::new(50, 2),
                     output: Decimal::new(25, 0),
+                },
+            },
+            ClaudePricedAssistantCase {
+                name: "fable pricing path",
+                request_id: Some("req-fable"),
+                message_id: "msg_fable",
+                uuid: CLAUDE_ASSISTANT_UUID,
+                model: "claude-fable-5",
+                usage: (1_000_000, 1_000_000, 1_000_000, 1_000_000),
+                expected_id: "req-fable",
+                expected_cost: LlmCost {
+                    input: Decimal::new(10, 0),
+                    cache_write: Decimal::new(125, 1),
+                    cache_read: Decimal::new(1, 0),
+                    output: Decimal::new(50, 0),
                 },
             },
         ];

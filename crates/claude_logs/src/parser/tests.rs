@@ -1061,6 +1061,54 @@ fn test_parse_stop_hook_summary() {
     }
 }
 
+// `hookAdditionalContext` (Claude Code 2.1.170+) has only ever been observed empty; the
+// empty array parses, and a populated element must break parsing (the `()` element type
+// only accepts JSON null) so an unmodeled real payload surfaces as a partial failure.
+#[test]
+fn test_parse_stop_hook_summary_with_hook_additional_context() {
+    let base = serde_json::json!({
+        "parentUuid": "5445927e-82b0-4164-91f3-782fafd2a49e",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "1a55057c-6af4-4c76-83a1-70b738990294",
+        "version": "2.1.170",
+        "gitBranch": "main",
+        "type": "system",
+        "subtype": "stop_hook_summary",
+        "hookCount": 1,
+        "hookInfos": [{"command": "moriarty hooks exec", "durationMs": 24}],
+        "hookErrors": [],
+        "hookAdditionalContext": [],
+        "preventedContinuation": false,
+        "stopReason": "",
+        "hasOutput": true,
+        "level": "suggestion",
+        "timestamp": "2026-06-09T19:32:49.551Z",
+        "uuid": "abc0350d-cc85-4624-ac9d-99dae25063a6",
+        "toolUseID": "a311cdc8-d81f-42c0-b3e3-a481280f607a"
+    });
+
+    match serde_json::from_value::<LogLine>(base.clone())
+        .expect("Failed to parse stop_hook_summary with empty hookAdditionalContext")
+    {
+        LogLine::System(SystemLogLine::StopHookSummary(summary)) => {
+            assert_eq!(summary.hook_additional_context, Some(vec![]));
+        }
+        _ => panic!("Expected System(StopHookSummary) variant"),
+    }
+
+    let mut populated = base;
+    populated["hookAdditionalContext"] = serde_json::json!([{"context": "surprise"}]);
+    let err_msg = serde_json::from_value::<LogLine>(populated)
+        .expect_err("populated hookAdditionalContext parsed but should have failed")
+        .to_string();
+    assert!(
+        err_msg.contains("hookAdditionalContext") || err_msg.contains("unit"),
+        "populated hookAdditionalContext should fail to parse, got: {err_msg}"
+    );
+}
+
 #[test]
 fn test_parse_stop_hook_summary_rejects_unknown_fields() {
     let json = serde_json::json!({
@@ -1375,6 +1423,134 @@ fn test_parse_stop_hook_summary_with_mixed_error_formats() {
 }
 
 #[test]
+fn test_parse_model_refusal_fallback() {
+    let json = serde_json::json!({
+        "type": "system",
+        "subtype": "model_refusal_fallback",
+        "parentUuid": "77502799-98d4-4548-b903-ed5d6f797e41",
+        "isSidechain": false,
+        "direction": "retry",
+        "content": "Fable 5's safety measures flagged this message. Switched to Opus 4.8.",
+        "level": "warning",
+        "trigger": "refusal",
+        "originalModel": "claude-fable-5",
+        "fallbackModel": "claude-opus-4-8",
+        "requestId": "req_011CbtEUxmnDLZxNhMjZT5dt",
+        "apiRefusalCategory": null,
+        "apiRefusalExplanation": null,
+        "isMeta": false,
+        "timestamp": "2026-06-09T19:24:49.832Z",
+        "uuid": "6e45b19e-8f68-4144-9eac-c1577fe3737e",
+        "retractedMessageUuids": ["6102750b-5a74-4578-bf67-d42e5b5f85ee"],
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "f671f20e-5ef4-41d5-bfe5-aa4b87a2bd54",
+        "version": "2.1.170",
+        "gitBranch": "HEAD",
+        "slug": "i-need-to-run-hashed-stroustrup"
+    });
+
+    let line: LogLine =
+        serde_json::from_value(json).expect("Failed to parse model_refusal_fallback");
+
+    match line {
+        LogLine::System(SystemLogLine::ModelRefusalFallback(fallback)) => {
+            assert_eq!(fallback.direction, "retry");
+            assert_eq!(fallback.trigger, "refusal");
+            assert_eq!(fallback.original_model.raw(), "claude-fable-5");
+            assert_eq!(fallback.fallback_model.raw(), "claude-opus-4-8");
+            assert_eq!(fallback.api_refusal_category, None);
+            assert_eq!(fallback.api_refusal_explanation, None);
+            assert_eq!(fallback.retracted_message_uuids.len(), 1);
+        }
+        _ => panic!("Expected System(ModelRefusalFallback) variant"),
+    }
+}
+
+#[test]
+fn test_parse_model_refusal_fallback_with_populated_refusal_details() {
+    let json = serde_json::json!({
+        "type": "system",
+        "subtype": "model_refusal_fallback",
+        "parentUuid": "77502799-98d4-4548-b903-ed5d6f797e41",
+        "isSidechain": false,
+        "direction": "retry",
+        "content": "Switched to Opus 4.8.",
+        "level": "warning",
+        "trigger": "refusal",
+        "originalModel": "claude-fable-5",
+        "fallbackModel": "claude-opus-4-8",
+        "requestId": "req_011CbtEUxmnDLZxNhMjZT5dt",
+        "apiRefusalCategory": "cyber",
+        "apiRefusalExplanation": "Flagged for cybersecurity topics.",
+        "isMeta": false,
+        "timestamp": "2026-06-09T19:24:49.832Z",
+        "uuid": "6e45b19e-8f68-4144-9eac-c1577fe3737e",
+        "retractedMessageUuids": [],
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "f671f20e-5ef4-41d5-bfe5-aa4b87a2bd54",
+        "version": "2.1.170",
+        "gitBranch": "HEAD"
+    });
+
+    match serde_json::from_value::<LogLine>(json)
+        .expect("Failed to parse model_refusal_fallback with populated refusal details")
+    {
+        LogLine::System(SystemLogLine::ModelRefusalFallback(fallback)) => {
+            assert_eq!(fallback.api_refusal_category.as_deref(), Some("cyber"));
+            assert_eq!(
+                fallback.api_refusal_explanation.as_deref(),
+                Some("Flagged for cybersecurity topics.")
+            );
+            assert!(fallback.retracted_message_uuids.is_empty());
+        }
+        _ => panic!("Expected System(ModelRefusalFallback) variant"),
+    }
+}
+
+#[test]
+fn test_parse_model_refusal_fallback_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "type": "system",
+        "subtype": "model_refusal_fallback",
+        "parentUuid": "77502799-98d4-4548-b903-ed5d6f797e41",
+        "isSidechain": false,
+        "direction": "retry",
+        "content": "Switched to Opus 4.8.",
+        "level": "warning",
+        "trigger": "refusal",
+        "originalModel": "claude-fable-5",
+        "fallbackModel": "claude-opus-4-8",
+        "requestId": "req_011CbtEUxmnDLZxNhMjZT5dt",
+        "apiRefusalCategory": null,
+        "apiRefusalExplanation": null,
+        "isMeta": false,
+        "timestamp": "2026-06-09T19:24:49.832Z",
+        "uuid": "6e45b19e-8f68-4144-9eac-c1577fe3737e",
+        "retractedMessageUuids": [],
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "f671f20e-5ef4-41d5-bfe5-aa4b87a2bd54",
+        "version": "2.1.170",
+        "gitBranch": "HEAD",
+        "unknownField": "should be rejected"
+    });
+
+    let err_msg = serde_json::from_value::<LogLine>(json)
+        .expect_err("Should reject unknown fields due to deny_unknown_fields")
+        .to_string();
+    assert!(
+        err_msg.contains("unknown field") || err_msg.contains("unknownField"),
+        "Error should mention unknown field, got: {}",
+        err_msg
+    );
+}
+
+#[test]
 fn test_parse_turn_duration() {
     let json = serde_json::json!({
         "type": "system",
@@ -1595,8 +1771,11 @@ fn test_parse_system_log_api_error_client_envelope() {
             assert_eq!(error.max_retries, 10);
             match &error.error {
                 SystemErrorBody::Client(client) => {
-                    assert_eq!(client.status, 529);
-                    assert_eq!(client.request_id, "req_011CbkMooev8tewDZ9JGCJ92");
+                    assert_eq!(client.status, Some(529));
+                    assert_eq!(
+                        client.request_id.as_deref(),
+                        Some("req_011CbkMooev8tewDZ9JGCJ92")
+                    );
                     assert_eq!(client.formatted, "529 Overloaded");
                     assert!(client.message.starts_with("529 "));
                     assert!(!client.is_network_down);
@@ -1644,12 +1823,56 @@ fn test_parse_system_log_error_client_envelope() {
     match serde_json::from_value::<LogLine>(json).expect("Failed to parse error client envelope") {
         LogLine::System(SystemLogLine::Error(error)) => match &error.error {
             SystemErrorBody::Client(client) => {
-                assert_eq!(client.status, 529);
-                assert_eq!(client.request_id, "req_err_123");
+                assert_eq!(client.status, Some(529));
+                assert_eq!(client.request_id.as_deref(), Some("req_err_123"));
             }
             other => panic!("Expected client error envelope, got {other:?}"),
         },
         _ => panic!("Expected System(Error) variant"),
+    }
+}
+
+// A request timeout fails before any HTTP response exists, so the Client envelope arrives
+// without `status`/`requestId`; it must still resolve to the Client variant (not Sdk).
+#[test]
+fn test_parse_system_log_api_error_timeout_client_envelope() {
+    let json = serde_json::json!({
+        "type": "system",
+        "subtype": "api_error",
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "non-uuid-session-id",
+        "version": "2.1.158",
+        "gitBranch": "HEAD",
+        "level": "error",
+        "error": {
+            "message": "Request timed out.",
+            "formatted": "Request timed out.",
+            "connection": null,
+            "isNetworkDown": false,
+            "rateLimits": null
+        },
+        "retryInMs": 542.2537521358778,
+        "retryAttempt": 1,
+        "maxRetries": 10,
+        "timestamp": "2026-06-09T19:41:10.971Z",
+        "uuid": "550e8400-e29b-41d4-a716-446655440009"
+    });
+
+    match serde_json::from_value::<LogLine>(json).expect("Failed to parse timeout client envelope")
+    {
+        LogLine::System(SystemLogLine::ApiError(error)) => match &error.error {
+            SystemErrorBody::Client(client) => {
+                assert_eq!(client.message, "Request timed out.");
+                assert_eq!(client.status, None);
+                assert_eq!(client.request_id, None);
+                assert!(!client.is_network_down);
+            }
+            other => panic!("Expected client error envelope, got {other:?}"),
+        },
+        _ => panic!("Expected System(ApiError) variant"),
     }
 }
 
@@ -4074,6 +4297,41 @@ fn test_parse_tool_use_caller_rejects_unknown_fields() {
 }
 
 #[test]
+fn test_parse_fallback_content_block() {
+    let json = serde_json::json!({
+        "type": "fallback",
+        "from": {"model": "claude-fable-5"},
+        "to": {"model": "claude-opus-4-8"}
+    });
+    match serde_json::from_value::<LogMessageTaggedContent>(json)
+        .expect("Failed to parse fallback block")
+    {
+        LogMessageTaggedContent::Fallback { from, to } => {
+            assert_eq!(from.model.raw(), "claude-fable-5");
+            assert_eq!(to.model.raw(), "claude-opus-4-8");
+        }
+        other => panic!("Expected Fallback variant, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_parse_fallback_content_block_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "type": "fallback",
+        "from": {"model": "claude-fable-5", "reason": "overloaded"},
+        "to": {"model": "claude-opus-4-8"}
+    });
+    let err_msg = serde_json::from_value::<LogMessageTaggedContent>(json)
+        .expect_err("Should reject unknown fields due to deny_unknown_fields")
+        .to_string();
+    assert!(
+        err_msg.contains("unknown field"),
+        "Error should mention unknown field, got: {}",
+        err_msg
+    );
+}
+
+#[test]
 fn test_parse_user_log_line_with_prompt_id() {
     let json = serde_json::json!({
         "parentUuid": null,
@@ -4130,6 +4388,47 @@ fn test_parse_user_log_line_without_prompt_id() {
     });
     let line: UserLogLine = serde_json::from_value(json).unwrap();
     assert_eq!(line.prompt_id, None);
+}
+
+#[test]
+fn test_parse_user_log_line_with_prompt_source() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "version": "2.1.170",
+        "gitBranch": "main",
+        "message": {"role": "user", "content": "test"},
+        "uuid": "550e8400-e29b-41d4-a716-446655440001",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "promptSource": "typed"
+    });
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(line.prompt_source.as_deref(), Some("typed"));
+}
+
+#[test]
+fn test_parse_user_log_line_with_source_tool_use_id() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "version": "2.1.170",
+        "gitBranch": "main",
+        "message": {"role": "user", "content": "test"},
+        "uuid": "550e8400-e29b-41d4-a716-446655440001",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "sourceToolUseID": "toolu_01TnFtjG2oYQQKKKUULR9y6V"
+    });
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(
+        line.source_tool_use_id.as_deref(),
+        Some("toolu_01TnFtjG2oYQQKKKUULR9y6V")
+    );
 }
 
 #[test]
@@ -5970,6 +6269,78 @@ fn test_parse_assistant_message_with_system_changed_diagnostics() {
         }) => assert_eq!(cache_missed_input_tokens, 277136),
         other => panic!("Expected SystemChanged diagnostics, got {:?}", other),
     }
+}
+
+// A model fallback (Fable 5 → Opus 4.8 under load) produces a `model_changed` cache-miss
+// reason plus per-iteration `model` fields whose values differ across iterations.
+#[test]
+fn test_parse_assistant_message_with_model_changed_diagnostics_and_iteration_models() {
+    let json = serde_json::json!({
+        "id": "msg-1",
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "fallback", "from": {"model": "claude-fable-5"}, "to": {"model": "claude-opus-4-8"}}],
+        "model": "claude-opus-4-8",
+        "stop_reason": "tool_use",
+        "usage": {
+            "input_tokens": 2,
+            "cache_creation_input_tokens": 155209,
+            "cache_read_input_tokens": 0,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": 0,
+                "ephemeral_1h_input_tokens": 155209
+            },
+            "output_tokens": 301,
+            "iterations": [
+                {
+                    "input_tokens": 2,
+                    "output_tokens": 160,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 155209,
+                    "cache_creation": {"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 155209},
+                    "type": "message",
+                    "model": "claude-fable-5"
+                },
+                {
+                    "input_tokens": 2,
+                    "output_tokens": 301,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 155209,
+                    "cache_creation": {"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 155209},
+                    "type": "fallback_message",
+                    "model": "claude-opus-4-8"
+                }
+            ]
+        },
+        "diagnostics": {
+            "cache_miss_reason": {
+                "type": "model_changed",
+                "cache_missed_input_tokens": 133891
+            }
+        }
+    });
+    let message: AssistantLogMessage = serde_json::from_value(json).unwrap();
+    match message.diagnostics {
+        Some(Diagnostics {
+            cache_miss_reason:
+                Some(CacheMissReason::ModelChanged {
+                    cache_missed_input_tokens,
+                }),
+        }) => assert_eq!(cache_missed_input_tokens, 133891),
+        other => panic!("Expected ModelChanged diagnostics, got {:?}", other),
+    }
+    let iterations = message.usage.iterations.expect("iterations present");
+    assert_eq!(iterations.len(), 2);
+    assert_eq!(
+        iterations[0].model.as_ref().map(|m| m.raw()),
+        Some("claude-fable-5")
+    );
+    assert_eq!(iterations[0].r#type.as_deref(), Some("message"));
+    assert_eq!(
+        iterations[1].model.as_ref().map(|m| m.raw()),
+        Some("claude-opus-4-8")
+    );
+    assert_eq!(iterations[1].r#type.as_deref(), Some("fallback_message"));
 }
 
 #[test]

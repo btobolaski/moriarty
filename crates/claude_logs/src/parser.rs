@@ -676,6 +676,49 @@ pub enum SystemLogLine {
     ScheduledTaskFire(ScheduledTaskFire),
     StopHookSummary(StopHookSummary),
     TurnDuration(TurnDuration),
+    ModelRefusalFallback(ModelRefusalFallback),
+}
+
+/// Emitted when a model's safety measures refuse a request and Claude Code retries it on a
+/// fallback model (e.g. Fable 5 → Opus 4.8); the refused assistant turns are listed in
+/// `retracted_message_uuids`. Added in Claude Code 2.1.170+.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct ModelRefusalFallback {
+    pub parent_uuid: Option<Uuid>,
+    pub is_sidechain: bool,
+    pub user_type: String,
+    pub cwd: String,
+    pub session_id: Uuid,
+    pub version: String,
+    pub git_branch: String,
+    /// Session slug identifier (e.g., "noble-floating-lemon"). Added in Claude Code 2.0.51.
+    pub slug: Option<String>,
+    pub content: String,
+    pub level: String,
+    /// Only `"retry"` has been observed (the refused request replays on
+    /// `fallback_model`); kept as a raw `String` because Claude Code may add
+    /// other recovery directives and a strict enum would break parsing.
+    pub direction: String,
+    /// Only `"refusal"` has been observed; raw `String` for the same
+    /// forward-compatibility reason as `direction`.
+    pub trigger: String,
+    pub original_model: crate::model::Model,
+    pub fallback_model: crate::model::Model,
+    pub request_id: String,
+    /// Structured refusal category from the API's `stop_details` (e.g. "cyber", "bio");
+    /// `null` when the API supplied none.
+    pub api_refusal_category: Option<String>,
+    /// See `api_refusal_category`: the API's free-text refusal explanation, when present.
+    pub api_refusal_explanation: Option<String>,
+    pub is_meta: bool,
+    pub timestamp: DateTime<Utc>,
+    pub uuid: Uuid,
+    /// Assistant turns retracted because they came from the refused request.
+    pub retracted_message_uuids: Vec<Uuid>,
+    /// Entry point that started the session (e.g., "cli"). Added in Claude Code 2.1.104+.
+    pub entrypoint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -716,6 +759,11 @@ pub struct StopHookSummary {
     pub hook_count: usize,
     pub hook_infos: Vec<HookInfo>,
     pub hook_errors: Vec<HookError>,
+    /// Only ever observed as an empty array, and absent before Claude Code 2.1.170. The
+    /// element type is `()` (which only deserializes from JSON null) so a future populated
+    /// payload fails to parse, surfacing as a partial-failure warning that forces us to
+    /// model its real shape.
+    pub hook_additional_context: Option<Vec<()>>,
     pub prevented_continuation: bool,
     pub stop_reason: String,
     pub has_output: bool,
@@ -834,8 +882,15 @@ pub enum SystemErrorBody {
 #[serde(deny_unknown_fields)]
 pub struct SystemLogClientError {
     pub message: String,
-    pub status: u16,
-    pub request_id: String,
+    /// Absent when the failure happens before an HTTP response exists (e.g. a request
+    /// timeout), so no status code or request id was ever assigned. Unlike `connection` /
+    /// `rate_limits` below (always present as explicit null), these keys are omitted from
+    /// the wire entirely on such failures, so serialization skips `None` to round-trip.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    /// See `status`: absent on pre-response failures such as timeouts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
     pub formatted: String,
     /// Only ever observed as JSON null, but always present on the wire, so (unlike the
     /// genuinely-optional fields elsewhere) it is serialized as explicit null rather than
@@ -1117,8 +1172,14 @@ pub struct UserLogLine {
     /// UUID of the assistant message that triggered the tool use. Added in Claude Code 2.0.51+.
     #[serde(rename = "sourceToolAssistantUUID")]
     pub source_tool_assistant_uuid: Option<Uuid>,
+    /// Id of the `tool_use` block this turn responds to (an Anthropic `toolu_…` id,
+    /// not a UUID). Added in Claude Code 2.1.170+.
+    #[serde(rename = "sourceToolUseID")]
+    pub source_tool_use_id: Option<String>,
     /// Prompt identifier for tracking prompt lineage. Added in Claude Code 2.1.77+.
     pub prompt_id: Option<Uuid>,
+    /// How the prompt was submitted (e.g., "typed"). Added in Claude Code 2.1.170+.
+    pub prompt_source: Option<String>,
     /// Current permission mode. Added in Claude Code 2.1.77+.
     pub permission_mode: Option<PermissionMode>,
     /// Plan content when in plan mode. Added in Claude Code 2.1.77+.
@@ -1235,6 +1296,21 @@ pub enum LogMessageTaggedContent {
     ToolReference {
         tool_name: String,
     },
+    /// Records that the request fell back from one model to another (e.g.
+    /// Fable 5 → Opus 4.8 under load). The message-level `model` field carries
+    /// the model that actually served the response (`to`). Added in Claude
+    /// Code 2.1.170+.
+    Fallback {
+        from: FallbackModelRef,
+        to: FallbackModelRef,
+    },
+}
+
+/// Wire envelope for the `from`/`to` ends of a `fallback` content block.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FallbackModelRef {
+    pub model: crate::model::Model,
 }
 
 /// Caller information for tool use tracking. Added in Claude Code 2.1.12+.
@@ -1345,9 +1421,21 @@ pub struct Diagnostics {
 #[serde(rename_all = "snake_case")]
 pub enum CacheMissReason {
     PreviousMessageNotFound,
-    ToolsChanged { cache_missed_input_tokens: usize },
-    MessagesChanged { cache_missed_input_tokens: usize },
-    SystemChanged { cache_missed_input_tokens: usize },
+    ToolsChanged {
+        cache_missed_input_tokens: usize,
+    },
+    MessagesChanged {
+        cache_missed_input_tokens: usize,
+    },
+    SystemChanged {
+        cache_missed_input_tokens: usize,
+    },
+    /// The request was served by a different model than the cached prefix
+    /// (caches are model-scoped), e.g. after a `fallback` content block.
+    /// Added in Claude Code 2.1.170+.
+    ModelChanged {
+        cache_missed_input_tokens: usize,
+    },
     Unavailable,
 }
 
@@ -1398,6 +1486,10 @@ pub struct Iteration {
     pub cache_creation_input_tokens: Option<usize>,
     pub cache_creation: Option<AssistantCacheCreation>,
     pub r#type: Option<String>,
+    /// Model that served this iteration; differs across iterations when the
+    /// request fell back to another model (`type: "fallback_message"`).
+    /// Added in Claude Code 2.1.170+.
+    pub model: Option<crate::model::Model>,
 }
 
 /// Speed setting for inference. Added in Claude Code 2.1.77+.
