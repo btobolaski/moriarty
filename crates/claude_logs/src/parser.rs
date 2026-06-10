@@ -448,7 +448,39 @@ pub struct FileAttachment {
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
 pub enum FileAttachmentContent {
-    Text { file: FileAttachmentTextBody },
+    Text {
+        file: FileAttachmentTextBody,
+    },
+    /// An `@`-referenced image file. Unlike the `image` content block inside
+    /// messages (which uses the API's base64 `source` envelope), attachments
+    /// carry Claude Code's own `file` envelope with size and render
+    /// dimensions. Observed in Claude Code 2.1.170 logs.
+    Image {
+        file: FileAttachmentImageBody,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct FileAttachmentImageBody {
+    pub base64: String,
+    /// MIME type (e.g. "image/png"); the wire key is literally `type`.
+    pub r#type: String,
+    pub original_size: u64,
+    pub dimensions: ImageDimensions,
+}
+
+/// Original vs display sizes are recorded separately because Claude Code may
+/// downscale large images before sending them to the model.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct ImageDimensions {
+    pub original_width: u32,
+    pub original_height: u32,
+    pub display_width: u32,
+    pub display_height: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1307,6 +1339,13 @@ pub enum LogMessageTaggedContent {
     Document {
         source: DocumentSource,
     },
+    /// An inline image block, observed inside tool_result content when a tool
+    /// returns a screenshot (e.g. a subagent reading an image file). The wire
+    /// `source` envelope is identical to `document`'s, so it reuses
+    /// [`DocumentSource`].
+    Image {
+        source: DocumentSource,
+    },
     ToolReference {
         tool_name: String,
     },
@@ -1335,7 +1374,9 @@ pub struct ToolUseCaller {
     pub r#type: String,
 }
 
-/// Represents a document attached to a message (e.g., PDF, image, text file)
+/// Wire envelope for the binary payload of a `document` or `image` content
+/// block; both block types share this exact shape on disk, so one struct
+/// serves both variants.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DocumentSource {

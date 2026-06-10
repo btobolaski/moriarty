@@ -23,9 +23,8 @@ use std::path::PathBuf;
 
 // 3rd party crates
 use rmcp::{
-    handler::server::wrapper::Parameters,
-    model::*,
-    tool, tool_handler, tool_router, ErrorData as McpError, Json, ServerHandler,
+    handler::server::wrapper::Parameters, model::*, tool, tool_handler, tool_router,
+    ErrorData as McpError, Json, ServerHandler,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -496,10 +495,7 @@ mod tests {
         assert_eq!(info.server_info.name, "moriarty");
         assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
         assert!(
-            info.instructions
-                .as_deref()
-                .unwrap_or("")
-                .contains("jj"),
+            info.instructions.as_deref().unwrap_or("").contains("jj"),
             "instructions should mention jj: {:?}",
             info.instructions
         );

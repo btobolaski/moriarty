@@ -1633,7 +1633,9 @@ fn parse_tool_result_details(
         | "project_tools_run_formatter"
         | "project_tools_run_lint"
         | "project_tools_run_tests"
-        | "jj_read_only_run" => serde_json::from_value(details).map(ToolResultDetails::McpToolResult),
+        | "jj_read_only_run" => {
+            serde_json::from_value(details).map(ToolResultDetails::McpToolResult)
+        }
         "plannotator_submit_plan" => {
             serde_json::from_value(details).map(ToolResultDetails::PlannotatorSubmitPlan)
         }

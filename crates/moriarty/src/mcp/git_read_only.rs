@@ -16,11 +16,9 @@
 use std::path::{Path, PathBuf};
 
 use rmcp::{
-    handler::server::wrapper::Parameters,
-    model::*,
-    prompt, prompt_handler, prompt_router,
-    service::RequestContext,
-    tool, tool_handler, tool_router, ErrorData as McpError, Json, RoleServer, ServerHandler,
+    handler::server::wrapper::Parameters, model::*, prompt, prompt_handler, prompt_router,
+    service::RequestContext, tool, tool_handler, tool_router, ErrorData as McpError, Json,
+    RoleServer, ServerHandler,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -592,10 +590,7 @@ mod tests {
         assert_eq!(info.server_info.name, "moriarty");
         assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
         assert!(
-            info.instructions
-                .as_deref()
-                .unwrap_or("")
-                .contains("git"),
+            info.instructions.as_deref().unwrap_or("").contains("git"),
             "instructions should mention git: {:?}",
             info.instructions
         );

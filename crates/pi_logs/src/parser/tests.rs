@@ -4895,10 +4895,7 @@ fn mcp_tool_result_accepts_search_mode() {
     };
     assert_eq!(details.mode, McpMode::Search);
     assert_eq!(details.query.as_deref(), Some("write"));
-    assert_eq!(
-        details.matches.as_deref().map(|v| &v[..]),
-        Some(&[][..])
-    );
+    assert_eq!(details.matches.as_deref().map(|v| &v[..]), Some(&[][..]));
     assert_eq!(details.count, Some(0));
 }
 
@@ -5007,13 +5004,16 @@ fn mcp_client_error_vs_git_read_only_discrimination() {
     // {server, tool, error} is rejected: GitReadOnlyDetails denies
     // `error`, McpClientError denies `tool`, McpBreadcrumb denies
     // `error`. The parser loudly surfaces the ambiguity.
-    let result =
-        serde_json::from_value::<ToolResultDetails>(json!({
-            "server": "git",
-            "tool": "status",
-            "error": "oops"
-        }));
-    assert!(result.is_err());
+    let err = serde_json::from_value::<ToolResultDetails>(json!({
+        "server": "git",
+        "tool": "status",
+        "error": "oops"
+    }))
+    .expect_err("{server, tool, error} should be rejected as ambiguous");
+    assert!(
+        err.to_string().contains("did not match any variant"),
+        "Error should surface the untagged-enum mismatch, got: {err}"
+    );
 }
 
 #[test]

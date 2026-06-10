@@ -46,19 +46,19 @@ impl McpServers {
     pub async fn run(self) -> miette::Result<()> {
         match self {
             Self::GitReadOnly => {
-                let server = GitReadOnly::default();
+                let server = GitReadOnly;
                 let service = server.serve(stdio()).await.into_diagnostic()?;
                 service.waiting().await.into_diagnostic()?;
                 Ok(())
             }
             Self::JjReadOnly => {
-                let server = JjReadOnly::default();
+                let server = JjReadOnly;
                 let service = server.serve(stdio()).await.into_diagnostic()?;
                 service.waiting().await.into_diagnostic()?;
                 Ok(())
             }
             Self::ProjectTools => {
-                let server = ToolRunner::default();
+                let server = ToolRunner;
 
                 let service = server.serve(stdio()).await.into_diagnostic()?;
 

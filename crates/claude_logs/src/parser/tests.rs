@@ -445,6 +445,82 @@ fn test_parse_user_message_with_document() {
 }
 
 #[test]
+fn test_parse_image_content() {
+    let json = serde_json::json!({
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": "image/png",
+            "data": "iVBORw0KGgo="
+        }
+    });
+
+    let content: LogMessageTaggedContent = serde_json::from_value(json).unwrap();
+    let LogMessageTaggedContent::Image { source } = content else {
+        panic!("Expected Image variant");
+    };
+    assert_eq!(source.r#type, "base64");
+    assert_eq!(source.media_type, "image/png");
+    assert_eq!(source.data, "iVBORw0KGgo=");
+}
+
+#[test]
+fn test_parse_image_content_in_tool_result() {
+    let json = serde_json::json!({
+        "tool_use_id": "toolu_019v9avQKZUB4HVmeqbHZtcX",
+        "type": "tool_result",
+        "content": [{
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "data": "iVBORw0KGgo=",
+                "media_type": "image/png"
+            }
+        }]
+    });
+
+    let content: LogMessageTaggedContent = serde_json::from_value(json).unwrap();
+    match content {
+        LogMessageTaggedContent::ToolResult(ToolResult::Current { content, .. }) => {
+            let LogMessageContent::Vec(items) = content else {
+                panic!("Expected Vec content");
+            };
+            match &items[0] {
+                LogMessageTaggedContent::Image { source } => {
+                    assert_eq!(source.r#type, "base64");
+                    assert_eq!(source.media_type, "image/png");
+                    assert_eq!(source.data, "iVBORw0KGgo=");
+                }
+                other => panic!("Expected Image variant, got {other:?}"),
+            }
+        }
+        _ => panic!("Expected ToolResult variant"),
+    }
+}
+
+#[test]
+fn test_parse_image_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": "image/png",
+            "data": "abc123"
+        },
+        "extra_field": "should be rejected"
+    });
+
+    let err_msg = serde_json::from_value::<LogMessageTaggedContent>(json)
+        .expect_err("Should reject unknown fields at Image variant level")
+        .to_string();
+    assert!(
+        err_msg.contains("unknown field") || err_msg.contains("extra_field"),
+        "Error should mention unknown field, got: {}",
+        err_msg
+    );
+}
+
+#[test]
 fn test_parse_document_rejects_unknown_fields() {
     let json = serde_json::json!({
         "type": "document",
@@ -5572,7 +5648,9 @@ fn test_parse_attachment_file() {
                 AttachmentData::File(file) => {
                     assert_eq!(file.filename, "/abs/path/to/file.md");
                     assert_eq!(file.display_path, "to/file.md");
-                    let FileAttachmentContent::Text { file: body } = file.content;
+                    let FileAttachmentContent::Text { file: body } = file.content else {
+                        panic!("Expected Text content");
+                    };
                     assert_eq!(body.file_path, "/abs/path/to/file.md");
                     assert_eq!(body.content, "hello");
                     assert_eq!(body.num_lines, 1);
@@ -5584,6 +5662,120 @@ fn test_parse_attachment_file() {
         }
         other => panic!("Expected Attachment, got {:?}", other),
     }
+}
+
+#[test]
+fn test_parse_attachment_image_file() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": "f79dbdf2-63a8-46c9-9975-6cb9aca8f8b9",
+        "isSidechain": false,
+        "attachment": {
+            "type": "file",
+            "filename": "/abs/path/call_starts.png",
+            "content": {
+                "type": "image",
+                "file": {
+                    "base64": "iVBORw0KGgo=",
+                    "type": "image/png",
+                    "originalSize": 95245,
+                    "dimensions": {
+                        "originalWidth": 1606,
+                        "originalHeight": 588,
+                        "displayWidth": 803,
+                        "displayHeight": 294
+                    }
+                }
+            },
+            "displayPath": "call_starts.png"
+        },
+        "uuid": "898d808b-9583-4be7-80d3-8e4e96f562bf",
+        "timestamp": "2026-06-11T00:12:47.506Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.170",
+        "gitBranch": "HEAD",
+        "slug": "happy-doodling-moonbeam"
+    });
+    let log_line: LogLine = serde_json::from_value(json).unwrap();
+    match log_line {
+        LogLine::Attachment(att) => match att.attachment {
+            AttachmentData::File(file) => {
+                assert_eq!(file.filename, "/abs/path/call_starts.png");
+                assert_eq!(file.display_path, "call_starts.png");
+                let FileAttachmentContent::Image { file: body } = file.content else {
+                    panic!("Expected Image content");
+                };
+                assert_eq!(body.base64, "iVBORw0KGgo=");
+                assert_eq!(body.r#type, "image/png");
+                assert_eq!(body.original_size, 95245);
+                assert_eq!(body.dimensions.original_width, 1606);
+                assert_eq!(body.dimensions.original_height, 588);
+                assert_eq!(body.dimensions.display_width, 803);
+                assert_eq!(body.dimensions.display_height, 294);
+            }
+            other => panic!("Expected File attachment, got {:?}", other),
+        },
+        other => panic!("Expected Attachment, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_attachment_image_file_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "type": "image",
+        "file": {
+            "base64": "iVBORw0KGgo=",
+            "type": "image/png",
+            "originalSize": 95245,
+            "dimensions": {
+                "originalWidth": 1606,
+                "originalHeight": 588,
+                "displayWidth": 1606,
+                "displayHeight": 588,
+                "unknownField": "should fail"
+            }
+        }
+    });
+
+    let err_msg = serde_json::from_value::<FileAttachmentContent>(json)
+        .expect_err("Should reject unknown fields due to deny_unknown_fields")
+        .to_string();
+    assert!(
+        err_msg.contains("unknown field") || err_msg.contains("unknownField"),
+        "Error should mention unknown field, got: {}",
+        err_msg
+    );
+}
+
+#[test]
+fn test_parse_attachment_image_body_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "type": "image",
+        "file": {
+            "base64": "iVBORw0KGgo=",
+            "type": "image/png",
+            "originalSize": 95245,
+            "dimensions": {
+                "originalWidth": 1606,
+                "originalHeight": 588,
+                "displayWidth": 1606,
+                "displayHeight": 588
+            },
+            "extraField": "should fail"
+        }
+    });
+
+    let err_msg = serde_json::from_value::<FileAttachmentContent>(json)
+        .expect_err("Should reject unknown fields in FileAttachmentImageBody")
+        .to_string();
+    assert!(
+        err_msg.contains("unknown field") || err_msg.contains("extraField"),
+        "Error should mention unknown field, got: {}",
+        err_msg
+    );
 }
 
 #[test]

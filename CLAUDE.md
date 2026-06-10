@@ -103,8 +103,10 @@ test in a separate process, making this safe and preventing tests from clobberin
   ai-titles, agent names, last prompts, permission-mode changes, session mode records, attachments, PR-link records
   (associating a session with the GitHub PR Claude Code opened or updated; added in Claude Code 2.1.158+),
   model-refusal-fallback records (when Claude Code retries a refused request on another model, e.g. Fable 5 →
-  Opus 4.8), and `fallback` content blocks recording the from/to model pair inside an assistant message (both added in
-  Claude Code 2.1.170+)
+  Opus 4.8), `fallback` content blocks recording the from/to model pair inside an assistant message (both added in
+  Claude Code 2.1.170+), `image` content blocks inside tool_result content (observed in Claude Code 2.1.170 logs
+  when a tool returns a screenshot), and `image` file-attachment content (a user `@`-referencing an image file; uses
+  Claude Code's own base64 `file` envelope with size/dimensions rather than the API's `source` envelope)
 - Also owns the structured view of the raw `model` string via `model::Model { family, version }` plus `ModelFamily` and
   `ModelVersion`. Both `cost_analyzer` (for pricing) and `moriarty::api_pricing` (for grouping/display) consume this one
   parser so family/version classification is not duplicated across crates
