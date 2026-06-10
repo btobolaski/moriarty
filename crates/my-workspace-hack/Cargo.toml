@@ -18,34 +18,22 @@ arrayvec = { version = "0.7" }
 crossbeam-utils = { version = "0.8", default-features = false, features = ["std"] }
 fastrand = { version = "2" }
 futures-sink = { version = "0.3" }
-hashbrown = { version = "0.16" }
 memchr = { version = "2" }
 num-traits = { version = "0.2", default-features = false, features = ["i128"] }
 peg-runtime = { version = "0.8", default-features = false, features = ["std"] }
-regex-automata = { version = "0.4", default-features = false, features = ["dfa-build", "dfa-onepass", "hybrid", "meta", "nfa-backtrack", "perf-inline", "perf-literal", "std", "unicode"] }
-regex-syntax = { version = "0.8" }
 serde = { version = "1", features = ["alloc", "derive", "rc"] }
 serde_core = { version = "1", default-features = false, features = ["alloc", "rc", "result", "std"] }
 serde_json = { version = "1", features = ["alloc"] }
 tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "parking_lot", "process", "rt-multi-thread", "sync", "time"] }
-toml_datetime = { version = "0.7", features = ["serde"] }
-toml_parser = { version = "1" }
 tracing-core = { version = "0.1" }
-winnow = { version = "0.7" }
 
 [build-dependencies]
-hashbrown = { version = "0.16" }
 memchr = { version = "2" }
 peg-runtime = { version = "0.8", default-features = false, features = ["std"] }
 proc-macro2 = { version = "1" }
 quote = { version = "1" }
-regex-automata = { version = "0.4", default-features = false, features = ["dfa-build", "dfa-onepass", "hybrid", "meta", "nfa-backtrack", "perf-inline", "perf-literal", "std", "unicode"] }
-regex-syntax = { version = "0.8" }
 serde_core = { version = "1", default-features = false, features = ["alloc", "rc", "result", "std"] }
 serde_json = { version = "1", features = ["alloc"] }
 syn = { version = "2", features = ["extra-traits", "full", "visit", "visit-mut"] }
-toml_datetime = { version = "0.7", features = ["serde"] }
-toml_parser = { version = "1" }
-winnow = { version = "0.7" }
 
 ### END HAKARI SECTION
