@@ -16,7 +16,7 @@
 use std::path::{Path, PathBuf};
 
 use rmcp::{
-    handler::server::{router::prompt::PromptRouter, tool::ToolRouter, wrapper::Parameters},
+    handler::server::wrapper::Parameters,
     model::*,
     prompt, prompt_handler, prompt_router,
     service::RequestContext,
@@ -65,10 +65,7 @@ pub struct ShowArgs {
 /// and pin git to the non-locking, internal-diff code paths so the server stays
 /// within repository-focused inspection.
 #[derive(Debug, Clone)]
-pub struct GitReadOnly {
-    pub tool_router: ToolRouter<Self>,
-    pub prompt_router: PromptRouter<Self>,
-}
+pub struct GitReadOnly;
 
 impl GitReadOnly {
     fn validate_args(subcommand: &str, args: &[String]) -> Result<(), McpError> {
@@ -249,10 +246,7 @@ impl ServerHandler for GitReadOnly {
 
 impl Default for GitReadOnly {
     fn default() -> Self {
-        Self {
-            tool_router: Self::tool_router(),
-            prompt_router: Self::prompt_router(),
-        }
+        Self
     }
 }
 

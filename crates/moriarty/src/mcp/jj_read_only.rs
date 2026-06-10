@@ -23,7 +23,7 @@ use std::path::PathBuf;
 
 // 3rd party crates
 use rmcp::{
-    handler::server::{tool::ToolRouter, wrapper::Parameters},
+    handler::server::wrapper::Parameters,
     model::*,
     tool, tool_handler, tool_router, ErrorData as McpError, Json, ServerHandler,
 };
@@ -90,9 +90,7 @@ pub struct JjArgs {
 /// force `--ignore-working-copy`, and block jj flags that would expand the
 /// server beyond repository-focused inspection.
 #[derive(Debug, Clone)]
-pub struct JjReadOnly {
-    pub tool_router: ToolRouter<Self>,
-}
+pub struct JjReadOnly;
 
 impl JjReadOnly {
     fn validate_args(command: &JjCommand, args: &[String]) -> Result<(), McpError> {
@@ -171,9 +169,7 @@ impl ServerHandler for JjReadOnly {
 
 impl Default for JjReadOnly {
     fn default() -> Self {
-        Self {
-            tool_router: Self::tool_router(),
-        }
+        Self
     }
 }
 

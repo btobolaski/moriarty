@@ -68,7 +68,7 @@
 use std::path::PathBuf;
 
 use rmcp::{
-    handler::server::{tool::ToolRouter, wrapper::Parameters},
+    handler::server::wrapper::Parameters,
     model::*,
     tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler,
 };
@@ -127,9 +127,7 @@ impl std::fmt::Display for ProjectCommand {
 /// // Server can now be used with rmcp::ServiceExt::serve()
 /// ```
 #[derive(Clone)]
-pub struct ToolRunner {
-    tool_router: ToolRouter<Self>,
-}
+pub struct ToolRunner;
 
 impl ToolRunner {
     async fn run_command(cmd: ProjectCommand, args: RunArgs) -> Result<CallToolResult, McpError> {
@@ -221,9 +219,7 @@ impl ServerHandler for ToolRunner {
 
 impl Default for ToolRunner {
     fn default() -> Self {
-        Self {
-            tool_router: Self::tool_router(),
-        }
+        Self
     }
 }
 
