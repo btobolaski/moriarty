@@ -161,15 +161,15 @@ impl ToolRunner {
             }
         })?;
 
-        Ok(CallToolResult {
-            content: vec![
-                Content::text(format!("stdout: \n\n {}", output.stdout)),
-                Content::text(format!("stderr: \n\n {}", output.stderr)),
-            ],
-            is_error: Some(!matches!(output.exit_code, Some(0))),
-            meta: None,
-            structured_content: None,
-        })
+        let content = vec![
+            Content::text(format!("stdout: \n\n {}", output.stdout)),
+            Content::text(format!("stderr: \n\n {}", output.stderr)),
+        ];
+        if matches!(output.exit_code, Some(0)) {
+            Ok(CallToolResult::success(content))
+        } else {
+            Ok(CallToolResult::error(content))
+        }
     }
 }
 
@@ -208,14 +208,14 @@ impl ToolRunner {
 #[tool_handler]
 impl ServerHandler for ToolRunner {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            server_info: Implementation::from_build_env(),
-            instructions: Some(
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new(
+                env!("CARGO_CRATE_NAME"),
+                env!("CARGO_PKG_VERSION"),
+            ))
+            .with_instructions(
                 "This server provides configured tooling from the project".to_string(),
-            ),
-            ..Default::default()
-        }
+            )
     }
 }
 

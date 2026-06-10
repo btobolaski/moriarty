@@ -156,16 +156,16 @@ impl JjReadOnly {
 #[tool_handler]
 impl ServerHandler for JjReadOnly {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            server_info: Implementation::from_build_env(),
-            instructions: Some(
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new(
+                env!("CARGO_CRATE_NAME"),
+                env!("CARGO_PKG_VERSION"),
+            ))
+            .with_instructions(
                 "This server provides a tool for executing read-only jj (jujutsu) commands. \
                  Use the `run` tool with a JjCommand enum to specify which command to execute."
                     .to_string(),
-            ),
-            ..Default::default()
-        }
+            )
     }
 }
 
@@ -482,5 +482,30 @@ mod tests {
             assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
             assert!(error.message.contains(&rejected));
         }
+    }
+
+    #[test]
+    fn test_get_info_metadata() {
+        let server = JjReadOnly::default();
+        let info = server.get_info();
+
+        assert!(
+            info.capabilities.tools.is_some(),
+            "JjReadOnly must expose tools capability"
+        );
+        assert!(
+            info.capabilities.prompts.is_none(),
+            "JjReadOnly should not expose prompts capability"
+        );
+        assert_eq!(info.server_info.name, "moriarty");
+        assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
+        assert!(
+            info.instructions
+                .as_deref()
+                .unwrap_or("")
+                .contains("jj"),
+            "instructions should mention jj: {:?}",
+            info.instructions
+        );
     }
 }

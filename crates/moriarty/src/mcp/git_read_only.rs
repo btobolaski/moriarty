@@ -162,16 +162,14 @@ fn build_prompt(
     project_dir: &Path,
 ) -> GetPromptResult {
     let project = project_dir.to_string_lossy();
-    GetPromptResult {
-        description: Some(format!("get git {description_phrase} for {project}")),
-        messages: vec![
-            PromptMessage::new_text(PromptMessageRole::Assistant, role_msg.to_string()),
-            PromptMessage::new_text(
-                PromptMessageRole::User,
-                format!("run the {tool_label} tool with project \"{project}\""),
-            ),
-        ],
-    }
+    GetPromptResult::new(vec![
+        PromptMessage::new_text(PromptMessageRole::Assistant, role_msg.to_string()),
+        PromptMessage::new_text(
+            PromptMessageRole::User,
+            format!("run the {tool_label} tool with project \"{project}\""),
+        ),
+    ])
+    .with_description(format!("get git {description_phrase} for {project}"))
 }
 
 #[prompt_router]
@@ -233,14 +231,19 @@ impl GitReadOnly {
 #[prompt_handler]
 impl ServerHandler for GitReadOnly {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            capabilities: ServerCapabilities::builder().enable_prompts().enable_tools().build(),
-            server_info: Implementation::from_build_env(),
-            instructions: Some(
-                "This server provides prompt templates for read only git actions. All prompts are designed to provide structured, context-aware assistance".to_string()
-            ),
-            ..Default::default()
-        }
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_prompts()
+                .enable_tools()
+                .build(),
+        )
+        .with_server_info(Implementation::new(
+            env!("CARGO_CRATE_NAME"),
+            env!("CARGO_PKG_VERSION"),
+        ))
+        .with_instructions(
+            "This server provides prompt templates for read only git actions. All prompts are designed to provide structured, context-aware assistance".to_string(),
+        )
     }
 }
 
@@ -577,5 +580,30 @@ mod tests {
                 "rejected git args created output file"
             );
         }
+    }
+
+    #[test]
+    fn test_get_info_metadata() {
+        let server = GitReadOnly::default();
+        let info = server.get_info();
+
+        assert!(
+            info.capabilities.tools.is_some(),
+            "GitReadOnly must expose tools capability"
+        );
+        assert!(
+            info.capabilities.prompts.is_some(),
+            "GitReadOnly must expose prompts capability"
+        );
+        assert_eq!(info.server_info.name, "moriarty");
+        assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
+        assert!(
+            info.instructions
+                .as_deref()
+                .unwrap_or("")
+                .contains("git"),
+            "instructions should mention git: {:?}",
+            info.instructions
+        );
     }
 }

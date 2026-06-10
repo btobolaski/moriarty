@@ -487,3 +487,28 @@ async fn test_approval_lifecycle_with_binary_modification() {
     // Keep xdg_dir alive
     drop(xdg_dir);
 }
+
+#[test]
+fn test_get_info_metadata() {
+    let server = ToolRunner::default();
+    let info = server.get_info();
+
+    assert!(
+        info.capabilities.tools.is_some(),
+        "ToolRunner must expose tools capability"
+    );
+    assert_eq!(info.server_info.name, "moriarty");
+    assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
+    assert!(
+        info.capabilities.prompts.is_none(),
+        "ToolRunner should not expose prompts capability"
+    );
+    assert!(
+        info.instructions
+            .as_deref()
+            .unwrap_or("")
+            .contains("configured tooling"),
+        "instructions should mention configured tooling: {:?}",
+        info.instructions
+    );
+}
