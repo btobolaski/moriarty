@@ -4875,6 +4875,147 @@ fn mcp_tool_result_accepts_tool_not_found_error() {
     assert!(details.mcp_result.is_none());
 }
 
+/// `mode: "search"` populates `matches` and `query` in addition to
+/// `count`, departing from the list/status fields.
+#[test]
+fn mcp_tool_result_accepts_search_mode() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "mcp",
+        vec![json!({"type": "text", "text": "search"})],
+        false,
+        Some(json!({
+            "mode": "search",
+            "matches": [],
+            "count": 0,
+            "query": "write"
+        })),
+    ));
+    let Some(ToolResultDetails::Mcp(details)) = tool_result.details else {
+        panic!("expected Mcp details")
+    };
+    assert_eq!(details.mode, McpMode::Search);
+    assert_eq!(details.query.as_deref(), Some("write"));
+    assert_eq!(
+        details.matches.as_deref().map(|v| &v[..]),
+        Some(&[][..])
+    );
+    assert_eq!(details.count, Some(0));
+}
+
+/// Verify that every tool name routed through `McpToolResult` in
+/// `parse_tool_result_details` accepts a `{error, server}` payload.
+/// The table catches accidental removal of a match arm during
+/// refactoring and regressions in `McpClientError` field
+/// deserialization.
+#[test]
+fn all_routed_mcp_tool_names_parse_client_errors() {
+    for (tool_name, server) in [
+        ("project_tools_run_build", "project-tools"),
+        ("project_tools_run_formatter", "project-tools"),
+        ("project_tools_run_lint", "project-tools"),
+        ("project_tools_run_tests", "project-tools"),
+        ("jj_read_only_run", "jj-read-only"),
+    ] {
+        let tool_result = parse_tool_result_message(tool_result_message_json(
+            tool_name,
+            vec![json!({"type": "text", "text": "client error"})],
+            false,
+            Some(json!({"error": "call_failed", "server": server})),
+        ));
+        let Some(ToolResultDetails::McpToolResult(mcp)) = tool_result.details else {
+            panic!("expected McpToolResult for {tool_name}")
+        };
+        let McpToolResult::Error(err) = mcp else {
+            panic!("expected McpToolResult::Error for {tool_name}")
+        };
+        assert_eq!(err.error, "call_failed");
+        assert_eq!(err.server, server);
+    }
+}
+
+/// A successful direct MCP tool call emits a `{server, tool}` breadcrumb.
+/// This path was historically routed through the shape-based fallback
+/// (matching `GitReadOnlyDetails`); now `project_tools_run_*` and
+/// `jj_read_only_run` are explicitly dispatched to `McpToolResult`, so
+/// this test ensures the breadcrumb is accepted there too.
+#[test]
+fn direct_mcp_tool_result_accepts_breadcrumb() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "project_tools_run_tests",
+        vec![json!({"type": "text", "text": "stdout:\n\n success\n"})],
+        false,
+        Some(json!({"server": "project-tools", "tool": "run_tests"})),
+    ));
+    let Some(ToolResultDetails::McpToolResult(mcp)) = tool_result.details else {
+        panic!("expected McpToolResult details")
+    };
+    let McpToolResult::Breadcrumb(breadcrumb) = mcp else {
+        panic!("expected McpToolResult::Breadcrumb")
+    };
+    assert_eq!(breadcrumb.server, "project-tools");
+    assert_eq!(breadcrumb.tool, "run_tests");
+}
+
+/// `jj_read_only_run` tool result parsing also routes through
+/// `McpToolResult`; here a client-side error is exercised so a
+/// regressed `jj_read_only_run` silently disappearing from reports
+/// would be caught before it reaches the user.
+#[test]
+fn jj_read_only_run_client_error_is_parsed() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "jj_read_only_run",
+        vec![json!({
+            "type": "text",
+            "text": "Failed to call tool: MCP error -32603: server disconnected"
+        })],
+        false,
+        Some(json!({
+            "error": "call_failed",
+            "server": "jj-read-only"
+        })),
+    ));
+    let Some(ToolResultDetails::McpToolResult(mcp)) = tool_result.details else {
+        panic!("expected McpToolResult details")
+    };
+    let McpToolResult::Error(err) = mcp else {
+        panic!("expected McpToolResult::Error, got Call")
+    };
+    assert_eq!(err.error, "call_failed");
+    assert_eq!(err.server, "jj-read-only");
+}
+
+/// Untagged enum dispatch is order-dependent: `McpToolResult` is ordered
+/// before `GitReadOnly`, so `{server, tool}` matches
+/// `McpToolResult::Breadcrumb` first. The test assertion pins this
+/// ordering.
+#[test]
+fn mcp_client_error_vs_git_read_only_discrimination() {
+    // {server, tool} → McpToolResult::Breadcrumb (hits first because
+    // McpBreadcrumb and GitReadOnlyDetails have the same field set and
+    // McpToolResult is ordered before GitReadOnly in the untagged enum).
+    let details: ToolResultDetails =
+        serde_json::from_value(json!({"server": "git", "tool": "status"}))
+            .expect("expected direct ToolResultDetails parse");
+    assert!(matches!(details, ToolResultDetails::McpToolResult(_)));
+
+    // {error, server} → McpToolResult::Error
+    let details: ToolResultDetails =
+        serde_json::from_value(json!({"error": "call_failed", "server": "project-tools"}))
+            .expect("expected direct ToolResultDetails parse");
+    assert!(matches!(details, ToolResultDetails::McpToolResult(_)));
+
+    // {server, tool, error} is rejected: GitReadOnlyDetails denies
+    // `error`, McpClientError denies `tool`, McpBreadcrumb denies
+    // `error`. The parser loudly surfaces the ambiguity.
+    let result =
+        serde_json::from_value::<ToolResultDetails>(json!({
+            "server": "git",
+            "tool": "status",
+            "error": "oops"
+        }));
+    assert!(result.is_err());
+}
+
 #[test]
 fn mcp_details_serialize_hint_server_as_camel_case() {
     let value = serde_json::to_value(McpDetails {
@@ -4891,6 +5032,8 @@ fn mcp_details_serialize_hint_server_as_camel_case() {
         connected_count: None,
         tools: None,
         count: None,
+        matches: None,
+        query: None,
     })
     .expect("serialize mcp details");
 

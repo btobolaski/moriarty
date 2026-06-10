@@ -1629,6 +1629,11 @@ fn parse_tool_result_details(
             serde_json::from_value(details).map(ToolResultDetails::SearchResult)
         }
         "mcp" => serde_json::from_value(details).map(ToolResultDetails::Mcp),
+        "project_tools_run_build"
+        | "project_tools_run_formatter"
+        | "project_tools_run_lint"
+        | "project_tools_run_tests"
+        | "jj_read_only_run" => serde_json::from_value(details).map(ToolResultDetails::McpToolResult),
         "plannotator_submit_plan" => {
             serde_json::from_value(details).map(ToolResultDetails::PlannotatorSubmitPlan)
         }
@@ -1672,6 +1677,7 @@ pub enum ToolResultDetails {
     SearchResult(SearchResultDetails),
     Intercom(IntercomResultDetails),
     Mcp(McpDetails),
+    McpToolResult(McpToolResult),
     Bash(BashDetails),
     PlannotatorSubmitPlan(PlannotatorSubmitPlanDetails),
     Todo(TodoDetails),
@@ -1686,8 +1692,14 @@ pub enum ToolResultDetails {
     // rejected by LsDetails (deny_unknown_fields) and falls through to Find.
     Ls(LsDetails),
     Find(FindDetails),
-    // GitReadOnly and FetchContent have no shape overlap with anything
-    // above (each carries fields no other variant declares).
+    // McpToolResult::Breadcrumb and GitReadOnly both declare `{server,
+    // tool}`; Breadcrumb hits first because McpToolResult is ordered
+    // above. `git_read_only_*` tools are still routed to `GitReadOnly`
+    // explicitly by `parse_tool_result_details`, so the variant ordering
+    // only affects the shape-based fallback path for unknown tools.
+    //
+    // FetchContent has no shape overlap with anything above (it declares
+    // `urls`, `urlCount`, ... that no other variant carries).
     //
     // GetSearchContent is dual-shape: its Success arm is uniquely
     // identified by `{url, title, contentLength}`, and its Error arm is
@@ -2482,6 +2494,7 @@ pub enum McpMode {
     Call,
     Describe,
     List,
+    Search,
     Status,
 }
 
@@ -2555,6 +2568,15 @@ pub struct McpDetails {
     /// Number of tools in `tools` (list mode).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub count: Option<u32>,
+    /// `mode: "search"` search results; kept as raw `JsonBlob` because
+    /// MCP tool search schemas are server-defined (same reasoning as
+    /// `McpCallResult.content`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matches: Option<Vec<JsonBlob>>,
+    /// `mode: "search"` query that produced `matches`; absent for
+    /// local-state-only searches that don't issue a remote query.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -2578,6 +2600,40 @@ pub struct McpCallResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub structured_content: Option<JsonBlob>,
     pub is_error: bool,
+}
+
+/// Client-side MCP call failure recorded when pi's MCP transport itself
+/// rejects a tool call before it reaches the server (e.g. config hash
+/// mismatch after approval).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct McpClientError {
+    pub error: String,
+    pub server: String,
+}
+
+/// Compact breadcrumb emitted when a direct MCP tool call succeeds (e.g.
+/// `project_tools_run_*`, `jj_read_only_run`, `git_read_only_*`). The
+/// full output is in the tool-result text; the breadcrumb just names the
+/// server and tool so the parser can attribute the result.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct McpBreadcrumb {
+    pub server: String,
+    pub tool: String,
+}
+
+/// Tool result details for MCP-based tools that are called directly (e.g.
+/// `project_tools_run_*`, `jj_read_only_run`). A successful call either
+/// passes through the MCP `CallToolResult` or records a compact
+/// `{server, tool}` breadcrumb; a client-side transport failure records
+/// only the server name and a compact error string.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum McpToolResult {
+    Call(McpCallResult),
+    Breadcrumb(McpBreadcrumb),
+    Error(McpClientError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
