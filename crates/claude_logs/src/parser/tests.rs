@@ -7935,6 +7935,68 @@ fn test_parse_turn_duration_with_message_count() {
 }
 
 #[test]
+fn test_parse_turn_duration_with_pending_background_agent_count() {
+    let json = serde_json::json!({
+        "type": "system",
+        "subtype": "turn_duration",
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.170",
+        "gitBranch": "main",
+        "durationMs": 1223071,
+        "timestamp": "2026-06-11T17:59:54.862Z",
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "isMeta": false,
+        "entrypoint": "cli",
+        "messageCount": 501,
+        "pendingBackgroundAgentCount": 3
+    });
+    let line: LogLine = serde_json::from_value(json)
+        .expect("Failed to parse turn_duration with pendingBackgroundAgentCount");
+    match line {
+        LogLine::System(SystemLogLine::TurnDuration(duration)) => {
+            assert_eq!(duration.duration_ms, 1223071);
+            assert_eq!(duration.message_count, Some(501));
+            assert_eq!(duration.pending_background_agent_count, Some(3));
+        }
+        _ => panic!("Expected System(TurnDuration) variant"),
+    }
+}
+
+#[test]
+fn test_parse_turn_duration_pending_background_agent_count_zero() {
+    // A zero count must deserialize to Some(0), distinct from the field being absent (None).
+    let json = serde_json::json!({
+        "type": "system",
+        "subtype": "turn_duration",
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.170",
+        "gitBranch": "main",
+        "durationMs": 100,
+        "timestamp": "2026-06-11T17:59:54.862Z",
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "isMeta": false,
+        "entrypoint": "cli",
+        "pendingBackgroundAgentCount": 0
+    });
+    let line: LogLine = serde_json::from_value(json)
+        .expect("Failed to parse turn_duration with pendingBackgroundAgentCount of 0");
+    match line {
+        LogLine::System(SystemLogLine::TurnDuration(duration)) => {
+            assert_eq!(duration.pending_background_agent_count, Some(0));
+        }
+        _ => panic!("Expected System(TurnDuration) variant"),
+    }
+}
+
+#[test]
 fn test_parse_user_log_line_with_origin() {
     let json = serde_json::json!({
         "parentUuid": null,

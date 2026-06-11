@@ -1134,6 +1134,8 @@ pub struct TurnDuration {
     pub entrypoint: Option<String>,
     /// Number of messages in the turn. Added in Claude Code 2.1.104+.
     pub message_count: Option<u32>,
+    /// Background agents still running when the turn completed. Added in Claude Code 2.1.170+.
+    pub pending_background_agent_count: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
