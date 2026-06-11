@@ -5789,6 +5789,7 @@ fn subagent_result_summary_serializes_control_events_as_camel_case() {
         task: None,
         response: None,
         exit_code: None,
+        timed_out: None,
         usage: None,
         model: None,
         artifact_paths: None,
@@ -5838,6 +5839,27 @@ fn subagent_result_summary_serializes_control_events_as_camel_case() {
     );
     assert!(value.get("control_events").is_none());
     assert!(value.get("acceptance").is_none());
+}
+
+/// Pins the `timedOut` camelCase wire key mapping on subagent result
+/// summaries, covering both `true` and `false` values.
+#[test]
+fn subagent_tool_result_deserializes_timed_out() {
+    for expected in [true, false] {
+        let tool_result = parse_tool_result_message(tool_result_message_json(
+            "subagent",
+            vec![json!({"type": "text", "text": "done"})],
+            false,
+            Some(json!({
+                "mode": "single",
+                "results": [{"agent": "scout", "timedOut": expected}]
+            })),
+        ));
+        let Some(ToolResultDetails::Subagent(details)) = tool_result.details else {
+            panic!("expected Subagent details")
+        };
+        assert_eq!(details.results[0].timed_out, Some(expected));
+    }
 }
 
 /// Pins strict rejection of extra fields on `SubagentControlEventPayload`.

@@ -2058,6 +2058,8 @@ pub struct SubagentResultSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timed_out: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<SubagentUsage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
