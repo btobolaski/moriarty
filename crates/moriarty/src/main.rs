@@ -364,13 +364,20 @@ enum RulesCommand {
         /// Only suggest commands seen at least this many times
         #[arg(long, default_value_t = 2)]
         min_count: u64,
-        /// Generated pattern shape: a fully-literal exact match, or a program-name prefix
+        /// Generated pattern shape: a fully-literal exact match per leaf, a program-name prefix,
+        /// or a fuzzy per-program generalization over observed subcommands
         #[arg(long = "match", value_enum, default_value = "exact")]
         match_mode: rules::MatchMode,
         /// Action for generated rules (defaults to ask, or deny when --result deny)
         #[arg(long, value_enum)]
         action: Option<rules::SuggestAction>,
-        /// Output as JSON ([{rule, count, observed_command}]) instead of TOML
+        /// Mine every recorded line, not just those produced by the rules currently in force
+        #[arg(long)]
+        all_rules: bool,
+        /// Mine only lines recorded under this exact rule-set hash (default: the active config's hash)
+        #[arg(long, value_name = "HASH")]
+        rules_hash: Option<String>,
+        /// Output as JSON ([{rule, count, observed_commands}]) instead of TOML
         #[arg(long)]
         json: bool,
     },
@@ -391,6 +398,12 @@ enum RulesCommand {
         /// Only replay commands whose recorded outcome was this (e.g. allow to guard auto-approvals)
         #[arg(long, value_enum)]
         result: Option<PreToolResult>,
+        /// Replay every recorded line, not just those produced by the rules currently in force
+        #[arg(long)]
+        all_rules: bool,
+        /// Replay only lines recorded under this exact rule-set hash (default: the active config's hash)
+        #[arg(long, value_name = "HASH")]
+        rules_hash: Option<String>,
         /// Output as JSON instead of human-readable text
         #[arg(long)]
         json: bool,

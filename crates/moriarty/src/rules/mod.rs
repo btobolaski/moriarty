@@ -5,8 +5,9 @@
 
 // standard library
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::PathBuf,
+    sync::LazyLock,
 };
 
 // 3rd party crates
@@ -16,23 +17,32 @@ use serde::Serialize;
 use tabled::{Table, Tabled};
 
 // local / workspace deps
-use crate::cost_report::TimeRangeFilter;
-use crate::hooks::bash_rules::{
-    default_fragments, expand_fragments, BashRuleEngine, RuleDiagnostic, RuleResult,
+use crate::{
+    cost_report::TimeRangeFilter,
+    hooks::{
+        bash_rules::{
+            default_fragments, expand_fragments, BashRuleEngine, RuleDiagnostic, RuleResult,
+        },
+        command_split::{split_command, SplitOutcome},
+        report::{aggregate_with_cwd, CwdAggregation, ReportRow, RulesHashFilter},
+        result::PreToolResult,
+        tool_rules::ToolRuleEngine,
+    },
+    user_config::{load_user_config, load_user_config_from, BashRule, BashRuleAction, UserConfig},
+    RulesCommand,
 };
-use crate::hooks::report::{aggregate, ReportRow};
-use crate::hooks::result::PreToolResult;
-use crate::hooks::tool_rules::ToolRuleEngine;
-use crate::user_config::{load_user_config_from, BashRule, BashRuleAction, UserConfig};
-use crate::RulesCommand;
 
 /// Generated-pattern shape for `rules suggest`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum MatchMode {
-    /// A fully-literal, fully-anchored match of the whole observed command.
+    /// A fully-literal, fully-anchored match of one observed leaf command.
     Exact,
     /// A match on just the program name (the first token).
     Prefix,
+    /// One pattern per program, generalizing safe-identifier subcommands across the observed
+    /// leaves into a closed alternation (`^cargo (build|check)(\s|$)`), falling back to a program
+    /// prefix when the second tokens are not all simple identifiers.
+    Fuzzy,
 }
 
 /// Action assigned to rules emitted by `rules suggest`.
@@ -62,6 +72,8 @@ pub async fn exec_rules(cmd: RulesCommand) -> Result<()> {
             min_count,
             match_mode,
             action,
+            all_rules,
+            rules_hash,
             json,
         } => {
             suggest(SuggestOptions {
@@ -73,6 +85,8 @@ pub async fn exec_rules(cmd: RulesCommand) -> Result<()> {
                 min_count,
                 match_mode,
                 action,
+                all_rules,
+                rules_hash,
                 json,
             })
             .await
@@ -83,8 +97,22 @@ pub async fn exec_rules(cmd: RulesCommand) -> Result<()> {
             start_time,
             end_time,
             result,
+            all_rules,
+            rules_hash,
             json,
-        } => replay(dir, config, start_time, end_time, result, json).await,
+        } => {
+            replay(ReplayOptions {
+                dir,
+                config,
+                start_time,
+                end_time,
+                result,
+                all_rules,
+                rules_hash,
+                json,
+            })
+            .await
+        }
     }
 }
 
@@ -484,31 +512,96 @@ struct SuggestOptions {
     min_count: u64,
     match_mode: MatchMode,
     action: Option<SuggestAction>,
+    all_rules: bool,
+    rules_hash: Option<String>,
     json: bool,
+}
+
+/// Mirrors the `rules replay` CLI fields; grouped to stay under clippy's argument-count limit.
+struct ReplayOptions {
+    dir: Option<PathBuf>,
+    config: Option<PathBuf>,
+    start_time: Option<String>,
+    end_time: Option<String>,
+    result: Option<PreToolResult>,
+    all_rules: bool,
+    rules_hash: Option<String>,
+    json: bool,
+}
+
+/// Resolves how `replay`/`suggest` scope recorded history to a rule set, returning the filter plus
+/// the hash to display (`None` under `--all-rules`). The default — neither `--all-rules` nor an
+/// explicit `--rules-hash` — is the rule set currently installed at the default config path, which
+/// for `replay` is the migration *source*, independent of any `--config` candidate being tested.
+async fn resolve_hash_filter(
+    all_rules: bool,
+    rules_hash: Option<String>,
+) -> Result<(RulesHashFilter, Option<String>)> {
+    if all_rules {
+        return Ok((RulesHashFilter::Any, None));
+    }
+    if let Some(hash) = rules_hash {
+        return Ok((RulesHashFilter::Only(hash.clone()), Some(hash)));
+    }
+    let active_hash = load_user_config().await?.effective_hash();
+    Ok((
+        RulesHashFilter::Only(active_hash.clone()),
+        Some(active_hash),
+    ))
+}
+
+/// A filtered run must never silently look like it covered all of history, so every output mode
+/// (human, TOML header, JSON-on-stderr) renders this same scope line.
+fn rules_scope_note(
+    active_hash: &Option<String>,
+    skipped: &crate::hooks::report::HashSkipStats,
+) -> String {
+    match active_hash {
+        None => "Rule set: all (--all-rules); no hash filter applied.".to_string(),
+        Some(hash) => format!(
+            "Rule set: {hash}; skipped {} record(s) from other rule sets and {} predating rule-hash logging \
+             (use --all-rules to include them).",
+            skipped.other_rules, skipped.no_hash
+        ),
+    }
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
 struct Suggestion {
     rule: BashRule,
     count: u64,
-    observed_command: String,
+    /// Every recorded command that contributed to this suggestion, so a generalized (prefix/fuzzy)
+    /// or shared-leaf pattern is reviewable against what was actually observed.
+    observed_commands: Vec<String>,
 }
 
 async fn suggest(opts: SuggestOptions) -> Result<()> {
     let action = opts.action.unwrap_or_else(|| default_action(opts.result));
 
-    // Allow rules must be exact: a prefix Allow would auto-approve far more than was observed.
+    // Allow rules must be exact: a prefix or fuzzy Allow would auto-approve more than was observed.
     if matches!(action, SuggestAction::Allow) && !matches!(opts.match_mode, MatchMode::Exact) {
         return Err(miette::miette!(
-            "Refusing to suggest Allow rules with --match prefix; use --match exact for literal, fully-anchored Allow rules"
+            "Refusing to suggest Allow rules with --match {}; use --match exact for literal, fully-anchored Allow rules",
+            match_mode_label(opts.match_mode)
         ));
     }
 
     let filter = TimeRangeFilter::new(opts.start_time, opts.end_time)?;
-    let rows = aggregate(opts.dir, &filter, Some("Bash"), Some(opts.result)).await?;
+    let (hash_filter, active_hash) = resolve_hash_filter(opts.all_rules, opts.rules_hash).await?;
+    let CwdAggregation { rows, skipped } = aggregate_with_cwd(
+        opts.dir,
+        &filter,
+        Some("Bash"),
+        Some(opts.result),
+        &hash_filter,
+    )
+    .await?;
     let suggestions = build_suggestions(&rows, opts.match_mode, action, opts.min_count, opts.limit);
+    let scope = rules_scope_note(&active_hash, &skipped);
 
     if opts.json {
+        // The scope note goes to stderr so stdout stays the suggestions array that callers parse.
+        eprintln!("{scope}");
         let rendered = serde_json::to_string_pretty(&suggestions)
             .into_diagnostic()
             .wrap_err("Failed to serialize suggestions")?;
@@ -517,6 +610,7 @@ async fn suggest(opts: SuggestOptions) -> Result<()> {
     }
 
     if suggestions.is_empty() {
+        println!("# {scope}");
         println!("# No commands matched (try lowering --min-count or widening the time range).");
         return Ok(());
     }
@@ -531,6 +625,7 @@ async fn suggest(opts: SuggestOptions) -> Result<()> {
         .wrap_err("Failed to render suggestions")?;
 
     println!("# Suggested rules from the hook logs. Review before adding them to tool_rules.toml.");
+    println!("# {scope}");
     println!("# Re-run with --json to see how often each command was seen.");
     println!();
     print!("{toml}");
@@ -546,8 +641,41 @@ fn default_action(result: PreToolResult) -> SuggestAction {
     }
 }
 
-/// Pure core of `suggest`: turns aggregated Bash rows into anchored rule suggestions. `rows` arrive
-/// sorted by descending count, so `take(limit)` yields the most-frequent commands.
+fn match_mode_label(mode: MatchMode) -> &'static str {
+    match mode {
+        MatchMode::Exact => "exact",
+        MatchMode::Prefix => "prefix",
+        MatchMode::Fuzzy => "fuzzy",
+    }
+}
+
+/// Accumulates everything observed for one leaf text (or one generated pattern): the summed
+/// occurrence count and the full commands it came from, kept sorted for deterministic output.
+#[derive(Default)]
+struct ObservedGroup {
+    count: u64,
+    observed: BTreeSet<String>,
+}
+
+impl ObservedGroup {
+    fn absorb(&mut self, count: u64, observed_command: &str) {
+        self.count += count;
+        self.observed.insert(observed_command.to_string());
+    }
+
+    fn merge(&mut self, other: &ObservedGroup) {
+        self.count += other.count;
+        self.observed.extend(other.observed.iter().cloned());
+    }
+}
+
+/// Pure core of `suggest`: turns aggregated Bash rows into anchored rule suggestions.
+///
+/// Each observed command is first split into the leaf simple-commands the hook actually evaluates
+/// (with the row's recorded cwd, so leaves are normalized exactly as they were matched), because a
+/// whole-compound literal like `^git status && ls$` can never match the per-leaf engine. Counts for
+/// the same leaf are summed across every compound it appeared in. A command the splitter bails on is
+/// kept whole — the hook cannot analyze it either, so only a whole-command pattern is meaningful.
 fn build_suggestions(
     rows: &[ReportRow],
     match_mode: MatchMode,
@@ -555,42 +683,130 @@ fn build_suggestions(
     min_count: u64,
     limit: usize,
 ) -> Vec<Suggestion> {
-    rows.iter()
-        .filter(|row| row.tool_name == "Bash" && row.count >= min_count)
-        .filter_map(|row| {
-            let command = row
-                .arguments
-                .get("command")
-                .and_then(|value| value.as_str())?;
-            let pattern = suggested_pattern(command, match_mode)?;
-            Some(Suggestion {
-                rule: BashRule {
-                    name: format!(
-                        "suggested-{}-{}",
-                        program_token(command),
-                        short_hash(command)
-                    ),
-                    pattern,
-                    action: to_bash_action(action),
-                },
-                count: row.count,
-                observed_command: command.to_string(),
-            })
-        })
-        .take(limit)
-        .collect()
-}
-
-/// Builds a safe regex for an observed command. Both shapes are fully `^`/`$`- or boundary-anchored
-/// and `regex::escape` the literal text, so a suggestion can never match more than intended.
-fn suggested_pattern(command: &str, match_mode: MatchMode) -> Option<String> {
-    match match_mode {
-        MatchMode::Exact => Some(format!("^{}$", regex::escape(command))),
-        MatchMode::Prefix => {
-            let program = shell_words::split(command).ok()?.into_iter().next()?;
-            Some(format!(r"^{}(\s|$)", regex::escape(&program)))
+    let mut leaves: BTreeMap<String, ObservedGroup> = BTreeMap::new();
+    for row in rows {
+        let Some(command) = row.bash_command() else {
+            continue;
+        };
+        // A leaf repeated within one compound counts once per recorded occurrence, not once per
+        // appearance, so the count still reflects how often the user saw a prompt.
+        let texts: BTreeSet<String> = match split_command(command, &row.cwd) {
+            SplitOutcome::Commands(parts) => parts.into_iter().map(|leaf| leaf.text).collect(),
+            SplitOutcome::Bail(_) => BTreeSet::from([command.to_string()]),
+        };
+        for text in texts {
+            leaves.entry(text).or_default().absorb(row.count, command);
         }
     }
+
+    // One candidate per generated pattern: exact mode yields one per leaf; prefix/fuzzy cluster all
+    // of a program's leaves into one pattern, merging their counts and observed commands.
+    let mut patterns: BTreeMap<String, (String, ObservedGroup)> = BTreeMap::new();
+    match match_mode {
+        MatchMode::Exact => {
+            for (text, group) in &leaves {
+                let pattern = format!("^{}$", regex::escape(text));
+                let entry = patterns
+                    .entry(pattern)
+                    .or_insert_with(|| (program_token(text), ObservedGroup::default()));
+                entry.1.merge(group);
+            }
+        }
+        MatchMode::Prefix => {
+            for (program, cluster) in cluster_by_program(&leaves) {
+                let pattern = format!(r"^{}(\s|$)", regex::escape(&program));
+                let entry = patterns
+                    .entry(pattern)
+                    .or_insert_with(|| (program_token(&program), ObservedGroup::default()));
+                entry.1.merge(&cluster.merged);
+            }
+        }
+        MatchMode::Fuzzy => {
+            for (program, cluster) in cluster_by_program(&leaves) {
+                let pattern = fuzzy_pattern(&program, &cluster.subcommands);
+                let entry = patterns
+                    .entry(pattern)
+                    .or_insert_with(|| (program_token(&program), ObservedGroup::default()));
+                entry.1.merge(&cluster.merged);
+            }
+        }
+    }
+
+    let mut suggestions: Vec<Suggestion> = patterns
+        .into_iter()
+        .filter(|(_, (_, group))| group.count >= min_count)
+        .map(|(pattern, (program, group))| Suggestion {
+            rule: BashRule {
+                name: format!("suggested-{}-{}", program, short_hash(&pattern)),
+                pattern,
+                action: to_bash_action(action),
+            },
+            count: group.count,
+            observed_commands: group.observed.into_iter().collect(),
+        })
+        .collect();
+
+    // Most frequent first; the pattern breaks ties so output is deterministic.
+    suggestions.sort_by(|a, b| {
+        b.count
+            .cmp(&a.count)
+            .then_with(|| a.rule.pattern.cmp(&b.rule.pattern))
+    });
+    suggestions.truncate(limit);
+    suggestions
+}
+
+/// One program's worth of observed leaves for prefix/fuzzy clustering.
+#[derive(Default)]
+struct ProgramCluster {
+    merged: ObservedGroup,
+    /// The second token of every leaf, or `None` for a leaf with no second token (bare program) or
+    /// one whose tokens cannot be parsed — either disqualifies the cluster from an alternation.
+    subcommands: Vec<Option<String>>,
+}
+
+/// Groups leaves by their program (first token). Leaves that cannot be tokenized are dropped: with
+/// no reliable program there is nothing safe to anchor a generalized pattern on.
+fn cluster_by_program(
+    leaves: &BTreeMap<String, ObservedGroup>,
+) -> BTreeMap<String, ProgramCluster> {
+    let mut clusters: BTreeMap<String, ProgramCluster> = BTreeMap::new();
+    for (text, group) in leaves {
+        let Ok(tokens) = shell_words::split(text) else {
+            continue;
+        };
+        let Some(program) = tokens.first().filter(|program| !program.is_empty()) else {
+            continue;
+        };
+        let cluster = clusters.entry(program.clone()).or_default();
+        cluster.merged.merge(group);
+        cluster.subcommands.push(tokens.get(1).cloned());
+    }
+    clusters
+}
+
+/// Generalizes one program's observed leaves: when every leaf has a simple-identifier second token
+/// (`cargo build`, `cargo check`), the distinct subcommands form a closed alternation; any bare
+/// invocation, flag, path, or other non-identifier second token falls back to a program prefix. The
+/// alternation never widens beyond tokens that were actually observed.
+fn fuzzy_pattern(program: &str, subcommands: &[Option<String>]) -> String {
+    static IDENTIFIER: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new("^[a-zA-Z][a-zA-Z0-9_-]*$").expect("static regex is valid"));
+    let all_safe = !subcommands.is_empty()
+        && subcommands
+            .iter()
+            .all(|sub| sub.as_deref().is_some_and(|sub| IDENTIFIER.is_match(sub)));
+    if !all_safe {
+        return format!(r"^{}(\s|$)", regex::escape(program));
+    }
+
+    let distinct: BTreeSet<&str> = subcommands.iter().flatten().map(String::as_str).collect();
+    let alternation = distinct
+        .into_iter()
+        .map(regex::escape)
+        .collect::<Vec<_>>()
+        .join("|");
+    format!(r"^{} ({})(\s|$)", regex::escape(program), alternation)
 }
 
 /// The command's program basename, for a readable rule name (`/usr/bin/ls` → `ls`).
@@ -646,17 +862,16 @@ struct ReplayReport {
     newly_allowed_count: usize,
     /// Total recorded commands evaluated (after any `--result` filter).
     total_evaluated: usize,
+    /// Hash of the rule set whose recorded decisions were replayed (`None` under `--all-rules`).
+    replayed_rules_hash: Option<String>,
+    /// Records excluded because they came from a different rule set.
+    skipped_other_rules: u64,
+    /// Records excluded because they predate rule-hash logging.
+    skipped_no_hash: u64,
 }
 
-async fn replay(
-    dir: Option<PathBuf>,
-    config_path: Option<PathBuf>,
-    start_time: Option<String>,
-    end_time: Option<String>,
-    result_filter: Option<PreToolResult>,
-    json: bool,
-) -> Result<()> {
-    let config = load_user_config_from(config_path.as_deref()).await?;
+async fn replay(opts: ReplayOptions) -> Result<()> {
+    let config = load_user_config_from(opts.config.as_deref()).await?;
     let engine = BashRuleEngine::from_config(
         config.bash_rules.unwrap_or_default(),
         config.pattern_fragments,
@@ -664,11 +879,13 @@ async fn replay(
 
     // Replay defaults to all recorded history, but `--start-time`/`--end-time` bound the window so a
     // long-lived log doesn't force every candidate to clear every command ever run.
-    let filter = TimeRangeFilter::new(start_time, end_time)?;
-    let rows = aggregate(dir, &filter, Some("Bash"), None).await?;
-    let report = build_replay_report(&rows, &engine, result_filter);
+    let filter = TimeRangeFilter::new(opts.start_time, opts.end_time)?;
+    let (hash_filter, replayed_hash) = resolve_hash_filter(opts.all_rules, opts.rules_hash).await?;
+    let CwdAggregation { rows, skipped } =
+        aggregate_with_cwd(opts.dir, &filter, Some("Bash"), None, &hash_filter).await?;
+    let report = build_replay_report(&rows, &engine, opts.result, replayed_hash, skipped);
 
-    if json {
+    if opts.json {
         let rendered = serde_json::to_string_pretty(&report)
             .into_diagnostic()
             .wrap_err("Failed to serialize replay report")?;
@@ -686,12 +903,14 @@ async fn replay(
 }
 
 /// Pure core of `replay`: recompute each recorded Bash command through the candidate engine and
-/// classify the divergences. Historical records carry no cwd, so normalization uses an empty cwd
-/// (the read-only commands that dominate Allow records do not depend on it).
+/// classify the divergences. Each row carries the cwd it ran under so commands normalize exactly as
+/// the hook did; rows from before cwd was logged fall back to an empty cwd (normalization disabled).
 fn build_replay_report(
     rows: &[ReportRow],
     engine: &BashRuleEngine,
     result_filter: Option<PreToolResult>,
+    replayed_rules_hash: Option<String>,
+    skipped: crate::hooks::report::HashSkipStats,
 ) -> ReplayReport {
     let mut divergences = Vec::new();
     let mut lost_allow_count = 0;
@@ -699,22 +918,15 @@ fn build_replay_report(
     let mut total_evaluated = 0;
 
     for row in rows {
-        if row.tool_name != "Bash" {
-            continue;
-        }
         if result_filter.is_some_and(|filter| filter != row.result) {
             continue;
         }
-        let Some(command) = row
-            .arguments
-            .get("command")
-            .and_then(|value| value.as_str())
-        else {
+        let Some(command) = row.bash_command() else {
             continue;
         };
         total_evaluated += 1;
 
-        let computed = classify_result(&engine.apply_rules_compound(command, ""));
+        let computed = classify_result(&engine.apply_rules_compound(command, &row.cwd));
         if computed == row.result {
             continue;
         }
@@ -743,6 +955,9 @@ fn build_replay_report(
         lost_allow_count,
         newly_allowed_count,
         total_evaluated,
+        replayed_rules_hash,
+        skipped_other_rules: skipped.other_rules,
+        skipped_no_hash: skipped.no_hash,
     }
 }
 
@@ -758,6 +973,14 @@ fn classify_result(result: &RuleResult) -> PreToolResult {
 }
 
 fn print_replay(report: &ReplayReport) {
+    match &report.replayed_rules_hash {
+        Some(hash) => println!(
+            "Rule set: {hash}; skipped {} record(s) from other rule sets and {} predating rule-hash \
+             logging (use --all-rules to include them).",
+            report.skipped_other_rules, report.skipped_no_hash
+        ),
+        None => println!("Rule set: all (--all-rules); no hash filter applied."),
+    }
     println!(
         "Replayed {} recorded Bash command(s) against the candidate config.",
         report.total_evaluated
@@ -951,11 +1174,17 @@ mod tests {
     // ===== suggest =====
 
     fn bash_row(command: &str, count: u64, result: PreToolResult) -> ReportRow {
+        bash_row_in(command, count, result, "")
+    }
+
+    fn bash_row_in(command: &str, count: u64, result: PreToolResult, cwd: &str) -> ReportRow {
         ReportRow {
             tool_name: "Bash".to_string(),
             arguments: serde_json::json!({ "command": command }),
             result,
             count,
+            rule: None,
+            cwd: cwd.to_string(),
         }
     }
 
@@ -967,7 +1196,7 @@ mod tests {
         assert_eq!(suggestions.len(), 1);
         let suggestion = &suggestions[0];
         assert_eq!(suggestion.count, 3);
-        assert_eq!(suggestion.observed_command, "ls -la");
+        assert_eq!(suggestion.observed_commands, vec!["ls -la".to_string()]);
         assert!(suggestion.rule.name.starts_with("suggested-ls-"));
         assert!(matches!(suggestion.rule.action, BashRuleAction::Ask));
 
@@ -1009,8 +1238,8 @@ mod tests {
             2,
             "min_count drops 'b', limit keeps top 2"
         );
-        assert_eq!(suggestions[0].observed_command, "a");
-        assert_eq!(suggestions[1].observed_command, "c");
+        assert_eq!(suggestions[0].observed_commands, vec!["a".to_string()]);
+        assert_eq!(suggestions[1].observed_commands, vec!["c".to_string()]);
     }
 
     #[test]
@@ -1037,6 +1266,8 @@ mod tests {
             min_count: 2,
             match_mode: MatchMode::Prefix,
             action: Some(SuggestAction::Allow),
+            all_rules: false,
+            rules_hash: None,
             json: false,
         })
         .await
@@ -1058,6 +1289,245 @@ mod tests {
         assert_eq!(parsed, config);
     }
 
+    #[test]
+    fn suggest_splits_compounds_into_per_leaf_suggestions() {
+        // A whole-compound literal could never match the per-leaf engine, so each leaf gets its own
+        // exact suggestion, and the generated pattern must actually allow that leaf when adopted.
+        let rows = vec![bash_row("git status && ls -la", 3, PreToolResult::Ask)];
+        let suggestions = build_suggestions(&rows, MatchMode::Exact, SuggestAction::Allow, 2, 10);
+
+        let patterns: Vec<&str> = suggestions
+            .iter()
+            .map(|suggestion| suggestion.rule.pattern.as_str())
+            .collect();
+        assert_eq!(patterns, vec![r"^git status$", r"^ls \-la$"]);
+        for suggestion in &suggestions {
+            assert_eq!(suggestion.count, 3);
+            assert_eq!(
+                suggestion.observed_commands,
+                vec!["git status && ls -la".to_string()]
+            );
+        }
+
+        let rules: Vec<BashRule> = suggestions.iter().map(|s| s.rule.clone()).collect();
+        let engine = BashRuleEngine::from_config(rules, None).unwrap();
+        assert!(
+            matches!(
+                engine.apply_rules_compound("git status && ls -la", ""),
+                RuleResult::Allowed { .. }
+            ),
+            "adopting the suggestions must allow the observed compound"
+        );
+    }
+
+    #[test]
+    fn suggest_sums_counts_for_a_leaf_shared_across_compounds() {
+        let rows = vec![
+            bash_row("git status && cargo test", 2, PreToolResult::Ask),
+            bash_row("git status", 3, PreToolResult::Ask),
+        ];
+        let suggestions = build_suggestions(&rows, MatchMode::Exact, SuggestAction::Ask, 1, 10);
+
+        let git = suggestions
+            .iter()
+            .find(|suggestion| suggestion.rule.pattern == "^git status$")
+            .expect("the shared git leaf should be suggested");
+        assert_eq!(
+            git.count, 5,
+            "counts sum across every compound the leaf appeared in"
+        );
+        assert_eq!(
+            git.observed_commands,
+            vec![
+                "git status".to_string(),
+                "git status && cargo test".to_string()
+            ],
+            "observed commands are reported in sorted order"
+        );
+    }
+
+    #[test]
+    fn suggest_normalizes_leaves_with_the_recorded_cwd() {
+        let rows = vec![bash_row_in(
+            "cat /work/proj/src/main.rs",
+            3,
+            PreToolResult::Ask,
+            "/work/proj",
+        )];
+        let suggestions = build_suggestions(&rows, MatchMode::Exact, SuggestAction::Ask, 2, 10);
+
+        assert_eq!(
+            suggestions[0].rule.pattern, r"^cat src/main\.rs$",
+            "the leaf is normalized exactly as the hook matched it"
+        );
+    }
+
+    #[test]
+    fn suggest_keeps_a_bailed_command_whole() {
+        // The hook cannot analyze a command with a substitution, so suggesting per-leaf pieces would
+        // be meaningless; the whole observed text is kept, exactly as before.
+        let rows = vec![bash_row("echo $(date)", 4, PreToolResult::Ask)];
+        let suggestions = build_suggestions(&rows, MatchMode::Exact, SuggestAction::Ask, 2, 10);
+
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(
+            suggestions[0].rule.pattern,
+            format!("^{}$", regex::escape("echo $(date)"))
+        );
+    }
+
+    #[test]
+    fn suggest_prefix_merges_same_program_rows() {
+        let rows = vec![
+            bash_row("cargo build", 2, PreToolResult::Ask),
+            bash_row("cargo check --all", 3, PreToolResult::Ask),
+        ];
+        let suggestions = build_suggestions(&rows, MatchMode::Prefix, SuggestAction::Ask, 2, 10);
+
+        assert_eq!(suggestions.len(), 1, "one prefix rule per program");
+        assert_eq!(suggestions[0].rule.pattern, r"^cargo(\s|$)");
+        assert_eq!(suggestions[0].count, 5);
+        assert_eq!(suggestions[0].observed_commands.len(), 2);
+    }
+
+    #[test]
+    fn suggest_fuzzy_generalizes_safe_subcommands_into_an_alternation() {
+        let rows = vec![
+            bash_row("cargo build", 2, PreToolResult::Ask),
+            bash_row("cargo build --release", 3, PreToolResult::Ask),
+            bash_row("cargo check", 2, PreToolResult::Ask),
+        ];
+        let suggestions = build_suggestions(&rows, MatchMode::Fuzzy, SuggestAction::Ask, 2, 10);
+
+        assert_eq!(suggestions.len(), 1);
+        let suggestion = &suggestions[0];
+        assert_eq!(suggestion.rule.pattern, r"^cargo (build|check)(\s|$)");
+        assert_eq!(suggestion.count, 7);
+        assert_eq!(suggestion.observed_commands.len(), 3);
+
+        let regex = Regex::new(&suggestion.rule.pattern).unwrap();
+        assert!(regex.is_match("cargo build"));
+        assert!(regex.is_match("cargo build --release"));
+        assert!(regex.is_match("cargo check"));
+        assert!(
+            !regex.is_match("cargo publish"),
+            "the alternation is closed"
+        );
+        assert!(
+            !regex.is_match("cargo buildx"),
+            "subcommand needs its own boundary"
+        );
+    }
+
+    #[test]
+    fn suggest_fuzzy_falls_back_to_prefix_on_non_identifier_second_token() {
+        // `-la` is a flag and `src/main.rs` is a path; neither is a safe-identifier subcommand, so
+        // the cluster degrades to a program prefix instead of inventing an alternation over them.
+        let rows = vec![
+            bash_row("ls -la", 3, PreToolResult::Ask),
+            bash_row("cat src/main.rs", 2, PreToolResult::Ask),
+        ];
+        let suggestions = build_suggestions(&rows, MatchMode::Fuzzy, SuggestAction::Ask, 2, 10);
+
+        let patterns: Vec<&str> = suggestions
+            .iter()
+            .map(|suggestion| suggestion.rule.pattern.as_str())
+            .collect();
+        assert_eq!(patterns, vec![r"^ls(\s|$)", r"^cat(\s|$)"]);
+    }
+
+    #[test]
+    fn suggest_fuzzy_escapes_regex_metacharacters_in_program_names() {
+        // `g++` contains regex metacharacters; the generated pattern must escape them so it
+        // compiles and matches only the literal program.
+        let rows = vec![
+            bash_row("g++ -c main.cpp", 2, PreToolResult::Ask),
+            bash_row("g++ -o out main.o", 2, PreToolResult::Ask),
+        ];
+        let suggestions = build_suggestions(&rows, MatchMode::Fuzzy, SuggestAction::Ask, 2, 10);
+
+        assert_eq!(suggestions.len(), 1);
+        let regex = Regex::new(&suggestions[0].rule.pattern)
+            .expect("escaped program must produce a valid regex");
+        assert!(regex.is_match("g++ -c main.cpp"));
+        assert!(
+            !regex.is_match("gxx -c main.cpp"),
+            "the + must match literally"
+        );
+    }
+
+    #[tokio::test]
+    async fn suggest_json_smoke_over_an_explicit_dir() {
+        // End-to-end through the async path: log reading, hash filtering (--all-rules), leaf
+        // splitting, and JSON rendering all compose without error.
+        let dir = tempfile::tempdir().unwrap();
+        let line = serde_json::json!({
+            "timestamp": "2026-06-10T01:00:00Z",
+            "fields": {
+                "message": "PreToolUse hook completed",
+                "tool_name": "Bash",
+                "tool_args": "{\"command\":\"git status && ls\"}",
+                "cwd": "/tmp",
+                "rules_hash": "sha256:test",
+                "result": "ask"
+            }
+        })
+        .to_string();
+        tokio::fs::write(dir.path().join("hooks.log.2026-06-10"), format!("{line}\n"))
+            .await
+            .unwrap();
+
+        suggest(SuggestOptions {
+            dir: Some(dir.path().to_path_buf()),
+            start_time: None,
+            end_time: None,
+            result: PreToolResult::Ask,
+            limit: 10,
+            min_count: 1,
+            match_mode: MatchMode::Exact,
+            action: None,
+            all_rules: true,
+            rules_hash: None,
+            json: true,
+        })
+        .await
+        .expect("suggest should succeed over an explicit log dir");
+    }
+
+    #[test]
+    fn suggest_fuzzy_bare_program_disqualifies_the_alternation() {
+        // A bare `cargo` has no second token; an alternation would stop matching it, so the cluster
+        // falls back to the prefix that covers every observed shape.
+        let rows = vec![
+            bash_row("cargo", 2, PreToolResult::Ask),
+            bash_row("cargo build", 2, PreToolResult::Ask),
+        ];
+        let suggestions = build_suggestions(&rows, MatchMode::Fuzzy, SuggestAction::Ask, 2, 10);
+
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].rule.pattern, r"^cargo(\s|$)");
+    }
+
+    #[tokio::test]
+    async fn suggest_rejects_allow_with_fuzzy_match() {
+        let err = suggest(SuggestOptions {
+            dir: Some(PathBuf::from("/tmp/moriarty-suggest-guard")),
+            start_time: None,
+            end_time: None,
+            result: PreToolResult::Ask,
+            limit: 10,
+            min_count: 2,
+            match_mode: MatchMode::Fuzzy,
+            action: Some(SuggestAction::Allow),
+            all_rules: false,
+            rules_hash: None,
+            json: false,
+        })
+        .await
+        .expect_err("Allow + fuzzy must be rejected");
+        assert!(err.to_string().contains("Allow rules with --match fuzzy"));
+    }
+
     // ===== replay =====
 
     #[test]
@@ -1069,7 +1539,7 @@ mod tests {
             bash_row("git status", 3, PreToolResult::Allow), // candidate no longer allows → lost
             bash_row("cargo build", 2, PreToolResult::Ask), // still prompts → unchanged
         ];
-        let report = build_replay_report(&rows, &engine, None);
+        let report = build_replay_report(&rows, &engine, None, None, Default::default());
 
         assert_eq!(report.total_evaluated, 3);
         assert_eq!(report.lost_allow_count, 1);
@@ -1087,7 +1557,7 @@ mod tests {
         let engine =
             BashRuleEngine::from_config(vec![allow("allow-ls", r"^ls($|\s)")], None).unwrap();
         let rows = vec![bash_row("ls -la", 4, PreToolResult::Ask)]; // was prompted, now allowed
-        let report = build_replay_report(&rows, &engine, None);
+        let report = build_replay_report(&rows, &engine, None, None, Default::default());
 
         assert_eq!(report.newly_allowed_count, 1);
         assert_eq!(report.lost_allow_count, 0);
@@ -1103,7 +1573,13 @@ mod tests {
             bash_row("git x", 2, PreToolResult::Allow), // allow → would be lost-allow
         ];
         // Filtering to recorded=Allow evaluates only the git row.
-        let report = build_replay_report(&rows, &engine, Some(PreToolResult::Allow));
+        let report = build_replay_report(
+            &rows,
+            &engine,
+            Some(PreToolResult::Allow),
+            None,
+            Default::default(),
+        );
 
         assert_eq!(report.total_evaluated, 1);
         assert_eq!(report.lost_allow_count, 1);
@@ -1113,7 +1589,7 @@ mod tests {
     #[test]
     fn replay_empty_rows_yield_an_empty_report() {
         let engine = BashRuleEngine::from_config(vec![], None).unwrap();
-        let report = build_replay_report(&[], &engine, None);
+        let report = build_replay_report(&[], &engine, None, None, Default::default());
         assert_eq!(report.total_evaluated, 0);
         assert_eq!(report.lost_allow_count, 0);
         assert_eq!(report.newly_allowed_count, 0);
@@ -1128,11 +1604,54 @@ mod tests {
             arguments: serde_json::json!({ "not_command": "ls" }),
             result: PreToolResult::Allow,
             count: 3,
+            rule: None,
+            cwd: String::new(),
         }];
-        let report = build_replay_report(&rows, &engine, None);
+        let report = build_replay_report(&rows, &engine, None, None, Default::default());
         // A Bash row missing its command is skipped, not counted or misclassified.
         assert_eq!(report.total_evaluated, 0);
         assert!(report.divergences.is_empty());
+    }
+
+    #[test]
+    fn replay_normalizes_in_cwd_absolute_paths_with_the_recorded_cwd() {
+        // The hook recorded an Allow for an in-cwd absolute path. A relative-path allow-rule only
+        // matches once the command is normalized against the cwd it ran under, so replaying with the
+        // recorded cwd must reproduce the Allow (no lost-approval) rather than diverging.
+        let engine =
+            BashRuleEngine::from_config(vec![allow("allow-cat-src", r"^cat src/")], None).unwrap();
+        let rows = vec![bash_row_in(
+            "cat /work/proj/src/main.rs",
+            1,
+            PreToolResult::Allow,
+            "/work/proj",
+        )];
+
+        let report = build_replay_report(&rows, &engine, None, None, Default::default());
+
+        assert_eq!(
+            report.lost_allow_count, 0,
+            "cwd normalization reproduces the Allow"
+        );
+        assert!(report.divergences.is_empty());
+    }
+
+    #[test]
+    fn replay_without_recorded_cwd_skips_normalization() {
+        // A legacy row (empty cwd) cannot be normalized, so the same absolute-path command no longer
+        // matches the relative allow-rule and is reported as a lost auto-approval.
+        let engine =
+            BashRuleEngine::from_config(vec![allow("allow-cat-src", r"^cat src/")], None).unwrap();
+        let rows = vec![bash_row_in(
+            "cat /work/proj/src/main.rs",
+            1,
+            PreToolResult::Allow,
+            "",
+        )];
+
+        let report = build_replay_report(&rows, &engine, None, None, Default::default());
+
+        assert_eq!(report.lost_allow_count, 1);
     }
 
     #[test]

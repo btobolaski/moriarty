@@ -4895,7 +4895,7 @@ fn mcp_tool_result_accepts_search_mode() {
     };
     assert_eq!(details.mode, McpMode::Search);
     assert_eq!(details.query.as_deref(), Some("write"));
-    assert_eq!(details.matches.as_deref().map(|v| &v[..]), Some(&[][..]));
+    assert_eq!(details.matches.as_deref(), Some(&[][..]));
     assert_eq!(details.count, Some(0));
 }
 

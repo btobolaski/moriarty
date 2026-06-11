@@ -277,7 +277,7 @@ mod tests {
     #[tokio::test]
     async fn test_status_tool_handler() {
         let temp_dir = setup_jj_repo().await;
-        let server = JjReadOnly::default();
+        let server = JjReadOnly;
 
         let args = JjArgs {
             project_dir: temp_dir.path().to_path_buf(),
@@ -317,7 +317,7 @@ mod tests {
             .unwrap();
         assert!(status.success(), "jj commit failed: {status:?}");
 
-        let server = JjReadOnly::default();
+        let server = JjReadOnly;
         let args = JjArgs {
             project_dir: temp_dir.path().to_path_buf(),
             command: JjCommand::Diff,
@@ -344,7 +344,7 @@ mod tests {
             .unwrap();
         assert!(status.success(), "jj describe failed: {status:?}");
 
-        let server = JjReadOnly::default();
+        let server = JjReadOnly;
         let args = JjArgs {
             project_dir: temp_dir.path().to_path_buf(),
             command: JjCommand::Log,
@@ -368,7 +368,7 @@ mod tests {
             .unwrap();
         assert!(status.success(), "jj describe failed: {status:?}");
 
-        let server = JjReadOnly::default();
+        let server = JjReadOnly;
         let args = JjArgs {
             project_dir: temp_dir.path().to_path_buf(),
             command: JjCommand::Show,
@@ -387,7 +387,7 @@ mod tests {
     #[tokio::test]
     async fn test_op_log_command() {
         let temp_dir = setup_jj_repo().await;
-        let server = JjReadOnly::default();
+        let server = JjReadOnly;
 
         let args = JjArgs {
             project_dir: temp_dir.path().to_path_buf(),
@@ -481,7 +481,7 @@ mod tests {
 
     #[test]
     fn test_get_info_metadata() {
-        let server = JjReadOnly::default();
+        let server = JjReadOnly;
         let info = server.get_info();
 
         assert!(

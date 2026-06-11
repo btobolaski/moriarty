@@ -90,8 +90,10 @@
 .Op Fl \-result Ar ask|deny
 .Op Fl \-limit Ar n
 .Op Fl \-min\-count Ar n
-.Op Fl \-match Ar exact|prefix
+.Op Fl \-match Ar exact|prefix|fuzzy
 .Op Fl \-action Ar ask|deny|allow
+.Op Fl \-all\-rules
+.Op Fl \-rules\-hash Ar hash
 .Op Fl \-json
 .Nm
 .Cm rules replay
@@ -100,6 +102,8 @@
 .Op Fl \-start\-time Ar DATETIME
 .Op Fl \-end\-time Ar DATETIME
 .Op Fl \-result Ar allow|ask|deny
+.Op Fl \-all\-rules
+.Op Fl \-rules\-hash Ar hash
 .Op Fl \-json
 .Sh DESCRIPTION
 .Nm
@@ -200,7 +204,10 @@ subcommand reads the JSON-lines hook logs from
 .Pa ~/.local/state/moriarty/hooks/
 .Pq or the directory given by the \-d / \-\-dir option
 and prints a JSON report of recorded PreToolUse results, aggregated by the
-exact tool, arguments, and result triple with a count per group.
+exact tool, arguments, result, and deciding rule with a count per group.
+Each row names the rule whose action produced the decision; the field is omitted
+when no rule decided
+.Pq passthrough, an unconfigured Ask, or a compound whose merged leaves matched no rule .
 The
 .Fl \-start\-time
 and
@@ -269,14 +276,36 @@ the per\-leaf engine.
 .It Cm rules suggest
 Suggest anchored rules for commands the hook frequently prompted on, mined from the
 hook logs.
+Each recorded command is first split into the leaf simple\-commands the hook actually
+evaluates (normalized with the recorded working directory), so a compound like
+.Ql git status && ls
+yields one candidate per leaf and a leaf shared by several compounds accumulates their counts.
 .Fl \-result
 selects the recorded outcome to mine
 .Pq Cm ask No or Cm deny ;
-.Fl \-match Cm exact|prefix
+.Fl \-match Cm exact|prefix|fuzzy
 chooses the generated pattern shape; and
 .Fl \-action Cm ask|deny|allow
 sets the action
 .Pq Cm allow No is refused unless Fl \-match Cm exact .
+.Cm exact
+emits one fully\-literal, fully\-anchored pattern per leaf;
+.Cm prefix
+one program\-name pattern per program; and
+.Cm fuzzy
+one pattern per program that generalizes observed simple\-identifier subcommands into a
+closed alternation
+.Pq for example Ql ^cargo (build|check)(\es|$) ,
+falling back to the program prefix when any observed leaf has a flag, path, or bare
+invocation in subcommand position.
+The suggestion lists every observed command it covers so the generalization is reviewable.
+By default only log lines recorded under the rule set currently installed at
+.Pa ~/.config/moriarty/tool_rules.toml
+are mined, so suggestions reflect the rules in force;
+.Fl \-rules\-hash
+restricts to a specific rule\-set hash and
+.Fl \-all\-rules
+mines every recorded line regardless of which rules produced it.
 .It Cm rules replay
 Re\-evaluate recorded Bash decisions against a candidate
 .Fl \-config
@@ -292,6 +321,16 @@ and
 options bound the replay window
 .Pq ISO 8601; UTC when no offset is given ,
 so a long\-lived log need not be replayed in full.
+By default replay considers only the decisions recorded under the rule set currently
+installed at the default config path
+.Pq the migration source, independent of the Fl \-config No candidate ,
+so the baseline is coherent;
+.Fl \-rules\-hash
+pins a specific rule\-set hash and
+.Fl \-all\-rules
+replays every recorded line.
+Each hook decision is stamped in the log with a hash of the effective rule set that
+produced it, which is what these filters match.
 .El
 .Sh ENVIRONMENT
 .Bl -tag -width Ds

@@ -2,8 +2,8 @@
 //!
 //! Reads the hooks tracing logs, keeps the completed PreToolUse records (those carrying the
 //! clean `result` field written by [`super::result`]), and groups them by the exact
-//! `(tool name, arguments, result)` triple so each row reports how often that exact call
-//! occurred. Output is JSON on stdout; nothing else is written there.
+//! `(tool name, arguments, result, deciding rule)` key so each row reports how often that exact
+//! call occurred. Output is JSON on stdout; nothing else is written there.
 
 // standard library
 use std::{
@@ -41,6 +41,10 @@ struct LogEventFields {
     tool_name: Option<String>,
     tool_args: Option<String>,
     result: Option<PreToolResult>,
+    // Provenance the rules commands need; optional because lines predating each field still parse.
+    cwd: Option<String>,
+    rules_hash: Option<String>,
+    rule: Option<String>,
 }
 
 struct HookRecord {
@@ -48,6 +52,12 @@ struct HookRecord {
     tool_name: String,
     tool_args: String,
     result: PreToolResult,
+    /// The hook's working directory, used by the rules path to normalize commands as the hook did.
+    cwd: Option<String>,
+    /// Hash of the rule set in force when this decision was made (see [`crate::rules`]).
+    rules_hash: Option<String>,
+    /// Name of the rule whose action produced the decision; `None` when no rule decided.
+    rule: Option<String>,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -56,7 +66,61 @@ pub(crate) struct ReportRow {
     pub(crate) arguments: Value,
     pub(crate) result: PreToolResult,
     pub(crate) count: u64,
+    /// The rule that decided these calls. Part of the grouping key, so one row never mixes
+    /// decisions from different rules; omitted from the JSON when no rule decided (legacy lines and
+    /// passthrough/unconfigured outcomes), keeping those rows' serialization unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) rule: Option<String>,
+    /// The cwd these calls ran under. Skipped in `hooks report` output, which groups without cwd so
+    /// its rows and counts are unchanged; populated (and part of the grouping key) only for the
+    /// rules path via [`aggregate_with_cwd`]. Empty string for the `hooks report` grouping.
+    #[serde(skip)]
+    pub(crate) cwd: String,
 }
+
+impl ReportRow {
+    /// The recorded Bash command, when this row is a Bash call whose arguments kept the wire shape.
+    ///
+    /// `arguments` deliberately stays a raw [`Value`] rather than a typed per-tool struct: the
+    /// report aggregates every tool's input verbatim, and a log line truncated past the size cap
+    /// degrades to a plain string — exactly the rows this accessor must skip gracefully rather
+    /// than reject at parse time. Routing all Bash-command extraction through here keeps "row had
+    /// no usable command" a single named code path instead of scattered `.get("command")` probes.
+    pub(crate) fn bash_command(&self) -> Option<&str> {
+        if self.tool_name != "Bash" {
+            return None;
+        }
+        self.arguments.get("command").and_then(Value::as_str)
+    }
+}
+
+/// Restricts the rules path to records produced by a particular rule set, so `rules replay`/`rules
+/// suggest` reason only about the rules in force rather than the union of every historical config.
+pub(crate) enum RulesHashFilter {
+    /// Keep only records stamped with this exact rule-set hash.
+    Only(String),
+    /// Keep every record regardless of its rule-set hash (`--all-rules`).
+    Any,
+}
+
+/// Records dropped by a [`RulesHashFilter::Only`] pass, surfaced so callers can report (never hide)
+/// how much history a hash filter excluded.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct HashSkipStats {
+    /// Dropped because the record's `rules_hash` differs from the requested one.
+    pub(crate) other_rules: u64,
+    /// Dropped because the record predates rule-hash logging (no `rules_hash`).
+    pub(crate) no_hash: u64,
+}
+
+/// Rows from [`aggregate_with_cwd`] plus the hash-filter skip accounting.
+pub(crate) struct CwdAggregation {
+    pub(crate) rows: Vec<ReportRow>,
+    pub(crate) skipped: HashSkipStats,
+}
+
+/// Grouping key for [`build_rows`]: tool name, raw `tool_args`, result, deciding rule, cwd.
+type RowKey = (String, String, PreToolResult, Option<String>, String);
 
 pub async fn run(
     dir: Option<PathBuf>,
@@ -76,7 +140,8 @@ pub async fn run(
 }
 
 /// Reads the hook logs and aggregates them into `(tool, arguments, result)` rows, sorted by count.
-/// Shared by `hooks report` and `rules suggest`/`rules replay`.
+/// Used by `hooks report`; `cwd` is not part of the grouping key, so identical calls from different
+/// directories merge into one row (the report's historical behavior).
 pub(crate) async fn aggregate(
     dir: Option<PathBuf>,
     filter: &TimeRangeFilter,
@@ -85,7 +150,24 @@ pub(crate) async fn aggregate(
 ) -> Result<Vec<ReportRow>> {
     let log_dir = resolve_log_dir(dir).await?;
     let records = read_records(&log_dir).await?;
-    Ok(build_rows(records, filter, tool, result))
+    Ok(build_rows(records, filter, tool, result, false, &RulesHashFilter::Any).rows)
+}
+
+/// The rules path needs per-cwd rows (a command only re-normalizes correctly against the directory
+/// it ran under), while [`aggregate`]'s output shape is `hooks report`'s public JSON and must not
+/// split rows by directory — hence two entry points instead of one parameterized signature.
+/// The returned [`CwdAggregation`] reports how many records `hash_filter` excluded so callers can
+/// surface (never hide) what a rule-set filter dropped.
+pub(crate) async fn aggregate_with_cwd(
+    dir: Option<PathBuf>,
+    filter: &TimeRangeFilter,
+    tool: Option<&str>,
+    result: Option<PreToolResult>,
+    hash_filter: &RulesHashFilter,
+) -> Result<CwdAggregation> {
+    let log_dir = resolve_log_dir(dir).await?;
+    let records = read_records(&log_dir).await?;
+    Ok(build_rows(records, filter, tool, result, true, hash_filter))
 }
 
 async fn resolve_log_dir(dir: Option<PathBuf>) -> Result<PathBuf> {
@@ -147,16 +229,30 @@ fn parse_record(line: &str) -> Option<HookRecord> {
         tool_name: envelope.fields.tool_name?,
         tool_args: envelope.fields.tool_args?,
         result: envelope.fields.result?,
+        cwd: envelope.fields.cwd,
+        // The log writes `""` (not an absent key) for "no rules hash" / "no deciding rule", so an
+        // empty value must mean None here — otherwise the hash filter would misclassify a
+        // config-load-failure line as belonging to some other rule set.
+        rules_hash: envelope.fields.rules_hash.filter(|hash| !hash.is_empty()),
+        rule: envelope.fields.rule.filter(|rule| !rule.is_empty()),
     })
 }
 
+/// Groups records by `(tool, arguments, result)`. When `include_cwd` is set, the cwd also joins the
+/// key (and is carried onto each row) so the rules path sees per-directory rows; otherwise cwd is
+/// the empty string and identical calls from different directories merge — `hooks report`'s shape.
+/// `hash_filter` drops records from other rule sets (counted in the returned [`HashSkipStats`]); the
+/// `hooks report` path passes [`RulesHashFilter::Any`], so it never drops on hash and reports zero.
 fn build_rows(
     records: Vec<HookRecord>,
     filter: &TimeRangeFilter,
     tool: Option<&str>,
     result: Option<PreToolResult>,
-) -> Vec<ReportRow> {
-    let mut counts: HashMap<(String, String, PreToolResult), u64> = HashMap::new();
+    include_cwd: bool,
+    hash_filter: &RulesHashFilter,
+) -> CwdAggregation {
+    let mut counts: HashMap<RowKey, u64> = HashMap::new();
+    let mut skipped = HashSkipStats::default();
 
     for record in records {
         if tool.is_some_and(|tool| tool != record.tool_name) {
@@ -169,35 +265,70 @@ fn build_rows(
             continue;
         }
 
+        // Hash filtering runs after the tool/result/time filters so the skip counts reflect only
+        // records that were otherwise in scope.
+        if let RulesHashFilter::Only(wanted) = hash_filter {
+            match &record.rules_hash {
+                Some(hash) if hash == wanted => {}
+                Some(_) => {
+                    skipped.other_rules += 1;
+                    continue;
+                }
+                None => {
+                    skipped.no_hash += 1;
+                    continue;
+                }
+            }
+        }
+
+        let cwd = if include_cwd {
+            record.cwd.unwrap_or_default()
+        } else {
+            String::new()
+        };
         *counts
-            .entry((record.tool_name, record.tool_args, record.result))
+            .entry((
+                record.tool_name,
+                record.tool_args,
+                record.result,
+                record.rule,
+                cwd,
+            ))
             .or_insert(0) += 1;
     }
 
-    let mut entries: Vec<((String, String, PreToolResult), u64)> = counts.into_iter().collect();
+    let mut entries: Vec<(RowKey, u64)> = counts.into_iter().collect();
 
-    // Most frequent first; tool name, raw arguments, then result fully order ties so the report is
-    // deterministic regardless of HashMap iteration order. Sorting on the raw `tool_args` key also
-    // avoids re-serializing the parsed arguments for every comparison.
+    // Most frequent first; tool name, raw arguments, result, rule, then cwd fully order ties so the
+    // report is deterministic regardless of HashMap iteration order. Sorting on the raw `tool_args`
+    // key also avoids re-serializing the parsed arguments for every comparison.
     entries.sort_by(
-        |((a_tool, a_args, a_result), a_count), ((b_tool, b_args, b_result), b_count)| {
+        |((a_tool, a_args, a_result, a_rule, a_cwd), a_count),
+         ((b_tool, b_args, b_result, b_rule, b_cwd), b_count)| {
             b_count
                 .cmp(a_count)
                 .then_with(|| a_tool.cmp(b_tool))
                 .then_with(|| a_args.cmp(b_args))
                 .then_with(|| a_result.as_str().cmp(b_result.as_str()))
+                .then_with(|| a_rule.cmp(b_rule))
+                .then_with(|| a_cwd.cmp(b_cwd))
         },
     );
 
-    entries
+    let rows = entries
         .into_iter()
-        .map(|((tool_name, tool_args, result), count)| ReportRow {
-            arguments: arguments_value(tool_args),
-            tool_name,
-            result,
-            count,
-        })
-        .collect()
+        .map(
+            |((tool_name, tool_args, result, rule, cwd), count)| ReportRow {
+                arguments: arguments_value(tool_args),
+                tool_name,
+                result,
+                count,
+                rule,
+                cwd,
+            },
+        )
+        .collect();
+    CwdAggregation { rows, skipped }
 }
 
 /// `tool_args` is the tool input serialized to a JSON string, so parse it back to emit real JSON.
@@ -221,7 +352,214 @@ mod tests {
             tool_name: tool.to_string(),
             tool_args: args.to_string(),
             result,
+            cwd: None,
+            rules_hash: None,
+            rule: None,
         }
+    }
+
+    fn record_with_hash(
+        timestamp: &str,
+        args: &str,
+        result: PreToolResult,
+        rules_hash: Option<&str>,
+    ) -> HookRecord {
+        HookRecord {
+            timestamp: ts(timestamp),
+            tool_name: "Bash".to_string(),
+            tool_args: args.to_string(),
+            result,
+            cwd: None,
+            rules_hash: rules_hash.map(str::to_string),
+            rule: None,
+        }
+    }
+
+    #[test]
+    fn build_rows_only_filter_keeps_matching_hash_and_counts_skips() {
+        let unrestricted = TimeRangeFilter::new(None, None).unwrap();
+        let records = vec![
+            record_with_hash(
+                "2026-06-03T01:00:00Z",
+                r#"{"command":"ls"}"#,
+                PreToolResult::Allow,
+                Some("h1"),
+            ),
+            record_with_hash(
+                "2026-06-03T02:00:00Z",
+                r#"{"command":"rm"}"#,
+                PreToolResult::Allow,
+                Some("h2"),
+            ),
+            record_with_hash(
+                "2026-06-03T03:00:00Z",
+                r#"{"command":"cat"}"#,
+                PreToolResult::Allow,
+                None,
+            ),
+        ];
+
+        let aggregation = build_rows(
+            records,
+            &unrestricted,
+            Some("Bash"),
+            None,
+            true,
+            &RulesHashFilter::Only("h1".to_string()),
+        );
+
+        // Only the h1 record survives; the other-rule-set and the unstamped legacy record are
+        // excluded but counted so the caller can report them.
+        assert_eq!(aggregation.rows.len(), 1);
+        assert_eq!(
+            aggregation.rows[0].arguments,
+            serde_json::json!({ "command": "ls" })
+        );
+        assert_eq!(
+            aggregation.skipped,
+            HashSkipStats {
+                other_rules: 1,
+                no_hash: 1
+            }
+        );
+    }
+
+    #[test]
+    fn build_rows_groups_by_deciding_rule_and_omits_absent_rule_from_json() {
+        // Two identical calls decided by different rules must not merge into one row, and a row
+        // with no deciding rule must serialize exactly as before (no `rule` key).
+        let unrestricted = TimeRangeFilter::new(None, None).unwrap();
+        let with_rule = |rule: Option<&str>| HookRecord {
+            timestamp: ts("2026-06-03T01:00:00Z"),
+            tool_name: "Bash".to_string(),
+            tool_args: r#"{"command":"ls"}"#.to_string(),
+            result: PreToolResult::Allow,
+            cwd: None,
+            rules_hash: None,
+            rule: rule.map(str::to_string),
+        };
+        let records = vec![
+            with_rule(Some("allow-ls")),
+            with_rule(Some("allow-read-commands")),
+            with_rule(None),
+        ];
+
+        let rows = build_rows(
+            records,
+            &unrestricted,
+            None,
+            None,
+            false,
+            &RulesHashFilter::Any,
+        )
+        .rows;
+
+        assert_eq!(rows.len(), 3, "each deciding rule gets its own row");
+        let mut rules: Vec<Option<&str>> = rows.iter().map(|row| row.rule.as_deref()).collect();
+        rules.sort_unstable();
+        assert_eq!(
+            rules,
+            vec![None, Some("allow-ls"), Some("allow-read-commands")],
+            "rows carry exactly the rules that decided them"
+        );
+        let no_rule_row = rows
+            .iter()
+            .find(|row| row.rule.is_none())
+            .expect("the rule-less record keeps its own row");
+        let json = serde_json::to_value(no_rule_row).unwrap();
+        assert!(
+            json.get("rule").is_none(),
+            "a row without a deciding rule serializes without a rule key, exactly as before"
+        );
+        let attributed = serde_json::to_value(
+            rows.iter()
+                .find(|row| row.rule.as_deref() == Some("allow-ls"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(attributed["rule"], "allow-ls");
+    }
+
+    #[test]
+    fn parse_record_treats_empty_provenance_as_absent() {
+        // The completion log writes "" (not an absent key) when there is no rules hash or deciding
+        // rule; both must come back as None so the hash filter classifies them as legacy/no-hash.
+        let line = serde_json::json!({
+            "timestamp": "2026-06-03T12:00:00Z",
+            "fields": {
+                "message": COMPLETION_MESSAGE,
+                "tool_name": "Bash",
+                "tool_args": "{\"command\":\"ls\"}",
+                "cwd": "/work",
+                "rules_hash": "",
+                "rule": "",
+                "result": "ask"
+            }
+        })
+        .to_string();
+
+        let record = parse_record(&line).expect("the line should parse");
+        assert_eq!(record.rules_hash, None);
+        assert_eq!(record.rule, None);
+        assert_eq!(record.cwd.as_deref(), Some("/work"));
+    }
+
+    #[test]
+    fn bash_command_gates_on_tool_name_and_argument_shape() {
+        let row = |tool: &str, arguments: Value| ReportRow {
+            tool_name: tool.to_string(),
+            arguments,
+            result: PreToolResult::Allow,
+            count: 1,
+            rule: None,
+            cwd: String::new(),
+        };
+
+        assert_eq!(
+            row("Read", serde_json::json!({ "command": "ls" })).bash_command(),
+            None,
+            "a non-Bash row never yields a command, even when a command key is present"
+        );
+        assert_eq!(
+            row("Bash", serde_json::json!({ "command": "ls" })).bash_command(),
+            Some("ls")
+        );
+        assert_eq!(
+            row("Bash", Value::String("truncated raw text".to_string())).bash_command(),
+            None,
+            "a truncation-degraded arguments string is skipped, not misread"
+        );
+    }
+
+    #[test]
+    fn build_rows_any_filter_keeps_every_rule_set() {
+        let unrestricted = TimeRangeFilter::new(None, None).unwrap();
+        let records = vec![
+            record_with_hash(
+                "2026-06-03T01:00:00Z",
+                r#"{"command":"ls"}"#,
+                PreToolResult::Allow,
+                Some("h1"),
+            ),
+            record_with_hash(
+                "2026-06-03T02:00:00Z",
+                r#"{"command":"rm"}"#,
+                PreToolResult::Allow,
+                None,
+            ),
+        ];
+
+        let aggregation = build_rows(
+            records,
+            &unrestricted,
+            Some("Bash"),
+            None,
+            true,
+            &RulesHashFilter::Any,
+        );
+
+        assert_eq!(aggregation.rows.len(), 2);
+        assert_eq!(aggregation.skipped, HashSkipStats::default());
     }
 
     fn completion_line(timestamp: &str, tool: &str, args: &str, result: &str) -> String {
@@ -338,7 +676,15 @@ mod tests {
             ),
         ];
 
-        let rows = build_rows(records, &unrestricted, None, None);
+        let rows = build_rows(
+            records,
+            &unrestricted,
+            None,
+            None,
+            false,
+            &RulesHashFilter::Any,
+        )
+        .rows;
 
         assert_eq!(
             rows,
@@ -348,18 +694,24 @@ mod tests {
                     arguments: serde_json::json!({ "command": "ls" }),
                     result: PreToolResult::Allow,
                     count: 2,
+                    rule: None,
+                    cwd: String::new(),
                 },
                 ReportRow {
                     tool_name: "Bash".to_string(),
                     arguments: serde_json::json!({ "command": "ls" }),
                     result: PreToolResult::Deny,
                     count: 1,
+                    rule: None,
+                    cwd: String::new(),
                 },
                 ReportRow {
                     tool_name: "Read".to_string(),
                     arguments: serde_json::json!({ "file_path": "/a" }),
                     result: PreToolResult::Passthrough,
                     count: 1,
+                    rule: None,
+                    cwd: String::new(),
                 },
             ]
         );
@@ -385,7 +737,15 @@ mod tests {
             ),
         ];
 
-        let rows = build_rows(records, &unrestricted, None, None);
+        let rows = build_rows(
+            records,
+            &unrestricted,
+            None,
+            None,
+            false,
+            &RulesHashFilter::Any,
+        )
+        .rows;
 
         assert_eq!(rows.len(), 2);
         assert_eq!(
@@ -425,7 +785,10 @@ mod tests {
             &unrestricted,
             Some("Bash"),
             Some(PreToolResult::Deny),
-        );
+            false,
+            &RulesHashFilter::Any,
+        )
+        .rows;
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].tool_name, "Bash");
@@ -463,7 +826,7 @@ mod tests {
             ),
         ];
 
-        let rows = build_rows(records, &filter, None, None);
+        let rows = build_rows(records, &filter, None, None, false, &RulesHashFilter::Any).rows;
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].count, 1, "only the 2026-06-03 record is in range");
@@ -547,7 +910,7 @@ mod tests {
             ),
         ];
 
-        let rows = build_rows(records, &filter, None, None);
+        let rows = build_rows(records, &filter, None, None, false, &RulesHashFilter::Any).rows;
 
         // The start boundary is inclusive, so the midnight record is kept and the earlier one dropped.
         assert_eq!(rows.len(), 1);

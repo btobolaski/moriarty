@@ -376,7 +376,7 @@ mod tests {
     #[tokio::test]
     async fn test_diff_tool_handler() {
         let temp_dir = setup_git_repo().await;
-        let server = GitReadOnly::default();
+        let server = GitReadOnly;
 
         let args = DiffArgs {
             project_dir: temp_dir.path().to_path_buf(),
@@ -406,7 +406,7 @@ mod tests {
             .unwrap();
         assert!(status.success(), "git commit failed: {status:?}");
 
-        let server = GitReadOnly::default();
+        let server = GitReadOnly;
         let args = LogArgs {
             project_dir: temp_dir.path().to_path_buf(),
             args: vec!["--oneline".to_string(), "-1".to_string()],
@@ -420,7 +420,7 @@ mod tests {
     #[tokio::test]
     async fn test_show_tool_handler() {
         let temp_dir = setup_git_repo().await;
-        let server = GitReadOnly::default();
+        let server = GitReadOnly;
 
         let args = ShowArgs {
             project_dir: temp_dir.path().to_path_buf(),
@@ -433,7 +433,7 @@ mod tests {
     #[tokio::test]
     async fn test_prompt_handlers() {
         let temp_dir = setup_git_repo().await;
-        let server = GitReadOnly::default();
+        let server = GitReadOnly;
         let project_dir = temp_dir.path().to_path_buf();
         let project_str = project_dir.to_string_lossy().to_string();
 
@@ -576,7 +576,7 @@ mod tests {
 
     #[test]
     fn test_get_info_metadata() {
-        let server = GitReadOnly::default();
+        let server = GitReadOnly;
         let info = server.get_info();
 
         assert!(

@@ -193,11 +193,30 @@ action = { type = "ArgumentFilter",
 .Pp
 Arguments are appended to the end of the command.
 .Pp
-.Em Replacing arguments
-.Pq combining remove and add :
+.Em Replacing arguments .
+The
+.Ic replace
+field is a table mapping an exact argument token to its replacement:
 .Bd -literal -offset indent
 [[bash_rules]]
 name = "rm\-force\-interactive"
+pattern = "^rm .*\-f"
+action = { type = "ArgumentFilter",
+           replace = { "\-f" = "\-i" },
+           reason = "Replaced force with interactive" }
+.Ed
+.Pp
+.Ic replace
+matches whole tokens exactly (not prefixes).
+To drop several variants of a flag and substitute one safe form, combine
+.Ic remove
+and
+.Ic add
+instead
+.Pq Ic remove No additionally matches prefixes such as Ql \-\-flag=value :
+.Bd -literal -offset indent
+[[bash_rules]]
+name = "rm\-force\-interactive\-variants"
 pattern = "^rm .*\-f"
 action = { type = "ArgumentFilter",
            remove = ["\-f", "\-\-force"],
@@ -260,12 +279,14 @@ provides the following default fragments:
 .Ql "( \-[a\-zA\-Z_][a\-zA\-Z0\-9_\-]*)"
 \(em safe command flag.
 .It Ic safe_path
-Safe file path (no shell metacharacters).
+.Ql "( [^|&;$\`()<>{}]+/[^|&;$\`()<>{}]*)"
+\(em a safe file path (no shell metacharacters).
 .It Ic safe_pipe_cmd
 .Ql (head|tail|grep|wc|sort|uniq)
 \(em safe pipe target commands.
 .It Ic safe_pipe
-Safe command piping using
+.Ql "( \e| (head|tail|grep|wc|sort|uniq)( [^|&;$\`()<>{}]+)*)"
+\(em safe command piping using
 .Ic safe_pipe_cmd .
 .El
 .Pp

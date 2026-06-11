@@ -219,7 +219,7 @@ async fn test_run_handler_matrix() {
     for (key, label, handler) in cases {
         let toml = format!("[commands]\n{key} = [\"echo\", \"{label}\"]\n");
         let (temp_dir, _xdg_dir) = setup_project_dir_with_approvals(&toml).await;
-        let server = ToolRunner::default();
+        let server = ToolRunner;
         let args = RunArgs {
             project_dir: temp_dir.path().to_path_buf(),
         };
@@ -490,7 +490,7 @@ async fn test_approval_lifecycle_with_binary_modification() {
 
 #[test]
 fn test_get_info_metadata() {
-    let server = ToolRunner::default();
+    let server = ToolRunner;
     let info = server.get_info();
 
     assert!(

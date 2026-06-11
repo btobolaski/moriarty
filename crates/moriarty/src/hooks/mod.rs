@@ -53,7 +53,7 @@
 //! require users to enable verbose mode to understand why hooks blocked their commands.
 
 pub mod bash_rules;
-mod command_split;
+pub(crate) mod command_split;
 pub mod parser;
 pub mod report;
 pub mod result;
@@ -177,17 +177,12 @@ fn truncate_log_field(field: &str, max_size: usize) -> String {
     )
 }
 
-/// Execute a single hook by reading input from stdin and logging all parsed data
-///
-/// This is primarily a development/debugging tool. It reads hook input JSON from stdin,
-/// parses it, and logs the results along with environment context.
-///
-/// Returns an error if parsing fails, ensuring malformed input is detectable via exit codes.
+/// Parse failures must surface as a nonzero exit code so Claude Code can distinguish a hook
+/// crash from a deliberate decision.
 async fn exec_hook() -> Result<()> {
     exec_hook_impl(std::io::stdin()).await
 }
 
-/// Internal implementation of exec_hook that accepts any Read source for testability
 async fn exec_hook_impl<R: Read>(reader: R) -> Result<()> {
     // Global tracing subscriber initialization races are acceptable in tests because nextest's
     // process isolation guarantees no cross-contamination, and failed initialization doesn't
@@ -198,7 +193,7 @@ async fn exec_hook_impl<R: Read>(reader: R) -> Result<()> {
         Err(e) => return Err(e),
     };
 
-    // Limit input size to 1MB to prevent DoS via memory exhaustion
+    // Cap stdin to prevent DoS via memory exhaustion.
     const MAX_INPUT_SIZE: usize = 1024 * 1024 * 100;
     const LOG_TRUNCATE_SIZE: usize = 50000;
 
@@ -267,7 +262,8 @@ async fn exec_hook_impl<R: Read>(reader: R) -> Result<()> {
         ref tool_input,
     } = hook_input.event_data
     {
-        let hook_output = handle_pretool_hook(tool_name, tool_input, &hook_input.cwd).await?;
+        let outcome = handle_pretool_hook(tool_name, tool_input, &hook_input.cwd).await?;
+        let hook_output = outcome.output;
 
         let json_output = serde_json::to_string(&hook_output)
             .map_err(|e| miette::miette!("Failed to serialize HookOutput: {}", e))?;
@@ -280,6 +276,8 @@ async fn exec_hook_impl<R: Read>(reader: R) -> Result<()> {
             tool_name = %tool_name,
             tool_args = %tool_args,
             cwd = %hook_input.cwd,
+            rules_hash = outcome.rules_hash.as_deref().unwrap_or_default(),
+            rule = outcome.rule.as_deref().unwrap_or_default(),
             result = result.as_str(),
             ?hook_output,
             "PreToolUse hook completed"
@@ -303,14 +301,8 @@ async fn exec_hook_impl<R: Read>(reader: R) -> Result<()> {
     Ok(())
 }
 
-/// Allows execution with optional user-facing feedback.
-///
-/// When `message` is provided, it's sent as both `reason` (for verbose mode/logs)
-/// and `system_message` (for immediate user feedback without verbose mode).
-///
-/// Use `system_message` when you want to provide user-facing feedback even without
-/// verbose mode enabled, such as informing users that checks passed or explaining
-/// why their command was allowed despite appearing potentially dangerous.
+// The reason/system_message duplication in these constructors is deliberate; see the module-level
+// "Hook Output Fields: reason vs system_message" section.
 fn allow_hook(message: Option<String>) -> HookOutput {
     HookOutput {
         decision: Some(HookDecision::Approve),
@@ -320,13 +312,6 @@ fn allow_hook(message: Option<String>) -> HookOutput {
     }
 }
 
-/// Denies execution with user-facing feedback.
-///
-/// The message is sent as both `reason` (for verbose mode/logs) and `system_message`
-/// (for immediate user feedback without verbose mode).
-///
-/// Use this when denying commands that users might legitimately attempt, to explain
-/// why the command was blocked (e.g., "Check 'semgrep' binary changed").
 fn deny_hook(reason: impl Into<String>) -> HookOutput {
     let message = reason.into();
     HookOutput {
@@ -337,14 +322,6 @@ fn deny_hook(reason: impl Into<String>) -> HookOutput {
     }
 }
 
-/// Construct a PreToolUse hook output with the given decision, reason, and optional updated input.
-///
-/// This is the single constructor used by all PreToolUse responses. The wrappers below
-/// (`pretool_allow_hook`, `pretool_deny_hook`, `pretool_ask_hook`, `pretool_modify_hook`)
-/// provide ergonomic call sites for each decision type.
-///
-/// When a reason is provided, it is sent as both `permission_decision_reason` (hook-specific)
-/// and `system_message` (immediate user feedback without verbose mode).
 fn pretool_hook(
     decision: PermissionDecision,
     reason: Option<String>,
@@ -378,8 +355,8 @@ fn pretool_modify_hook(new_input: serde_json::Value, reason: Option<String>) -> 
     pretool_hook(PermissionDecision::Allow, reason, Some(new_input))
 }
 
-/// Loads user config, logging and returning the Ask-fallback `HookOutput` (via `Err`)
-/// on failure. The `Ok` branch yields the parsed config for continued evaluation.
+/// `Err` carries the ready-to-emit Ask fallback rather than an error type so call sites can
+/// `return Ok(fallback)` directly — a load failure is a decision, not a hook failure.
 async fn load_config_or_ask() -> std::result::Result<crate::user_config::UserConfig, HookOutput> {
     match load_user_config().await {
         Ok(cfg) => Ok(cfg),
@@ -390,24 +367,46 @@ async fn load_config_or_ask() -> std::result::Result<crate::user_config::UserCon
     }
 }
 
-/// Unified PreToolUse handler: checks tool_rules first, then falls back to bash_rules for Bash.
-///
-/// Evaluation order:
-/// 1. tool_rules engine (first-match-wins) — if match, return Allow/Deny/Ask
-/// 2. If NoMatch and tool is Bash — bash_rules engine (existing behavior)
-/// 3. If NoMatch and tool is not Bash — return no decision (defer to Claude Code)
-///
-/// `cwd` is the current working directory from the hook input. It is used to strip absolute path
-/// prefixes from field values before matching against tool rule patterns, allowing rules to be
-/// written with relative paths.
+/// A decision plus the provenance the completion log records. Grouped because the three values are
+/// produced together and only meaningful as a unit: the log line must attribute the decision to the
+/// rule set and rule that made it, and `None` (not an empty string) marks "no rules involved" so
+/// the report layer can distinguish legacy lines from genuinely unattributed decisions.
+struct PretoolOutcome {
+    output: HookOutput,
+    /// Hash of the rule set that produced this decision (see
+    /// [`crate::user_config::UserConfig::effective_hash`]); `None` when the config could not be
+    /// loaded, so the fallback decision is not attributed to any rules.
+    rules_hash: Option<String>,
+    /// Name of the rule whose action produced `output`; `None` when no rule decided (passthrough,
+    /// unconfigured-Ask, `NoMatch` prompt, or a post-filter re-validation that matched nothing).
+    /// For a compound command this is the deciding leaf's rule, mirroring `merge_results`.
+    rule: Option<String>,
+}
+
+/// tool_rules are deliberately checked before bash_rules so a tool rule can short-circuit Bash
+/// evaluation entirely; reordering this would change which rule set decides and silently alter
+/// recorded attributions.
 async fn handle_pretool_hook(
     tool_name: &str,
     tool_input: &serde_json::Value,
     cwd: &str,
-) -> Result<HookOutput> {
+) -> Result<PretoolOutcome> {
     let config = match load_config_or_ask().await {
         Ok(c) => c,
-        Err(fallback) => return Ok(fallback),
+        Err(fallback) => {
+            return Ok(PretoolOutcome {
+                output: fallback,
+                rules_hash: None,
+                rule: None,
+            })
+        }
+    };
+
+    let rules_hash = config.effective_hash();
+    let outcome = |output, rule: Option<String>| PretoolOutcome {
+        output,
+        rules_hash: Some(rules_hash.clone()),
+        rule,
     };
 
     if let Some(rules) = &config.tool_rules {
@@ -425,7 +424,7 @@ async fn handle_pretool_hook(
                         rule = %rule_name,
                         "Tool call allowed by tool rule"
                     );
-                    return Ok(pretool_allow_hook(None));
+                    return Ok(outcome(pretool_allow_hook(None), Some(rule_name)));
                 }
                 tool_rules::ToolRuleResult::Denied { rule_name, reason } => {
                     info!(
@@ -434,7 +433,7 @@ async fn handle_pretool_hook(
                         reason = %reason,
                         "Tool call denied by tool rule"
                     );
-                    return Ok(pretool_deny_hook(reason));
+                    return Ok(outcome(pretool_deny_hook(reason), Some(rule_name)));
                 }
                 tool_rules::ToolRuleResult::Asked { rule_name } => {
                     info!(
@@ -442,7 +441,7 @@ async fn handle_pretool_hook(
                         rule = %rule_name,
                         "Tool rule requests user permission"
                     );
-                    return Ok(pretool_ask_hook());
+                    return Ok(outcome(pretool_ask_hook(), Some(rule_name)));
                 }
                 tool_rules::ToolRuleResult::NoMatch => {
                     debug!(tool_name = %tool_name, "No tool rules matched, continuing to engine-specific handling");
@@ -452,10 +451,11 @@ async fn handle_pretool_hook(
     }
 
     if tool_name == "Bash" {
-        handle_bash_pretool_hook_with_config(tool_input, config, cwd).await
+        let (output, rule) = handle_bash_pretool_hook_with_config(tool_input, config, cwd).await?;
+        Ok(outcome(output, rule))
     } else {
         debug!(tool_name = %tool_name, "No tool rules matched for non-Bash tool, deferring to Claude Code");
-        Ok(HookOutput::default())
+        Ok(outcome(HookOutput::default(), None))
     }
 }
 
@@ -469,18 +469,24 @@ async fn handle_bash_pretool_hook(tool_input: &serde_json::Value, cwd: &str) -> 
         Ok(c) => c,
         Err(fallback) => return Ok(fallback),
     };
-    handle_bash_pretool_hook_with_config(tool_input, config, cwd).await
+    handle_bash_pretool_hook_with_config(tool_input, config, cwd)
+        .await
+        .map(|(output, _rule)| output)
 }
 
 /// Apply bash_rules from a pre-loaded config to validate Bash commands.
 ///
-/// `cwd` is the hook's working directory; it drives compound-command splitting and in-cwd
-/// absolute-path normalization in [`bash_rules::BashRuleEngine::apply_rules_compound`].
+/// `cwd` must be the verbatim value from the hook input — not canonicalized — because rule
+/// normalization strips it as a literal string prefix, and the recorded `cwd` must round-trip
+/// through `rules replay` to reproduce the same normalization.
+///
+/// The returned rule name is the one whose *action* produced the decision (`None` when no rule
+/// decided), which the completion log records as attribution.
 async fn handle_bash_pretool_hook_with_config(
     tool_input: &serde_json::Value,
     config: crate::user_config::UserConfig,
     cwd: &str,
-) -> Result<HookOutput> {
+) -> Result<(HookOutput, Option<String>)> {
     use bash_rules::{BashRuleEngine, RuleResult};
 
     let command = tool_input
@@ -494,7 +500,7 @@ async fn handle_bash_pretool_hook_with_config(
         Some(rules) if !rules.is_empty() => rules,
         _ => {
             info!("No bash_rules configured, defaulting to Ask");
-            return Ok(pretool_ask_hook());
+            return Ok((pretool_ask_hook(), None));
         }
     };
 
@@ -508,7 +514,7 @@ async fn handle_bash_pretool_hook_with_config(
                 rule = %rule_name,
                 "Bash command allowed by rule"
             );
-            Ok(pretool_allow_hook(None))
+            Ok((pretool_allow_hook(None), Some(rule_name)))
         }
         RuleResult::Denied { rule_name, reason } => {
             info!(
@@ -517,7 +523,7 @@ async fn handle_bash_pretool_hook_with_config(
                 reason = %reason,
                 "Bash command denied by rule"
             );
-            Ok(pretool_deny_hook(reason))
+            Ok((pretool_deny_hook(reason), Some(rule_name)))
         }
         RuleResult::Modified {
             rule_name,
@@ -536,7 +542,10 @@ async fn handle_bash_pretool_hook_with_config(
             );
             updated_tool_input["command"] = serde_json::Value::String(new_command);
 
-            Ok(pretool_modify_hook(updated_tool_input, Some(reason)))
+            Ok((
+                pretool_modify_hook(updated_tool_input, Some(reason)),
+                Some(rule_name),
+            ))
         }
         RuleResult::Asked { rule_name } => {
             info!(
@@ -544,7 +553,7 @@ async fn handle_bash_pretool_hook_with_config(
                 rule = %rule_name,
                 "Bash rule requests user permission"
             );
-            Ok(pretool_ask_hook())
+            Ok((pretool_ask_hook(), Some(rule_name)))
         }
         RuleResult::ArgumentFiltered {
             rule_name,
@@ -558,14 +567,12 @@ async fn handle_bash_pretool_hook_with_config(
                 "Command arguments filtered, re-validating"
             );
 
-            // CRITICAL: Re-validate filtered command for security
             let recheck_result = engine.apply_rules_compound(&new_command, cwd);
 
             match recheck_result {
                 RuleResult::Allowed {
                     rule_name: allow_rule,
                 } => {
-                    // Filtered command is explicitly allowed, safe to execute
                     info!(
                         filtered_command = %new_command,
                         allowed_by = %allow_rule,
@@ -578,41 +585,44 @@ async fn handle_bash_pretool_hook_with_config(
                     let final_reason = reason
                         .unwrap_or_else(|| format!("Arguments filtered by rule '{}'", rule_name));
 
-                    Ok(pretool_modify_hook(updated_tool_input, Some(final_reason)))
+                    // The visible effect (the rewritten command) is the filter rule's action, so
+                    // attribution names it rather than the allow rule that merely re-validated.
+                    Ok((
+                        pretool_modify_hook(updated_tool_input, Some(final_reason)),
+                        Some(rule_name),
+                    ))
                 }
                 RuleResult::Denied {
+                    rule_name: deny_rule,
                     reason: deny_reason,
-                    ..
                 } => {
-                    // Filtered command matched a deny rule
                     warn!(
                         filtered_command = %new_command,
                         reason = %deny_reason,
                         "Filtered command was denied by rules"
                     );
-                    Ok(pretool_deny_hook(deny_reason))
+                    Ok((pretool_deny_hook(deny_reason), Some(deny_rule)))
                 }
                 RuleResult::NoMatch => {
-                    // Filtered command doesn't match any rule, ask user
                     info!(
                         filtered_command = %new_command,
                         "Filtered command doesn't match any allow rule, asking user"
                     );
-                    Ok(pretool_ask_hook())
+                    Ok((pretool_ask_hook(), None))
                 }
-                RuleResult::Asked { .. } => {
-                    // Filtered command matched an Ask rule
+                RuleResult::Asked {
+                    rule_name: ask_rule,
+                } => {
                     info!(
                         filtered_command = %new_command,
                         "Filtered command requires user confirmation"
                     );
-                    Ok(pretool_ask_hook())
+                    Ok((pretool_ask_hook(), Some(ask_rule)))
                 }
                 RuleResult::Modified {
+                    rule_name: modify_rule,
                     new_command: further_modified,
-                    ..
                 } => {
-                    // Filtered command was modified again (chained modifications)
                     info!(
                         filtered_command = %new_command,
                         further_modified = %further_modified,
@@ -622,53 +632,35 @@ async fn handle_bash_pretool_hook_with_config(
                     let mut updated_tool_input = tool_input.clone();
                     updated_tool_input["command"] = serde_json::Value::String(further_modified);
 
-                    Ok(pretool_modify_hook(updated_tool_input, reason))
+                    Ok((
+                        pretool_modify_hook(updated_tool_input, reason),
+                        Some(modify_rule),
+                    ))
                 }
-                RuleResult::ArgumentFiltered { .. } => {
+                RuleResult::ArgumentFiltered {
+                    rule_name: chained_rule,
+                    ..
+                } => {
                     // Prevent infinite loops - don't allow chained argument filtering
                     warn!(
                         filtered_command = %new_command,
                         "Filtered command matched another ArgumentFilter rule, asking user to prevent loops"
                     );
-                    Ok(pretool_ask_hook())
+                    Ok((pretool_ask_hook(), Some(chained_rule)))
                 }
             }
         }
         RuleResult::NoMatch => {
             debug!(command = %command, "No bash rules matched, prompting user");
-            Ok(pretool_ask_hook())
+            Ok((pretool_ask_hook(), None))
         }
     }
 }
 
-/// Handle Stop hook by running project checks if configured
-///
-/// This function:
-/// 1. Checks for $CLAUDE_PROJECT_DIR environment variable
-/// 2. Loads and validates the project's .config/tools.toml
-/// 3. Verifies all checks are approved
-/// 4. Runs all checks in parallel
-/// 5. Returns HookOutput with decision based on check results
-///
-/// ## Security Model: Fail-Open Design
-///
-/// This handler implements a **fail-open** approach, returning `Allow` when:
-/// - `$CLAUDE_PROJECT_DIR` environment variable is not set
-/// - Project directory doesn't exist or cannot be canonicalized
-/// - `.config/tools.toml` cannot be loaded or parsed
-/// - No checks are defined in the configuration
-///
-/// **Rationale**: This design prioritizes developer experience and avoids breaking workflows
-/// when projects don't use the checks feature. Since checks are opt-in security validations,
-/// their absence or misconfiguration should not block execution.
-///
-/// **Trade-offs**: An attacker who can manipulate the environment or filesystem to cause
-/// config loading failures could bypass checks. However, this requires the same level of
-/// access needed to modify approved binaries directly, so it doesn't meaningfully weaken
-/// the security model. Once checks are configured and approved, the handler fails **closed**
-/// on all verification failures (unapproved checks, hash mismatches, check failures).
+/// Every early `allow_hook(None)` return below is the fail-open path described in the
+/// module-level "Security Model: Fail-Open Design" section; once checks exist and are
+/// approved, any verification failure fails closed.
 async fn handle_stop_hook() -> Result<HookOutput> {
-    // Check for project directory environment variable
     let project_dir = match std::env::var("CLAUDE_PROJECT_DIR") {
         Ok(dir) => {
             info!(project_dir = %dir, "Found CLAUDE_PROJECT_DIR");
@@ -699,7 +691,6 @@ async fn handle_stop_hook() -> Result<HookOutput> {
         }
     };
 
-    // Use repository root for config loading and approval verification
     let config = match load_project_settings(repository_root.clone()).await {
         Ok(config) => config,
         Err(e) => {
@@ -711,7 +702,6 @@ async fn handle_stop_hook() -> Result<HookOutput> {
         }
     };
 
-    // Check if there are any checks defined
     let checks = match config.checks {
         Some(checks) if !checks.is_empty() => checks,
         _ => {
@@ -722,7 +712,6 @@ async fn handle_stop_hook() -> Result<HookOutput> {
 
     info!(check_count = checks.len(), "Found checks to run");
 
-    // Validate all checks have non-empty commands
     for check in &checks {
         if check.command.is_empty() {
             error!(check_name = %check.name, "Check has empty command");
@@ -735,10 +724,8 @@ async fn handle_stop_hook() -> Result<HookOutput> {
         }
     }
 
-    // Load project approvals
     let approvals = ProjectApprovals::load().await?;
 
-    // Verify all checks are approved
     for check in &checks {
         let verification = approvals
             .verify_check(&repository_root, &check.name)
@@ -821,7 +808,6 @@ async fn handle_stop_hook() -> Result<HookOutput> {
     const MAX_OUTPUT_SIZE: usize = 1024 * 1024;
     const MAX_TOTAL_OUTPUT: usize = 10 * 1024 * 1024;
 
-    // Execute checks with concurrency limits
     let timeout_duration = std::time::Duration::from_secs(CHECK_TIMEOUT_SECS);
     let repository_root_clone = repository_root.clone();
 
@@ -855,7 +841,6 @@ async fn handle_stop_hook() -> Result<HookOutput> {
     .buffer_unordered(MAX_CONCURRENT_CHECKS)
     .collect::<Vec<_>>();
 
-    // Wait for all checks to complete with timeout
     let results = match tokio::time::timeout(timeout_duration, check_futures).await {
         Ok(results) => results,
         Err(_) => {
@@ -867,7 +852,6 @@ async fn handle_stop_hook() -> Result<HookOutput> {
         }
     };
 
-    // Process results
     let mut failures = Vec::new();
     let mut all_output = Vec::new();
     let mut total_output_size = 0;
@@ -961,7 +945,6 @@ async fn handle_stop_hook() -> Result<HookOutput> {
         }
     }
 
-    // Return result based on failures
     info!(
         total_output_size = total_output_size,
         "Finished processing all check results"

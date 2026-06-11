@@ -15,8 +15,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::persistence::FileType;
 
-/// Check if a miette error represents a "file not found" condition.
-///
 /// Miette's `into_diagnostic()` converts io::Error to miette::Report, losing type information.
 /// We must check the error message for ENOENT (os error 2) which indicates file not found.
 /// This is fragile but unavoidable given miette's design - the original io::Error::NotFound
@@ -64,6 +62,26 @@ pub struct UserConfig {
 
     #[serde(default)]
     pub tool_rules: Option<Vec<ToolRule>>,
+}
+
+impl UserConfig {
+    /// Stable hash of the effective rule set, used to stamp each hook decision (`rules_hash`) with
+    /// the rules that produced it so `rules replay`/`rules suggest` can scope recorded history to the
+    /// rules currently in force.
+    ///
+    /// The parsed config is hashed — not the file bytes — so comment, whitespace, and key-order edits
+    /// do not fragment history, while any pattern/action/rule-order/fragment change yields a new hash.
+    /// Hashing goes through `serde_json::to_value`, whose objects are `BTreeMap`-backed (the
+    /// `preserve_order` feature is off), so the map keys (`pattern_fragments` and an ArgumentFilter
+    /// `replace` table) serialize in sorted order and the hash is reproducible; rule `Vec` order, which
+    /// is significant for first-match-wins, is preserved. The whole config is hashed because a
+    /// `tool_rule` matching Bash short-circuits the bash engine and so co-determines the decision.
+    pub fn effective_hash(&self) -> String {
+        let canonical = serde_json::to_value(self)
+            .and_then(|value| serde_json::to_string(&value))
+            .expect("UserConfig is always JSON-serializable");
+        crate::hashing::hash_string(&canonical)
+    }
 }
 
 /// Rules evaluated in order with first-match-wins semantics.
@@ -258,6 +276,55 @@ mod tests {
         assert_eq!(config.bash_rules, None);
         assert_eq!(config.pattern_fragments, None);
         assert_eq!(config.tool_rules, None);
+    }
+
+    fn allow(name: &str, pattern: &str) -> BashRule {
+        BashRule {
+            name: name.to_string(),
+            pattern: pattern.to_string(),
+            action: BashRuleAction::Allow,
+        }
+    }
+
+    #[test]
+    fn effective_hash_is_stable_across_fragment_insertion_order() {
+        // pattern_fragments is a HashMap, so two configs with the same fragments inserted in a
+        // different order must still hash identically — otherwise the rules_hash would flap between
+        // runs of an unchanged config and the replay/suggest filter would exclude its own history.
+        let mut a = HashMap::new();
+        a.insert("alpha".to_string(), "a".to_string());
+        a.insert("beta".to_string(), "b".to_string());
+        let mut b = HashMap::new();
+        b.insert("beta".to_string(), "b".to_string());
+        b.insert("alpha".to_string(), "a".to_string());
+
+        let config_a = UserConfig {
+            pattern_fragments: Some(a),
+            bash_rules: Some(vec![allow("ls", "^ls")]),
+            tool_rules: None,
+        };
+        let config_b = UserConfig {
+            pattern_fragments: Some(b),
+            bash_rules: Some(vec![allow("ls", "^ls")]),
+            tool_rules: None,
+        };
+
+        assert_eq!(config_a.effective_hash(), config_b.effective_hash());
+    }
+
+    #[test]
+    fn effective_hash_changes_on_semantic_edits() {
+        let base = sample_config(Some(vec![allow("ls", "^ls")]), None);
+
+        // A changed pattern is a different rule set.
+        let changed_pattern = sample_config(Some(vec![allow("ls", "^ls -la")]), None);
+        assert_ne!(base.effective_hash(), changed_pattern.effective_hash());
+
+        // Rule order is significant for first-match-wins, so reordering changes the hash.
+        let reordered = sample_config(Some(vec![allow("cat", "^cat"), allow("ls", "^ls")]), None);
+        let original_order =
+            sample_config(Some(vec![allow("ls", "^ls"), allow("cat", "^cat")]), None);
+        assert_ne!(reordered.effective_hash(), original_order.effective_hash());
     }
 
     #[test]

@@ -138,6 +138,17 @@ async fn run_pretool_hook(
     input: &serde_json::Value,
     cwd: &str,
 ) -> HookOutput {
+    run_pretool_outcome(config, tool, input, cwd).await.output
+}
+
+/// Like [`run_pretool_hook`] but returns the full outcome, so tests can assert which rule the
+/// completion log would attribute the decision to.
+async fn run_pretool_outcome(
+    config: &str,
+    tool: &str,
+    input: &serde_json::Value,
+    cwd: &str,
+) -> PretoolOutcome {
     let _xdg_config = setup_user_bash_rules(config).await;
     handle_pretool_hook(tool, input, cwd)
         .await
@@ -406,6 +417,74 @@ async fn test_exec_hook_pretool_completion_log_includes_tool_context() {
         fields.get("cwd").and_then(Value::as_str),
         Some("/tmp/project"),
         "completion log should record the hook cwd for exact replay"
+    );
+    // A passthrough has no deciding rule, but the (default, empty) config still loaded, so the
+    // rule-set hash must be stamped for the replay/suggest provenance filter.
+    assert_eq!(
+        fields.get("rule").and_then(Value::as_str),
+        Some(""),
+        "no rule decides a passthrough"
+    );
+    let rules_hash = fields
+        .get("rules_hash")
+        .and_then(Value::as_str)
+        .expect("rules_hash should be logged on completion events");
+    assert!(
+        rules_hash.starts_with("sha256:"),
+        "rules_hash should be the effective-config hash, got: {rules_hash}"
+    );
+}
+
+#[tokio::test]
+async fn test_exec_hook_completion_log_attributes_the_deciding_rule() {
+    let _xdg_state = setup_isolated_xdg_state();
+    let _xdg_config = setup_user_bash_rules(&cfg_bash_rule(
+        "allow-echo",
+        r"^echo\b",
+        r#"{ type = "Allow" }"#,
+    ))
+    .await;
+
+    let input = r#"{
+        "session_id": "test-session",
+        "transcript_path": "/tmp/transcript.json",
+        "cwd": "/tmp/project",
+        "permission_mode": "default",
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": "echo hello"}
+    }"#;
+
+    exec_hook_impl(Cursor::new(input))
+        .await
+        .expect("PreToolUse Bash event should succeed");
+
+    let content = read_hooks_log_file().await;
+    let fields = content
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|event| {
+            event.pointer("/fields/message").and_then(Value::as_str)
+                == Some("PreToolUse hook completed")
+        })
+        .expect("PreToolUse completion log event should be present")
+        .get("fields")
+        .cloned()
+        .expect("Tracing JSON event should contain fields");
+
+    assert_eq!(fields.get("result").and_then(Value::as_str), Some("allow"));
+    assert_eq!(
+        fields.get("rule").and_then(Value::as_str),
+        Some("allow-echo"),
+        "completion log should attribute the decision to the matching rule"
+    );
+    let rules_hash = fields
+        .get("rules_hash")
+        .and_then(Value::as_str)
+        .expect("rules_hash should be logged");
+    assert!(
+        rules_hash.starts_with("sha256:"),
+        "rules_hash should be the effective-config hash, got: {rules_hash}"
     );
 }
 
@@ -1547,7 +1626,8 @@ async fn test_non_bash_tool_no_rules_returns_passthrough() {
     let tool_input = serde_json::json!({"file_path": "/tmp/foo"});
     let result = handle_pretool_hook("Read", &tool_input, "")
         .await
-        .expect("Should succeed");
+        .expect("Should succeed")
+        .output;
 
     // When no tool rules match a non-Bash tool, all fields should be None
     // (serializes to `{}`, deferring to Claude Code's native permission system)
@@ -1567,7 +1647,8 @@ async fn test_non_bash_tool_no_matching_rule_returns_passthrough() {
     // Config exists with rules, but none match Read — should passthrough
     let result = handle_pretool_hook("Read", &serde_json::json!({"file_path": "/tmp/foo"}), "")
         .await
-        .expect("Should succeed");
+        .expect("Should succeed")
+        .output;
 
     assert_eq!(result.hook_specific_output, None);
     assert_eq!(result.permission_decision, None);
@@ -1659,7 +1740,8 @@ async fn test_pretool_hook_invalid_config_defaults_to_ask() {
     let tool_input = serde_json::json!({"file_path": "/tmp/foo.rs"});
     let result = handle_pretool_hook("Read", &tool_input, "")
         .await
-        .expect("Should succeed with Ask fallback");
+        .expect("Should succeed with Ask fallback")
+        .output;
 
     assert_pretool_ask(&result);
 }
@@ -1740,6 +1822,7 @@ async fn run_allow_local_read(
     )
     .await
     .expect("Should succeed")
+    .output
 }
 
 #[tokio::test]
@@ -1765,7 +1848,8 @@ async fn test_tool_rule_allow_local_matches_existing_path() {
         cwd.to_str().unwrap(),
     )
     .await
-    .expect("Should succeed");
+    .expect("Should succeed")
+    .output;
     assert_pretool_allow(&result);
 }
 
@@ -1789,7 +1873,8 @@ async fn test_tool_rule_allow_local_matches_nonexistent_path() {
         cwd.to_str().unwrap(),
     )
     .await
-    .expect("Should succeed");
+    .expect("Should succeed")
+    .output;
     assert_pretool_allow(&result);
 }
 
@@ -1811,7 +1896,8 @@ async fn test_tool_rule_allow_local_rejects_path_escape() {
         cwd.to_str().unwrap(),
     )
     .await
-    .expect("Should succeed");
+    .expect("Should succeed")
+    .output;
     assert_eq!(
         result.hook_specific_output, None,
         "Should not match: path is outside cwd, allow_local must reject"
@@ -1835,7 +1921,8 @@ async fn test_tool_rule_allow_local_no_match_for_regex_miss() {
         cwd.to_str().unwrap(),
     )
     .await
-    .expect("Should succeed");
+    .expect("Should succeed")
+    .output;
     assert_eq!(
         result.hook_specific_output, None,
         "Should not match: path is local but regex does not match Cargo.toml"
@@ -1870,6 +1957,7 @@ allow_local = true
     )
     .await
     .expect("Should succeed")
+    .output
 }
 
 #[tokio::test]
@@ -1905,7 +1993,8 @@ async fn test_tool_rule_allow_local_with_non_path_field_does_not_match() {
         cwd.to_str().unwrap(),
     )
     .await
-    .expect("Should succeed");
+    .expect("Should succeed")
+    .output;
 
     assert_eq!(
         result.hook_specific_output, None,
@@ -1951,6 +2040,227 @@ async fn test_tool_rule_allow_local_rejects_symlink_escape() {
         result.hook_specific_output, None,
         "Should not match: symlink resolves outside cwd, treated as non-local"
     );
+}
+
+#[tokio::test]
+async fn test_tool_rule_allow_local_with_wildcard_tool() {
+    // A wildcard rule with `allow_local` permissions every tool's local-path calls in one rule,
+    // while non-local paths still fall through to Claude Code.
+    let config = "[[tool_rules]]\nname = 'any-local'\ntool = '*'\nallow_local = true\naction = { type = \"Allow\" }\n";
+    let _xdg_config = setup_user_bash_rules(config).await;
+
+    let temp_dir = TempDir::new().unwrap();
+    let cwd = temp_dir.path();
+    std::fs::write(cwd.join("local.txt"), "hello\n").unwrap();
+
+    let local = handle_pretool_hook(
+        "Write",
+        &serde_json::json!({"path": cwd.join("local.txt"), "content": "x"}),
+        cwd.to_str().unwrap(),
+    )
+    .await
+    .expect("Should succeed")
+    .output;
+    assert_pretool_allow(&local);
+
+    let outside = temp_dir.path().join("elsewhere.txt");
+    std::fs::write(&outside, "outside\n").unwrap();
+    let non_local = handle_pretool_hook(
+        "Write",
+        &serde_json::json!({"path": outside, "content": "x"}),
+        cwd.join("nested-cwd").to_str().unwrap(),
+    )
+    .await
+    .expect("Should succeed")
+    .output;
+    assert_eq!(
+        non_local.hook_specific_output, None,
+        "a wildcard allow_local rule must not match a non-local path"
+    );
+}
+
+#[tokio::test]
+async fn test_tool_rule_matches_numeric_and_boolean_fields() {
+    // Documented behavior: numbers and booleans are converted to strings before regex matching.
+    let config = "\
+[[tool_rules]]
+name = 'limit-42'
+tool = 'Read'
+field = 'limit'
+pattern = '^42$'
+action = { type = \"Allow\" }
+
+[[tool_rules]]
+name = 'recursive-true'
+tool = 'Grep'
+field = 'recursive'
+pattern = '^true$'
+action = { type = \"Allow\" }
+";
+    let _xdg_config = setup_user_bash_rules(config).await;
+
+    let number = handle_pretool_hook("Read", &serde_json::json!({"limit": 42}), "")
+        .await
+        .expect("Should succeed")
+        .output;
+    assert_pretool_allow(&number);
+
+    let other_number = handle_pretool_hook("Read", &serde_json::json!({"limit": 7}), "")
+        .await
+        .expect("Should succeed")
+        .output;
+    assert_eq!(
+        other_number.hook_specific_output, None,
+        "7 does not match ^42$"
+    );
+
+    let boolean = handle_pretool_hook("Grep", &serde_json::json!({"recursive": true}), "")
+        .await
+        .expect("Should succeed")
+        .output;
+    assert_pretool_allow(&boolean);
+
+    let false_boolean = handle_pretool_hook("Grep", &serde_json::json!({"recursive": false}), "")
+        .await
+        .expect("Should succeed")
+        .output;
+    assert_eq!(
+        false_boolean.hook_specific_output, None,
+        "false does not match ^true$"
+    );
+}
+
+#[tokio::test]
+async fn test_tool_rule_array_and_null_fields_never_match() {
+    // Documented behavior: arrays, objects, and null cannot be matched, even by a match-anything
+    // pattern, so a rule keyed on such a field simply does not apply.
+    let config = "\
+[[tool_rules]]
+name = 'paths-any'
+tool = 'Read'
+field = 'paths'
+pattern = '.*'
+action = { type = \"Allow\" }
+";
+    let _xdg_config = setup_user_bash_rules(config).await;
+
+    for (label, input) in [
+        ("array", serde_json::json!({"paths": ["a", "b"]})),
+        ("null", serde_json::json!({"paths": null})),
+        ("object", serde_json::json!({"paths": {"k": "v"}})),
+    ] {
+        let result = handle_pretool_hook("Read", &input, "")
+            .await
+            .expect("Should succeed")
+            .output;
+        assert_eq!(
+            result.hook_specific_output, None,
+            "case {label}: non-scalar field values never match"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_argument_filter_attribution_names_the_rule_that_acted() {
+    // The three ArgumentFilter re-validation outcomes attribute differently: the rewrite is the
+    // filter rule's action, a deny is the deny rule's, and a prompt that matched nothing has no
+    // deciding rule. These attributions feed the completion log's `rule` field.
+    let bash_input = |command: &str| serde_json::json!({ "command": command });
+
+    // Filter, then the filtered command matches an Allow rule → attributed to the filter rule,
+    // whose action (the rewrite) is what the user observes.
+    let filter_then_allow = r#"
+[[bash_rules]]
+name = "strip-open"
+pattern = '^cargo doc.*--open'
+action = { type = "ArgumentFilter", remove = ["--open"] }
+
+[[bash_rules]]
+name = "allow-cargo-doc"
+pattern = '^cargo doc'
+action = { type = "Allow" }
+"#;
+    let outcome = run_pretool_outcome(
+        filter_then_allow,
+        "Bash",
+        &bash_input("cargo doc --open"),
+        "",
+    )
+    .await;
+    assert_pretool_modified_case(&outcome.output, "cargo doc", "filter-then-allow");
+    assert_eq!(
+        outcome.rule.as_deref(),
+        Some("strip-open"),
+        "the rewrite is the filter rule's action"
+    );
+
+    // Filter, then the filtered command matches a Deny rule → attributed to the deny rule.
+    let filter_then_deny = r#"
+[[bash_rules]]
+name = "strip-force"
+pattern = '^rm\s.*--force'
+action = { type = "ArgumentFilter", remove = ["--force"] }
+
+[[bash_rules]]
+name = "deny-rm"
+pattern = '^rm\b'
+action = { type = "Deny", value = "rm is blocked" }
+"#;
+    let outcome =
+        run_pretool_outcome(filter_then_deny, "Bash", &bash_input("rm --force x"), "").await;
+    assert_pretool_deny(&outcome.output, "rm is blocked");
+    assert_eq!(outcome.rule.as_deref(), Some("deny-rm"));
+
+    // Filter, then the filtered command matches nothing → prompt with no deciding rule.
+    let filter_then_nomatch = r#"
+[[bash_rules]]
+name = "strip-open-only"
+pattern = '^cargo doc.*--open'
+action = { type = "ArgumentFilter", remove = ["--open"] }
+"#;
+    let outcome = run_pretool_outcome(
+        filter_then_nomatch,
+        "Bash",
+        &bash_input("cargo doc --open"),
+        "",
+    )
+    .await;
+    assert_pretool_ask(&outcome.output);
+    assert_eq!(
+        outcome.rule, None,
+        "a post-filter prompt that matched no rule has no attribution"
+    );
+}
+
+#[tokio::test]
+async fn test_argument_filter_emptying_args_requires_explicit_allow() {
+    // Filtering can strip a command down to its bare program. The bare program must still clear
+    // re-validation: with no rule matching `rm` alone, the rewrite prompts instead of executing.
+    let config = r#"
+[[bash_rules]]
+name = "strip-rm-args"
+pattern = '^rm\s'
+action = { type = "ArgumentFilter", remove = ["-f", "file.txt"] }
+"#;
+    let result = run_bash_hook(config, "rm -f file.txt").await;
+    assert_pretool_ask(&result);
+}
+
+#[tokio::test]
+async fn test_argument_filter_emptying_args_executes_when_bare_program_allowed() {
+    let config = r#"
+[[bash_rules]]
+name = "strip-rm-args"
+pattern = '^rm\s'
+action = { type = "ArgumentFilter", remove = ["-f", "file.txt"] }
+
+[[bash_rules]]
+name = "allow-bare-rm"
+pattern = "^rm$"
+action = { type = "Allow" }
+"#;
+    let result = run_bash_hook(config, "rm -f file.txt").await;
+    assert_pretool_modified_case(&result, "rm", "all arguments removed");
 }
 
 // ===== Compound-command splitting & cwd-normalization integration tests =====

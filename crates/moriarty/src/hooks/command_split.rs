@@ -580,6 +580,16 @@ mod tests {
     }
 
     #[test]
+    fn empty_cwd_disables_normalization() {
+        // The replay path falls back to an empty cwd for records that predate cwd logging; the
+        // absolute path must then pass through untouched rather than being mangled.
+        assert_eq!(
+            texts("cat /abs/cwd/src/foo.rs", ""),
+            vec!["cat /abs/cwd/src/foo.rs"]
+        );
+    }
+
+    #[test]
     fn normalization_preserves_other_tokens_byte_for_byte() {
         // Only the in-cwd path is rewritten; the quoted argument keeps its quotes and spaces.
         assert_eq!(
