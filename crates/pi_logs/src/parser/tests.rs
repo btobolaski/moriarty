@@ -1686,6 +1686,34 @@ fn todo_tool_result_accepts_error_field() {
     );
 }
 
+    /// Accepts a `subjects` array for bulk task creation.
+#[test]
+fn todo_tool_result_accepts_subjects_param() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "todo",
+        vec![json!({"type": "text", "text": "created todos"})],
+        false,
+        Some(json!({
+            "action": "create",
+            "params": {
+                "action": "create",
+                "subjects": ["first", "second"]
+            },
+            "tasks": [],
+            "nextId": 1
+        })),
+    ));
+
+    let Some(ToolResultDetails::Todo(details)) = tool_result.details else {
+        panic!("expected Todo details")
+    };
+
+    assert_eq!(
+        details.params.subjects,
+        Some(vec!["first".to_string(), "second".to_string()])
+    );
+}
+
 #[test]
 fn fact_list_tool_result_accepts_count() {
     let tool_result = parse_tool_result_message(tool_result_message_json(
@@ -1902,7 +1930,7 @@ fn mcp_tool_result_accepts_call_result() {
         }),
     );
 
-    assert_eq!(details.mode, McpMode::Call);
+    assert_eq!(details.mode, Some(McpMode::Call));
     assert_eq!(details.server.as_deref(), Some("git-read-only"));
     assert_eq!(details.tool.as_ref().map(McpTool::name), Some("status"));
 
@@ -1987,7 +2015,7 @@ fn mcp_tool_result_accepts_missing_structured_content() {
         }),
     );
 
-    assert_eq!(details.mode, McpMode::Call);
+    assert_eq!(details.mode, Some(McpMode::Call));
     let mcp_result = details.mcp_result.expect("expected mcp result");
     assert!(!mcp_result.is_error);
     assert!(mcp_result.structured_content.is_none());
@@ -2020,7 +2048,7 @@ fn mcp_tool_result_accepts_describe_mode() {
         }),
     );
 
-    assert_eq!(details.mode, McpMode::Describe);
+    assert_eq!(details.mode, Some(McpMode::Describe));
     assert_eq!(details.server.as_deref(), Some("jj-read-only"));
     let described = details
         .tool
@@ -2056,7 +2084,7 @@ fn mcp_tool_result_accepts_call_failure() {
         }),
     );
 
-    assert_eq!(details.mode, McpMode::Call);
+    assert_eq!(details.mode, Some(McpMode::Call));
     assert_eq!(details.error.as_deref(), Some("call_failed"));
     assert_eq!(
         details.message.as_deref(),
@@ -4792,7 +4820,7 @@ fn mcp_tool_result_accepts_status_mode() {
     let Some(ToolResultDetails::Mcp(details)) = tool_result.details else {
         panic!("expected Mcp details")
     };
-    assert_eq!(details.mode, McpMode::Status);
+    assert_eq!(details.mode, Some(McpMode::Status));
     assert_eq!(details.total_tools, Some(4));
     assert_eq!(details.connected_count, Some(1));
     let servers = details.servers.expect("expected servers");
@@ -4827,7 +4855,7 @@ fn mcp_tool_result_accepts_list_mode() {
     let Some(ToolResultDetails::Mcp(details)) = tool_result.details else {
         panic!("expected Mcp details")
     };
-    assert_eq!(details.mode, McpMode::List);
+    assert_eq!(details.mode, Some(McpMode::List));
     assert_eq!(details.server.as_deref(), Some("git-read-only"));
     assert_eq!(
         details.tools,
@@ -4864,7 +4892,7 @@ fn mcp_tool_result_accepts_tool_not_found_error() {
     let Some(ToolResultDetails::Mcp(details)) = tool_result.details else {
         panic!("expected Mcp details")
     };
-    assert_eq!(details.mode, McpMode::Call);
+    assert_eq!(details.mode, Some(McpMode::Call));
     assert_eq!(details.server.as_deref(), Some("git-read-only"));
     assert_eq!(details.tool.as_ref().map(McpTool::name), Some("rebase"));
     assert_eq!(details.error.as_deref(), Some("tool_not_found"));
@@ -4893,7 +4921,7 @@ fn mcp_tool_result_accepts_search_mode() {
     let Some(ToolResultDetails::Mcp(details)) = tool_result.details else {
         panic!("expected Mcp details")
     };
-    assert_eq!(details.mode, McpMode::Search);
+    assert_eq!(details.mode, Some(McpMode::Search));
     assert_eq!(details.query.as_deref(), Some("write"));
     assert_eq!(details.matches.as_deref(), Some(&[][..]));
     assert_eq!(details.count, Some(0));
@@ -5019,7 +5047,8 @@ fn mcp_client_error_vs_git_read_only_discrimination() {
 #[test]
 fn mcp_details_serialize_hint_server_as_camel_case() {
     let value = serde_json::to_value(McpDetails {
-        mode: McpMode::Call,
+        mode: Some(McpMode::Call),
+        sessions: None,
         mcp_result: None,
         server: Some("git-read-only".to_string()),
         tool: Some(McpTool::Name("rebase".to_string())),
@@ -5039,6 +5068,73 @@ fn mcp_details_serialize_hint_server_as_camel_case() {
 
     assert_eq!(value.get("hintServer"), Some(&Value::from("project-tools")));
     assert!(value.get("hint_server").is_none());
+}
+
+/// The `action: "ui-messages"` server status payload has only `sessions`.
+#[test]
+fn mcp_details_accepts_sessions_only_ui_messages_shape() {
+    let details: McpDetails = serde_json::from_value(json!({
+        "sessions": 3
+    }))
+    .expect("sessions-only shape should parse");
+
+    assert_eq!(details.mode, None);
+    assert_eq!(details.sessions, Some(3));
+    assert!(details.mcp_result.is_none());
+    assert!(details.server.is_none());
+}
+
+#[test]
+fn mcp_details_sessions_only_shape_rejects_unknown_fields() {
+    let err = serde_json::from_value::<McpDetails>(json!({
+        "sessions": 3,
+        "unexpected": true
+    }))
+    .expect_err("sessions-only shape should reject unknown fields");
+
+    assert!(
+        err.to_string().contains("unknown field"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn mcp_details_normal_mode_accepts_sessions_field() {
+    let details: McpDetails = serde_json::from_value(json!({
+        "mode": "call",
+        "sessions": 2
+    }))
+    .expect("mode-based shape with sessions should parse");
+
+    assert_eq!(details.mode, Some(McpMode::Call));
+    assert_eq!(details.sessions, Some(2));
+}
+
+#[test]
+fn mcp_details_normal_mode_rejects_unknown_fields() {
+    let err = serde_json::from_value::<McpDetails>(json!({
+        "mode": "call",
+        "garbage": true
+    }))
+    .expect_err("mode-based shape should reject unknown fields");
+
+    assert!(
+        err.to_string().contains("unknown field"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn mcp_details_missing_mode_without_sessions_is_rejected() {
+    let err = serde_json::from_value::<McpDetails>(json!({
+        "server": "git"
+    }))
+    .expect_err("no-mode no-sessions shape should be rejected");
+
+    assert!(
+        err.to_string().contains("missing field"),
+        "unexpected error: {err}"
+    );
 }
 
 /// Pins the routed async-only fields on subagent results.

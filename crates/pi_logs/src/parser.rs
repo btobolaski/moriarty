@@ -11,7 +11,7 @@
 //! model-emitted payload before the runtime validates it, so hard-coding tool
 //! schemas into the parser would reject or misrepresent real sessions.
 //!
-//! Three categories of structure legitimately deviate from the strict default:
+//! Four categories of structure legitimately deviate from the strict default:
 //!
 //! * **`serde(flatten)` of an internally-tagged enum** — when the flattened
 //!   target is an internally-tagged enum (one with `#[serde(tag = "...")]`
@@ -49,6 +49,17 @@
 //!   other string value still fails loudly. This is intentionally narrower
 //!   than a fully open `String` but wider than a strict enum, because faux
 //!   session IDs are dynamic and cannot be enumerated ahead of time.
+//!
+//! * **Shape-branching custom deserializer** — [`McpDetails`] uses a
+//!   custom `Deserialize` impl that accepts two structurally incompatible
+//!   wire formats: a sessions-only action shape (`{ sessions: N }` with no
+//!   `mode`, emitted by pi's `action: "ui-messages"` MCP server status
+//!   call) and the normal mode-based shape (all standard fields with
+//!   `mode` required). Both branches enforce strict unknown-field
+//!   rejection — the sessions-only path via
+//!   [`reject_unknown_object_fields`] and the mode-based path via an
+//!   internally-derived `StrictMcpDetails` struct with
+//!   `#[serde(deny_unknown_fields)]`.
 //!
 //! Each corrupt-stream exception carries an inline comment naming the
 //! observed failure mode.
@@ -786,6 +797,8 @@ pub struct SubagentStatusArgs {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TodoArgs {
     pub action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subjects: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2535,10 +2548,13 @@ pub struct McpDescribedTool {
     pub input_schema: JsonBlob,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct McpDetails {
-    pub mode: McpMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<McpMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sessions: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_result: Option<McpCallResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2581,6 +2597,104 @@ pub struct McpDetails {
     /// local-state-only searches that don't issue a remote query.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for McpDetails {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| de::Error::custom("McpDetails payload must be an object"))?;
+
+        // `action: "ui-messages"` shape: { sessions: N } with no mode field.
+        if !object.contains_key("mode") && object.contains_key("sessions") {
+            let sessions = object_field::<u32>(object, "sessions")
+                .map_err(de::Error::custom)?;
+            reject_unknown_object_fields(object, &["sessions"])
+                .map_err(de::Error::custom)?;
+            return Ok(McpDetails {
+                mode: None,
+                sessions: Some(sessions),
+                mcp_result: None,
+                server: None,
+                tool: None,
+                error: None,
+                message: None,
+                requested_tool: None,
+                hint_server: None,
+                servers: None,
+                total_tools: None,
+                connected_count: None,
+                tools: None,
+                count: None,
+                matches: None,
+                query: None,
+            });
+        }
+
+        // Fall through: validate through a strict intermediate struct.
+        // The intermediate struct enforces deny_unknown_fields so the
+        // usual mode-based McpDetails wire shape is still strict; only
+        // the sessions-only action shape bypasses it above.
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct StrictMcpDetails {
+            mode: McpMode,
+            #[serde(default)]
+            sessions: Option<u32>,
+            #[serde(default)]
+            mcp_result: Option<McpCallResult>,
+            #[serde(default)]
+            server: Option<String>,
+            #[serde(default)]
+            tool: Option<McpTool>,
+            #[serde(default)]
+            error: Option<String>,
+            #[serde(default)]
+            message: Option<String>,
+            #[serde(default)]
+            requested_tool: Option<String>,
+            #[serde(default)]
+            hint_server: Option<String>,
+            #[serde(default)]
+            servers: Option<Vec<McpServerStatus>>,
+            #[serde(default)]
+            total_tools: Option<u32>,
+            #[serde(default)]
+            connected_count: Option<u32>,
+            #[serde(default)]
+            tools: Option<Vec<String>>,
+            #[serde(default)]
+            count: Option<u32>,
+            #[serde(default)]
+            matches: Option<Vec<JsonBlob>>,
+            #[serde(default)]
+            query: Option<String>,
+        }
+
+        let strict = StrictMcpDetails::deserialize(value).map_err(de::Error::custom)?;
+        Ok(McpDetails {
+            mode: Some(strict.mode),
+            sessions: strict.sessions,
+            mcp_result: strict.mcp_result,
+            server: strict.server,
+            tool: strict.tool,
+            error: strict.error,
+            message: strict.message,
+            requested_tool: strict.requested_tool,
+            hint_server: strict.hint_server,
+            servers: strict.servers,
+            total_tools: strict.total_tools,
+            connected_count: strict.connected_count,
+            tools: strict.tools,
+            count: strict.count,
+            matches: strict.matches,
+            query: strict.query,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
