@@ -5643,6 +5643,126 @@ fn subagent_tool_result_accepts_parallel_mode() {
 }
 
 #[test]
+fn subagent_tool_result_accepts_workflow_graph() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "subagent",
+        vec![json!({"type": "text", "text": "parallel run queued"})],
+        false,
+        Some(json!({
+            "mode": "parallel",
+            "results": [{"agent": "scout"}],
+            "workflowGraph": {
+                "runId": "run_42",
+                "mode": "parallel",
+                "phases": [{"name": "review"}],
+                "nodes": [{
+                    "id": "group-1",
+                    "kind": "parallel-group",
+                    "label": "Reviewers",
+                    "status": "running",
+                    "stepIndex": 0,
+                    "children": [{
+                        "id": "agent-1",
+                        "kind": "agent",
+                        "status": "running",
+                        "stepIndex": 1,
+                        "agent": "scout",
+                        "flatIndex": 0,
+                        "structured": true
+                    }]
+                }]
+            }
+        })),
+    ));
+    let Some(ToolResultDetails::Subagent(details)) = tool_result.details else {
+        panic!("expected Subagent details")
+    };
+
+    let graph = details.workflow_graph.expect("expected workflow graph");
+    assert_eq!(graph.run_id, "run_42");
+    assert_eq!(graph.mode, "parallel");
+    let phases: Vec<Value> = graph.phases.into_iter().map(|b| b.0).collect();
+    assert_eq!(phases, vec![json!({"name": "review"})]);
+
+    let group = &graph.nodes[0];
+    assert_eq!(group.id, "group-1");
+    assert_eq!(group.kind, "parallel-group");
+    assert_eq!(group.label.as_deref(), Some("Reviewers"));
+    assert_eq!(group.status, "running");
+    assert_eq!(group.step_index, 0);
+    assert!(group.agent.is_none());
+    assert!(group.flat_index.is_none());
+    assert!(group.structured.is_none());
+
+    let children = group.children.as_ref().expect("expected children");
+    assert_eq!(children.len(), 1);
+    let child = &children[0];
+    assert_eq!(child.id, "agent-1");
+    assert_eq!(child.kind, "agent");
+    assert_eq!(child.agent.as_deref(), Some("scout"));
+    assert_eq!(child.flat_index, Some(0));
+    assert_eq!(child.structured, Some(true));
+    assert_eq!(child.status, "running");
+    assert_eq!(child.step_index, 1);
+    assert!(child.children.is_none());
+}
+
+#[test]
+fn workflow_graph_rejects_unknown_node_field() {
+    let err = parse_err(tool_result_message_json(
+        "subagent",
+        vec![json!({"type": "text", "text": "ok"})],
+        false,
+        Some(json!({
+            "mode": "parallel",
+            "results": [{"agent": "scout"}],
+            "workflowGraph": {
+                "runId": "r",
+                "mode": "parallel",
+                "nodes": [{
+                    "id": "n1",
+                    "kind": "agent",
+                    "status": "running",
+                    "stepIndex": 0,
+                    "agent": "a",
+                    "flatIndex": 0,
+                    "structured": false,
+                    "extraField": "should be rejected"
+                }]
+            }
+        })),
+    ));
+    let msg = err.to_string();
+    assert!(
+        msg.contains("unknown field") && msg.contains("extraField"),
+        "expected unknown field rejection, got: {msg}"
+    );
+}
+
+#[test]
+fn workflow_graph_rejects_unknown_graph_field() {
+    let err = parse_err(tool_result_message_json(
+        "subagent",
+        vec![json!({"type": "text", "text": "ok"})],
+        false,
+        Some(json!({
+            "mode": "parallel",
+            "results": [{"agent": "scout"}],
+            "workflowGraph": {
+                "runId": "r",
+                "mode": "parallel",
+                "unexpected": true
+            }
+        })),
+    ));
+    let msg = err.to_string();
+    assert!(
+        msg.contains("unknown field") && msg.contains("unexpected"),
+        "expected unknown field rejection, got: {msg}"
+    );
+}
+
+#[test]
 fn subagent_tool_result_rejects_unknown_mode() {
     let err = parse_err(tool_result_message_json(
         "subagent",

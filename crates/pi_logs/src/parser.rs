@@ -1811,6 +1811,41 @@ pub enum SubagentResultMode {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkflowGraph {
+    pub run_id: String,
+    pub mode: String,
+    /// Phase descriptors emitted by pi when the runtime tracks named
+    /// workflow phases (e.g. `{"name": "review"}`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub phases: Vec<JsonBlob>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nodes: Vec<WorkflowGraphNode>,
+}
+
+/// A node in the workflow execution tree. Group nodes (e.g. `kind =
+/// "parallel-group"`) carry `children`; leaf nodes (e.g. `kind =
+/// "agent"`) carry agent-specific fields.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkflowGraphNode {
+    pub id: String,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub status: String,
+    pub step_index: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flat_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub children: Option<Vec<WorkflowGraphNode>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SubagentResultDetails {
     pub mode: SubagentResultMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1834,6 +1869,11 @@ pub struct SubagentResultDetails {
     /// Working directory where the async run is staging its artifacts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub async_dir: Option<PathBuf>,
+    /// Structured execution tree for multi-agent workflow runs. Present
+    /// when the subagent operation tracks parallel groups and nested
+    /// agents; absent for single-agent or non-structured runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_graph: Option<WorkflowGraph>,
 }
 
 /// One streaming progress record per subagent result. The pi runtime emits
