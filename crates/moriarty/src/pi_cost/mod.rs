@@ -1,18 +1,21 @@
 mod analyzer;
 mod pricing;
 
-use std::path::Path;
+use std::{collections::BTreeMap, path::Path};
 
 use tabled::Tabled;
 
 use crate::cost_report::{
-    build_grouped_rows, format_duration, format_session_id, format_time_range, grouped_label,
-    push_nonzero_metric_rows, render_grouped_metrics, render_or_empty, render_stacked_charts,
-    ChartBucket, ChartSegment, DateTimezone, FormattedMetricColumns, MetricComponents, MetricTotal,
-    ReportMode, TimeRangeFilter,
+    build_grouped_rows, display_summary, format_duration, format_session_id, format_time_range,
+    grouped_label, print_grouped_report, push_nonzero_metric_rows, render_or_empty,
+    render_stacked_charts, ChartBucket, ChartSegment, DateTimezone, FormattedMetricColumns,
+    MetricComponents, MetricTotal, ReportMode, TimeRangeFilter,
 };
 use analyzer::{DailyMetrics, SessionMetrics};
 use pi_logs::Provider;
+use pricing::PiModelMetricsMap;
+
+type SummaryAggregates = (Vec<(String, MetricComponents)>, Vec<(String, MetricComponents)>);
 
 #[derive(Tabled)]
 struct PiMetricRow {
@@ -288,17 +291,68 @@ fn build_session_rows(
     )
 }
 
+pub(super) fn collect_provider_and_model_aggregates(
+    items: &[DailyMetrics],
+) -> SummaryAggregates {
+    collect_provider_and_model_aggregates_from_maps(items.iter().map(|d| &d.per_model))
+}
+
+pub(super) fn collect_session_provider_and_model_aggregates(
+    items: &[SessionMetrics],
+) -> SummaryAggregates {
+    collect_provider_and_model_aggregates_from_maps(items.iter().map(|s| &s.per_model))
+}
+
+fn collect_provider_and_model_aggregates_from_maps<'a>(
+    maps: impl IntoIterator<Item = &'a PiModelMetricsMap>,
+) -> SummaryAggregates {
+    let mut providers: BTreeMap<String, MetricComponents> = BTreeMap::new();
+    let mut models: BTreeMap<String, MetricComponents> = BTreeMap::new();
+
+    for per_model in maps {
+        for (pi_model, metrics) in per_model.model_metrics() {
+            let label = provider_label(pi_model.provider).to_string();
+            providers
+                .entry(label)
+                .and_modify(|existing| {
+                    existing
+                        .checked_add_assign(*metrics)
+                        .expect("provider aggregate overflow")
+                })
+                .or_insert(*metrics);
+
+            models
+                .entry(pi_model.model.clone())
+                .and_modify(|existing| {
+                    existing
+                        .checked_add_assign(*metrics)
+                        .expect("model aggregate overflow")
+                })
+                .or_insert(*metrics);
+        }
+    }
+
+    let provider_rows: Vec<_> = providers.into_iter().collect();
+    let model_rows: Vec<_> = models.into_iter().collect();
+
+    (provider_rows, model_rows)
+}
+
 fn display_daily_metrics(
     daily_metrics: &[DailyMetrics],
     report_mode: ReportMode,
 ) -> miette::Result<()> {
-    render_grouped_metrics(
-        daily_title(report_mode),
-        daily_metrics,
-        report_mode,
-        |items| build_daily_rows(items, report_mode),
-        DailyMetrics::total,
-    )
+    let (rows, total_row_indices) = build_daily_rows(daily_metrics, report_mode)?;
+    let grand_total = daily_metrics
+        .iter()
+        .try_fold(MetricTotal::zero(report_mode), |acc, item| {
+            acc.checked_add(item.total(report_mode)?)
+        })?;
+    let (providers, models) = collect_provider_and_model_aggregates(daily_metrics);
+
+    print_grouped_report(daily_title(report_mode), &rows, &total_row_indices);
+    display_summary(report_mode, Some(&providers), &models, grand_total);
+    Ok(())
 }
 
 fn display_session_metrics(
@@ -306,13 +360,17 @@ fn display_session_metrics(
     timezone: DateTimezone,
     report_mode: ReportMode,
 ) -> miette::Result<()> {
-    render_grouped_metrics(
-        session_title(report_mode),
-        session_metrics,
-        report_mode,
-        |items| build_session_rows(items, timezone, report_mode),
-        SessionMetrics::total,
-    )
+    let (rows, total_row_indices) = build_session_rows(session_metrics, timezone, report_mode)?;
+    let grand_total = session_metrics
+        .iter()
+        .try_fold(MetricTotal::zero(report_mode), |acc, item| {
+            acc.checked_add(item.total(report_mode)?)
+        })?;
+    let (providers, models) = collect_session_provider_and_model_aggregates(session_metrics);
+
+    print_grouped_report(session_title(report_mode), &rows, &total_row_indices);
+    display_summary(report_mode, Some(&providers), &models, grand_total);
+    Ok(())
 }
 
 fn display_daily_graphs(
@@ -659,5 +717,160 @@ mod tests {
         assert_eq!(rows[1].time_range, "");
         assert_eq!(rows[1].duration, "");
         assert_eq!(rows[2].model, "Total");
+    }
+
+    #[test]
+    fn provider_and_model_summary_totals_equal_grand_total() {
+        let daily_costs = vec![
+            costs_on(2025, 10, 23)
+                .with_model(Provider::Anthropic, "claude-sonnet-4-5", 1.0, 2.0, 0.0, 0.0)
+                .with_model(Provider::OpenAi, "gpt-5", 0.5, 1.0, 0.0, 0.0),
+            costs_on(2025, 10, 24).with_model(
+                Provider::OpenRouter,
+                "claude-sonnet-4-5",
+                3.0,
+                4.0,
+                0.0,
+                0.0,
+            ),
+        ];
+
+        let grand_total = daily_costs
+            .iter()
+            .fold(MetricTotal::Cost(0.0), |acc, item| {
+                acc.checked_add(item.total(ReportMode::Cost).unwrap())
+                    .unwrap()
+            });
+
+        let (providers, models) = collect_provider_and_model_aggregates(&daily_costs);
+
+        let provider_total = providers
+            .iter()
+            .map(|(_, m)| m.total())
+            .fold(MetricTotal::Cost(0.0), |acc, t| acc.checked_add(t).unwrap());
+        assert_eq!(
+            provider_total, grand_total,
+            "provider summary total must equal grand total"
+        );
+
+        let model_total = models
+            .iter()
+            .map(|(_, m)| m.total())
+            .fold(MetricTotal::Cost(0.0), |acc, t| acc.checked_add(t).unwrap());
+        assert_eq!(model_total, grand_total);
+        assert_eq!(grand_total, MetricTotal::Cost(11.5));
+    }
+
+    #[test]
+    fn session_provider_and_model_summary_totals_equal_grand_total() {
+        let mut per_model = PiModelCostsMap::default();
+        per_model
+            .add(
+                PiModel {
+                    provider: Provider::Anthropic,
+                    model: "claude-sonnet-4-5".to_string(),
+                },
+                ComponentTotals::new(1.0, 2.0, 0.0, 0.0),
+            )
+            .unwrap();
+        per_model
+            .add(
+                PiModel {
+                    provider: Provider::OpenAi,
+                    model: "gpt-5".to_string(),
+                },
+                ComponentTotals::new(0.5, 1.0, 0.0, 0.0),
+            )
+            .unwrap();
+
+        let sessions = vec![SessionCosts {
+            session_id: "session-a".to_string(),
+            start_time: Utc.with_ymd_and_hms(2025, 10, 23, 9, 0, 0).unwrap(),
+            end_time: Utc.with_ymd_and_hms(2025, 10, 23, 10, 0, 0).unwrap(),
+            per_model,
+        }];
+
+        let grand_total = sessions.iter().fold(MetricTotal::Cost(0.0), |acc, item| {
+            acc.checked_add(item.total(ReportMode::Cost).unwrap())
+                .unwrap()
+        });
+
+        let (providers, models) = collect_session_provider_and_model_aggregates(&sessions);
+
+        let provider_total = providers
+            .iter()
+            .map(|(_, m)| m.total())
+            .fold(MetricTotal::Cost(0.0), |acc, t| acc.checked_add(t).unwrap());
+        assert_eq!(provider_total, grand_total);
+
+        let model_total = models
+            .iter()
+            .map(|(_, m)| m.total())
+            .fold(MetricTotal::Cost(0.0), |acc, t| acc.checked_add(t).unwrap());
+        assert_eq!(model_total, grand_total);
+        assert_eq!(grand_total, MetricTotal::Cost(4.5));
+    }
+
+    #[test]
+    fn same_model_name_across_providers_merges_into_one_model_row() {
+        let daily_costs = vec![costs_on(2025, 10, 23)
+            .with_model(Provider::Anthropic, "claude-sonnet-4-5", 1.0, 2.0, 0.0, 0.0)
+            .with_model(
+                Provider::OpenRouter,
+                "claude-sonnet-4-5",
+                3.0,
+                4.0,
+                0.0,
+                0.0,
+            )];
+
+        let (_, models) = collect_provider_and_model_aggregates(&daily_costs);
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].0, "claude-sonnet-4-5");
+        assert_eq!(
+            models[0].1,
+            MetricComponents::Cost(ComponentTotals::new(4.0, 6.0, 0.0, 0.0))
+        );
+    }
+
+    #[test]
+    fn display_costs_with_summary_smoke() {
+        let daily_costs = vec![costs_on(2025, 10, 23)
+            .with_model(Provider::Anthropic, "claude-sonnet-4-5", 1.0, 2.0, 0.0, 0.0)
+            .with_model(Provider::OpenAi, "gpt-5", 0.5, 1.0, 0.0, 0.0)];
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            display_daily_metrics(&daily_costs, ReportMode::Cost).unwrap()
+        }));
+        if result.is_err() {
+            panic!("display panicked");
+        }
+    }
+
+    #[test]
+    fn display_costs_with_summary_token_mode_smoke() {
+        let mut per_model = PiModelCostsMap::default();
+        per_model
+            .add(
+                PiModel {
+                    provider: Provider::Anthropic,
+                    model: "claude-sonnet-4-5".to_string(),
+                },
+                MetricComponents::Tokens(TokenCounts::new(1_000, 500, 100, 50)),
+            )
+            .unwrap();
+
+        let token_daily = vec![DailyCosts {
+            date: test_date(2025, 10, 23),
+            per_model,
+        }];
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            display_daily_metrics(&token_daily, ReportMode::Tokens).unwrap()
+        }));
+        if result.is_err() {
+            panic!("token mode display panicked");
+        }
     }
 }

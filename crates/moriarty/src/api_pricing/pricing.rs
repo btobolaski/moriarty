@@ -28,7 +28,7 @@ fn family_sort_key(family: ModelFamily) -> usize {
 /// `has_no_version` flag forces entries with no parsed digits to sort last
 /// inside their family so e.g. a bare `"SONNET"` row sits below
 /// `"Sonnet 4.5"` rather than ahead of it.
-fn model_sort_key(model: &Model) -> (usize, Reverse<(u32, u32)>, u8) {
+pub(super) fn model_sort_key(model: &Model) -> (usize, Reverse<(u32, u32)>, u8) {
     let (major, minor, has_no_version) = match model.version {
         Some(version) => (version.major, version.minor.unwrap_or(0), 0u8),
         None => (0, 0, 1u8),
@@ -91,6 +91,18 @@ impl ModelMetricsMap {
             .try_fold(MetricTotal::zero(report_mode), |acc, metrics| {
                 acc.checked_add(metrics.total())
             })
+    }
+
+    /// Ordered view of every populated bucket, keyed by the parsed `Model`
+    /// so callers can accumulate across multiple maps without re-parsing
+    /// display strings.
+    pub fn model_entries(&self) -> Vec<(Model, MetricComponents)> {
+        let mut entries: Vec<(&Model, &MetricComponents)> = self.metrics.iter().collect();
+        entries.sort_by_key(|left| model_sort_key(left.0));
+        entries
+            .into_iter()
+            .map(|(model, metrics)| (model.clone(), *metrics))
+            .collect()
     }
 
     /// Ordered view of every populated bucket. Empty buckets are not emitted,

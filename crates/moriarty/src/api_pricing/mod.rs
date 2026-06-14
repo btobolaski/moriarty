@@ -1,17 +1,20 @@
 mod analyzer;
 mod pricing;
 
-use std::path::Path;
+use std::{collections::HashMap, path::Path};
 
 use tabled::Tabled;
 
+use claude_logs::Model;
+
 use crate::cost_report::{
-    build_grouped_rows, format_duration, format_session_id, format_time_range, grouped_label,
-    push_nonzero_metric_rows, render_grouped_metrics, render_or_empty, render_stacked_charts,
-    ChartBucket, ChartSegment, DateTimezone, FormattedMetricColumns, MetricComponents, MetricTotal,
-    ReportMode, TimeRangeFilter,
+    build_grouped_rows, display_summary, format_duration, format_session_id, format_time_range,
+    grouped_label, print_grouped_report, push_nonzero_metric_rows, render_or_empty,
+    render_stacked_charts, ChartBucket, ChartSegment, DateTimezone, FormattedMetricColumns,
+    MetricComponents, MetricTotal, ReportMode, TimeRangeFilter,
 };
 use analyzer::{DailyMetrics, SessionMetrics};
+use pricing::{model_sort_key, ModelMetricsMap};
 
 #[derive(Tabled)]
 struct ApiMetricRow {
@@ -248,17 +251,54 @@ fn build_session_rows(
     )
 }
 
+pub(super) fn collect_model_aggregates(items: &[DailyMetrics]) -> Vec<(String, MetricComponents)> {
+    collect_model_aggregates_from_maps(items.iter().map(|d| &d.per_model))
+}
+
+pub(super) fn collect_session_model_aggregates(
+    items: &[SessionMetrics],
+) -> Vec<(String, MetricComponents)> {
+    collect_model_aggregates_from_maps(items.iter().map(|s| &s.per_model))
+}
+
+fn collect_model_aggregates_from_maps<'a>(
+    maps: impl IntoIterator<Item = &'a ModelMetricsMap>,
+) -> Vec<(String, MetricComponents)> {
+    let mut map: HashMap<Model, MetricComponents> = HashMap::new();
+    for per_model in maps {
+        for (model, metrics) in per_model.model_entries() {
+            map.entry(model)
+                .and_modify(|existing| {
+                    existing
+                        .checked_add_assign(metrics)
+                        .expect("model aggregate overflow")
+                })
+                .or_insert(metrics);
+        }
+    }
+    let mut entries: Vec<_> = map.into_iter().collect();
+    entries.sort_by_key(|(model, _)| model_sort_key(model));
+    entries
+        .into_iter()
+        .map(|(model, metrics)| (model.to_string(), metrics))
+        .collect()
+}
+
 fn display_daily_metrics(
     daily_metrics: &[DailyMetrics],
     report_mode: ReportMode,
 ) -> miette::Result<()> {
-    render_grouped_metrics(
-        daily_title(report_mode),
-        daily_metrics,
-        report_mode,
-        |items| build_daily_rows(items, report_mode),
-        DailyMetrics::total,
-    )
+    let (rows, total_row_indices) = build_daily_rows(daily_metrics, report_mode)?;
+    let grand_total = daily_metrics
+        .iter()
+        .try_fold(MetricTotal::zero(report_mode), |acc, item| {
+            acc.checked_add(item.total(report_mode)?)
+        })?;
+    let models = collect_model_aggregates(daily_metrics);
+
+    print_grouped_report(daily_title(report_mode), &rows, &total_row_indices);
+    display_summary(report_mode, None, &models, grand_total);
+    Ok(())
 }
 
 fn display_session_metrics(
@@ -266,13 +306,17 @@ fn display_session_metrics(
     timezone: DateTimezone,
     report_mode: ReportMode,
 ) -> miette::Result<()> {
-    render_grouped_metrics(
-        session_title(report_mode),
-        session_metrics,
-        report_mode,
-        |items| build_session_rows(items, timezone, report_mode),
-        SessionMetrics::total,
-    )
+    let (rows, total_row_indices) = build_session_rows(session_metrics, timezone, report_mode)?;
+    let grand_total = session_metrics
+        .iter()
+        .try_fold(MetricTotal::zero(report_mode), |acc, item| {
+            acc.checked_add(item.total(report_mode)?)
+        })?;
+    let models = collect_session_model_aggregates(session_metrics);
+
+    print_grouped_report(session_title(report_mode), &rows, &total_row_indices);
+    display_summary(report_mode, None, &models, grand_total);
+    Ok(())
 }
 
 fn display_daily_graphs(

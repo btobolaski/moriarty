@@ -118,9 +118,11 @@ test in a separate process, making this safe and preventing tests from clobberin
 
 - Holds shared time filtering, grouped-table rendering, stacked-chart rendering, `ReportMode`, `CostComponents`,
   `TokenCounts`, `MetricComponents`, and report warning helpers used by both cost-report backends
-- `FormattedMetricColumns`, `GrandTotalRow`, and `render_grouped_metrics` are mode-aware: cost mode formats dollars,
+- `FormattedMetricColumns` and `GrandTotalRow` are mode-aware: cost mode formats dollars,
   token mode formats integer token counts with thousands separators, while preserving the same table shape for both
   backends
+- `display_summary` renders a consolidated "Summary" section (optional provider table for `pi cost`, model table for
+  both backends, and grand total) called by each backend after its inline grouped-table rendering
 - `charts.rs` renders deterministic horizontal stacked bars for both time-series and share views, including top-N plus
   `Other`, stable glyph/color assignment, and narrow-terminal truncation without changing the table-report path
 - Keeps the output behavior for `api-pricing`, `pi cost`, and the graph commands aligned without forcing the backends

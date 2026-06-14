@@ -720,3 +720,152 @@ fn iter_model_costs_returns_per_bucket_values() {
     assert_eq!(model_costs[3].0, "Haiku");
     assert_eq!(model_costs[3].1.input, 0.25);
 }
+
+#[test]
+fn collect_model_aggregates_total_equals_grand_total() {
+    let daily_costs = vec![
+        costs_on(2025, 10, 23)
+            .with_sonnet(1.0, 2.0, 0.0, 0.0)
+            .with_haiku(0.5, 1.0, 0.0, 0.0),
+        costs_on(2025, 10, 24)
+            .with_opus(15.0, 75.0, 0.0, 0.0)
+            .with_sonnet(3.0, 15.0, 0.0, 0.0)
+            .with_opus4(5.0, 25.0, 0.0, 0.0),
+    ];
+
+    let grand_total = daily_costs
+        .iter()
+        .fold(MetricTotal::Cost(0.0), |acc, item| {
+            acc.checked_add(item.total(ReportMode::Cost).unwrap())
+                .unwrap()
+        });
+
+    let models = collect_model_aggregates(&daily_costs);
+    let model_grand = models
+        .iter()
+        .map(|(_, m)| m.total())
+        .fold(MetricTotal::Cost(0.0), |acc, t| acc.checked_add(t).unwrap());
+
+    assert_eq!(grand_total, model_grand);
+    assert_eq!(grand_total, MetricTotal::Cost(142.5));
+}
+
+#[test]
+fn collect_session_model_aggregates_total_equals_grand_total() {
+    let mut per_model_a = ModelCostsMap::default();
+    per_model_a
+        .add(
+            Model::family(ModelFamily::Sonnet),
+            MetricComponents::Cost(ComponentTotals::new(1.0, 2.0, 0.0, 0.0)),
+        )
+        .unwrap();
+    per_model_a
+        .add(
+            Model::family(ModelFamily::Haiku),
+            MetricComponents::Cost(ComponentTotals::new(0.5, 1.0, 0.0, 0.0)),
+        )
+        .unwrap();
+
+    let mut per_model_b = ModelCostsMap::default();
+    per_model_b
+        .add(
+            Model::family(ModelFamily::Opus),
+            MetricComponents::Cost(ComponentTotals::new(15.0, 75.0, 0.0, 0.0)),
+        )
+        .unwrap();
+
+    let sessions = vec![
+        SessionCosts {
+            session_id: "session-a".to_string(),
+            start_time: Utc.with_ymd_and_hms(2025, 10, 23, 9, 0, 0).unwrap(),
+            end_time: Utc.with_ymd_and_hms(2025, 10, 23, 10, 0, 0).unwrap(),
+            per_model: per_model_a,
+        },
+        SessionCosts {
+            session_id: "session-b".to_string(),
+            start_time: Utc.with_ymd_and_hms(2025, 10, 24, 9, 0, 0).unwrap(),
+            end_time: Utc.with_ymd_and_hms(2025, 10, 24, 10, 0, 0).unwrap(),
+            per_model: per_model_b,
+        },
+    ];
+
+    let grand_total = sessions.iter().fold(MetricTotal::Cost(0.0), |acc, item| {
+        acc.checked_add(item.total(ReportMode::Cost).unwrap())
+            .unwrap()
+    });
+
+    let models = collect_session_model_aggregates(&sessions);
+    let model_grand = models
+        .iter()
+        .map(|(_, m)| m.total())
+        .fold(MetricTotal::Cost(0.0), |acc, t| acc.checked_add(t).unwrap());
+
+    assert_eq!(grand_total, model_grand);
+    assert_eq!(grand_total, MetricTotal::Cost(94.5));
+}
+
+#[test]
+fn collect_model_aggregates_preserves_family_then_version_desc_order() {
+    let daily_costs = vec![costs_on(2025, 10, 23)
+        .with_haiku(0.25, 1.25, 0.0, 0.0)
+        .with_sonnet(3.0, 15.0, 0.0, 0.0)
+        .with_opus(15.0, 75.0, 0.0, 0.0)
+        .with_opus4(5.0, 25.0, 0.0, 0.0)];
+
+    let models = collect_model_aggregates(&daily_costs);
+    let labels: Vec<&str> = models.iter().map(|(name, _)| name.as_str()).collect();
+
+    assert_eq!(labels, vec!["Opus 4", "Opus", "Sonnet", "Haiku"]);
+}
+
+#[test]
+fn display_costs_with_summary_smoke_variants() {
+    let cases = vec![
+        (
+            "single model single day",
+            vec![costs_on(2025, 10, 23).with_sonnet(1.0, 2.0, 0.0, 0.0)],
+        ),
+        (
+            "multiple models multiple days",
+            vec![
+                costs_on(2025, 10, 23)
+                    .with_opus(15.0, 75.0, 0.0, 0.0)
+                    .with_sonnet(3.0, 15.0, 0.0, 0.0)
+                    .with_haiku(0.25, 1.25, 0.0, 0.0)
+                    .with_opus4(5.0, 25.0, 0.0, 0.0),
+                costs_on(2025, 10, 24).with_sonnet(1.0, 1.0, 0.0, 0.0),
+            ],
+        ),
+    ];
+
+    for (label, daily_costs) in cases {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            display_costs(&daily_costs, ReportMode::Cost)
+        }));
+        if result.is_err() {
+            panic!("display_costs panicked on case {label}");
+        }
+    }
+}
+
+#[test]
+fn display_costs_with_summary_token_mode_smoke() {
+    let mut map = ModelCostsMap::default();
+    let opus4 = Model::from_model_string("claude-opus-4-20250514").unwrap();
+    map.add(
+        opus4,
+        MetricComponents::Tokens(TokenCounts::new(1_000, 500, 100, 50)),
+    )
+    .unwrap();
+    let token_daily = vec![DailyCosts {
+        date: test_date(2025, 10, 23),
+        per_model: map,
+    }];
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        display_costs(&token_daily, ReportMode::Tokens)
+    }));
+    if result.is_err() {
+        panic!("token mode display panicked");
+    }
+}

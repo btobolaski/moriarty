@@ -157,13 +157,6 @@ impl MetricTotal {
         }
     }
 
-    pub(crate) fn report_mode(self) -> ReportMode {
-        match self {
-            Self::Cost(_) => ReportMode::Cost,
-            Self::Tokens(_) => ReportMode::Tokens,
-        }
-    }
-
     pub(crate) fn checked_add(self, other: Self) -> miette::Result<Self> {
         match (self, other) {
             (Self::Cost(left), Self::Cost(right)) => Ok(Self::Cost(left + right)),
@@ -329,7 +322,23 @@ impl GrandTotalRow {
     }
 }
 
-fn get_terminal_width() -> usize {
+#[derive(Tabled)]
+pub(crate) struct ProviderSummaryRow {
+    #[tabled(rename = "Provider")]
+    provider: String,
+    #[tabled(inline)]
+    metrics: FormattedMetricColumns,
+}
+
+#[derive(Tabled)]
+pub(crate) struct ModelSummaryRow {
+    #[tabled(rename = "Model")]
+    model: String,
+    #[tabled(inline)]
+    metrics: FormattedMetricColumns,
+}
+
+pub(crate) fn get_terminal_width() -> usize {
     terminal::size()
         .map(|(cols, _)| cols as usize)
         .unwrap_or(80)
@@ -404,6 +413,23 @@ pub(crate) fn create_grouped_table<T: Tabled>(rows: &[T], total_row_indices: &[u
     table
 }
 
+pub(crate) fn print_grouped_report<T: Tabled>(
+    title: &str,
+    rows: &[T],
+    total_row_indices: &[usize],
+) {
+    let term_width = get_terminal_width();
+    println!("{}", divider(term_width));
+    println!("{}", title);
+    println!("{}", divider(term_width));
+    println!();
+
+    let mut table = create_grouped_table(rows, total_row_indices);
+    apply_width_config(&mut table, term_width);
+    println!("{}", table);
+    println!();
+}
+
 pub(crate) fn format_session_id(session_id: &str) -> String {
     let truncated: String = session_id.chars().take(8).collect();
     if truncated.is_empty() {
@@ -468,44 +494,6 @@ pub(crate) fn format_duration(minutes: i64) -> String {
     }
 }
 
-pub(crate) fn render_metric_report<T: Tabled>(
-    title: &str,
-    rows: &[T],
-    total_row_indices: &[usize],
-    grand_total: MetricTotal,
-) {
-    let term_width = get_terminal_width();
-    println!("{}", divider(term_width));
-    println!("{}", title);
-    println!("{}", divider(term_width));
-    println!();
-
-    let mut table = create_grouped_table(rows, total_row_indices);
-    apply_width_config(&mut table, term_width);
-
-    println!("{}", table);
-    println!();
-
-    display_grand_total(grand_total.report_mode(), grand_total);
-}
-
-pub(crate) fn render_grouped_metrics<Item, Row: Tabled>(
-    title: &str,
-    items: &[Item],
-    report_mode: ReportMode,
-    build_rows: impl Fn(&[Item]) -> miette::Result<(Vec<Row>, Vec<usize>)>,
-    total: impl Fn(&Item, ReportMode) -> miette::Result<MetricTotal>,
-) -> miette::Result<()> {
-    let (rows, total_row_indices) = build_rows(items)?;
-    let grand_total = items
-        .iter()
-        .try_fold(MetricTotal::zero(report_mode), |acc, item| {
-            acc.checked_add(total(item, report_mode)?)
-        })?;
-    render_metric_report(title, &rows, &total_row_indices, grand_total);
-    Ok(())
-}
-
 pub(crate) fn render_or_empty<T>(
     items: &[T],
     had_errors: bool,
@@ -531,6 +519,88 @@ pub(crate) fn warn_if_incomplete(had_errors: bool) {
     }
 }
 
+pub(crate) fn display_summary(
+    report_mode: ReportMode,
+    providers: Option<&[(String, MetricComponents)]>,
+    models: &[(String, MetricComponents)],
+    grand_total: MetricTotal,
+) {
+    let term_width = get_terminal_width();
+    println!("{}", divider(term_width));
+    println!("Summary");
+    println!("{}", divider(term_width));
+    println!();
+
+    if let Some(providers) = providers {
+        render_summary_table(
+            report_mode,
+            providers,
+            |provider, metrics| ProviderSummaryRow {
+                provider,
+                metrics: FormattedMetricColumns::from_metrics(metrics),
+            },
+            |total| ProviderSummaryRow {
+                provider: "Total".to_string(),
+                metrics: FormattedMetricColumns::from_total(total),
+            },
+            term_width,
+        );
+        println!();
+    }
+
+    render_summary_table(
+        report_mode,
+        models,
+        |model, metrics| ModelSummaryRow {
+            model,
+            metrics: FormattedMetricColumns::from_metrics(metrics),
+        },
+        |total| ModelSummaryRow {
+            model: "Total".to_string(),
+            metrics: FormattedMetricColumns::from_total(total),
+        },
+        term_width,
+    );
+    println!();
+
+    let row = GrandTotalRow::new(report_mode, grand_total);
+    let mut table = Table::new(vec![row]);
+    table.with(Style::rounded());
+    table.with(Modify::new(Rows::first()).with(Alignment::center()));
+    apply_width_config(&mut table, term_width);
+    println!("{}", table);
+    println!("{}", divider(term_width));
+}
+
+fn render_summary_table<Row: Tabled>(
+    report_mode: ReportMode,
+    items: &[(String, MetricComponents)],
+    into_row: impl Fn(String, MetricComponents) -> Row,
+    into_total_row: impl Fn(MetricTotal) -> Row,
+    term_width: usize,
+) {
+    let mut rows: Vec<Row> = Vec::new();
+    let mut total = MetricTotal::zero(report_mode);
+
+    for (key, metrics) in items.iter() {
+        if !metrics.is_zero() {
+            total = total
+                .checked_add(metrics.total())
+                .expect("summary table subtotal overflow");
+            rows.push(into_row(key.clone(), *metrics));
+        }
+    }
+
+    rows.push(into_total_row(total));
+
+    let mut table = Table::new(rows);
+    table.with(Style::rounded());
+    table.with(Modify::new(Rows::first()).with(Alignment::center()));
+    apply_width_config(&mut table, term_width);
+    println!("{}", table);
+}
+
+#[cfg(test)]
 pub(crate) fn display_grand_total(
     report_mode: ReportMode,
     grand_total: impl IntoMetricTotalForMode,
@@ -550,4 +620,83 @@ pub(crate) fn display_grand_total(
 
     println!("{}", table);
     println!("{}", divider(term_width));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cost_metrics(
+        input: f64,
+        output: f64,
+        cache_write: f64,
+        cache_read: f64,
+    ) -> MetricComponents {
+        MetricComponents::Cost(CostComponents::new(input, output, cache_write, cache_read))
+    }
+
+    fn token_metrics(
+        input: u64,
+        output: u64,
+        cache_write: u64,
+        cache_read: u64,
+    ) -> MetricComponents {
+        MetricComponents::Tokens(TokenCounts::new(input, output, cache_write, cache_read))
+    }
+
+    #[test]
+    fn display_summary_cost_mode_does_not_panic() {
+        let providers = vec![
+            ("Anthropic".to_string(), cost_metrics(1.0, 2.0, 0.0, 0.0)),
+            ("OpenAI".to_string(), cost_metrics(0.5, 1.0, 0.0, 0.0)),
+        ];
+        let models = vec![
+            (
+                "claude-sonnet-4-5".to_string(),
+                cost_metrics(1.0, 2.0, 0.0, 0.0),
+            ),
+            ("gpt-5".to_string(), cost_metrics(0.5, 1.0, 0.0, 0.0)),
+        ];
+
+        display_summary(
+            ReportMode::Cost,
+            Some(&providers),
+            &models,
+            MetricTotal::Cost(4.5),
+        );
+    }
+
+    #[test]
+    fn display_summary_token_mode_does_not_panic() {
+        let providers = vec![("Anthropic".to_string(), token_metrics(1_000, 500, 100, 50))];
+        let models = vec![(
+            "claude-sonnet-4-5".to_string(),
+            token_metrics(1_000, 500, 100, 50),
+        )];
+
+        display_summary(
+            ReportMode::Tokens,
+            Some(&providers),
+            &models,
+            MetricTotal::Tokens(1_650),
+        );
+    }
+
+    #[test]
+    fn display_summary_no_providers_does_not_panic() {
+        let models = vec![("Sonnet".to_string(), cost_metrics(1.0, 2.0, 0.0, 0.0))];
+
+        display_summary(ReportMode::Cost, None, &models, MetricTotal::Cost(3.0));
+    }
+
+    #[test]
+    fn display_summary_empty_models_does_not_panic() {
+        display_summary(ReportMode::Cost, None, &[], MetricTotal::Cost(0.0));
+    }
+
+    #[test]
+    fn display_summary_zero_metrics_skips_detail_rows() {
+        let models = vec![("Zero".to_string(), cost_metrics(0.0, 0.0, 0.0, 0.0))];
+        display_summary(ReportMode::Cost, None, &models, MetricTotal::Cost(0.0));
+    }
 }
