@@ -1766,8 +1766,9 @@ pub struct ContactSupervisorResultDetails {
     pub error: Option<bool>,
 }
 
-/// `ls` tool results are always either a plain listing (no `details`) or a
-/// lean-ctx augmented listing with this shape. `entry_limit_reached` is
+/// `ls` tool results are either a plain listing (no `details`), a lean-ctx
+/// augmented listing, or a raw-output truncation payload when the serialized
+/// entry list exceeds pi's message byte cap. `entry_limit_reached` is
 /// orthogonal to the lean-ctx augmentation and reports the truncation cap
 /// when the directory had more entries than the tool was willing to emit.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -1779,6 +1780,8 @@ pub struct LsDetails {
     pub source: Option<ToolResultSource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub truncated: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncation: Option<TruncationInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compression: Option<CompressionInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2611,10 +2614,8 @@ impl<'de> Deserialize<'de> for McpDetails {
 
         // `action: "ui-messages"` shape: { sessions: N } with no mode field.
         if !object.contains_key("mode") && object.contains_key("sessions") {
-            let sessions = object_field::<u32>(object, "sessions")
-                .map_err(de::Error::custom)?;
-            reject_unknown_object_fields(object, &["sessions"])
-                .map_err(de::Error::custom)?;
+            let sessions = object_field::<u32>(object, "sessions").map_err(de::Error::custom)?;
+            reject_unknown_object_fields(object, &["sessions"]).map_err(de::Error::custom)?;
             return Ok(McpDetails {
                 mode: None,
                 sessions: Some(sessions),
@@ -2771,7 +2772,7 @@ pub struct BashDetails {
     pub compression: Option<CompressionInfo>,
 }
 
-/// Shared between `read` and `bash` tool results.
+/// Shared between `bash`, `find`, `grep`, `ls`, and `read` tool results.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TruncationInfo {

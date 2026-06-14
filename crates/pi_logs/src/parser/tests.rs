@@ -1686,7 +1686,7 @@ fn todo_tool_result_accepts_error_field() {
     );
 }
 
-    /// Accepts a `subjects` array for bulk task creation.
+/// Accepts a `subjects` array for bulk task creation.
 #[test]
 fn todo_tool_result_accepts_subjects_param() {
     let tool_result = parse_tool_result_message(tool_result_message_json(
@@ -3593,6 +3593,47 @@ fn ls_tool_result_accepts_entry_limit_only() {
     };
     assert_eq!(details.entry_limit_reached, Some(500));
     assert!(details.compression.is_none());
+}
+
+#[test]
+fn ls_tool_result_accepts_truncation_details() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "ls",
+        vec![json!({"type": "text", "text": "sessions/..."})],
+        false,
+        Some(json!({
+            "path": "sessions",
+            "truncation": {
+                "content": "sessions/...",
+                "truncated": true,
+                "truncatedBy": "bytes",
+                "totalLines": 500,
+                "totalBytes": 59789,
+                "outputLines": 427,
+                "outputBytes": 51147,
+                "lastLinePartial": false,
+                "firstLineExceedsLimit": false,
+                "maxLines": 9007199254740991u64,
+                "maxBytes": 51200
+            }
+        })),
+    ));
+    let Some(ToolResultDetails::Ls(details)) = tool_result.details else {
+        panic!("expected Ls details")
+    };
+    let truncation = details.truncation.expect("expected truncation details");
+    assert!(truncation.truncated);
+    assert_eq!(truncation.truncated_by, TruncatedBy::Bytes);
+    assert_eq!(truncation.content, "sessions/...");
+    assert_eq!(truncation.output_bytes, 51147);
+    assert_eq!(truncation.total_lines, 500);
+    assert_eq!(truncation.max_bytes, 51200);
+    assert_eq!(truncation.max_lines, 9007199254740991);
+    assert_eq!(
+        details.path,
+        Some(PathBuf::from("sessions")),
+        "path should coexist with truncation"
+    );
 }
 
 #[test]
