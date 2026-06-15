@@ -5571,6 +5571,122 @@ fn test_parse_attachment_deferred_tools_delta() {
 }
 
 #[test]
+fn test_parse_attachment_agent_listing_delta() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": null,
+        "isSidechain": false,
+        "attachment": {
+            "type": "agent_listing_delta",
+            "addedTypes": ["claude", "Explore"],
+            "addedLines": ["- claude: catch-all", "- Explore: read-only search"],
+            "removedTypes": [],
+            "isInitial": true,
+            "showConcurrencyNote": true
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440000",
+        "timestamp": "2026-06-15T00:00:00Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.175",
+        "gitBranch": "main",
+        "slug": null
+    });
+    let log_line: LogLine = serde_json::from_value(json).unwrap();
+    match log_line {
+        LogLine::Attachment(att) => match att.attachment {
+            AttachmentData::AgentListingDelta(delta) => {
+                assert_eq!(delta.added_types, vec!["claude", "Explore"]);
+                assert_eq!(
+                    delta.added_lines,
+                    vec!["- claude: catch-all", "- Explore: read-only search"]
+                );
+                assert!(delta.removed_types.is_empty());
+                assert!(delta.is_initial);
+                assert!(delta.show_concurrency_note);
+            }
+            other => panic!("Expected AgentListingDelta, got {:?}", other),
+        },
+        other => panic!("Expected Attachment, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_attachment_agent_listing_delta_non_initial() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": null,
+        "isSidechain": false,
+        "attachment": {
+            "type": "agent_listing_delta",
+            "addedTypes": ["new-agent"],
+            "addedLines": ["- new-agent: added mid-session"],
+            "removedTypes": ["old-agent"],
+            "isInitial": false,
+            "showConcurrencyNote": false
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440000",
+        "timestamp": "2026-06-15T00:00:00Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.175",
+        "gitBranch": "main",
+        "slug": null
+    });
+    let log_line: LogLine = serde_json::from_value(json).unwrap();
+    match log_line {
+        LogLine::Attachment(att) => match att.attachment {
+            AttachmentData::AgentListingDelta(delta) => {
+                assert_eq!(delta.added_types, vec!["new-agent"]);
+                assert_eq!(delta.added_lines, vec!["- new-agent: added mid-session"]);
+                assert_eq!(delta.removed_types, vec!["old-agent"]);
+                assert!(!delta.is_initial);
+                assert!(!delta.show_concurrency_note);
+            }
+            other => panic!("Expected AgentListingDelta, got {:?}", other),
+        },
+        other => panic!("Expected Attachment, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_attachment_agent_listing_delta_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": null,
+        "isSidechain": false,
+        "attachment": {
+            "type": "agent_listing_delta",
+            "addedTypes": ["claude"],
+            "addedLines": ["- claude: catch-all"],
+            "removedTypes": [],
+            "isInitial": true,
+            "showConcurrencyNote": true,
+            "extraField": "should fail"
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440000",
+        "timestamp": "2026-06-15T00:00:00Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.175",
+        "gitBranch": "main",
+        "slug": null
+    });
+    let err = serde_json::from_value::<LogLine>(json)
+        .expect_err("Should reject unknown fields in agent_listing_delta");
+    assert!(
+        err.to_string().contains("extraField"),
+        "error should name the unknown field, got: {err}"
+    );
+}
+
+#[test]
 fn test_parse_attachment_deferred_tools_delta_with_readded_and_pending() {
     let json = serde_json::json!({
         "type": "attachment",

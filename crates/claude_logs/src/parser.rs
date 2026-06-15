@@ -341,6 +341,7 @@ pub struct AttachmentLogLine {
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
 pub enum AttachmentData {
+    AgentListingDelta(AgentListingDelta),
     AutoMode(AutoMode),
     AutoModeExit(AutoModeExit),
     CommandPermissions(CommandPermissions),
@@ -365,6 +366,18 @@ pub enum AttachmentData {
     QueuedCommand(QueuedCommand),
     SkillListing(SkillListing),
     TaskReminder(TaskReminder),
+}
+
+/// The agent (subagent) analogue of `deferred_tools_delta`. Added in Claude Code 2.1.175+.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct AgentListingDelta {
+    pub added_types: Vec<String>,
+    pub added_lines: Vec<String>,
+    pub removed_types: Vec<String>,
+    pub is_initial: bool,
+    pub show_concurrency_note: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]

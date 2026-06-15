@@ -15,7 +15,10 @@ use analyzer::{DailyMetrics, SessionMetrics};
 use pi_logs::Provider;
 use pricing::PiModelMetricsMap;
 
-type SummaryAggregates = (Vec<(String, MetricComponents)>, Vec<(String, MetricComponents)>);
+type SummaryAggregates = (
+    Vec<(String, MetricComponents)>,
+    Vec<(String, MetricComponents)>,
+);
 
 #[derive(Tabled)]
 struct PiMetricRow {
@@ -291,9 +294,7 @@ fn build_session_rows(
     )
 }
 
-pub(super) fn collect_provider_and_model_aggregates(
-    items: &[DailyMetrics],
-) -> SummaryAggregates {
+pub(super) fn collect_provider_and_model_aggregates(items: &[DailyMetrics]) -> SummaryAggregates {
     collect_provider_and_model_aggregates_from_maps(items.iter().map(|d| &d.per_model))
 }
 

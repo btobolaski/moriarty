@@ -108,7 +108,9 @@ test in a separate process, making this safe and preventing tests from clobberin
   a screenshot), `image` file-attachment content (a user `@`-referencing an image file; uses Claude Code's own base64
   `file` envelope with size/dimensions rather than the API's `source` envelope), and a `pendingBackgroundAgentCount`
   field on `turn_duration` system records (the count of background agents still running when the turn completed; added
-  in Claude Code 2.1.170+)
+  in Claude Code 2.1.170+), and `agent_listing_delta` attachments (`AgentListingDelta`, the subagent
+  analogue of `deferred_tools_delta`, carrying `added_types`/`added_lines`/`removed_types` plus
+  `is_initial` and `show_concurrency_note`; added in Claude Code 2.1.175+)
 - Also owns the structured view of the raw `model` string via `model::Model { family, version }` plus `ModelFamily` and
   `ModelVersion`. Both `cost_analyzer` (for pricing) and `moriarty::api_pricing` (for grouping/display) consume this one
   parser so family/version classification is not duplicated across crates
