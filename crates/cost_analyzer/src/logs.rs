@@ -407,6 +407,7 @@ impl AnalyzableLog for ClaudeLogLine {
             ClaudeLogLine::Attachment(line) => line.timestamp,
             // Unlike the other session-metadata records, `pr-link` carries a real timestamp.
             ClaudeLogLine::PrLink(line) => line.timestamp,
+            ClaudeLogLine::ForkContextRef(_) => claude_timestamp_sentinel(),
         }
     }
 
@@ -436,6 +437,11 @@ impl AnalyzableLog for ClaudeLogLine {
             // A session can link several PRs, so key on the PR number too rather than session alone.
             ClaudeLogLine::PrLink(line) => {
                 format!("pr-link:{}:{}", line.session_id, line.pr_number)
+            }
+            // Each subagent file has exactly one `fork-context-ref` header and its `agent_id` is
+            // derived from the filename, so the agent id alone is a stable, unique dedup key.
+            ClaudeLogLine::ForkContextRef(line) => {
+                format!("fork-context-ref:{}", line.agent_id)
             }
         }
     }
@@ -850,6 +856,16 @@ mod tests {
             "prUrl": "https://github.com/owner/repo/pull/76",
             "prRepository": "owner/repo",
             "timestamp": CLAUDE_TIMESTAMP,
+        })
+    }
+
+    fn claude_fork_context_ref_json() -> serde_json::Value {
+        json!({
+            "type": "fork-context-ref",
+            "agentId": "awhere-does-this-c5f743e50c0b4c81",
+            "parentSessionId": CLAUDE_SESSION_ID,
+            "parentLastUuid": CLAUDE_LEAF_UUID,
+            "contextLength": 143,
         })
     }
 
@@ -1726,6 +1742,12 @@ mod tests {
                 value: claude_pr_link_json,
                 expected_timestamp: ExpectedClaudeTimestamp::Real,
                 expected_id: format!("pr-link:{CLAUDE_SESSION_ID}:76"),
+            },
+            ClaudeNonBillableCase {
+                name: "fork context ref",
+                value: claude_fork_context_ref_json,
+                expected_timestamp: ExpectedClaudeTimestamp::Sentinel,
+                expected_id: "fork-context-ref:awhere-does-this-c5f743e50c0b4c81".to_string(),
             },
         ];
 

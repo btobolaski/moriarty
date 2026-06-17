@@ -232,6 +232,8 @@ pub enum LogLine {
     Attachment(Box<AttachmentLogLine>),
     #[serde(rename = "pr-link")]
     PrLink(PrLink),
+    #[serde(rename = "fork-context-ref")]
+    ForkContextRef(ForkContextRef),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -312,6 +314,19 @@ pub struct PrLink {
     pub pr_url: String,
     pub pr_repository: String,
     pub timestamp: DateTime<Utc>,
+}
+
+/// First line of a subagent's `subagents/agent-*.jsonl` file, recording where the subagent forked
+/// from its parent conversation. Added in Claude Code 2.1.175+. `context_length` is the parent
+/// context (token count) carried into the fork; it is `u64` to avoid ever rejecting a large value.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct ForkContextRef {
+    pub agent_id: String,
+    pub parent_session_id: Uuid,
+    pub parent_last_uuid: Uuid,
+    pub context_length: u64,
 }
 
 /// Attachment log line for deferred tools, hooks, and other metadata. Added in Claude Code 2.1.104+.

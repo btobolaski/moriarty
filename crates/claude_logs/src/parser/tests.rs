@@ -160,6 +160,83 @@ fn test_parse_pr_link_rejects_unknown_fields() {
 }
 
 #[test]
+fn test_parse_fork_context_ref_log_line() {
+    let json = serde_json::json!({
+        "type": "fork-context-ref",
+        "agentId": "awhere-does-this-c5f743e50c0b4c81",
+        "parentSessionId": "8b6b2715-243e-4ae3-b857-739a9ed419ac",
+        "parentLastUuid": "e9897053-95a9-4964-968d-f4426ec737f3",
+        "contextLength": 143
+    });
+    let LogLine::ForkContextRef(fork) = serde_json::from_value(json).unwrap() else {
+        panic!("expected a fork-context-ref log line");
+    };
+    assert_eq!(fork.agent_id, "awhere-does-this-c5f743e50c0b4c81");
+    assert_eq!(
+        fork.parent_session_id,
+        "8b6b2715-243e-4ae3-b857-739a9ed419ac"
+            .parse::<Uuid>()
+            .unwrap()
+    );
+    assert_eq!(
+        fork.parent_last_uuid,
+        "e9897053-95a9-4964-968d-f4426ec737f3"
+            .parse::<Uuid>()
+            .unwrap()
+    );
+    assert_eq!(fork.context_length, 143);
+}
+
+#[test]
+fn test_parse_fork_context_ref_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "type": "fork-context-ref",
+        "agentId": "awhere-does-this-c5f743e50c0b4c81",
+        "parentSessionId": "8b6b2715-243e-4ae3-b857-739a9ed419ac",
+        "parentLastUuid": "e9897053-95a9-4964-968d-f4426ec737f3",
+        "contextLength": 143,
+        "extraField": "should fail"
+    });
+    let err = serde_json::from_value::<LogLine>(json).expect_err("Should reject unknown fields");
+    assert!(
+        err.to_string().contains("unknown field"),
+        "Error should mention unknown field, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_parse_fork_context_ref_rejects_missing_field() {
+    let json = serde_json::json!({
+        "type": "fork-context-ref",
+        "agentId": "awhere-does-this-c5f743e50c0b4c81",
+        "parentSessionId": "8b6b2715-243e-4ae3-b857-739a9ed419ac",
+        "parentLastUuid": "e9897053-95a9-4964-968d-f4426ec737f3"
+    });
+    let err = serde_json::from_value::<LogLine>(json).expect_err("Should reject missing field");
+    assert!(
+        err.to_string().contains("contextLength"),
+        "Error should mention the missing field, got: {}",
+        err
+    );
+}
+
+// `rename_all = "camelCase"` and `deny_unknown_fields` interact: a serialize-side rename bug would
+// make a serialized record fail to parse back, so assert the wire keys explicitly via round-trip.
+#[test]
+fn test_fork_context_ref_round_trips() {
+    let json = serde_json::json!({
+        "type": "fork-context-ref",
+        "agentId": "awhere-does-this-c5f743e50c0b4c81",
+        "parentSessionId": "8b6b2715-243e-4ae3-b857-739a9ed419ac",
+        "parentLastUuid": "e9897053-95a9-4964-968d-f4426ec737f3",
+        "contextLength": 143
+    });
+    let parsed: LogLine = serde_json::from_value(json.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&parsed).unwrap(), json);
+}
+
+#[test]
 fn test_parse_user_log_line_with_null_todos() {
     let json = serde_json::json!({
         "parentUuid": null,
