@@ -35,9 +35,9 @@ async fn main() -> miette::Result<()> {
             init_cost_report_tracing();
             let dir = resolve_claude_logs_dir(dir)?;
             let timezone = parse_date_timezone(&cost_args.timezone)?;
-            let filter = cost_args.time_filter()?;
+            let filter = cost_args.time_filter(timezone)?;
             let report_mode = cost_args.report_mode();
-            print_time_range_filter(&filter);
+            print_time_range_filter(&filter, timezone);
             api_pricing::run(
                 &dir,
                 timezone,
@@ -52,9 +52,9 @@ async fn main() -> miette::Result<()> {
                 init_cost_report_tracing();
                 let dir = resolve_claude_logs_dir(dir)?;
                 let timezone = parse_date_timezone(&cost_args.timezone)?;
-                let filter = cost_args.time_filter()?;
+                let filter = cost_args.time_filter(timezone)?;
                 let report_mode = cost_args.report_mode();
-                print_time_range_filter(&filter);
+                print_time_range_filter(&filter, timezone);
                 api_pricing::run_graphs(
                     &dir,
                     timezone,
@@ -68,9 +68,9 @@ async fn main() -> miette::Result<()> {
                 init_cost_report_tracing();
                 let dir = resolve_pi_sessions_dir(dir)?;
                 let timezone = parse_date_timezone(&cost_args.timezone)?;
-                let filter = cost_args.time_filter()?;
+                let filter = cost_args.time_filter(timezone)?;
                 let report_mode = cost_args.report_mode();
-                print_time_range_filter(&filter);
+                print_time_range_filter(&filter, timezone);
                 pi_cost::run_graphs(
                     &dir,
                     timezone,
@@ -86,9 +86,9 @@ async fn main() -> miette::Result<()> {
                 init_cost_report_tracing();
                 let dir = resolve_pi_sessions_dir(dir)?;
                 let timezone = parse_date_timezone(&cost_args.timezone)?;
-                let filter = cost_args.time_filter()?;
+                let filter = cost_args.time_filter(timezone)?;
                 let report_mode = cost_args.report_mode();
-                print_time_range_filter(&filter);
+                print_time_range_filter(&filter, timezone);
                 pi_cost::run(
                     &dir,
                     timezone,
@@ -137,7 +137,7 @@ async fn main() -> miette::Result<()> {
 
 #[derive(Debug, Clone, Args)]
 struct CostCommandArgs {
-    /// Timezone to use for date determination (local or utc)
+    /// Timezone for interpreting date-only and naive datetime inputs (local or utc)
     #[arg(long, default_value = "local")]
     timezone: String,
     /// Aggregate by conversation/session instead of by date
@@ -147,18 +147,21 @@ struct CostCommandArgs {
     #[arg(long)]
     tokens: bool,
     /// Start time for filtering messages (ISO 8601 format, e.g., "2025-01-01T00:00:00Z" or "2025-01-01")
-    /// If no timezone specified, UTC is assumed
+    /// Date-only and naive datetime inputs use the command --timezone (default: local)
     #[arg(long, value_name = "DATETIME")]
     start_time: Option<String>,
     /// End time for filtering messages (ISO 8601 format, e.g., "2025-01-01T23:59:59Z" or "2025-01-01")
-    /// If no timezone specified, UTC is assumed
+    /// Date-only and naive datetime inputs use the command --timezone (default: local)
     #[arg(long, value_name = "DATETIME")]
     end_time: Option<String>,
 }
 
 impl CostCommandArgs {
-    fn time_filter(&self) -> miette::Result<cost_report::TimeRangeFilter> {
-        cost_report::TimeRangeFilter::new(self.start_time.clone(), self.end_time.clone())
+    fn time_filter(
+        &self,
+        timezone: cost_report::DateTimezone,
+    ) -> miette::Result<cost_report::TimeRangeFilter> {
+        cost_report::TimeRangeFilter::new(self.start_time.clone(), self.end_time.clone(), timezone)
     }
 
     fn report_mode(&self) -> cost_report::ReportMode {
@@ -181,27 +184,23 @@ fn init_cost_report_tracing() {
 }
 
 fn parse_date_timezone(timezone: &str) -> miette::Result<cost_report::DateTimezone> {
-    match timezone.to_ascii_lowercase().as_str() {
-        "local" => Ok(cost_report::DateTimezone::Local),
-        "utc" => Ok(cost_report::DateTimezone::Utc),
-        _ => Err(miette::miette!(
-            "Invalid timezone '{}'. Must be 'local' or 'utc'",
-            timezone
-        )),
-    }
+    cost_report::parse_timezone(timezone)
 }
 
-fn print_time_range_filter(filter: &cost_report::TimeRangeFilter) {
+fn print_time_range_filter(
+    filter: &cost_report::TimeRangeFilter,
+    timezone: cost_report::DateTimezone,
+) {
     if filter.is_unrestricted() {
         return;
     }
 
     println!("Applying time range filter:");
     if let Some(start) = filter.start {
-        println!("  Start: {}", start.to_rfc3339());
+        println!("  Start: {}", timezone.display_timestamp(&start));
     }
     if let Some(end) = filter.end {
-        println!("  End:   {}", end.to_rfc3339());
+        println!("  End:   {}", timezone.display_timestamp(&end));
     }
     println!();
 }
@@ -349,12 +348,15 @@ enum RulesCommand {
         /// Directory containing hook logs (defaults to ~/.local/state/moriarty/hooks)
         #[arg(short, long)]
         dir: Option<PathBuf>,
-        /// Only include results at or after this time (ISO 8601; UTC if no offset)
+        /// Only include results at or after this time (ISO 8601; date-only and naive inputs use --timezone)
         #[arg(long, value_name = "DATETIME")]
         start_time: Option<String>,
-        /// Only include results before this time (ISO 8601; UTC if no offset)
+        /// Only include results before this time (ISO 8601; date-only and naive inputs use --timezone)
         #[arg(long, value_name = "DATETIME")]
         end_time: Option<String>,
+        /// Timezone for interpreting date-only and naive datetime inputs (local or utc)
+        #[arg(long, default_value = "local")]
+        timezone: String,
         /// Which recorded outcome to mine for suggestions (ask or deny)
         #[arg(long, value_enum, default_value = "ask")]
         result: PreToolResult,
@@ -389,12 +391,15 @@ enum RulesCommand {
         /// Candidate config to evaluate against (defaults to ~/.config/moriarty/tool_rules.toml)
         #[arg(short, long)]
         config: Option<PathBuf>,
-        /// Only replay commands recorded at or after this time (ISO 8601; UTC if no offset)
+        /// Only replay commands recorded at or after this time (ISO 8601; date-only and naive inputs use --timezone)
         #[arg(long, value_name = "DATETIME")]
         start_time: Option<String>,
-        /// Only replay commands recorded before this time (ISO 8601; UTC if no offset)
+        /// Only replay commands recorded before this time (ISO 8601; date-only and naive inputs use --timezone)
         #[arg(long, value_name = "DATETIME")]
         end_time: Option<String>,
+        /// Timezone for interpreting date-only and naive datetime inputs (local or utc)
+        #[arg(long, default_value = "local")]
+        timezone: String,
         /// Only replay commands whose recorded outcome was this (e.g. allow to guard auto-approvals)
         #[arg(long, value_enum)]
         result: Option<PreToolResult>,
@@ -455,10 +460,10 @@ struct HooksReportArgs {
     /// Directory containing hook logs (defaults to ~/.local/state/moriarty/hooks)
     #[arg(short, long)]
     dir: Option<PathBuf>,
-    /// Only include results at or after this time (ISO 8601, e.g. "2026-01-01"; UTC if no offset)
+    /// Only include results at or after this time (ISO 8601, e.g. "2026-01-01"; date-only and naive inputs use --timezone)
     #[arg(long, value_name = "DATETIME")]
     start_time: Option<String>,
-    /// Only include results before this time (ISO 8601, e.g. "2026-01-01"; UTC if no offset)
+    /// Only include results before this time (ISO 8601, e.g. "2026-01-01"; date-only and naive inputs use --timezone)
     #[arg(long, value_name = "DATETIME")]
     end_time: Option<String>,
     /// Only include calls to this tool (exact match)
@@ -467,6 +472,9 @@ struct HooksReportArgs {
     /// Only include results with this outcome
     #[arg(long, value_enum)]
     result: Option<PreToolResult>,
+    /// Timezone for interpreting date-only and naive datetime inputs (local or utc)
+    #[arg(long, default_value = "local")]
+    timezone: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -519,7 +527,7 @@ mod tests {
 
     use super::{
         parse_date_timezone, resolve_claude_logs_dir, resolve_pi_sessions_dir, Cli, Command,
-        GraphsCommand, PiCommand,
+        GraphsCommand, HooksCommand, PiCommand, RulesCommand,
     };
     use crate::cost_report::DateTimezone;
 
@@ -860,6 +868,95 @@ mod tests {
                 assert_eq!(dir, None);
             }
             other => panic!("expected graphs claude command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_hooks_report_with_timezone() {
+        let cli = Cli::try_parse_from([
+            "moriarty",
+            "hooks",
+            "report",
+            "--timezone",
+            "utc",
+            "--start-time",
+            "2026-01-01",
+            "--tool",
+            "Bash",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Command::Hooks {
+                subcommand: HooksCommand::Report(args),
+            } => {
+                assert_eq!(args.timezone, "utc");
+                assert_eq!(args.start_time.as_deref(), Some("2026-01-01"));
+                assert_eq!(args.tool.as_deref(), Some("Bash"));
+            }
+            other => panic!("expected hooks report command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_rules_suggest_with_timezone() {
+        use crate::rules::MatchMode;
+
+        let cli = Cli::try_parse_from([
+            "moriarty",
+            "rules",
+            "suggest",
+            "--timezone",
+            "utc",
+            "--start-time",
+            "2026-01-01",
+            "--match",
+            "prefix",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Command::Rules {
+                subcommand:
+                    RulesCommand::Suggest {
+                        timezone,
+                        start_time,
+                        match_mode,
+                        ..
+                    },
+            } => {
+                assert_eq!(timezone, "utc");
+                assert_eq!(start_time.as_deref(), Some("2026-01-01"));
+                assert_eq!(match_mode, MatchMode::Prefix);
+            }
+            other => panic!("expected rules suggest command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_rules_replay_with_timezone() {
+        let cli = Cli::try_parse_from([
+            "moriarty",
+            "rules",
+            "replay",
+            "--timezone",
+            "utc",
+            "--end-time",
+            "2026-06-01",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Command::Rules {
+                subcommand:
+                    RulesCommand::Replay {
+                        timezone, end_time, ..
+                    },
+            } => {
+                assert_eq!(timezone, "utc");
+                assert_eq!(end_time.as_deref(), Some("2026-06-01"));
+            }
+            other => panic!("expected rules replay command, got {other:?}"),
         }
     }
 

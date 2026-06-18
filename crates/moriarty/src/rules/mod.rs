@@ -67,6 +67,7 @@ pub async fn exec_rules(cmd: RulesCommand) -> Result<()> {
             dir,
             start_time,
             end_time,
+            timezone,
             result,
             limit,
             min_count,
@@ -80,6 +81,7 @@ pub async fn exec_rules(cmd: RulesCommand) -> Result<()> {
                 dir,
                 start_time,
                 end_time,
+                timezone,
                 result,
                 limit,
                 min_count,
@@ -96,6 +98,7 @@ pub async fn exec_rules(cmd: RulesCommand) -> Result<()> {
             config,
             start_time,
             end_time,
+            timezone,
             result,
             all_rules,
             rules_hash,
@@ -106,6 +109,7 @@ pub async fn exec_rules(cmd: RulesCommand) -> Result<()> {
                 config,
                 start_time,
                 end_time,
+                timezone,
                 result,
                 all_rules,
                 rules_hash,
@@ -507,6 +511,7 @@ struct SuggestOptions {
     dir: Option<PathBuf>,
     start_time: Option<String>,
     end_time: Option<String>,
+    timezone: String,
     result: PreToolResult,
     limit: usize,
     min_count: u64,
@@ -523,6 +528,7 @@ struct ReplayOptions {
     config: Option<PathBuf>,
     start_time: Option<String>,
     end_time: Option<String>,
+    timezone: String,
     result: Option<PreToolResult>,
     all_rules: bool,
     rules_hash: Option<String>,
@@ -586,7 +592,11 @@ async fn suggest(opts: SuggestOptions) -> Result<()> {
         ));
     }
 
-    let filter = TimeRangeFilter::new(opts.start_time, opts.end_time)?;
+    let filter = TimeRangeFilter::new(
+        opts.start_time,
+        opts.end_time,
+        crate::cost_report::parse_timezone(&opts.timezone)?,
+    )?;
     let (hash_filter, active_hash) = resolve_hash_filter(opts.all_rules, opts.rules_hash).await?;
     let CwdAggregation { rows, skipped } = aggregate_with_cwd(
         opts.dir,
@@ -879,7 +889,11 @@ async fn replay(opts: ReplayOptions) -> Result<()> {
 
     // Replay defaults to all recorded history, but `--start-time`/`--end-time` bound the window so a
     // long-lived log doesn't force every candidate to clear every command ever run.
-    let filter = TimeRangeFilter::new(opts.start_time, opts.end_time)?;
+    let filter = TimeRangeFilter::new(
+        opts.start_time,
+        opts.end_time,
+        crate::cost_report::parse_timezone(&opts.timezone)?,
+    )?;
     let (hash_filter, replayed_hash) = resolve_hash_filter(opts.all_rules, opts.rules_hash).await?;
     let CwdAggregation { rows, skipped } =
         aggregate_with_cwd(opts.dir, &filter, Some("Bash"), None, &hash_filter).await?;
@@ -1261,6 +1275,7 @@ mod tests {
             dir: Some(PathBuf::from("/tmp/moriarty-suggest-guard")),
             start_time: None,
             end_time: None,
+            timezone: "utc".to_string(),
             result: PreToolResult::Ask,
             limit: 10,
             min_count: 2,
@@ -1481,6 +1496,7 @@ mod tests {
             dir: Some(dir.path().to_path_buf()),
             start_time: None,
             end_time: None,
+            timezone: "utc".to_string(),
             result: PreToolResult::Ask,
             limit: 10,
             min_count: 1,
@@ -1514,6 +1530,7 @@ mod tests {
             dir: Some(PathBuf::from("/tmp/moriarty-suggest-guard")),
             start_time: None,
             end_time: None,
+            timezone: "utc".to_string(),
             result: PreToolResult::Ask,
             limit: 10,
             min_count: 2,

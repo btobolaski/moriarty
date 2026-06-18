@@ -255,13 +255,14 @@ mod tests {
     }
 
     fn unrestricted_filter() -> TimeRangeFilter {
-        TimeRangeFilter::new(None, None).expect("unrestricted filter")
+        TimeRangeFilter::new(None, None, DateTimezone::Utc).expect("unrestricted filter")
     }
 
     fn april_16_only_filter() -> TimeRangeFilter {
         TimeRangeFilter::new(
             Some("2026-04-16".to_string()),
             Some("2026-04-16".to_string()),
+            DateTimezone::Utc,
         )
         .expect("filter parses")
     }

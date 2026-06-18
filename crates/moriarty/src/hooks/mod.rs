@@ -85,12 +85,14 @@ pub async fn exec_hooks(cmd: HooksCommand) -> Result<()> {
     match cmd {
         HooksCommand::Exec => exec_hook().await,
         HooksCommand::Report(args) => {
+            let timezone = crate::cost_report::parse_timezone(&args.timezone)?;
             report::run(
                 args.dir,
                 args.start_time,
                 args.end_time,
                 args.tool,
                 args.result,
+                timezone,
             )
             .await
         }

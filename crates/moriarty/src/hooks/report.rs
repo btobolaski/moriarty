@@ -128,8 +128,9 @@ pub async fn run(
     end_time: Option<String>,
     tool: Option<String>,
     result: Option<PreToolResult>,
+    timezone: crate::cost_report::DateTimezone,
 ) -> Result<()> {
-    let filter = TimeRangeFilter::new(start_time, end_time)?;
+    let filter = TimeRangeFilter::new(start_time, end_time, timezone)?;
     let rows = aggregate(dir, &filter, tool.as_deref(), result).await?;
 
     let json = serde_json::to_string_pretty(&rows)
@@ -341,6 +342,7 @@ fn arguments_value(tool_args: String) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cost_report::DateTimezone;
 
     fn ts(value: &str) -> DateTime<Utc> {
         value.parse().expect("test timestamp should be RFC 3339")
@@ -377,7 +379,7 @@ mod tests {
 
     #[test]
     fn build_rows_only_filter_keeps_matching_hash_and_counts_skips() {
-        let unrestricted = TimeRangeFilter::new(None, None).unwrap();
+        let unrestricted = TimeRangeFilter::new(None, None, DateTimezone::Utc).unwrap();
         let records = vec![
             record_with_hash(
                 "2026-06-03T01:00:00Z",
@@ -428,7 +430,7 @@ mod tests {
     fn build_rows_groups_by_deciding_rule_and_omits_absent_rule_from_json() {
         // Two identical calls decided by different rules must not merge into one row, and a row
         // with no deciding rule must serialize exactly as before (no `rule` key).
-        let unrestricted = TimeRangeFilter::new(None, None).unwrap();
+        let unrestricted = TimeRangeFilter::new(None, None, DateTimezone::Utc).unwrap();
         let with_rule = |rule: Option<&str>| HookRecord {
             timestamp: ts("2026-06-03T01:00:00Z"),
             tool_name: "Bash".to_string(),
@@ -533,7 +535,7 @@ mod tests {
 
     #[test]
     fn build_rows_any_filter_keeps_every_rule_set() {
-        let unrestricted = TimeRangeFilter::new(None, None).unwrap();
+        let unrestricted = TimeRangeFilter::new(None, None, DateTimezone::Utc).unwrap();
         let records = vec![
             record_with_hash(
                 "2026-06-03T01:00:00Z",
@@ -647,7 +649,7 @@ mod tests {
 
     #[test]
     fn build_rows_counts_exact_triples_and_sorts_by_count() {
-        let unrestricted = TimeRangeFilter::new(None, None).unwrap();
+        let unrestricted = TimeRangeFilter::new(None, None, DateTimezone::Utc).unwrap();
         let records = vec![
             record(
                 "2026-06-03T01:00:00Z",
@@ -721,7 +723,7 @@ mod tests {
     fn build_rows_breaks_result_ties_deterministically() {
         // Identical tool, args, and count; only the result differs. The result tiebreaker orders
         // them by the lowercase label so the output never depends on HashMap iteration order.
-        let unrestricted = TimeRangeFilter::new(None, None).unwrap();
+        let unrestricted = TimeRangeFilter::new(None, None, DateTimezone::Utc).unwrap();
         let records = vec![
             record(
                 "2026-06-03T02:00:00Z",
@@ -758,7 +760,7 @@ mod tests {
 
     #[test]
     fn build_rows_applies_tool_and_result_filters() {
-        let unrestricted = TimeRangeFilter::new(None, None).unwrap();
+        let unrestricted = TimeRangeFilter::new(None, None, DateTimezone::Utc).unwrap();
         let records = vec![
             record(
                 "2026-06-03T01:00:00Z",
@@ -803,6 +805,7 @@ mod tests {
         let filter = TimeRangeFilter::new(
             Some("2026-06-03".to_string()),
             Some("2026-06-03".to_string()),
+            DateTimezone::Utc,
         )
         .unwrap();
         let records = vec![
@@ -894,7 +897,8 @@ mod tests {
 
     #[test]
     fn build_rows_applies_start_only_filter() {
-        let filter = TimeRangeFilter::new(Some("2026-06-03".to_string()), None).unwrap();
+        let filter =
+            TimeRangeFilter::new(Some("2026-06-03".to_string()), None, DateTimezone::Utc).unwrap();
         let records = vec![
             record(
                 "2026-06-02T12:00:00Z",
@@ -947,8 +951,15 @@ mod tests {
 
         // Exercises the full path: resolve_log_dir (explicit dir) -> read_records -> build_rows ->
         // JSON serialization. Output goes to stdout; we only assert the run itself succeeds.
-        run(Some(dir.path().to_path_buf()), None, None, None, None)
-            .await
-            .expect("report over a valid directory should succeed");
+        run(
+            Some(dir.path().to_path_buf()),
+            None,
+            None,
+            None,
+            None,
+            DateTimezone::Utc,
+        )
+        .await
+        .expect("report over a valid directory should succeed");
     }
 }
