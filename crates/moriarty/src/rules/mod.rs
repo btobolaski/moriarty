@@ -581,7 +581,9 @@ struct Suggestion {
     observed_commands: Vec<String>,
 }
 
-async fn suggest(opts: SuggestOptions) -> Result<()> {
+/// Returns suggestions and a scope note without rendering, so callers can assert on the raw
+/// results without capturing stdout.
+async fn collect_suggestions(opts: &SuggestOptions) -> Result<(Vec<Suggestion>, String)> {
     let action = opts.action.unwrap_or_else(|| default_action(opts.result));
 
     // Allow rules must be exact: a prefix or fuzzy Allow would auto-approve more than was observed.
@@ -593,21 +595,41 @@ async fn suggest(opts: SuggestOptions) -> Result<()> {
     }
 
     let filter = TimeRangeFilter::new(
-        opts.start_time,
-        opts.end_time,
+        opts.start_time.clone(),
+        opts.end_time.clone(),
         crate::cost_report::parse_timezone(&opts.timezone)?,
     )?;
-    let (hash_filter, active_hash) = resolve_hash_filter(opts.all_rules, opts.rules_hash).await?;
+    let (hash_filter, active_hash) =
+        resolve_hash_filter(opts.all_rules, opts.rules_hash.clone()).await?;
+    let engine = {
+        let config = load_user_config().await?;
+        BashRuleEngine::from_config(
+            config.bash_rules.unwrap_or_default(),
+            config.pattern_fragments,
+        )?
+    };
     let CwdAggregation { rows, skipped } = aggregate_with_cwd(
-        opts.dir,
+        opts.dir.clone(),
         &filter,
         Some("Bash"),
         Some(opts.result),
         &hash_filter,
     )
     .await?;
-    let suggestions = build_suggestions(&rows, opts.match_mode, action, opts.min_count, opts.limit);
+    let suggestions = build_suggestions(
+        &rows,
+        opts.match_mode,
+        action,
+        opts.min_count,
+        opts.limit,
+        Some(&engine),
+    );
     let scope = rules_scope_note(&active_hash, &skipped);
+    Ok((suggestions, scope))
+}
+
+async fn suggest(opts: SuggestOptions) -> Result<()> {
+    let (suggestions, scope) = collect_suggestions(&opts).await?;
 
     if opts.json {
         // The scope note goes to stderr so stdout stays the suggestions array that callers parse.
@@ -679,6 +701,18 @@ impl ObservedGroup {
     }
 }
 
+/// True when the current `BashRuleEngine` already allows a leaf and the leaf doesn't write to a
+/// real file — i.e. the leaf won't prompt the user even without a new rule. `real_file_write` caps
+/// Allow → Ask in the compound engine, so a write-redirecting leaf must stay in the suggestions.
+fn is_already_allowed(engine: Option<&BashRuleEngine>, text: &str, real_file_write: bool) -> bool {
+    match engine {
+        Some(engine) => {
+            !real_file_write && matches!(engine.apply_rules(text), RuleResult::Allowed { .. })
+        }
+        None => false,
+    }
+}
+
 /// Pure core of `suggest`: turns aggregated Bash rows into anchored rule suggestions.
 ///
 /// Each observed command is first split into the leaf simple-commands the hook actually evaluates
@@ -692,6 +726,7 @@ fn build_suggestions(
     action: SuggestAction,
     min_count: u64,
     limit: usize,
+    engine: Option<&BashRuleEngine>,
 ) -> Vec<Suggestion> {
     let mut leaves: BTreeMap<String, ObservedGroup> = BTreeMap::new();
     for row in rows {
@@ -701,7 +736,11 @@ fn build_suggestions(
         // A leaf repeated within one compound counts once per recorded occurrence, not once per
         // appearance, so the count still reflects how often the user saw a prompt.
         let texts: BTreeSet<String> = match split_command(command, &row.cwd) {
-            SplitOutcome::Commands(parts) => parts.into_iter().map(|leaf| leaf.text).collect(),
+            SplitOutcome::Commands(parts) => parts
+                .into_iter()
+                .filter(|leaf| !is_already_allowed(engine, &leaf.text, leaf.real_file_write))
+                .map(|leaf| leaf.text)
+                .collect(),
             SplitOutcome::Bail(_) => BTreeSet::from([command.to_string()]),
         };
         for text in texts {
@@ -1036,6 +1075,7 @@ fn print_replay(report: &ReplayReport) {
 mod tests {
     use super::*;
     use crate::user_config::{BashRule, BashRuleAction, ToolRule, ToolRuleAction};
+    use std::env;
 
     fn config_with_bash(rules: Vec<BashRule>) -> UserConfig {
         UserConfig {
@@ -1205,7 +1245,8 @@ mod tests {
     #[test]
     fn suggest_exact_produces_fully_anchored_literal() {
         let rows = vec![bash_row("ls -la", 3, PreToolResult::Ask)];
-        let suggestions = build_suggestions(&rows, MatchMode::Exact, SuggestAction::Ask, 2, 10);
+        let suggestions =
+            build_suggestions(&rows, MatchMode::Exact, SuggestAction::Ask, 2, 10, None);
 
         assert_eq!(suggestions.len(), 1);
         let suggestion = &suggestions[0];
@@ -1226,7 +1267,8 @@ mod tests {
     #[test]
     fn suggest_prefix_anchors_on_program_token() {
         let rows = vec![bash_row("cargo build --release", 5, PreToolResult::Ask)];
-        let suggestions = build_suggestions(&rows, MatchMode::Prefix, SuggestAction::Ask, 2, 10);
+        let suggestions =
+            build_suggestions(&rows, MatchMode::Prefix, SuggestAction::Ask, 2, 10, None);
 
         let regex = Regex::new(&suggestions[0].rule.pattern).unwrap();
         assert!(regex.is_match("cargo build --release"));
@@ -1245,7 +1287,8 @@ mod tests {
             bash_row("c", 4, PreToolResult::Ask),
             bash_row("d", 3, PreToolResult::Ask),
         ];
-        let suggestions = build_suggestions(&rows, MatchMode::Exact, SuggestAction::Ask, 2, 2);
+        let suggestions =
+            build_suggestions(&rows, MatchMode::Exact, SuggestAction::Ask, 2, 2, None);
 
         assert_eq!(
             suggestions.len(),
@@ -1293,7 +1336,8 @@ mod tests {
     #[test]
     fn suggested_rules_round_trip_through_toml() {
         let rows = vec![bash_row("git status", 3, PreToolResult::Ask)];
-        let suggestions = build_suggestions(&rows, MatchMode::Exact, SuggestAction::Ask, 2, 10);
+        let suggestions =
+            build_suggestions(&rows, MatchMode::Exact, SuggestAction::Ask, 2, 10, None);
         let config = UserConfig {
             pattern_fragments: None,
             bash_rules: Some(suggestions.iter().map(|s| s.rule.clone()).collect()),
@@ -1309,7 +1353,8 @@ mod tests {
         // A whole-compound literal could never match the per-leaf engine, so each leaf gets its own
         // exact suggestion, and the generated pattern must actually allow that leaf when adopted.
         let rows = vec![bash_row("git status && ls -la", 3, PreToolResult::Ask)];
-        let suggestions = build_suggestions(&rows, MatchMode::Exact, SuggestAction::Allow, 2, 10);
+        let suggestions =
+            build_suggestions(&rows, MatchMode::Exact, SuggestAction::Allow, 2, 10, None);
 
         let patterns: Vec<&str> = suggestions
             .iter()
@@ -1341,7 +1386,8 @@ mod tests {
             bash_row("git status && cargo test", 2, PreToolResult::Ask),
             bash_row("git status", 3, PreToolResult::Ask),
         ];
-        let suggestions = build_suggestions(&rows, MatchMode::Exact, SuggestAction::Ask, 1, 10);
+        let suggestions =
+            build_suggestions(&rows, MatchMode::Exact, SuggestAction::Ask, 1, 10, None);
 
         let git = suggestions
             .iter()
@@ -1369,7 +1415,8 @@ mod tests {
             PreToolResult::Ask,
             "/work/proj",
         )];
-        let suggestions = build_suggestions(&rows, MatchMode::Exact, SuggestAction::Ask, 2, 10);
+        let suggestions =
+            build_suggestions(&rows, MatchMode::Exact, SuggestAction::Ask, 2, 10, None);
 
         assert_eq!(
             suggestions[0].rule.pattern, r"^cat src/main\.rs$",
@@ -1382,7 +1429,8 @@ mod tests {
         // The hook cannot analyze a command with a substitution, so suggesting per-leaf pieces would
         // be meaningless; the whole observed text is kept, exactly as before.
         let rows = vec![bash_row("echo $(date)", 4, PreToolResult::Ask)];
-        let suggestions = build_suggestions(&rows, MatchMode::Exact, SuggestAction::Ask, 2, 10);
+        let suggestions =
+            build_suggestions(&rows, MatchMode::Exact, SuggestAction::Ask, 2, 10, None);
 
         assert_eq!(suggestions.len(), 1);
         assert_eq!(
@@ -1397,7 +1445,8 @@ mod tests {
             bash_row("cargo build", 2, PreToolResult::Ask),
             bash_row("cargo check --all", 3, PreToolResult::Ask),
         ];
-        let suggestions = build_suggestions(&rows, MatchMode::Prefix, SuggestAction::Ask, 2, 10);
+        let suggestions =
+            build_suggestions(&rows, MatchMode::Prefix, SuggestAction::Ask, 2, 10, None);
 
         assert_eq!(suggestions.len(), 1, "one prefix rule per program");
         assert_eq!(suggestions[0].rule.pattern, r"^cargo(\s|$)");
@@ -1412,7 +1461,8 @@ mod tests {
             bash_row("cargo build --release", 3, PreToolResult::Ask),
             bash_row("cargo check", 2, PreToolResult::Ask),
         ];
-        let suggestions = build_suggestions(&rows, MatchMode::Fuzzy, SuggestAction::Ask, 2, 10);
+        let suggestions =
+            build_suggestions(&rows, MatchMode::Fuzzy, SuggestAction::Ask, 2, 10, None);
 
         assert_eq!(suggestions.len(), 1);
         let suggestion = &suggestions[0];
@@ -1442,7 +1492,8 @@ mod tests {
             bash_row("ls -la", 3, PreToolResult::Ask),
             bash_row("cat src/main.rs", 2, PreToolResult::Ask),
         ];
-        let suggestions = build_suggestions(&rows, MatchMode::Fuzzy, SuggestAction::Ask, 2, 10);
+        let suggestions =
+            build_suggestions(&rows, MatchMode::Fuzzy, SuggestAction::Ask, 2, 10, None);
 
         let patterns: Vec<&str> = suggestions
             .iter()
@@ -1459,7 +1510,8 @@ mod tests {
             bash_row("g++ -c main.cpp", 2, PreToolResult::Ask),
             bash_row("g++ -o out main.o", 2, PreToolResult::Ask),
         ];
-        let suggestions = build_suggestions(&rows, MatchMode::Fuzzy, SuggestAction::Ask, 2, 10);
+        let suggestions =
+            build_suggestions(&rows, MatchMode::Fuzzy, SuggestAction::Ask, 2, 10, None);
 
         assert_eq!(suggestions.len(), 1);
         let regex = Regex::new(&suggestions[0].rule.pattern)
@@ -1518,7 +1570,8 @@ mod tests {
             bash_row("cargo", 2, PreToolResult::Ask),
             bash_row("cargo build", 2, PreToolResult::Ask),
         ];
-        let suggestions = build_suggestions(&rows, MatchMode::Fuzzy, SuggestAction::Ask, 2, 10);
+        let suggestions =
+            build_suggestions(&rows, MatchMode::Fuzzy, SuggestAction::Ask, 2, 10, None);
 
         assert_eq!(suggestions.len(), 1);
         assert_eq!(suggestions[0].rule.pattern, r"^cargo(\s|$)");
@@ -1673,7 +1726,246 @@ mod tests {
 
     #[test]
     fn suggest_empty_rows_yield_no_suggestions() {
-        assert!(build_suggestions(&[], MatchMode::Exact, SuggestAction::Ask, 2, 10).is_empty());
+        assert!(
+            build_suggestions(&[], MatchMode::Exact, SuggestAction::Ask, 2, 10, None).is_empty()
+        );
+    }
+
+    #[test]
+    fn suggest_filters_already_allowed_leaves() {
+        // Already-allowed leaves wouldn't prompt the user, so suggesting a rule for them would
+        // be noise.
+        let engine =
+            BashRuleEngine::from_config(vec![allow("allow-head", r"^head($|\s)")], None).unwrap();
+        let rows = vec![
+            bash_row("head -5 Cargo.toml", 4, PreToolResult::Ask),
+            bash_row("tail -20 Cargo.toml", 3, PreToolResult::Ask),
+        ];
+        let suggestions = build_suggestions(
+            &rows,
+            MatchMode::Exact,
+            SuggestAction::Ask,
+            1,
+            10,
+            Some(&engine),
+        );
+
+        assert_eq!(suggestions.len(), 1);
+        let suggestion = &suggestions[0];
+        assert_eq!(suggestion.rule.pattern, r"^tail \-20 Cargo\.toml$",);
+        assert_eq!(suggestion.count, 3);
+    }
+
+    #[test]
+    fn suggest_filters_leaves_in_a_compound_command() {
+        let engine =
+            BashRuleEngine::from_config(vec![allow("allow-head", r"^head($|\s)")], None).unwrap();
+        let rows = vec![bash_row(
+            "head -5 Cargo.toml && tail -20 Cargo.toml",
+            4,
+            PreToolResult::Ask,
+        )];
+        let suggestions = build_suggestions(
+            &rows,
+            MatchMode::Exact,
+            SuggestAction::Ask,
+            1,
+            10,
+            Some(&engine),
+        );
+
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].rule.pattern, r"^tail \-20 Cargo\.toml$",);
+        assert_eq!(suggestions[0].count, 4);
+    }
+
+    #[test]
+    fn suggest_keeps_real_file_write_leaves_even_when_allowed() {
+        // The compound engine caps Allow → Ask when a leaf writes to a real file, so those
+        // leaves still reach the user. The filter must not drop them even when `apply_rules`
+        // alone says Allowed.
+        let engine =
+            BashRuleEngine::from_config(vec![allow("allow-echo", r"^echo($|\s)")], None).unwrap();
+        let rows = vec![bash_row("echo hi > output.txt", 5, PreToolResult::Ask)];
+        let suggestions = build_suggestions(
+            &rows,
+            MatchMode::Exact,
+            SuggestAction::Ask,
+            1,
+            10,
+            Some(&engine),
+        );
+
+        assert_eq!(
+            suggestions.len(),
+            1,
+            "real-file-write leaf must survive the filter"
+        );
+        assert_eq!(suggestions[0].rule.pattern, r"^echo hi > output\.txt$",);
+    }
+
+    #[test]
+    fn suggest_keeps_bailed_commands_even_when_allowed() {
+        // A bailed command (e.g., one with command substitution) is never `Allowed` by the
+        // compound engine — it is capped to Ask — so `apply_rules()` alone returning `Allowed`
+        // for a bailed leaf must not filter it out.
+        let engine =
+            BashRuleEngine::from_config(vec![allow("allow-echo", r"^echo($|\s)")], None).unwrap();
+        let rows = vec![bash_row("echo $(date)", 4, PreToolResult::Ask)];
+        let suggestions = build_suggestions(
+            &rows,
+            MatchMode::Exact,
+            SuggestAction::Ask,
+            1,
+            10,
+            Some(&engine),
+        );
+
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(
+            suggestions[0].rule.pattern,
+            format!("^{}$", regex::escape("echo $(date)"))
+        );
+    }
+
+    #[tokio::test]
+    async fn suggest_with_active_config_filters_already_allowed_leaves() {
+        // Uses --all-rules to skip the record-hash filter so the test doesn't need to match
+        // the config's effective hash, while still exercising the engine-loading codepath.
+        let _config_guard = crate::test_helpers::setup_isolated_xdg_config();
+        let moriarty_dir = PathBuf::from(env::var("XDG_CONFIG_HOME").unwrap()).join("moriarty");
+        tokio::fs::create_dir_all(&moriarty_dir).await.unwrap();
+        tokio::fs::write(
+            moriarty_dir.join("tool_rules.toml"),
+            r#"[[bash_rules]]
+name = "allow-head"
+pattern = "^head($|\\s)"
+action = { type = "Allow" }
+"#,
+        )
+        .await
+        .unwrap();
+
+        let log_dir = tempfile::tempdir().unwrap();
+        let line = serde_json::json!({
+            "timestamp": "2026-06-10T01:00:00Z",
+            "fields": {
+                "message": "PreToolUse hook completed",
+                "tool_name": "Bash",
+                "tool_args": r#"{"command":"head -5 Cargo.toml"}"#,
+                "cwd": "/tmp",
+                "rules_hash": "sha256:test",
+                "result": "ask"
+            }
+        })
+        .to_string();
+        let line2 = serde_json::json!({
+            "timestamp": "2026-06-10T02:00:00Z",
+            "fields": {
+                "message": "PreToolUse hook completed",
+                "tool_name": "Bash",
+                "tool_args": r#"{"command":"tail -20 Cargo.toml"}"#,
+                "cwd": "/tmp",
+                "rules_hash": "sha256:test",
+                "result": "ask"
+            }
+        })
+        .to_string();
+        tokio::fs::write(
+            log_dir.path().join("hooks.log.2026-06-10"),
+            format!("{line}\n{line2}\n"),
+        )
+        .await
+        .unwrap();
+
+        let opts = SuggestOptions {
+            dir: Some(log_dir.path().to_path_buf()),
+            start_time: None,
+            end_time: None,
+            timezone: "utc".to_string(),
+            result: PreToolResult::Ask,
+            limit: 10,
+            min_count: 1,
+            match_mode: MatchMode::Exact,
+            action: None,
+            all_rules: true,
+            rules_hash: None,
+            json: true,
+        };
+        let (suggestions, _scope) = collect_suggestions(&opts).await.unwrap();
+
+        assert_eq!(
+            suggestions.len(),
+            1,
+            "already-allowed head must be filtered"
+        );
+        assert!(
+            suggestions[0].rule.pattern.contains("tail"),
+            "only tail should survive the filter"
+        );
+        assert!(
+            suggestions.iter().all(|s| !s.rule.pattern.contains("head")),
+            "no head suggestion should appear"
+        );
+    }
+
+    #[tokio::test]
+    async fn suggest_empty_when_all_leaves_are_already_allowed() {
+        let _config_guard = crate::test_helpers::setup_isolated_xdg_config();
+        let moriarty_dir = PathBuf::from(env::var("XDG_CONFIG_HOME").unwrap()).join("moriarty");
+        tokio::fs::create_dir_all(&moriarty_dir).await.unwrap();
+        tokio::fs::write(
+            moriarty_dir.join("tool_rules.toml"),
+            r#"[[bash_rules]]
+name = "allow-head"
+pattern = "^head($|\\s)"
+action = { type = "Allow" }
+"#,
+        )
+        .await
+        .unwrap();
+
+        let log_dir = tempfile::tempdir().unwrap();
+        let line = serde_json::json!({
+            "timestamp": "2026-06-10T01:00:00Z",
+            "fields": {
+                "message": "PreToolUse hook completed",
+                "tool_name": "Bash",
+                "tool_args": r#"{"command":"head -5 Cargo.toml"}"#,
+                "cwd": "/tmp",
+                "rules_hash": "sha256:test",
+                "result": "ask"
+            }
+        })
+        .to_string();
+        tokio::fs::write(
+            log_dir.path().join("hooks.log.2026-06-10"),
+            format!("{line}\n"),
+        )
+        .await
+        .unwrap();
+
+        let opts = SuggestOptions {
+            dir: Some(log_dir.path().to_path_buf()),
+            start_time: None,
+            end_time: None,
+            timezone: "utc".to_string(),
+            result: PreToolResult::Ask,
+            limit: 10,
+            min_count: 1,
+            match_mode: MatchMode::Exact,
+            action: None,
+            all_rules: true,
+            rules_hash: None,
+            json: true,
+        };
+        let (suggestions, _scope) = collect_suggestions(&opts).await.unwrap();
+
+        assert!(
+            suggestions.is_empty(),
+            "all-head-allowed: no suggestions expected, got {:?}",
+            suggestions
+        );
     }
 
     #[test]
