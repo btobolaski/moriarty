@@ -563,9 +563,9 @@ mod tests {
 
     use super::*;
     use crate::test_support::{
-        claude_assistant_json, claude_transcript_envelope, claude_usage_json,
         CLAUDE_ASSISTANT_UUID, CLAUDE_BRANCH, CLAUDE_CWD, CLAUDE_LEAF_UUID, CLAUDE_PARENT_UUID,
         CLAUDE_SESSION_ID, CLAUDE_TIMESTAMP, CLAUDE_USER_UUID, CLAUDE_VERSION,
+        claude_assistant_json, claude_transcript_envelope, claude_usage_json,
     };
 
     fn timestamp() -> DateTime<Utc> {
@@ -1277,12 +1277,16 @@ mod tests {
 
     #[test]
     fn line_with_cost_parse_returns_none_when_only_cost_or_model_is_present() {
-        assert!(LineWithCost::<AsymmetricMockLog>::parse("cost-only")
-            .unwrap()
-            .is_none());
-        assert!(LineWithCost::<AsymmetricMockLog>::parse("model-only")
-            .unwrap()
-            .is_none());
+        assert!(
+            LineWithCost::<AsymmetricMockLog>::parse("cost-only")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            LineWithCost::<AsymmetricMockLog>::parse("model-only")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

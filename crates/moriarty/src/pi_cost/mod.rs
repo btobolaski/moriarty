@@ -6,10 +6,10 @@ use std::{collections::BTreeMap, path::Path};
 use tabled::Tabled;
 
 use crate::cost_report::{
-    build_grouped_rows, display_summary, format_duration, format_session_id, format_time_range,
-    grouped_label, print_grouped_report, push_nonzero_metric_rows, render_or_empty,
-    render_stacked_charts, ChartBucket, ChartSegment, DateTimezone, FormattedMetricColumns,
-    MetricComponents, MetricTotal, ReportMode, TimeRangeFilter,
+    ChartBucket, ChartSegment, DateTimezone, FormattedMetricColumns, MetricComponents, MetricTotal,
+    ReportMode, TimeRangeFilter, build_grouped_rows, display_summary, format_duration,
+    format_session_id, format_time_range, grouped_label, print_grouped_report,
+    push_nonzero_metric_rows, render_or_empty, render_stacked_charts,
 };
 use analyzer::{DailyMetrics, SessionMetrics};
 use pi_logs::Provider;
@@ -486,8 +486,8 @@ mod tests {
     use super::*;
     use crate::{
         cost_report::{
-            fmt_money, ComponentTotals, FormattedCostColumns, MetricComponents, ReportMode,
-            TokenCounts,
+            ComponentTotals, FormattedCostColumns, MetricComponents, ReportMode, TokenCounts,
+            fmt_money,
         },
         pi_cost::{
             analyzer::{DailyCosts, SessionCosts},
@@ -626,10 +626,12 @@ mod tests {
 
     #[test]
     fn build_cost_rows_preserves_provider_then_model_order() {
-        let daily_costs = vec![costs_on(2025, 10, 23)
-            .with_model(Provider::OpenAi, "gpt-5", 1.0, 0.0, 0.0, 0.0)
-            .with_model(Provider::Anthropic, "claude-sonnet-4-5", 2.0, 0.0, 0.0, 0.0)
-            .with_model(Provider::Anthropic, "claude-haiku-3-5", 0.5, 0.0, 0.0, 0.0)];
+        let daily_costs = vec![
+            costs_on(2025, 10, 23)
+                .with_model(Provider::OpenAi, "gpt-5", 1.0, 0.0, 0.0, 0.0)
+                .with_model(Provider::Anthropic, "claude-sonnet-4-5", 2.0, 0.0, 0.0, 0.0)
+                .with_model(Provider::Anthropic, "claude-haiku-3-5", 0.5, 0.0, 0.0, 0.0),
+        ];
 
         let (rows, total_row_indices) = build_cost_rows(&daily_costs, ReportMode::Cost);
 
@@ -814,16 +816,18 @@ mod tests {
 
     #[test]
     fn same_model_name_across_providers_merges_into_one_model_row() {
-        let daily_costs = vec![costs_on(2025, 10, 23)
-            .with_model(Provider::Anthropic, "claude-sonnet-4-5", 1.0, 2.0, 0.0, 0.0)
-            .with_model(
-                Provider::OpenRouter,
-                "claude-sonnet-4-5",
-                3.0,
-                4.0,
-                0.0,
-                0.0,
-            )];
+        let daily_costs = vec![
+            costs_on(2025, 10, 23)
+                .with_model(Provider::Anthropic, "claude-sonnet-4-5", 1.0, 2.0, 0.0, 0.0)
+                .with_model(
+                    Provider::OpenRouter,
+                    "claude-sonnet-4-5",
+                    3.0,
+                    4.0,
+                    0.0,
+                    0.0,
+                ),
+        ];
 
         let (_, models) = collect_provider_and_model_aggregates(&daily_costs);
 
@@ -837,9 +841,11 @@ mod tests {
 
     #[test]
     fn display_costs_with_summary_smoke() {
-        let daily_costs = vec![costs_on(2025, 10, 23)
-            .with_model(Provider::Anthropic, "claude-sonnet-4-5", 1.0, 2.0, 0.0, 0.0)
-            .with_model(Provider::OpenAi, "gpt-5", 0.5, 1.0, 0.0, 0.0)];
+        let daily_costs = vec![
+            costs_on(2025, 10, 23)
+                .with_model(Provider::Anthropic, "claude-sonnet-4-5", 1.0, 2.0, 0.0, 0.0)
+                .with_model(Provider::OpenAi, "gpt-5", 0.5, 1.0, 0.0, 0.0),
+        ];
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             display_daily_metrics(&daily_costs, ReportMode::Cost).unwrap()

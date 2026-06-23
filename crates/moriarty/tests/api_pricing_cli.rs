@@ -1,7 +1,7 @@
 use std::{fs, path::Path, process::Command};
 
 use chrono::{DateTime, TimeZone, Utc};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tempfile::TempDir;
 
 fn write_log(dir: &Path, name: &str, lines: &[Value]) {

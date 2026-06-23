@@ -7,7 +7,7 @@ use clap::{Args, Parser, Subcommand};
 use hooks::result::PreToolResult;
 use mcp::McpServers;
 use miette::{IntoDiagnostic, WrapErr};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 mod api_pricing;
 mod approval_tui;
@@ -526,8 +526,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        parse_date_timezone, resolve_claude_logs_dir, resolve_pi_sessions_dir, Cli, Command,
-        GraphsCommand, HooksCommand, PiCommand, RulesCommand,
+        Cli, Command, GraphsCommand, HooksCommand, PiCommand, RulesCommand, parse_date_timezone,
+        resolve_claude_logs_dir, resolve_pi_sessions_dir,
     };
     use crate::cost_report::DateTimezone;
 

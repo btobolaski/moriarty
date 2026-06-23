@@ -10,7 +10,7 @@ use crate::cost_report::{
 };
 use claude_logs::{LogLine, Model};
 use cost_analyzer::{
-    analyze_directory as cost_analyze_directory, AnalyzableLog, LineWithCost, LlmCost, TokenType,
+    AnalyzableLog, LineWithCost, LlmCost, TokenType, analyze_directory as cost_analyze_directory,
 };
 
 /// `had_errors` is propagated from `cost_analyzer::analyze_directory` so the
@@ -266,7 +266,7 @@ mod tests {
 
     use chrono::TimeZone;
     use rust_decimal::Decimal;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use tempfile::TempDir;
 
     use super::*;

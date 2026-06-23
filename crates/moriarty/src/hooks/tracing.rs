@@ -13,7 +13,7 @@ use miette::Result;
 #[cfg(test)]
 use std::path::PathBuf;
 use tracing_appender::non_blocking::WorkerGuard;
-use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Initialize tracing for hooks with file-based JSON logging
 ///
@@ -181,7 +181,9 @@ mod tests {
     #[tokio::test]
     async fn test_log_level_from_env() {
         let _xdg_dir = setup_isolated_xdg_state();
-        std::env::set_var("RUST_LOG", "debug");
+        unsafe {
+            std::env::set_var("RUST_LOG", "debug");
+        }
 
         let _guard = init_tracing().await.unwrap();
         tracing::debug!("Debug level message");
@@ -205,7 +207,9 @@ mod tests {
     #[tokio::test]
     async fn test_debug_messages_filtered_by_default() {
         let _xdg_dir = setup_isolated_xdg_state();
-        std::env::remove_var("RUST_LOG");
+        unsafe {
+            std::env::remove_var("RUST_LOG");
+        }
 
         let _guard = init_tracing().await.unwrap();
         tracing::debug!("Debug message that should not appear");
@@ -229,7 +233,9 @@ mod tests {
     #[tokio::test]
     async fn test_initialization_message_at_debug_level() {
         let _xdg_dir = setup_isolated_xdg_state();
-        std::env::set_var("RUST_LOG", "debug");
+        unsafe {
+            std::env::set_var("RUST_LOG", "debug");
+        }
 
         let _guard = init_tracing().await.unwrap();
         // Force flush by dropping the guard before reading log file

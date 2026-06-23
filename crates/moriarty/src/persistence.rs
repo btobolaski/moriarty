@@ -48,7 +48,7 @@
 use std::path::PathBuf;
 
 use miette::{IntoDiagnostic, WrapErr};
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 use tokio::task::spawn_blocking;
 
 /// The type of file being stored

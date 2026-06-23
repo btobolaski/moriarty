@@ -1,6 +1,6 @@
 use std::{
     cmp::Ordering,
-    collections::{hash_map::Entry, HashMap},
+    collections::{HashMap, hash_map::Entry},
     path::{Path, PathBuf},
 };
 
@@ -9,7 +9,7 @@ use futures::StreamExt;
 use miette::{Context, IntoDiagnostic};
 use tokio::{fs::read_to_string, sync::mpsc};
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{event, Level};
+use tracing::{Level, event};
 
 use crate::logs::{AnalyzableLog, LineWithCost};
 
@@ -268,7 +268,7 @@ mod tests {
     use std::{collections::HashSet, path::Path};
 
     use chrono::{DateTime, TimeZone, Utc};
-    use rust_decimal::{prelude::ToPrimitive, Decimal};
+    use rust_decimal::{Decimal, prelude::ToPrimitive};
     use serde::Deserialize;
     use serde_json::json;
     use tempfile::TempDir;
@@ -279,9 +279,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        logs::{parse_json_line, ClaudeModelPricing, ClaudeTokenCounts, LlmCost},
+        logs::{ClaudeModelPricing, ClaudeTokenCounts, LlmCost, parse_json_line},
         test_support::{
-            claude_assistant_json, claude_usage_json, CLAUDE_SESSION_ID, CLAUDE_TIMESTAMP,
+            CLAUDE_SESSION_ID, CLAUDE_TIMESTAMP, claude_assistant_json, claude_usage_json,
         },
     };
 

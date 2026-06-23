@@ -132,7 +132,9 @@ impl Model {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, miette::Diagnostic, thiserror::Error)]
-#[error("unrecognized Claude model id `{raw}` — update `claude_logs::ModelFamily` if a new family has shipped")]
+#[error(
+    "unrecognized Claude model id `{raw}` — update `claude_logs::ModelFamily` if a new family has shipped"
+)]
 pub struct UnknownModelError {
     pub raw: String,
 }

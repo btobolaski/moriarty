@@ -16,10 +16,10 @@ use tui_scrollview::ScrollViewState;
 
 use crate::{
     project_config::{
-        is_script, is_within_project, is_writable, read_script_contents,
-        resolve_binary_path_with_original, CommandApproval, ProjectApprovals, ProjectConfig,
+        CommandApproval, ProjectApprovals, ProjectConfig, is_script, is_within_project,
+        is_writable, read_script_contents, resolve_binary_path_with_original,
     },
-    tui::event_bus::{input_stream, Event, UIEvent},
+    tui::event_bus::{Event, UIEvent, input_stream},
 };
 
 mod approval_state;

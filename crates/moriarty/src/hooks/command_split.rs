@@ -14,12 +14,12 @@
 
 // 3rd party crates
 use brush_parser::{
+    ParserOptions,
     ast::{
         AndOr, Command, CommandPrefixOrSuffixItem, CompoundCommand, IoFileRedirectKind,
         IoFileRedirectTarget, IoRedirect, Pipeline, SimpleCommand, Word,
     },
     word::{ParameterExpr, WordPiece, WordPieceWithSource},
-    ParserOptions,
 };
 use serde::Serialize;
 
@@ -125,7 +125,7 @@ fn collect_pipeline(
             // out of scope for v1 and bails conservatively.
             Command::Compound(CompoundCommand::Subshell(_), _) => return Err(BailReason::Subshell),
             Command::Compound(_, _) | Command::Function(_) | Command::ExtendedTest(_, _) => {
-                return Err(BailReason::CompoundCommand)
+                return Err(BailReason::CompoundCommand);
             }
         }
     }
@@ -445,9 +445,11 @@ mod tests {
 
     #[test]
     fn north_star_has_no_real_file_writes() {
-        assert!(leaves(NORTH_STAR, "")
-            .iter()
-            .all(|leaf| !leaf.real_file_write));
+        assert!(
+            leaves(NORTH_STAR, "")
+                .iter()
+                .all(|leaf| !leaf.real_file_write)
+        );
     }
 
     #[test]

@@ -219,9 +219,11 @@ mod tests {
             )
             .unwrap_err();
 
-        assert!(error
-            .to_string()
-            .contains("failed to aggregate Sonnet metrics"));
+        assert!(
+            error
+                .to_string()
+                .contains("failed to aggregate Sonnet metrics")
+        );
     }
 
     #[test]
@@ -314,9 +316,11 @@ mod tests {
             )
             .unwrap_err();
 
-        assert!(error
-            .to_string()
-            .contains("failed to aggregate Sonnet metrics"));
+        assert!(
+            error
+                .to_string()
+                .contains("failed to aggregate Sonnet metrics")
+        );
         assert!(format!("{error:?}").contains("token input total exceeded u64"));
     }
 

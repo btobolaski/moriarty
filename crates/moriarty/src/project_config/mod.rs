@@ -44,11 +44,11 @@ pub mod runner;
 
 // Re-export commonly used types and functions
 pub use approvals::{
-    is_script, is_within_project, is_writable, read_script_contents,
-    resolve_binary_path_with_original, CommandApproval, ProjectApprovals, VerificationResult,
+    CommandApproval, ProjectApprovals, VerificationResult, is_script, is_within_project,
+    is_writable, read_script_contents, resolve_binary_path_with_original,
 };
-pub use config::{load_project_settings, ProjectConfig};
+pub use config::{ProjectConfig, load_project_settings};
 // Allow unused imports warning for re-exports that are part of the public API
 // but not used within this crate
 #[allow(unused_imports)]
-pub use runner::{verify_and_load_project, CommandOutput, VerifiedProject};
+pub use runner::{CommandOutput, VerifiedProject, verify_and_load_project};

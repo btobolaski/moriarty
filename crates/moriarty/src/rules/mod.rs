@@ -18,18 +18,18 @@ use tabled::{Table, Tabled};
 
 // local / workspace deps
 use crate::{
+    RulesCommand,
     cost_report::TimeRangeFilter,
     hooks::{
         bash_rules::{
-            default_fragments, expand_fragments, BashRuleEngine, RuleDiagnostic, RuleResult,
+            BashRuleEngine, RuleDiagnostic, RuleResult, default_fragments, expand_fragments,
         },
-        command_split::{split_command, SplitOutcome},
-        report::{aggregate_with_cwd, CwdAggregation, ReportRow, RulesHashFilter},
+        command_split::{SplitOutcome, split_command},
+        report::{CwdAggregation, ReportRow, RulesHashFilter, aggregate_with_cwd},
         result::PreToolResult,
         tool_rules::ToolRuleEngine,
     },
-    user_config::{load_user_config, load_user_config_from, BashRule, BashRuleAction, UserConfig},
-    RulesCommand,
+    user_config::{BashRule, BashRuleAction, UserConfig, load_user_config, load_user_config_from},
 };
 
 /// Generated-pattern shape for `rules suggest`.
@@ -1143,10 +1143,12 @@ mod tests {
     fn strict_flags_over_broad_allow() {
         let config = config_with_bash(vec![allow("any", ".*")]);
         let report = build_lint_report(&config, true).unwrap();
-        assert!(report
-            .warnings
-            .iter()
-            .any(|warning| warning.kind == "over-broad-allow"));
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.kind == "over-broad-allow")
+        );
         // Over-broad is a warning, not a dropped rule.
         assert_eq!(report.ignored_count, 0);
     }

@@ -97,14 +97,14 @@ impl TimeRangeFilter {
             .map(|s| parse_datetime_for_end(&s, timezone))
             .transpose()?;
 
-        if let (Some(start), Some(end)) = (start_dt, end_dt) {
-            if start >= end {
-                return Err(miette::miette!(
-                    "Start time ({}) must be before end time ({})",
-                    start,
-                    end
-                ));
-            }
+        if let (Some(start), Some(end)) = (start_dt, end_dt)
+            && start >= end
+        {
+            return Err(miette::miette!(
+                "Start time ({}) must be before end time ({})",
+                start,
+                end
+            ));
         }
 
         Ok(Self {
@@ -114,15 +114,15 @@ impl TimeRangeFilter {
     }
 
     pub fn contains(&self, timestamp: &DateTime<Utc>) -> bool {
-        if let Some(start) = self.start {
-            if timestamp < &start {
-                return false;
-            }
+        if let Some(start) = self.start
+            && timestamp < &start
+        {
+            return false;
         }
-        if let Some(end) = self.end {
-            if timestamp >= &end {
-                return false;
-            }
+        if let Some(end) = self.end
+            && timestamp >= &end
+        {
+            return false;
         }
         true
     }

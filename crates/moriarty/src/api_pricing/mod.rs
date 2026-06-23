@@ -8,13 +8,13 @@ use tabled::Tabled;
 use claude_logs::Model;
 
 use crate::cost_report::{
-    build_grouped_rows, display_summary, format_duration, format_session_id, format_time_range,
-    grouped_label, print_grouped_report, push_nonzero_metric_rows, render_or_empty,
-    render_stacked_charts, ChartBucket, ChartSegment, DateTimezone, FormattedMetricColumns,
-    MetricComponents, MetricTotal, ReportMode, TimeRangeFilter,
+    ChartBucket, ChartSegment, DateTimezone, FormattedMetricColumns, MetricComponents, MetricTotal,
+    ReportMode, TimeRangeFilter, build_grouped_rows, display_summary, format_duration,
+    format_session_id, format_time_range, grouped_label, print_grouped_report,
+    push_nonzero_metric_rows, render_or_empty, render_stacked_charts,
 };
 use analyzer::{DailyMetrics, SessionMetrics};
-use pricing::{model_sort_key, ModelMetricsMap};
+use pricing::{ModelMetricsMap, model_sort_key};
 
 #[derive(Tabled)]
 struct ApiMetricRow {

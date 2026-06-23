@@ -7,4 +7,4 @@ pub use logs::{
     AnalyzableLog, ClaudeModelPricing, ClaudeTokenCounts, Identifier, LineWithCost, LlmCost,
     PiModel, TokenType,
 };
-pub use reader::{analyze_directory, AnalysisResult};
+pub use reader::{AnalysisResult, analyze_directory};

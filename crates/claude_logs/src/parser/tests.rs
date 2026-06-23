@@ -794,10 +794,12 @@ fn test_parse_file_history_snapshot() {
                 Uuid::parse_str("550e8400-e29b-41d4-a716-446655440010").unwrap()
             );
             assert!(!snapshot.is_snapshot_update);
-            assert!(snapshot
-                .snapshot
-                .tracked_file_backups
-                .contains_key("src/main.rs"));
+            assert!(
+                snapshot
+                    .snapshot
+                    .tracked_file_backups
+                    .contains_key("src/main.rs")
+            );
         }
         _ => panic!("Expected FileHistorySnapshot variant"),
     }
@@ -848,10 +850,12 @@ fn test_parse_file_history_snapshot_with_update() {
     match line {
         LogLine::FileHistorySnapshot(snapshot) => {
             assert!(snapshot.is_snapshot_update);
-            assert!(snapshot
-                .snapshot
-                .tracked_file_backups
-                .contains_key("src/lib.rs"));
+            assert!(
+                snapshot
+                    .snapshot
+                    .tracked_file_backups
+                    .contains_key("src/lib.rs")
+            );
         }
         _ => panic!("Expected FileHistorySnapshot variant"),
     }
@@ -3769,10 +3773,12 @@ fn test_parse_microcompact_boundary() {
             assert_eq!(boundary.microcompact_metadata.pre_tokens, 58482);
             assert_eq!(boundary.microcompact_metadata.tokens_saved, 20010);
             assert_eq!(boundary.microcompact_metadata.compacted_tool_ids.len(), 2);
-            assert!(boundary
-                .microcompact_metadata
-                .cleared_attachment_uuids
-                .is_empty());
+            assert!(
+                boundary
+                    .microcompact_metadata
+                    .cleared_attachment_uuids
+                    .is_empty()
+            );
         }
         _ => panic!("Expected System(MicrocompactBoundary) variant"),
     }

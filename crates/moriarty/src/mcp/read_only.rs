@@ -13,7 +13,7 @@ use std::{
 };
 
 // 3rd party crates
-use rmcp::{model::ErrorCode, ErrorData as McpError, Json};
+use rmcp::{ErrorData as McpError, Json, model::ErrorCode};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;

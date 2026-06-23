@@ -67,9 +67,9 @@ use futures::stream::StreamExt;
 use miette::Result;
 use serde_json::{Map, Value};
 
+use crate::HooksCommand;
 use crate::project_config::{approvals::ProjectApprovals, config::load_project_settings};
 use crate::user_config::load_user_config;
-use crate::HooksCommand;
 use parser::{
     HookDecision, HookEventData, HookInput, HookOutput, HookSpecificOutput, PermissionDecision,
     PreToolUseOutput,
@@ -400,7 +400,7 @@ async fn handle_pretool_hook(
                 output: fallback,
                 rules_hash: None,
                 rule: None,
-            })
+            });
         }
     };
 
@@ -411,43 +411,43 @@ async fn handle_pretool_hook(
         rule,
     };
 
-    if let Some(rules) = &config.tool_rules {
-        if !rules.is_empty() {
-            let engine = tool_rules::ToolRuleEngine::from_config(
-                rules.clone(),
-                config.pattern_fragments.clone(),
-            );
-            let result = engine.apply_rules(tool_name, tool_input, cwd).await;
+    if let Some(rules) = &config.tool_rules
+        && !rules.is_empty()
+    {
+        let engine = tool_rules::ToolRuleEngine::from_config(
+            rules.clone(),
+            config.pattern_fragments.clone(),
+        );
+        let result = engine.apply_rules(tool_name, tool_input, cwd).await;
 
-            match result {
-                tool_rules::ToolRuleResult::Allowed { rule_name } => {
-                    info!(
-                        tool_name = %tool_name,
-                        rule = %rule_name,
-                        "Tool call allowed by tool rule"
-                    );
-                    return Ok(outcome(pretool_allow_hook(None), Some(rule_name)));
-                }
-                tool_rules::ToolRuleResult::Denied { rule_name, reason } => {
-                    info!(
-                        tool_name = %tool_name,
-                        rule = %rule_name,
-                        reason = %reason,
-                        "Tool call denied by tool rule"
-                    );
-                    return Ok(outcome(pretool_deny_hook(reason), Some(rule_name)));
-                }
-                tool_rules::ToolRuleResult::Asked { rule_name } => {
-                    info!(
-                        tool_name = %tool_name,
-                        rule = %rule_name,
-                        "Tool rule requests user permission"
-                    );
-                    return Ok(outcome(pretool_ask_hook(), Some(rule_name)));
-                }
-                tool_rules::ToolRuleResult::NoMatch => {
-                    debug!(tool_name = %tool_name, "No tool rules matched, continuing to engine-specific handling");
-                }
+        match result {
+            tool_rules::ToolRuleResult::Allowed { rule_name } => {
+                info!(
+                    tool_name = %tool_name,
+                    rule = %rule_name,
+                    "Tool call allowed by tool rule"
+                );
+                return Ok(outcome(pretool_allow_hook(None), Some(rule_name)));
+            }
+            tool_rules::ToolRuleResult::Denied { rule_name, reason } => {
+                info!(
+                    tool_name = %tool_name,
+                    rule = %rule_name,
+                    reason = %reason,
+                    "Tool call denied by tool rule"
+                );
+                return Ok(outcome(pretool_deny_hook(reason), Some(rule_name)));
+            }
+            tool_rules::ToolRuleResult::Asked { rule_name } => {
+                info!(
+                    tool_name = %tool_name,
+                    rule = %rule_name,
+                    "Tool rule requests user permission"
+                );
+                return Ok(outcome(pretool_ask_hook(), Some(rule_name)));
+            }
+            tool_rules::ToolRuleResult::NoMatch => {
+                debug!(tool_name = %tool_name, "No tool rules matched, continuing to engine-specific handling");
             }
         }
     }

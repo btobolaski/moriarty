@@ -75,7 +75,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
-use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use serde_json::{Map, Value};
 use uuid::Uuid;
 
@@ -639,7 +639,7 @@ impl<'de> Deserialize<'de> for AssistantApi {
         match s.as_str() {
             "anthropic-messages" => return Ok(AssistantApi::Known(ApiKind::AnthropicMessages)),
             "openai-codex-responses" => {
-                return Ok(AssistantApi::Known(ApiKind::OpenAiCodexResponses))
+                return Ok(AssistantApi::Known(ApiKind::OpenAiCodexResponses));
             }
             "openai-completions" => return Ok(AssistantApi::Known(ApiKind::OpenAiCompletions)),
             "openai-responses" => return Ok(AssistantApi::Known(ApiKind::OpenAiResponses)),

@@ -8,21 +8,23 @@ use tempfile::TempDir;
 
 /// Create a temporary directory with XDG_CONFIG_HOME set to it.
 ///
-/// Safe to use `std::env::set_var` because cargo nextest isolates each test in
-/// a separate process.
-///
-/// **IMPORTANT**: The returned `TempDir` must be kept alive (bound to a variable)
-/// for the duration of the test. `TempDir` deletes its directory when dropped.
+/// **SAFETY**: Callers must ensure each test runs in its own process (this
+/// is the case with `cargo nextest`, which is required for this project).
+/// The returned `TempDir` must be kept alive for the test's duration.
 pub fn setup_isolated_xdg_config() -> TempDir {
     let temp_dir = tempfile::tempdir().unwrap();
-    std::env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+    unsafe {
+        std::env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+    }
     temp_dir
 }
 
 /// Create a temporary directory with XDG_STATE_HOME set to it.
 pub fn setup_isolated_xdg_state() -> TempDir {
     let temp_dir = tempfile::tempdir().unwrap();
-    std::env::set_var("XDG_STATE_HOME", temp_dir.path());
+    unsafe {
+        std::env::set_var("XDG_STATE_HOME", temp_dir.path());
+    }
     temp_dir
 }
 

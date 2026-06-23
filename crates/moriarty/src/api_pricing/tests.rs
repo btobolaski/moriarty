@@ -10,10 +10,10 @@ use crate::{
         pricing::ModelCostsMap,
     },
     cost_report::{
-        apply_width_config, create_grouped_table, display_grand_total, divider, fmt_money,
-        format_duration, format_session_id, format_time_range, ComponentTotals, DateTimezone,
-        FormattedCostColumns, GrandTotalRow, MetricComponents, MetricTotal, ReportMode,
-        TokenCounts,
+        ComponentTotals, DateTimezone, FormattedCostColumns, GrandTotalRow, MetricComponents,
+        MetricTotal, ReportMode, TokenCounts, apply_width_config, create_grouped_table,
+        display_grand_total, divider, fmt_money, format_duration, format_session_id,
+        format_time_range,
     },
 };
 
@@ -336,9 +336,11 @@ fn metric_total_checked_add_rejects_token_overflow() {
         .checked_add(MetricTotal::Tokens(1))
         .unwrap_err();
 
-    assert!(error
-        .to_string()
-        .contains("grand token total exceeded u128"));
+    assert!(
+        error
+            .to_string()
+            .contains("grand token total exceeded u128")
+    );
 }
 
 #[test]
@@ -358,10 +360,12 @@ fn build_cost_rows_variants() {
         ),
         (
             "multi-model same day",
-            vec![costs_on(2025, 10, 23)
-                .with_opus(1.0, 1.0, 0.0, 0.0)
-                .with_sonnet(2.0, 2.0, 0.0, 0.0)
-                .with_haiku(0.5, 0.5, 0.0, 0.0)],
+            vec![
+                costs_on(2025, 10, 23)
+                    .with_opus(1.0, 1.0, 0.0, 0.0)
+                    .with_sonnet(2.0, 2.0, 0.0, 0.0)
+                    .with_haiku(0.5, 0.5, 0.0, 0.0),
+            ],
             vec![3],
             vec![
                 ("2025-10-23", "Opus"),
@@ -806,11 +810,13 @@ fn collect_session_model_aggregates_total_equals_grand_total() {
 
 #[test]
 fn collect_model_aggregates_preserves_family_then_version_desc_order() {
-    let daily_costs = vec![costs_on(2025, 10, 23)
-        .with_haiku(0.25, 1.25, 0.0, 0.0)
-        .with_sonnet(3.0, 15.0, 0.0, 0.0)
-        .with_opus(15.0, 75.0, 0.0, 0.0)
-        .with_opus4(5.0, 25.0, 0.0, 0.0)];
+    let daily_costs = vec![
+        costs_on(2025, 10, 23)
+            .with_haiku(0.25, 1.25, 0.0, 0.0)
+            .with_sonnet(3.0, 15.0, 0.0, 0.0)
+            .with_opus(15.0, 75.0, 0.0, 0.0)
+            .with_opus4(5.0, 25.0, 0.0, 0.0),
+    ];
 
     let models = collect_model_aggregates(&daily_costs);
     let labels: Vec<&str> = models.iter().map(|(name, _)| name.as_str()).collect();

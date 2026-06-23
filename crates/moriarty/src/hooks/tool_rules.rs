@@ -20,8 +20,8 @@ use tokio::task::spawn_blocking;
 use tracing::{debug, warn};
 
 use super::bash_rules::{
-    classify_fragment_error, default_fragments, expand_fragments, RuleDiagnostic,
-    RuleDiagnosticKind,
+    RuleDiagnostic, RuleDiagnosticKind, classify_fragment_error, default_fragments,
+    expand_fragments,
 };
 use crate::user_config::{ToolRule, ToolRuleAction};
 
@@ -485,7 +485,7 @@ fn canonicalize_allow_missing(path: &Path) -> io::Result<PathBuf> {
     loop {
         match fs::canonicalize(&current) {
             Ok(canonical) => {
-                return rebuild_missing_suffix(canonical, removed_components.into_iter().rev())
+                return rebuild_missing_suffix(canonical, removed_components.into_iter().rev());
             }
             Err(error) if is_missing_path_error(&error) => {
                 // TOCTOU note: between `canonicalize` failing and this `symlink_metadata`

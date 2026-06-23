@@ -22,7 +22,7 @@ use clap::Subcommand;
 use git_read_only::GitReadOnly;
 use jj_read_only::JjReadOnly;
 use miette::IntoDiagnostic;
-use rmcp::{transport::stdio, ServiceExt};
+use rmcp::{ServiceExt, transport::stdio};
 use tool_runner::ToolRunner;
 
 pub mod git_read_only;

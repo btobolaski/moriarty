@@ -23,11 +23,11 @@ use std::{io::Read, path::PathBuf};
 
 use miette::{IntoDiagnostic, Result, WrapErr};
 use serde_json::json;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::{
     hooks::bash_rules::{BashRuleEngine, CommandTrace, RuleResult},
-    project_config::runner::{verify_and_load_project, CommandOutput, VerifiedProject},
+    project_config::runner::{CommandOutput, VerifiedProject, verify_and_load_project},
     user_config::load_user_config_from,
 };
 

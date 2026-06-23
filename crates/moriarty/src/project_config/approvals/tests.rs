@@ -12,7 +12,7 @@ use std::os::unix::fs::PermissionsExt;
 
 use miette::{IntoDiagnostic, Result, WrapErr};
 use tempfile::{NamedTempFile, TempDir};
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 
 use crate::{
     hashing,
@@ -22,8 +22,8 @@ use crate::{
 };
 
 use super::super::{
-    is_script, is_within_project, is_writable, resolve_binary_path_with_original, CommandApproval,
-    ProjectApprovals, VerificationResult,
+    CommandApproval, ProjectApprovals, VerificationResult, is_script, is_within_project,
+    is_writable, resolve_binary_path_with_original,
 };
 
 /// Builds a `CommandApproval` with stable dummy hash/path fields for tests that
@@ -161,7 +161,9 @@ async fn is_writable_with_mode(mode: u32) -> bool {
 /// tools.toml contents, returning both temp dirs (which must be kept alive).
 fn isolated_project_with_config(config_content: &str) -> (TempDir, TempDir) {
     let xdg_dir = TempDir::new().unwrap();
-    std::env::set_var("XDG_CONFIG_HOME", xdg_dir.path());
+    unsafe {
+        std::env::set_var("XDG_CONFIG_HOME", xdg_dir.path());
+    }
 
     let project_dir = TempDir::new().unwrap();
     write_tools_config(project_dir.path(), config_content);
@@ -457,7 +459,9 @@ command = ["echo", "modified"]
 #[tokio::test]
 async fn test_verify_check_binary_hash_mismatch() {
     let _xdg_dir = TempDir::new().unwrap();
-    std::env::set_var("XDG_CONFIG_HOME", _xdg_dir.path());
+    unsafe {
+        std::env::set_var("XDG_CONFIG_HOME", _xdg_dir.path());
+    }
 
     let temp_dir = TempDir::new().unwrap();
 
@@ -758,7 +762,9 @@ async fn test_concurrent_approvals_use_file_locking() {
     // This validates that ProjectApprovals::update() properly serializes concurrent writes
 
     let _xdg_dir = TempDir::new().unwrap();
-    std::env::set_var("XDG_CONFIG_HOME", _xdg_dir.path());
+    unsafe {
+        std::env::set_var("XDG_CONFIG_HOME", _xdg_dir.path());
+    }
 
     // Spawn fewer concurrent operations to avoid test timeout
     let mut handles = vec![];
@@ -824,7 +830,9 @@ async fn test_concurrent_updates_to_same_project() {
     // Last write should win, and file should not be corrupted
 
     let _xdg_dir = TempDir::new().unwrap();
-    std::env::set_var("XDG_CONFIG_HOME", _xdg_dir.path());
+    unsafe {
+        std::env::set_var("XDG_CONFIG_HOME", _xdg_dir.path());
+    }
 
     let project_dir = PathBuf::from("/test/same-project");
 
@@ -884,7 +892,9 @@ async fn test_file_locking_prevents_read_during_write() {
     // Test that file locking prevents reading partially-written approval files
     // This ensures atomicity of the load-modify-save cycle
     let _xdg_dir = TempDir::new().unwrap();
-    std::env::set_var("XDG_CONFIG_HOME", _xdg_dir.path());
+    unsafe {
+        std::env::set_var("XDG_CONFIG_HOME", _xdg_dir.path());
+    }
 
     // Create a real temp directory for the project
     let _project_temp_dir = TempDir::new().unwrap();
@@ -1006,7 +1016,9 @@ command = ["echo", "check"]
 #[tokio::test]
 async fn test_jj_workspaces_share_approvals() {
     let _xdg_dir = TempDir::new().unwrap();
-    std::env::set_var("XDG_CONFIG_HOME", _xdg_dir.path());
+    unsafe {
+        std::env::set_var("XDG_CONFIG_HOME", _xdg_dir.path());
+    }
 
     let repo_dir = TempDir::new().unwrap();
     let repo_path = repo_dir.path();
@@ -1037,7 +1049,9 @@ lint = ["echo", "lint"]
 #[tokio::test]
 async fn test_git_worktrees_share_approvals() {
     let _xdg_dir = TempDir::new().unwrap();
-    std::env::set_var("XDG_CONFIG_HOME", _xdg_dir.path());
+    unsafe {
+        std::env::set_var("XDG_CONFIG_HOME", _xdg_dir.path());
+    }
 
     let repo_dir = TempDir::new().unwrap();
     let repo_path = repo_dir.path();
@@ -1068,7 +1082,9 @@ lint = ["echo", "lint"]
 #[tokio::test]
 async fn test_load_approvals_without_checks_field() {
     let xdg_dir = TempDir::new().unwrap();
-    std::env::set_var("XDG_CONFIG_HOME", xdg_dir.path());
+    unsafe {
+        std::env::set_var("XDG_CONFIG_HOME", xdg_dir.path());
+    }
 
     // Create old-format approval TOML without checks field
     let approvals_dir = xdg_dir.path().join("moriarty");

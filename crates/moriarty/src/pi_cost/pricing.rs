@@ -144,9 +144,11 @@ mod tests {
             .add(key, MetricComponents::Tokens(TokenCounts::new(1, 0, 0, 0)))
             .unwrap_err();
 
-        assert!(error
-            .to_string()
-            .contains("failed to aggregate metrics for claude-sonnet-4-5"));
+        assert!(
+            error
+                .to_string()
+                .contains("failed to aggregate metrics for claude-sonnet-4-5")
+        );
     }
 
     #[test]
@@ -223,9 +225,11 @@ mod tests {
             .add(key, MetricComponents::Tokens(TokenCounts::new(1, 0, 0, 0)))
             .unwrap_err();
 
-        assert!(error
-            .to_string()
-            .contains("failed to aggregate metrics for claude-sonnet-4-5"));
+        assert!(
+            error
+                .to_string()
+                .contains("failed to aggregate metrics for claude-sonnet-4-5")
+        );
         assert!(format!("{error:?}").contains("token input total exceeded u64"));
     }
 }

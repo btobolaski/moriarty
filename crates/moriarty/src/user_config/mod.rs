@@ -469,26 +469,34 @@ reason = "Browser not needed""#;
     async fn test_load_user_config_missing_file() {
         // Set XDG_CONFIG_HOME to a temp directory that doesn't have the config file
         let temp_dir = tempfile::tempdir().unwrap();
-        std::env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+        }
 
         let config = load_user_config().await.unwrap();
         assert_eq!(config, UserConfig::default());
 
-        std::env::remove_var("XDG_CONFIG_HOME");
+        unsafe {
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
     }
 
     /// Persist `test_config` to a temp XDG_CONFIG_HOME and assert load_user_config
     /// round-trips the same value.
     async fn assert_config_roundtrips(test_config: UserConfig) {
         let temp_dir = tempfile::tempdir().unwrap();
-        std::env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+        }
         FileType::Config
             .persist("tool_rules.toml", &test_config)
             .await
             .unwrap();
         let loaded_config = load_user_config().await.unwrap();
         assert_eq!(loaded_config, test_config);
-        std::env::remove_var("XDG_CONFIG_HOME");
+        unsafe {
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
     }
 
     #[tokio::test]
@@ -521,7 +529,9 @@ reason = "Browser not needed""#;
     #[tokio::test]
     async fn test_load_user_config_invalid_toml() {
         let temp_dir = tempfile::tempdir().unwrap();
-        std::env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+        }
 
         let moriarty_dir = temp_dir.path().join("moriarty");
         tokio::fs::create_dir_all(&moriarty_dir).await.unwrap();
@@ -542,7 +552,9 @@ reason = "Browser not needed""#;
             err_msg
         );
 
-        std::env::remove_var("XDG_CONFIG_HOME");
+        unsafe {
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
     }
 
     #[test]

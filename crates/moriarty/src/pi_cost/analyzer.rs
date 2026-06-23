@@ -9,7 +9,7 @@ use crate::cost_report::{
     TokenCounts,
 };
 use cost_analyzer::{
-    analyze_directory as cost_analyze_directory, AnalyzableLog, LineWithCost, LlmCost, TokenType,
+    AnalyzableLog, LineWithCost, LlmCost, TokenType, analyze_directory as cost_analyze_directory,
 };
 use pi_logs::PiLogLine;
 
@@ -238,7 +238,7 @@ mod tests {
 
     use chrono::TimeZone;
     use rust_decimal::Decimal;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use tempfile::TempDir;
 
     use super::*;

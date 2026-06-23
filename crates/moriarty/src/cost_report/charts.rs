@@ -11,7 +11,7 @@ use crossterm::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::render::{divider, fmt_money, fmt_tokens, MetricTotal, ReportMode};
+use super::render::{MetricTotal, ReportMode, divider, fmt_money, fmt_tokens};
 
 const DEFAULT_TOP_N: usize = 5;
 const DEFAULT_TIME_BAR_WIDTH: usize = 48;
@@ -585,10 +585,8 @@ fn render_bar(segments: &[OrderedSegment], widths: &[usize], use_color: bool) ->
 
 fn render_marker(segment: &OrderedSegment, use_color: bool) -> String {
     let marker = segment.glyph.to_string();
-    if use_color {
-        if let Some(color) = segment.color {
-            return format!("{}", marker.with(color));
-        }
+    if use_color && let Some(color) = segment.color {
+        return format!("{}", marker.with(color));
     }
     marker
 }

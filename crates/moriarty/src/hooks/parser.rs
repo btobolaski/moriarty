@@ -296,7 +296,7 @@ pub fn parse_hook_output(json: &str) -> Result<HookOutput, serde_json::Error> {
 
 #[cfg(test)]
 mod tests {
-    use serde::{de::DeserializeOwned, Serialize};
+    use serde::{Serialize, de::DeserializeOwned};
 
     use super::*;
 

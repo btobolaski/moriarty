@@ -59,7 +59,7 @@ pub fn pretool_result(output: &HookOutput) -> PreToolResult {
 
 #[cfg(test)]
 mod tests {
-    use super::{pretool_result, PreToolResult};
+    use super::{PreToolResult, pretool_result};
     use crate::hooks::parser::{
         HookOutput, HookSpecificOutput, PermissionDecision, PreToolUseOutput,
     };

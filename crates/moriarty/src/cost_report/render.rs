@@ -2,13 +2,13 @@ use chrono::{DateTime, Local, Utc};
 use crossterm::terminal;
 use miette::miette;
 use tabled::{
+    Table, Tabled,
     settings::{
+        Alignment, Modify, Width,
         object::Rows,
         style::{HorizontalLine, Style},
         themes::Theme,
-        Alignment, Modify, Width,
     },
-    Table, Tabled,
 };
 
 use super::time_filter::DateTimezone;
@@ -212,11 +212,7 @@ fn format_integer_with_separators(value: u128) -> String {
 }
 
 pub(crate) fn grouped_label(first_row: bool, value: &str) -> &str {
-    if first_row {
-        value
-    } else {
-        ""
-    }
+    if first_row { value } else { "" }
 }
 
 const MIN_WIDTH_FOR_WRAPPING: usize = 100;

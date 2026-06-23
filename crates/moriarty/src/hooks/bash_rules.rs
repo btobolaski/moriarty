@@ -6,12 +6,12 @@
 
 use std::collections::{HashMap, HashSet};
 
-use miette::{miette, Result};
+use miette::{Result, miette};
 use regex::{Regex, RegexSet};
 use serde::Serialize;
 use tracing::debug;
 
-use super::command_split::{split_command, BailReason, SplitOutcome};
+use super::command_split::{BailReason, SplitOutcome, split_command};
 use crate::user_config::{BashRule, BashRuleAction};
 
 /// Runtime representation of a rule with pre-compiled regex for efficient matching.
@@ -1783,10 +1783,12 @@ mod tests {
     #[test]
     fn test_parse_command_invalid_syntax() {
         let result = parse_command(r#"echo "unmatched quote"#);
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Failed to parse command"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Failed to parse command")
+        );
     }
 
     #[test]

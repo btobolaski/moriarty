@@ -68,8 +68,8 @@
 use std::path::PathBuf;
 
 use rmcp::{
-    handler::server::wrapper::Parameters, model::*, tool, tool_handler, tool_router,
-    ErrorData as McpError, ServerHandler,
+    ErrorData as McpError, ServerHandler, handler::server::wrapper::Parameters, model::*, tool,
+    tool_handler, tool_router,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};

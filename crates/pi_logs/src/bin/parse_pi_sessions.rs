@@ -11,7 +11,7 @@ use std::{
 };
 
 use clap::Parser;
-use pi_logs::parser::{parse_file, ParseError};
+use pi_logs::parser::{ParseError, parse_file};
 use walkdir::WalkDir;
 
 #[derive(Parser, Debug)]

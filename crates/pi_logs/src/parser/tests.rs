@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::*;
 

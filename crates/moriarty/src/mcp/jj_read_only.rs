@@ -23,13 +23,13 @@ use std::path::PathBuf;
 
 // 3rd party crates
 use rmcp::{
-    handler::server::wrapper::Parameters, model::*, tool, tool_handler, tool_router,
-    ErrorData as McpError, Json, ServerHandler,
+    ErrorData as McpError, Json, ServerHandler, handler::server::wrapper::Parameters, model::*,
+    tool, tool_handler, tool_router,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::read_only::{run_read_only_command, CommandResult};
+use super::read_only::{CommandResult, run_read_only_command};
 
 /// Supported jj commands that can be executed via the MCP server.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

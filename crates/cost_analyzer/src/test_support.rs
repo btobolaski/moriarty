@@ -1,4 +1,4 @@
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 pub(crate) const CLAUDE_ASSISTANT_UUID: &str = "22222222-2222-4222-8222-222222222222";
 pub(crate) const CLAUDE_BRANCH: &str = "main";

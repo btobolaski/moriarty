@@ -32,7 +32,7 @@ use futures::stream::{self, StreamExt};
 use miette::{Context, IntoDiagnostic, Result};
 use tokio::process::Command;
 
-use super::{load_project_settings, ProjectApprovals, ProjectConfig, VerificationResult};
+use super::{ProjectApprovals, ProjectConfig, VerificationResult, load_project_settings};
 
 /// Maximum number of commands to run concurrently.
 ///
@@ -172,7 +172,7 @@ impl VerifiedProject {
                 return Err(miette::miette!(
                     "Unknown command '{}'. Valid commands: lint, test, build, format",
                     command_name
-                ))
+                ));
             }
         };
 
