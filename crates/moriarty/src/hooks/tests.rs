@@ -6,7 +6,9 @@ use serde_json::Value;
 use tempfile::TempDir;
 
 use super::*;
-use crate::test_helpers::{setup_isolated_xdg_config, setup_isolated_xdg_state};
+use crate::test_helpers::{
+    remove_test_env_var, set_test_env_var, setup_isolated_xdg_config, setup_isolated_xdg_state,
+};
 
 async fn setup_user_bash_rules(rules_toml: &str) -> TempDir {
     let temp_dir = setup_isolated_xdg_config();
@@ -27,9 +29,7 @@ fn setup_project_with_config(toml_content: &str) -> TempDir {
     std::fs::create_dir(&config_dir).expect("Failed to create .config dir");
     std::fs::write(config_dir.join("tools.toml"), toml_content)
         .expect("Failed to write tools.toml");
-    unsafe {
-        std::env::set_var("CLAUDE_PROJECT_DIR", temp_dir.path());
-    }
+    set_test_env_var("CLAUDE_PROJECT_DIR", temp_dir.path());
     temp_dir
 }
 
@@ -62,9 +62,7 @@ fn check_cmd(exit_ok: bool) -> (&'static str, Vec<&'static str>) {
 /// Returns the temp dir (kept alive by caller) and the hook result.
 async fn run_stop_hook_with_checks(checks: Vec<(&str, &str, Vec<&str>)>) -> (TempDir, HookOutput) {
     let temp_dir = setup_approved_project_with_checks(checks).await;
-    unsafe {
-        std::env::set_var("CLAUDE_PROJECT_DIR", temp_dir.path());
-    }
+    set_test_env_var("CLAUDE_PROJECT_DIR", temp_dir.path());
     let result = handle_stop_hook().await.expect("Should succeed");
     (temp_dir, result)
 }
@@ -549,10 +547,7 @@ async fn test_exec_hook_truncates_long_invalid_input() {
 
 #[tokio::test]
 async fn test_xdg_isolation_verification() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    unsafe {
-        std::env::set_var("XDG_STATE_HOME", temp_dir.path());
-    }
+    let temp_dir = setup_isolated_xdg_state();
 
     // Verify the xdg crate sees our isolated directory
     use crate::persistence::FileType;
@@ -573,9 +568,7 @@ async fn test_exec_hook_all_event_types() {
     // Prevent infinite recursion: if this test is running inside a hook's test check,
     // the Stop event would try to run checks again, including this test, causing deadlock.
     // Clear CLAUDE_PROJECT_DIR to disable check execution in the Stop hook.
-    unsafe {
-        std::env::remove_var("CLAUDE_PROJECT_DIR");
-    }
+    remove_test_env_var("CLAUDE_PROJECT_DIR");
 
     let test_cases = vec![
         r#"{"session_id":"s","transcript_path":"/t","cwd":"/c","permission_mode":"default","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"ls"}}"#,
@@ -610,9 +603,7 @@ async fn test_stop_hook_no_env_var() {
     let _xdg_dir = setup_isolated_xdg_state();
 
     // Ensure CLAUDE_PROJECT_DIR is not set
-    unsafe {
-        std::env::remove_var("CLAUDE_PROJECT_DIR");
-    }
+    remove_test_env_var("CLAUDE_PROJECT_DIR");
 
     let result = handle_stop_hook().await.expect("Should succeed");
 
@@ -627,9 +618,7 @@ async fn test_stop_hook_approval_variants() {
             "no config file",
             Box::new(|| {
                 let temp_dir = TempDir::new().expect("Failed to create temp dir");
-                unsafe {
-                    std::env::set_var("CLAUDE_PROJECT_DIR", temp_dir.path());
-                }
+                set_test_env_var("CLAUDE_PROJECT_DIR", temp_dir.path());
                 Some(temp_dir)
             }) as Box<dyn FnOnce() -> Option<TempDir>>,
         ),
@@ -828,9 +817,7 @@ async fn test_stop_hook_check_binary_hash_mismatch() {
         .await
         .expect("Failed to save corrupted approvals");
 
-    unsafe {
-        std::env::set_var("CLAUDE_PROJECT_DIR", temp_dir.path());
-    }
+    set_test_env_var("CLAUDE_PROJECT_DIR", temp_dir.path());
     let result = handle_stop_hook().await.expect("Should succeed");
     assert_stop_blocked_with(&result, &["binary changed", "test-check"]);
 }

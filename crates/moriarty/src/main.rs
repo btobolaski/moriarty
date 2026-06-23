@@ -529,49 +529,13 @@ mod tests {
         Cli, Command, GraphsCommand, HooksCommand, PiCommand, RulesCommand, parse_date_timezone,
         resolve_claude_logs_dir, resolve_pi_sessions_dir,
     };
-    use crate::cost_report::DateTimezone;
-
-    struct HomeGuard {
-        original: Option<OsString>,
-    }
-
-    impl HomeGuard {
-        fn set(home: Option<&Path>) -> Self {
-            let original = env::var_os("HOME");
-
-            match home {
-                Some(home) => {
-                    // These tests run under `cargo nextest`, so each test has its own process and can
-                    // safely mutate process-global environment variables.
-                    unsafe { env::set_var("HOME", home) };
-                }
-                None => {
-                    // See comment above about `cargo nextest` process isolation.
-                    unsafe { env::remove_var("HOME") };
-                }
-            }
-
-            Self { original }
-        }
-    }
-
-    impl Drop for HomeGuard {
-        fn drop(&mut self) {
-            match self.original.as_ref() {
-                Some(value) => {
-                    // See comment above about `cargo nextest` process isolation.
-                    unsafe { env::set_var("HOME", value) };
-                }
-                None => {
-                    // See comment above about `cargo nextest` process isolation.
-                    unsafe { env::remove_var("HOME") };
-                }
-            }
-        }
-    }
+    use crate::{cost_report::DateTimezone, test_helpers::TestEnvVarGuard};
 
     fn with_home<R>(home: Option<&Path>, f: impl FnOnce() -> R) -> R {
-        let _guard = HomeGuard::set(home);
+        let _guard = match home {
+            Some(home) => TestEnvVarGuard::set("HOME", home),
+            None => TestEnvVarGuard::unset("HOME"),
+        };
         f()
     }
 

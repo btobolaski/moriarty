@@ -105,7 +105,7 @@ pub async fn get_current_log_path() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_helpers::setup_isolated_xdg_state;
+    use crate::test_helpers::{TestEnvVarGuard, setup_isolated_xdg_state};
 
     #[tokio::test]
     async fn test_get_current_log_path() {
@@ -181,9 +181,7 @@ mod tests {
     #[tokio::test]
     async fn test_log_level_from_env() {
         let _xdg_dir = setup_isolated_xdg_state();
-        unsafe {
-            std::env::set_var("RUST_LOG", "debug");
-        }
+        let _rust_log = TestEnvVarGuard::set("RUST_LOG", "debug");
 
         let _guard = init_tracing().await.unwrap();
         tracing::debug!("Debug level message");
@@ -207,9 +205,7 @@ mod tests {
     #[tokio::test]
     async fn test_debug_messages_filtered_by_default() {
         let _xdg_dir = setup_isolated_xdg_state();
-        unsafe {
-            std::env::remove_var("RUST_LOG");
-        }
+        let _rust_log = TestEnvVarGuard::unset("RUST_LOG");
 
         let _guard = init_tracing().await.unwrap();
         tracing::debug!("Debug message that should not appear");
@@ -233,9 +229,7 @@ mod tests {
     #[tokio::test]
     async fn test_initialization_message_at_debug_level() {
         let _xdg_dir = setup_isolated_xdg_state();
-        unsafe {
-            std::env::set_var("RUST_LOG", "debug");
-        }
+        let _rust_log = TestEnvVarGuard::set("RUST_LOG", "debug");
 
         let _guard = init_tracing().await.unwrap();
         // Force flush by dropping the guard before reading log file

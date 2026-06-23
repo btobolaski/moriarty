@@ -18,7 +18,7 @@ use crate::{
     hashing,
     project_config::config::ProjectConfig,
     repository,
-    test_helpers::{create_executable_script, write_tools_config},
+    test_helpers::{create_executable_script, setup_isolated_xdg_config, write_tools_config},
 };
 
 use super::super::{
@@ -160,10 +160,7 @@ async fn is_writable_with_mode(mode: u32) -> bool {
 /// Sets up an isolated XDG_CONFIG_HOME and a new project temp dir with the given
 /// tools.toml contents, returning both temp dirs (which must be kept alive).
 fn isolated_project_with_config(config_content: &str) -> (TempDir, TempDir) {
-    let xdg_dir = TempDir::new().unwrap();
-    unsafe {
-        std::env::set_var("XDG_CONFIG_HOME", xdg_dir.path());
-    }
+    let xdg_dir = setup_isolated_xdg_config();
 
     let project_dir = TempDir::new().unwrap();
     write_tools_config(project_dir.path(), config_content);
@@ -458,10 +455,7 @@ command = ["echo", "modified"]
 
 #[tokio::test]
 async fn test_verify_check_binary_hash_mismatch() {
-    let _xdg_dir = TempDir::new().unwrap();
-    unsafe {
-        std::env::set_var("XDG_CONFIG_HOME", _xdg_dir.path());
-    }
+    let _xdg_dir = setup_isolated_xdg_config();
 
     let temp_dir = TempDir::new().unwrap();
 
@@ -761,10 +755,7 @@ async fn test_concurrent_approvals_use_file_locking() {
     // Test that concurrent approval updates don't corrupt the file due to file locking
     // This validates that ProjectApprovals::update() properly serializes concurrent writes
 
-    let _xdg_dir = TempDir::new().unwrap();
-    unsafe {
-        std::env::set_var("XDG_CONFIG_HOME", _xdg_dir.path());
-    }
+    let _xdg_dir = setup_isolated_xdg_config();
 
     // Spawn fewer concurrent operations to avoid test timeout
     let mut handles = vec![];
@@ -829,10 +820,7 @@ async fn test_concurrent_updates_to_same_project() {
     // Test that concurrent updates to the same project are properly serialized
     // Last write should win, and file should not be corrupted
 
-    let _xdg_dir = TempDir::new().unwrap();
-    unsafe {
-        std::env::set_var("XDG_CONFIG_HOME", _xdg_dir.path());
-    }
+    let _xdg_dir = setup_isolated_xdg_config();
 
     let project_dir = PathBuf::from("/test/same-project");
 
@@ -891,10 +879,7 @@ async fn test_concurrent_updates_to_same_project() {
 async fn test_file_locking_prevents_read_during_write() {
     // Test that file locking prevents reading partially-written approval files
     // This ensures atomicity of the load-modify-save cycle
-    let _xdg_dir = TempDir::new().unwrap();
-    unsafe {
-        std::env::set_var("XDG_CONFIG_HOME", _xdg_dir.path());
-    }
+    let _xdg_dir = setup_isolated_xdg_config();
 
     // Create a real temp directory for the project
     let _project_temp_dir = TempDir::new().unwrap();
@@ -1015,10 +1000,7 @@ command = ["echo", "check"]
 
 #[tokio::test]
 async fn test_jj_workspaces_share_approvals() {
-    let _xdg_dir = TempDir::new().unwrap();
-    unsafe {
-        std::env::set_var("XDG_CONFIG_HOME", _xdg_dir.path());
-    }
+    let _xdg_dir = setup_isolated_xdg_config();
 
     let repo_dir = TempDir::new().unwrap();
     let repo_path = repo_dir.path();
@@ -1048,10 +1030,7 @@ lint = ["echo", "lint"]
 
 #[tokio::test]
 async fn test_git_worktrees_share_approvals() {
-    let _xdg_dir = TempDir::new().unwrap();
-    unsafe {
-        std::env::set_var("XDG_CONFIG_HOME", _xdg_dir.path());
-    }
+    let _xdg_dir = setup_isolated_xdg_config();
 
     let repo_dir = TempDir::new().unwrap();
     let repo_path = repo_dir.path();
@@ -1081,10 +1060,7 @@ lint = ["echo", "lint"]
 
 #[tokio::test]
 async fn test_load_approvals_without_checks_field() {
-    let xdg_dir = TempDir::new().unwrap();
-    unsafe {
-        std::env::set_var("XDG_CONFIG_HOME", xdg_dir.path());
-    }
+    let xdg_dir = setup_isolated_xdg_config();
 
     // Create old-format approval TOML without checks field
     let approvals_dir = xdg_dir.path().join("moriarty");

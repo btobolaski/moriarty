@@ -256,6 +256,7 @@ pub async fn load_user_config_from(path: Option<&Path>) -> Result<UserConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_helpers::setup_isolated_xdg_config;
 
     /// Builds a minimal `UserConfig` fixture for round-trip tests that only vary
     /// the bash/tool rule lists.
@@ -467,36 +468,22 @@ reason = "Browser not needed""#;
 
     #[tokio::test]
     async fn test_load_user_config_missing_file() {
-        // Set XDG_CONFIG_HOME to a temp directory that doesn't have the config file
-        let temp_dir = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", temp_dir.path());
-        }
+        let _xdg_dir = setup_isolated_xdg_config();
 
         let config = load_user_config().await.unwrap();
         assert_eq!(config, UserConfig::default());
-
-        unsafe {
-            std::env::remove_var("XDG_CONFIG_HOME");
-        }
     }
 
     /// Persist `test_config` to a temp XDG_CONFIG_HOME and assert load_user_config
     /// round-trips the same value.
     async fn assert_config_roundtrips(test_config: UserConfig) {
-        let temp_dir = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", temp_dir.path());
-        }
+        let _temp_dir = setup_isolated_xdg_config();
         FileType::Config
             .persist("tool_rules.toml", &test_config)
             .await
             .unwrap();
         let loaded_config = load_user_config().await.unwrap();
         assert_eq!(loaded_config, test_config);
-        unsafe {
-            std::env::remove_var("XDG_CONFIG_HOME");
-        }
     }
 
     #[tokio::test]
@@ -528,10 +515,7 @@ reason = "Browser not needed""#;
 
     #[tokio::test]
     async fn test_load_user_config_invalid_toml() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", temp_dir.path());
-        }
+        let temp_dir = setup_isolated_xdg_config();
 
         let moriarty_dir = temp_dir.path().join("moriarty");
         tokio::fs::create_dir_all(&moriarty_dir).await.unwrap();
@@ -551,10 +535,6 @@ reason = "Browser not needed""#;
             "Error message should mention configuration failure or TOML, got: {}",
             err_msg
         );
-
-        unsafe {
-            std::env::remove_var("XDG_CONFIG_HOME");
-        }
     }
 
     #[test]

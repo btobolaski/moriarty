@@ -1,7 +1,10 @@
 use super::ApprovalApp;
 use crate::{
     approval_tui::approval_state::{Screen, Section},
-    test_helpers::{create_executable_script, setup_project_dir_with_config, write_tools_config},
+    test_helpers::{
+        create_executable_script, setup_isolated_xdg_config, setup_project_dir_with_config,
+        write_tools_config,
+    },
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tempfile::TempDir;
@@ -160,10 +163,7 @@ async fn test_approve_current_and_advance() {
 async fn test_save_approvals_validation() {
     // Test that save_approvals validates all commands are approved
     let temp_dir = setup_test_project();
-    let _xdg_dir = TempDir::new().unwrap();
-    unsafe {
-        std::env::set_var("XDG_CONFIG_HOME", _xdg_dir.path());
-    }
+    let _xdg_dir = setup_isolated_xdg_config();
 
     let mut app = new_test_app(&temp_dir).await;
 
@@ -404,10 +404,7 @@ async fn test_approve_commands_then_checks_section_transition() {
 #[tokio::test]
 async fn test_save_approvals_requires_all_checks_approved() {
     // Test that save_approvals fails when checks are not approved
-    let _xdg_dir = TempDir::new().unwrap();
-    unsafe {
-        std::env::set_var("XDG_CONFIG_HOME", _xdg_dir.path());
-    }
+    let _xdg_dir = setup_isolated_xdg_config();
 
     let temp_dir = project_with_config(LINT_PLUS_SECURITY_TOML);
 
@@ -465,10 +462,7 @@ command = ["echo", "license"]
 
 #[tokio::test]
 async fn test_approve_checks_when_no_commands() {
-    let _xdg_dir = TempDir::new().unwrap();
-    unsafe {
-        std::env::set_var("XDG_CONFIG_HOME", _xdg_dir.path());
-    }
+    let _xdg_dir = setup_isolated_xdg_config();
 
     let temp_dir = project_with_config(
         r#"
@@ -519,10 +513,7 @@ command = ["echo", "license"]
 
 #[tokio::test]
 async fn test_check_with_relative_script_path() {
-    let _xdg_dir = TempDir::new().unwrap();
-    unsafe {
-        std::env::set_var("XDG_CONFIG_HOME", _xdg_dir.path());
-    }
+    let _xdg_dir = setup_isolated_xdg_config();
 
     let temp_dir = TempDir::new().unwrap();
 
@@ -575,10 +566,7 @@ command = ["./scripts/custom-check.sh"]
 
 #[tokio::test]
 async fn test_check_metadata_captured() {
-    let _xdg_dir = TempDir::new().unwrap();
-    unsafe {
-        std::env::set_var("XDG_CONFIG_HOME", _xdg_dir.path());
-    }
+    let _xdg_dir = setup_isolated_xdg_config();
 
     let temp_dir = TempDir::new().unwrap();
 

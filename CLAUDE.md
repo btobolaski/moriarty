@@ -372,9 +372,12 @@ test in a separate process, making this safe and preventing tests from clobberin
 **Workspace Optimization**: The `my-workspace-hack` crate is managed by cargo-hakari to unify dependencies.
 
 **Shared Test Utilities**: Test helpers used across multiple modules (`setup_isolated_xdg_config`,
-`setup_isolated_xdg_state`, `setup_project_dir_with_config`, `write_tools_config`, `create_executable_script`) live in
-`crates/moriarty/src/test_helpers.rs`. This module is compiled only in test builds (`#[cfg(test)]`). New test-only
-helpers needed in more than one module belong here rather than being duplicated.
+`setup_isolated_xdg_state`, `setup_project_dir_with_config`, `write_tools_config`, `create_executable_script`,
+`set_test_env_var`, `remove_test_env_var`, `TestEnvVarGuard`) live in
+`crates/moriarty/src/test_helpers.rs`. This module is compiled only in test builds (`#[cfg(test)]`). All test
+environment mutations go through `apply_test_env_var()` — the module's single `unsafe` block — with process
+isolation guaranteed by `cargo nextest`. New test-only helpers needed in more than one module belong here rather than
+being duplicated.
 
 **Logging**: Hook execution is logged via tracing as JSON lines to `~/.local/state/moriarty/hooks/` (daily-rotated); the
 `hooks report` command consumes these. Cost-report commands log to stderr instead. Sensitive env vars (TOKEN, SECRET,
