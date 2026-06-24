@@ -11,6 +11,7 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 
 mod api_pricing;
 mod approval_tui;
+mod checks;
 mod cost_report;
 mod hashing;
 mod hooks;

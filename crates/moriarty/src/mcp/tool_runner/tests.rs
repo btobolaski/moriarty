@@ -512,3 +512,67 @@ fn test_get_info_metadata() {
         info.instructions
     );
 }
+
+async fn run_checks_tool(
+    project_dir: &std::path::Path,
+) -> std::result::Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+    ToolRunner::run_checks_impl(run_args(project_dir)).await
+}
+
+fn content_contains(result: &rmcp::model::CallToolResult, needle: &str) -> bool {
+    result
+        .content
+        .iter()
+        .filter_map(|c| c.as_text())
+        .any(|t| t.text.contains(needle))
+}
+
+#[tokio::test]
+async fn test_run_checks_success() {
+    let (temp_dir, _xdg_dir) = setup_project_dir_with_approvals(
+        "[commands]\n[[checks]]\nname = \"ok\"\ncommand = [\"echo\", \"check output\"]\n",
+    )
+    .await;
+    let tool_result = run_checks_tool(temp_dir.path()).await.unwrap();
+    assert_eq!(tool_result.is_error, Some(false));
+    // One content block per check.
+    assert_eq!(tool_result.content.len(), 1);
+    assert!(content_contains(&tool_result, "check output"));
+}
+
+#[tokio::test]
+async fn test_run_checks_failure() {
+    let (temp_dir, _xdg_dir) = setup_project_dir_with_approvals(
+        "[commands]\n[[checks]]\nname = \"boom\"\ncommand = [\"sh\", \"-c\", \"exit 3\"]\n",
+    )
+    .await;
+    let tool_result = run_checks_tool(temp_dir.path()).await.unwrap();
+    assert_eq!(tool_result.is_error, Some(true));
+    // One per-check output block plus the appended "Checks failed" summary.
+    assert_eq!(tool_result.content.len(), 2);
+    assert!(content_contains(&tool_result, "Checks failed"));
+    assert!(content_contains(&tool_result, "boom"));
+    assert!(content_contains(&tool_result, "exit code: 3"));
+}
+
+#[tokio::test]
+async fn test_run_checks_no_checks_configured() {
+    // Commands but no [[checks]]: the tool reports success with an informational note.
+    let (temp_dir, _xdg_dir) =
+        setup_project_dir_with_approvals("[commands]\ntest = [\"echo\", \"hi\"]\n").await;
+    let tool_result = run_checks_tool(temp_dir.path()).await.unwrap();
+    assert_eq!(tool_result.is_error, Some(false));
+    assert!(content_contains(&tool_result, "No checks"));
+}
+
+#[tokio::test]
+async fn test_run_checks_not_approved() {
+    // Unapproved checks fail closed, surfaced as a tool-result error with actionable guidance.
+    let _xdg_dir = setup_isolated_xdg_config();
+    let temp_dir = setup_project_dir_with_config(
+        "[commands]\n[[checks]]\nname = \"ok\"\ncommand = [\"echo\", \"hi\"]\n",
+    );
+    let tool_result = run_checks_tool(temp_dir.path()).await.unwrap();
+    assert_eq!(tool_result.is_error, Some(true));
+    assert!(content_contains(&tool_result, "not approved"));
+}

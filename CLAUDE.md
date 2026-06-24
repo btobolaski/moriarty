@@ -207,13 +207,19 @@ test in a separate process, making this safe and preventing tests from clobberin
 **`mcp/`** - Model Context Protocol servers:
 
 - Three MCP servers: `git_read_only` (status, diff, log, show), `jj_read_only` (status, diff, log, show, op log), and
-  `tool_runner` (lint, test, build, format)
+  `tool_runner` (lint, test, build, format, checks)
 - `read_only`: Shared infrastructure used by both `git_read_only` and `jj_read_only`. Provides `CommandResult`,
   `validate_project_dir`, and the generic `run_read_only_command`. It rejects parent-traversal and non-directory targets
   before canonicalizing the working directory, while the per-server wrappers add command-specific flag restrictions
   (`git` forces `--no-optional-locks`, `--no-ext-diff`, and `--no-textconv` while rejecting output-file / no-index
   escape flags; `jj` forces `--ignore-working-copy` and rejects external-tool, config-injection, and repository-override
   flags). Neither server consults `.config/tools.toml` approvals; only `tool_runner` does.
+- `tool_runner`'s four command tools (`run_lint`/`run_build`/`run_formatter`/`run_tests`) run a single `[commands]`
+  entry via `verify_and_load_project` + `run_command`; its `run_checks` tool runs the project's `[[checks]]` via the
+  shared `crate::checks::run_configured_checks` routine — the same approval verification (checks only, not commands),
+  resource limits (5-min timeout, 1 MB/check + 10 MB total output caps), and fail-closed semantics as the Stop hook.
+  That shared routine is intentionally distinct from `project_config::runner::run_all_checks` (no limits, verifies all
+  commands too), which the `moriarty test checks` CLI uses.
 - Uses rmcp library with stdio transport for Claude Code integration
 - All servers run as stdin/stdout servers that Claude Code can invoke
 - `install` command configures all servers in Claude Code's MCP registry
@@ -251,7 +257,9 @@ test in a separate process, making this safe and preventing tests from clobberin
     `cat /abs/cwd/src/x`. `apply_rules(command)` stays the single-command primitive;
     `apply_rules_compound(command, cwd)` is what the hook calls.
   - Evaluation order: tool_rules → bash_rules (for Bash) → passthrough (for non-Bash, defers to Claude Code)
-- **Stop hook**: Runs project checks before allowing execution
+- **Stop hook**: Runs the project's configured checks before allowing execution, delegating to the shared
+  `crate::checks::run_configured_checks` routine (see `mcp/` above); it maps the routine's `CheckRunOutcome` onto
+  allow/deny
 - Structured logging with tracing crate for debugging hook execution. The "PreToolUse hook completed" log event records
   a clean `result` field (`allow`/`deny`/`ask`/`modify`/`passthrough`) classified from the typed `HookOutput` by
   `hooks::result::pretool_result`, alongside `tool_name`, `tool_args`, `cwd`, `rules_hash`, and `rule` — the name of the

@@ -16,8 +16,10 @@
 //!
 //! ## Security Model: Fail-Open Design
 //!
-//! The Stop hook handler implements a **fail-open** approach, returning `Allow` when:
-//! - `$CLAUDE_PROJECT_DIR` environment variable is not set
+//! `handle_stop_hook` reads `$CLAUDE_PROJECT_DIR`, returning `Allow` immediately if it is unset.
+//! When set, it delegates to [`crate::checks::run_configured_checks`] and maps the returned
+//! `CheckRunOutcome` onto allow/deny. That shared routine takes a **fail-open** approach,
+//! reporting "no checks to run" (which the handler maps to `Allow`) when:
 //! - Project directory doesn't exist or cannot be canonicalized
 //! - `.config/tools.toml` cannot be loaded or parsed
 //! - No checks are defined in the configuration
@@ -63,12 +65,11 @@ pub mod tracing;
 use std::{io::Read, path::PathBuf};
 
 use ::tracing::{debug, error, info, warn};
-use futures::stream::StreamExt;
 use miette::Result;
 use serde_json::{Map, Value};
 
 use crate::HooksCommand;
-use crate::project_config::{approvals::ProjectApprovals, config::load_project_settings};
+use crate::checks::CheckRunOutcome;
 use crate::user_config::load_user_config;
 use parser::{
     HookDecision, HookEventData, HookInput, HookOutput, HookSpecificOutput, PermissionDecision,
@@ -659,9 +660,10 @@ async fn handle_bash_pretool_hook_with_config(
     }
 }
 
-/// Every early `allow_hook(None)` return below is the fail-open path described in the
-/// module-level "Security Model: Fail-Open Design" section; once checks exist and are
-/// approved, any verification failure fails closed.
+/// Reads `$CLAUDE_PROJECT_DIR` (fail-open if unset) and runs the project's configured checks via
+/// [`crate::checks::run_configured_checks`], mapping the outcome onto allow/deny. The fail-open /
+/// fail-closed policy and resource limits live in that shared routine (see its docs and the
+/// module-level "Security Model: Fail-Open Design").
 async fn handle_stop_hook() -> Result<HookOutput> {
     let project_dir = match std::env::var("CLAUDE_PROJECT_DIR") {
         Ok(dir) => {
@@ -674,293 +676,18 @@ async fn handle_stop_hook() -> Result<HookOutput> {
         }
     };
 
-    let repository_root = match crate::repository::detect_repository_root(&project_dir) {
-        Ok(root) => {
-            info!(
-                project_dir = %project_dir.display(),
-                repository_root = %root.display(),
-                "Detected repository root"
-            );
-            root
-        }
-        Err(e) => {
-            error!(
-                project_dir = %project_dir.display(),
-                error = %e,
-                "Failed to detect repository root"
-            );
-            return Ok(allow_hook(None));
-        }
-    };
-
-    let config = match load_project_settings(repository_root.clone()).await {
-        Ok(config) => config,
-        Err(e) => {
-            info!(
-                error = %e,
-                "No .config/tools.toml found, allowing without checks"
-            );
-            return Ok(allow_hook(None));
-        }
-    };
-
-    let checks = match config.checks {
-        Some(checks) if !checks.is_empty() => checks,
-        _ => {
-            info!("No checks defined in config, allowing");
-            return Ok(allow_hook(None));
-        }
-    };
-
-    info!(check_count = checks.len(), "Found checks to run");
-
-    for check in &checks {
-        if check.command.is_empty() {
-            error!(check_name = %check.name, "Check has empty command");
-            return Ok(deny_hook(format!(
-                "Check '{}' has empty command array in {}/.config/tools.toml\n\
-                 Expected format: command = [\"binary\", \"arg1\", \"arg2\"]",
-                check.name,
-                repository_root.display()
-            )));
-        }
-    }
-
-    let approvals = ProjectApprovals::load().await?;
-
-    for check in &checks {
-        let verification = approvals
-            .verify_check(&repository_root, &check.name)
-            .await?;
-
-        use crate::project_config::approvals::VerificationResult;
-        match verification {
-            VerificationResult::Approved => {
-                info!(check_name = %check.name, "Check is approved");
-            }
-            VerificationResult::NotApproved => {
-                error!(check_name = %check.name, "Check not approved");
-                return Ok(deny_hook(format!(
-                    "Check '{}' is not approved. Run: moriarty approve-project {}",
-                    check.name,
-                    repository_root.display()
-                )));
-            }
-            VerificationResult::ConfigHashMismatch { expected, actual } => {
-                error!(
-                    check_name = %check.name,
-                    expected = %expected,
-                    actual = %actual,
-                    "Config hash mismatch"
-                );
-                return Ok(deny_hook(format!(
-                    "Project configuration changed. Run: moriarty approve-project {}",
-                    repository_root.display()
-                )));
-            }
-            VerificationResult::BinaryHashMismatch {
-                item,
-                expected,
-                actual,
-            } => {
-                error!(
-                    check_name = %check.name,
-                    item = %item,
-                    expected = %expected,
-                    actual = %actual,
-                    "Binary hash mismatch"
-                );
-                return Ok(deny_hook(format!(
-                    "Check '{}' binary changed. Run: moriarty approve-project {}",
-                    check.name,
-                    repository_root.display()
-                )));
-            }
-            VerificationResult::ItemNotApproved { item } => {
-                error!(check_name = %check.name, item = %item, "Item not approved");
-                return Ok(deny_hook(format!(
-                    "Check '{}' not in approvals. Run: moriarty approve-project {}",
-                    item,
-                    repository_root.display()
-                )));
-            }
-        }
-    }
-
-    // Run all checks with concurrency limits and timeout protection
-    //
-    // ## Resource Limits Rationale:
-    //
-    // CHECK_TIMEOUT_SECS (5 minutes): Balances allowing slow checks (e.g., linting large
-    // codebases) while preventing indefinitely hanging processes that could DoS the system.
-    // Most CI checks complete in seconds; 5 minutes provides generous headroom.
-    //
-    // MAX_CONCURRENT_CHECKS (4): Limits resource consumption when many checks are configured.
-    // Prevents fork bombing or exhausting file descriptors if a malicious config defines hundreds
-    // of checks. Value chosen to match typical CPU core count while still providing parallelism.
-    //
-    // MAX_OUTPUT_SIZE (1MB per check): Prevents individual checks from consuming excessive memory
-    // via stdout/stderr. Typical check output is <10KB; 1MB allows detailed error messages and
-    // verbose tooling while preventing abuse.
-    //
-    // MAX_TOTAL_OUTPUT (10MB total): Prevents aggregate memory exhaustion across all checks.
-    // With 4 concurrent checks, this allows each to use its full 1MB quota with headroom.
-    const CHECK_TIMEOUT_SECS: u64 = 300;
-    const MAX_CONCURRENT_CHECKS: usize = 4;
-    const MAX_OUTPUT_SIZE: usize = 1024 * 1024;
-    const MAX_TOTAL_OUTPUT: usize = 10 * 1024 * 1024;
-
-    let timeout_duration = std::time::Duration::from_secs(CHECK_TIMEOUT_SECS);
-    let repository_root_clone = repository_root.clone();
-
-    let check_futures = futures::stream::iter(checks.into_iter().map(move |check| {
-        let repository_root = repository_root_clone.clone();
-        async move {
-            // Split command into executable and arguments
-            // Defensive handling despite line 240 validation because async timing allows config
-            // modification between validation and execution, and graceful degradation is safer
-            // than panicking in production.
-            let Some((cmd, args)) = check.command.split_first() else {
-                return (
-                    check.name,
-                    check.command,
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "Check command array is empty",
-                    )),
-                );
-            };
-
-            let output = tokio::process::Command::new(cmd)
-                .args(args)
-                .current_dir(&repository_root)
-                .output()
-                .await;
-
-            (check.name, check.command, output)
-        }
-    }))
-    .buffer_unordered(MAX_CONCURRENT_CHECKS)
-    .collect::<Vec<_>>();
-
-    let results = match tokio::time::timeout(timeout_duration, check_futures).await {
-        Ok(results) => results,
-        Err(_) => {
-            error!(timeout_secs = CHECK_TIMEOUT_SECS, "Checks timed out");
-            return Ok(deny_hook(format!(
-                "Checks timed out after {} seconds",
-                CHECK_TIMEOUT_SECS
-            )));
-        }
-    };
-
-    let mut failures = Vec::new();
-    let mut all_output = Vec::new();
-    let mut total_output_size = 0;
-
-    for (check_name, command, output_result) in results {
-        match output_result {
-            Ok(output) => {
-                let exit_code = output.status.code().unwrap_or(-1);
-
-                // Truncate output to prevent excessive memory usage
-                let truncate_output = |s: &str| -> String {
-                    if s.len() > MAX_OUTPUT_SIZE {
-                        format!(
-                            "{}... [truncated {} bytes]",
-                            &s[..MAX_OUTPUT_SIZE],
-                            s.len() - MAX_OUTPUT_SIZE
-                        )
-                    } else {
-                        s.to_string()
-                    }
-                };
-
-                let stdout = truncate_output(&String::from_utf8_lossy(&output.stdout));
-                let stderr = truncate_output(&String::from_utf8_lossy(&output.stderr));
-
-                let combined_output = if stdout.is_empty() && stderr.is_empty() {
-                    "<no output>".to_string()
-                } else if stderr.is_empty() {
-                    stdout.clone()
-                } else if stdout.is_empty() {
-                    stderr.clone()
-                } else {
-                    format!("stdout:\n{}\nstderr:\n{}", stdout, stderr)
-                };
-
-                total_output_size += combined_output.len();
-
-                // Limit total output to prevent unbounded memory growth
-                if total_output_size > MAX_TOTAL_OUTPUT {
-                    error!(
-                        total_size = total_output_size,
-                        max_total = MAX_TOTAL_OUTPUT,
-                        "Total check output exceeded limit"
-                    );
-                    return Ok(HookOutput {
-                        continue_execution: None,
-                        stop_reason: None,
-                        suppress_output: None,
-                        decision: Some(HookDecision::Block),
-                        reason: Some(format!(
-                            "Total check output exceeded {} MB limit. Checks produced too much output.",
-                            MAX_TOTAL_OUTPUT / (1024 * 1024)
-                        )),
-                        system_message: None,
-                        permission_decision: None,
-                        hook_specific_output: None,
-                    });
-                }
-
-                info!(
-                    check_name = %check_name,
-                    exit_code = exit_code,
-                    output_size = combined_output.len(),
-                    "Check completed"
-                );
-
-                let output_entry = format!(
-                    "Check '{}' [exit code: {}]:\n{}",
-                    check_name, exit_code, combined_output
-                );
-                all_output.push(output_entry);
-
-                if exit_code != 0 {
-                    failures.push(format!(
-                        "Check '{}' failed with exit code {}\nCommand: {:?}\n{}",
-                        check_name, exit_code, command, combined_output
-                    ));
-                }
-            }
-            Err(e) => {
-                error!(
-                    check_name = %check_name,
-                    error = %e,
-                    "Failed to execute check"
-                );
-                failures.push(format!(
-                    "Check '{}' failed to execute: {}\nCommand: {:?}",
-                    check_name, e, command
-                ));
-            }
-        }
-    }
-
-    info!(
-        total_output_size = total_output_size,
-        "Finished processing all check results"
-    );
-
-    if failures.is_empty() {
-        info!("All checks passed");
-        Ok(allow_hook(None))
-    } else {
-        error!(failure_count = failures.len(), "Some checks failed");
-        Ok(deny_hook(format!(
+    match crate::checks::run_configured_checks(&project_dir).await? {
+        CheckRunOutcome::NoChecks(_) => Ok(allow_hook(None)),
+        // deny_hook populates both `reason` and `system_message`. The pre-extraction code built the
+        // total-output-cap denial by hand with `system_message: None`; routing every Blocked reason
+        // through deny_hook makes that one path consistent with the other denials (and correct for
+        // the non-verbose UI, per this module's "reason vs system_message" notes).
+        CheckRunOutcome::Blocked(reason) => Ok(deny_hook(reason)),
+        CheckRunOutcome::Ran { failures, .. } if failures.is_empty() => Ok(allow_hook(None)),
+        CheckRunOutcome::Ran { failures, .. } => Ok(deny_hook(format!(
             "Checks failed:\n\n{}",
             failures.join("\n\n")
-        )))
+        ))),
     }
 }
 

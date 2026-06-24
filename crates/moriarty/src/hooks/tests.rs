@@ -6,8 +6,11 @@ use serde_json::Value;
 use tempfile::TempDir;
 
 use super::*;
-use crate::test_helpers::{
-    remove_test_env_var, set_test_env_var, setup_isolated_xdg_config, setup_isolated_xdg_state,
+use crate::{
+    project_config::approvals::ProjectApprovals,
+    test_helpers::{
+        remove_test_env_var, set_test_env_var, setup_isolated_xdg_config, setup_isolated_xdg_state,
+    },
 };
 
 async fn setup_user_bash_rules(rules_toml: &str) -> TempDir {
