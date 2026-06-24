@@ -113,7 +113,9 @@ test in a separate process, making this safe and preventing tests from clobberin
   `is_initial` and `show_concurrency_note`; added in Claude Code 2.1.175+), and a `fork-context-ref`
   record (`ForkContextRef`, the first line of a subagent's `subagents/agent-*.jsonl` file, carrying
   `agent_id`/`parent_session_id`/`parent_last_uuid`/`context_length` to record where the subagent forked from its parent
-  conversation; added in Claude Code 2.1.175+)
+  conversation; added in Claude Code 2.1.175+), and `invoked_skills` attachments (`InvokedSkills`, the skills actually
+  run during a turn — e.g. a `/code-review` slash command — each carrying `name`/`path`/`content`, distinct from
+  `skill_listing` which only advertises available skills; added in Claude Code 2.1.179+)
 - Also owns the structured view of the raw `model` string via `model::Model { family, version }` plus `ModelFamily` and
   `ModelVersion`. Both `cost_analyzer` (for pricing) and `moriarty::api_pricing` (for grouping/display) consume this one
   parser so family/version classification is not duplicated across crates

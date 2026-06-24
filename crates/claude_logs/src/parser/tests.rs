@@ -6279,6 +6279,145 @@ fn test_parse_attachment_skill_listing_without_names() {
 }
 
 #[test]
+fn test_parse_attachment_invoked_skills() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": "c64f3f86-4c80-4731-867c-f5edd1ca017d",
+        "isSidechain": false,
+        "attachment": {
+            "type": "invoked_skills",
+            "skills": [{
+                "name": "code-review",
+                "path": "userSettings:code-review",
+                "content": "The following is feedback from a code review"
+            }]
+        },
+        "uuid": "ec995960-3e87-49be-aa57-e57baba03f9e",
+        "timestamp": "2026-06-24T23:07:08.822Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.179",
+        "gitBranch": "HEAD",
+        "slug": "elegant-yawning-steele"
+    });
+    let log_line: LogLine = serde_json::from_value(json).unwrap();
+    match log_line {
+        LogLine::Attachment(att) => match att.attachment {
+            AttachmentData::InvokedSkills(invoked) => {
+                assert_eq!(invoked.skills.len(), 1);
+                assert_eq!(invoked.skills[0].name, "code-review");
+                assert_eq!(invoked.skills[0].path, "userSettings:code-review");
+                assert_eq!(
+                    invoked.skills[0].content,
+                    "The following is feedback from a code review"
+                );
+            }
+            other => panic!("Expected InvokedSkills attachment, got {:?}", other),
+        },
+        other => panic!("Expected Attachment, got {:?}", other),
+    }
+}
+
+// A turn can record zero invoked skills, so an empty `skills` array must parse cleanly.
+#[test]
+fn test_parse_attachment_invoked_skills_empty() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": null,
+        "isSidechain": false,
+        "attachment": {
+            "type": "invoked_skills",
+            "skills": []
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440000",
+        "timestamp": "2026-06-24T23:07:08.822Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.179",
+        "gitBranch": "HEAD",
+        "slug": null
+    });
+    let log_line: LogLine = serde_json::from_value(json).unwrap();
+    match log_line {
+        LogLine::Attachment(att) => match att.attachment {
+            AttachmentData::InvokedSkills(invoked) => assert!(invoked.skills.is_empty()),
+            other => panic!("Expected InvokedSkills attachment, got {:?}", other),
+        },
+        other => panic!("Expected Attachment, got {:?}", other),
+    }
+}
+
+// `deny_unknown_fields` on the outer `InvokedSkills` envelope is a separate code path from the
+// per-skill struct, so guard it independently.
+#[test]
+fn test_parse_attachment_invoked_skills_rejects_unknown_envelope_fields() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": null,
+        "isSidechain": false,
+        "attachment": {
+            "type": "invoked_skills",
+            "skills": [],
+            "extraField": "should fail"
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440000",
+        "timestamp": "2026-06-24T23:07:08.822Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.179",
+        "gitBranch": "HEAD",
+        "slug": null
+    });
+    let err = serde_json::from_value::<LogLine>(json)
+        .expect_err("Should reject unknown fields on InvokedSkills");
+    assert!(
+        err.to_string().contains("unknown field"),
+        "Error should mention unknown field, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_parse_attachment_invoked_skills_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": null,
+        "isSidechain": false,
+        "attachment": {
+            "type": "invoked_skills",
+            "skills": [{
+                "name": "code-review",
+                "path": "userSettings:code-review",
+                "content": "feedback",
+                "extraField": "should fail"
+            }]
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440000",
+        "timestamp": "2026-06-24T23:07:08.822Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.179",
+        "gitBranch": "HEAD",
+        "slug": null
+    });
+    let err = serde_json::from_value::<LogLine>(json)
+        .expect_err("Should reject unknown fields on InvokedSkill");
+    assert!(
+        err.to_string().contains("unknown field"),
+        "Error should mention unknown field, got: {}",
+        err
+    );
+}
+
+#[test]
 fn test_parse_attachment_file_rejects_unknown_fields() {
     let json = serde_json::json!({
         "type": "attachment",

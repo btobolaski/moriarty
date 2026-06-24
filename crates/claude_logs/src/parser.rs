@@ -372,6 +372,7 @@ pub enum AttachmentData {
     HookPermissionDecision(HookPermissionDecision),
     HookSuccess(HookSuccess),
     HookSystemMessage(HookSystemMessage),
+    InvokedSkills(InvokedSkills),
     McpInstructionsDelta(McpInstructionsDelta),
     NestedMemory(NestedMemory),
     PlanFileReference(PlanFileReference),
@@ -611,6 +612,27 @@ pub struct HookSystemMessage {
     #[serde(rename = "toolUseID")]
     pub tool_use_id: String,
     pub hook_event: String,
+}
+
+/// Skills invoked during a turn (e.g. a `/code-review` slash command), each carrying the loaded
+/// skill instructions. Added in Claude Code 2.1.179+. Distinct from `skill_listing`, which only
+/// advertises available skills; this records the ones actually run.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct InvokedSkills {
+    pub skills: Vec<InvokedSkill>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct InvokedSkill {
+    pub name: String,
+    /// Scope-qualified identifier in `{scope}:{name}` form (e.g. `userSettings:code-review`),
+    /// recording where the skill definition was loaded from.
+    pub path: String,
+    pub content: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
