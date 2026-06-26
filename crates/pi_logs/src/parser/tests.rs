@@ -1462,6 +1462,21 @@ fn assistant_stop_reason_stop() {
 }
 
 #[test]
+fn assistant_stop_reason_length() {
+    let assistant = parse_assistant_message(
+        vec![json!({"type": "text", "text": "truncated"})],
+        AssistantFixture::new(
+            "openai-completions",
+            "openai",
+            "gpt-5.4",
+            "length",
+        ),
+    );
+
+    assert_eq!(assistant.stop_reason, AssistantStopReason::Length);
+}
+
+#[test]
 fn assistant_thinking_opaque_signature() {
     let signature = parse_assistant_thinking_signature(
         json!("opaque-sig"),
@@ -5474,6 +5489,36 @@ fn skill_tool_result_accepts_skill_index_details() {
     assert_eq!(skills[0].skill_id, "global:debug-typescript-errors");
     assert_eq!(skills[0].scope, "global");
     assert_eq!(skills[0].name, "debug-typescript-errors");
+}
+
+#[test]
+fn skill_tool_result_accepts_skill_index_timestamps() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "skill",
+        vec![json!({"type": "text", "text": "{\"success\":true,\"skills\":[]}"})],
+        false,
+        Some(json!({
+            "skills": [
+                {
+                    "skillId": "global:debug-typescript-errors",
+                    "scope": "global",
+                    "fileName": "SKILL.md",
+                    "path": "/tmp/skills/debug-typescript-errors/SKILL.md",
+                    "name": "debug-typescript-errors",
+                    "description": "Use when TypeScript errors need debugging",
+                    "created": "2026-05-19T00:00:00.000Z",
+                    "updated": "2026-05-19T01:00:00.000Z"
+                }
+            ]
+        })),
+    ));
+    let Some(ToolResultDetails::Skill(details)) = tool_result.details else {
+        panic!("expected Skill details")
+    };
+    let skills = details.skills.expect("expected skills");
+    assert_eq!(skills.len(), 1);
+    assert_eq!(skills[0].created.as_deref(), Some("2026-05-19T00:00:00.000Z"));
+    assert_eq!(skills[0].updated.as_deref(), Some("2026-05-19T01:00:00.000Z"));
 }
 
 #[test]

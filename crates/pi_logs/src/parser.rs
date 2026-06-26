@@ -681,6 +681,8 @@ pub enum AssistantStopReason {
     Aborted,
     #[serde(rename = "error")]
     Error,
+    #[serde(rename = "length")]
+    Length,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -2941,6 +2943,10 @@ pub struct SkillIndexDetails {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
     pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated: Option<String>,
 }
 
 /// Hermes skill results mix an index listing (`{skills:[...]}`), document
