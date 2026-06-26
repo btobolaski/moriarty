@@ -4728,6 +4728,25 @@ fn test_parse_user_log_line_with_permission_mode_accept_edits() {
 }
 
 #[test]
+fn test_parse_user_log_line_with_permission_mode_auto() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "version": "2.1.77",
+        "gitBranch": "main",
+        "message": {"role": "user", "content": "test"},
+        "uuid": "550e8400-e29b-41d4-a716-446655440001",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "permissionMode": "auto"
+    });
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(line.permission_mode, Some(PermissionMode::Auto));
+}
+
+#[test]
 fn test_parse_user_log_line_with_permission_mode_default() {
     let json = serde_json::json!({
         "parentUuid": null,
@@ -4974,7 +4993,7 @@ fn test_parse_assistant_usage_without_iterations_and_speed() {
 }
 
 #[test]
-fn test_parse_user_log_line_rejects_unknown_permission_mode() {
+fn test_parse_user_log_line_with_permission_mode_bypass_permissions() {
     let json = serde_json::json!({
         "parentUuid": null,
         "isSidechain": false,
@@ -4988,11 +5007,33 @@ fn test_parse_user_log_line_rejects_unknown_permission_mode() {
         "timestamp": "2025-01-01T00:00:00Z",
         "permissionMode": "bypassPermissions"
     });
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(
+        line.permission_mode,
+        Some(PermissionMode::BypassPermissions)
+    );
+}
+
+#[test]
+fn test_parse_user_log_line_rejects_unknown_permission_mode() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "version": "2.1.77",
+        "gitBranch": "main",
+        "message": {"role": "user", "content": "test"},
+        "uuid": "550e8400-e29b-41d4-a716-446655440001",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "permissionMode": "totallyBogusMode"
+    });
     let err_msg = serde_json::from_value::<UserLogLine>(json)
         .expect_err("Should reject unknown permissionMode variant")
         .to_string();
     assert!(
-        err_msg.contains("unknown variant") || err_msg.contains("bypassPermissions"),
+        err_msg.contains("unknown variant") || err_msg.contains("totallyBogusMode"),
         "Error should mention unknown variant, got: {}",
         err_msg
     );
@@ -5491,6 +5532,18 @@ fn test_parse_permission_mode_change_accept_edits() {
     match log_line {
         LogLine::PermissionModeChange(pm) => {
             assert_eq!(pm.permission_mode, PermissionMode::AcceptEdits);
+        }
+        other => panic!("Expected PermissionModeChange, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_permission_mode_change_auto() {
+    let json = r#"{"type":"permission-mode","permissionMode":"auto","sessionId":"550e8400-e29b-41d4-a716-446655440000"}"#;
+    let log_line: LogLine = serde_json::from_str(json).unwrap();
+    match log_line {
+        LogLine::PermissionModeChange(pm) => {
+            assert_eq!(pm.permission_mode, PermissionMode::Auto);
         }
         other => panic!("Expected PermissionModeChange, got {:?}", other),
     }

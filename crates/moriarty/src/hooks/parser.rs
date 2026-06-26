@@ -81,6 +81,7 @@ pub enum PermissionMode {
     Plan,
     AcceptEdits,
     BypassPermissions,
+    Auto,
 }
 
 /// Hook definition with command and execution parameters
@@ -583,6 +584,7 @@ mod tests {
             (PermissionMode::Plan, r#""plan""#),
             (PermissionMode::AcceptEdits, r#""acceptEdits""#),
             (PermissionMode::BypassPermissions, r#""bypassPermissions""#),
+            (PermissionMode::Auto, r#""auto""#),
         ]);
     }
 

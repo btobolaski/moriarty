@@ -1465,12 +1465,7 @@ fn assistant_stop_reason_stop() {
 fn assistant_stop_reason_length() {
     let assistant = parse_assistant_message(
         vec![json!({"type": "text", "text": "truncated"})],
-        AssistantFixture::new(
-            "openai-completions",
-            "openai",
-            "gpt-5.4",
-            "length",
-        ),
+        AssistantFixture::new("openai-completions", "openai", "gpt-5.4", "length"),
     );
 
     assert_eq!(assistant.stop_reason, AssistantStopReason::Length);
@@ -5517,8 +5512,14 @@ fn skill_tool_result_accepts_skill_index_timestamps() {
     };
     let skills = details.skills.expect("expected skills");
     assert_eq!(skills.len(), 1);
-    assert_eq!(skills[0].created.as_deref(), Some("2026-05-19T00:00:00.000Z"));
-    assert_eq!(skills[0].updated.as_deref(), Some("2026-05-19T01:00:00.000Z"));
+    assert_eq!(
+        skills[0].created.as_deref(),
+        Some("2026-05-19T00:00:00.000Z")
+    );
+    assert_eq!(
+        skills[0].updated.as_deref(),
+        Some("2026-05-19T01:00:00.000Z")
+    );
 }
 
 #[test]

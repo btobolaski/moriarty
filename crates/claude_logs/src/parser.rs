@@ -1326,6 +1326,8 @@ pub enum PermissionMode {
     Default,
     Plan,
     AcceptEdits,
+    Auto,
+    BypassPermissions,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
