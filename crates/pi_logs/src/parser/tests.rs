@@ -2248,6 +2248,9 @@ fn web_search_tool_result_accepts_details() {
     assert_eq!(details.curated_from, None);
     assert_eq!(details.curated_queries, None);
     assert_eq!(details.summary, None);
+    assert!(!details.cancelled);
+    assert_eq!(details.error, None);
+    assert_eq!(details.cancel_reason, None);
 }
 
 #[test]
@@ -2568,6 +2571,40 @@ fn web_search_tool_result_rejects_unknown_details_field() {
         ),
         &["unknown field", "unexpected"],
     );
+}
+
+#[test]
+fn web_search_tool_result_accepts_cancel_reason() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "web_search",
+        vec![json!({"type": "text", "text": "Search curation cancelled (stale)."})],
+        false,
+        Some(json!({
+            "searchId": "search_cancelled",
+            "queryCount": 2,
+            "successfulQueries": 0,
+            "totalResults": 0,
+            "includeContent": false,
+            "queries": ["query one", "query two"],
+            "cancelled": true,
+            "error": "Search curation cancelled (stale).",
+            "cancelReason": "stale"
+        })),
+    ));
+
+    let Some(ToolResultDetails::WebSearch(details)) = tool_result.details else {
+        panic!("expected WebSearch details")
+    };
+
+    assert!(details.cancelled);
+    assert_eq!(
+        details.error.as_deref(),
+        Some("Search curation cancelled (stale).")
+    );
+    assert_eq!(details.cancel_reason.as_deref(), Some("stale"));
+    assert_eq!(details.search_id.as_deref(), Some("search_cancelled"));
+    assert_eq!(details.successful_queries, 0);
+    assert_eq!(details.total_results, 0);
 }
 
 #[test]

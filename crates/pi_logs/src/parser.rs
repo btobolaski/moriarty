@@ -2383,6 +2383,13 @@ pub struct WebSearchDetails {
     pub curated_queries: Option<Vec<CuratedQueryInfo>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<SearchSummary>,
+    #[serde(default)]
+    pub cancelled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Reason a search curation was cancelled (e.g. "stale").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel_reason: Option<String>,
 }
 
 /// `read` emits two sub-shapes for `details` that classify here: a plain
