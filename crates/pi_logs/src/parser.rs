@@ -7,7 +7,7 @@
 //! as parse errors rather than silent data loss.
 //!
 //! Tool-call envelopes stay typed and strict, but [`ToolCallContent`]
-//! deliberately preserves the inner `arguments` object as raw JSON. Pi logs the
+//! deliberately preserves the inner `arguments` payload as raw JSON. Pi logs the
 //! model-emitted payload before the runtime validates it, so hard-coding tool
 //! schemas into the parser would reject or misrepresent real sessions.
 //!
@@ -26,8 +26,7 @@
 //!
 //! * **Corrupt-stream tolerance** — some payloads are absorbed via
 //!   permissive structs, targeted field aliases, or untagged fallback enums
-//!   so a single corrupted record cannot abort an entire log file. Four
-//!   flavors exist:
+//!   so a single corrupted record cannot abort an entire log file:
 //!     1. Permissive argument/payload structs ([`EditArgs`], nested edit
 //!        payloads like [`EditReplacement`], and [`GrepArgs`]) that omit
 //!        `deny_unknown_fields` to ignore hallucinated sibling keys (e.g.
@@ -41,6 +40,9 @@
 //!     4. Value-level fallback enums ([`MaybeU32`]) whose `Garbage` variant
 //!        absorbs string-typed corruption (e.g. `"limit": "limit"` where
 //!        the model echoed the schema field name as the value).
+//!     5. Transparent value wrappers ([`ToolCallArguments`]) that accept
+//!        any JSON value, so a stray `"}"` or other non-object artifact
+//!        in the tool-call stream does not abort the whole session.
 //!
 //! * **Open-ended protocol discriminators** — [`AssistantApi`] uses a custom
 //!   deserializer that accepts a small set of well-known API identifiers
@@ -742,10 +744,47 @@ pub struct StructuredThinkingSignature {
 // Tool call arguments
 // ---------------------------------------------------------------------------
 
-/// Pi records the model-emitted `arguments` object before the tool runtime has
-/// a chance to validate it, so the parser preserves the raw JSON map instead of
-/// hard-coding per-tool schemas into `ToolCallContent`.
-pub type ToolCallArguments = BTreeMap<String, JsonBlob>;
+/// Pi records the model-emitted `arguments` payload before the tool runtime
+/// has a chance to validate it, so the parser preserves the raw JSON value
+/// instead of hard-coding per-tool schemas into `ToolCallContent`.
+///
+/// Accepts any JSON value, not just an object, so a stray `"}"` or other
+/// corrupt-model-stream artifact does not poison the entire session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ToolCallArguments(pub Value);
+
+impl ToolCallArguments {
+    fn canonical_json(&self) -> String {
+        serde_json::to_string(&self.0).expect("json values should always serialize")
+    }
+}
+
+impl PartialEq for ToolCallArguments {
+    fn eq(&self, other: &Self) -> bool {
+        self.canonical_json() == other.canonical_json()
+    }
+}
+
+impl Eq for ToolCallArguments {}
+
+impl Hash for ToolCallArguments {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.canonical_json().hash(state);
+    }
+}
+
+impl PartialOrd for ToolCallArguments {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ToolCallArguments {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.canonical_json().cmp(&other.canonical_json())
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Typed helper structs for known tool schemas
@@ -1664,9 +1703,64 @@ fn parse_tool_result_details(
         }
         "subagent" => serde_json::from_value(details).map(ToolResultDetails::Subagent),
         "todo" => serde_json::from_value(details).map(ToolResultDetails::Todo),
-        "web_search" => serde_json::from_value(details).map(ToolResultDetails::WebSearch),
+        "web_search" => parse_web_search_details(details),
         _ => serde_json::from_value(details),
     }
+}
+
+/// Handles the web_search cancelled-stale case where `details` omits
+/// `queryCount` and related fields.  A small strict helper struct
+/// preserves `deny_unknown_fields` and type validation; the normal
+/// (serde) path keeps `WebSearchDetails` fields required, which
+/// preserves the untagged-enum dispatch comment that `WebSearchDetails`
+/// cannot absorb a bare `{error}` payload.
+fn parse_web_search_details(details: Value) -> Result<ToolResultDetails, serde_json::Error> {
+    if details.get("cancelled").and_then(|v| v.as_bool()) == Some(true)
+        && details.get("queryCount").is_none()
+    {
+        let cancelled: WebSearchCancelledDetails = serde_json::from_value(details)?;
+        Ok(ToolResultDetails::WebSearch(WebSearchDetails {
+            fetch_id: cancelled.fetch_id,
+            search_id: cancelled.search_id,
+            query_count: 0,
+            successful_queries: 0,
+            total_results: 0,
+            include_content: false,
+            queries: Vec::new(),
+            curated: cancelled.curated.unwrap_or(false),
+            curated_from: cancelled.curated_from,
+            curated_queries: None,
+            summary: None,
+            cancelled: true,
+            error: cancelled.error,
+            cancel_reason: cancelled.cancel_reason,
+        }))
+    } else {
+        serde_json::from_value(details).map(ToolResultDetails::WebSearch)
+    }
+}
+
+/// Strict helper for cancelled web_search results that omit query fields.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WebSearchCancelledDetails {
+    #[serde(default)]
+    fetch_id: Option<String>,
+    #[serde(default)]
+    search_id: Option<String>,
+    #[serde(default)]
+    curated: Option<bool>,
+    #[serde(default)]
+    curated_from: Option<u32>,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    cancel_reason: Option<String>,
+    // Accepted so deny_unknown_fields doesn't reject it, but the
+    // value is already known to be `true` from the caller's guard.
+    #[serde(default)]
+    #[allow(dead_code)]
+    cancelled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

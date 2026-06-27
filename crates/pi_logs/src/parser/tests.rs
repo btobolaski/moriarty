@@ -986,23 +986,23 @@ fn tool_call_preserves_arguments_as_a_raw_json_map() {
 }
 
 #[test]
-fn tool_call_rejects_non_object_arguments() {
-    let line = assistant_message_json(
-        vec![json!({
-            "type": "toolCall",
-            "id": "call_1",
-            "name": "bash",
-            "arguments": ["not", "an", "object"]
-        })],
-        AssistantFixture::new("openai-responses", "openai", "gpt-5.4", "toolUse"),
-    );
+fn tool_call_accepts_corrupt_non_object_arguments() {
+    for corrupt_arguments in [
+        json!("}"),
+        json!(["not", "an", "object"]),
+        json!(null),
+        json!(42),
+        json!(true),
+    ] {
+        let tool_call = parse_tool_call("bash", corrupt_arguments.clone());
 
-    let err = parse_err(line);
-    let msg = err.to_string();
-    assert!(
-        msg.contains("invalid type") || msg.contains("map"),
-        "expected non-object arguments to be rejected, got: {msg}"
-    );
+        assert_eq!(tool_call.name(), "bash");
+        assert_eq!(
+            serde_json::to_value(&tool_call.arguments).expect("serialize raw arguments"),
+            corrupt_arguments,
+            "corrupt arguments must be preserved through the transparent wrapper"
+        );
+    }
 }
 
 #[test]
@@ -2605,6 +2605,75 @@ fn web_search_tool_result_accepts_cancel_reason() {
     assert_eq!(details.search_id.as_deref(), Some("search_cancelled"));
     assert_eq!(details.successful_queries, 0);
     assert_eq!(details.total_results, 0);
+}
+
+#[test]
+fn web_search_tool_result_accepts_cancelled_without_query_fields() {
+    // Real-world case: a stale-curation cancellation has only error,
+    // cancelled, and cancelReason in details; queryCount and related
+    // fields are absent.
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "web_search",
+        vec![json!({"type": "text", "text": "Search curation cancelled (stale)."})],
+        false,
+        Some(json!({
+            "error": "Search curation cancelled (stale).",
+            "cancelled": true,
+            "cancelReason": "stale"
+        })),
+    ));
+
+    let Some(ToolResultDetails::WebSearch(details)) = tool_result.details else {
+        panic!("expected WebSearch details")
+    };
+
+    assert!(details.cancelled);
+    assert_eq!(
+        details.error.as_deref(),
+        Some("Search curation cancelled (stale).")
+    );
+    assert_eq!(details.cancel_reason.as_deref(), Some("stale"));
+    assert_eq!(details.query_count, 0);
+    assert_eq!(details.successful_queries, 0);
+    assert_eq!(details.total_results, 0);
+    assert!(!details.include_content);
+    assert!(details.queries.is_empty());
+}
+
+#[test]
+fn web_search_cancelled_without_query_fields_rejects_unknown_field() {
+    assert_parse_error_contains_any(
+        "web_search cancelled without query fields rejects unknown details field",
+        tool_result_message_json(
+            "web_search",
+            vec![json!({"type": "text", "text": "Search curation cancelled (stale)."})],
+            false,
+            Some(json!({
+                "error": "Search curation cancelled (stale).",
+                "cancelled": true,
+                "cancelReason": "stale",
+                "unexpected": true
+            })),
+        ),
+        &["unknown field", "unexpected"],
+    );
+}
+
+#[test]
+fn web_search_without_query_fields_requires_cancelled_true() {
+    assert_parse_error_contains_any(
+        "web_search without query fields requires cancelled true",
+        tool_result_message_json(
+            "web_search",
+            vec![json!({"type": "text", "text": "Search failed"})],
+            false,
+            Some(json!({
+                "error": "Search failed",
+                "cancelReason": "stale"
+            })),
+        ),
+        &["missing field", "queryCount"],
+    );
 }
 
 #[test]
