@@ -32,18 +32,22 @@ cargo build
 cargo run -- api-pricing --timezone local|utc
 cargo run -- api-pricing --tokens
 cargo run -- api-pricing --dir <directory>
+cargo run -- api-pricing --last-days 7
 
 # Run pi cost analyzer (--dir defaults to ~/.pi/agent/sessions)
 cargo run -- pi cost --timezone local|utc
 cargo run -- pi cost --conversations
 cargo run -- pi cost --tokens
 cargo run -- pi cost --dir <pi-sessions-directory>
+cargo run -- pi cost --last-days 3
 
 # Render chart-focused usage graphs
 # (graphs claude --dir defaults to ~/.claude/projects; graphs pi --dir defaults to ~/.pi/agent/sessions)
 cargo run -- graphs claude --timezone local|utc
 cargo run -- graphs pi --conversations --tokens
 cargo run -- graphs pi --dir <pi-sessions-directory>
+cargo run -- graphs claude --last-days 7
+cargo run -- graphs pi --last-days 7
 
 # Run MCP servers
 cargo run -- mcp git-read-only

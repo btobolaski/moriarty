@@ -342,6 +342,69 @@ fn api_pricing_cli_graphs_apply_time_filter() {
 }
 
 #[test]
+fn api_pricing_cli_graphs_last_days_filters_by_recent_days() {
+    let dir = TempDir::new().unwrap();
+    let session = "019dc252-e50e-766c-8182-d654b46881af";
+
+    let now = Utc::now();
+    let today = now.date_naive();
+    let ten_days_ago = today - chrono::Duration::days(10);
+    let today_9am = today.and_hms_opt(9, 0, 0).unwrap().and_utc();
+    let old_noon = ten_days_ago.and_hms_opt(12, 0, 0).unwrap().and_utc();
+
+    write_log(
+        dir.path(),
+        "tokens.jsonl",
+        &[
+            // A log from ~10 days ago — should be excluded by --last-days 7.
+            assistant_line(
+                session,
+                old_noon,
+                "claude-sonnet-4-20250514",
+                "req-old-1",
+                usage_json(5_000, 10_000, 0, 0),
+            ),
+            // A log from today — should be included.
+            assistant_line(
+                session,
+                today_9am,
+                "claude-opus-4-20250514",
+                "req-new-1",
+                usage_json(100, 200, 0, 0),
+            ),
+        ],
+    );
+
+    let output = moriarty_command()
+        .args(["graphs", "claude", "--dir"])
+        .arg(dir.path())
+        .args(["--last-days", "7", "--timezone", "utc", "--tokens"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    assert!(stdout.contains("Applying time range filter:"));
+    let expected_start_date = today - chrono::Duration::days(6);
+    let expected_start_str = format!("Start: {}T00:00:00+00:00", expected_start_date);
+    assert!(
+        stdout.contains(&expected_start_str),
+        "expected start banner with '{expected_start_str}' in:\n{stdout}"
+    );
+
+    assert!(stdout.contains(&today.format("%Y-%m-%d").to_string()));
+    assert!(!stdout.contains(&ten_days_ago.format("%Y-%m-%d").to_string()));
+    assert!(stdout.contains("Grand Total: 300"));
+    assert_has_graph_bar(&stdout, &today.format("%Y-%m-%d").to_string());
+}
+
+#[test]
 fn api_pricing_cli_graphs_print_empty_state_and_warning() {
     let dir = TempDir::new().unwrap();
     let session = "019dc252-e50e-766c-8182-d654b46881af";

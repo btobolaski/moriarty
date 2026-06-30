@@ -1,4 +1,4 @@
-use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, Duration, Local, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use miette::Result;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,6 +129,53 @@ impl TimeRangeFilter {
 
     pub fn is_unrestricted(&self) -> bool {
         self.start.is_none() && self.end.is_none()
+    }
+
+    /// Build a filter with a start bound at midnight of `(today − (days−1))`
+    /// in the command `timezone`. The upper bound is unbounded unless `end`
+    /// (the raw `--end-time` string) is provided.
+    ///
+    /// `days` must be ≥ 1 and must be small enough that the calendar
+    /// arithmetic does not overflow chrono's internal duration or date
+    /// representation; values that would overflow are rejected.
+    pub fn with_last_days(days: u64, timezone: DateTimezone, end: Option<String>) -> Result<Self> {
+        if days == 0 {
+            return Err(miette::miette!(
+                "--last-days must be at least 1 (received 0)"
+            ));
+        }
+
+        let delta_days = i64::try_from(days - 1)
+            .map_err(|_| miette::miette!("--last-days value {days} is too large"))?;
+
+        let delta = Duration::try_days(delta_days).ok_or_else(|| {
+            miette::miette!("--last-days value {days} is too large")
+        })?;
+
+        let now = Utc::now();
+        let today = timezone.to_date(&now);
+        let start_date = today
+            .checked_sub_signed(delta)
+            .ok_or_else(|| miette::miette!("--last-days value {days} is too large"))?;
+        let start = timezone.date_to_utc(start_date)?;
+        let end_dt = end
+            .map(|s| parse_datetime_for_end(&s, timezone))
+            .transpose()?;
+
+        if let Some(end_dt) = end_dt
+            && start >= end_dt
+        {
+            return Err(miette::miette!(
+                "--last-days start ({}) must be before --end-time ({})",
+                start,
+                end_dt
+            ));
+        }
+
+        Ok(Self {
+            start: Some(start),
+            end: end_dt,
+        })
     }
 }
 
@@ -384,6 +431,82 @@ mod tests {
         assert!(filter.contains(&local_noon));
         // Anything 2026-06-03 or later is unambiguously past local June 2 midnight.
         assert!(!filter.contains(&dt_utc("2026-06-03T00:00:00Z")));
+    }
+
+    #[test]
+    fn with_last_days_rejects_zero_days() {
+        let error = TimeRangeFilter::with_last_days(0, DateTimezone::Utc, None).unwrap_err();
+        assert!(
+            error.to_string().contains("must be at least 1"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn with_last_days_contains_now() {
+        let filter = TimeRangeFilter::with_last_days(7, DateTimezone::Utc, None).unwrap();
+        assert!(filter.contains(&Utc::now()));
+    }
+
+    #[test]
+    fn with_last_days_rejects_timestamp_before_computed_start() {
+        let filter = TimeRangeFilter::with_last_days(7, DateTimezone::Utc, None).unwrap();
+
+        let start = filter.start.unwrap();
+        assert!(!filter.contains(&(start - Duration::seconds(1))));
+    }
+
+    #[test]
+    fn with_last_days_respects_explicit_end() {
+        // Use a far-future end so the start<end check passes.
+        let filter =
+            TimeRangeFilter::with_last_days(30, DateTimezone::Utc, Some("2099-01-01".to_string()))
+                .unwrap();
+
+        assert!(!filter.contains(&dt_utc("2099-01-02T00:00:01Z")));
+        assert!(filter.contains(&Utc::now()));
+    }
+
+    #[test]
+    fn with_last_days_rejects_start_at_or_after_end() {
+        let error =
+            TimeRangeFilter::with_last_days(1, DateTimezone::Utc, Some("2020-01-01".to_string()))
+                .unwrap_err();
+        assert!(
+            error.to_string().contains("last-days"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.to_string().contains("end-time"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn with_last_days_rejects_overflowing_days() {
+        let error = TimeRangeFilter::with_last_days(u64::MAX, DateTimezone::Utc, None).unwrap_err();
+        assert!(
+            error.to_string().contains("too large"),
+            "unexpected error: {error}"
+        );
+
+        let error =
+            TimeRangeFilter::with_last_days(i64::MAX as u64, DateTimezone::Utc, None).unwrap_err();
+        assert!(
+            error.to_string().contains("too large"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn with_last_days_start_is_inclusive_midnight() {
+        let filter = TimeRangeFilter::with_last_days(7, DateTimezone::Utc, None).unwrap();
+
+        let start = filter.start.unwrap();
+        assert!(filter.contains(&start));
+        let start_date = DateTimezone::Utc.to_date(&start);
+        let midnight_of_start = DateTimezone::Utc.date_to_utc(start_date).unwrap();
+        assert_eq!(start, midnight_of_start);
     }
 
     #[test]

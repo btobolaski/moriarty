@@ -147,6 +147,11 @@ struct CostCommandArgs {
     /// Show token counts instead of dollar costs
     #[arg(long)]
     tokens: bool,
+    /// Only include the last N calendar days (e.g. `--last-days 7`),
+    /// counting from today at midnight in the command --timezone.
+    /// N must be ≥ 1. Mutually exclusive with --start-time.
+    #[arg(long, value_name = "DAYS", conflicts_with("start_time"))]
+    last_days: Option<u64>,
     /// Start time for filtering messages (ISO 8601 format, e.g., "2025-01-01T00:00:00Z" or "2025-01-01")
     /// Date-only and naive datetime inputs use the command --timezone (default: local)
     #[arg(long, value_name = "DATETIME")]
@@ -162,7 +167,15 @@ impl CostCommandArgs {
         &self,
         timezone: cost_report::DateTimezone,
     ) -> miette::Result<cost_report::TimeRangeFilter> {
-        cost_report::TimeRangeFilter::new(self.start_time.clone(), self.end_time.clone(), timezone)
+        if let Some(days) = self.last_days {
+            cost_report::TimeRangeFilter::with_last_days(days, timezone, self.end_time.clone())
+        } else {
+            cost_report::TimeRangeFilter::new(
+                self.start_time.clone(),
+                self.end_time.clone(),
+                timezone,
+            )
+        }
     }
 
     fn report_mode(&self) -> cost_report::ReportMode {
@@ -923,6 +936,129 @@ mod tests {
             }
             other => panic!("expected rules replay command, got {other:?}"),
         }
+    }
+
+    #[track_caller]
+    fn assert_last_days_parsed(cost_args: &super::CostCommandArgs) {
+        assert_eq!(cost_args.last_days, Some(7));
+        assert_eq!(cost_args.timezone, "utc");
+    }
+
+    #[test]
+    fn cli_parses_last_days_for_api_pricing() {
+        let cli = Cli::try_parse_from([
+            "moriarty",
+            "api-pricing",
+            "--last-days",
+            "7",
+            "--timezone",
+            "utc",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Command::ApiPricing { cost_args, .. } => assert_last_days_parsed(&cost_args),
+            other => panic!("expected api-pricing command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_last_days_for_pi_cost() {
+        let cli = Cli::try_parse_from([
+            "moriarty",
+            "pi",
+            "cost",
+            "--last-days",
+            "7",
+            "--timezone",
+            "utc",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Command::Pi {
+                subcommand: PiCommand::Cost { cost_args, .. },
+            } => assert_last_days_parsed(&cost_args),
+            other => panic!("expected pi cost command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_last_days_for_graphs_claude() {
+        let cli = Cli::try_parse_from([
+            "moriarty",
+            "graphs",
+            "claude",
+            "--last-days",
+            "7",
+            "--timezone",
+            "utc",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Command::Graphs {
+                subcommand: GraphsCommand::Claude { cost_args, .. },
+            } => assert_last_days_parsed(&cost_args),
+            other => panic!("expected graphs claude command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_last_days_for_graphs_pi() {
+        let cli = Cli::try_parse_from([
+            "moriarty",
+            "graphs",
+            "pi",
+            "--last-days",
+            "7",
+            "--timezone",
+            "utc",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Command::Graphs {
+                subcommand: GraphsCommand::Pi { cost_args, .. },
+            } => assert_last_days_parsed(&cost_args),
+            other => panic!("expected graphs pi command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_allows_last_days_with_end_time() {
+        let cli = Cli::try_parse_from([
+            "moriarty",
+            "api-pricing",
+            "--last-days",
+            "7",
+            "--end-time",
+            "2099-01-01",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Command::ApiPricing { cost_args, .. } => {
+                assert_eq!(cost_args.last_days, Some(7));
+                assert_eq!(cost_args.end_time.as_deref(), Some("2099-01-01"));
+            }
+            other => panic!("expected api-pricing command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_rejects_last_days_with_start_time() {
+        let error = Cli::try_parse_from([
+            "moriarty",
+            "api-pricing",
+            "--last-days",
+            "7",
+            "--start-time",
+            "2025-01-01",
+        ])
+        .unwrap_err();
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]

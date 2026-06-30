@@ -13,6 +13,7 @@
 .Op Fl \-timezone Ar local|utc
 .Op Fl \-conversations
 .Op Fl \-tokens
+.Op Fl \-last\-days Ar DAYS
 .Op Fl \-start\-time Ar DATETIME
 .Op Fl \-end\-time Ar DATETIME
 .Nm
@@ -21,6 +22,7 @@
 .Op Fl \-timezone Ar local|utc
 .Op Fl \-conversations
 .Op Fl \-tokens
+.Op Fl \-last\-days Ar DAYS
 .Op Fl \-start\-time Ar DATETIME
 .Op Fl \-end\-time Ar DATETIME
 .Nm
@@ -29,6 +31,7 @@
 .Op Fl \-timezone Ar local|utc
 .Op Fl \-conversations
 .Op Fl \-tokens
+.Op Fl \-last\-days Ar DAYS
 .Op Fl \-start\-time Ar DATETIME
 .Op Fl \-end\-time Ar DATETIME
 .Nm
@@ -37,6 +40,7 @@
 .Op Fl \-timezone Ar local|utc
 .Op Fl \-conversations
 .Op Fl \-tokens
+.Op Fl \-last\-days Ar DAYS
 .Op Fl \-start\-time Ar DATETIME
 .Op Fl \-end\-time Ar DATETIME
 .Nm
@@ -127,6 +131,13 @@ Default:
 Aggregate by conversation/session instead of by date.
 .It Fl \-tokens
 Show token counts instead of dollar costs.
+.It Fl \-last\-days Ar DAYS
+Only include the last
+.Ar DAYS
+calendar days, counting from today at midnight in the command timezone.
+Must be 1 or more.
+Mutually exclusive with
+.Fl \-start\-time .
 .It Fl \-start\-time Ar DATETIME
 Start time filter in ISO 8601 format
 .Pq e.g., 2025\-01\-01T00:00:00Z .
@@ -154,6 +165,13 @@ Default:
 Aggregate by conversation/session instead of by date.
 .It Fl \-tokens
 Show token counts instead of dollar costs.
+.It Fl \-last\-days Ar DAYS
+Only include the last
+.Ar DAYS
+calendar days, counting from today at midnight in the command timezone.
+Must be 1 or more.
+Mutually exclusive with
+.Fl \-start\-time .
 .It Fl \-start\-time Ar DATETIME
 Start time filter in ISO 8601 format.
 UTC is assumed if no timezone is specified.
