@@ -119,7 +119,12 @@ test in a separate process, making this safe and preventing tests from clobberin
   `agent_id`/`parent_session_id`/`parent_last_uuid`/`context_length` to record where the subagent forked from its parent
   conversation; added in Claude Code 2.1.175+), and `invoked_skills` attachments (`InvokedSkills`, the skills actually
   run during a turn — e.g. a `/code-review` slash command — each carrying `name`/`path`/`content`, distinct from
-  `skill_listing` which only advertises available skills; added in Claude Code 2.1.179+)
+  `skill_listing` which only advertises available skills; added in Claude Code 2.1.179+), and `origin`/`timestamp`
+  fields on `queued_command` attachments (`QueuedCommand`, recording who queued a command and when; `origin` reuses
+  `MessageOrigin` since both carry the same `kind` discriminator; added in Claude Code 2.1.197+), and `context_tip`
+  attachments (`ContextTip`, a contextual UI hint Claude Code surfaces to the user — e.g. suggesting `/add-dir` when
+  searching outside the working directory — whose payload nests `tip`/`featureId`/optional `action` under a `tip`
+  object; added in Claude Code 2.1.197+)
 - Also owns the structured view of the raw `model` string via `model::Model { family, version }` plus `ModelFamily` and
   `ModelVersion`. Both `cost_analyzer` (for pricing) and `moriarty::api_pricing` (for grouping/display) consume this one
   parser so family/version classification is not duplicated across crates

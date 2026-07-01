@@ -361,6 +361,7 @@ pub enum AttachmentData {
     AutoModeExit(AutoModeExit),
     CommandPermissions(CommandPermissions),
     CompactFileReference(CompactFileReference),
+    ContextTip(ContextTip),
     DateChange(DateChange),
     DeferredToolsDelta(DeferredToolsDelta),
     Directory(DirectoryAttachment),
@@ -422,6 +423,26 @@ pub struct CommandPermissions {
 pub struct CompactFileReference {
     pub filename: String,
     pub display_path: String,
+}
+
+/// A contextual UI hint Claude Code surfaces to the user (e.g. suggesting `/add-dir` when searching
+/// outside the working directory). The payload is nested under a `tip` object. Added in Claude Code
+/// 2.1.197+. `action` is optional because a tip need not carry a suggested command.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct ContextTip {
+    pub tip: ContextTipBody,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct ContextTipBody {
+    pub tip: String,
+    pub feature_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -709,6 +730,11 @@ pub struct PlanModeReentryAttachment {
 pub struct QueuedCommand {
     pub prompt: String,
     pub command_mode: String,
+    /// Who queued the command (e.g. `{"kind":"human"}`); absent in logs before Claude Code
+    /// 2.1.197. Reuses [`MessageOrigin`] since both carry the same `kind` discriminator.
+    pub origin: Option<MessageOrigin>,
+    /// When the command was queued; absent in logs before Claude Code 2.1.197.
+    pub timestamp: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]

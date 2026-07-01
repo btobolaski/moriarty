@@ -148,9 +148,8 @@ impl TimeRangeFilter {
         let delta_days = i64::try_from(days - 1)
             .map_err(|_| miette::miette!("--last-days value {days} is too large"))?;
 
-        let delta = Duration::try_days(delta_days).ok_or_else(|| {
-            miette::miette!("--last-days value {days} is too large")
-        })?;
+        let delta = Duration::try_days(delta_days)
+            .ok_or_else(|| miette::miette!("--last-days value {days} is too large"))?;
 
         let now = Utc::now();
         let today = timezone.to_date(&now);

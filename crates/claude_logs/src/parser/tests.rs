@@ -6169,6 +6169,89 @@ fn test_parse_attachment_compact_file_reference_rejects_unknown_fields() {
 }
 
 #[test]
+fn test_parse_attachment_context_tip() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": "3f2db2c5-ade2-4192-bdb0-c5697e6e565d",
+        "isSidechain": false,
+        "attachment": {
+            "type": "context_tip",
+            "tip": {
+                "tip": "You're searching across multiple directories outside your working directory. You can grant Claude access to those paths with /add-dir so you don't have to manually search — just read the file directly",
+                "featureId": "outside-working-dir",
+                "action": "/add-dir /Users/brendan/src/h2/h2-root-auth"
+            }
+        },
+        "uuid": "a340a6a7-125e-44c9-ab4d-69596ca5c4ae",
+        "timestamp": "2026-07-01T20:55:09.945Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/Users/brendan/src/h2",
+        "sessionId": "a5f871fa-d7d6-44c0-a68c-6227535e1afd",
+        "version": "2.1.197",
+        "gitBranch": "main"
+    });
+    let log_line: LogLine = serde_json::from_value(json).unwrap();
+    match log_line {
+        LogLine::Attachment(att) => match att.attachment {
+            AttachmentData::ContextTip(tip) => {
+                assert_eq!(
+                    tip.tip.tip,
+                    "You're searching across multiple directories outside your working directory. You can grant Claude access to those paths with /add-dir so you don't have to manually search — just read the file directly"
+                );
+                assert_eq!(tip.tip.feature_id, "outside-working-dir");
+                assert_eq!(
+                    tip.tip.action.as_deref(),
+                    Some("/add-dir /Users/brendan/src/h2/h2-root-auth")
+                );
+            }
+            other => panic!("Expected ContextTip attachment, got {:?}", other),
+        },
+        other => panic!("Expected Attachment, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_attachment_context_tip_without_action() {
+    let json = serde_json::json!({
+        "type": "context_tip",
+        "tip": {
+            "tip": "A tip that carries no suggested command",
+            "featureId": "some-feature"
+        }
+    });
+    let att: AttachmentData = serde_json::from_value(json).unwrap();
+    match att {
+        AttachmentData::ContextTip(tip) => {
+            assert_eq!(tip.tip.tip, "A tip that carries no suggested command");
+            assert_eq!(tip.tip.feature_id, "some-feature");
+            assert_eq!(tip.tip.action, None);
+        }
+        other => panic!("Expected ContextTip attachment, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_attachment_context_tip_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "type": "context_tip",
+        "tip": {
+            "tip": "A tip",
+            "featureId": "some-feature",
+            "extraField": "should be rejected"
+        }
+    });
+    let err_msg = serde_json::from_value::<AttachmentData>(json)
+        .expect_err("Should reject unknown fields in ContextTip")
+        .to_string();
+    assert!(
+        err_msg.contains("unknown field") || err_msg.contains("extraField"),
+        "Error should mention unknown field, got: {}",
+        err_msg
+    );
+}
+
+#[test]
 fn test_parse_attachment_plan_file_reference() {
     let json = serde_json::json!({
         "type": "attachment",
@@ -7815,6 +7898,90 @@ fn test_parse_attachment_queued_command() {
             if let AttachmentData::QueuedCommand(cmd) = &att.attachment {
                 assert_eq!(cmd.prompt, "Run the tests");
                 assert_eq!(cmd.command_mode, "prompt");
+                assert_eq!(cmd.origin, None);
+            } else {
+                panic!("Expected QueuedCommand, got {:?}", att.attachment);
+            }
+        }
+        other => panic!("Expected Attachment, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_attachment_queued_command_with_origin() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": null,
+        "isSidechain": false,
+        "attachment": {
+            "type": "queued_command",
+            "prompt": "be sure to use the gitattributes to mark the crds as generated.",
+            "commandMode": "prompt",
+            "origin": {"kind": "human"},
+            "timestamp": "2026-07-01T18:50:39.389Z"
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440000",
+        "timestamp": "2026-07-01T18:50:39.389Z",
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.197",
+        "gitBranch": "HEAD"
+    });
+    let log_line: LogLine = serde_json::from_value(json).unwrap();
+    match log_line {
+        LogLine::Attachment(att) => {
+            if let AttachmentData::QueuedCommand(cmd) = &att.attachment {
+                assert_eq!(
+                    cmd.prompt,
+                    "be sure to use the gitattributes to mark the crds as generated."
+                );
+                assert_eq!(cmd.command_mode, "prompt");
+                assert_eq!(
+                    cmd.origin,
+                    Some(MessageOrigin {
+                        kind: "human".to_string()
+                    })
+                );
+                assert_eq!(
+                    cmd.timestamp,
+                    Some("2026-07-01T18:50:39.389Z".parse::<DateTime<Utc>>().unwrap())
+                );
+            } else {
+                panic!("Expected QueuedCommand, got {:?}", att.attachment);
+            }
+        }
+        other => panic!("Expected Attachment, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_attachment_queued_command_with_null_origin() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": null,
+        "isSidechain": false,
+        "attachment": {
+            "type": "queued_command",
+            "prompt": "Run the tests",
+            "commandMode": "prompt",
+            "origin": null,
+            "timestamp": null
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440000",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.197",
+        "gitBranch": "main"
+    });
+    let log_line: LogLine = serde_json::from_value(json).unwrap();
+    match log_line {
+        LogLine::Attachment(att) => {
+            if let AttachmentData::QueuedCommand(cmd) = &att.attachment {
+                assert_eq!(cmd.origin, None);
+                assert_eq!(cmd.timestamp, None);
             } else {
                 panic!("Expected QueuedCommand, got {:?}", att.attachment);
             }
