@@ -124,7 +124,9 @@ test in a separate process, making this safe and preventing tests from clobberin
   `MessageOrigin` since both carry the same `kind` discriminator; added in Claude Code 2.1.197+), and `context_tip`
   attachments (`ContextTip`, a contextual UI hint Claude Code surfaces to the user — e.g. suggesting `/add-dir` when
   searching outside the working directory — whose payload nests `tip`/`featureId`/optional `action` under a `tip`
-  object; added in Claude Code 2.1.197+)
+  object; added in Claude Code 2.1.197+), and a `cumulativeDroppedTokens` field on `compact_boundary` records'
+  `compactMetadata` (`CompactMetadata`, a running total of tokens dropped across all compactions in the session; added
+  in Claude Code 2.1.197+)
 - Also owns the structured view of the raw `model` string via `model::Model { family, version }` plus `ModelFamily` and
   `ModelVersion`. Both `cost_analyzer` (for pricing) and `moriarty::api_pricing` (for grouping/display) consume this one
   parser so family/version classification is not duplicated across crates

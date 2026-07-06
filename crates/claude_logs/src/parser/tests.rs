@@ -3441,6 +3441,7 @@ fn test_parse_compact_boundary() {
             assert_eq!(boundary.compact_metadata.pre_compact_discovered_tools, None);
             assert_eq!(boundary.compact_metadata.preserved_segment, None);
             assert_eq!(boundary.compact_metadata.preserved_messages, None);
+            assert_eq!(boundary.compact_metadata.cumulative_dropped_tokens, None);
             assert_eq!(boundary.slug.as_deref(), Some("noble-floating-lemon"));
         }
         _ => panic!("Expected System(CompactBoundary) variant"),
@@ -3587,6 +3588,61 @@ fn test_parse_compact_boundary_with_partial_preserved_metadata() {
             assert_eq!(meta.pre_compact_discovered_tools, None);
             assert_eq!(meta.preserved_segment, None);
             assert_eq!(meta.preserved_messages, None);
+            assert_eq!(meta.cumulative_dropped_tokens, None);
+        }
+        _ => panic!("Expected System(CompactBoundary) variant"),
+    }
+}
+
+#[test]
+fn test_parse_compact_boundary_with_cumulative_dropped_tokens() {
+    // Claude Code 2.1.197 added cumulativeDroppedTokens to compactMetadata.
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "logicalParentUuid": "1d6ea6ce-23d1-47d4-bf8a-65a9b884dc89",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "538faf26-5f15-48a0-be20-20876e5f4f29",
+        "version": "2.1.197",
+        "gitBranch": "HEAD",
+        "slug": "spicy-snuggling-ocean",
+        "type": "system",
+        "subtype": "compact_boundary",
+        "content": "Conversation compacted",
+        "isMeta": false,
+        "timestamp": "2026-07-06T15:48:03.553Z",
+        "uuid": "c7486d00-8c13-4665-acb0-0c3e5e812cd2",
+        "level": "info",
+        "compactMetadata": {
+            "trigger": "manual",
+            "preTokens": 922398,
+            "durationMs": 172092,
+            "preCompactDiscoveredTools": ["Monitor", "WebFetch", "WebSearch"],
+            "preservedSegment": {
+                "headUuid": "e6cd3a07-837a-4be6-ae4c-ee54fb79bc12",
+                "anchorUuid": "0421d5ff-507b-42bb-b799-b434c78f73f8",
+                "tailUuid": "1d6ea6ce-23d1-47d4-bf8a-65a9b884dc89"
+            },
+            "preservedMessages": {
+                "anchorUuid": "0421d5ff-507b-42bb-b799-b434c78f73f8",
+                "uuids": ["e6cd3a07-837a-4be6-ae4c-ee54fb79bc12", "1d6ea6ce-23d1-47d4-bf8a-65a9b884dc89"],
+                "allUuids": ["e6cd3a07-837a-4be6-ae4c-ee54fb79bc12", "1d6ea6ce-23d1-47d4-bf8a-65a9b884dc89"]
+            },
+            "postTokens": 14546,
+            "cumulativeDroppedTokens": 907852
+        }
+    });
+
+    let line: LogLine = serde_json::from_value(json)
+        .expect("Failed to parse compact_boundary with cumulativeDroppedTokens");
+
+    match line {
+        LogLine::System(SystemLogLine::CompactBoundary(boundary)) => {
+            let meta = boundary.compact_metadata;
+            assert_eq!(meta.pre_tokens, 922398);
+            assert_eq!(meta.post_tokens, Some(14546));
+            assert_eq!(meta.cumulative_dropped_tokens, Some(907852));
         }
         _ => panic!("Expected System(CompactBoundary) variant"),
     }

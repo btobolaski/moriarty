@@ -1108,9 +1108,9 @@ pub struct SystemLogInformational {
     pub entrypoint: Option<String>,
 }
 
-/// `trigger` and `pre_tokens` are the only fields present before Claude Code 2.1.158; the rest
-/// arrived in 2.1.158 with the preserved-segment feature and stay `Option` so the older two-field
-/// records still parse.
+/// `trigger` and `pre_tokens` are the only fields present before Claude Code 2.1.158; the
+/// preserved-segment fields arrived in 2.1.158 and `cumulative_dropped_tokens` in 2.1.197. All
+/// stay `Option` so older records still parse.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
@@ -1122,6 +1122,9 @@ pub struct CompactMetadata {
     pub pre_compact_discovered_tools: Option<Vec<String>>,
     pub preserved_segment: Option<PreservedSegment>,
     pub preserved_messages: Option<PreservedMessages>,
+    /// Running total of tokens dropped across all compactions in the session. Added in Claude
+    /// Code 2.1.197+.
+    pub cumulative_dropped_tokens: Option<usize>,
 }
 
 /// Added in Claude Code 2.1.158+.
