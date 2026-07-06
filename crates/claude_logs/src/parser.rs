@@ -573,6 +573,12 @@ pub struct HookCancelled {
     pub hook_event: String,
     pub command: String,
     pub duration_ms: u64,
+    /// Whether the hook was cancelled because it hit its timeout (vs. cancelled for another
+    /// reason). Added in Claude Code 2.1.201+, hence `Option` so older records still parse.
+    pub timed_out: Option<bool>,
+    /// The hook's configured timeout in milliseconds. Added in Claude Code 2.1.201+, hence
+    /// `Option` so older records still parse.
+    pub timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1322,6 +1328,10 @@ pub struct UserLogLine {
     /// Present only on user turns that deliver an MCP tool result; absent on ordinary turns and on
     /// built-in (non-MCP) tool results, hence `Option`. Added in Claude Code 2.1.158+.
     pub mcp_meta: Option<McpMeta>,
+    /// Why Claude Code denied the tool call this turn responds to; present only on the user turn
+    /// carrying a denied tool's error `tool_result`, absent otherwise, hence `Option`. Added in
+    /// Claude Code 2.1.201+.
+    pub tool_denial_kind: Option<ToolDenialKind>,
 }
 
 /// Strict envelope mirroring Claude Code's `mcpMeta` object. Kept `deny_unknown_fields` so a future
@@ -1345,6 +1355,15 @@ pub struct McpMeta {
 #[serde(deny_unknown_fields)]
 pub struct MessageOrigin {
     pub kind: String,
+}
+
+/// Why Claude Code denied a tool call. Modeled as a strict enum (not a free `String`) so a new
+/// denial kind surfaces as a parse error to be handled, matching the parser's fail-on-unknown
+/// stance. Added in Claude Code 2.1.201+.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ToolDenialKind {
+    PermissionRule,
 }
 
 /// Permission mode for the conversation. Added in Claude Code 2.1.77+.

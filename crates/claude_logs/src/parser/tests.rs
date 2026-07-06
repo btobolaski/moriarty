@@ -4724,6 +4724,83 @@ fn test_parse_user_log_line_with_prompt_source() {
 }
 
 #[test]
+fn test_parse_user_log_line_with_tool_denial_kind() {
+    // Claude Code 2.1.201 added toolDenialKind on the user turn carrying a denied tool's error
+    // result (here a Bash `cd` blocked by a permission rule).
+    let json = serde_json::json!({
+        "parentUuid": "bd9aab76-4d33-4895-b111-b993a7c4ab91",
+        "isSidechain": false,
+        "promptId": "92e5f63a-6444-4ffa-bce4-620d0e81b1be",
+        "message": {"role": "user", "content": [{
+            "type": "tool_result",
+            "content": "You are not allowed to change directories.",
+            "is_error": true,
+            "tool_use_id": "toolu_01FYZzge6xHacXuXxY4GF2UG"
+        }]},
+        "uuid": "6a9597eb-fe7f-4a20-8b33-654bd87fe806",
+        "timestamp": "2026-07-06T18:51:55.332Z",
+        "toolUseResult": "Error: You are not allowed to change directories.",
+        "toolDenialKind": "permission-rule",
+        "sourceToolAssistantUUID": "bd9aab76-4d33-4895-b111-b993a7c4ab91",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/Users/brendan/src/h2/h2-iac",
+        "sessionId": "538faf26-5f15-48a0-be20-20876e5f4f29",
+        "version": "2.1.201",
+        "gitBranch": "HEAD",
+        "slug": "spicy-snuggling-ocean"
+    });
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(line.tool_denial_kind, Some(ToolDenialKind::PermissionRule));
+}
+
+#[test]
+fn test_parse_user_log_line_without_tool_denial_kind() {
+    // The field is absent on ordinary user turns, so it must default to None.
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "version": "2.1.201",
+        "gitBranch": "main",
+        "message": {"role": "user", "content": "test"},
+        "uuid": "550e8400-e29b-41d4-a716-446655440001",
+        "timestamp": "2025-01-01T00:00:00Z"
+    });
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(line.tool_denial_kind, None);
+}
+
+#[test]
+fn test_parse_user_log_line_rejects_unknown_tool_denial_kind() {
+    // ToolDenialKind is a closed enum: an unrecognized denial kind must fail to parse so the new
+    // value surfaces rather than being silently dropped.
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "version": "2.1.201",
+        "gitBranch": "main",
+        "message": {"role": "user", "content": "test"},
+        "uuid": "550e8400-e29b-41d4-a716-446655440001",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "toolDenialKind": "totally-bogus-kind"
+    });
+    let err_msg = serde_json::from_value::<UserLogLine>(json)
+        .expect_err("Should reject unknown toolDenialKind variant")
+        .to_string();
+    assert!(
+        err_msg.contains("unknown variant") || err_msg.contains("totally-bogus-kind"),
+        "Error should mention unknown variant, got: {}",
+        err_msg
+    );
+}
+
+#[test]
 fn test_parse_user_log_line_with_source_tool_use_id() {
     let json = serde_json::json!({
         "parentUuid": null,
@@ -8466,6 +8543,91 @@ fn test_parse_attachment_hook_cancelled() {
                 assert_eq!(cancelled.hook_event, "Stop");
                 assert_eq!(cancelled.command, "moriarty hooks exec");
                 assert_eq!(cancelled.duration_ms, 3184);
+                assert_eq!(cancelled.timed_out, None);
+                assert_eq!(cancelled.timeout_ms, None);
+            } else {
+                panic!("Expected HookCancelled, got {:?}", att.attachment);
+            }
+        }
+        other => panic!("Expected Attachment, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_attachment_hook_cancelled_with_timeout_fields() {
+    // Claude Code 2.1.201 added timedOut/timeoutMs to hook_cancelled attachments.
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": "b0d3f006-e1dd-4c60-bcff-af3ecd19b5d7",
+        "isSidechain": false,
+        "attachment": {
+            "type": "hook_cancelled",
+            "hookName": "Stop",
+            "toolUseID": "68798b35-9bd5-45b1-a1f6-dea7a7c162b6",
+            "hookEvent": "Stop",
+            "command": "moriarty hooks exec",
+            "durationMs": 11734,
+            "timedOut": false,
+            "timeoutMs": 300000
+        },
+        "uuid": "72d63f46-b398-474e-83e9-50dfb1a15493",
+        "timestamp": "2026-07-06T21:41:57.253Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "538faf26-5f15-48a0-be20-20876e5f4f29",
+        "version": "2.1.201",
+        "gitBranch": "HEAD",
+        "slug": "spicy-snuggling-ocean"
+    });
+    let log_line: LogLine = serde_json::from_value(json).unwrap();
+    match log_line {
+        LogLine::Attachment(att) => {
+            if let AttachmentData::HookCancelled(cancelled) = &att.attachment {
+                assert_eq!(cancelled.duration_ms, 11734);
+                assert_eq!(cancelled.timed_out, Some(false));
+                assert_eq!(cancelled.timeout_ms, Some(300000));
+            } else {
+                panic!("Expected HookCancelled, got {:?}", att.attachment);
+            }
+        }
+        other => panic!("Expected Attachment, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_attachment_hook_cancelled_timed_out_true() {
+    // The interesting timeout case: a hook actually cancelled for hitting its timeout.
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": "b0d3f006-e1dd-4c60-bcff-af3ecd19b5d7",
+        "isSidechain": false,
+        "attachment": {
+            "type": "hook_cancelled",
+            "hookName": "Stop",
+            "toolUseID": "68798b35-9bd5-45b1-a1f6-dea7a7c162b6",
+            "hookEvent": "Stop",
+            "command": "moriarty hooks exec",
+            "durationMs": 300001,
+            "timedOut": true,
+            "timeoutMs": 300000
+        },
+        "uuid": "72d63f46-b398-474e-83e9-50dfb1a15493",
+        "timestamp": "2026-07-06T21:41:57.253Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "538faf26-5f15-48a0-be20-20876e5f4f29",
+        "version": "2.1.201",
+        "gitBranch": "HEAD",
+        "slug": "spicy-snuggling-ocean"
+    });
+    let log_line: LogLine = serde_json::from_value(json).unwrap();
+    match log_line {
+        LogLine::Attachment(att) => {
+            if let AttachmentData::HookCancelled(cancelled) = &att.attachment {
+                assert_eq!(cancelled.timed_out, Some(true));
+                assert_eq!(cancelled.timeout_ms, Some(300000));
             } else {
                 panic!("Expected HookCancelled, got {:?}", att.attachment);
             }
