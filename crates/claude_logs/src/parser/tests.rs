@@ -1620,6 +1620,8 @@ fn test_parse_model_refusal_fallback() {
             assert_eq!(fallback.api_refusal_category, None);
             assert_eq!(fallback.api_refusal_explanation, None);
             assert_eq!(fallback.retracted_message_uuids.len(), 1);
+            // Absent key must default to None (pre-2.1.201 logs never had this field).
+            assert_eq!(fallback.refused_user_message_uuid, None);
         }
         _ => panic!("Expected System(ModelRefusalFallback) variant"),
     }
@@ -1663,6 +1665,94 @@ fn test_parse_model_refusal_fallback_with_populated_refusal_details() {
                 Some("Flagged for cybersecurity topics.")
             );
             assert!(fallback.retracted_message_uuids.is_empty());
+            assert_eq!(fallback.refused_user_message_uuid, None);
+        }
+        _ => panic!("Expected System(ModelRefusalFallback) variant"),
+    }
+}
+
+#[test]
+fn test_parse_model_refusal_fallback_with_refused_user_message_uuid() {
+    let json = serde_json::json!({
+        "type": "system",
+        "subtype": "model_refusal_fallback",
+        "parentUuid": "9528e913-20fc-42ea-9e4c-5fb080b07c04",
+        "isSidechain": false,
+        "direction": "retry",
+        "content": "Fable 5's safeguards flagged this message. Switched to Opus 4.8.",
+        "level": "warning",
+        "trigger": "refusal",
+        "originalModel": "claude-fable-5",
+        "fallbackModel": "claude-opus-4-8",
+        "requestId": "req_011Ccmjmo1wkFV3JyX6W34NT",
+        "apiRefusalCategory": "cyber",
+        "apiRefusalExplanation": null,
+        "isMeta": false,
+        "timestamp": "2026-07-07T00:19:18.167Z",
+        "uuid": "5eba741a-e6a1-449a-adbe-4d29aaa8468a",
+        "retractedMessageUuids": ["490b7142-41ad-4667-8166-469606129093"],
+        "refusedUserMessageUuid": "490b7142-41ad-4667-8166-469606129093",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "583790a4-8207-4478-92ee-ebb9538b54dd",
+        "version": "2.1.201",
+        "gitBranch": "HEAD"
+    });
+
+    match serde_json::from_value::<LogLine>(json)
+        .expect("Failed to parse model_refusal_fallback with refusedUserMessageUuid")
+    {
+        LogLine::System(SystemLogLine::ModelRefusalFallback(fallback)) => {
+            assert_eq!(
+                fallback.refused_user_message_uuid,
+                Some(
+                    "490b7142-41ad-4667-8166-469606129093"
+                        .parse()
+                        .expect("valid uuid")
+                )
+            );
+        }
+        _ => panic!("Expected System(ModelRefusalFallback) variant"),
+    }
+}
+
+#[test]
+fn test_parse_model_refusal_fallback_with_null_refused_user_message_uuid() {
+    // The real 2.1.201 shape records the key present but JSON-null (Claude Code noted no refused
+    // user message), distinct from the absent-key path the base fixtures cover.
+    let json = serde_json::json!({
+        "type": "system",
+        "subtype": "model_refusal_fallback",
+        "parentUuid": "9528e913-20fc-42ea-9e4c-5fb080b07c04",
+        "isSidechain": false,
+        "direction": "retry",
+        "content": "Fable 5's safeguards flagged this message. Switched to Opus 4.8.",
+        "level": "warning",
+        "trigger": "refusal",
+        "originalModel": "claude-fable-5",
+        "fallbackModel": "claude-opus-4-8",
+        "requestId": "req_011Ccmjmo1wkFV3JyX6W34NT",
+        "apiRefusalCategory": "cyber",
+        "apiRefusalExplanation": null,
+        "isMeta": false,
+        "timestamp": "2026-07-07T00:19:18.167Z",
+        "uuid": "5eba741a-e6a1-449a-adbe-4d29aaa8468a",
+        "retractedMessageUuids": ["490b7142-41ad-4667-8166-469606129093"],
+        "refusedUserMessageUuid": null,
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "583790a4-8207-4478-92ee-ebb9538b54dd",
+        "version": "2.1.201",
+        "gitBranch": "HEAD"
+    });
+
+    match serde_json::from_value::<LogLine>(json)
+        .expect("Failed to parse model_refusal_fallback with null refusedUserMessageUuid")
+    {
+        LogLine::System(SystemLogLine::ModelRefusalFallback(fallback)) => {
+            assert_eq!(fallback.refused_user_message_uuid, None);
         }
         _ => panic!("Expected System(ModelRefusalFallback) variant"),
     }
@@ -4752,6 +4842,36 @@ fn test_parse_user_log_line_with_tool_denial_kind() {
     });
     let line: UserLogLine = serde_json::from_value(json).unwrap();
     assert_eq!(line.tool_denial_kind, Some(ToolDenialKind::PermissionRule));
+}
+
+#[test]
+fn test_parse_user_log_line_with_user_rejected_tool_denial_kind() {
+    // Claude Code 2.1.201 also emits toolDenialKind "user-rejected" when the user manually
+    // declines the tool call at the permission prompt.
+    let json = serde_json::json!({
+        "parentUuid": "9b324826-db0c-4613-9658-ab7deb91abb4",
+        "isSidechain": false,
+        "promptId": "1a749aae-3cad-424c-a945-9469df183d0d",
+        "message": {"role": "user", "content": [{
+            "type": "tool_result",
+            "content": "The user doesn't want to proceed with this tool use.",
+            "is_error": true,
+            "tool_use_id": "toolu_01Y7KGdNsGpi3x1ajwzmgFUr"
+        }]},
+        "uuid": "527dc3ba-c146-493e-a202-9716bc1b9e50",
+        "timestamp": "2026-07-07T00:23:04.199Z",
+        "toolUseResult": "Error: The user doesn't want to proceed with this tool use.",
+        "toolDenialKind": "user-rejected",
+        "sourceToolAssistantUUID": "9b324826-db0c-4613-9658-ab7deb91abb4",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/Users/brendan/src/switchboard-jj",
+        "sessionId": "583790a4-8207-4478-92ee-ebb9538b54dd",
+        "version": "2.1.201",
+        "gitBranch": "HEAD"
+    });
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(line.tool_denial_kind, Some(ToolDenialKind::UserRejected));
 }
 
 #[test]

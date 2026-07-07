@@ -833,6 +833,9 @@ pub struct ModelRefusalFallback {
     pub retracted_message_uuids: Vec<Uuid>,
     /// Entry point that started the session (e.g., "cli"). Added in Claude Code 2.1.104+.
     pub entrypoint: Option<String>,
+    /// The user message whose request was refused; `null` when Claude Code recorded none.
+    /// Added in Claude Code 2.1.201+.
+    pub refused_user_message_uuid: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1364,6 +1367,9 @@ pub struct MessageOrigin {
 #[serde(rename_all = "kebab-case")]
 pub enum ToolDenialKind {
     PermissionRule,
+    /// The user manually rejected the tool call at the permission prompt. Added in Claude Code
+    /// 2.1.201+.
+    UserRejected,
 }
 
 /// Permission mode for the conversation. Added in Claude Code 2.1.77+.
