@@ -381,6 +381,11 @@ pub struct DiagnosticError {
     pub name: String,
     pub message: String,
     pub stack: String,
+    /// WebSocket close code when the transport error is a socket-level
+    /// close (e.g. `1000` for normal closure). Absent for non-WebSocket
+    /// transport failures.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
