@@ -1536,6 +1536,11 @@ pub struct AssistantLogLine {
     /// Upstream HTTP status for an API-error message (e.g. 529), set alongside
     /// `is_api_error_message`/`error` on synthetic error turns. Added in Claude Code 2.1.158+.
     pub api_error_status: Option<u16>,
+    /// Raw upstream error body for an API-error message (e.g. the full `429 {...}` JSON string
+    /// returned by the API), set alongside `error`/`api_error_status`. Kept as the verbatim string
+    /// Claude Code logged rather than a parsed struct because it is the provider's opaque payload.
+    /// Added in Claude Code 2.1.201+.
+    pub error_details: Option<String>,
     /// Entry point that started the session (e.g., "cli"). Added in Claude Code 2.1.104+.
     pub entrypoint: Option<String>,
     /// Named subagent attributed with producing this message (e.g., "code-quality-reviewer").

@@ -132,7 +132,10 @@ test in a separate process, making this safe and preventing tests from clobberin
   `tool_result`; added in Claude Code 2.1.201+), and `timedOut`/`timeoutMs` fields on `hook_cancelled` attachments
   (`HookCancelled`, recording whether the hook was cancelled for hitting its timeout and the configured timeout in
   milliseconds; added in Claude Code 2.1.201+), and a `refusedUserMessageUuid` field on `model_refusal_fallback` system
-  records (`ModelRefusalFallback`, the user message whose request was refused, nullable; added in Claude Code 2.1.201+)
+  records (`ModelRefusalFallback`, the user message whose request was refused, nullable; added in Claude Code 2.1.201+),
+  and an `errorDetails` field on assistant turns (`AssistantLogLine`, the raw upstream error body — e.g. the full
+  `429 {...}` JSON string — kept verbatim as the provider's opaque payload alongside `error`/`apiErrorStatus`; added in
+  Claude Code 2.1.201+)
 - Also owns the structured view of the raw `model` string via `model::Model { family, version }` plus `ModelFamily` and
   `ModelVersion`. Both `cost_analyzer` (for pricing) and `moriarty::api_pricing` (for grouping/display) consume this one
   parser so family/version classification is not duplicated across crates

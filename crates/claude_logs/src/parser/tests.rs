@@ -1040,6 +1040,70 @@ fn test_parse_assistant_api_error_message_with_status() {
             assert_eq!(assistant.is_api_error_message, Some(true));
             assert_eq!(assistant.error.as_deref(), Some("server_error"));
             assert_eq!(assistant.api_error_status, Some(529));
+            assert_eq!(assistant.error_details, None);
+        }
+        _ => panic!("Expected Assistant variant"),
+    }
+}
+
+// Synthetic API-error assistant turn (Claude Code 2.1.201) carrying the raw upstream error body in
+// `errorDetails` alongside `error`/`apiErrorStatus`.
+#[test]
+fn test_parse_assistant_api_error_message_with_error_details() {
+    let json = serde_json::json!({
+        "parentUuid": "eede2871-e78d-4c6e-864a-76cac855f446",
+        "isSidechain": false,
+        "type": "assistant",
+        "uuid": "97d081ac-aa71-436d-bda0-0a53b196e6fe",
+        "timestamp": "2026-07-07T22:47:12.395Z",
+        "message": {
+            "id": "5754569c-0201-4018-a884-9d76cbf94c47",
+            "container": null,
+            "model": "<synthetic>",
+            "role": "assistant",
+            "stop_details": null,
+            "stop_reason": "stop_sequence",
+            "stop_sequence": "",
+            "type": "message",
+            "usage": {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "server_tool_use": {"web_search_requests": 0, "web_fetch_requests": 0},
+                "service_tier": null,
+                "cache_creation": {"ephemeral_1h_input_tokens": 0, "ephemeral_5m_input_tokens": 0}
+            },
+            "content": [{"type": "text", "text": "You've hit your monthly spend limit. /model to switch models."}],
+            "context_management": null
+        },
+        "requestId": "req_011CcoWaJyfmubPDDPN2iUDU",
+        "error": "rate_limit",
+        "errorDetails": "429 {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"This request would exceed your account's monthly spend limit. Please try again later.\"},\"request_id\":\"req_011CcoWaJyfmubPDDPN2iUDU\"}",
+        "isApiErrorMessage": true,
+        "apiErrorStatus": 429,
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "e51c5fa7-4122-484e-8183-8c531ff7b98c",
+        "version": "2.1.201",
+        "gitBranch": "HEAD"
+    });
+
+    let line: LogLine =
+        serde_json::from_value(json).expect("Failed to parse api-error assistant message");
+
+    match line {
+        LogLine::Assistant(assistant) => {
+            assert_eq!(assistant.is_api_error_message, Some(true));
+            assert_eq!(assistant.error.as_deref(), Some("rate_limit"));
+            assert_eq!(assistant.api_error_status, Some(429));
+            assert_eq!(
+                assistant.error_details.as_deref(),
+                Some(
+                    "429 {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"This request would exceed your account's monthly spend limit. Please try again later.\"},\"request_id\":\"req_011CcoWaJyfmubPDDPN2iUDU\"}"
+                )
+            );
         }
         _ => panic!("Expected Assistant variant"),
     }
