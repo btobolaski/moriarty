@@ -4985,6 +4985,78 @@ fn test_parse_user_log_line_rejects_unknown_tool_denial_kind() {
 }
 
 #[test]
+fn test_parse_user_log_line_with_queue_priority() {
+    // Claude Code 2.1.201 added queuePriority on a prompt that was queued (here a meta "Continue"
+    // prompt queued with priority "later") rather than sent immediately.
+    let json = serde_json::json!({
+        "parentUuid": "a828a29c-0171-40f3-be9a-30c141de4aa7",
+        "isSidechain": false,
+        "promptId": "818b0049-6469-4773-a417-4e4702e8c3db",
+        "message": {"role": "user", "content": "Continue: collect the test review pass-2 result."},
+        "isMeta": true,
+        "uuid": "64c01ff2-4aac-4117-85bf-21fa50c6736f",
+        "timestamp": "2026-07-08T00:07:00.977Z",
+        "permissionMode": "acceptEdits",
+        "promptSource": "system",
+        "queuePriority": "later",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/Users/brendan/src/h2/h2-iac",
+        "sessionId": "e51c5fa7-4122-484e-8183-8c531ff7b98c",
+        "version": "2.1.201",
+        "gitBranch": "HEAD"
+    });
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(line.queue_priority, Some(QueuePriority::Later));
+}
+
+#[test]
+fn test_parse_user_log_line_without_queue_priority() {
+    // The field is absent on turns sent immediately, so it must default to None.
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "version": "2.1.201",
+        "gitBranch": "main",
+        "message": {"role": "user", "content": "test"},
+        "uuid": "550e8400-e29b-41d4-a716-446655440001",
+        "timestamp": "2025-01-01T00:00:00Z"
+    });
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(line.queue_priority, None);
+}
+
+#[test]
+fn test_parse_user_log_line_rejects_unknown_queue_priority() {
+    // QueuePriority is a closed enum: an unrecognized priority must fail to parse so the new value
+    // surfaces rather than being silently dropped.
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "version": "2.1.201",
+        "gitBranch": "main",
+        "message": {"role": "user", "content": "test"},
+        "uuid": "550e8400-e29b-41d4-a716-446655440001",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "queuePriority": "totally-bogus-priority"
+    });
+    let err_msg = serde_json::from_value::<UserLogLine>(json)
+        .expect_err("Should reject unknown queuePriority variant")
+        .to_string();
+    assert!(
+        err_msg.contains("unknown variant") || err_msg.contains("totally-bogus-priority"),
+        "Error should mention unknown variant, got: {}",
+        err_msg
+    );
+}
+
+#[test]
 fn test_parse_user_log_line_with_source_tool_use_id() {
     let json = serde_json::json!({
         "parentUuid": null,

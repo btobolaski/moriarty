@@ -1335,6 +1335,9 @@ pub struct UserLogLine {
     /// carrying a denied tool's error `tool_result`, absent otherwise, hence `Option`. Added in
     /// Claude Code 2.1.201+.
     pub tool_denial_kind: Option<ToolDenialKind>,
+    /// Scheduling priority for a queued prompt (e.g. `later`); present only on turns that were
+    /// queued rather than sent immediately, hence `Option`. Added in Claude Code 2.1.201+.
+    pub queue_priority: Option<QueuePriority>,
 }
 
 /// Strict envelope mirroring Claude Code's `mcpMeta` object. Kept `deny_unknown_fields` so a future
@@ -1370,6 +1373,15 @@ pub enum ToolDenialKind {
     /// The user manually rejected the tool call at the permission prompt. Added in Claude Code
     /// 2.1.201+.
     UserRejected,
+}
+
+/// Scheduling priority for a prompt queued while Claude Code was busy. Modeled as a strict enum
+/// (not a free `String`) so a new priority surfaces as a parse error to be handled, matching the
+/// parser's fail-on-unknown stance. Added in Claude Code 2.1.201+.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum QueuePriority {
+    Later,
 }
 
 /// Permission mode for the conversation. Added in Claude Code 2.1.77+.

@@ -135,7 +135,9 @@ test in a separate process, making this safe and preventing tests from clobberin
   records (`ModelRefusalFallback`, the user message whose request was refused, nullable; added in Claude Code 2.1.201+),
   and an `errorDetails` field on assistant turns (`AssistantLogLine`, the raw upstream error body — e.g. the full
   `429 {...}` JSON string — kept verbatim as the provider's opaque payload alongside `error`/`apiErrorStatus`; added in
-  Claude Code 2.1.201+)
+  Claude Code 2.1.201+), and a `queuePriority` field on user turns (`QueuePriority`, a strict enum — currently only
+  `later` — giving the scheduling priority of a prompt that was queued while Claude Code was busy rather than sent
+  immediately; present only on queued turns; added in Claude Code 2.1.201+)
 - Also owns the structured view of the raw `model` string via `model::Model { family, version }` plus `ModelFamily` and
   `ModelVersion`. Both `cost_analyzer` (for pricing) and `moriarty::api_pricing` (for grouping/display) consume this one
   parser so family/version classification is not duplicated across crates
