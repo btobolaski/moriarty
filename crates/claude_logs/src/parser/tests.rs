@@ -4939,6 +4939,42 @@ fn test_parse_user_log_line_with_user_rejected_tool_denial_kind() {
 }
 
 #[test]
+fn test_parse_user_log_line_with_automode_unavailable_tool_denial_kind() {
+    // Claude Code 2.1.201 emits toolDenialKind "automode-unavailable" (observed on a sidechain
+    // agent's turn) when auto mode's safety classifier model is temporarily unavailable and the
+    // call is denied rather than approved.
+    let json = serde_json::json!({
+        "parentUuid": "b594a747-6cac-41ba-a66c-fa751bdf8b90",
+        "isSidechain": true,
+        "promptId": "acdfb908-1034-496b-8641-335cd0f2f695",
+        "agentId": "aa7bae6fc5eeca488",
+        "message": {"role": "user", "content": [{
+            "type": "tool_result",
+            "content": "claude-opus-4-8[1m] is temporarily unavailable, so auto mode cannot determine the safety of WebSearch right now.",
+            "is_error": true,
+            "tool_use_id": "toolu_013GG8Q3zDB6XBfBZSrgrCbK"
+        }]},
+        "uuid": "06fe5d3a-928b-4454-b0b8-94f895ee9d53",
+        "timestamp": "2026-07-08T18:40:56.155Z",
+        "toolUseResult": "Error: claude-opus-4-8[1m] is temporarily unavailable, so auto mode cannot determine the safety of WebSearch right now.",
+        "toolDenialKind": "automode-unavailable",
+        "sourceToolAssistantUUID": "b594a747-6cac-41ba-a66c-fa751bdf8b90",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/Users/brendan/src/h2/h2-iac",
+        "sessionId": "15eb4f99-064c-424f-a7da-ddb39e340c1c",
+        "version": "2.1.201",
+        "gitBranch": "HEAD",
+        "slug": "transient-cooking-thunder"
+    });
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(
+        line.tool_denial_kind,
+        Some(ToolDenialKind::AutomodeUnavailable)
+    );
+}
+
+#[test]
 fn test_parse_user_log_line_without_tool_denial_kind() {
     // The field is absent on ordinary user turns, so it must default to None.
     let json = serde_json::json!({

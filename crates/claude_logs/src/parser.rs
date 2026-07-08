@@ -1373,6 +1373,10 @@ pub enum ToolDenialKind {
     /// The user manually rejected the tool call at the permission prompt. Added in Claude Code
     /// 2.1.201+.
     UserRejected,
+    /// Auto mode could not classify the tool call because the safety classifier model was
+    /// temporarily unavailable, so the call was denied rather than approved. Added in Claude Code
+    /// 2.1.201+.
+    AutomodeUnavailable,
 }
 
 /// Scheduling priority for a prompt queued while Claude Code was busy. Modeled as a strict enum

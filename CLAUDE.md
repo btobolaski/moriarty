@@ -127,9 +127,11 @@ test in a separate process, making this safe and preventing tests from clobberin
   object; added in Claude Code 2.1.197+), and a `cumulativeDroppedTokens` field on `compact_boundary` records'
   `compactMetadata` (`CompactMetadata`, a running total of tokens dropped across all compactions in the session; added
   in Claude Code 2.1.197+), and a `toolDenialKind` field on user turns (`ToolDenialKind`, a strict enum —
-  `permission-rule` (a rule blocked the call) or `user-rejected` (the user declined it at the prompt) — recording why
-  Claude Code denied the tool call the turn responds to; present only on the user turn carrying a denied tool's error
-  `tool_result`; added in Claude Code 2.1.201+), and `timedOut`/`timeoutMs` fields on `hook_cancelled` attachments
+  `permission-rule` (a rule blocked the call), `user-rejected` (the user declined it at the prompt), or
+  `automode-unavailable` (auto mode's safety classifier model was temporarily unavailable, so the call was denied rather
+  than approved) — recording why Claude Code denied the tool call the turn responds to; present only on the user turn
+  carrying a denied tool's error `tool_result`; added in Claude Code 2.1.201+), and `timedOut`/`timeoutMs` fields on
+  `hook_cancelled` attachments
   (`HookCancelled`, recording whether the hook was cancelled for hitting its timeout and the configured timeout in
   milliseconds; added in Claude Code 2.1.201+), and a `refusedUserMessageUuid` field on `model_refusal_fallback` system
   records (`ModelRefusalFallback`, the user message whose request was refused, nullable; added in Claude Code 2.1.201+),
