@@ -393,7 +393,7 @@ pub struct DiagnosticError {
 pub struct ToolResultMessage {
     pub tool_call_id: String,
     pub tool_name: String,
-    pub content: Vec<TextContentItem>,
+    pub content: Vec<ToolResultContentItem>,
     pub is_error: bool,
     pub timestamp: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -405,7 +405,7 @@ pub struct ToolResultMessage {
 struct RawToolResultMessage {
     pub tool_call_id: String,
     pub tool_name: String,
-    pub content: Vec<TextContentItem>,
+    pub content: Vec<ToolResultContentItem>,
     pub is_error: bool,
     pub timestamp: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -493,6 +493,14 @@ pub struct BashExecutionMessage {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum UserContentItem {
     Text { text: String },
+    /// Base64-encoded image data from a user `@`-mentioning an image file.
+    /// The wire protocol embeds the image inline as a base64 string rather
+    /// than referencing a path, so the content is self-contained.
+    Image {
+        data: String,
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -529,17 +537,19 @@ pub struct ThinkingAssistantContent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct TextContentItem {
-    #[serde(rename = "type")]
-    pub kind: TextContentKind,
-    pub text: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TextContentKind {
-    Text,
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+/// Pi tool results can now carry image data alongside text — the `read`
+/// tool embeds images inline when the model requests an image file, using
+/// the same base64 wire format as `UserContentItem::Image`.
+pub enum ToolResultContentItem {
+    Text { text: String },
+    /// Base64-encoded image data embedded in a tool result (e.g. from `read`
+    /// of an image file). Same wire format as `UserContentItem::Image`.
+    Image {
+        data: String,
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

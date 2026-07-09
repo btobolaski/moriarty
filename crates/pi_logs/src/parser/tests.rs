@@ -910,6 +910,38 @@ fn user_message() {
 }
 
 #[test]
+fn user_message_accepts_image_content() {
+    let line = parse(message_line_json(
+        "u1",
+        "p1",
+        json!({
+            "role": "user",
+            "content": [{
+                "type": "image",
+                "data": "base64-image-data",
+                "mimeType": "image/png",
+            }],
+            "timestamp": MESSAGE_TIMESTAMP,
+        }),
+    ));
+
+    match line {
+        PiLogLine::Message(message) => match message.message {
+            RoleMessage::User(user) => {
+                assert_eq!(user.content.len(), 1);
+                assert!(matches!(
+                    &user.content[0],
+                    UserContentItem::Image { data, mime_type }
+                        if data == "base64-image-data" && mime_type == "image/png"
+                ));
+            }
+            other => panic!("expected User, got {other:?}"),
+        },
+        other => panic!("expected Message, got {other:?}"),
+    }
+}
+
+#[test]
 fn bash_execution_message() {
     let bash_execution = parse_bash_execution_message(bash_execution_message_json(
         "cargo run --bin parse_pi_sessions",
@@ -2896,6 +2928,73 @@ fn tool_result_without_details() {
     ));
 
     assert!(tool_result.details.is_none());
+}
+
+#[test]
+fn tool_result_message_accepts_image_content() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "read",
+        vec![json!({
+            "type": "image",
+            "data": "base64-image-data",
+            "mimeType": "image/png",
+        })],
+        false,
+        None,
+    ));
+
+    assert_eq!(tool_result.content.len(), 1);
+    assert!(matches!(
+        &tool_result.content[0],
+        ToolResultContentItem::Image { data, mime_type }
+            if data == "base64-image-data" && mime_type == "image/png"
+    ));
+}
+
+#[test]
+fn tool_result_message_accepts_mixed_text_and_image_content() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "screenshot",
+        vec![
+            json!({"type": "text", "text": "captured screenshot"}),
+            json!({
+                "type": "image",
+                "data": "base64-image-data",
+                "mimeType": "image/png",
+            }),
+        ],
+        false,
+        None,
+    ));
+
+    assert_eq!(tool_result.content.len(), 2);
+    assert!(matches!(
+        &tool_result.content[0],
+        ToolResultContentItem::Text { text } if text == "captured screenshot"
+    ));
+    assert!(matches!(
+        &tool_result.content[1],
+        ToolResultContentItem::Image { mime_type, .. } if mime_type == "image/png"
+    ));
+}
+
+#[test]
+fn tool_result_image_content_rejects_unknown_fields() {
+    assert_parse_error_contains_any(
+        "tool result image content rejects unknown fields",
+        tool_result_message_json(
+            "screenshot",
+            vec![json!({
+                "type": "image",
+                "data": "base64-image-data",
+                "mimeType": "image/png",
+                "extra": true,
+            })],
+            false,
+            None,
+        ),
+        &["extra"],
+    );
 }
 
 #[test]
