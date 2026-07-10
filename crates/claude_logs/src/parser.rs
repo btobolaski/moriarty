@@ -482,6 +482,8 @@ pub struct DirectoryAttachment {
 pub struct EditedTextFile {
     pub filename: String,
     pub snippet: String,
+    /// Added in Claude Code 2.1.201+, hence `Option` so older records still parse.
+    pub display_path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]

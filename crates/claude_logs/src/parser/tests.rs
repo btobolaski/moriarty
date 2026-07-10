@@ -8636,12 +8636,66 @@ fn test_parse_attachment_edited_text_file() {
             if let AttachmentData::EditedTextFile(edited) = &att.attachment {
                 assert_eq!(edited.filename, "/src/main.rs");
                 assert_eq!(edited.snippet, "fn main() {\n    println!(\"hello\");\n}");
+                assert_eq!(edited.display_path, None);
             } else {
                 panic!("Expected EditedTextFile, got {:?}", att.attachment);
             }
         }
         other => panic!("Expected Attachment, got {:?}", other),
     }
+}
+
+#[test]
+fn test_parse_attachment_edited_text_file_with_display_path() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": null,
+        "isSidechain": false,
+        "attachment": {
+            "type": "edited_text_file",
+            "filename": "/Users/brendan/src/h2/h2-iac/.specs/foundation.md",
+            "snippet": "1\t# foundation",
+            "displayPath": ".specs/foundation.md"
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2026-07-09T20:59:11.764Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/Users/brendan/src/h2/h2-iac",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.201",
+        "gitBranch": "HEAD"
+    });
+    let log_line: LogLine = serde_json::from_value(json).unwrap();
+    match log_line {
+        LogLine::Attachment(att) => {
+            if let AttachmentData::EditedTextFile(edited) = &att.attachment {
+                assert_eq!(
+                    edited.filename,
+                    "/Users/brendan/src/h2/h2-iac/.specs/foundation.md"
+                );
+                assert_eq!(edited.snippet, "1\t# foundation");
+                assert_eq!(edited.display_path.as_deref(), Some(".specs/foundation.md"));
+            } else {
+                panic!("Expected EditedTextFile, got {:?}", att.attachment);
+            }
+        }
+        other => panic!("Expected Attachment, got {:?}", other),
+    }
+}
+
+// `rename_all = "camelCase"` and `deny_unknown_fields` interact: a serialize-side rename bug would
+// make a serialized record fail to parse back, so assert the wire keys explicitly via round-trip.
+#[test]
+fn test_edited_text_file_round_trips() {
+    let attachment = serde_json::json!({
+        "type": "edited_text_file",
+        "filename": "/Users/brendan/src/h2/h2-iac/.specs/foundation.md",
+        "snippet": "1\t# foundation",
+        "displayPath": ".specs/foundation.md"
+    });
+    let parsed: AttachmentData = serde_json::from_value(attachment.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&parsed).unwrap(), attachment);
 }
 
 #[test]
