@@ -492,7 +492,9 @@ pub struct BashExecutionMessage {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum UserContentItem {
-    Text { text: String },
+    Text {
+        text: String,
+    },
     /// Base64-encoded image data from a user `@`-mentioning an image file.
     /// The wire protocol embeds the image inline as a base64 string rather
     /// than referencing a path, so the content is self-contained.
@@ -542,7 +544,9 @@ pub struct ThinkingAssistantContent {
 /// tool embeds images inline when the model requests an image file, using
 /// the same base64 wire format as `UserContentItem::Image`.
 pub enum ToolResultContentItem {
-    Text { text: String },
+    Text {
+        text: String,
+    },
     /// Base64-encoded image data embedded in a tool result (e.g. from `read`
     /// of an image file). Same wire format as `UserContentItem::Image`.
     Image {

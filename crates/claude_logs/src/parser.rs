@@ -348,6 +348,12 @@ pub struct AttachmentLogLine {
     pub version: String,
     pub git_branch: String,
     pub slug: Option<String>,
+    /// Claude Code 2.1.206+ repeats the session id under the snake_case key `session_id` alongside
+    /// the camelCase `sessionId` (`session_id` above); the two always carry the same value. Modeled
+    /// as its own field rather than a `#[serde(alias)]` on `session_id` because both keys appear at
+    /// once, which serde would reject as a duplicate. `Option` so pre-2.1.206 lines still parse.
+    #[serde(rename = "session_id")]
+    pub session_id_snake: Option<Uuid>,
 }
 
 /// Attachment payload types. Added in Claude Code 2.1.104+.
@@ -893,6 +899,14 @@ pub struct StopHookSummary {
     pub tool_use_id: String,
     /// Entry point that started the session (e.g., "cli"). Added in Claude Code 2.1.104+.
     pub entrypoint: Option<String>,
+    /// Claude Code 2.1.206+ repeats the session id under the snake_case key `session_id` alongside
+    /// the camelCase `sessionId` (`session_id` above); the two always carry the same value. Modeled
+    /// as its own field rather than a `#[serde(alias)]` on `session_id` because both keys appear at
+    /// once, which serde would reject as a duplicate. `Option` so pre-2.1.206 lines still parse.
+    /// Only the `stop_hook_summary` system record carries this duplicate; other system variants do
+    /// not, so the field lives here rather than on a shared system envelope.
+    #[serde(rename = "session_id")]
+    pub session_id_snake: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1340,6 +1354,12 @@ pub struct UserLogLine {
     /// Scheduling priority for a queued prompt (e.g. `later`); present only on turns that were
     /// queued rather than sent immediately, hence `Option`. Added in Claude Code 2.1.201+.
     pub queue_priority: Option<QueuePriority>,
+    /// Claude Code 2.1.206+ repeats the session id under the snake_case key `session_id` alongside
+    /// the camelCase `sessionId` (`session_id` above); the two always carry the same value. Modeled
+    /// as its own field rather than a `#[serde(alias)]` on `session_id` because both keys appear at
+    /// once, which serde would reject as a duplicate. `Option` so pre-2.1.206 lines still parse.
+    #[serde(rename = "session_id")]
+    pub session_id_snake: Option<Uuid>,
 }
 
 /// Strict envelope mirroring Claude Code's `mcpMeta` object. Kept `deny_unknown_fields` so a future
@@ -1574,6 +1594,13 @@ pub struct AssistantLogLine {
     /// paralleling `attribution_agent`/`attribution_skill` above. Added in Claude Code 2.1.158+.
     pub attribution_mcp_server: Option<String>,
     pub attribution_mcp_tool: Option<String>,
+    /// Claude Code 2.1.206+ repeats the session id under the snake_case key `session_id` alongside
+    /// the camelCase `sessionId` (`session_id` above); the two always carry the same value. Modeled
+    /// as its own field rather than a `#[serde(alias)]` on `session_id` because both keys appear at
+    /// once, which serde would reject as a duplicate. `Option` so pre-2.1.206 lines still parse.
+    /// Mirrors `session_id`'s `String` type here since assistant session ids are not parsed as UUIDs.
+    #[serde(rename = "session_id")]
+    pub session_id_snake: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

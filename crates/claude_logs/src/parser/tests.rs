@@ -1109,6 +1109,214 @@ fn test_parse_assistant_api_error_message_with_error_details() {
     }
 }
 
+// Claude Code 2.1.206 began repeating the session id under the snake_case key `session_id`
+// alongside the camelCase `sessionId` on the full conversation records (user, assistant,
+// attachment, and the `stop_hook_summary` system record). The parser must accept the duplicate
+// rather than reject the line; it lands in `session_id_snake` and always matches `sessionId`.
+#[test]
+fn test_parse_assistant_with_snake_case_session_id() {
+    let json = serde_json::json!({
+        "parentUuid": "eede2871-e78d-4c6e-864a-76cac855f446",
+        "isSidechain": false,
+        "type": "assistant",
+        "uuid": "97d081ac-aa71-436d-bda0-0a53b196e6fe",
+        "timestamp": "2026-07-09T22:47:12.395Z",
+        "message": {
+            "id": "msg_011Cctf6yyjGaNhwgqmUY6KP",
+            "container": null,
+            "model": "claude-opus-4-8",
+            "role": "assistant",
+            "stop_details": null,
+            "stop_reason": "end_turn",
+            "stop_sequence": null,
+            "type": "message",
+            "usage": {
+                "input_tokens": 4,
+                "output_tokens": 8,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "server_tool_use": {"web_search_requests": 0, "web_fetch_requests": 0},
+                "service_tier": null,
+                "cache_creation": {"ephemeral_1h_input_tokens": 0, "ephemeral_5m_input_tokens": 0}
+            },
+            "content": [{"type": "text", "text": "ok"}],
+            "context_management": null
+        },
+        "requestId": "req_011Cctf6yyjGaNhwgqmUY6KP",
+        // Distinct from `sessionId` below so the assertions prove the snake_case key maps to
+        // `session_id_snake` specifically; real logs always carry the same value in both.
+        "session_id": "11111111-1111-1111-1111-111111111111",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "22222222-2222-2222-2222-222222222222",
+        "version": "2.1.206",
+        "gitBranch": "HEAD"
+    });
+
+    let line: LogLine =
+        serde_json::from_value(json).expect("Failed to parse assistant with snake_case session_id");
+    match line {
+        LogLine::Assistant(assistant) => {
+            assert_eq!(
+                assistant.session_id_snake.as_deref(),
+                Some("11111111-1111-1111-1111-111111111111")
+            );
+            assert_eq!(assistant.session_id, "22222222-2222-2222-2222-222222222222");
+        }
+        _ => panic!("Expected Assistant variant"),
+    }
+}
+
+#[test]
+fn test_parse_user_with_snake_case_session_id() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        // Distinct values prove the snake_case key populates `session_id_snake` and the camelCase
+        // key populates `session_id`; real logs always carry the same value in both.
+        "session_id": "33333333-3333-3333-3333-333333333333",
+        "sessionId": "44444444-4444-4444-4444-444444444444",
+        "version": "2.1.206",
+        "gitBranch": "main",
+        "message": {"role": "user", "content": "test"},
+        "uuid": "550e8400-e29b-41d4-a716-446655440001",
+        "timestamp": "2026-07-09T00:00:00Z"
+    });
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(
+        line.session_id_snake,
+        Some(
+            "33333333-3333-3333-3333-333333333333"
+                .parse::<Uuid>()
+                .unwrap()
+        )
+    );
+    assert_eq!(
+        line.session_id,
+        "44444444-4444-4444-4444-444444444444"
+            .parse::<Uuid>()
+            .unwrap()
+    );
+}
+
+#[test]
+fn test_parse_attachment_with_snake_case_session_id() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": null,
+        "isSidechain": false,
+        "attachment": {
+            "type": "deferred_tools_delta",
+            "addedNames": ["WebFetch"],
+            "addedLines": ["WebFetch"],
+            "removedNames": []
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440000",
+        "timestamp": "2026-07-09T00:00:00Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        // Distinct values prove the snake_case key populates `session_id_snake` independently of
+        // the camelCase `sessionId`; real logs always carry the same value in both.
+        "session_id": "55555555-5555-5555-5555-555555555555",
+        "sessionId": "66666666-6666-6666-6666-666666666666",
+        "version": "2.1.206",
+        "gitBranch": "main",
+        "slug": null
+    });
+    let line: LogLine = serde_json::from_value(json).unwrap();
+    match line {
+        LogLine::Attachment(att) => {
+            assert_eq!(
+                att.session_id_snake,
+                Some(
+                    "55555555-5555-5555-5555-555555555555"
+                        .parse::<Uuid>()
+                        .unwrap()
+                )
+            );
+            assert_eq!(
+                att.session_id,
+                "66666666-6666-6666-6666-666666666666"
+                    .parse::<Uuid>()
+                    .unwrap()
+            );
+        }
+        other => panic!("Expected Attachment, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_stop_hook_summary_with_snake_case_session_id() {
+    let json = serde_json::json!({
+        "parentUuid": "5445927e-82b0-4164-91f3-782fafd2a49e",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/home/brendan/src/moriarty",
+        // Distinct values prove the snake_case key populates `session_id_snake` independently of
+        // the camelCase `sessionId`; real logs always carry the same value in both.
+        "session_id": "77777777-7777-7777-7777-777777777777",
+        "sessionId": "88888888-8888-8888-8888-888888888888",
+        "version": "2.1.206",
+        "gitBranch": "main",
+        "type": "system",
+        "subtype": "stop_hook_summary",
+        "hookCount": 1,
+        "hookInfos": [{"command": "moriarty hooks exec"}],
+        "hookErrors": [],
+        "preventedContinuation": false,
+        "stopReason": "",
+        "hasOutput": false,
+        "level": "suggestion",
+        "timestamp": "2026-07-09T05:27:44.883Z",
+        "uuid": "35c84fed-bf99-42dc-a7bb-eae460cd23ab",
+        "toolUseID": "8f3746a9-caa9-4d2d-8e6e-e7a7b005d5d4"
+    });
+    let line: LogLine = serde_json::from_value(json)
+        .expect("Failed to parse stop_hook_summary with snake_case session_id");
+    match line {
+        LogLine::System(SystemLogLine::StopHookSummary(summary)) => {
+            assert_eq!(
+                summary.session_id_snake,
+                Some(
+                    "77777777-7777-7777-7777-777777777777"
+                        .parse::<Uuid>()
+                        .unwrap()
+                )
+            );
+            assert_eq!(
+                summary.session_id,
+                "88888888-8888-8888-8888-888888888888"
+                    .parse::<Uuid>()
+                    .unwrap()
+            );
+        }
+        _ => panic!("Expected System(StopHookSummary) variant"),
+    }
+}
+
+// Pre-2.1.206 records omit the snake_case duplicate, so `session_id_snake` stays `None`.
+#[test]
+fn test_parse_user_without_snake_case_session_id_yields_none() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "version": "2.1.201",
+        "gitBranch": "main",
+        "message": {"role": "user", "content": "test"},
+        "uuid": "550e8400-e29b-41d4-a716-446655440001",
+        "timestamp": "2026-07-09T00:00:00Z"
+    });
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(line.session_id_snake, None);
+}
+
 #[test]
 fn test_parse_assistant_without_web_fetch_requests() {
     // Test backward compatibility with old format (no web_fetch_requests)
