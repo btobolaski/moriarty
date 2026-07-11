@@ -549,7 +549,7 @@ struct Example {
 **Important**: Always use `#[serde(deny_unknown_fields)]` when deserializing Claude Code protocol messages (hooks, log
 parsing) to catch when Claude Code updates have added new fields that this codebase doesn't yet handle.
 
-**Exceptions**: in `pi_logs`, two categories of struct legitimately omit `deny_unknown_fields`:
+**Exceptions**: in `pi_logs`, three categories of struct legitimately omit `deny_unknown_fields`:
 
 Also, do not force `rename_all = "camelCase"` onto parser structs whose upstream wire schema is not camelCase. Preserve
 the on-disk protocol exactly, even when that means snake_case fields like `GitReadOnlyArgs.project_dir`.
@@ -567,6 +567,11 @@ the on-disk protocol exactly, even when that means snake_case fields like `GitRe
    `.limit` while keeping the rest of the struct strict) and untagged fallback enums (`EditEntry::Fragment` absorbs raw
    JSON tokens in an `edits` array; `MaybeU32::Garbage` absorbs string-typed corruption of numeric tool-call arguments).
    Each such exception must carry an inline comment naming the observed failure mode.
+3. **Forward-compatible protocol schemas**: structs representing server-defined or runtime-defined protocol envelopes
+   whose field sets evolve independently of the parser (e.g. `McpCallResult` for MCP tool-call results, which pi's
+   runtime regularly extends with new metadata fields like `contentBlocks`, `outputGuard`, and `omitted`). Every such
+   exception must carry a struct-level doc comment explaining why strict rejection is omitted and citing example fields
+   that motivated the relaxation.
 
 ## Suggesting Updates to CLAUDE.md
 

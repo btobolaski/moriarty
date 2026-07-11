@@ -2016,10 +2016,10 @@ fn mcp_tool_result_accepts_arbitrary_structured_content() {
     let mcp_result = details.mcp_result.expect("expected mcp result");
     assert_eq!(
         mcp_result.content,
-        vec![JsonBlob::from(json!({
+        Some(vec![JsonBlob::from(json!({
             "type": "resource",
             "resource": {"uri": "mcp://example/items/1", "text": "payload"}
-        }))]
+        }))])
     );
     assert_eq!(
         mcp_result.structured_content,
@@ -5214,6 +5214,93 @@ fn all_routed_mcp_tool_names_parse_client_errors() {
     }
 }
 
+#[test]
+fn mcp_call_result_accepts_omitted_content_shape() {
+    let call_json = json!({
+        "isError": false,
+        "omitted": true,
+        "contentBlocks": [{"type": "text", "bytes": 50000}],
+        "contentSummary": [{"type": "text", "text": "..."}],
+        "fullResultPath": "/tmp/full-result.txt",
+        "outputGuard": {"truncated": true, "originalBytes": 100000},
+        "rawResultBytes": 100000,
+        "reason": "oversized"
+    });
+    let result: McpCallResult =
+        serde_json::from_value(call_json).expect("omitted content shape should parse");
+    assert_eq!(result.is_error, false);
+    assert_eq!(result.omitted, Some(true));
+    assert!(result.content.is_none());
+    assert!(result.content_blocks.is_some());
+    assert!(result.content_summary.is_some());
+    assert_eq!(
+        result.full_result_path,
+        Some(PathBuf::from("/tmp/full-result.txt"))
+    );
+    assert!(result.output_guard.is_some());
+    assert_eq!(result.raw_result_bytes, Some(100000));
+    assert_eq!(result.reason.as_deref(), Some("oversized"));
+}
+
+#[test]
+fn mcp_call_result_tolerates_unknown_future_fields() {
+    let call_json = json!({
+        "isError": false,
+        "content": [{"type": "text", "text": "ok"}],
+        "futureExtension": {"nested": true, "version": 2}
+    });
+    let result: McpCallResult =
+        serde_json::from_value(call_json).expect("future fields should be tolerated");
+    assert_eq!(result.is_error, false);
+    assert!(result.content.is_some());
+}
+
+#[test]
+fn mcp_details_sessions_only_accepts_output_guard() {
+    let details: McpDetails = serde_json::from_value(json!({
+        "sessions": 1,
+        "outputGuard": {"truncated": true, "originalBytes": 100000}
+    }))
+    .expect("sessions-only shape with outputGuard should parse");
+    assert_eq!(details.sessions, Some(1));
+    assert!(details.output_guard.is_some());
+    assert!(details.mode.is_none());
+}
+
+#[test]
+fn acceptance_config_accepts_missing_finalization() {
+    let config: ResolvedAcceptanceConfig = serde_json::from_value(json!({
+        "level": "attested",
+        "explicit": false,
+        "inferredReason": ["read-only/reviewer-style agent"],
+        "criteria": [{
+            "id": "c1",
+            "must": "Return findings",
+            "evidence": ["review-findings"],
+            "severity": "required"
+        }],
+        "evidence": ["review-findings"],
+        "verify": [],
+        "stopRules": []
+    }))
+    .expect("acceptance config without finalization should parse");
+    assert_eq!(config.level, "attested");
+    assert!(config.finalization.is_none());
+}
+
+#[test]
+fn intercom_result_accepts_active_field() {
+    let details: IntercomResultDetails = serde_json::from_value(json!({
+        "messageId": "msg-1",
+        "delivered": true,
+        "active": true
+    }))
+    .expect("intercom result with active should parse");
+    assert_eq!(details.message_id.as_deref(), Some("msg-1"));
+    assert_eq!(details.delivered, Some(true));
+    assert_eq!(details.active, Some(true));
+}
+
 /// A successful direct MCP tool call emits a `{server, tool}` breadcrumb.
 /// This path was historically routed through the shape-based fallback
 /// (matching `GitReadOnlyDetails`); now `project_tools_run_*` and
@@ -5319,6 +5406,7 @@ fn mcp_details_serialize_hint_server_as_camel_case() {
         count: None,
         matches: None,
         query: None,
+        output_guard: None,
     })
     .expect("serialize mcp details");
 
@@ -5519,6 +5607,8 @@ fn assistant_usage_preserves_field_meaning() {
     assert_eq!(usage.cache_read, 0);
     assert_eq!(usage.cache_write, 0);
     assert_eq!(usage.total_tokens, 15);
+    // Reasoning was added later; older logs default to 0.
+    assert_eq!(usage.reasoning, 0);
     // Comparing via `to_string()` keeps the test free of a fresh `FromStr`
     // import while still pinning each cost component to its exact wire repr,
     // including the trailing zeros on the zero-cost fields.
@@ -5527,6 +5617,51 @@ fn assistant_usage_preserves_field_meaning() {
     assert_eq!(usage.cost.cache_read.to_string(), "0");
     assert_eq!(usage.cost.cache_write.to_string(), "0");
     assert_eq!(usage.cost.total.to_string(), "0.000105");
+}
+
+#[test]
+fn assistant_usage_reasoning_parses_when_present() {
+    let usage_with_reasoning = json!({
+        "input": 10,
+        "output": 5,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 20,
+        "reasoning": 42,
+        "cost": {
+            "input": "0.00003",
+            "output": "0.000075",
+            "cacheRead": "0",
+            "cacheWrite": "0",
+            "total": "0.000105",
+        },
+    });
+    let message = json!({
+        "type": "message",
+        "id": "a1",
+        "parentId": "u1",
+        "timestamp": FIXED_TIMESTAMP,
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "reply"}],
+            "api": "anthropic-messages",
+            "provider": "anthropic",
+            "model": "claude-sonnet-4-5",
+            "usage": usage_with_reasoning,
+            "stopReason": "stop",
+            "timestamp": MESSAGE_TIMESTAMP,
+        },
+    });
+    let line = parse(message);
+    let PiLogLine::Message(msg) = line else {
+        panic!("expected message");
+    };
+    let RoleMessage::Assistant(assistant) = &msg.message else {
+        panic!("expected assistant, got {:?}", msg.message);
+    };
+    assert_eq!(assistant.usage.reasoning, 42);
+    assert_eq!(assistant.usage.input, 10);
+    assert_eq!(assistant.usage.total_tokens, 20);
 }
 
 /// The cancelled path through `ask_user` omits `response` entirely
@@ -6291,6 +6426,58 @@ fn subagent_tool_result_accepts_needs_attention_control_event() {
 }
 
 #[test]
+fn subagent_tool_result_accepts_budget_and_transcript_fields() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "subagent",
+        vec![json!({"type": "text", "text": "complete"})],
+        false,
+        Some(json!({
+            "mode": "parallel",
+            "results": [{
+                "agent": "reviewer",
+                "toolBudget": {"soft": 20, "hard": 30, "block": ["bash"]},
+                "turnBudget": {"maxTurns": 10, "graceTurns": 3},
+                "turnBudgetExceeded": true,
+                "wrapUpRequested": true,
+                "transcriptPath": "/tmp/transcript.jsonl"
+            }],
+            "totalChildUsage": {"input": 100, "output": 50, "cacheRead": 10, "cacheWrite": 5, "cost": "0.05", "turns": 3},
+            "totalCost": {"inputTokens": 1000, "outputTokens": 500, "costUsd": 0.05}
+        })),
+    ));
+    let Some(ToolResultDetails::Subagent(details)) = tool_result.details else {
+        panic!("expected Subagent details")
+    };
+    let result = &details.results[0];
+    assert!(result.tool_budget.is_some());
+    let tb = result.tool_budget.as_ref().unwrap();
+    assert_eq!(tb.soft, 20);
+    assert_eq!(tb.hard, 30);
+    assert_eq!(tb.block.as_deref(), Some(&["bash".to_string()][..]));
+    assert!(result.turn_budget.is_some());
+    let trnb = result.turn_budget.as_ref().unwrap();
+    assert_eq!(trnb.max_turns, 10);
+    assert_eq!(trnb.grace_turns, 3);
+    assert_eq!(result.turn_budget_exceeded, Some(true));
+    assert_eq!(result.wrap_up_requested, Some(true));
+    assert_eq!(
+        result.transcript_path,
+        Some(PathBuf::from("/tmp/transcript.jsonl"))
+    );
+    let cu = details.total_child_usage.as_ref().unwrap();
+    assert_eq!(cu.input, 100);
+    assert_eq!(cu.output, 50);
+    assert_eq!(cu.cache_read, 10);
+    assert_eq!(cu.cache_write, 5);
+    assert_eq!(cu.cost.to_string(), "0.05");
+    assert_eq!(cu.turns, 3);
+    let tc = details.total_cost.as_ref().unwrap();
+    assert_eq!(tc.input_tokens, 1000);
+    assert_eq!(tc.output_tokens, 500);
+    assert_eq!(tc.cost_usd.to_string(), "0.05");
+}
+
+#[test]
 fn subagent_result_summary_serializes_control_events_as_camel_case() {
     let value = serde_json::to_value(SubagentResultSummary {
         agent: Some("code-quality-reviewer".to_string()),
@@ -6311,6 +6498,13 @@ fn subagent_result_summary_serializes_control_events_as_camel_case() {
         model_attempts: None,
         session_file: None,
         tool_calls: None,
+        tool_budget: None,
+        turn_budget: None,
+        turn_budget_exceeded: None,
+        wrap_up_requested: None,
+        detached: None,
+        detached_reason: None,
+        transcript_path: None,
         control_events: Some(vec![SubagentControlEvent::ActiveLongRunning(
             SubagentControlEventPayload {
                 to: "active_long_running".to_string(),
@@ -6700,8 +6894,9 @@ fn subagent_tool_result_parse_acceptance_ledger() {
         ea.review.as_ref().unwrap().agent.as_deref(),
         Some("test-quality-reviewer")
     );
-    assert_eq!(ea.finalization.mode, "self-review-loop");
-    assert_eq!(ea.finalization.max_turns, 3);
+    let fin = ea.finalization.as_ref().unwrap();
+    assert_eq!(fin.mode, "self-review-loop");
+    assert_eq!(fin.max_turns, 3);
 
     let report = acceptance.child_report.as_ref().unwrap();
     assert_eq!(
@@ -6804,4 +6999,71 @@ fn subagent_tool_result_rejects_unknown_nested_acceptance_field() {
         ),
         &["unknown field `unexpected`"],
     );
+}
+
+#[test]
+fn subagent_supervisor_request_custom_message_parses() {
+    let line = parse(json!({
+        "type": "custom_message",
+        "customType": "subagent_supervisor_request",
+        "content": "Child needs a decision",
+        "display": true,
+        "details": {
+            "id": "req-1",
+            "reason": "need_decision",
+            "expectsReply": true,
+            "runId": "run-42",
+            "agent": "reviewer",
+            "childIndex": 2
+        },
+        "id": "cm-1",
+        "parentId": "msg-1",
+        "timestamp": FIXED_TIMESTAMP,
+    }));
+
+    let PiLogLine::CustomMessage(msg) = line else {
+        panic!("expected custom_message");
+    };
+    let CustomMessagePayload::SubagentSupervisorRequest(req) = &msg.payload else {
+        panic!("expected SubagentSupervisorRequest");
+    };
+    assert_eq!(req.id, "req-1");
+    assert_eq!(req.reason, "need_decision");
+    assert!(req.expects_reply);
+    assert_eq!(req.run_id, "run-42");
+    assert_eq!(req.agent, "reviewer");
+    assert_eq!(req.child_index, 2);
+}
+
+#[test]
+fn subagent_supervisor_tool_result_parses() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "subagent_supervisor",
+        vec![json!({"type": "text", "text": "Replied to supervisor request"})],
+        false,
+        Some(json!({
+            "replyTo": "req-1",
+            "runId": "run-42",
+            "agent": "reviewer"
+        })),
+    ));
+    let Some(ToolResultDetails::SubagentSupervisor(details)) = tool_result.details else {
+        panic!("expected SubagentSupervisor details")
+    };
+    assert_eq!(details.reply_to, "req-1");
+    assert_eq!(details.run_id, "run-42");
+    assert_eq!(details.agent, "reviewer");
+}
+
+#[test]
+fn intercom_result_accepts_request_id() {
+    let details: IntercomResultDetails = serde_json::from_value(json!({
+        "messageId": "msg-1",
+        "delivered": true,
+        "requestId": "req-42"
+    }))
+    .expect("intercom result with requestId should parse");
+    assert_eq!(details.message_id.as_deref(), Some("msg-1"));
+    assert_eq!(details.delivered, Some(true));
+    assert_eq!(details.request_id.as_deref(), Some("req-42"));
 }

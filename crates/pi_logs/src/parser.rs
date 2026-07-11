@@ -11,7 +11,7 @@
 //! model-emitted payload before the runtime validates it, so hard-coding tool
 //! schemas into the parser would reject or misrepresent real sessions.
 //!
-//! Four categories of structure legitimately deviate from the strict default:
+//! Five categories of structure legitimately deviate from the strict default:
 //!
 //! * **`serde(flatten)` of an internally-tagged enum** — when the flattened
 //!   target is an internally-tagged enum (one with `#[serde(tag = "...")]`
@@ -62,6 +62,15 @@
 //!   [`reject_unknown_object_fields`] and the mode-based path via an
 //!   internally-derived `StrictMcpDetails` struct with
 //!   `#[serde(deny_unknown_fields)]`.
+//!
+//! * **Forward-compatible protocol schemas** — structs representing
+//!   server-defined or runtime-defined protocol envelopes whose field
+//!   sets evolve independently of the parser (e.g. [`McpCallResult`] for
+//!   MCP tool-call results, which pi's runtime regularly extends with new
+//!   metadata fields like `contentBlocks`, `outputGuard`, and `omitted`).
+//!   These structs omit `deny_unknown_fields` at the struct level and use
+//!   `#[serde(default)]` on every field, so unrecognized fields are
+//!   silently accepted rather than rejecting the whole log line.
 //!
 //! Each corrupt-stream exception carries an inline comment naming the
 //! observed failure mode.
@@ -304,6 +313,10 @@ pub enum CustomMessagePayload {
     /// underlying control event that triggered it.
     #[serde(rename = "subagent_control_notice")]
     SubagentControlNotice(Box<SubagentControlNoticeDetails>),
+    /// Supervisor request relayed via intercom (e.g. child subagent asking
+    /// the parent for a decision). Added in newer pi versions.
+    #[serde(rename = "subagent_supervisor_request")]
+    SubagentSupervisorRequest(SubagentSupervisorRequestDetails),
 }
 
 // ---------------------------------------------------------------------------
@@ -584,6 +597,10 @@ pub struct AssistantUsage {
     pub cache_read: u64,
     pub cache_write: u64,
     pub total_tokens: u64,
+    /// Reasoning tokens (e.g. from DeepSeek-V4-Pro, GLM-5.2).
+    /// Pi added this field later; optional for backward compatibility.
+    #[serde(default)]
+    pub reasoning: u64,
     pub cost: UsageCost,
 }
 
@@ -1721,6 +1738,9 @@ fn parse_tool_result_details(
             }
         }
         "subagent" => serde_json::from_value(details).map(ToolResultDetails::Subagent),
+        "subagent_supervisor" => {
+            serde_json::from_value(details).map(ToolResultDetails::SubagentSupervisor)
+        }
         "todo" => serde_json::from_value(details).map(ToolResultDetails::Todo),
         "web_search" => parse_web_search_details(details),
         _ => serde_json::from_value(details),
@@ -1787,6 +1807,7 @@ struct WebSearchCancelledDetails {
 pub enum ToolResultDetails {
     Edit(EditDetails),
     Subagent(SubagentResultDetails),
+    SubagentSupervisor(SubagentSupervisorResultDetails),
     AskUser(AskUserDetails),
     CodeSearch(CodeSearchDetails),
     ContactSupervisor(ContactSupervisorResultDetails),
@@ -1989,6 +2010,34 @@ pub struct SubagentResultDetails {
     /// agents; absent for single-agent or non-structured runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_graph: Option<WorkflowGraph>,
+    /// Tool budget configuration for the subagent run (soft/hard limits and
+    /// blocked tools). Added in newer pi versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_budget: Option<SubagentToolBudget>,
+    /// Turn budget configuration for the subagent run (max/grace turns).
+    /// Added in newer pi versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_budget: Option<SubagentTurnBudget>,
+    /// Aggregate usage across all child subagents in the run. Added in newer
+    /// pi versions; optional for backward compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_child_usage: Option<SubagentUsage>,
+    /// Aggregate cost summary across the entire subagent run. Added in newer
+    /// pi versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_cost: Option<SubagentTotalCost>,
+}
+
+/// Payload for the `subagent_supervisor` tool result, which captures a
+/// parent's reply to a child subagent's intercom supervisor request.
+/// Carries routing fields so the child can correlate the reply with its
+/// original request.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SubagentSupervisorResultDetails {
+    pub reply_to: String,
+    pub run_id: String,
+    pub agent: String,
 }
 
 /// One streaming progress record per subagent result. The pi runtime emits
@@ -2050,7 +2099,11 @@ pub struct ResolvedAcceptanceConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review: Option<AcceptanceReviewGate>,
     pub stop_rules: Vec<String>,
-    pub finalization: AcceptanceFinalizationConfig,
+    /// Finalization config for the acceptance contract (mode, max turns).
+    /// Optional for backward compatibility with older pi log files that
+    /// did not include this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finalization: Option<AcceptanceFinalizationConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -2256,6 +2309,35 @@ pub struct SubagentResultSummary {
     pub session_file: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<SubagentToolCallSummary>>,
+    /// Tool budget configuration for the subagent run (soft/hard limits and
+    /// blocked tools). Added in newer pi versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_budget: Option<SubagentToolBudget>,
+    /// Turn budget configuration for the subagent run (max/grace turns).
+    /// Added in newer pi versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_budget: Option<SubagentTurnBudget>,
+    /// Whether the subagent exceeded its turn budget. Added in newer pi
+    /// versions; absent when the budget was not configured or not exceeded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_budget_exceeded: Option<bool>,
+    /// Whether the subagent was asked to wrap up (turn limit approaching).
+    /// Added in newer pi versions; absent when wrap-up was not requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wrap_up_requested: Option<bool>,
+    /// Whether the subagent detached for intercom coordination (as opposed
+    /// to completing in-process). Added in newer pi versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detached: Option<bool>,
+    /// Reason for detachment (e.g. "intercom coordination"). Added in newer
+    /// pi versions alongside `detached`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detached_reason: Option<String>,
+    /// Top-level transcript path for the subagent session (distinct from the
+    /// per-file `transcriptPath` inside `artifactPaths`). Added in newer pi
+    /// versions; optional for backward compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_path: Option<PathBuf>,
     /// Control-channel events emitted by the pi subagent runtime while the
     /// child was running (for example the `active_long_running` notice). The
     /// parent surfaces these so downstream consumers can correlate notices
@@ -2343,6 +2425,65 @@ pub struct SubagentUsage {
     pub turns: u32,
 }
 
+/// Captures the tool-budget envelope that newer pi runtimes attach to
+/// subagent results. Kept as a separate strict struct rather than inline
+/// fields so the budget shape can evolve without touching every consumer.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SubagentToolBudget {
+    pub soft: u32,
+    pub hard: u32,
+    /// Tools blocked after the hard limit; `null` when no block is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block: Option<Vec<String>>,
+    /// Timestamp (ms since epoch) when the hard budget was reached.
+    /// Added in newer pi versions; absent when the budget was not exceeded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hard_reached_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soft_reached_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_count: Option<u64>,
+    /// Budget outcome (e.g. "completed", "exceeded"). Added in newer pi
+    /// versions; absent when the budget was not configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+}
+
+/// Captures the turn-budget envelope that newer pi runtimes attach to
+/// subagent results. Mirror of `SubagentToolBudget` for turn-count
+/// limits rather than tool-call limits.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SubagentTurnBudget {
+    pub max_turns: u32,
+    pub grace_turns: u32,
+    /// Turn number at which the budget was exceeded. Added in newer pi
+    /// versions; absent when the budget was not exceeded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exceeded_at_turn: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_count: Option<u64>,
+    /// Turn number at which wrap-up was requested. Added in newer pi
+    /// versions; absent when wrap-up was not requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wrap_up_requested_at_turn: Option<u32>,
+    /// Budget outcome (e.g. "completed", "exceeded"). Added in newer pi
+    /// versions; absent when the budget was not configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+}
+
+/// Aggregate token/cost totals that newer pi runtimes attach to the
+/// top-level subagent result envelope (distinct from per-result usage).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SubagentTotalCost {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cost_usd: Decimal,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SubagentArtifactPaths {
@@ -2350,6 +2491,10 @@ pub struct SubagentArtifactPaths {
     pub output_path: PathBuf,
     pub jsonl_path: PathBuf,
     pub metadata_path: PathBuf,
+    /// Transcript of the subagent session.
+    /// Pi added this field later; optional for backward compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -2360,6 +2505,21 @@ pub struct SubagentControlNoticeDetails {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub child_intercom_target: Option<String>,
     pub notice_text: String,
+}
+
+/// Payload for the `subagent_supervisor_request` custom message, which pi
+/// emits when a child subagent uses intercom to ask the parent for a
+/// decision. Carries the request identity, reason, and routing fields so
+/// the parent can correlate the request with the child's run and reply.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SubagentSupervisorRequestDetails {
+    pub id: String,
+    pub reason: String,
+    pub expects_reply: bool,
+    pub run_id: String,
+    pub agent: String,
+    pub child_index: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -2762,6 +2922,10 @@ pub struct McpDetails {
     /// local-state-only searches that don't issue a remote query.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query: Option<String>,
+    /// Overflow/truncation metadata added in newer pi versions when an
+    /// MCP response exceeds pi's in-message byte cap. Stored as raw JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_guard: Option<JsonBlob>,
 }
 
 impl<'de> Deserialize<'de> for McpDetails {
@@ -2777,7 +2941,12 @@ impl<'de> Deserialize<'de> for McpDetails {
         // `action: "ui-messages"` shape: { sessions: N } with no mode field.
         if !object.contains_key("mode") && object.contains_key("sessions") {
             let sessions = object_field::<u32>(object, "sessions").map_err(de::Error::custom)?;
-            reject_unknown_object_fields(object, &["sessions"]).map_err(de::Error::custom)?;
+            let output_guard = object
+                .get("outputGuard")
+                .map(|v| serde_json::from_value(v.clone()).map_err(de::Error::custom))
+                .transpose()?;
+            reject_unknown_object_fields(object, &["sessions", "outputGuard"])
+                .map_err(de::Error::custom)?;
             return Ok(McpDetails {
                 mode: None,
                 sessions: Some(sessions),
@@ -2795,6 +2964,7 @@ impl<'de> Deserialize<'de> for McpDetails {
                 count: None,
                 matches: None,
                 query: None,
+                output_guard,
             });
         }
 
@@ -2836,6 +3006,8 @@ impl<'de> Deserialize<'de> for McpDetails {
             matches: Option<Vec<JsonBlob>>,
             #[serde(default)]
             query: Option<String>,
+            #[serde(default)]
+            output_guard: Option<JsonBlob>,
         }
 
         let strict = StrictMcpDetails::deserialize(value).map_err(de::Error::custom)?;
@@ -2856,6 +3028,7 @@ impl<'de> Deserialize<'de> for McpDetails {
             count: strict.count,
             matches: strict.matches,
             query: strict.query,
+            output_guard: strict.output_guard,
         })
     }
 }
@@ -2872,15 +3045,54 @@ pub struct McpServerStatus {
     pub failed_ago: Option<u64>,
 }
 
+/// Generic MCP call payloads are server-defined, so preserve them as raw
+/// JSON instead of hard-coding Moriarty's command-result schema.
+/// `deny_unknown_fields` is intentionally omitted here because the MCP
+/// protocol and pi's runtime regularly add new fields to tool-result
+/// envelopes (e.g. `contentBlocks`, `outputGuard`, `omitted`).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct McpCallResult {
-    /// Generic MCP call payloads are server-defined, so preserve them as raw
-    /// JSON instead of hard-coding Moriarty's command-result schema.
-    pub content: Vec<JsonBlob>,
+    /// Optional because newer pi versions may omit `content` when `omitted`
+    /// is true and only `contentBlocks` is populated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<Vec<JsonBlob>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub structured_content: Option<JsonBlob>,
     pub is_error: bool,
+    /// Opaque content-block representation added in newer pi versions
+    /// alongside the flat `content` array; currently observed as null when
+    /// absent and present when pi records per-block tool-result metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_blocks: Option<JsonBlob>,
+    /// Short summary of tool-result content added in newer pi versions;
+    /// observable as null when absent and present when pi records a
+    /// content summary alongside the flat `content` array.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_summary: Option<JsonBlob>,
+    /// Path to an external file containing the full MCP tool result when
+    /// the result exceeded pi's in-message byte cap. Added in newer pi
+    /// versions; null or absent when the result fit in `content`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_result_path: Option<PathBuf>,
+    /// Overflow/truncation metadata added in newer pi versions when an MCP
+    /// tool result exceeds pi's in-message byte cap. Stored as raw JSON
+    /// because the schema is still evolving.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_guard: Option<JsonBlob>,
+    /// Flag indicating the tool result content was omitted (e.g. for
+    /// performance or privacy). Added in newer pi versions; absent when
+    /// content was included.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub omitted: Option<bool>,
+    /// Size in bytes of the raw tool result before truncation.
+    /// Added in newer pi versions; absent when content was not truncated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_result_bytes: Option<u64>,
+    /// Reason string for omitted or truncated results (e.g. "oversized",
+    /// "mcp-protocol-limits"). Added in newer pi versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// Client-side MCP call failure recorded when pi's MCP transport itself
@@ -2902,6 +3114,11 @@ pub struct McpClientError {
 pub struct McpBreadcrumb {
     pub server: String,
     pub tool: String,
+    /// Overflow/truncation metadata added in newer pi versions when an
+    /// MCP tool result exceeds pi's in-message byte cap. Stored as raw
+    /// JSON because the schema is still evolving.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_guard: Option<JsonBlob>,
 }
 
 /// Tool result details for MCP-based tools that are called directly (e.g.
@@ -3128,6 +3345,14 @@ pub struct IntercomResultDetails {
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<bool>,
+    /// Whether the intercom message is currently active (pending a response).
+    /// Added in newer pi versions; optional for backward compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active: Option<bool>,
+    /// Request identifier for the intercom message. Added in newer pi
+    /// versions; optional for backward compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
