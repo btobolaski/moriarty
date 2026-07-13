@@ -2035,16 +2035,46 @@ pub struct SubagentResultDetails {
     pub total_cost: Option<SubagentTotalCost>,
 }
 
-/// Payload for the `subagent_supervisor` tool result, which captures a
-/// parent's reply to a child subagent's intercom supervisor request.
-/// Carries routing fields so the child can correlate the reply with its
-/// original request.
+/// The native supervisor tool uses a different strict payload for each action.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SubagentSupervisorResultDetails {
+    Reply(SubagentSupervisorReplyDetails),
+    Status(SubagentSupervisorStatusDetails),
+    Pending(SubagentSupervisorPendingDetails),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct SubagentSupervisorResultDetails {
+pub struct SubagentSupervisorReplyDetails {
     pub reply_to: String,
     pub run_id: String,
     pub agent: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SubagentSupervisorStatusDetails {
+    pub active: bool,
+    pub pending: u32,
+    pub root: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SubagentSupervisorPendingDetails {
+    pub pending: Vec<PendingSupervisorRequest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PendingSupervisorRequest {
+    pub id: String,
+    pub run_id: String,
+    pub agent: String,
+    pub child_index: u32,
+    pub reason: String,
+    pub expects_reply: bool,
 }
 
 /// One streaming progress record per subagent result. The pi runtime emits
@@ -2106,6 +2136,8 @@ pub struct ResolvedAcceptanceConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review: Option<AcceptanceReviewGate>,
     pub stop_rules: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     /// Finalization config for the acceptance contract (mode, max turns).
     /// Optional for backward compatibility with older pi log files that
     /// did not include this field.

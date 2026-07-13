@@ -71,8 +71,7 @@ fn parse(value: Value) -> PiLogLine {
 fn parse_err(value: Value) -> ParseError {
     let raw = value.to_string();
     let parsed = parse_line(raw.as_str());
-    let err = parsed.expect_err(&format!("expected parse error\nJSON: {raw}"));
-    err
+    parsed.expect_err(&format!("expected parse error\nJSON: {raw}"))
 }
 
 fn message_line_json(id: &str, parent_id: &str, message: Value) -> Value {
@@ -5290,7 +5289,7 @@ fn mcp_call_result_accepts_omitted_content_shape() {
     });
     let result: McpCallResult =
         serde_json::from_value(call_json).expect("omitted content shape should parse");
-    assert_eq!(result.is_error, false);
+    assert!(!result.is_error);
     assert_eq!(result.omitted, Some(true));
     assert!(result.content.is_none());
     assert!(result.content_blocks.is_some());
@@ -5313,7 +5312,7 @@ fn mcp_call_result_tolerates_unknown_future_fields() {
     });
     let result: McpCallResult =
         serde_json::from_value(call_json).expect("future fields should be tolerated");
-    assert_eq!(result.is_error, false);
+    assert!(!result.is_error);
     assert!(result.content.is_some());
 }
 
@@ -5348,6 +5347,26 @@ fn acceptance_config_accepts_missing_finalization() {
     .expect("acceptance config without finalization should parse");
     assert_eq!(config.level, "attested");
     assert!(config.finalization.is_none());
+}
+
+#[test]
+fn acceptance_config_accepts_explicit_reason() {
+    let config: ResolvedAcceptanceConfig = serde_json::from_value(json!({
+        "level": "none",
+        "explicit": true,
+        "inferredReason": ["read-only/reviewer-style agent"],
+        "criteria": [],
+        "evidence": [],
+        "verify": [],
+        "stopRules": [],
+        "reason": "Acceptance gates disabled by user"
+    }))
+    .expect("acceptance config with an explicit reason should parse");
+
+    assert_eq!(
+        config.reason.as_deref(),
+        Some("Acceptance gates disabled by user")
+    );
 }
 
 #[test]
@@ -7113,12 +7132,70 @@ fn subagent_supervisor_tool_result_parses() {
             "agent": "reviewer"
         })),
     ));
-    let Some(ToolResultDetails::SubagentSupervisor(details)) = tool_result.details else {
-        panic!("expected SubagentSupervisor details")
+    let Some(ToolResultDetails::SubagentSupervisor(SubagentSupervisorResultDetails::Reply(
+        details,
+    ))) = tool_result.details
+    else {
+        panic!("expected SubagentSupervisor reply details")
     };
     assert_eq!(details.reply_to, "req-1");
     assert_eq!(details.run_id, "run-42");
     assert_eq!(details.agent, "reviewer");
+}
+
+#[test]
+fn subagent_supervisor_status_result_parses() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "subagent_supervisor",
+        vec![json!({"type": "text", "text": "Native supervisor channel active"})],
+        false,
+        Some(json!({
+            "active": true,
+            "pending": 0,
+            "root": "/tmp/pi-subagents/supervisor-channels"
+        })),
+    ));
+    let Some(ToolResultDetails::SubagentSupervisor(SubagentSupervisorResultDetails::Status(
+        details,
+    ))) = tool_result.details
+    else {
+        panic!("expected SubagentSupervisor status details")
+    };
+    assert!(details.active);
+    assert_eq!(details.pending, 0);
+    assert_eq!(
+        details.root,
+        PathBuf::from("/tmp/pi-subagents/supervisor-channels")
+    );
+}
+
+#[test]
+fn subagent_supervisor_pending_result_parses() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "subagent_supervisor",
+        vec![json!({"type": "text", "text": "Pending supervisor requests"})],
+        false,
+        Some(json!({
+            "pending": [{
+                "id": "req-1",
+                "runId": "run-42",
+                "agent": "reviewer",
+                "childIndex": 2,
+                "reason": "need_decision",
+                "expectsReply": true
+            }]
+        })),
+    ));
+    let Some(ToolResultDetails::SubagentSupervisor(SubagentSupervisorResultDetails::Pending(
+        details,
+    ))) = tool_result.details
+    else {
+        panic!("expected SubagentSupervisor pending details")
+    };
+    assert_eq!(details.pending[0].id, "req-1");
+    assert_eq!(details.pending[0].run_id, "run-42");
+    assert_eq!(details.pending[0].child_index, 2);
+    assert!(details.pending[0].expects_reply);
 }
 
 #[test]
