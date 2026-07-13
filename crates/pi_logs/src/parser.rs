@@ -191,7 +191,7 @@ pub struct ModelChangeLine {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ThinkingLevelChangeLine {
     pub id: String,
-    pub parent_id: String,
+    pub parent_id: Option<String>,
     pub timestamp: DateTime<Utc>,
     pub thinking_level: ThinkingLevel,
 }
@@ -2409,16 +2409,21 @@ pub struct SubagentControlEventPayload {
     /// runtime threshold knobs are user-configurable and the full set of
     /// reasons is not documented as a closed protocol enum.
     pub reason: String,
-    pub turns: u32,
-    pub tokens: u64,
-    pub tool_count: u32,
+    /// Async idle notices can fire before the child reports usage counters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turns: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_count: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_tool: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_tool_duration_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_path: Option<PathBuf>,
-    pub elapsed_ms: u64,
+    /// The runtime measures elapsed time with a sub-millisecond clock.
+    pub elapsed_ms: Decimal,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -2509,6 +2514,9 @@ pub struct SubagentArtifactPaths {
 pub struct SubagentControlNoticeDetails {
     pub event: SubagentControlEvent,
     pub source: String,
+    /// Async notices retain the run directory so the parent can inspect its artifacts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub async_dir: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub child_intercom_target: Option<String>,
     pub notice_text: String,

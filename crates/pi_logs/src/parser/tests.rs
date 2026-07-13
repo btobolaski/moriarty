@@ -754,10 +754,28 @@ fn thinking_level_change() {
 
     match line {
         PiLogLine::ThinkingLevelChange(thinking_level) => {
+            assert_eq!(thinking_level.parent_id.as_deref(), Some("m1"));
             assert_eq!(thinking_level.thinking_level, ThinkingLevel::High);
         }
         other => panic!("expected ThinkingLevelChange, got {other:?}"),
     }
+}
+
+#[test]
+fn thinking_level_change_accepts_null_parent_id() {
+    let line = parse(json!({
+        "type": "thinking_level_change",
+        "id": "t1",
+        "parentId": null,
+        "timestamp": FIXED_TIMESTAMP,
+        "thinkingLevel": "off",
+    }));
+
+    let PiLogLine::ThinkingLevelChange(thinking_level) = line else {
+        panic!("expected ThinkingLevelChange")
+    };
+    assert_eq!(thinking_level.parent_id, None);
+    assert_eq!(thinking_level.thinking_level, ThinkingLevel::Off);
 }
 
 #[test]
@@ -4593,14 +4611,58 @@ fn custom_message_subagent_control_notice_accepts_needs_attention_event() {
                 "documentation-reviewer needs attention (no observed activity for 60s)"
             );
             assert_eq!(event.reason, "idle");
-            assert_eq!(event.turns, 12);
-            assert_eq!(event.tokens, 71740);
-            assert_eq!(event.tool_count, 54);
+            assert_eq!(event.turns, Some(12));
+            assert_eq!(event.tokens, Some(71740));
+            assert_eq!(event.tool_count, Some(54));
             assert_eq!(
                 event.current_path,
                 Some(PathBuf::from("review-documentation-3.md"))
             );
-            assert_eq!(event.elapsed_ms, 60887);
+            assert_eq!(event.elapsed_ms, Decimal::from(60887));
+        }
+        other => panic!("expected SubagentControlNotice, got {other:?}"),
+    }
+}
+
+#[test]
+fn custom_message_subagent_control_notice_accepts_fractional_async_event() {
+    match parse_custom_message_payload(
+        "Subagent needs attention: scout",
+        "subagent_control_notice",
+        Some(json!({
+            "event": {
+                "type": "needs_attention",
+                "to": "needs_attention",
+                "ts": 1783963467012_u64,
+                "runId": "1f2886b7",
+                "agent": "scout",
+                "index": 0,
+                "message": "scout needs attention (no observed activity for 60s)",
+                "reason": "idle",
+                "elapsedMs": 60068.85791015625_f64
+            },
+            "source": "async",
+            "asyncDir": "/tmp/pi-subagents/1f2886b7",
+            "childIntercomTarget": "subagent-scout-1f2886b7-1",
+            "noticeText": "Subagent needs attention: scout"
+        })),
+    ) {
+        CustomMessagePayload::SubagentControlNotice(details) => {
+            assert_eq!(details.source, "async");
+            assert_eq!(
+                details.async_dir,
+                Some(PathBuf::from("/tmp/pi-subagents/1f2886b7"))
+            );
+            let SubagentControlEvent::NeedsAttention(event) = details.event else {
+                panic!("expected needs_attention event")
+            };
+            assert_eq!(event.turns, None);
+            assert_eq!(event.tokens, None);
+            assert_eq!(event.tool_count, None);
+            assert_eq!(
+                event.elapsed_ms,
+                Decimal::from_str_exact("60068.85791015625").unwrap()
+            );
         }
         other => panic!("expected SubagentControlNotice, got {other:?}"),
     }
@@ -6346,16 +6408,16 @@ fn subagent_tool_result_accepts_active_long_running_control_event() {
         "code-quality-reviewer is still active but long-running"
     );
     assert_eq!(event.reason, "turn_threshold");
-    assert_eq!(event.turns, 15);
-    assert_eq!(event.tokens, 121069);
-    assert_eq!(event.tool_count, 44);
+    assert_eq!(event.turns, Some(15));
+    assert_eq!(event.tokens, Some(121069));
+    assert_eq!(event.tool_count, Some(44));
     assert_eq!(event.current_tool.as_deref(), Some("read"));
     assert_eq!(event.current_tool_duration_ms, Some(1500));
     assert_eq!(
         event.current_path,
         Some(PathBuf::from("charts/temporal/values.yaml"))
     );
-    assert_eq!(event.elapsed_ms, 97198);
+    assert_eq!(event.elapsed_ms, Decimal::from(97198));
 }
 
 #[test]
@@ -6411,9 +6473,9 @@ fn subagent_tool_result_accepts_needs_attention_control_event() {
         "documentation-reviewer needs attention (no observed activity for 60s)"
     );
     assert_eq!(event.reason, "idle");
-    assert_eq!(event.turns, 12);
-    assert_eq!(event.tokens, 71740);
-    assert_eq!(event.tool_count, 54);
+    assert_eq!(event.turns, Some(12));
+    assert_eq!(event.tokens, Some(71740));
+    assert_eq!(event.tool_count, Some(54));
     assert_eq!(event.current_tool.as_deref(), Some("intercom"));
     assert_eq!(event.current_tool_duration_ms, Some(60617));
     assert_eq!(
@@ -6422,7 +6484,7 @@ fn subagent_tool_result_accepts_needs_attention_control_event() {
             "/Users/brendan/src/hydrogen-cloud/review-documentation-3.md"
         ))
     );
-    assert_eq!(event.elapsed_ms, 60887);
+    assert_eq!(event.elapsed_ms, Decimal::from(60887));
 }
 
 #[test]
@@ -6519,13 +6581,13 @@ fn subagent_result_summary_serializes_control_events_as_camel_case() {
                 index: 0,
                 message: "still active".to_string(),
                 reason: "turn_threshold".to_string(),
-                turns: 15,
-                tokens: 121069,
-                tool_count: 44,
+                turns: Some(15),
+                tokens: Some(121069),
+                tool_count: Some(44),
                 current_tool: None,
                 current_tool_duration_ms: None,
                 current_path: Some(PathBuf::from("charts/temporal/values.yaml")),
-                elapsed_ms: 97198,
+                elapsed_ms: Decimal::from(97198),
             },
         )]),
         acceptance: None,
