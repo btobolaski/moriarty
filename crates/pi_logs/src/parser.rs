@@ -2005,6 +2005,13 @@ pub struct SubagentResultDetails {
     /// Working directory where the async run is staging its artifacts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub async_dir: Option<PathBuf>,
+    /// Added in newer pi versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    /// Absolute deadline (Unix epoch ms) after which the subagent will be
+    /// interrupted. Added in newer pi versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_at: Option<u64>,
     /// Structured execution tree for multi-agent workflow runs. Present
     /// when the subagent operation tracks parallel groups and nested
     /// agents; absent for single-agent or non-structured runs.

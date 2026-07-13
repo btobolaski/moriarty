@@ -6426,7 +6426,7 @@ fn subagent_tool_result_accepts_needs_attention_control_event() {
 }
 
 #[test]
-fn subagent_tool_result_accepts_budget_and_transcript_fields() {
+fn subagent_tool_result_accepts_budget_transcript_timeout_and_deadline_fields() {
     let tool_result = parse_tool_result_message(tool_result_message_json(
         "subagent",
         vec![json!({"type": "text", "text": "complete"})],
@@ -6441,6 +6441,8 @@ fn subagent_tool_result_accepts_budget_and_transcript_fields() {
                 "wrapUpRequested": true,
                 "transcriptPath": "/tmp/transcript.jsonl"
             }],
+            "timeoutMs": 600000,
+            "deadlineAt": 1783906909078u64,
             "totalChildUsage": {"input": 100, "output": 50, "cacheRead": 10, "cacheWrite": 5, "cost": "0.05", "turns": 3},
             "totalCost": {"inputTokens": 1000, "outputTokens": 500, "costUsd": 0.05}
         })),
@@ -6475,6 +6477,8 @@ fn subagent_tool_result_accepts_budget_and_transcript_fields() {
     assert_eq!(tc.input_tokens, 1000);
     assert_eq!(tc.output_tokens, 500);
     assert_eq!(tc.cost_usd.to_string(), "0.05");
+    assert_eq!(details.timeout_ms, Some(600000));
+    assert_eq!(details.deadline_at, Some(1783906909078));
 }
 
 #[test]
