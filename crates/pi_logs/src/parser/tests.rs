@@ -2280,7 +2280,8 @@ fn web_search_tool_result_accepts_details() {
             "successfulQueries": 1,
             "totalResults": 3,
             "includeContent": true,
-            "queries": ["rust serde deny_unknown_fields", "pi log parser"]
+            "queries": ["rust serde deny_unknown_fields", "pi log parser"],
+            "fetchUrls": ["https://example.com/page1", "https://example.com/page2"]
         })),
     ));
 
@@ -2300,6 +2301,15 @@ fn web_search_tool_result_accepts_details() {
     assert!(!details.cancelled);
     assert_eq!(details.error, None);
     assert_eq!(details.cancel_reason, None);
+    assert_eq!(
+        details.fetch_urls.as_deref(),
+        Some(
+            &[
+                "https://example.com/page1".to_string(),
+                "https://example.com/page2".to_string()
+            ][..]
+        )
+    );
 }
 
 #[test]
@@ -4498,6 +4508,35 @@ fn custom_message_subagent_notify_rejects_details() {
             "unknown variant",
             "did not match any variant",
             "subagent-notify",
+        ],
+    );
+}
+
+#[test]
+fn custom_message_web_search_content_ready_has_no_details() {
+    assert!(matches!(
+        parse_custom_message_payload(
+            "Content fetched for 50/51 URLs [abc123]. Full page content now available.",
+            "web-search-content-ready",
+            None,
+        ),
+        CustomMessagePayload::WebSearchContentReady
+    ));
+}
+
+#[test]
+fn custom_message_web_search_content_ready_rejects_details() {
+    assert_parse_error_contains_any(
+        "web-search-content-ready rejects details",
+        custom_message_json(
+            "Content fetched for 50/51 URLs [abc123].",
+            "web-search-content-ready",
+            Some(json!({"unexpected": true})),
+        ),
+        &[
+            "unknown variant",
+            "did not match any variant",
+            "web-search-content-ready",
         ],
     );
 }

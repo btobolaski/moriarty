@@ -317,6 +317,11 @@ pub enum CustomMessagePayload {
     /// the parent for a decision). Added in newer pi versions.
     #[serde(rename = "subagent_supervisor_request")]
     SubagentSupervisorRequest(SubagentSupervisorRequestDetails),
+    /// Announced by the web-search extension when background content
+    /// fetching completes. The human-readable progress summary lives in
+    /// the outer `content` field; no structured `details` payload.
+    #[serde(rename = "web-search-content-ready")]
+    WebSearchContentReady,
 }
 
 // ---------------------------------------------------------------------------
@@ -1761,6 +1766,7 @@ fn parse_web_search_details(details: Value) -> Result<ToolResultDetails, serde_j
         Ok(ToolResultDetails::WebSearch(WebSearchDetails {
             fetch_id: cancelled.fetch_id,
             search_id: cancelled.search_id,
+            fetch_urls: None,
             query_count: 0,
             successful_queries: 0,
             total_results: 0,
@@ -2691,6 +2697,10 @@ pub struct WebSearchDetails {
     pub fetch_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search_id: Option<String>,
+    /// URLs fetched asynchronously for content extraction (present
+    /// when `include_content` is true). Absent from older log entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetch_urls: Option<Vec<String>>,
     pub query_count: u32,
     pub successful_queries: u32,
     pub total_results: u32,
