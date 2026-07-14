@@ -6064,6 +6064,7 @@ fn skill_tool_result_preserves_empty_error_details() {
 fn subagent_tool_result_accepts_all_mode_values() {
     for (wire_mode, expected_mode) in [
         ("async", SubagentResultMode::Async),
+        ("chain", SubagentResultMode::Chain),
         ("management", SubagentResultMode::Management),
         ("parallel", SubagentResultMode::Parallel),
         ("single", SubagentResultMode::Single),

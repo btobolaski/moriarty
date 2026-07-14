@@ -1940,6 +1940,7 @@ pub struct EditDetails {
 #[serde(rename_all = "lowercase")]
 pub enum SubagentResultMode {
     Async,
+    Chain,
     Management,
     Parallel,
     Single,
