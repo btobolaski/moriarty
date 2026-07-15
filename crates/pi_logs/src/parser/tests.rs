@@ -4112,6 +4112,28 @@ fn get_search_content_tool_result_accepts_error_details() {
         panic!("expected GetSearchContent error details")
     };
     assert_eq!(details.error, "URL not found");
+    assert!(details.url.is_none());
+    assert!(details.response_id.is_none());
+}
+
+#[test]
+fn get_search_content_tool_result_accepts_error_details_with_url() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "get_search_content",
+        vec![json!({"type": "text", "text": "HTTP 404: Not Found"})],
+        false,
+        Some(json!({
+            "error": "HTTP 404: Not Found",
+            "url": "https://example.com/missing",
+        })),
+    ));
+    let Some(ToolResultDetails::GetSearchContent(GetSearchContentDetails::Error(details))) =
+        tool_result.details
+    else {
+        panic!("expected GetSearchContent error details")
+    };
+    assert_eq!(details.error, "HTTP 404: Not Found");
+    assert_eq!(details.url.as_deref(), Some("https://example.com/missing"));
     assert!(details.response_id.is_none());
 }
 

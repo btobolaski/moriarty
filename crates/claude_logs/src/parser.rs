@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use tokio::fs::read_to_string;
 use uuid::Uuid;
 
+use crate::model::Model;
+
 #[cfg(test)]
 mod tests;
 
@@ -387,6 +389,7 @@ pub enum AttachmentData {
     PlanModeExit(PlanModeExitAttachment),
     PlanModeReentry(PlanModeReentryAttachment),
     QueuedCommand(QueuedCommand),
+    ReadTruncationNotice(ReadTruncationNotice),
     SkillListing(SkillListing),
     TaskReminder(TaskReminder),
 }
@@ -751,6 +754,18 @@ pub struct QueuedCommand {
     pub timestamp: Option<DateTime<Utc>>,
 }
 
+/// Preserves the warning Claude Code emits when `Read` returns only part of an oversized result,
+/// so transcript consumers do not mistake that page for the complete tool output. Observed in
+/// Claude Code 2.1.206+.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct ReadTruncationNotice {
+    pub banner: String,
+    #[serde(rename = "toolUseID")]
+    pub tool_use_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
@@ -799,6 +814,39 @@ pub enum SystemLogLine {
     StopHookSummary(StopHookSummary),
     TurnDuration(TurnDuration),
     ModelRefusalFallback(ModelRefusalFallback),
+    ModelConsentFallback(ModelConsentFallback),
+}
+
+/// Records Claude Code's session-level fallback when the selected model requires usage-credit
+/// consent that is unavailable. This is distinct from `ModelRefusalFallback`: no request was
+/// refused and no assistant messages were retracted. Added in Claude Code 2.1.206+.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct ModelConsentFallback {
+    pub parent_uuid: Option<Uuid>,
+    pub is_sidechain: bool,
+    pub content: String,
+    pub level: String,
+    /// Kept raw because consent handling may add choices beyond the observed `switch_default`.
+    pub choice: String,
+    pub original_model: Model,
+    pub fallback_model: Model,
+    pub persisted_as_default: bool,
+    pub is_meta: bool,
+    pub timestamp: DateTime<Utc>,
+    pub uuid: Uuid,
+    /// Claude Code writes both session-id spellings on this record; separate fields avoid serde's
+    /// duplicate-field rejection while preserving the exact wire shape.
+    #[serde(rename = "session_id")]
+    pub session_id_snake: Uuid,
+    pub user_type: String,
+    pub entrypoint: Option<String>,
+    pub cwd: String,
+    pub session_id: Uuid,
+    pub version: String,
+    pub git_branch: String,
+    pub slug: Option<String>,
 }
 
 /// Emitted when a model's safety measures refuse a request and Claude Code retries it on a
@@ -826,8 +874,8 @@ pub struct ModelRefusalFallback {
     /// Only `"refusal"` has been observed; raw `String` for the same
     /// forward-compatibility reason as `direction`.
     pub trigger: String,
-    pub original_model: crate::model::Model,
-    pub fallback_model: crate::model::Model,
+    pub original_model: Model,
+    pub fallback_model: Model,
     pub request_id: String,
     /// Structured refusal category from the API's `stop_details` (e.g. "cyber", "bio");
     /// `null` when the API supplied none.
@@ -903,8 +951,8 @@ pub struct StopHookSummary {
     /// the camelCase `sessionId` (`session_id` above); the two always carry the same value. Modeled
     /// as its own field rather than a `#[serde(alias)]` on `session_id` because both keys appear at
     /// once, which serde would reject as a duplicate. `Option` so pre-2.1.206 lines still parse.
-    /// Only the `stop_hook_summary` system record carries this duplicate; other system variants do
-    /// not, so the field lives here rather than on a shared system envelope.
+    /// The duplication is variant-specific, so this stays here rather than on a shared system
+    /// envelope; `model_consent_fallback` models its own duplicate the same way.
     #[serde(rename = "session_id")]
     pub session_id_snake: Option<Uuid>,
 }
@@ -1240,6 +1288,9 @@ pub struct TurnDuration {
     pub message_count: Option<u32>,
     /// Background agents still running when the turn completed. Added in Claude Code 2.1.170+.
     pub pending_background_agent_count: Option<u32>,
+    /// Optional because only workflow-enabled turns emit this count. Observed in Claude Code
+    /// 2.1.206+.
+    pub pending_workflow_count: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1328,6 +1379,9 @@ pub struct UserLogLine {
     /// not a UUID). Added in Claude Code 2.1.170+.
     #[serde(rename = "sourceToolUseID")]
     pub source_tool_use_id: Option<String>,
+    /// Optional because ordinary user turns and non-terminal tool results omit this workflow
+    /// control flag. Observed in Claude Code 2.1.206+.
+    pub tool_ends_turn: Option<bool>,
     /// Prompt identifier for tracking prompt lineage. Added in Claude Code 2.1.77+.
     pub prompt_id: Option<Uuid>,
     /// How the prompt was submitted (e.g., "typed"). Added in Claude Code 2.1.170+.
@@ -1509,7 +1563,7 @@ pub enum LogMessageTaggedContent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FallbackModelRef {
-    pub model: crate::model::Model,
+    pub model: Model,
 }
 
 /// Caller information for tool use tracking. Added in Claude Code 2.1.12+.
@@ -1609,7 +1663,7 @@ pub struct AssistantLogMessage {
     pub id: String,
     pub r#type: String,
     pub role: String,
-    pub model: crate::model::Model,
+    pub model: Model,
     pub container: Option<String>,
     pub content: LogMessageContent,
     pub stop_reason: Option<String>,
@@ -1655,19 +1709,24 @@ pub enum CacheMissReason {
 /// Stop details from the Anthropic Messages API. Added in Claude Code 2.1.77+.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct StopDetails {
-    pub r#type: StopType,
-    pub stop_sequence: Option<String>,
-}
-
-/// The reason the model stopped generating tokens.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
-pub enum StopType {
-    EndTurn,
-    StopSequence,
-    MaxTokens,
+pub enum StopDetails {
+    EndTurn {
+        stop_sequence: Option<String>,
+    },
+    StopSequence {
+        stop_sequence: Option<String>,
+    },
+    MaxTokens {
+        stop_sequence: Option<String>,
+    },
+    Refusal {
+        category: String,
+        explanation: String,
+        fallback_has_prefill_claim: bool,
+        recommended_model: Option<Model>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1702,7 +1761,7 @@ pub struct Iteration {
     /// Model that served this iteration; differs across iterations when the
     /// request fell back to another model (`type: "fallback_message"`).
     /// Added in Claude Code 2.1.170+.
-    pub model: Option<crate::model::Model>,
+    pub model: Option<Model>,
 }
 
 /// Speed setting for inference. Added in Claude Code 2.1.77+.

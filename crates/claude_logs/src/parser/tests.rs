@@ -2069,6 +2069,89 @@ fn test_parse_model_refusal_fallback_rejects_unknown_fields() {
     );
 }
 
+fn model_consent_fallback_json() -> serde_json::Value {
+    serde_json::json!({
+        "parentUuid": "f37b9468-0ca5-4a8c-a37c-23edfa132e2f",
+        "isSidechain": false,
+        "type": "system",
+        "subtype": "model_consent_fallback",
+        "content": "Switched to Opus 4.8 (1M context) for this session · Fable 5 requires usage credits · /model to change",
+        "level": "warning",
+        "choice": "switch_default",
+        "originalModel": "claude-fable-5",
+        "fallbackModel": "claude-opus-4-8[1m]",
+        "persistedAsDefault": false,
+        "isMeta": false,
+        "timestamp": "2026-07-15T16:42:33.669Z",
+        "uuid": "2fed4bf1-10c6-4bed-b475-c8f26de3d992",
+        "session_id": "1bde49fd-c08a-4fe3-8be3-d44c8d858f3e",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "1bde49fd-c08a-4fe3-8be3-d44c8d858f3e",
+        "version": "2.1.206",
+        "gitBranch": "HEAD",
+        "slug": "purring-skipping-mountain"
+    })
+}
+
+#[test]
+fn test_parse_model_consent_fallback() {
+    let json = model_consent_fallback_json();
+    let line: LogLine =
+        serde_json::from_value(json.clone()).expect("Failed to parse model_consent_fallback");
+    assert_eq!(
+        serde_json::to_value(&line).expect("Failed to serialize model_consent_fallback"),
+        json
+    );
+
+    match line {
+        LogLine::System(SystemLogLine::ModelConsentFallback(fallback)) => {
+            assert_eq!(fallback.choice, "switch_default");
+            assert_eq!(fallback.original_model.raw(), "claude-fable-5");
+            assert_eq!(fallback.fallback_model.raw(), "claude-opus-4-8[1m]");
+            assert_eq!(fallback.fallback_model.to_string(), "Opus 4.8");
+            assert!(!fallback.persisted_as_default);
+            assert_eq!(fallback.session_id, fallback.session_id_snake);
+            assert_eq!(fallback.entrypoint.as_deref(), Some("cli"));
+            assert_eq!(fallback.slug.as_deref(), Some("purring-skipping-mountain"));
+        }
+        _ => panic!("Expected System(ModelConsentFallback) variant"),
+    }
+}
+
+#[test]
+fn test_parse_model_consent_fallback_accepts_unknown_choice() {
+    let mut json = model_consent_fallback_json();
+    json.as_object_mut()
+        .expect("fixture must be an object")
+        .insert("choice".to_string(), serde_json::json!("ask_again"));
+
+    match serde_json::from_value::<LogLine>(json)
+        .expect("model_consent_fallback choice must remain forward-compatible")
+    {
+        LogLine::System(SystemLogLine::ModelConsentFallback(fallback)) => {
+            assert_eq!(fallback.choice, "ask_again");
+        }
+        _ => panic!("Expected System(ModelConsentFallback) variant"),
+    }
+}
+
+#[test]
+fn test_parse_model_consent_fallback_rejects_unknown_fields() {
+    let mut json = model_consent_fallback_json();
+    json.as_object_mut()
+        .expect("fixture must be an object")
+        .insert("unknownField".to_string(), serde_json::json!(true));
+
+    let error = serde_json::from_value::<LogLine>(json)
+        .expect_err("model_consent_fallback must reject unknown fields");
+    assert!(
+        error.to_string().contains("unknown field"),
+        "unexpected error: {error}"
+    );
+}
+
 #[test]
 fn test_parse_turn_duration() {
     let json = serde_json::json!({
@@ -2746,6 +2829,62 @@ fn test_parse_user_log_line_with_source_tool_assistant_uuid() {
         line.source_tool_assistant_uuid,
         Some(Uuid::parse_str("550e8400-e29b-41d4-a716-446655440099").unwrap())
     );
+}
+
+#[test]
+fn test_parse_user_log_line_with_tool_ends_turn() {
+    let json = serde_json::json!({
+        "parentUuid": "b47a9862-3f97-46d5-8d7a-5e6aeaa05a13",
+        "isSidechain": true,
+        "promptId": "37bc4209-4827-461d-b7d5-6d3a1737da55",
+        "agentId": "a14d40e18963bb5c5",
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [{
+                "tool_use_id": "toolu_01BX4nyDkkyCK3pbopv4Ux2R",
+                "type": "tool_result",
+                "content": "Structured output provided successfully"
+            }]
+        },
+        "uuid": "d800de02-0edd-4606-9a21-13640c3970c9",
+        "timestamp": "2026-07-15T15:53:10.905Z",
+        "toolEndsTurn": true,
+        "sourceToolAssistantUUID": "b47a9862-3f97-46d5-8d7a-5e6aeaa05a13",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "1bde49fd-c08a-4fe3-8be3-d44c8d858f3e",
+        "version": "2.1.206",
+        "gitBranch": "HEAD"
+    });
+
+    let line: LogLine = serde_json::from_value(json).expect("Should parse toolEndsTurn");
+    match line {
+        LogLine::User(user) => assert_eq!(user.tool_ends_turn, Some(true)),
+        other => panic!("Expected User, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_parse_user_log_line_with_tool_ends_turn_false() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": true,
+        "agentId": "agent-1",
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "version": "2.1.206",
+        "gitBranch": "HEAD",
+        "message": {"role": "user", "content": "continue"},
+        "uuid": "550e8400-e29b-41d4-a716-446655440001",
+        "timestamp": "2026-07-15T15:53:10.905Z",
+        "toolEndsTurn": false
+    });
+
+    let line: UserLogLine = serde_json::from_value(json).expect("Should preserve false");
+    assert_eq!(line.tool_ends_turn, Some(false));
 }
 
 #[test]
@@ -5747,9 +5886,12 @@ fn test_parse_assistant_message_with_stop_details_end_turn() {
         "timestamp": "2025-01-01T00:00:00Z"
     });
     let line: AssistantLogLine = serde_json::from_value(json).unwrap();
-    let stop_details = line.message.stop_details.unwrap();
-    assert_eq!(stop_details.r#type, StopType::EndTurn);
-    assert_eq!(stop_details.stop_sequence, None);
+    assert_eq!(
+        line.message.stop_details,
+        Some(StopDetails::EndTurn {
+            stop_sequence: None
+        })
+    );
 }
 
 #[test]
@@ -5785,9 +5927,87 @@ fn test_parse_assistant_message_with_stop_details_stop_sequence() {
         "timestamp": "2025-01-01T00:00:00Z"
     });
     let line: AssistantLogLine = serde_json::from_value(json).unwrap();
-    let stop_details = line.message.stop_details.unwrap();
-    assert_eq!(stop_details.r#type, StopType::StopSequence);
-    assert_eq!(stop_details.stop_sequence, Some("</result>".to_string()));
+    assert_eq!(
+        line.message.stop_details,
+        Some(StopDetails::StopSequence {
+            stop_sequence: Some("</result>".to_string())
+        })
+    );
+}
+
+#[test]
+fn test_parse_assistant_message_with_stop_details_refusal() {
+    let json = serde_json::json!({
+        "parentUuid": "4d6871d6-3564-4b65-acb7-4f35e2e35fcd",
+        "isSidechain": true,
+        "agentId": "a10a0c9183a023b6b",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "1bde49fd-c08a-4fe3-8be3-d44c8d858f3e",
+        "version": "2.1.206",
+        "gitBranch": "HEAD",
+        "message": {
+            "id": "msg_011Cd49BEfBZCRGtkgZy4Znn",
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "model": "claude-fable-5",
+            "stop_reason": "refusal",
+            "stop_sequence": null,
+            "stop_details": {
+                "type": "refusal",
+                "category": "cyber",
+                "explanation": "This request triggered restrictions.",
+                "fallback_has_prefill_claim": true,
+                "recommended_model": null
+            },
+            "usage": {
+                "input_tokens": 2,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "output_tokens": 1,
+                "cache_creation": {
+                    "ephemeral_1h_input_tokens": 0,
+                    "ephemeral_5m_input_tokens": 0
+                }
+            }
+        },
+        "uuid": "be321e14-803d-4b3c-9410-3ef092292eec",
+        "timestamp": "2026-07-15T16:16:28.036Z"
+    });
+
+    let line: AssistantLogLine = serde_json::from_value(json).expect("Should parse refusal");
+    assert_eq!(
+        line.message.stop_details,
+        Some(StopDetails::Refusal {
+            category: "cyber".to_string(),
+            explanation: "This request triggered restrictions.".to_string(),
+            fallback_has_prefill_claim: true,
+            recommended_model: None,
+        })
+    );
+}
+
+#[test]
+fn test_parse_refusal_stop_details_with_recommended_model() {
+    let json = serde_json::json!({
+        "type": "refusal",
+        "category": "cyber",
+        "explanation": "Retry on the recommended model.",
+        "fallback_has_prefill_claim": false,
+        "recommended_model": "claude-opus-4-8"
+    });
+
+    let stop_details: StopDetails =
+        serde_json::from_value(json).expect("Should parse recommended_model");
+    match stop_details {
+        StopDetails::Refusal {
+            recommended_model: Some(model),
+            ..
+        } => assert_eq!(model.raw(), "claude-opus-4-8"),
+        other => panic!("Expected Refusal with a recommended model, got {other:?}"),
+    }
 }
 
 #[test]
@@ -5838,6 +6058,22 @@ fn test_parse_stop_details_rejects_unknown_fields() {
         err.to_string().contains("unknown field"),
         "Error should mention unknown field, got: {}",
         err
+    );
+}
+
+#[test]
+fn test_parse_refusal_stop_details_requires_refusal_fields() {
+    let json = serde_json::json!({
+        "type": "refusal",
+        "recommended_model": null
+    });
+
+    let error = serde_json::from_value::<StopDetails>(json)
+        .expect_err("Should require refusal-specific fields")
+        .to_string();
+    assert!(
+        error.contains("missing field"),
+        "Error should name a missing refusal field, got: {error}"
     );
 }
 
@@ -6337,6 +6573,64 @@ fn test_parse_attachment_deferred_tools_delta() {
         },
         other => panic!("Expected Attachment, got {:?}", other),
     }
+}
+
+#[test]
+fn test_parse_attachment_read_truncation_notice() {
+    let expected_banner = "[Truncated: PARTIAL view — /tmp/task.output: showing lines 1-395 of 1282 total (68943 tokens, cap 25000).]";
+    let json = serde_json::json!({
+        "parentUuid": "b35b8500-ef4f-4780-8e0a-1b4283ded2a5",
+        "isSidechain": false,
+        "attachment": {
+            "type": "read_truncation_notice",
+            "banner": expected_banner,
+            "toolUseID": "toolu_01At3K4pi5v6Ejx6tDDzghPy"
+        },
+        "type": "attachment",
+        "uuid": "d4e923c5-4523-486c-b549-e3202e177585",
+        "timestamp": "2026-07-10T23:49:39.051Z",
+        "session_id": "436afaba-9873-4009-bee2-b858681e6648",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "436afaba-9873-4009-bee2-b858681e6648",
+        "version": "2.1.206",
+        "gitBranch": "HEAD"
+    });
+
+    let line: LogLine = serde_json::from_value(json).expect("Should parse read_truncation_notice");
+    match line {
+        LogLine::Attachment(attachment) => match attachment.attachment {
+            AttachmentData::ReadTruncationNotice(notice) => {
+                assert_eq!(notice.banner, expected_banner);
+                assert_eq!(notice.tool_use_id, "toolu_01At3K4pi5v6Ejx6tDDzghPy");
+
+                let serialized = serde_json::to_value(notice).expect("Should serialize notice");
+                assert_eq!(serialized["toolUseID"], "toolu_01At3K4pi5v6Ejx6tDDzghPy");
+                assert!(serialized.get("toolUseId").is_none());
+            }
+            other => panic!("Expected ReadTruncationNotice, got {other:?}"),
+        },
+        other => panic!("Expected Attachment, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_parse_read_truncation_notice_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "type": "read_truncation_notice",
+        "banner": "truncated",
+        "toolUseID": "toolu_123",
+        "extraField": true
+    });
+
+    let error = serde_json::from_value::<AttachmentData>(json)
+        .expect_err("Should reject unknown read_truncation_notice fields")
+        .to_string();
+    assert!(
+        error.contains("extraField"),
+        "Error should name the unknown field, got: {error}"
+    );
 }
 
 #[test]
@@ -9323,6 +9617,64 @@ fn test_parse_turn_duration_pending_background_agent_count_zero() {
             assert_eq!(duration.pending_background_agent_count, Some(0));
         }
         _ => panic!("Expected System(TurnDuration) variant"),
+    }
+}
+
+#[test]
+fn test_parse_turn_duration_with_pending_workflow_count() {
+    let json = serde_json::json!({
+        "type": "system",
+        "subtype": "turn_duration",
+        "parentUuid": "85dac7ae-e8cc-46ad-a221-787f6896a532",
+        "isSidechain": false,
+        "durationMs": 34964,
+        "messageCount": 20,
+        "pendingWorkflowCount": 1,
+        "timestamp": "2026-07-15T15:51:25.784Z",
+        "uuid": "f192fd34-7613-4b6b-833f-cf9c591766cd",
+        "isMeta": false,
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "1bde49fd-c08a-4fe3-8be3-d44c8d858f3e",
+        "version": "2.1.206",
+        "gitBranch": "HEAD"
+    });
+
+    let line: LogLine = serde_json::from_value(json).expect("Should parse pendingWorkflowCount");
+    match line {
+        LogLine::System(SystemLogLine::TurnDuration(duration)) => {
+            assert_eq!(duration.pending_workflow_count, Some(1));
+        }
+        other => panic!("Expected System(TurnDuration), got {other:?}"),
+    }
+}
+
+#[test]
+fn test_parse_turn_duration_with_zero_pending_workflows() {
+    let json = serde_json::json!({
+        "type": "system",
+        "subtype": "turn_duration",
+        "parentUuid": "85dac7ae-e8cc-46ad-a221-787f6896a532",
+        "isSidechain": false,
+        "durationMs": 100,
+        "pendingWorkflowCount": 0,
+        "timestamp": "2026-07-15T15:51:25.784Z",
+        "uuid": "f192fd34-7613-4b6b-833f-cf9c591766cd",
+        "isMeta": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "1bde49fd-c08a-4fe3-8be3-d44c8d858f3e",
+        "version": "2.1.206",
+        "gitBranch": "HEAD"
+    });
+
+    let line: LogLine = serde_json::from_value(json).expect("Should preserve zero");
+    match line {
+        LogLine::System(SystemLogLine::TurnDuration(duration)) => {
+            assert_eq!(duration.pending_workflow_count, Some(0));
+        }
+        other => panic!("Expected System(TurnDuration), got {other:?}"),
     }
 }
 

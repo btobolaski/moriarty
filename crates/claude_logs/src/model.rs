@@ -229,6 +229,9 @@ fn classify_family(model_lower: &str) -> Option<ModelFamily> {
 
 fn parse_version(model_lower: &str, family: ModelFamily) -> Option<ModelVersion> {
     let keyword = family.keyword()?;
+    // Claude Code appends this capability marker to consent-fallback model ids. It describes the
+    // context window rather than the model version, so remove it before tokenizing the version.
+    let model_lower = model_lower.strip_suffix("[1m]").unwrap_or(model_lower);
     let tokens: Vec<&str> = model_lower.split('-').collect();
     let family_idx = tokens.iter().position(|t| *t == keyword)?;
 
@@ -321,6 +324,39 @@ mod tests {
             "claude-opus-45",
         ] {
             assert_eq!(parse(id).family, ModelFamily::Opus, "id {id:?}");
+        }
+    }
+
+    #[test]
+    fn from_model_string_ignores_context_window_suffix_when_parsing_version() {
+        let cases = [
+            (
+                "claude-opus-4-8[1m]",
+                ModelVersion {
+                    major: 4,
+                    minor: Some(8),
+                },
+            ),
+            (
+                "claude-opus-4[1m]",
+                ModelVersion {
+                    major: 4,
+                    minor: None,
+                },
+            ),
+            (
+                "CLAUDE-OPUS-4-8[1M]",
+                ModelVersion {
+                    major: 4,
+                    minor: Some(8),
+                },
+            ),
+        ];
+
+        for (raw, expected) in cases {
+            let model = parse(raw);
+            assert_eq!(model.version, Some(expected), "id {raw:?}");
+            assert_eq!(model.raw(), raw);
         }
     }
 

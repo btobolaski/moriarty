@@ -143,13 +143,18 @@ test in a separate process, making this safe and preventing tests from clobberin
   `edited_text_file` attachments (`EditedTextFile`, the shortened path Claude Code shows the user for the edited file,
   distinct from the absolute `filename`; nullable so pre-2.1.201 logs still parse; added in Claude Code 2.1.201+), and a
   `session_id` (snake_case) field mirroring the existing camelCase `sessionId` on the full conversation records — user,
-  assistant, attachment, and the `stop_hook_summary` system record only (other line types keep just `sessionId`) —
-  captured as `session_id_snake` (`Option`, typed to match each struct's `session_id` sibling) because both keys appear
-  at once so a `#[serde(alias)]` would be rejected as a duplicate; the two always carry the same value; added in Claude
-  Code 2.1.206+)
+  assistant, and attachment — plus the `stop_hook_summary` and `model_consent_fallback` system records (other line types
+  keep just `sessionId`); captured as a separate `session_id_snake` because both keys appear at once so a
+  `#[serde(alias)]` would be rejected as a duplicate; the two always carry the same value; added in Claude Code
+  2.1.206+), `read_truncation_notice` attachments carrying the display banner and originating tool-use id, a
+  `pendingWorkflowCount` field on `turn_duration`, a `toolEndsTurn` field on workflow-subagent user turns, `refusal`
+  stop details carrying the API's category, explanation, prefill-fallback flag, and optional recommended model, and
+  `model_consent_fallback` system records describing a session-level switch when the selected model requires unavailable
+  usage-credit consent (all observed in Claude Code 2.1.206+)
 - Also owns the structured view of the raw `model` string via `model::Model { family, version }` plus `ModelFamily` and
   `ModelVersion`. Both `cost_analyzer` (for pricing) and `moriarty::api_pricing` (for grouping/display) consume this one
-  parser so family/version classification is not duplicated across crates
+  parser so family/version classification is not duplicated across crates. The parser preserves capability-decorated
+  raw ids such as `claude-opus-4-8[1m]` while excluding the `[1m]` context-window suffix from version classification
 - Used by `moriarty`'s `api_pricing` module to analyze Claude Code conversation logs
 
 **`cost_report/`** - Shared cost report rendering and filtering:
@@ -212,7 +217,8 @@ test in a separate process, making this safe and preventing tests from clobberin
 **`cost_analyzer/`** - Generic cost-analysis library:
 
 - Workspace crate for recursively scanning JSONL directories, parsing logs in parallel, and deduplicating billable model
-  responses
+  responses. It skips Claude's well-known non-transcript `history.jsonl` and workflow `journal.jsonl` files by basename
+  wherever they occur because neither schema contains billable model responses
 - Core abstractions: `AnalyzableLog` for pluggable log formats, `LlmCost` for input/cache/output cost breakdowns,
   `TokenType` plus `AnalyzableLog::token_count(...) -> Option<u64>` for raw token extraction, `LineWithCost` for
   normalized billable entries, and `AnalysisResult` for returning those deduplicated lines alongside a partial-failure

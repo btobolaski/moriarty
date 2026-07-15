@@ -359,6 +359,10 @@ fn claude_system_fields(system: &ClaudeSystemLogLine) -> ClaudeSystemFields {
             timestamp: line.timestamp,
             uuid: line.uuid,
         },
+        ClaudeSystemLogLine::ModelConsentFallback(line) => ClaudeSystemFields {
+            timestamp: line.timestamp,
+            uuid: line.uuid,
+        },
     }
 }
 
@@ -463,11 +467,13 @@ impl AnalyzableLog for ClaudeLogLine {
     }
 
     fn should_parse_file(path: &Path) -> bool {
-        // `~/.claude/history.jsonl` shares the `.jsonl` extension with the per-session
-        // transcripts but stores command-history entries in a different schema. Scanning
-        // it produces a parse error and never contributes billable lines, so skip it when
-        // the directory walk crosses the well-known filename.
-        path.file_name().and_then(|name| name.to_str()) != Some("history.jsonl")
+        // These well-known sibling files use non-transcript schemas and never contain billable
+        // responses: `history.jsonl` stores command history, while workflow `journal.jsonl` files
+        // store agent lifecycle and result records.
+        !matches!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("history.jsonl" | "journal.jsonl")
+        )
     }
 }
 
@@ -591,6 +597,7 @@ mod tests {
     const CLAUDE_SYSTEM_LOCAL_COMMAND_UUID: &str = "12121212-1212-4212-8212-121212121212";
     const CLAUDE_SYSTEM_STOP_HOOK_SUMMARY_UUID: &str = "13131313-1313-4313-8313-131313131313";
     const CLAUDE_SYSTEM_TURN_DURATION_UUID: &str = "14141414-1414-4414-8414-141414141414";
+    const CLAUDE_SYSTEM_CONSENT_FALLBACK_UUID: &str = "17171717-1717-4717-8717-171717171717";
     const CLAUDE_SYSTEM_LOGICAL_PARENT_UUID: &str = "15151515-1515-4515-8515-151515151515";
     const CLAUDE_SYSTEM_CLEARED_ATTACHMENT_UUID: &str = "16161616-1616-4616-8616-161616161616";
 
@@ -1024,6 +1031,23 @@ mod tests {
         metadata.insert("durationMs".to_string(), json!(1234));
         metadata.insert("isMeta".to_string(), json!(false));
         metadata.insert("messageCount".to_string(), json!(2));
+        serde_json::Value::Object(metadata)
+    }
+
+    fn claude_system_consent_fallback_json() -> serde_json::Value {
+        let mut metadata = claude_system_json(
+            "model_consent_fallback",
+            Some(CLAUDE_PARENT_UUID),
+            CLAUDE_SYSTEM_CONSENT_FALLBACK_UUID,
+        );
+        metadata.insert("content".to_string(), json!("Switched to Opus 4.8"));
+        metadata.insert("level".to_string(), json!("warning"));
+        metadata.insert("choice".to_string(), json!("switch_default"));
+        metadata.insert("originalModel".to_string(), json!("claude-fable-5"));
+        metadata.insert("fallbackModel".to_string(), json!("claude-opus-4-8[1m]"));
+        metadata.insert("persistedAsDefault".to_string(), json!(false));
+        metadata.insert("isMeta".to_string(), json!(false));
+        metadata.insert("session_id".to_string(), json!(CLAUDE_SESSION_ID));
         serde_json::Value::Object(metadata)
     }
 
@@ -1487,9 +1511,19 @@ mod tests {
     }
 
     fn assert_claude_non_billable_case(case: ClaudeNonBillableCase) {
+        let value = (case.value)();
+        let line = parse_claude_log(value.clone());
+        for token_type in [
+            TokenType::Input,
+            TokenType::Output,
+            TokenType::CacheWrite,
+            TokenType::CacheRead,
+        ] {
+            assert!(line.token_count(token_type).is_none(), "case {}", case.name);
+        }
         assert_claude_non_billable_value(
             case.name,
-            (case.value)(),
+            value,
             case.expected_timestamp.value(),
             &case.expected_id,
         );
@@ -1716,6 +1750,12 @@ mod tests {
                 value: claude_system_turn_duration_json,
                 expected_timestamp: ExpectedClaudeTimestamp::Real,
                 expected_id: CLAUDE_SYSTEM_TURN_DURATION_UUID.to_string(),
+            },
+            ClaudeNonBillableCase {
+                name: "system consent fallback",
+                value: claude_system_consent_fallback_json,
+                expected_timestamp: ExpectedClaudeTimestamp::Real,
+                expected_id: CLAUDE_SYSTEM_CONSENT_FALLBACK_UUID.to_string(),
             },
             ClaudeNonBillableCase {
                 name: "queue operation",

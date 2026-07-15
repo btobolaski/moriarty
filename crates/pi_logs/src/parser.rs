@@ -1860,12 +1860,12 @@ pub enum ToolResultDetails {
     //
     // GetSearchContent is dual-shape: its Success arm is uniquely
     // identified by `{url, title, contentLength}`, and its Error arm is
-    // a bare `{error}` payload. Earlier variants that also declare an
-    // `error` field (CodeSearchDetails, McpDetails, TodoDetails,
+    // `{error}` with an optional `url`. Earlier variants that also declare
+    // an `error` field (CodeSearchDetails, McpDetails, TodoDetails,
     // SubagentResultDetails-via-Subagent, WebSearchDetails) all require
     // additional discriminator fields (e.g. `query`+`maxTokens`,
     // `mode`, `action`+`params`+`nextId`, `mode`+`results`,
-    // `queryCount`+`successfulQueries`+...), so a bare `{error}` cannot
+    // `queryCount`+`successfulQueries`+...), so either error shape cannot
     // be absorbed by any of them and safely falls through here.
     GitReadOnly(GitReadOnlyDetails),
     FetchContent(FetchContentDetails),
@@ -2830,10 +2830,9 @@ pub struct FetchContentDetails {
 
 /// Replaying a single previously-fetched URL via `get_search_content`
 /// emits a small breadcrumb describing which URL was returned and how
-/// large the cached body is. When the requested URL is not in the cache
-/// the tool emits an error breadcrumb instead, with the available URLs
-/// listed in the textual content; we model both shapes via an untagged
-/// enum so the strict variants stay tight.
+/// large the cached body is. Failed retrievals may instead repeat the
+/// requested URL beside the error message, so the error variant retains that
+/// breadcrumb while keeping both wire shapes strict.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum GetSearchContentDetails {
@@ -2853,6 +2852,8 @@ pub struct GetSearchContentSuccessDetails {
 #[serde(deny_unknown_fields)]
 pub struct GetSearchContentErrorDetails {
     pub error: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",

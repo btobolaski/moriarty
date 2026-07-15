@@ -1016,6 +1016,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn analyze_directory_skips_claude_workflow_journal_jsonl() {
+        let temp_dir = temp_dir();
+        let claude_log = claude_assistant_json(
+            None,
+            Some("req-1"),
+            "msg-1",
+            "22222222-2222-4222-8222-222222222222",
+            "claude-sonnet-4-20250514",
+            claude_usage_json(1, 0, 0, 0),
+        );
+        let journal = concat!(
+            "{\"type\":\"started\",\"key\":\"v2:abc\",\"agentId\":\"agent-1\"}\n",
+            "{\"type\":\"result\",\"key\":\"v2:abc\",\"agentId\":\"agent-1\",",
+            "\"result\":{\"summary\":\"done\"}}\n"
+        );
+        write_log_files(
+            temp_dir.path(),
+            &[
+                (
+                    "subagents/workflows/wf_123/journal.jsonl",
+                    journal.to_string(),
+                ),
+                ("session.jsonl", format!("{}\n", claude_log)),
+            ],
+        )
+        .await;
+
+        let result = analyze_directory::<ClaudeLogLine>(temp_dir.path().to_path_buf()).await;
+
+        assert!(!result.had_errors);
+        assert_eq!(result.lines.len(), 1);
+    }
+
+    #[tokio::test]
     async fn analyze_directory_skips_claude_history_jsonl() {
         let temp_dir = temp_dir();
         let claude_log = claude_assistant_json(
