@@ -745,6 +745,7 @@ fn thinking_level_order_is_stable() {
     assert!(ThinkingLevel::Low < ThinkingLevel::Medium);
     assert!(ThinkingLevel::Medium < ThinkingLevel::High);
     assert!(ThinkingLevel::High < ThinkingLevel::Xhigh);
+    assert!(ThinkingLevel::Xhigh < ThinkingLevel::Max);
 }
 
 #[test]
@@ -808,6 +809,18 @@ fn thinking_level_change_low() {
     match line {
         PiLogLine::ThinkingLevelChange(thinking_level) => {
             assert_eq!(thinking_level.thinking_level, ThinkingLevel::Low);
+        }
+        other => panic!("expected ThinkingLevelChange, got {other:?}"),
+    }
+}
+
+#[test]
+fn thinking_level_change_max() {
+    let line = parse(thinking_level_change_json("m1", "max"));
+
+    match line {
+        PiLogLine::ThinkingLevelChange(thinking_level) => {
+            assert_eq!(thinking_level.thinking_level, ThinkingLevel::Max);
         }
         other => panic!("expected ThinkingLevelChange, got {other:?}"),
     }
@@ -6598,7 +6611,10 @@ fn subagent_tool_result_accepts_budget_transcript_timeout_and_deadline_fields() 
     let tb = result.tool_budget.as_ref().unwrap();
     assert_eq!(tb.soft, 20);
     assert_eq!(tb.hard, 30);
-    assert_eq!(tb.block.as_deref(), Some(&["bash".to_string()][..]));
+    assert_eq!(
+        tb.block,
+        Some(SubagentBlock::List(vec!["bash".to_string()]))
+    );
     assert!(result.turn_budget.is_some());
     let trnb = result.turn_budget.as_ref().unwrap();
     assert_eq!(trnb.max_turns, 10);
@@ -6622,6 +6638,108 @@ fn subagent_tool_result_accepts_budget_transcript_timeout_and_deadline_fields() 
     assert_eq!(tc.cost_usd.to_string(), "0.05");
     assert_eq!(details.timeout_ms, Some(600000));
     assert_eq!(details.deadline_at, Some(1783906909078));
+}
+
+#[test]
+fn subagent_tool_result_accepts_wildcard_block() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "subagent",
+        vec![json!({"type": "text", "text": "complete"})],
+        false,
+        Some(json!({
+            "mode": "single",
+            "results": [{
+                "agent": "reviewer",
+                "toolBudget": {"soft": 10, "hard": 20, "block": "*"}
+            }]
+        })),
+    ));
+    let Some(ToolResultDetails::Subagent(details)) = tool_result.details else {
+        panic!("expected Subagent details")
+    };
+    let tb = details.results[0].tool_budget.as_ref().unwrap();
+    assert_eq!(tb.soft, 10);
+    assert_eq!(tb.hard, 20);
+    assert_eq!(tb.block, Some(SubagentBlock::All));
+}
+
+#[test]
+fn subagent_tool_result_omits_block_when_not_set() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "subagent",
+        vec![json!({"type": "text", "text": "complete"})],
+        false,
+        Some(json!({
+            "mode": "single",
+            "results": [{
+                "agent": "reviewer",
+                "toolBudget": {"soft": 10, "hard": 20}
+            }]
+        })),
+    ));
+    let Some(ToolResultDetails::Subagent(details)) = tool_result.details else {
+        panic!("expected Subagent details")
+    };
+    let tb = details.results[0].tool_budget.as_ref().unwrap();
+    assert_eq!(tb.block, None);
+}
+
+#[test]
+fn subagent_block_round_trips_list_and_wildcard() {
+    let cases = [
+        (SubagentBlock::List(vec!["bash".into()]), json!(["bash"])),
+        (SubagentBlock::List(vec![]), json!([])),
+        (SubagentBlock::All, json!("*")),
+    ];
+    for (block, expected) in cases {
+        let value = serde_json::to_value(&block).unwrap();
+        assert_eq!(value, expected, "serialize mismatch");
+        let round_tripped: SubagentBlock =
+            serde_json::from_value(value).expect("round-trip failed");
+        assert_eq!(round_tripped, block, "deserialized value mismatch");
+    }
+}
+
+#[test]
+fn subagent_block_rejects_invalid_inputs() {
+    assert!(serde_json::from_value::<SubagentBlock>(json!("bash")).is_err());
+    assert!(serde_json::from_value::<SubagentBlock>(json!(42)).is_err());
+    assert!(serde_json::from_value::<SubagentBlock>(json!({})).is_err());
+    assert!(serde_json::from_value::<SubagentBlock>(json!(null)).is_err());
+    assert!(serde_json::from_value::<SubagentBlock>(json!(["bash", 1])).is_err());
+}
+
+#[test]
+fn subagent_tool_result_block_null_parses_as_none() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "subagent",
+        vec![json!({"type": "text", "text": "complete"})],
+        false,
+        Some(json!({
+            "mode": "single",
+            "results": [{
+                "agent": "reviewer",
+                "toolBudget": {"soft": 10, "hard": 20, "block": null}
+            }]
+        })),
+    ));
+    let Some(ToolResultDetails::Subagent(details)) = tool_result.details else {
+        panic!("expected Subagent details")
+    };
+    let tb = details.results[0].tool_budget.as_ref().unwrap();
+    assert_eq!(tb.block, None);
+
+    let value = serde_json::to_value(tb).unwrap();
+    assert!(value.get("block").is_none());
+}
+
+#[test]
+fn thinking_level_max_serializes_and_rejects_invalid() {
+    assert_eq!(
+        serde_json::to_value(ThinkingLevel::Max).unwrap(),
+        json!("max")
+    );
+    assert!(serde_json::from_value::<ThinkingLevel>(json!("maximum")).is_err());
 }
 
 #[test]

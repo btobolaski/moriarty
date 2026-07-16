@@ -78,6 +78,7 @@
 use std::{
     cmp::Ordering,
     collections::BTreeMap,
+    fmt,
     fs::File,
     hash::{Hash, Hasher},
     io::{BufRead, BufReader},
@@ -650,6 +651,8 @@ pub enum ThinkingLevel {
     Medium,
     High,
     Xhigh,
+    /// Added in pi 0.80+; maps to extended thinking mode.
+    Max,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -2484,9 +2487,8 @@ pub struct SubagentUsage {
 pub struct SubagentToolBudget {
     pub soft: u32,
     pub hard: u32,
-    /// Tools blocked after the hard limit; `null` when no block is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub block: Option<Vec<String>>,
+    pub block: Option<SubagentBlock>,
     /// Timestamp (ms since epoch) when the hard budget was reached.
     /// Added in newer pi versions; absent when the budget was not exceeded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2499,6 +2501,65 @@ pub struct SubagentToolBudget {
     /// versions; absent when the budget was not configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<String>,
+}
+
+/// The tool-block policy attached to a subagent's budget. Newer pi versions
+/// serialize the wildcard (all tools) as `"*"` rather than a list, so this
+/// enum accepts both wire shapes.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SubagentBlock {
+    List(Vec<String>),
+    All,
+}
+
+impl Serialize for SubagentBlock {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::List(tools) => tools.serialize(serializer),
+            Self::All => serializer.serialize_str("*"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SubagentBlock {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl<'de> de::Visitor<'de> for Visitor {
+            type Value = SubagentBlock;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a list of tool names or the string \"*\"")
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                if v == "*" {
+                    Ok(SubagentBlock::All)
+                } else {
+                    Err(de::Error::invalid_value(de::Unexpected::Str(v), &self))
+                }
+            }
+
+            fn visit_seq<A>(self, seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: de::SeqAccess<'de>,
+            {
+                let tools = Vec::deserialize(de::value::SeqAccessDeserializer::new(seq))?;
+                Ok(SubagentBlock::List(tools))
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
 }
 
 /// Captures the turn-budget envelope that newer pi runtimes attach to
