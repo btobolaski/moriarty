@@ -6607,9 +6607,8 @@ fn subagent_tool_result_accepts_budget_transcript_timeout_and_deadline_fields() 
         panic!("expected Subagent details")
     };
     let result = &details.results[0];
-    assert!(result.tool_budget.is_some());
-    let tb = result.tool_budget.as_ref().unwrap();
-    assert_eq!(tb.soft, 20);
+    let tb = result.tool_budget.as_ref().expect("expected toolBudget");
+    assert_eq!(tb.soft, Some(20));
     assert_eq!(tb.hard, 30);
     assert_eq!(
         tb.block,
@@ -6658,9 +6657,34 @@ fn subagent_tool_result_accepts_wildcard_block() {
         panic!("expected Subagent details")
     };
     let tb = details.results[0].tool_budget.as_ref().unwrap();
-    assert_eq!(tb.soft, 10);
+    assert_eq!(tb.soft, Some(10));
     assert_eq!(tb.hard, 20);
     assert_eq!(tb.block, Some(SubagentBlock::All));
+}
+
+#[test]
+fn subagent_tool_result_accepts_tool_budget_without_soft() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "subagent",
+        vec![json!({"type": "text", "text": "complete"})],
+        false,
+        Some(json!({
+            "mode": "single",
+            "results": [{
+                "agent": "reviewer",
+                "toolBudget": {"hard": 20}
+            }]
+        })),
+    ));
+    let Some(ToolResultDetails::Subagent(details)) = tool_result.details else {
+        panic!("expected Subagent details")
+    };
+    let budget = details.results[0]
+        .tool_budget
+        .as_ref()
+        .expect("expected toolBudget");
+    assert_eq!(budget.soft, None);
+    assert_eq!(budget.hard, 20);
 }
 
 #[test]

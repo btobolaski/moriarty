@@ -2485,7 +2485,9 @@ pub struct SubagentUsage {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SubagentToolBudget {
-    pub soft: u32,
+    /// Some newer pi runtimes omit this when only a hard limit applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soft: Option<u32>,
     pub hard: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub block: Option<SubagentBlock>,
