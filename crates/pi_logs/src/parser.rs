@@ -3475,6 +3475,12 @@ pub struct IntercomResultDetails {
     /// versions; optional for backward compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+    /// Each element is kept as a raw `JsonBlob` because the
+    /// session-entry schema is owned by the pi runtime and evolves
+    /// independently of this parser. Added in newer pi versions;
+    /// optional for backward compatibility.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sessions: Vec<JsonBlob>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

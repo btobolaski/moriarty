@@ -7414,3 +7414,16 @@ fn intercom_result_accepts_request_id() {
     assert_eq!(details.delivered, Some(true));
     assert_eq!(details.request_id.as_deref(), Some("req-42"));
 }
+
+#[test]
+fn intercom_result_accepts_sessions_field() {
+    let session_entry = json!({"id": "session-1", "metadata": {"active": true}});
+    let details: IntercomResultDetails = serde_json::from_value(json!({
+        "sessions": [session_entry.clone()]
+    }))
+    .expect("intercom result with non-empty sessions should parse");
+    assert_eq!(details.sessions, vec![JsonBlob::from(session_entry)]);
+
+    let empty: IntercomResultDetails = serde_json::from_value(json!({"sessions": []})).unwrap();
+    assert!(empty.sessions.is_empty());
+}
