@@ -210,6 +210,8 @@ pub enum LogLine {
     Assistant(Box<AssistantLogLine>),
     #[serde(rename = "file-history-snapshot")]
     FileHistorySnapshot(FileHistorySnapshot),
+    #[serde(rename = "file-history-delta")]
+    FileHistoryDelta(FileHistoryDelta),
     #[serde(rename = "summary")]
     Summary(Summary),
     #[serde(rename = "system")]
@@ -392,6 +394,7 @@ pub enum AttachmentData {
     ReadTruncationNotice(ReadTruncationNotice),
     SkillListing(SkillListing),
     TaskReminder(TaskReminder),
+    TaskStatus(TaskStatus),
 }
 
 /// The agent (subagent) analogue of `deferred_tools_delta`. Added in Claude Code 2.1.175+.
@@ -799,6 +802,23 @@ pub struct TaskReminderItem {
     pub blocked_by: Vec<String>,
 }
 
+/// Progress record for a background agent Claude Code spawned (e.g. a subagent task). Added in
+/// Claude Code 2.1.214+. `task_type` and `status` are `String` rather than strict enums because
+/// their runtime-lifecycle vocabularies are undocumented and volatile (a still-running agent's
+/// `status` becomes another value once it finishes), and nothing downstream reads them — mirroring
+/// the `String`-typed `status` on `TaskReminderItem`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct TaskStatus {
+    pub task_id: String,
+    pub task_type: String,
+    pub description: String,
+    pub status: String,
+    pub delta_summary: String,
+    pub output_file_path: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[serde(tag = "subtype")]
@@ -1140,7 +1160,11 @@ macro_rules! define_boundary_log {
             /// Session slug identifier (e.g., "noble-floating-lemon"). Added in Claude Code 2.0.51.
             pub slug: Option<String>,
             pub content: String,
-            pub is_meta: bool,
+            /// Optional because Claude Code 2.1.214 stopped emitting `isMeta` on `compact_boundary`
+            /// records; older records still carry it and it is only read for schema completeness.
+            /// `MicrocompactBoundary` shares this field via the macro, so its `isMeta` is optional
+            /// too as a byproduct rather than an independently observed omission.
+            pub is_meta: Option<bool>,
             pub timestamp: DateTime<Utc>,
             pub uuid: Uuid,
             pub level: String,
@@ -1300,6 +1324,31 @@ pub struct FileHistorySnapshot {
     pub message_id: Uuid,
     pub snapshot: FileHistorySnapshotSnapshot,
     pub is_snapshot_update: bool,
+}
+
+/// Incremental file-history record noting a single tracked file's backup, emitted between the full
+/// `file-history-snapshot` records rather than re-emitting the whole snapshot. Added in Claude Code
+/// 2.1.214+.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct FileHistoryDelta {
+    pub message_id: Uuid,
+    pub snapshot_message_id: Uuid,
+    pub tracking_path: String,
+    pub backup: FileHistoryBackup,
+    pub timestamp: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct FileHistoryBackup {
+    /// Null when Claude Code records the backup before the backup file itself exists (observed on
+    /// deltas for newly tracked files).
+    pub backup_file_name: Option<String>,
+    pub version: u32,
+    pub backup_time: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1462,6 +1511,20 @@ pub enum ToolDenialKind {
 #[serde(rename_all = "camelCase")]
 pub enum QueuePriority {
     Later,
+}
+
+/// Reasoning-effort level the assistant turn was generated at. Modeled as a strict enum (not a free
+/// `String`) so a genuinely new level surfaces as a parse error to be handled, matching the parser's
+/// fail-on-unknown stance; the variants are Claude Code's documented closed set. Added in Claude
+/// Code 2.1.214+.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ReasoningEffort {
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
 }
 
 /// Permission mode for the conversation. Added in Claude Code 2.1.77+.
@@ -1655,6 +1718,9 @@ pub struct AssistantLogLine {
     /// Mirrors `session_id`'s `String` type here since assistant session ids are not parsed as UUIDs.
     #[serde(rename = "session_id")]
     pub session_id_snake: Option<String>,
+    /// Reasoning-effort level the turn was generated at (e.g. "xhigh"). `Option` so pre-2.1.214
+    /// lines still parse. Added in Claude Code 2.1.214+.
+    pub effort: Option<ReasoningEffort>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

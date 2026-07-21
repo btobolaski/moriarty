@@ -112,10 +112,10 @@ test in a separate process, making this safe and preventing tests from clobberin
   a screenshot), `image` file-attachment content (a user `@`-referencing an image file; uses Claude Code's own base64
   `file` envelope with size/dimensions rather than the API's `source` envelope), and a `pendingBackgroundAgentCount`
   field on `turn_duration` system records (the count of background agents still running when the turn completed; added
-  in Claude Code 2.1.170+), and `agent_listing_delta` attachments (`AgentListingDelta`, the subagent
-  analogue of `deferred_tools_delta`, carrying `added_types`/`added_lines`/`removed_types` plus
-  `is_initial` and `show_concurrency_note`; added in Claude Code 2.1.175+), and a `fork-context-ref`
-  record (`ForkContextRef`, the first line of a subagent's `subagents/agent-*.jsonl` file, carrying
+  in Claude Code 2.1.170+), and `agent_listing_delta` attachments (`AgentListingDelta`, the subagent analogue of
+  `deferred_tools_delta`, carrying `added_types`/`added_lines`/`removed_types` plus `is_initial` and
+  `show_concurrency_note`; added in Claude Code 2.1.175+), and a `fork-context-ref` record (`ForkContextRef`, the first
+  line of a subagent's `subagents/agent-*.jsonl` file, carrying
   `agent_id`/`parent_session_id`/`parent_last_uuid`/`context_length` to record where the subagent forked from its parent
   conversation; added in Claude Code 2.1.175+), and `invoked_skills` attachments (`InvokedSkills`, the skills actually
   run during a turn — e.g. a `/code-review` slash command — each carrying `name`/`path`/`content`, distinct from
@@ -131,39 +131,50 @@ test in a separate process, making this safe and preventing tests from clobberin
   `automode-unavailable` (auto mode's safety classifier model was temporarily unavailable, so the call was denied rather
   than approved) — recording why Claude Code denied the tool call the turn responds to; present only on the user turn
   carrying a denied tool's error `tool_result`; added in Claude Code 2.1.201+), and `timedOut`/`timeoutMs` fields on
-  `hook_cancelled` attachments
-  (`HookCancelled`, recording whether the hook was cancelled for hitting its timeout and the configured timeout in
-  milliseconds; added in Claude Code 2.1.201+), and a `refusedUserMessageUuid` field on `model_refusal_fallback` system
-  records (`ModelRefusalFallback`, the user message whose request was refused, nullable; added in Claude Code 2.1.201+),
-  and an `errorDetails` field on assistant turns (`AssistantLogLine`, the raw upstream error body — e.g. the full
-  `429 {...}` JSON string — kept verbatim as the provider's opaque payload alongside `error`/`apiErrorStatus`; added in
-  Claude Code 2.1.201+), and a `queuePriority` field on user turns (`QueuePriority`, a strict enum — currently only
-  `later` — giving the scheduling priority of a prompt that was queued while Claude Code was busy rather than sent
-  immediately; present only on queued turns; added in Claude Code 2.1.201+), and a `displayPath` field on
-  `edited_text_file` attachments (`EditedTextFile`, the shortened path Claude Code shows the user for the edited file,
-  distinct from the absolute `filename`; nullable so pre-2.1.201 logs still parse; added in Claude Code 2.1.201+), and a
-  `session_id` (snake_case) field mirroring the existing camelCase `sessionId` on the full conversation records — user,
-  assistant, and attachment — plus the `stop_hook_summary` and `model_consent_fallback` system records (other line types
-  keep just `sessionId`); captured as a separate `session_id_snake` because both keys appear at once so a
-  `#[serde(alias)]` would be rejected as a duplicate; the two always carry the same value; added in Claude Code
-  2.1.206+), `read_truncation_notice` attachments carrying the display banner and originating tool-use id, a
+  `hook_cancelled` attachments (`HookCancelled`, recording whether the hook was cancelled for hitting its timeout and
+  the configured timeout in milliseconds; added in Claude Code 2.1.201+), and a `refusedUserMessageUuid` field on
+  `model_refusal_fallback` system records (`ModelRefusalFallback`, the user message whose request was refused, nullable;
+  added in Claude Code 2.1.201+), and an `errorDetails` field on assistant turns (`AssistantLogLine`, the raw upstream
+  error body — e.g. the full `429 {...}` JSON string — kept verbatim as the provider's opaque payload alongside
+  `error`/`apiErrorStatus`; added in Claude Code 2.1.201+), and a `queuePriority` field on user turns (`QueuePriority`,
+  a strict enum — currently only `later` — giving the scheduling priority of a prompt that was queued while Claude Code
+  was busy rather than sent immediately; present only on queued turns; added in Claude Code 2.1.201+), and a
+  `displayPath` field on `edited_text_file` attachments (`EditedTextFile`, the shortened path Claude Code shows the user
+  for the edited file, distinct from the absolute `filename`; nullable so pre-2.1.201 logs still parse; added in Claude
+  Code 2.1.201+), and a `session_id` (snake_case) field mirroring the existing camelCase `sessionId` on the full
+  conversation records — user, assistant, and attachment — plus the `stop_hook_summary` and `model_consent_fallback`
+  system records (other line types keep just `sessionId`); captured as a separate `session_id_snake` because both keys
+  appear at once so a `#[serde(alias)]` would be rejected as a duplicate; the two always carry the same value; added in
+  Claude Code 2.1.206+), `read_truncation_notice` attachments carrying the display banner and originating tool-use id, a
   `pendingWorkflowCount` field on `turn_duration`, a `toolEndsTurn` field on workflow-subagent user turns, `refusal`
   stop details carrying the API's category, explanation, prefill-fallback flag, and optional recommended model, and
   `model_consent_fallback` system records describing a session-level switch when the selected model requires unavailable
-  usage-credit consent (all observed in Claude Code 2.1.206+)
+  usage-credit consent (all observed in Claude Code 2.1.206+), an `effort` field on assistant turns (`AssistantLogLine`,
+  the reasoning-effort level the turn was generated at, modeled as the strict `ReasoningEffort` enum —
+  `low`/`medium`/`high`/`xhigh`/`max`, Claude Code's documented closed set — so a genuinely new level surfaces as a
+  parse error; nullable so pre-2.1.214 logs still parse), and a `file-history-delta` line type (`FileHistoryDelta`, the
+  incremental analogue of `file-history-snapshot`: it records a single tracked file's backup — `messageId`,
+  `snapshotMessageId`, `trackingPath`, a nested `backup` whose `backupFileName` is null when the backup file does not
+  yet exist for a newly tracked file, and a `timestamp` — rather than re-emitting the whole snapshot), and a relaxation
+  of the `define_boundary_log!` macro's `isMeta` to `Option<bool>` (shared by `CompactBoundary` and
+  `MicrocompactBoundary`) because Claude Code 2.1.214 stopped emitting it on `compact_boundary` records (the field is
+  read only for schema completeness, so older records that still carry it keep parsing), and a `task_status` attachment
+  (`TaskStatus`, a progress record for a spawned background agent carrying
+  `taskId`/`taskType`/`description`/`status`/`deltaSummary`/`outputFilePath`; `taskType` and `status` are kept as
+  `String` rather than strict enums because their runtime-lifecycle vocabularies are undocumented and volatile and
+  nothing downstream reads them, mirroring `TaskReminderItem.status`) (all added in Claude Code 2.1.214+)
 - Also owns the structured view of the raw `model` string via `model::Model { family, version }` plus `ModelFamily` and
   `ModelVersion`. Both `cost_analyzer` (for pricing) and `moriarty::api_pricing` (for grouping/display) consume this one
-  parser so family/version classification is not duplicated across crates. The parser preserves capability-decorated
-  raw ids such as `claude-opus-4-8[1m]` while excluding the `[1m]` context-window suffix from version classification
+  parser so family/version classification is not duplicated across crates. The parser preserves capability-decorated raw
+  ids such as `claude-opus-4-8[1m]` while excluding the `[1m]` context-window suffix from version classification
 - Used by `moriarty`'s `api_pricing` module to analyze Claude Code conversation logs
 
 **`cost_report/`** - Shared cost report rendering and filtering:
 
 - Holds shared time filtering, grouped-table rendering, stacked-chart rendering, `ReportMode`, `CostComponents`,
   `TokenCounts`, `MetricComponents`, and report warning helpers used by both cost-report backends
-- `FormattedMetricColumns` and `GrandTotalRow` are mode-aware: cost mode formats dollars,
-  token mode formats integer token counts with thousands separators, while preserving the same table shape for both
-  backends
+- `FormattedMetricColumns` and `GrandTotalRow` are mode-aware: cost mode formats dollars, token mode formats integer
+  token counts with thousands separators, while preserving the same table shape for both backends
 - `display_summary` renders a consolidated "Summary" section (optional provider table for `pi cost`, model table for
   both backends, and grand total) called by each backend after its inline grouped-table rendering
 - `charts.rs` renders deterministic horizontal stacked bars for both time-series and share views, including top-N plus
@@ -420,11 +431,10 @@ test in a separate process, making this safe and preventing tests from clobberin
 
 **Shared Test Utilities**: Test helpers used across multiple modules (`setup_isolated_xdg_config`,
 `setup_isolated_xdg_state`, `setup_project_dir_with_config`, `write_tools_config`, `create_executable_script`,
-`set_test_env_var`, `remove_test_env_var`, `TestEnvVarGuard`) live in
-`crates/moriarty/src/test_helpers.rs`. This module is compiled only in test builds (`#[cfg(test)]`). All test
-environment mutations go through `apply_test_env_var()` — the module's single `unsafe` block — with process
-isolation guaranteed by `cargo nextest`. New test-only helpers needed in more than one module belong here rather than
-being duplicated.
+`set_test_env_var`, `remove_test_env_var`, `TestEnvVarGuard`) live in `crates/moriarty/src/test_helpers.rs`. This module
+is compiled only in test builds (`#[cfg(test)]`). All test environment mutations go through `apply_test_env_var()` — the
+module's single `unsafe` block — with process isolation guaranteed by `cargo nextest`. New test-only helpers needed in
+more than one module belong here rather than being duplicated.
 
 **Logging**: Hook execution is logged via tracing as JSON lines to `~/.local/state/moriarty/hooks/` (daily-rotated); the
 `hooks report` command consumes these. Cost-report commands log to stderr instead. Sensitive env vars (TOKEN, SECRET,

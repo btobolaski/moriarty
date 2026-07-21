@@ -70,8 +70,10 @@ fn parse(value: Value) -> PiLogLine {
 
 fn parse_err(value: Value) -> ParseError {
     let raw = value.to_string();
-    let parsed = parse_line(raw.as_str());
-    parsed.expect_err(&format!("expected parse error\nJSON: {raw}"))
+    let Err(error) = parse_line(raw.as_str()) else {
+        panic!("expected parse error\nJSON: {raw}");
+    };
+    error
 }
 
 fn message_line_json(id: &str, parent_id: &str, message: Value) -> Value {

@@ -885,6 +885,144 @@ fn test_parse_file_history_snapshot_inner_rejects_unknown_fields() {
     );
 }
 
+// Incremental file-history record (Claude Code 2.1.214+) noting a single tracked file's backup.
+#[test]
+fn test_parse_file_history_delta() {
+    let json = serde_json::json!({
+        "type": "file-history-delta",
+        "messageId": "7c772208-16a4-4c6e-9a85-32b5887e04d8",
+        "snapshotMessageId": "336ca9bd-c0e7-46ca-a9fc-fda53b740ee2",
+        "trackingPath": "scripts/populate-dev-key-vault-evidence.mjs",
+        "backup": {
+            "backupFileName": "d959a531a8cd1839@v1",
+            "version": 1,
+            "backupTime": "2026-07-21T00:19:11.576Z"
+        },
+        "timestamp": "2026-07-21T00:19:11.576Z"
+    });
+
+    let line: LogLine = serde_json::from_value(json).expect("Failed to parse file-history-delta");
+    match line {
+        LogLine::FileHistoryDelta(delta) => {
+            assert_eq!(
+                delta.message_id,
+                Uuid::parse_str("7c772208-16a4-4c6e-9a85-32b5887e04d8").unwrap()
+            );
+            assert_eq!(
+                delta.snapshot_message_id,
+                Uuid::parse_str("336ca9bd-c0e7-46ca-a9fc-fda53b740ee2").unwrap()
+            );
+            assert_eq!(
+                delta.tracking_path,
+                "scripts/populate-dev-key-vault-evidence.mjs"
+            );
+            assert_eq!(
+                delta.backup.backup_file_name.as_deref(),
+                Some("d959a531a8cd1839@v1")
+            );
+            assert_eq!(delta.backup.version, 1);
+        }
+        _ => panic!("Expected FileHistoryDelta variant"),
+    }
+}
+
+// A delta for a newly tracked file records the backup before the backup file exists, so
+// `backupFileName` is null.
+#[test]
+fn test_parse_file_history_delta_null_backup_file_name() {
+    let json = serde_json::json!({
+        "type": "file-history-delta",
+        "messageId": "68b04e69-6ac5-4168-91e2-468df7f42f1f",
+        "snapshotMessageId": "336ca9bd-c0e7-46ca-a9fc-fda53b740ee2",
+        "trackingPath": "memory/runbook-style-derive-values.md",
+        "backup": {
+            "backupFileName": null,
+            "version": 1,
+            "backupTime": "2026-07-21T15:26:54.933Z"
+        },
+        "timestamp": "2026-07-21T15:26:54.933Z"
+    });
+
+    let line: LogLine =
+        serde_json::from_value(json).expect("Failed to parse file-history-delta with null backup");
+    match line {
+        LogLine::FileHistoryDelta(delta) => assert_eq!(delta.backup.backup_file_name, None),
+        _ => panic!("Expected FileHistoryDelta variant"),
+    }
+}
+
+#[test]
+fn test_parse_file_history_delta_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "type": "file-history-delta",
+        "messageId": "7c772208-16a4-4c6e-9a85-32b5887e04d8",
+        "snapshotMessageId": "336ca9bd-c0e7-46ca-a9fc-fda53b740ee2",
+        "trackingPath": "src/main.rs",
+        "backup": {
+            "backupFileName": "d959a531a8cd1839@v1",
+            "version": 1,
+            "backupTime": "2026-07-21T00:19:11.576Z"
+        },
+        "timestamp": "2026-07-21T00:19:11.576Z",
+        "unknownField": "should be rejected"
+    });
+
+    let err_msg = serde_json::from_value::<LogLine>(json)
+        .expect_err("Should reject unknown fields in file-history-delta")
+        .to_string();
+    assert!(
+        err_msg.contains("unknown field") || err_msg.contains("unknownField"),
+        "Error should mention unknown field, got: {}",
+        err_msg
+    );
+}
+
+#[test]
+fn test_parse_file_history_delta_inner_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "type": "file-history-delta",
+        "messageId": "7c772208-16a4-4c6e-9a85-32b5887e04d8",
+        "snapshotMessageId": "336ca9bd-c0e7-46ca-a9fc-fda53b740ee2",
+        "trackingPath": "src/main.rs",
+        "backup": {
+            "backupFileName": "d959a531a8cd1839@v1",
+            "version": 1,
+            "backupTime": "2026-07-21T00:19:11.576Z",
+            "unknownField": "should be rejected"
+        },
+        "timestamp": "2026-07-21T00:19:11.576Z"
+    });
+
+    let err_msg = serde_json::from_value::<LogLine>(json)
+        .expect_err("Should reject unknown fields in file-history-delta backup")
+        .to_string();
+    assert!(
+        err_msg.contains("unknown field") || err_msg.contains("unknownField"),
+        "Error should mention unknown field, got: {}",
+        err_msg
+    );
+}
+
+// `rename_all = "camelCase"` plus `deny_unknown_fields` interact: a serialize-side rename bug would
+// make a serialized record fail to parse back, so assert the wire keys via round-trip.
+#[test]
+fn test_file_history_delta_round_trips() {
+    let json = serde_json::json!({
+        "type": "file-history-delta",
+        "messageId": "7c772208-16a4-4c6e-9a85-32b5887e04d8",
+        "snapshotMessageId": "336ca9bd-c0e7-46ca-a9fc-fda53b740ee2",
+        "trackingPath": "src/main.rs",
+        "backup": {
+            "backupFileName": "d959a531a8cd1839@v1",
+            "version": 1,
+            "backupTime": "2026-07-21T00:19:11.576Z"
+        },
+        "timestamp": "2026-07-21T00:19:11.576Z"
+    });
+    let parsed: LogLine = serde_json::from_value(json.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&parsed).unwrap(), json);
+}
+
 #[test]
 fn test_parse_summary() {
     let json = serde_json::json!({
@@ -1165,6 +1303,133 @@ fn test_parse_assistant_with_snake_case_session_id() {
             assert_eq!(assistant.session_id, "22222222-2222-2222-2222-222222222222");
         }
         _ => panic!("Expected Assistant variant"),
+    }
+}
+
+// The `effort` field on assistant turns (Claude Code 2.1.214+) records the reasoning-effort level.
+#[test]
+fn test_parse_assistant_with_effort() {
+    let json = serde_json::json!({
+        "parentUuid": "eede2871-e78d-4c6e-864a-76cac855f446",
+        "isSidechain": false,
+        "type": "assistant",
+        "uuid": "97d081ac-aa71-436d-bda0-0a53b196e6fe",
+        "timestamp": "2026-07-21T00:14:47.742Z",
+        "message": {
+            "id": "msg_011Cctf6yyjGaNhwgqmUY6KP",
+            "container": null,
+            "model": "claude-fable-5",
+            "role": "assistant",
+            "stop_details": null,
+            "stop_reason": "end_turn",
+            "stop_sequence": null,
+            "type": "message",
+            "usage": {
+                "input_tokens": 4,
+                "output_tokens": 8,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "server_tool_use": {"web_search_requests": 0, "web_fetch_requests": 0},
+                "service_tier": null,
+                "cache_creation": {"ephemeral_1h_input_tokens": 0, "ephemeral_5m_input_tokens": 0}
+            },
+            "content": [{"type": "text", "text": "ok"}],
+            "context_management": null
+        },
+        "requestId": "req_011Cctf6yyjGaNhwgqmUY6KP",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "22222222-2222-2222-2222-222222222222",
+        "version": "2.1.214",
+        "gitBranch": "HEAD",
+        "effort": "xhigh"
+    });
+
+    let line: LogLine =
+        serde_json::from_value(json).expect("Failed to parse assistant with effort");
+    match line {
+        LogLine::Assistant(assistant) => {
+            assert_eq!(assistant.effort, Some(ReasoningEffort::Xhigh));
+        }
+        _ => panic!("Expected Assistant variant"),
+    }
+}
+
+// Pre-2.1.214 assistant records omit `effort`, so it stays `None`.
+#[test]
+fn test_parse_assistant_without_effort() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "type": "assistant",
+        "uuid": "97d081ac-aa71-436d-bda0-0a53b196e6fe",
+        "timestamp": "2026-07-09T22:47:12.395Z",
+        "message": {
+            "id": "msg_011Cctf6yyjGaNhwgqmUY6KP",
+            "container": null,
+            "model": "claude-opus-4-8",
+            "role": "assistant",
+            "stop_details": null,
+            "stop_reason": "end_turn",
+            "stop_sequence": null,
+            "type": "message",
+            "usage": {
+                "input_tokens": 4,
+                "output_tokens": 8,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "server_tool_use": {"web_search_requests": 0, "web_fetch_requests": 0},
+                "service_tier": null,
+                "cache_creation": {"ephemeral_1h_input_tokens": 0, "ephemeral_5m_input_tokens": 0}
+            },
+            "content": [{"type": "text", "text": "ok"}],
+            "context_management": null
+        },
+        "requestId": "req_011Cctf6yyjGaNhwgqmUY6KP",
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "22222222-2222-2222-2222-222222222222",
+        "version": "2.1.104",
+        "gitBranch": "HEAD"
+    });
+
+    let line: LogLine =
+        serde_json::from_value(json).expect("Failed to parse assistant without effort");
+    match line {
+        LogLine::Assistant(assistant) => assert_eq!(assistant.effort, None),
+        _ => panic!("Expected Assistant variant"),
+    }
+}
+
+// The effort enum is strict so a genuinely new level surfaces as a parse error rather than being
+// silently dropped.
+#[test]
+fn test_reasoning_effort_rejects_unknown_level() {
+    let err = serde_json::from_value::<ReasoningEffort>(serde_json::json!("ludicrous"))
+        .expect_err("Should reject an unknown effort level");
+    assert!(
+        err.to_string().contains("unknown variant"),
+        "Error should mention unknown variant, got: {}",
+        err
+    );
+}
+
+// `rename_all = "camelCase"` maps each variant to its lowercase wire token; round-trip guards
+// against a serialize-side rename bug (notably `Xhigh` <-> "xhigh").
+#[test]
+fn test_reasoning_effort_round_trips() {
+    for (variant, wire) in [
+        (ReasoningEffort::Low, "low"),
+        (ReasoningEffort::Medium, "medium"),
+        (ReasoningEffort::High, "high"),
+        (ReasoningEffort::Xhigh, "xhigh"),
+        (ReasoningEffort::Max, "max"),
+    ] {
+        let json = serde_json::json!(wire);
+        let parsed: ReasoningEffort = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(parsed, variant);
+        assert_eq!(serde_json::to_value(variant).unwrap(), json);
     }
 }
 
@@ -3933,7 +4198,7 @@ fn test_parse_compact_boundary() {
                 Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap()
             );
             assert_eq!(boundary.content, "Compacted");
-            assert!(!boundary.is_meta);
+            assert_eq!(boundary.is_meta, Some(false));
             assert_eq!(boundary.compact_metadata.trigger, "manual");
             assert_eq!(boundary.compact_metadata.pre_tokens, 100000);
             // Pre-2.1.158 logs omit the preserved-segment metadata entirely.
@@ -4144,6 +4409,45 @@ fn test_parse_compact_boundary_with_cumulative_dropped_tokens() {
             assert_eq!(meta.pre_tokens, 922398);
             assert_eq!(meta.post_tokens, Some(14546));
             assert_eq!(meta.cumulative_dropped_tokens, Some(907852));
+        }
+        _ => panic!("Expected System(CompactBoundary) variant"),
+    }
+}
+
+// Claude Code 2.1.214 stopped emitting `isMeta` on compact_boundary records, so it must parse when
+// the field is absent.
+#[test]
+fn test_parse_compact_boundary_without_is_meta() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "logicalParentUuid": "f0d71e01-ae8d-49a7-8fe3-45171353e8d0",
+        "isSidechain": false,
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "33479dd1-b321-4619-b4d1-3c1ebaacb0ca",
+        "version": "2.1.214",
+        "gitBranch": "HEAD",
+        "slug": "binary-skipping-mango",
+        "type": "system",
+        "subtype": "compact_boundary",
+        "content": "Conversation compacted",
+        "timestamp": "2026-07-21T17:41:54.339Z",
+        "uuid": "bf589097-56a7-45fa-9f80-bf6990bff0e7",
+        "level": "info",
+        "compactMetadata": {
+            "trigger": "manual",
+            "preTokens": 997403,
+            "postTokens": 7407,
+            "cumulativeDroppedTokens": 989996
+        }
+    });
+
+    let line: LogLine =
+        serde_json::from_value(json).expect("Failed to parse compact_boundary without isMeta");
+    match line {
+        LogLine::System(SystemLogLine::CompactBoundary(boundary)) => {
+            assert_eq!(boundary.is_meta, None);
         }
         _ => panic!("Expected System(CompactBoundary) variant"),
     }
@@ -4414,6 +4718,43 @@ fn test_parse_microcompact_boundary_rejects_unknown_fields() {
         "Error should mention unknown field, got: {}",
         err_msg
     );
+}
+
+// `is_meta` is optional via the shared `define_boundary_log!` macro, so a microcompact_boundary
+// without `isMeta` must parse too even though the omission was observed on compact_boundary records.
+#[test]
+fn test_parse_microcompact_boundary_without_is_meta() {
+    let json = serde_json::json!({
+        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.214",
+        "gitBranch": "HEAD",
+        "type": "system",
+        "subtype": "microcompact_boundary",
+        "content": "Context microcompacted",
+        "timestamp": "2026-01-18T23:44:09.153Z",
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "level": "info",
+        "microcompactMetadata": {
+            "trigger": "auto",
+            "preTokens": 58482,
+            "tokensSaved": 20010,
+            "compactedToolIds": [],
+            "clearedAttachmentUUIDs": []
+        }
+    });
+
+    let line: LogLine =
+        serde_json::from_value(json).expect("Failed to parse microcompact_boundary without isMeta");
+    match line {
+        LogLine::System(SystemLogLine::MicrocompactBoundary(boundary)) => {
+            assert_eq!(boundary.is_meta, None);
+        }
+        _ => panic!("Expected System(MicrocompactBoundary) variant"),
+    }
 }
 
 #[test]
@@ -8600,6 +8941,79 @@ fn test_parse_attachment_task_reminder_without_active_form() {
         }
         other => panic!("Expected Attachment, got {:?}", other),
     }
+}
+
+// `task_status` attachment (Claude Code 2.1.214+) tracks a spawned background agent's progress.
+#[test]
+fn test_parse_attachment_task_status() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": "acc69b3e-00e9-4fe5-8feb-3a44658dae15",
+        "isSidechain": false,
+        "attachment": {
+            "type": "task_status",
+            "taskId": "a1155314b8a6f5c42",
+            "taskType": "local_agent",
+            "description": "Code-quality review pass 2",
+            "status": "running",
+            "deltaSummary": "Reading config shape-rejection cases",
+            "outputFilePath": "/tmp/tasks/a1155314b8a6f5c42.output"
+        },
+        "uuid": "b03318a9-c802-41c5-8aec-4a06f78ca35f",
+        "timestamp": "2026-07-21T18:03:47.391Z",
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "33479dd1-b321-4619-b4d1-3c1ebaacb0ca",
+        "version": "2.1.214",
+        "gitBranch": "HEAD"
+    });
+    let log_line: LogLine = serde_json::from_value(json).unwrap();
+    match log_line {
+        LogLine::Attachment(att) => {
+            if let AttachmentData::TaskStatus(task) = &att.attachment {
+                assert_eq!(task.task_id, "a1155314b8a6f5c42");
+                assert_eq!(task.task_type, "local_agent");
+                assert_eq!(task.status, "running");
+            } else {
+                panic!("Expected TaskStatus, got {:?}", att.attachment);
+            }
+        }
+        other => panic!("Expected Attachment, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_attachment_task_status_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": null,
+        "isSidechain": false,
+        "attachment": {
+            "type": "task_status",
+            "taskId": "a1155314b8a6f5c42",
+            "taskType": "local_agent",
+            "description": "review",
+            "status": "running",
+            "deltaSummary": "working",
+            "outputFilePath": "/tmp/tasks/x.output",
+            "unknownField": "should be rejected"
+        },
+        "uuid": "b03318a9-c802-41c5-8aec-4a06f78ca35f",
+        "timestamp": "2026-07-21T18:03:47.391Z",
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "33479dd1-b321-4619-b4d1-3c1ebaacb0ca",
+        "version": "2.1.214",
+        "gitBranch": "HEAD"
+    });
+    let err_msg = serde_json::from_value::<LogLine>(json)
+        .expect_err("Should reject unknown fields in task_status attachment")
+        .to_string();
+    assert!(
+        err_msg.contains("unknown field") || err_msg.contains("unknownField"),
+        "Error should mention unknown field, got: {}",
+        err_msg
+    );
 }
 
 #[test]

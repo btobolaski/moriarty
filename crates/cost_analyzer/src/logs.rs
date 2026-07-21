@@ -398,6 +398,7 @@ impl AnalyzableLog for ClaudeLogLine {
             ClaudeLogLine::User(line) => line.timestamp,
             ClaudeLogLine::Assistant(line) => line.timestamp,
             ClaudeLogLine::FileHistorySnapshot(line) => line.snapshot.timestamp,
+            ClaudeLogLine::FileHistoryDelta(line) => line.timestamp,
             ClaudeLogLine::Summary(_) => claude_timestamp_sentinel(),
             ClaudeLogLine::System(line) => claude_system_timestamp(line),
             ClaudeLogLine::QueueOperation(line) => line.timestamp,
@@ -420,6 +421,14 @@ impl AnalyzableLog for ClaudeLogLine {
             ClaudeLogLine::User(line) => line.uuid.to_string(),
             ClaudeLogLine::Assistant(line) => claude_assistant_identifier(line),
             ClaudeLogLine::FileHistorySnapshot(line) => line.message_id.to_string(),
+            // One message can back up several files, so key on the tracked path too rather than
+            // the message id alone to keep distinct deltas from colliding.
+            ClaudeLogLine::FileHistoryDelta(line) => {
+                format!(
+                    "file-history-delta:{}:{}",
+                    line.message_id, line.tracking_path
+                )
+            }
             ClaudeLogLine::Summary(line) => line.leaf_uuid.to_string(),
             ClaudeLogLine::System(line) => claude_system_identifier(line),
             ClaudeLogLine::QueueOperation(line) => {
@@ -1071,6 +1080,21 @@ mod tests {
                 "timestamp": CLAUDE_TIMESTAMP,
             },
             "isSnapshotUpdate": false,
+        })
+    }
+
+    fn claude_file_history_delta_json() -> serde_json::Value {
+        json!({
+            "type": "file-history-delta",
+            "messageId": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            "snapshotMessageId": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+            "trackingPath": "src/main.rs",
+            "backup": {
+                "backupFileName": "abc123@v1",
+                "version": 1,
+                "backupTime": CLAUDE_TIMESTAMP,
+            },
+            "timestamp": CLAUDE_TIMESTAMP,
         })
     }
 
@@ -1768,6 +1792,15 @@ mod tests {
                 value: claude_file_history_snapshot_json,
                 expected_timestamp: ExpectedClaudeTimestamp::Real,
                 expected_id: "88888888-8888-4888-8888-888888888888".to_string(),
+            },
+            ClaudeNonBillableCase {
+                name: "file history delta",
+                value: claude_file_history_delta_json,
+                // The delta carries a real timestamp and keys its identifier on message id plus
+                // tracking path, so a swapped `format!` argument order would fail this case.
+                expected_timestamp: ExpectedClaudeTimestamp::Real,
+                expected_id: "file-history-delta:cccccccc-cccc-4ccc-8ccc-cccccccccccc:src/main.rs"
+                    .to_string(),
             },
             ClaudeNonBillableCase {
                 name: "progress",

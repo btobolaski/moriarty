@@ -244,6 +244,7 @@
             cargo-hakari
             prettier
             treefmt
+            taplo
           ];
         };
       }
