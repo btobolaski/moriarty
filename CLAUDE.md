@@ -223,6 +223,10 @@ test in a separate process, making this safe and preventing tests from clobberin
   accepts their observed action-agnostic fields plus the real `{}` validation-error payload used by the extension
 - Strict by default with `#[serde(deny_unknown_fields)]`, path-aware parse errors, and narrowly documented exceptions
   for shapes that require custom deserialization or specific corrupt-stream tolerance
+- `CompactionLine` and `BranchSummaryLine` carry an optional `usage: Option<AssistantUsage>` recording the cost/tokens
+  of the summarization call pi made to produce them (pi added this field after the initial compaction schema, so it is
+  `#[serde(default)]` for backward compatibility); the lines record no provider/model of their own, so attribution is
+  left to `cost_analyzer`'s active-model fallback
 - Includes a `parse_pi_sessions` binary that recursively smoke-tests a sessions tree by parsing every `*.jsonl` file
 
 **`cost_analyzer/`** - Generic cost-analysis library:
@@ -244,6 +248,17 @@ test in a separate process, making this safe and preventing tests from clobberin
   extraction to this crate; the backends only bucket the returned billable lines into cost or token report rows
 - `LineWithCost.session_id` is normalized during parsing so backends can group by conversation without re-reading log
   files; Claude assistant lines provide it inline and pi logs inherit it from the file's `SessionLine`
+- `AnalyzableLog::active_model()` (default: the line's own `model()`) reports the model a line establishes as active for
+  subsequent lines in the same file; `reader::parse_file` threads the most recent non-`None` value alongside
+  `session_id`. A billable line that carries no model of its own — a pi compaction/branch-summary summarization cost,
+  which records no provider/model — is attributed to that active model via `LineWithCost::from_log`'s fallback
+  (`log.model().or(active_model)`), so it folds into whatever model was current when it ran. `PiLogLine` overrides
+  `active_model()` so an explicit `model_change` (which carries no cost) also updates the active model, matching the
+  user's model at that point even mid-session. `LineWithCost::parse` (single-line, no file context) passes no active
+  model, so a model-less billable line parsed in isolation is not attributed. If such a line appears in a file before
+  any model has been established (in practice unreachable — nothing to summarize before the first turn), its cost is
+  dropped rather than attributed to an invented model; `parse_file` emits a `tracing` warning so the (never-observed)
+  undercount is visible rather than silent
 - Deduplication keeps the highest-cost duplicate for a `(ModelId, LogId)` pair and breaks equal-cost ties by keeping the
   earliest timestamped entry
 - Public entry point: `cost_analyzer::analyze_directory(path)`

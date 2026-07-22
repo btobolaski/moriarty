@@ -131,6 +131,18 @@ fn log_parse_line_error(path: &Path, line_number: usize, line: &str, error: &mie
     );
 }
 
+/// Consistent with the crate's goal of never silently undercounting: surface the
+/// (in practice unreachable) case where a billable line's cost is dropped for
+/// lack of any model to attribute it to.
+fn log_dropped_unattributed_cost(path: &Path, line_number: usize) {
+    event!(
+        Level::WARN,
+        path = %path.display(),
+        line_number,
+        "dropping billable log line before any model was established; cost is undercounted"
+    );
+}
+
 async fn read_file_contents(path: &Path) -> miette::Result<String> {
     let contents = read_to_string(path).await;
 
@@ -159,6 +171,7 @@ async fn parse_file<LogType: AnalyzableLog>(
     tokio::spawn(async move {
         let mut output = Vec::new();
         let mut current_session_id: Option<String> = None;
+        let mut current_model: Option<LogType::ModelId> = None;
 
         for (line_number, line) in contents.lines().enumerate() {
             if line.trim().is_empty() {
@@ -174,8 +187,26 @@ async fn parse_file<LogType: AnalyzableLog>(
                 current_session_id = Some(session_id);
             }
 
-            if let Some(line_with_cost) = LineWithCost::from_log(log, current_session_id.clone()) {
+            // Track the active model so a later billable line without one of its
+            // own (e.g. a compaction summary) is attributed to whatever model was
+            // active when it ran.
+            if let Some(model) = log.active_model() {
+                current_model = Some(model);
+            }
+
+            // A billable line with no model of its own is only droppable before
+            // any model has been established (`current_model` is still `None`);
+            // once one exists it becomes the fallback. Gate on `current_model`
+            // first so the common already-attributed path skips the extra calls.
+            let unattributed_cost =
+                current_model.is_none() && log.cost().is_some() && log.model().is_none();
+
+            if let Some(line_with_cost) =
+                LineWithCost::from_log(log, current_session_id.clone(), current_model.clone())
+            {
                 output.push(line_with_cost);
+            } else if unattributed_cost {
+                log_dropped_unattributed_cost(&path, line_number + 1);
             }
         }
 
@@ -275,11 +306,11 @@ mod tests {
     use tokio::fs::{create_dir_all, write};
 
     use claude_logs::LogLine as ClaudeLogLine;
-    use pi_logs::PiLogLine;
+    use pi_logs::{PiLogLine, Provider};
 
     use super::*;
     use crate::{
-        logs::{ClaudeModelPricing, ClaudeTokenCounts, LlmCost, parse_json_line},
+        logs::{ClaudeModelPricing, ClaudeTokenCounts, LlmCost, PiModel, parse_json_line},
         test_support::{
             CLAUDE_SESSION_ID, CLAUDE_TIMESTAMP, claude_assistant_json, claude_usage_json,
         },
@@ -393,6 +424,105 @@ mod tests {
             "cwd": "/tmp/project"
         })
         .to_string()
+    }
+
+    fn pi_model_change_log(provider: &str, model_id: &str, timestamp: &str) -> String {
+        json!({
+            "type": "model_change",
+            "id": "mc1",
+            "parentId": null,
+            "timestamp": timestamp,
+            "provider": provider,
+            "modelId": model_id
+        })
+        .to_string()
+    }
+
+    /// A compaction line carrying summarization usage (cost total 7) but, as pi
+    /// writes it, no provider/model of its own.
+    fn pi_compaction_log(id: &str, timestamp: &str) -> String {
+        json!({
+            "type": "compaction",
+            "id": id,
+            "parentId": "p1",
+            "timestamp": timestamp,
+            "summary": "Compacted earlier work",
+            "firstKeptEntryId": "e1",
+            "tokensBefore": 12345,
+            "details": {"readFiles": [], "modifiedFiles": []},
+            "usage": {
+                "input": 7,
+                "output": 0,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "totalTokens": 7,
+                "cost": {
+                    "input": "7",
+                    "output": "0",
+                    "cacheRead": "0",
+                    "cacheWrite": "0",
+                    "total": "7",
+                    "source": "pi"
+                }
+            },
+            "fromHook": false
+        })
+        .to_string()
+    }
+
+    /// A branch-summary line carrying summarization usage (cost total 7) but no
+    /// provider/model of its own, mirroring [`pi_compaction_log`].
+    fn pi_branch_summary_log(id: &str, timestamp: &str) -> String {
+        json!({
+            "type": "branch_summary",
+            "id": id,
+            "parentId": "p1",
+            "timestamp": timestamp,
+            "fromId": "branch-root-1",
+            "summary": "explored a branch",
+            "details": {"readFiles": [], "modifiedFiles": []},
+            "usage": {
+                "input": 7,
+                "output": 0,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "totalTokens": 7,
+                "cost": {
+                    "input": "7",
+                    "output": "0",
+                    "cacheRead": "0",
+                    "cacheWrite": "0",
+                    "total": "7",
+                    "source": "pi"
+                }
+            },
+            "fromHook": false
+        })
+        .to_string()
+    }
+
+    fn sonnet_model() -> PiModel {
+        PiModel {
+            provider: Provider::Anthropic,
+            model: "claude-sonnet-4-5".to_string(),
+        }
+    }
+
+    fn gpt5_model() -> PiModel {
+        PiModel {
+            provider: Provider::OpenAi,
+            model: "gpt-5".to_string(),
+        }
+    }
+
+    fn line_by_id<'a>(
+        lines: &'a [LineWithCost<PiLogLine>],
+        id: &str,
+    ) -> &'a LineWithCost<PiLogLine> {
+        lines
+            .iter()
+            .find(|line| line.id == id)
+            .unwrap_or_else(|| panic!("no billable line with id {id}"))
     }
 
     fn timestamp(seconds: i64) -> DateTime<Utc> {
@@ -678,6 +808,122 @@ mod tests {
         let lines = parse_file::<PiLogLine>(path).await.unwrap();
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].session_id, None);
+    }
+
+    #[tokio::test]
+    async fn parse_file_folds_compaction_cost_into_active_model() {
+        let temp_dir = temp_dir();
+        let path = temp_dir.path().join("pi.jsonl");
+        let contents = format!(
+            "{}\n{}\n{}\n",
+            pi_session_log(PI_SESSION_ID, CLAUDE_TIMESTAMP),
+            pi_assistant_log("a1", CLAUDE_TIMESTAMP),
+            pi_compaction_log("cmp1", CLAUDE_TIMESTAMP),
+        );
+
+        write(&path, contents).await.unwrap();
+
+        let lines = parse_file::<PiLogLine>(path).await.unwrap();
+
+        assert_eq!(lines.len(), 2);
+        // The compaction line carries no model of its own, so it inherits the
+        // preceding assistant turn's model while keeping its own cost.
+        let compaction = line_by_id(&lines, "cmp1");
+        assert_eq!(compaction.model, sonnet_model());
+        assert_eq!(compaction.cost.total(), Decimal::new(7, 0));
+    }
+
+    #[tokio::test]
+    async fn parse_file_folds_branch_summary_cost_into_active_model() {
+        let temp_dir = temp_dir();
+        let path = temp_dir.path().join("pi.jsonl");
+        // Branch-summary usage shares the compaction attribution path; exercise
+        // it through the file-threading mechanism, not only unit fixtures.
+        let contents = format!(
+            "{}\n{}\n{}\n",
+            pi_session_log(PI_SESSION_ID, CLAUDE_TIMESTAMP),
+            pi_assistant_log("a1", CLAUDE_TIMESTAMP),
+            pi_branch_summary_log("bs1", CLAUDE_TIMESTAMP),
+        );
+
+        write(&path, contents).await.unwrap();
+
+        let lines = parse_file::<PiLogLine>(path).await.unwrap();
+
+        assert_eq!(lines.len(), 2);
+        let branch_summary = line_by_id(&lines, "bs1");
+        assert_eq!(branch_summary.model, sonnet_model());
+        assert_eq!(branch_summary.cost.total(), Decimal::new(7, 0));
+    }
+
+    #[tokio::test]
+    async fn parse_file_folds_compaction_cost_into_currently_active_model_after_model_change() {
+        let temp_dir = temp_dir();
+        let path = temp_dir.path().join("pi.jsonl");
+        // The session's model changes after the only assistant turn, so the
+        // compaction must fold into the model active at its point in the file,
+        // not the model of the last assistant turn.
+        let contents = format!(
+            "{}\n{}\n{}\n{}\n",
+            pi_session_log(PI_SESSION_ID, CLAUDE_TIMESTAMP),
+            pi_assistant_log("a1", CLAUDE_TIMESTAMP),
+            pi_model_change_log("openai", "gpt-5", CLAUDE_TIMESTAMP),
+            pi_compaction_log("cmp1", CLAUDE_TIMESTAMP),
+        );
+
+        write(&path, contents).await.unwrap();
+
+        let lines = parse_file::<PiLogLine>(path).await.unwrap();
+
+        assert_eq!(lines.len(), 2);
+        // The compaction folds into the post-change model...
+        assert_eq!(line_by_id(&lines, "cmp1").model, gpt5_model());
+        // ...while the earlier assistant turn keeps its own model (the model
+        // change must not retroactively reassign already-attributed lines).
+        assert_eq!(line_by_id(&lines, "a1").model, sonnet_model());
+    }
+
+    #[tokio::test]
+    async fn parse_file_reattributes_each_compaction_to_the_model_active_at_its_point() {
+        let temp_dir = temp_dir();
+        let path = temp_dir.path().join("pi.jsonl");
+        // Two compactions straddling a model change confirm `current_model` is
+        // re-read per line rather than latched at first use.
+        let contents = format!(
+            "{}\n{}\n{}\n{}\n{}\n",
+            pi_session_log(PI_SESSION_ID, CLAUDE_TIMESTAMP),
+            pi_assistant_log("a1", CLAUDE_TIMESTAMP),
+            pi_compaction_log("cmp1", CLAUDE_TIMESTAMP),
+            pi_model_change_log("openai", "gpt-5", CLAUDE_TIMESTAMP),
+            pi_compaction_log("cmp2", CLAUDE_TIMESTAMP),
+        );
+
+        write(&path, contents).await.unwrap();
+
+        let lines = parse_file::<PiLogLine>(path).await.unwrap();
+
+        assert_eq!(lines.len(), 3);
+        assert_eq!(line_by_id(&lines, "cmp1").model, sonnet_model());
+        assert_eq!(line_by_id(&lines, "cmp2").model, gpt5_model());
+    }
+
+    #[tokio::test]
+    async fn parse_file_drops_compaction_cost_when_no_model_is_yet_active() {
+        let temp_dir = temp_dir();
+        let path = temp_dir.path().join("pi.jsonl");
+        // A compaction before any model is established cannot be attributed;
+        // rather than invent a model, its cost is dropped. This should not occur
+        // in practice (nothing to compact before the first turn).
+        let contents = format!(
+            "{}\n{}\n",
+            pi_session_log(PI_SESSION_ID, CLAUDE_TIMESTAMP),
+            pi_compaction_log("cmp1", CLAUDE_TIMESTAMP),
+        );
+
+        write(&path, contents).await.unwrap();
+
+        let lines = parse_file::<PiLogLine>(path).await.unwrap();
+        assert!(lines.is_empty());
     }
 
     #[test]

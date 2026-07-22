@@ -160,6 +160,27 @@ fn branch_summary_json(from_hook: bool) -> Value {
     })
 }
 
+/// Mirrors the real compaction `usage` payload: carries `reasoning` and a
+/// `cost.source` of `"pi"`, both of which the parser must tolerate.
+fn compaction_usage_json() -> Value {
+    json!({
+        "input": 90351,
+        "output": 1822,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "reasoning": 460,
+        "totalTokens": 92173,
+        "cost": {
+            "input": 0.451755,
+            "output": 0.05466,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0.5064150000000001,
+            "source": "pi",
+        },
+    })
+}
+
 fn user_message_json(text: &str) -> Value {
     message_line_json(
         "u1",
@@ -849,6 +870,32 @@ fn compaction_line() {
                 vec![PathBuf::from("crates/pi_logs/src/parser.rs")]
             );
             assert!(!compaction.from_hook);
+            assert!(
+                compaction.usage.is_none(),
+                "usage must default to None on logs that predate the field"
+            );
+        }
+        other => panic!("expected Compaction, got {other:?}"),
+    }
+}
+
+#[test]
+fn compaction_line_with_usage() {
+    let mut value = compaction_json(false);
+    value
+        .as_object_mut()
+        .unwrap()
+        .insert("usage".to_string(), compaction_usage_json());
+
+    match parse(value) {
+        PiLogLine::Compaction(compaction) => {
+            let usage = compaction.usage.expect("usage present");
+            assert_eq!(usage.input, 90351);
+            assert_eq!(usage.output, 1822);
+            assert_eq!(usage.reasoning, 460);
+            assert_eq!(usage.total_tokens, 92173);
+            assert_eq!(usage.cost.total, "0.5064150000000001".parse().unwrap());
+            assert_eq!(usage.cost.source.as_deref(), Some("pi"));
         }
         other => panic!("expected Compaction, got {other:?}"),
     }
@@ -892,6 +939,29 @@ fn branch_summary_line() {
                 vec![PathBuf::from("plans/ci-cd-monorepo.md")]
             );
             assert!(!branch_summary.from_hook);
+            assert!(
+                branch_summary.usage.is_none(),
+                "usage must default to None on logs that predate the field"
+            );
+        }
+        other => panic!("expected BranchSummary, got {other:?}"),
+    }
+}
+
+#[test]
+fn branch_summary_line_with_usage() {
+    let mut value = branch_summary_json(false);
+    value
+        .as_object_mut()
+        .unwrap()
+        .insert("usage".to_string(), compaction_usage_json());
+
+    match parse(value) {
+        PiLogLine::BranchSummary(branch_summary) => {
+            let usage = branch_summary.usage.expect("usage present");
+            assert_eq!(usage.input, 90351);
+            assert_eq!(usage.total_tokens, 92173);
+            assert_eq!(usage.cost.source.as_deref(), Some("pi"));
         }
         other => panic!("expected BranchSummary, got {other:?}"),
     }
@@ -918,6 +988,21 @@ fn rejects_unknown_branch_summary_field() {
     assert_parse_error_contains_any(
         "rejects unknown branch_summary field",
         bad_branch_summary,
+        &["bogus"],
+    );
+}
+
+#[test]
+fn rejects_unknown_compaction_field() {
+    let mut bad_compaction = compaction_json(false);
+    bad_compaction
+        .as_object_mut()
+        .unwrap()
+        .insert("bogus".to_string(), json!("value"));
+
+    assert_parse_error_contains_any(
+        "rejects unknown compaction field",
+        bad_compaction,
         &["bogus"],
     );
 }

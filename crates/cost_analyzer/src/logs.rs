@@ -11,7 +11,9 @@ use claude_logs::{
     LogLine as ClaudeLogLine, Model as ClaudeModel, ModelFamily as ClaudeModelFamily,
     SystemLogLine as ClaudeSystemLogLine,
 };
-use pi_logs::{AssistantMessage, PiLogLine, Provider, RoleMessage};
+use pi_logs::{
+    AssistantMessage, AssistantUsage as PiAssistantUsage, PiLogLine, Provider, RoleMessage,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LlmCost {
@@ -83,6 +85,16 @@ pub trait AnalyzableLog: std::fmt::Debug + Clone + Send + Sync + 'static {
     fn identifier(&self) -> Self::LogId;
     /// model is only set on messages from the LLM so, this returns option
     fn model(&self) -> Option<Self::ModelId>;
+    /// The model this line establishes as active for the lines that follow it
+    /// in the same file. The reader threads the most recent non-`None` value so
+    /// a billable line that carries no model of its own (e.g. a compaction
+    /// summary) can be attributed to the model that was active when it ran. The
+    /// default tracks only the line's own `model()`; implementations override
+    /// when a non-billable line (e.g. an explicit model switch) also changes the
+    /// active model.
+    fn active_model(&self) -> Option<Self::ModelId> {
+        self.model()
+    }
     /// Returns a normalized conversation/session identifier when the parsed log
     /// line exposes one.
     fn session_id(&self) -> Option<String>;
@@ -113,8 +125,17 @@ impl<Log> LineWithCost<Log>
 where
     Log: AnalyzableLog,
 {
-    pub fn from_log(log: Log, session_id: Option<String>) -> Option<Self> {
-        match (log.cost(), log.model()) {
+    /// `active_model` is the model that was active when this line ran, threaded
+    /// by the reader from earlier lines in the same file. It is used only as a
+    /// fallback for billable lines that carry no model of their own (e.g. a
+    /// compaction summary, whose log line records cost but no provider/model);
+    /// a line with its own `model()` ignores it.
+    pub fn from_log(
+        log: Log,
+        session_id: Option<String>,
+        active_model: Option<Log::ModelId>,
+    ) -> Option<Self> {
+        match (log.cost(), log.model().or(active_model)) {
             (Some(cost), Some(model)) => Some(Self {
                 id: log.identifier(),
                 model,
@@ -130,7 +151,9 @@ where
     pub fn parse(value: &str) -> miette::Result<Option<Self>> {
         let log = Log::parse(value)?;
         let session_id = log.session_id();
-        Ok(Self::from_log(log, session_id))
+        // Single-line parse has no preceding-line context to establish an active
+        // model, so a line without its own model is not attributed.
+        Ok(Self::from_log(log, session_id, None))
     }
 }
 
@@ -271,10 +294,7 @@ fn token_count_from_claude_usage(
     }
 }
 
-fn token_count_from_pi_usage(
-    usage: &pi_logs::AssistantUsage,
-    token_type: TokenType,
-) -> Option<u64> {
+fn token_count_from_pi_usage(usage: &PiAssistantUsage, token_type: TokenType) -> Option<u64> {
     match token_type {
         TokenType::Input => Some(usage.input),
         TokenType::Output => Some(usage.output),
@@ -502,22 +522,36 @@ fn pi_assistant_message(line: &PiLogLine) -> Option<&AssistantMessage> {
     }
 }
 
+/// Usage for any billable pi line. Assistant turns always carry it; compaction
+/// and branch-summary lines carry it only on logs new enough to record the
+/// summarization call's cost, and neither records a provider/model of its own.
+fn pi_billable_usage(line: &PiLogLine) -> Option<&PiAssistantUsage> {
+    match line {
+        PiLogLine::Compaction(compaction) => compaction.usage.as_ref(),
+        PiLogLine::BranchSummary(branch_summary) => branch_summary.usage.as_ref(),
+        _ => pi_assistant_message(line).map(|assistant| &assistant.usage),
+    }
+}
+
+fn llm_cost_from_pi_usage(usage: &PiAssistantUsage) -> LlmCost {
+    LlmCost {
+        input: usage.cost.input,
+        cache_read: usage.cost.cache_read,
+        cache_write: usage.cost.cache_write,
+        output: usage.cost.output,
+    }
+}
+
 impl AnalyzableLog for PiLogLine {
     type LogId = String;
     type ModelId = PiModel;
 
     fn cost(&self) -> Option<LlmCost> {
-        pi_assistant_message(self).map(|assistant| LlmCost {
-            input: assistant.usage.cost.input,
-            cache_read: assistant.usage.cost.cache_read,
-            cache_write: assistant.usage.cost.cache_write,
-            output: assistant.usage.cost.output,
-        })
+        pi_billable_usage(self).map(llm_cost_from_pi_usage)
     }
 
     fn token_count(&self, token_type: TokenType) -> Option<u64> {
-        let assistant = pi_assistant_message(self)?;
-        token_count_from_pi_usage(&assistant.usage, token_type)
+        token_count_from_pi_usage(pi_billable_usage(self)?, token_type)
     }
 
     fn identifier(&self) -> String {
@@ -538,6 +572,20 @@ impl AnalyzableLog for PiLogLine {
         pi_assistant_message(self).map(|assistant| PiModel {
             model: assistant.model.clone(),
             provider: assistant.provider,
+        })
+    }
+
+    fn active_model(&self) -> Option<PiModel> {
+        // An assistant turn establishes its own model; an explicit model switch
+        // establishes the new one even though it carries no cost. Compaction and
+        // branch-summary lines carry no model, so they leave the active model
+        // unchanged and instead inherit it as a fallback in `from_log`.
+        self.model().or_else(|| match self {
+            PiLogLine::ModelChange(model_change) => Some(PiModel {
+                model: model_change.model_id.clone(),
+                provider: model_change.provider,
+            }),
+            _ => None,
         })
     }
 
@@ -777,6 +825,46 @@ mod tests {
             },
             "fromHook": false,
         })
+    }
+
+    /// Summarization-call usage as pi now records it on compaction/branch-summary
+    /// lines. Uses a total (7) distinct from the assistant fixture's (11) so a
+    /// folded compaction cost is distinguishable from an assistant turn's.
+    fn summarization_usage_json() -> serde_json::Value {
+        json!({
+            "input": 4,
+            "output": 3,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "reasoning": 2,
+            "totalTokens": 7,
+            "cost": {
+                "input": "4",
+                "output": "3",
+                "cacheRead": "0",
+                "cacheWrite": "0",
+                "total": "7",
+                "source": "pi",
+            },
+        })
+    }
+
+    fn compaction_with_usage_json() -> serde_json::Value {
+        let mut value = compaction_json();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("usage".to_string(), summarization_usage_json());
+        value
+    }
+
+    fn branch_summary_with_usage_json() -> serde_json::Value {
+        let mut value = branch_summary_json();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("usage".to_string(), summarization_usage_json());
+        value
     }
 
     fn custom_message_json() -> serde_json::Value {
@@ -1255,15 +1343,72 @@ mod tests {
     }
 
     #[test]
-    fn branch_summary_has_no_cost_model_or_tokens() {
-        let line = parse_pi_log(branch_summary_json());
+    fn compaction_and_branch_summary_without_usage_have_no_cost_model_or_tokens() {
+        for value in [compaction_json(), branch_summary_json()] {
+            let line = parse_pi_log(value);
 
-        assert!(line.cost().is_none());
-        assert!(line.model().is_none());
-        assert!(line.token_count(TokenType::Input).is_none());
-        assert!(line.token_count(TokenType::Output).is_none());
-        assert!(line.token_count(TokenType::CacheWrite).is_none());
-        assert!(line.token_count(TokenType::CacheRead).is_none());
+            assert!(line.cost().is_none());
+            assert!(line.model().is_none());
+            assert!(line.token_count(TokenType::Input).is_none());
+            assert!(line.token_count(TokenType::Output).is_none());
+            assert!(line.token_count(TokenType::CacheWrite).is_none());
+            assert!(line.token_count(TokenType::CacheRead).is_none());
+        }
+    }
+
+    #[test]
+    fn compaction_and_branch_summary_with_usage_have_cost_and_tokens_but_no_model() {
+        for value in [
+            compaction_with_usage_json(),
+            branch_summary_with_usage_json(),
+        ] {
+            let line = parse_pi_log(value);
+
+            // Assert each cost component, not just the total: the fixture's
+            // unequal input (4) and output (3) would let an input/output swap in
+            // `llm_cost_from_pi_usage` still sum to 7 and pass a total-only check.
+            let cost = line.cost().expect("usage present");
+            assert_eq!(cost.input, Decimal::new(4, 0));
+            assert_eq!(cost.output, Decimal::new(3, 0));
+            assert_eq!(cost.cache_read, Decimal::ZERO);
+            assert_eq!(cost.cache_write, Decimal::ZERO);
+            assert_eq!(cost.total(), Decimal::new(7, 0));
+            // The summarization call records no provider/model of its own, so
+            // attribution is left to the reader's active-model fallback.
+            assert!(line.model().is_none());
+            assert!(line.active_model().is_none());
+            assert_eq!(line.token_count(TokenType::Input), Some(4));
+            assert_eq!(line.token_count(TokenType::Output), Some(3));
+            assert_eq!(line.token_count(TokenType::CacheWrite), Some(0));
+            assert_eq!(line.token_count(TokenType::CacheRead), Some(0));
+        }
+    }
+
+    #[test]
+    fn active_model_tracks_assistant_turns_and_model_changes() {
+        // Both an assistant turn and an explicit model switch establish the
+        // active model for the lines that follow; lines that are neither leave
+        // it unchanged.
+        assert_eq!(
+            parse_pi_log(assistant_message_json()).active_model(),
+            Some(PiModel {
+                provider: Provider::Anthropic,
+                model: "claude-sonnet-4-5".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_pi_log(model_change_json()).active_model(),
+            Some(PiModel {
+                provider: Provider::Anthropic,
+                model: "claude-sonnet-4-5".to_string(),
+            })
+        );
+        assert!(parse_pi_log(user_message_json()).active_model().is_none());
+        assert!(
+            parse_pi_log(compaction_with_usage_json())
+                .active_model()
+                .is_none()
+        );
     }
 
     #[derive(Debug, Clone)]

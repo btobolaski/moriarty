@@ -207,6 +207,11 @@ pub struct CompactionLine {
     pub first_kept_entry_id: String,
     pub tokens_before: u64,
     pub details: CompactionDetails,
+    /// Cost/token usage of the summarization call pi made to produce this
+    /// compaction. Added by pi after the initial compaction schema, so older
+    /// logs omit it; the line records no provider/model of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<AssistantUsage>,
     pub from_hook: bool,
 }
 
@@ -221,6 +226,10 @@ pub struct BranchSummaryLine {
     pub from_id: String,
     pub summary: String,
     pub details: CompactionDetails,
+    /// Cost/token usage of the summarization call, mirroring
+    /// [`CompactionLine::usage`]; likewise optional for backward compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<AssistantUsage>,
     pub from_hook: bool,
 }
 
