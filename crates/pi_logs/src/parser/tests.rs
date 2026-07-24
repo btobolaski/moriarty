@@ -4778,7 +4778,7 @@ fn custom_message_subagent_control_notice_accepts_needs_attention_event() {
                 event.current_path,
                 Some(PathBuf::from("review-documentation-3.md"))
             );
-            assert_eq!(event.elapsed_ms, Decimal::from(60887));
+            assert_eq!(event.elapsed_ms, Some(Decimal::from(60887)));
         }
         other => panic!("expected SubagentControlNotice, got {other:?}"),
     }
@@ -4821,7 +4821,7 @@ fn custom_message_subagent_control_notice_accepts_fractional_async_event() {
             assert_eq!(event.tool_count, None);
             assert_eq!(
                 event.elapsed_ms,
-                Decimal::from_str_exact("60068.85791015625").unwrap()
+                Some(Decimal::from_str_exact("60068.85791015625").unwrap())
             );
         }
         other => panic!("expected SubagentControlNotice, got {other:?}"),
@@ -4865,6 +4865,45 @@ fn custom_message_subagent_control_notice_accepts_active_long_running_event() {
             assert_eq!(event.run_id, "b48327c8");
             assert_eq!(event.agent, "code-quality-reviewer");
             assert_eq!(event.reason, "turn_threshold");
+        }
+        other => panic!("expected SubagentControlNotice, got {other:?}"),
+    }
+}
+
+#[test]
+fn custom_message_subagent_control_notice_accepts_needs_attention_without_elapsed_ms() {
+    // completion_guard fires immediately when a subagent finishes without
+    // edits — no elapsedMs, turns, tokens, or toolCount are present.
+    match parse_custom_message_payload(
+        "Subagent failed: worker",
+        "subagent_control_notice",
+        Some(json!({
+            "event": {
+                "type": "needs_attention",
+                "to": "needs_attention",
+                "ts": 1784680924502_u64,
+                "runId": "066d4c0a-f502-4a2f-8d9d-f803beb51976",
+                "agent": "worker",
+                "index": 0,
+                "message": "worker completed without making edits for an implementation task",
+                "reason": "completion_guard"
+            },
+            "source": "async",
+            "asyncDir": "/tmp/pi-subagents/066d4c0a",
+            "childIntercomTarget": "subagent-worker-066d4c0a-f502-4a2f-8d9d-f803beb51976-1",
+            "noticeText": "Subagent failed: worker"
+        })),
+    ) {
+        CustomMessagePayload::SubagentControlNotice(details) => {
+            assert_eq!(details.source, "async");
+            let SubagentControlEvent::NeedsAttention(event) = details.event else {
+                panic!("expected needs_attention event")
+            };
+            assert_eq!(event.reason, "completion_guard");
+            assert_eq!(event.elapsed_ms, None);
+            assert_eq!(event.turns, None);
+            assert_eq!(event.tokens, None);
+            assert_eq!(event.tool_count, None);
         }
         other => panic!("expected SubagentControlNotice, got {other:?}"),
     }
@@ -6598,7 +6637,7 @@ fn subagent_tool_result_accepts_active_long_running_control_event() {
         event.current_path,
         Some(PathBuf::from("charts/temporal/values.yaml"))
     );
-    assert_eq!(event.elapsed_ms, Decimal::from(97198));
+    assert_eq!(event.elapsed_ms, Some(Decimal::from(97198)));
 }
 
 #[test]
@@ -6665,7 +6704,7 @@ fn subagent_tool_result_accepts_needs_attention_control_event() {
             "/Users/brendan/src/hydrogen-cloud/review-documentation-3.md"
         ))
     );
-    assert_eq!(event.elapsed_ms, Decimal::from(60887));
+    assert_eq!(event.elapsed_ms, Some(Decimal::from(60887)));
 }
 
 #[test]
@@ -6897,7 +6936,7 @@ fn subagent_result_summary_serializes_control_events_as_camel_case() {
                 current_tool: None,
                 current_tool_duration_ms: None,
                 current_path: Some(PathBuf::from("charts/temporal/values.yaml")),
-                elapsed_ms: Decimal::from(97198),
+                elapsed_ms: Some(Decimal::from(97198)),
             },
         )]),
         acceptance: None,

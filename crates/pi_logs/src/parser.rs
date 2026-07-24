@@ -2474,7 +2474,10 @@ pub struct SubagentControlEventPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_path: Option<PathBuf>,
     /// The runtime measures elapsed time with a sub-millisecond clock.
-    pub elapsed_ms: Decimal,
+    /// Omitted by event producers such as `completion_guard` that do not
+    /// include runtime observability counters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<Decimal>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
