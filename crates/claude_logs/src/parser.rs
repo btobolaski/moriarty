@@ -1351,6 +1351,9 @@ pub struct FileHistoryBackup {
     pub backup_file_name: Option<String>,
     pub version: u32,
     pub backup_time: DateTime<Utc>,
+    /// Optional because otherwise valid observed records may omit `realParentDir`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub real_parent_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]

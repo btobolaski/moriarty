@@ -896,12 +896,15 @@ fn test_parse_file_history_delta() {
         "backup": {
             "backupFileName": "d959a531a8cd1839@v1",
             "version": 1,
-            "backupTime": "2026-07-21T00:19:11.576Z"
+            "backupTime": "2026-07-21T00:19:11.576Z",
+            "realParentDir": "/private/tmp/claude-501/session/scratchpad"
         },
         "timestamp": "2026-07-21T00:19:11.576Z"
     });
 
-    let line: LogLine = serde_json::from_value(json).expect("Failed to parse file-history-delta");
+    let line: LogLine =
+        serde_json::from_value(json.clone()).expect("Failed to parse file-history-delta");
+    assert_eq!(serde_json::to_value(&line).unwrap(), json);
     match line {
         LogLine::FileHistoryDelta(delta) => {
             assert_eq!(
@@ -921,6 +924,10 @@ fn test_parse_file_history_delta() {
                 Some("d959a531a8cd1839@v1")
             );
             assert_eq!(delta.backup.version, 1);
+            assert_eq!(
+                delta.backup.real_parent_dir.as_deref(),
+                Some("/private/tmp/claude-501/session/scratchpad")
+            );
         }
         _ => panic!("Expected FileHistoryDelta variant"),
     }
@@ -946,7 +953,10 @@ fn test_parse_file_history_delta_null_backup_file_name() {
     let line: LogLine =
         serde_json::from_value(json).expect("Failed to parse file-history-delta with null backup");
     match line {
-        LogLine::FileHistoryDelta(delta) => assert_eq!(delta.backup.backup_file_name, None),
+        LogLine::FileHistoryDelta(delta) => {
+            assert_eq!(delta.backup.backup_file_name, None);
+            assert_eq!(delta.backup.real_parent_dir, None);
+        }
         _ => panic!("Expected FileHistoryDelta variant"),
     }
 }

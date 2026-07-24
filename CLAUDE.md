@@ -155,11 +155,11 @@ test in a separate process, making this safe and preventing tests from clobberin
   parse error; nullable so pre-2.1.214 logs still parse), and a `file-history-delta` line type (`FileHistoryDelta`, the
   incremental analogue of `file-history-snapshot`: it records a single tracked file's backup — `messageId`,
   `snapshotMessageId`, `trackingPath`, a nested `backup` whose `backupFileName` is null when the backup file does not
-  yet exist for a newly tracked file, and a `timestamp` — rather than re-emitting the whole snapshot), and a relaxation
-  of the `define_boundary_log!` macro's `isMeta` to `Option<bool>` (shared by `CompactBoundary` and
-  `MicrocompactBoundary`) because Claude Code 2.1.214 stopped emitting it on `compact_boundary` records (the field is
-  read only for schema completeness, so older records that still carry it keep parsing), and a `task_status` attachment
-  (`TaskStatus`, a progress record for a spawned background agent carrying
+  yet exist for a newly tracked file and which may also carry an optional `realParentDir` path, and a `timestamp` —
+  rather than re-emitting the whole snapshot), and a relaxation of the `define_boundary_log!` macro's `isMeta` to
+  `Option<bool>` (shared by `CompactBoundary` and `MicrocompactBoundary`) because Claude Code 2.1.214 stopped emitting
+  it on `compact_boundary` records (the field is read only for schema completeness, so older records that still carry it
+  keep parsing), and a `task_status` attachment (`TaskStatus`, a progress record for a spawned background agent carrying
   `taskId`/`taskType`/`description`/`status`/`deltaSummary`/`outputFilePath`; `taskType` and `status` are kept as
   `String` rather than strict enums because their runtime-lifecycle vocabularies are undocumented and volatile and
   nothing downstream reads them, mirroring `TaskReminderItem.status`), a `messagesSummarized` field on
