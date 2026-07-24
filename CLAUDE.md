@@ -162,7 +162,12 @@ test in a separate process, making this safe and preventing tests from clobberin
   (`TaskStatus`, a progress record for a spawned background agent carrying
   `taskId`/`taskType`/`description`/`status`/`deltaSummary`/`outputFilePath`; `taskType` and `status` are kept as
   `String` rather than strict enums because their runtime-lifecycle vocabularies are undocumented and volatile and
-  nothing downstream reads them, mirroring `TaskReminderItem.status`) (all added in Claude Code 2.1.214+)
+  nothing downstream reads them, mirroring `TaskReminderItem.status`), a `messagesSummarized` field on
+  `compact_boundary` records' `compactMetadata` (`CompactMetadata`, the count of messages folded into the summary by
+  this compaction; nullable so older records still parse), and a `summarizeMetadata` object on the compact-summary user
+  turn (`SummarizeMetadata`, carrying `messagesSummarized` plus a `direction` string kept as `String` rather than a
+  strict enum because its vocabulary — observed `from` — is undocumented and nothing downstream reads it; present only
+  alongside `isCompactSummary`, hence `Option`) (all added in Claude Code 2.1.214+)
 - Also owns the structured view of the raw `model` string via `model::Model { family, version }` plus `ModelFamily` and
   `ModelVersion`. Both `cost_analyzer` (for pricing) and `moriarty::api_pricing` (for grouping/display) consume this one
   parser so family/version classification is not duplicated across crates. The parser preserves capability-decorated raw

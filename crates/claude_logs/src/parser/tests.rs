@@ -4208,6 +4208,7 @@ fn test_parse_compact_boundary() {
             assert_eq!(boundary.compact_metadata.preserved_segment, None);
             assert_eq!(boundary.compact_metadata.preserved_messages, None);
             assert_eq!(boundary.compact_metadata.cumulative_dropped_tokens, None);
+            assert_eq!(boundary.compact_metadata.messages_summarized, None);
             assert_eq!(boundary.slug.as_deref(), Some("noble-floating-lemon"));
         }
         _ => panic!("Expected System(CompactBoundary) variant"),
@@ -4355,6 +4356,7 @@ fn test_parse_compact_boundary_with_partial_preserved_metadata() {
             assert_eq!(meta.preserved_segment, None);
             assert_eq!(meta.preserved_messages, None);
             assert_eq!(meta.cumulative_dropped_tokens, None);
+            assert_eq!(meta.messages_summarized, None);
         }
         _ => panic!("Expected System(CompactBoundary) variant"),
     }
@@ -4414,6 +4416,50 @@ fn test_parse_compact_boundary_with_cumulative_dropped_tokens() {
     }
 }
 
+#[test]
+fn test_parse_compact_boundary_with_messages_summarized() {
+    // Claude Code 2.1.214 added messagesSummarized to compactMetadata.
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "logicalParentUuid": "fe41433a-9ce4-4f68-9a00-decd968be064",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "d7dc9685-4671-4982-8ebc-6bd9d79ad6b0",
+        "version": "2.1.214",
+        "gitBranch": "HEAD",
+        "slug": "partitioned-plotting-firefly",
+        "type": "system",
+        "subtype": "compact_boundary",
+        "content": "Conversation compacted",
+        "isMeta": false,
+        "timestamp": "2026-07-23T23:53:20.901Z",
+        "uuid": "94709d97-84f4-4579-8b95-6b6757672a2f",
+        "level": "info",
+        "compactMetadata": {
+            "trigger": "manual",
+            "preTokens": 847997,
+            "messagesSummarized": 703,
+            "durationMs": 222556,
+            "postTokens": 384048,
+            "cumulativeDroppedTokens": 463949
+        }
+    });
+
+    let line: LogLine = serde_json::from_value(json)
+        .expect("Failed to parse compact_boundary with messagesSummarized");
+
+    match line {
+        LogLine::System(SystemLogLine::CompactBoundary(boundary)) => {
+            let meta = boundary.compact_metadata;
+            assert_eq!(meta.pre_tokens, 847997);
+            assert_eq!(meta.post_tokens, Some(384048));
+            assert_eq!(meta.messages_summarized, Some(703));
+        }
+        _ => panic!("Expected System(CompactBoundary) variant"),
+    }
+}
+
 // Claude Code 2.1.214 stopped emitting `isMeta` on compact_boundary records, so it must parse when
 // the field is absent.
 #[test]
@@ -4451,6 +4497,73 @@ fn test_parse_compact_boundary_without_is_meta() {
         }
         _ => panic!("Expected System(CompactBoundary) variant"),
     }
+}
+
+#[test]
+fn test_parse_user_log_line_with_summarize_metadata() {
+    // Claude Code 2.1.214 added summarizeMetadata to the compact-summary user turn.
+    let json = serde_json::json!({
+        "parentUuid": "f9d262b2-7250-449d-955f-cc4e1fda4f83",
+        "isSidechain": false,
+        "promptId": "a98be83f-0357-48ba-9e64-27aa66b4cb7b",
+        "message": {"role": "user", "content": "This session is being continued..."},
+        "isCompactSummary": true,
+        "summarizeMetadata": {"messagesSummarized": 703, "direction": "from"},
+        "uuid": "0afa2d5b-b030-4aa3-8c2f-599f8bc18262",
+        "timestamp": "2026-07-23T23:53:20.903Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "d7dc9685-4671-4982-8ebc-6bd9d79ad6b0",
+        "version": "2.1.214",
+        "gitBranch": "HEAD",
+        "slug": "partitioned-plotting-firefly"
+    });
+
+    let line: UserLogLine =
+        serde_json::from_value(json).expect("Failed to parse user turn with summarizeMetadata");
+    assert_eq!(line.is_compact_summary, Some(true));
+    let meta = line
+        .summarize_metadata
+        .expect("summarizeMetadata should be present");
+    assert_eq!(meta.messages_summarized, 703);
+    assert_eq!(meta.direction, "from");
+}
+
+#[test]
+fn test_parse_summarize_metadata_rejects_unknown_fields() {
+    let json = serde_json::json!({
+        "messagesSummarized": 703,
+        "direction": "from",
+        "extraField": "should be rejected"
+    });
+
+    let err_msg = serde_json::from_value::<SummarizeMetadata>(json)
+        .expect_err("Should reject unknown fields in SummarizeMetadata")
+        .to_string();
+    assert!(
+        err_msg.contains("unknown field") || err_msg.contains("extraField"),
+        "Error should mention unknown field, got: {}",
+        err_msg
+    );
+}
+
+#[test]
+fn test_parse_summarize_metadata_requires_direction() {
+    // `direction` is non-Option, so a payload omitting it must be rejected rather than silently
+    // defaulting.
+    let json = serde_json::json!({
+        "messagesSummarized": 703
+    });
+
+    let err_msg = serde_json::from_value::<SummarizeMetadata>(json)
+        .expect_err("Should reject SummarizeMetadata missing direction")
+        .to_string();
+    assert!(
+        err_msg.contains("missing field") || err_msg.contains("direction"),
+        "Error should mention the missing direction field, got: {}",
+        err_msg
+    );
 }
 
 #[test]

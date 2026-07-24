@@ -1206,8 +1206,8 @@ pub struct SystemLogInformational {
 }
 
 /// `trigger` and `pre_tokens` are the only fields present before Claude Code 2.1.158; the
-/// preserved-segment fields arrived in 2.1.158 and `cumulative_dropped_tokens` in 2.1.197. All
-/// stay `Option` so older records still parse.
+/// preserved-segment fields arrived in 2.1.158, `cumulative_dropped_tokens` in 2.1.197, and
+/// `messages_summarized` in 2.1.214. All stay `Option` so older records still parse.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
@@ -1222,6 +1222,8 @@ pub struct CompactMetadata {
     /// Running total of tokens dropped across all compactions in the session. Added in Claude
     /// Code 2.1.197+.
     pub cumulative_dropped_tokens: Option<usize>,
+    /// Count of messages folded into the summary by this compaction. Added in Claude Code 2.1.214+.
+    pub messages_summarized: Option<usize>,
 }
 
 /// Added in Claude Code 2.1.158+.
@@ -1419,6 +1421,9 @@ pub struct UserLogLine {
     pub thinking_metadata: Option<ThinkingMetadata>,
     pub is_visible_in_transcript_only: Option<bool>,
     pub is_compact_summary: Option<bool>,
+    /// Metadata about the summarization that produced this compact-summary turn; present only
+    /// alongside `is_compact_summary`, hence `Option`. Added in Claude Code 2.1.214+.
+    pub summarize_metadata: Option<SummarizeMetadata>,
     /// Todo list from Claude Code 2.0.47+. Contains tasks being tracked in the conversation.
     pub todos: Option<Vec<Todo>>,
     /// UUID of the assistant message that triggered the tool use. Added in Claude Code 2.0.51+.
@@ -1463,6 +1468,19 @@ pub struct UserLogLine {
     /// once, which serde would reject as a duplicate. `Option` so pre-2.1.206 lines still parse.
     #[serde(rename = "session_id")]
     pub session_id_snake: Option<Uuid>,
+}
+
+/// Summarization metadata on a compact-summary user turn. Added in Claude Code 2.1.214+.
+///
+/// `direction` is kept a `String` rather than a strict enum because its vocabulary (observed:
+/// `"from"`) is undocumented and nothing downstream reads it, matching the parser's treatment of
+/// other undocumented volatile vocabularies (e.g. [`TaskStatus`]'s `status`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct SummarizeMetadata {
+    pub messages_summarized: usize,
+    pub direction: String,
 }
 
 /// Strict envelope mirroring Claude Code's `mcpMeta` object. Kept `deny_unknown_fields` so a future
