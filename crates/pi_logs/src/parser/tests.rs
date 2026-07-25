@@ -858,15 +858,18 @@ fn compaction_line() {
             assert_eq!(compaction.summary, "Compacted earlier work");
             assert_eq!(compaction.first_kept_entry_id, "e1");
             assert_eq!(compaction.tokens_before, 12345);
+            let CompactionDetails::V1(details) = &compaction.details else {
+                panic!("expected V1 compaction details, got {:?}", compaction.details);
+            };
             assert_eq!(
-                compaction.details.read_files,
+                details.read_files,
                 vec![
                     PathBuf::from("src/main.rs"),
                     PathBuf::from("/tmp/output.log")
                 ]
             );
             assert_eq!(
-                compaction.details.modified_files,
+                details.modified_files,
                 vec![PathBuf::from("crates/pi_logs/src/parser.rs")]
             );
             assert!(!compaction.from_hook);
@@ -930,12 +933,18 @@ fn branch_summary_line() {
                 branch_summary.summary,
                 "The user explored a different branch before returning here."
             );
+            let CompactionDetails::V1(details) = &branch_summary.details else {
+                panic!(
+                    "expected V1 branch summary details, got {:?}",
+                    branch_summary.details
+                );
+            };
             assert_eq!(
-                branch_summary.details.read_files,
+                details.read_files,
                 vec![PathBuf::from("references/hydrogen-rtc/Dockerfile")]
             );
             assert_eq!(
-                branch_summary.details.modified_files,
+                details.modified_files,
                 vec![PathBuf::from("plans/ci-cd-monorepo.md")]
             );
             assert!(!branch_summary.from_hook);
@@ -1005,6 +1014,110 @@ fn rejects_unknown_compaction_field() {
         bad_compaction,
         &["bogus"],
     );
+}
+
+#[test]
+fn compaction_line_v2() {
+    let mut value = json!({
+        "type": "compaction",
+        "id": "c1",
+        "parentId": "p1",
+        "timestamp": FIXED_TIMESTAMP,
+        "summary": "Compacted earlier work",
+        "firstKeptEntryId": "e1",
+        "tokensBefore": 12345,
+        "details": {
+            "compactor": "blackhole",
+            "version": 1,
+            "sections": ["Session Goal", "Files And Changes"],
+            "sourceMessageCount": 42,
+            "previousSummaryUsed": true,
+            "om.folded": {
+                "type": "om.folded",
+                "version": 1,
+                "fullFold": false,
+                "observations": [],
+                "reflections": []
+            }
+        },
+        "fromHook": false,
+    });
+    value
+        .as_object_mut()
+        .unwrap()
+        .insert("usage".to_string(), compaction_usage_json());
+
+    match parse(value) {
+        PiLogLine::Compaction(compaction) => {
+            assert_eq!(compaction.summary, "Compacted earlier work");
+            assert_eq!(compaction.first_kept_entry_id, "e1");
+            assert_eq!(compaction.tokens_before, 12345);
+            assert!(!compaction.from_hook);
+
+            let CompactionDetails::V2(details) = &compaction.details else {
+                panic!("expected V2 compaction details, got {:?}", compaction.details);
+            };
+            assert_eq!(details.compactor, "blackhole");
+            assert_eq!(details.version, 1);
+            assert_eq!(details.sections, vec!["Session Goal", "Files And Changes"]);
+            assert_eq!(details.source_message_count, 42);
+            assert!(details.previous_summary_used);
+            assert_eq!(details.om_folded.typ, "om.folded");
+            assert_eq!(details.om_folded.version, 1);
+            assert!(!details.om_folded.full_fold);
+            assert!(details.om_folded.observations.is_empty());
+            assert!(details.om_folded.reflections.is_empty());
+
+            let usage = compaction.usage.expect("usage present");
+            assert_eq!(usage.input, 90351);
+        }
+        other => panic!("expected Compaction, got {other:?}"),
+    }
+}
+
+#[test]
+fn compaction_line_v2_minimal() {
+    let line = parse(json!({
+        "type": "compaction",
+        "id": "c1",
+        "parentId": "p1",
+        "timestamp": FIXED_TIMESTAMP,
+        "summary": "Minimal",
+        "firstKeptEntryId": "e1",
+        "tokensBefore": 0,
+        "details": {
+            "compactor": "om",
+            "version": 2,
+            "sections": [],
+            "sourceMessageCount": 0,
+            "previousSummaryUsed": false,
+            "om.folded": {
+                "type": "om.folded",
+                "version": 1,
+                "fullFold": false,
+                "observations": [{"nested": true}],
+                "reflections": [42, "text"]
+            }
+        },
+        "fromHook": true,
+    }));
+
+    match line {
+        PiLogLine::Compaction(compaction) => {
+            assert!(compaction.from_hook);
+            let CompactionDetails::V2(details) = &compaction.details else {
+                panic!("expected V2");
+            };
+            assert_eq!(details.compactor, "om");
+            assert_eq!(details.version, 2);
+            assert_eq!(details.sections.len(), 0);
+            assert_eq!(details.source_message_count, 0);
+            assert!(!details.previous_summary_used);
+            assert_eq!(details.om_folded.observations.len(), 1);
+            assert_eq!(details.om_folded.reflections.len(), 2);
+        }
+        other => panic!("expected Compaction, got {other:?}"),
+    }
 }
 
 #[test]
@@ -3571,6 +3684,158 @@ fn custom_plannotator_execute() {
         }
         other => panic!("expected PlannotatorExecute, got {other:?}"),
     }
+}
+
+#[test]
+fn custom_om_observations_recorded() {
+    match parse_custom_payload(
+        "om.observations.recorded",
+        json!({
+            "observations": [{
+                "id": "obs-1",
+                "content": "Observation content",
+                "timestamp": "2026-07-25 12:57",
+                "relevance": "high",
+                "sourceEntryIds": ["e1", "e2"],
+                "tokenCount": 54
+            }],
+            "coversUpToId": "entry-99"
+        }),
+    ) {
+        CustomPayload::OmObservationsRecorded(data) => {
+            assert_eq!(data.covers_up_to_id, "entry-99");
+            assert_eq!(data.observations.len(), 1);
+            let obs = &data.observations[0];
+            assert_eq!(obs.id, "obs-1");
+            assert_eq!(obs.content, "Observation content");
+            assert_eq!(obs.timestamp, "2026-07-25 12:57");
+            assert_eq!(obs.relevance, "high");
+            assert_eq!(obs.source_entry_ids, vec!["e1", "e2"]);
+            assert_eq!(obs.token_count, 54);
+        }
+        other => panic!("expected OmObservationsRecorded, got {other:?}"),
+    }
+}
+
+#[test]
+fn custom_om_reflections_recorded() {
+    match parse_custom_payload(
+        "om.reflections.recorded",
+        json!({
+            "reflections": [{
+                "id": "ref-1",
+                "content": "Reflection content",
+                "supportingObservationIds": ["obs-1"],
+                "tokenCount": 57
+            }],
+            "coversUpToId": "entry-99"
+        }),
+    ) {
+        CustomPayload::OmReflectionsRecorded(data) => {
+            assert_eq!(data.covers_up_to_id, "entry-99");
+            assert_eq!(data.reflections.len(), 1);
+            let refl = &data.reflections[0];
+            assert_eq!(refl.id, "ref-1");
+            assert_eq!(refl.content, "Reflection content");
+            assert_eq!(refl.supporting_observation_ids, vec!["obs-1"]);
+            assert_eq!(refl.token_count, 57);
+        }
+        other => panic!("expected OmReflectionsRecorded, got {other:?}"),
+    }
+}
+
+#[test]
+fn custom_om_observations_dropped() {
+    match parse_custom_payload(
+        "om.observations.dropped",
+        json!({
+            "observationIds": ["obs-1", "obs-2"],
+            "coversUpToId": "entry-42"
+        }),
+    ) {
+        CustomPayload::OmObservationsDropped(data) => {
+            assert_eq!(data.covers_up_to_id, "entry-42");
+            assert_eq!(data.observation_ids, vec!["obs-1", "obs-2"]);
+        }
+        other => panic!("expected OmObservationsDropped, got {other:?}"),
+    }
+}
+
+#[test]
+fn custom_om_reflections_dropped() {
+    match parse_custom_payload(
+        "om.reflections.dropped",
+        json!({
+            "reflectionIds": ["ref-1"],
+            "coversUpToId": "entry-7"
+        }),
+    ) {
+        CustomPayload::OmReflectionsDropped(data) => {
+            assert_eq!(data.covers_up_to_id, "entry-7");
+            assert_eq!(data.reflection_ids, vec!["ref-1"]);
+        }
+        other => panic!("expected OmReflectionsDropped, got {other:?}"),
+    }
+}
+
+#[test]
+fn om_observations_dropped_rejects_reflection_ids() {
+    assert_parse_error_contains_any(
+        "om.observations.dropped rejects reflectionIds",
+        custom_json(
+            "om.observations.dropped",
+            json!({
+                "observationIds": ["obs-1"],
+                "reflectionIds": ["ref-1"],
+                "coversUpToId": "entry-7"
+            }),
+        ),
+        &["unknown field", "reflectionIds"],
+    );
+}
+
+#[test]
+fn om_observations_dropped_rejects_missing_observation_ids() {
+    assert_parse_error_contains_any(
+        "om.observations.dropped rejects missing observationIds",
+        custom_json(
+            "om.observations.dropped",
+            json!({
+                "coversUpToId": "entry-7"
+            }),
+        ),
+        &["missing field", "observationIds"],
+    );
+}
+
+#[test]
+fn om_reflections_dropped_rejects_observation_ids() {
+    assert_parse_error_contains_any(
+        "om.reflections.dropped rejects observationIds",
+        custom_json(
+            "om.reflections.dropped",
+            json!({
+                "reflectionIds": ["ref-1"],
+                "observationIds": ["obs-1"],
+                "coversUpToId": "entry-7"
+            }),
+        ),
+        &["unknown field", "observationIds"],
+    );
+}
+
+#[test]
+fn om_reflections_dropped_rejects_missing_reflection_ids() {
+    assert_parse_error_contains_any(
+        "om.reflections.dropped rejects missing reflectionIds",
+        custom_json(
+            "om.reflections.dropped",
+            json!({
+                "coversUpToId": "entry-7"
+            }),
+        ),
+        &["missing field", "reflectionIds"],
+    );
 }
 
 #[test]

@@ -11,7 +11,7 @@
 //! model-emitted payload before the runtime validates it, so hard-coding tool
 //! schemas into the parser would reject or misrepresent real sessions.
 //!
-//! Five categories of structure legitimately deviate from the strict default:
+//! Six categories of structure legitimately deviate from the strict default:
 //!
 //! * **`serde(flatten)` of an internally-tagged enum** — when the flattened
 //!   target is an internally-tagged enum (one with `#[serde(tag = "...")]`
@@ -71,6 +71,15 @@
 //!   These structs omit `deny_unknown_fields` at the struct level and use
 //!   `#[serde(default)]` on every field, so unrecognized fields are
 //!   silently accepted rather than rejecting the whole log line.
+//!
+//! * **Versioned payloads** — [`CompactionDetails`] uses `#[serde(untagged)]`
+//!   to accept two structurally incompatible wire formats: a legacy shape
+//!   with `readFiles`/`modifiedFiles` and a current shape with compaction
+//!   metadata (`compactor`, `version`, `sections`, …). Serde tries each
+//!   variant in declaration order and picks the first that deserializes
+//!   successfully. Both variant structs keep `#[serde(deny_unknown_fields)]`
+//!   so unexpected fields are still caught regardless of which shape is
+//!   selected.
 //!
 //! Each corrupt-stream exception carries an inline comment naming the
 //! observed failure mode.
@@ -233,11 +242,46 @@ pub struct BranchSummaryLine {
     pub from_hook: bool,
 }
 
+/// Pi has changed the shape of this field over time: the original format
+/// carried `readFiles` / `modifiedFiles`; the current format carries
+/// compaction metadata (`compactor`, `version`, `sections`, …).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CompactionDetails {
+    /// Current format: compaction metadata (pi ≥ mid-2026).
+    V2(CompactionDetailsV2),
+    /// Legacy format: per-file read / modified lists.
+    V1(CompactionDetailsV1),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CompactionDetails {
+pub struct CompactionDetailsV1 {
     pub read_files: Vec<PathBuf>,
     pub modified_files: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CompactionDetailsV2 {
+    pub compactor: String,
+    pub version: u32,
+    pub sections: Vec<String>,
+    pub source_message_count: u64,
+    pub previous_summary_used: bool,
+    #[serde(rename = "om.folded")]
+    pub om_folded: OmFolded,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OmFolded {
+    #[serde(rename = "type")]
+    pub typ: String,
+    pub version: u32,
+    pub full_fold: bool,
+    pub observations: Vec<JsonBlob>,
+    pub reflections: Vec<JsonBlob>,
 }
 
 // ---------------------------------------------------------------------------
@@ -277,6 +321,14 @@ pub enum CustomPayload {
     PlannotatorExecute(PlannotatorExecuteData),
     #[serde(rename = "intercom_sent")]
     IntercomSent(IntercomSentData),
+    #[serde(rename = "om.observations.recorded")]
+    OmObservationsRecorded(OmObservationsRecordedData),
+    #[serde(rename = "om.reflections.recorded")]
+    OmReflectionsRecorded(OmReflectionsRecordedData),
+    #[serde(rename = "om.observations.dropped")]
+    OmObservationsDropped(OmObservationsDroppedData),
+    #[serde(rename = "om.reflections.dropped")]
+    OmReflectionsDropped(OmReflectionsDroppedData),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -1470,6 +1522,59 @@ pub struct IntercomSentData {
     pub timestamp: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent: Option<JsonBlob>,
+}
+
+/// Emitted by the om extension when it records observations extracted
+/// during a session.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OmObservationsRecordedData {
+    pub observations: Vec<ObservationEntry>,
+    pub covers_up_to_id: String,
+}
+
+/// Emitted by the om extension when it records reflections synthesized
+/// from observations.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OmReflectionsRecordedData {
+    pub reflections: Vec<ReflectionEntry>,
+    pub covers_up_to_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ObservationEntry {
+    pub id: String,
+    pub content: String,
+    /// Wall-clock timestamp in `"YYYY-MM-DD HH:MM"` format (not ISO 8601).
+    pub timestamp: String,
+    pub relevance: String,
+    pub source_entry_ids: Vec<String>,
+    pub token_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReflectionEntry {
+    pub id: String,
+    pub content: String,
+    pub supporting_observation_ids: Vec<String>,
+    pub token_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OmObservationsDroppedData {
+    pub observation_ids: Vec<String>,
+    pub covers_up_to_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OmReflectionsDroppedData {
+    pub reflection_ids: Vec<String>,
+    pub covers_up_to_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
