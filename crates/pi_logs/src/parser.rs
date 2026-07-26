@@ -2972,13 +2972,23 @@ pub struct FindDetails {
 }
 
 /// Tool-result details emitted by the flat `git_read_only_*` MCP tools.
-/// The pi-tool-display extension just records which MCP `server` and `tool`
-/// the call was dispatched to.
+/// The pi-tool-display extension records which MCP `server` and `tool`
+/// the call was dispatched to; newer pi runtimes also attach overflow
+/// metadata when the MCP tool result exceeds the in-message byte cap.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GitReadOnlyDetails {
     pub server: String,
     pub tool: String,
+    /// Overflow/truncation metadata added in newer pi versions when an
+    /// MCP tool result exceeds pi's in-message byte cap. Stored as raw
+    /// JSON because the schema is still evolving.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "outputGuard"
+    )]
+    pub output_guard: Option<JsonBlob>,
 }
 
 /// Summary metadata recorded by the `fetch_content` tool. Newer failed
