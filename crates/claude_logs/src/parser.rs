@@ -1462,6 +1462,9 @@ pub struct UserLogLine {
     /// carrying a denied tool's error `tool_result`, absent otherwise, hence `Option`. Added in
     /// Claude Code 2.1.201+.
     pub tool_denial_kind: Option<ToolDenialKind>,
+    /// Preserved despite not driving analysis so a feedback-bearing denial does not make strict
+    /// deserialization discard the whole turn. Added in Claude Code 2.1.219+.
+    pub user_feedback: Option<String>,
     /// Scheduling priority for a queued prompt (e.g. `later`); present only on turns that were
     /// queued rather than sent immediately, hence `Option`. Added in Claude Code 2.1.201+.
     pub queue_priority: Option<QueuePriority>,
@@ -1739,6 +1742,9 @@ pub struct AssistantLogLine {
     /// Mirrors `session_id`'s `String` type here since assistant session ids are not parsed as UUIDs.
     #[serde(rename = "session_id")]
     pub session_id_snake: Option<String>,
+    /// Kept separate from the message stop reason because interrupted responses can still have
+    /// billable usage and must remain analyzable. Added in Claude Code 2.1.219+.
+    pub is_aborted_mid_stream: Option<bool>,
     /// Reasoning-effort level the turn was generated at (e.g. "xhigh"). `Option` so pre-2.1.214
     /// lines still parse. Added in Claude Code 2.1.214+.
     pub effort: Option<ReasoningEffort>,

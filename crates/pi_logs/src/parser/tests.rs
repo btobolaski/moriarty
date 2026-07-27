@@ -859,7 +859,10 @@ fn compaction_line() {
             assert_eq!(compaction.first_kept_entry_id, "e1");
             assert_eq!(compaction.tokens_before, 12345);
             let CompactionDetails::V1(details) = &compaction.details else {
-                panic!("expected V1 compaction details, got {:?}", compaction.details);
+                panic!(
+                    "expected V1 compaction details, got {:?}",
+                    compaction.details
+                );
             };
             assert_eq!(
                 details.read_files,
@@ -1055,7 +1058,10 @@ fn compaction_line_v2() {
             assert!(!compaction.from_hook);
 
             let CompactionDetails::V2(details) = &compaction.details else {
-                panic!("expected V2 compaction details, got {:?}", compaction.details);
+                panic!(
+                    "expected V2 compaction details, got {:?}",
+                    compaction.details
+                );
             };
             assert_eq!(details.compactor, "blackhole");
             assert_eq!(details.version, 1);

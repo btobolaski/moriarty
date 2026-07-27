@@ -170,7 +170,11 @@ test in a separate process, making this safe and preventing tests from clobberin
   this compaction; nullable so older records still parse), and a `summarizeMetadata` object on the compact-summary user
   turn (`SummarizeMetadata`, carrying `messagesSummarized` plus a `direction` string kept as `String` rather than a
   strict enum because its vocabulary — observed `from` — is undocumented and nothing downstream reads it; present only
-  alongside `isCompactSummary`, hence `Option`) (all added in Claude Code 2.1.214+)
+  alongside `isCompactSummary`, hence `Option`) (all added in Claude Code 2.1.214+), a `userFeedback`
+  field on user turns (`UserLogLine`, an optional free-form `String` carrying the instruction that
+  accompanied a rejected tool call), and an `isAbortedMidStream` field on assistant turns
+  (`AssistantLogLine`, an optional `bool` marking a response stopped before streaming completed;
+  partial responses remain billable) (both added in Claude Code 2.1.219+)
 - Also owns the structured view of the raw `model` string via `model::Model { family, version }` plus `ModelFamily` and
   `ModelVersion`. Both `cost_analyzer` (for pricing) and `moriarty::api_pricing` (for grouping/display) consume this one
   parser so family/version classification is not duplicated across crates. The parser preserves capability-decorated raw

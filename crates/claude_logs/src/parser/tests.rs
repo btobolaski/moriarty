@@ -1366,6 +1366,53 @@ fn test_parse_assistant_with_effort() {
     }
 }
 
+#[test]
+fn test_parse_assistant_with_is_aborted_mid_stream() {
+    let json = serde_json::json!({
+        "parentUuid": "eede2871-e78d-4c6e-864a-76cac855f446",
+        "isSidechain": false,
+        "type": "assistant",
+        "uuid": "97d081ac-aa71-436d-bda0-0a53b196e6fe",
+        "timestamp": "2026-07-27T21:55:37.279Z",
+        "message": {
+            "id": "msg_011Cctf6yyjGaNhwgqmUY6KP",
+            "container": null,
+            "model": "claude-opus-5",
+            "role": "assistant",
+            "stop_details": null,
+            "stop_reason": null,
+            "stop_sequence": null,
+            "type": "message",
+            "usage": {
+                "input_tokens": 2,
+                "output_tokens": 1,
+                "cache_creation_input_tokens": 261,
+                "cache_read_input_tokens": 61828,
+                "service_tier": "standard",
+                "cache_creation": {"ephemeral_1h_input_tokens": 261, "ephemeral_5m_input_tokens": 0}
+            },
+            "content": [{"type": "text", "text": "interrupted"}]
+        },
+        "requestId": "req_011Cctf6yyjGaNhwgqmUY6KP",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "22222222-2222-2222-2222-222222222222",
+        "session_id": "22222222-2222-2222-2222-222222222222",
+        "version": "2.1.219",
+        "gitBranch": "HEAD",
+        "isAbortedMidStream": true,
+        "effort": "xhigh"
+    });
+
+    let line: LogLine =
+        serde_json::from_value(json).expect("Failed to parse assistant with isAbortedMidStream");
+    match line {
+        LogLine::Assistant(assistant) => assert_eq!(assistant.is_aborted_mid_stream, Some(true)),
+        _ => panic!("Expected Assistant variant"),
+    }
+}
+
 // Pre-2.1.214 assistant records omit `effort`, so it stays `None`.
 #[test]
 fn test_parse_assistant_without_effort() {
@@ -5501,6 +5548,49 @@ fn test_parse_assistant_usage_rejects_unknown_fields() {
 }
 
 #[test]
+fn test_parse_assistant_rejects_unknown_top_level_fields() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "test-session",
+        "version": "1.0",
+        "gitBranch": "main",
+        "message": {
+            "id": "msg-1",
+            "type": "message",
+            "role": "assistant",
+            "content": "response",
+            "model": "claude-3-5-sonnet",
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 100,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": 0,
+                    "ephemeral_1h_input_tokens": 0
+                },
+                "output_tokens": 50
+            }
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "unknown_field": "should fail"
+    });
+
+    let err_msg = serde_json::from_value::<AssistantLogLine>(json)
+        .expect_err("Should reject unknown top-level fields due to deny_unknown_fields")
+        .to_string();
+    assert!(
+        err_msg.contains("unknown field") || err_msg.contains("unknown_field"),
+        "Error should mention unknown field, got: {}",
+        err_msg
+    );
+}
+
+#[test]
 fn test_parse_tool_use_with_caller() {
     let json = serde_json::json!({
         "type": "tool_use",
@@ -5747,6 +5837,36 @@ fn test_parse_user_log_line_with_user_rejected_tool_denial_kind() {
     });
     let line: UserLogLine = serde_json::from_value(json).unwrap();
     assert_eq!(line.tool_denial_kind, Some(ToolDenialKind::UserRejected));
+}
+
+#[test]
+fn test_parse_user_log_line_with_user_feedback() {
+    let json = serde_json::json!({
+        "parentUuid": "9b324826-db0c-4613-9658-ab7deb91abb4",
+        "isSidechain": false,
+        "message": {"role": "user", "content": [{
+            "type": "tool_result",
+            "content": "The user doesn't want to proceed with this tool use.",
+            "is_error": true,
+            "tool_use_id": "toolu_01Y7KGdNsGpi3x1ajwzmgFUr"
+        }]},
+        "uuid": "527dc3ba-c146-493e-a202-9716bc1b9e50",
+        "timestamp": "2026-07-27T16:38:27.167Z",
+        "toolUseResult": "Error: The user doesn't want to proceed with this tool use.",
+        "toolDenialKind": "user-rejected",
+        "userFeedback": "Use the Write tool",
+        "sourceToolAssistantUUID": "9b324826-db0c-4613-9658-ab7deb91abb4",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "583790a4-8207-4478-92ee-ebb9538b54dd",
+        "session_id": "583790a4-8207-4478-92ee-ebb9538b54dd",
+        "version": "2.1.219",
+        "gitBranch": "HEAD"
+    });
+    let line: UserLogLine =
+        serde_json::from_value(json).expect("Failed to parse user record with userFeedback");
+    assert_eq!(line.user_feedback.as_deref(), Some("Use the Write tool"));
 }
 
 #[test]
