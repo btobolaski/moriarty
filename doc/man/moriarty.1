@@ -9,7 +9,7 @@
 .Sh SYNOPSIS
 .Nm
 .Cm api\-pricing
-.Fl d Ar dir
+.Op Fl d Ar dir
 .Op Fl \-timezone Ar local|utc
 .Op Fl \-conversations
 .Op Fl \-tokens
@@ -18,7 +18,7 @@
 .Op Fl \-end\-time Ar DATETIME
 .Nm
 .Cm graphs claude
-.Fl d Ar dir
+.Op Fl d Ar dir
 .Op Fl \-timezone Ar local|utc
 .Op Fl \-conversations
 .Op Fl \-tokens
@@ -28,6 +28,16 @@
 .Nm
 .Cm graphs pi
 .Op Fl d Ar dir
+.Op Fl \-timezone Ar local|utc
+.Op Fl \-conversations
+.Op Fl \-tokens
+.Op Fl \-last\-days Ar DAYS
+.Op Fl \-start\-time Ar DATETIME
+.Op Fl \-end\-time Ar DATETIME
+.Nm
+.Cm graphs all
+.Op Fl \-claude\-dir Ar dir
+.Op Fl \-pi\-dir Ar dir
 .Op Fl \-timezone Ar local|utc
 .Op Fl \-conversations
 .Op Fl \-tokens
@@ -123,6 +133,8 @@ and generates detailed cost or token-count reports.
 .Bl -tag -width Ds
 .It Fl d , Fl \-dir Ar dir
 Directory to analyze for API usage.
+Default:
+.Pa ~/.claude/projects .
 .It Fl \-timezone Ar local|utc
 Timezone for date determination.
 Default:
@@ -180,15 +192,21 @@ End time filter in ISO 8601 format.
 .El
 .Ss Graphs
 The
-.Cm graphs claude
+.Cm graphs claude ,
+.Cm graphs pi ,
 and
-.Cm graphs pi
+.Cm graphs all
 subcommands render chart-focused stacked summaries for Claude/API and pi usage.
 They accept the same timezone, conversation, token, and time-filter flags
 as the corresponding table reports.
 .Bl -tag -width Ds
-.It Cm graphs claude Fl d Ar dir
+.It Cm graphs claude Op Fl d Ar dir
 Render Claude/API usage graphs from the given log directory.
+Defaults to
+.Pa ~/.claude/projects
+when
+.Fl \-dir
+is omitted.
 .It Cm graphs pi Op Fl d Ar dir
 Render pi usage graphs from the given session directory.
 Defaults to
@@ -196,6 +214,15 @@ Defaults to
 when
 .Fl \-dir
 is omitted.
+.It Cm graphs all Op Fl \-claude\-dir Ar dir Op Fl \-pi\-dir Ar dir
+Render source-labelled combined graphs, defaulting to
+.Pa ~/.claude/projects
+and
+.Pa ~/.pi/agent/sessions .
+Cost mode uses local Claude pricing and prices recorded in pi logs; token mode
+combines homogeneous counts.
+Missing defaults warn and are skipped; explicit missing paths and having no
+available source are errors.
 .El
 .Ss MCP Servers
 The

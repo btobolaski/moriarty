@@ -10,8 +10,8 @@ Moriarty is a Rust CLI tool for analyzing Claude Code logs and API usage. It pro
   reports
 - **Pi cost analyzer**: Analyzes pi session logs and generates daily or per-conversation cost or token reports grouped
   by provider and model
-- **Terminal graphs**: Renders chart-focused stacked-bar summaries for Claude/API and pi usage via `graphs claude` and
-  `graphs pi`
+- **Terminal graphs**: Renders chart-focused stacked-bar summaries for Claude/API and pi usage via `graphs all`,
+  `graphs claude`, and `graphs pi`
 - **MCP servers**: Provides Model Context Protocol servers for read-only git operations, read-only jj operations, and
   project tools
 - **Hooks system**: Security integration for validating commands before execution (bash rules, project checks)
@@ -42,7 +42,10 @@ cargo run -- pi cost --dir <pi-sessions-directory>
 cargo run -- pi cost --last-days 3
 
 # Render chart-focused usage graphs
-# (graphs claude --dir defaults to ~/.claude/projects; graphs pi --dir defaults to ~/.pi/agent/sessions)
+# (graphs all uses both defaults; graphs claude --dir defaults to ~/.claude/projects;
+# graphs pi --dir defaults to ~/.pi/agent/sessions)
+cargo run -- graphs all --last-days 7
+cargo run -- graphs all --claude-dir <claude-projects-directory> --pi-dir <pi-sessions-directory>
 cargo run -- graphs claude --timezone local|utc
 cargo run -- graphs pi --conversations --tokens
 cargo run -- graphs pi --dir <pi-sessions-directory>
@@ -184,6 +187,7 @@ test in a separate process, making this safe and preventing tests from clobberin
   both backends, and grand total) called by each backend after its inline grouped-table rendering
 - `charts.rs` renders deterministic horizontal stacked bars for both time-series and share views, including top-N plus
   `Other`, stable glyph/color assignment, and narrow-terminal truncation without changing the table-report path
+- `series.rs` carries typed date/session chart handoff data so multiple sources can be merged before rendering
 - Keeps the output behavior for `api-pricing`, `pi cost`, and the graph commands aligned without forcing the backends
   into a dynamic-column abstraction
 
@@ -211,6 +215,10 @@ test in a separate process, making this safe and preventing tests from clobberin
 - Also prepares provider/model `ChartBucket` data for `graphs pi`, reusing the same analyzer output while keeping the
   existing detailed table report unchanged
 - Entry points: `pi cost` and `graphs pi` subcommands in `main.rs`
+
+**`combined_graphs/`** - Concurrently analyzes Claude/API and pi logs, merges typed date/session series, and prefixes
+segment labels by source. Cost mode mixes Claude's local pricing with pi's recorded prices; missing defaults are skipped
+with warnings, while explicit missing paths and having no available source are errors.
 
 **`pi_logs/`** - Pi session log parsing:
 

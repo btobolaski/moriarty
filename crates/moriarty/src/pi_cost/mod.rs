@@ -6,10 +6,11 @@ use std::{collections::BTreeMap, path::Path};
 use tabled::Tabled;
 
 use crate::cost_report::{
-    ChartBucket, ChartSegment, DateTimezone, FormattedMetricColumns, MetricComponents, MetricTotal,
-    ReportMode, TimeRangeFilter, build_grouped_rows, display_summary, format_duration,
-    format_session_id, format_time_range, grouped_label, print_grouped_report,
-    push_nonzero_metric_rows, render_or_empty, render_stacked_charts,
+    ChartBucket, ChartSegment, DateTimezone, DatedSegments, FormattedMetricColumns,
+    MetricComponents, MetricTotal, ReportMode, SessionSegments, TimeRangeFilter,
+    build_grouped_rows, display_summary, format_duration, format_session_id, format_time_range,
+    grouped_label, print_grouped_report, push_nonzero_metric_rows, render_or_empty,
+    render_stacked_charts,
 };
 use analyzer::{DailyMetrics, SessionMetrics};
 use pi_logs::Provider;
@@ -165,19 +166,22 @@ fn segment_label(provider: Provider, model: &str) -> String {
     format!("{} / {}", provider_label(provider), model)
 }
 
+fn chart_segments(per_model: &PiModelMetricsMap) -> Vec<ChartSegment> {
+    per_model
+        .model_metrics()
+        .map(|(model, metrics)| ChartSegment {
+            label: segment_label(model.provider, &model.model),
+            total: metrics.total(),
+        })
+        .collect()
+}
+
 fn build_daily_chart_buckets(daily_metrics: &[DailyMetrics]) -> Vec<ChartBucket> {
     daily_metrics
         .iter()
         .map(|metrics| ChartBucket {
             label: metrics.date.to_string(),
-            segments: metrics
-                .per_model
-                .model_metrics()
-                .map(|(model, metric_components)| ChartSegment {
-                    label: segment_label(model.provider, &model.model),
-                    total: metric_components.total(),
-                })
-                .collect(),
+            segments: chart_segments(&metrics.per_model),
         })
         .collect()
 }
@@ -187,14 +191,7 @@ fn build_session_chart_buckets(session_metrics: &[SessionMetrics]) -> Vec<ChartB
         .iter()
         .map(|metrics| ChartBucket {
             label: format_session_id(&metrics.session_id),
-            segments: metrics
-                .per_model
-                .model_metrics()
-                .map(|(model, metric_components)| ChartSegment {
-                    label: segment_label(model.provider, &model.model),
-                    total: metric_components.total(),
-                })
-                .collect(),
+            segments: chart_segments(&metrics.per_model),
         })
         .collect()
 }
@@ -398,6 +395,42 @@ fn display_session_graphs(
         &build_session_chart_buckets(session_metrics),
         report_mode,
     )
+}
+
+pub(crate) async fn daily_chart_series(
+    dir: &Path,
+    timezone: DateTimezone,
+    filter: &TimeRangeFilter,
+    report_mode: ReportMode,
+) -> miette::Result<(Vec<DatedSegments>, bool)> {
+    let result = analyzer::analyze_directory(dir, timezone, filter, report_mode).await?;
+    let series = result
+        .daily_metrics
+        .iter()
+        .map(|metrics| DatedSegments {
+            date: metrics.date,
+            segments: chart_segments(&metrics.per_model),
+        })
+        .collect();
+    Ok((series, result.had_errors))
+}
+
+pub(crate) async fn session_chart_series(
+    dir: &Path,
+    filter: &TimeRangeFilter,
+    report_mode: ReportMode,
+) -> miette::Result<(Vec<SessionSegments>, bool)> {
+    let result = analyzer::analyze_directory_by_session(dir, filter, report_mode).await?;
+    let series = result
+        .session_metrics
+        .iter()
+        .map(|metrics| SessionSegments {
+            session_id: metrics.session_id.clone(),
+            start_time: metrics.start_time,
+            segments: chart_segments(&metrics.per_model),
+        })
+        .collect();
+    Ok((series, result.had_errors))
 }
 
 pub async fn run_by_session(

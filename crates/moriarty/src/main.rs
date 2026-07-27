@@ -12,6 +12,7 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 mod api_pricing;
 mod approval_tui;
 mod checks;
+mod combined_graphs;
 mod cost_report;
 mod hashing;
 mod hooks;
@@ -49,6 +50,38 @@ async fn main() -> miette::Result<()> {
             .await?;
         }
         Command::Graphs { subcommand } => match subcommand {
+            GraphsCommand::All {
+                claude_dir,
+                pi_dir,
+                cost_args,
+            } => {
+                init_cost_report_tracing();
+                let claude_dir = resolve_optional_logs_dir(
+                    claude_dir,
+                    ".claude/projects",
+                    "Claude logs",
+                    "claude-dir",
+                )?;
+                let pi_dir = resolve_optional_logs_dir(
+                    pi_dir,
+                    ".pi/agent/sessions",
+                    "pi sessions",
+                    "pi-dir",
+                )?;
+                let timezone = parse_date_timezone(&cost_args.timezone)?;
+                let filter = cost_args.time_filter(timezone)?;
+                let report_mode = cost_args.report_mode();
+                print_time_range_filter(&filter, timezone);
+                combined_graphs::run_graphs(
+                    claude_dir.as_deref(),
+                    pi_dir.as_deref(),
+                    timezone,
+                    cost_args.conversations,
+                    &filter,
+                    report_mode,
+                )
+                .await?;
+            }
             GraphsCommand::Claude { dir, cost_args } => {
                 init_cost_report_tracing();
                 let dir = resolve_claude_logs_dir(dir)?;
@@ -225,6 +258,37 @@ fn resolve_pi_sessions_dir(override_dir: Option<PathBuf>) -> miette::Result<Path
 
 fn resolve_claude_logs_dir(override_dir: Option<PathBuf>) -> miette::Result<PathBuf> {
     resolve_logs_dir(override_dir, ".claude/projects", "Claude logs")
+}
+
+/// A combined graph must work when only one tool is installed, so unavailable
+/// defaults are skipped; explicit paths stay strict so typos cannot hide data.
+fn resolve_optional_logs_dir(
+    override_dir: Option<PathBuf>,
+    home_relative_default: &str,
+    kind: &str,
+    flag: &str,
+) -> miette::Result<Option<PathBuf>> {
+    if let Some(dir) = override_dir {
+        validate_logs_dir(&dir, kind)?;
+        return Ok(Some(dir));
+    }
+
+    let Some(home) = env::var_os("HOME") else {
+        eprintln!("Warning: HOME is not set; skipping {kind} source. Pass --{flag} to include it.");
+        return Ok(None);
+    };
+
+    let dir = PathBuf::from(home).join(home_relative_default);
+    if !dir.is_dir() {
+        eprintln!(
+            "Warning: default {kind} directory '{}' is unavailable; skipping this source. \
+             Pass --{flag} to include it.",
+            dir.display()
+        );
+        return Ok(None);
+    }
+
+    Ok(Some(dir))
 }
 
 fn resolve_logs_dir(
@@ -431,6 +495,17 @@ enum RulesCommand {
 
 #[derive(Debug, Subcommand)]
 enum GraphsCommand {
+    /// Render combined Claude/API and pi usage graphs
+    All {
+        /// The directory to analyze for Claude/API usage (defaults to ~/.claude/projects)
+        #[arg(long)]
+        claude_dir: Option<PathBuf>,
+        /// The directory to analyze for pi session usage (defaults to ~/.pi/agent/sessions)
+        #[arg(long)]
+        pi_dir: Option<PathBuf>,
+        #[command(flatten)]
+        cost_args: CostCommandArgs,
+    },
     /// Render Claude/API usage graphs
     Claude {
         /// The directory to analyze for API usage (defaults to ~/.claude/projects)

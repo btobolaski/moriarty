@@ -8,8 +8,9 @@ security hooks for command validation.
 - **API pricing analyzer**: Analyzes Claude API usage from log directories and generates detailed cost or token reports
 - **Pi cost analyzer**: Analyzes pi session logs and generates daily or per-conversation cost or token reports grouped
   by provider and model
-- **Terminal graphs**: Renders chart-focused stacked summaries for Claude/API and pi usage via `moriarty graphs claude`
-  and `moriarty graphs pi`
+- **Terminal graphs**: Renders chart-focused stacked summaries for Claude/API and pi usage via `moriarty graphs all`,
+  `moriarty graphs claude`, and `moriarty graphs pi`. For `moriarty graphs all`, cost mode uses local pricing tables for
+  Claude values and prices recorded in pi logs for pi values; token mode combines homogeneous token counts.
 - **MCP servers**: Provides Model Context Protocol servers for read-only git operations, read-only jj operations, and
   project tools
 - **Tool call permissioning**: Security hooks that control which tools and commands Claude Code can execute
