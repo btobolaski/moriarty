@@ -2129,6 +2129,18 @@ pub struct SubagentResultDetails {
     /// Working directory where the async run is staging its artifacts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub async_dir: Option<PathBuf>,
+    /// Opaque fingerprint of the launch contract, retained to correlate this
+    /// immediate result with its lifecycle artifacts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_contract_digest: Option<String>,
+    /// Kept as raw JSON because this runtime-owned envelope evolves separately
+    /// from the log format; `processTerminal` is one observed nested status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle_status: Option<JsonBlob>,
+    /// Kept as raw JSON because the runtime may add budget-accounting fields
+    /// without coordinating a parser schema release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn_budget: Option<JsonBlob>,
     /// Added in newer pi versions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
@@ -3162,6 +3174,9 @@ pub struct McpDetails {
     /// Number of tools in `tools` (list mode).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub count: Option<u32>,
+    /// Optional because older MCP list results omit this metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has_instructions: Option<bool>,
     /// `mode: "search"` search results; kept as raw `JsonBlob` because
     /// MCP tool search schemas are server-defined (same reasoning as
     /// `McpCallResult.content`).
@@ -3211,6 +3226,7 @@ impl<'de> Deserialize<'de> for McpDetails {
                 connected_count: None,
                 tools: None,
                 count: None,
+                has_instructions: None,
                 matches: None,
                 query: None,
                 output_guard,
@@ -3252,6 +3268,8 @@ impl<'de> Deserialize<'de> for McpDetails {
             #[serde(default)]
             count: Option<u32>,
             #[serde(default)]
+            has_instructions: Option<bool>,
+            #[serde(default)]
             matches: Option<Vec<JsonBlob>>,
             #[serde(default)]
             query: Option<String>,
@@ -3275,6 +3293,7 @@ impl<'de> Deserialize<'de> for McpDetails {
             connected_count: strict.connected_count,
             tools: strict.tools,
             count: strict.count,
+            has_instructions: strict.has_instructions,
             matches: strict.matches,
             query: strict.query,
             output_guard: strict.output_guard,
@@ -3653,6 +3672,9 @@ pub struct PlannotatorData {
     pub last_submitted_path: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub saved_state: Option<PlannotatorSavedState>,
+    /// Defaults empty because older records predate phase-specific tool tracking.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub phase_added_tools: Vec<String>,
 }
 
 /// Plannotator originally serialised `savedState` as an opaque marker

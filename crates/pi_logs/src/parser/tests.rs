@@ -3377,7 +3377,8 @@ fn custom_plannotator() {
             "phase": "planning",
             "planFilePath": "/tmp/PLAN.md",
             "lastSubmittedPath": "/tmp/submitted.md",
-            "savedState": "draft"
+            "savedState": "draft",
+            "phaseAddedTools": ["read", "subagent"]
         }),
     ) {
         CustomPayload::Plannotator(details) => {
@@ -3391,7 +3392,19 @@ fn custom_plannotator() {
                 details.saved_state,
                 Some(PlannotatorSavedState::Legacy("draft".to_string()))
             );
+            assert_eq!(
+                details.phase_added_tools,
+                vec!["read".to_string(), "subagent".to_string()]
+            );
         }
+        other => panic!("expected Plannotator, got {other:?}"),
+    }
+}
+
+#[test]
+fn custom_plannotator_defaults_phase_added_tools_when_omitted() {
+    match parse_custom_payload("plannotator", json!({"phase": "idle"})) {
+        CustomPayload::Plannotator(details) => assert!(details.phase_added_tools.is_empty()),
         other => panic!("expected Plannotator, got {other:?}"),
     }
 }
@@ -5637,7 +5650,8 @@ fn mcp_tool_result_accepts_list_mode() {
             "mode": "list",
             "server": "git-read-only",
             "tools": ["status", "diff", "log", "show"],
-            "count": 4
+            "count": 4,
+            "hasInstructions": true
         })),
     ));
     let Some(ToolResultDetails::Mcp(details)) = tool_result.details else {
@@ -5645,6 +5659,7 @@ fn mcp_tool_result_accepts_list_mode() {
     };
     assert_eq!(details.mode, Some(McpMode::List));
     assert_eq!(details.server.as_deref(), Some("git-read-only"));
+    assert_eq!(details.has_instructions, Some(true));
     assert_eq!(
         details.tools,
         Some(vec![
@@ -5956,6 +5971,7 @@ fn mcp_details_serialize_hint_server_as_camel_case() {
         connected_count: None,
         tools: None,
         count: None,
+        has_instructions: None,
         matches: None,
         query: None,
         output_guard: None,
@@ -6045,6 +6061,7 @@ fn subagent_tool_result_accepts_async_progress() {
             "results": [{"agent": "scout"}],
             "asyncId": "run_42",
             "asyncDir": "/tmp/scout-run",
+            "launchContractDigest": "f21cc9a43e20307c1026290db8259f04761a67a2ed5a951544bfd14144d90555",
             "progress": [{
                 "index": 0,
                 "agent": "scout",
@@ -6064,6 +6081,15 @@ fn subagent_tool_result_accepts_async_progress() {
     assert_eq!(details.mode, SubagentResultMode::Async);
     assert_eq!(details.async_id.as_deref(), Some("run_42"));
     assert_eq!(details.async_dir, Some(PathBuf::from("/tmp/scout-run")));
+    assert_eq!(
+        details.launch_contract_digest.as_deref(),
+        Some("f21cc9a43e20307c1026290db8259f04761a67a2ed5a951544bfd14144d90555")
+    );
+    assert!(details.lifecycle_status.is_none());
+    assert!(details.spawn_budget.is_none());
+    let serialized = serde_json::to_value(&details).expect("serialize subagent details");
+    assert!(serialized.get("lifecycleStatus").is_none());
+    assert!(serialized.get("spawnBudget").is_none());
     let progress = details.progress.expect("expected progress entries");
     assert_eq!(progress.len(), 1);
     assert_eq!(progress[0].agent, "scout");
@@ -6075,6 +6101,58 @@ fn subagent_tool_result_accepts_async_progress() {
     assert_eq!(progress[0].recent_output, vec!["matches found"]);
     assert_eq!(progress[0].task, "inspect");
     assert_eq!(progress[0].index, 0);
+}
+
+#[test]
+fn subagent_tool_result_preserves_runtime_lifecycle_and_spawn_budget() {
+    let lifecycle_status = json!({
+        "processTerminal": {
+            "version": 1,
+            "state": "observed",
+            "runId": "run_42",
+            "futureRuntimeField": true
+        }
+    });
+    let spawn_budget = json!({
+        "used": 0,
+        "configuredLimit": null,
+        "futureBudgetField": "preserved"
+    });
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "subagent",
+        vec![json!({"type": "text", "text": "complete"})],
+        false,
+        Some(json!({
+            "mode": "single",
+            "results": [],
+            "lifecycleStatus": lifecycle_status,
+            "spawnBudget": spawn_budget
+        })),
+    ));
+    let Some(ToolResultDetails::Subagent(details)) = tool_result.details else {
+        panic!("expected Subagent details")
+    };
+
+    assert_eq!(
+        details
+            .lifecycle_status
+            .as_ref()
+            .expect("expected lifecycle status")
+            .0,
+        lifecycle_status
+    );
+    assert_eq!(
+        details
+            .spawn_budget
+            .as_ref()
+            .expect("expected spawn budget")
+            .0,
+        spawn_budget
+    );
+
+    let serialized = serde_json::to_value(details).expect("serialize subagent details");
+    assert_eq!(serialized["lifecycleStatus"], lifecycle_status);
+    assert_eq!(serialized["spawnBudget"], spawn_budget);
 }
 
 /// `parent_session` is the Rust field, but pi writes the camelCase wire key
