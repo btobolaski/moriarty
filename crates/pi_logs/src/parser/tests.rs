@@ -4894,6 +4894,42 @@ fn custom_plannotator_accepts_snapshot_saved_state_with_pi_lens_tools() {
 }
 
 #[test]
+fn custom_plannotator_accepts_snapshot_saved_state_without_active_tools() {
+    match parse_custom_payload(
+        "plannotator",
+        json!({
+            "phase": "planning",
+            "lastSubmittedPath": null,
+            "savedState": {
+                "model": {"provider": "openrouter", "id": "anthropic/claude-fable-5"},
+                "thinkingLevel": "xhigh"
+            },
+            "phaseAddedTools": ["grep", "find", "ls", "plannotator_submit_plan"]
+        }),
+    ) {
+        CustomPayload::Plannotator(details) => {
+            let Some(PlannotatorSavedState::Snapshot(snapshot)) = details.saved_state else {
+                panic!("expected snapshot saved_state")
+            };
+            assert!(snapshot.active_tools.is_empty());
+            assert_eq!(snapshot.model.provider, Provider::OpenRouter);
+            assert_eq!(snapshot.model.id, "anthropic/claude-fable-5");
+            assert_eq!(snapshot.thinking_level, ThinkingLevel::Xhigh);
+            assert_eq!(
+                details.phase_added_tools,
+                vec![
+                    "grep".to_string(),
+                    "find".to_string(),
+                    "ls".to_string(),
+                    "plannotator_submit_plan".to_string()
+                ]
+            );
+        }
+        other => panic!("expected Plannotator, got {other:?}"),
+    }
+}
+
+#[test]
 fn custom_message_subagent_notify_has_no_details() {
     assert!(matches!(
         parse_custom_message_payload("Background task failed: timeout", "subagent-notify", None,),
@@ -7112,6 +7148,103 @@ fn subagent_tool_result_accepts_budget_transcript_timeout_and_deadline_fields() 
     assert_eq!(tc.cost_usd.to_string(), "0.05");
     assert_eq!(details.timeout_ms, Some(600000));
     assert_eq!(details.deadline_at, Some(1783906909078));
+}
+
+#[test]
+fn subagent_tool_result_accepts_steering_details() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "subagent",
+        vec![json!({"type": "text", "text": "Steering delivered"})],
+        false,
+        Some(json!({
+            "mode": "management",
+            "results": [],
+            "steering": {
+                "requestId": "c50b508f-1203-416c-a07b-390e49ea6c7a",
+                "state": "delivered",
+                "sourceRunId": "47ee1204-caf9-4740-bc72-0c51685e5808",
+                "targets": [
+                    {"index": 0, "state": "delivered", "deliveredAt": 1785310395431_u64},
+                    {"index": 1, "state": "pending"}
+                ]
+            }
+        })),
+    ));
+    let Some(ToolResultDetails::Subagent(details)) = tool_result.details else {
+        panic!("expected Subagent details")
+    };
+    assert_eq!(details.mode, SubagentResultMode::Management);
+    assert!(details.results.is_empty());
+    let steering = details.steering.as_ref().expect("expected steering");
+    assert_eq!(
+        steering.request_id,
+        "c50b508f-1203-416c-a07b-390e49ea6c7a"
+    );
+    assert_eq!(steering.state, "delivered");
+    assert_eq!(
+        steering.source_run_id,
+        "47ee1204-caf9-4740-bc72-0c51685e5808"
+    );
+    assert_eq!(steering.targets.len(), 2);
+    assert_eq!(steering.targets[0].index, 0);
+    assert_eq!(steering.targets[0].state, "delivered");
+    assert_eq!(steering.targets[0].delivered_at, Some(1785310395431));
+    assert_eq!(steering.targets[1].index, 1);
+    assert_eq!(steering.targets[1].state, "pending");
+    assert_eq!(steering.targets[1].delivered_at, None);
+}
+
+#[test]
+fn subagent_tool_result_rejects_unknown_steering_field() {
+    // Pins `deny_unknown_fields` on `SubagentSteeringDetails` so pi-side
+    // schema additions to the steering payload surface as loud errors.
+    assert_parse_error_contains_any(
+        "subagent rejects unknown steering field",
+        tool_result_message_json(
+            "subagent",
+            vec![json!({"type": "text", "text": "steered"})],
+            false,
+            Some(json!({
+                "mode": "management",
+                "results": [],
+                "steering": {
+                    "requestId": "req",
+                    "state": "delivered",
+                    "sourceRunId": "run",
+                    "bogus": true,
+                    "targets": []
+                }
+            })),
+        ),
+        &["bogus", "unknown field", "did not match any variant"],
+    );
+}
+
+#[test]
+fn subagent_tool_result_rejects_unknown_steering_target_field() {
+    // Pins `deny_unknown_fields` on `SubagentSteeringTarget` so pi-side
+    // schema additions inside a target entry surface as loud errors.
+    assert_parse_error_contains_any(
+        "subagent rejects unknown steering target field",
+        tool_result_message_json(
+            "subagent",
+            vec![json!({"type": "text", "text": "steered"})],
+            false,
+            Some(json!({
+                "mode": "management",
+                "results": [],
+                "steering": {
+                    "requestId": "req",
+                    "state": "delivered",
+                    "sourceRunId": "run",
+                    "targets": [
+                        {"index": 0, "state": "pending", "bogus": true}
+                    ]
+                }
+            })),
+        ),
+        &["bogus", "unknown field", "did not match any variant"],
+    );
 }
 
 #[test]

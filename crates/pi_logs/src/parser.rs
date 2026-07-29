@@ -2169,6 +2169,35 @@ pub struct SubagentResultDetails {
     /// pi versions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_cost: Option<SubagentTotalCost>,
+    /// Steering details recorded when an external caller steers an async
+    /// subagent run via management RPC. Present only for steered runs; absent
+    /// for normal invocations and completed-from-launch runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steering: Option<SubagentSteeringDetails>,
+}
+
+/// Steering details for an async subagent run, recorded when an external
+/// caller steers the agent mid-execution.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SubagentSteeringDetails {
+    pub request_id: String,
+    /// Kept as `String` rather than a strict enum because the steering
+    /// lifecycle vocabulary is undocumented and volatile.
+    pub state: String,
+    pub source_run_id: String,
+    pub targets: Vec<SubagentSteeringTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SubagentSteeringTarget {
+    pub index: u32,
+    /// Kept as `String` — see [`SubagentSteeringDetails::state`].
+    pub state: String,
+    /// Unix epoch milliseconds when the steering was delivered to this target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivered_at: Option<u64>,
 }
 
 /// The native supervisor tool uses a different strict payload for each action.
@@ -3691,6 +3720,9 @@ pub enum PlannotatorSavedState {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PlannotatorSavedStateSnapshot {
+    /// Defaults empty because newer pi versions omit `activeTools` from the
+    /// `savedState` payload (only `model` and `thinkingLevel` are emitted).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub active_tools: Vec<String>,
     pub model: PlannotatorModelRef,
     pub thinking_level: ThinkingLevel,
