@@ -6121,9 +6121,11 @@ fn subagent_tool_result_accepts_async_progress() {
         details.launch_contract_digest.as_deref(),
         Some("f21cc9a43e20307c1026290db8259f04761a67a2ed5a951544bfd14144d90555")
     );
+    assert!(details.source_launch_contract_digest.is_none());
     assert!(details.lifecycle_status.is_none());
     assert!(details.spawn_budget.is_none());
     let serialized = serde_json::to_value(&details).expect("serialize subagent details");
+    assert!(serialized.get("sourceLaunchContractDigest").is_none());
     assert!(serialized.get("lifecycleStatus").is_none());
     assert!(serialized.get("spawnBudget").is_none());
     let progress = details.progress.expect("expected progress entries");
@@ -6137,6 +6139,55 @@ fn subagent_tool_result_accepts_async_progress() {
     assert_eq!(progress[0].recent_output, vec!["matches found"]);
     assert_eq!(progress[0].task, "inspect");
     assert_eq!(progress[0].index, 0);
+}
+
+#[test]
+fn subagent_tool_result_accepts_revived_source_launch_contract_digest() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "subagent",
+        vec![json!({"type": "text", "text": "revived"})],
+        false,
+        Some(json!({
+            "mode": "single",
+            "runId": "b01ed3eb",
+            "results": [],
+            "launchContractDigest": "508724e7432352281a729ec95d15c0024f28232cb5eb9ff600de7709971ce5ce",
+            "sourceLaunchContractDigest": "f2d410013fef8e4e778d5422605f352c94d40542e338e5e14e52a08b6dd571d4"
+        })),
+    ));
+    let Some(ToolResultDetails::Subagent(details)) = tool_result.details else {
+        panic!("expected Subagent details")
+    };
+
+    assert_eq!(
+        details.source_launch_contract_digest.as_deref(),
+        Some("f2d410013fef8e4e778d5422605f352c94d40542e338e5e14e52a08b6dd571d4")
+    );
+    let serialized = serde_json::to_value(&details).expect("serialize subagent details");
+    assert_eq!(
+        serialized
+            .get("sourceLaunchContractDigest")
+            .and_then(|value| value.as_str()),
+        Some("f2d410013fef8e4e778d5422605f352c94d40542e338e5e14e52a08b6dd571d4")
+    );
+}
+
+#[test]
+fn subagent_tool_result_rejects_unknown_outer_detail_field() {
+    assert_parse_error_contains_all(
+        "subagent rejects unknown outer detail field",
+        tool_result_message_json(
+            "subagent",
+            vec![json!({"type": "text", "text": "revived"})],
+            false,
+            Some(json!({
+                "mode": "single",
+                "results": [],
+                "sourceLaunchContractDigests": "unexpected"
+            })),
+        ),
+        &["unknown field", "sourceLaunchContractDigests"],
+    );
 }
 
 #[test]
@@ -7176,10 +7227,7 @@ fn subagent_tool_result_accepts_steering_details() {
     assert_eq!(details.mode, SubagentResultMode::Management);
     assert!(details.results.is_empty());
     let steering = details.steering.as_ref().expect("expected steering");
-    assert_eq!(
-        steering.request_id,
-        "c50b508f-1203-416c-a07b-390e49ea6c7a"
-    );
+    assert_eq!(steering.request_id, "c50b508f-1203-416c-a07b-390e49ea6c7a");
     assert_eq!(steering.state, "delivered");
     assert_eq!(
         steering.source_run_id,

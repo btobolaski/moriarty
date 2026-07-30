@@ -2133,6 +2133,10 @@ pub struct SubagentResultDetails {
     /// immediate result with its lifecycle artifacts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_contract_digest: Option<String>,
+    /// A revived run preserves the original contract's digest alongside the
+    /// new launch digest so lifecycle artifacts remain traceable across runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_launch_contract_digest: Option<String>,
     /// Kept as raw JSON because this runtime-owned envelope evolves separately
     /// from the log format; `processTerminal` is one observed nested status.
     #[serde(default, skip_serializing_if = "Option::is_none")]
