@@ -25,7 +25,7 @@ use crate::{
         approvals::{ProjectApprovals, VerificationResult},
         config::{Check, load_project_settings},
     },
-    repository::detect_repository_root,
+    repository::{detect_repository_root, detect_workspace_root},
 };
 
 // Resource limits rationale:
@@ -75,9 +75,9 @@ impl CheckLimits {
 /// Kept neutral so one routine serves both the hook (allow/deny) and the MCP tool (tool result)
 /// without embedding either output format.
 pub(crate) enum CheckRunOutcome {
-    /// Fail-open: the repository root could not be detected, `.config/tools.toml` could not be
-    /// loaded, or no checks are configured. Carries a human-readable explanation that the MCP tool
-    /// surfaces and the hook ignores (it simply allows).
+    /// Fail-open: the repository or workspace root could not be detected, `.config/tools.toml`
+    /// could not be loaded, or no checks are configured. Carries a human-readable explanation that
+    /// the MCP tool surfaces and the hook ignores (it simply allows).
     NoChecks(String),
     /// Fail-closed: a pre-execution gate failed (empty command, unapproved, config- or
     /// binary-hash mismatch) or a global limit was hit (timeout, total-output cap). Carries the
@@ -93,7 +93,14 @@ pub(crate) enum CheckRunOutcome {
 
 /// The shared path behind both the Stop hook and the `run_checks` MCP tool: detect the repository
 /// root, load `.config/tools.toml`, verify the checks (checks only, not commands), and run them
-/// under the Stop hook's resource limits.
+/// in the workspace root under the Stop hook's resource limits.
+///
+/// Two distinct roots are in play. The repository root (shared across jj workspaces and git
+/// worktrees) keys the approvals, is where the config is loaded from, and is the base a relative
+/// check program resolves against — everything that decides *what* runs must come from the files
+/// the approvals layer hashes, so a workspace-local `tools.toml` or script edit cannot run
+/// unapproved code. The workspace root is only the working directory the checks execute in, so a
+/// secondary workspace validates its own working copy instead of the main one's.
 ///
 /// `Err` is reserved for unexpected failures the caller should surface as an error (e.g. the
 /// approvals store failing to load). Every check-level decision is encoded in [`CheckRunOutcome`]
@@ -116,6 +123,28 @@ pub(crate) async fn run_configured_checks(project_dir: &Path) -> Result<CheckRun
             );
             return Ok(CheckRunOutcome::NoChecks(format!(
                 "could not detect repository root for {}: {e}",
+                project_dir.display()
+            )));
+        }
+    };
+
+    let workspace_root = match detect_workspace_root(project_dir) {
+        Ok(root) => {
+            info!(
+                project_dir = %project_dir.display(),
+                workspace_root = %root.display(),
+                "Detected workspace root for check execution"
+            );
+            root
+        }
+        Err(e) => {
+            error!(
+                project_dir = %project_dir.display(),
+                error = %e,
+                "Failed to detect workspace root"
+            );
+            return Ok(CheckRunOutcome::NoChecks(format!(
+                "could not detect workspace root for {}: {e}",
                 project_dir.display()
             )));
         }
@@ -158,14 +187,22 @@ pub(crate) async fn run_configured_checks(project_dir: &Path) -> Result<CheckRun
 
     let approvals = ProjectApprovals::load().await?;
 
-    for check in &checks {
+    // Substitute the program path verification resolved and hashed, not the raw command string:
+    // with the cwd moved to the workspace root, a relative program like "./check.sh" would
+    // otherwise re-resolve against the workspace, where an unapproved local copy could shadow
+    // the approved file (std also documents relative-program + `current_dir` resolution as
+    // platform-specific).
+    let mut resolved_checks = Vec::with_capacity(checks.len());
+    for mut check in checks {
         let verification = approvals
-            .verify_check(&repository_root, &check.name)
+            .verify_check_at_root(&repository_root, &check.name)
             .await?;
 
         match verification {
-            VerificationResult::Approved => {
+            VerificationResult::Approved { program } => {
                 info!(check_name = %check.name, "Check is approved");
+                check.command[0] = program.to_string_lossy().into_owned();
+                resolved_checks.push(check);
             }
             VerificationResult::NotApproved => {
                 error!(check_name = %check.name, "Check not approved");
@@ -216,24 +253,25 @@ pub(crate) async fn run_configured_checks(project_dir: &Path) -> Result<CheckRun
         }
     }
 
-    Ok(run_checks_with_limits(repository_root, checks, CheckLimits::defaults()).await)
+    Ok(run_checks_with_limits(workspace_root, resolved_checks, CheckLimits::defaults()).await)
 }
 
-/// Execute the already-verified `checks` in parallel under `limits`.
+/// Execute the already-verified `checks` in parallel under `limits`, each spawned with
+/// `workspace_root` as its working directory.
 ///
 /// Non-zero exits and spawn errors become `failures` entries rather than propagating, so a failing
 /// check is reported (fail-closed) rather than aborting the run. A timeout or a breach of the
 /// aggregate output cap short-circuits to [`CheckRunOutcome::Blocked`].
 async fn run_checks_with_limits(
-    repository_root: PathBuf,
+    workspace_root: PathBuf,
     checks: Vec<Check>,
     limits: CheckLimits,
 ) -> CheckRunOutcome {
     let timeout_duration = limits.timeout;
-    let repository_root_clone = repository_root.clone();
+    let workspace_root_clone = workspace_root.clone();
 
     let check_futures = futures::stream::iter(checks.into_iter().map(move |check| {
-        let repository_root = repository_root_clone.clone();
+        let workspace_root = workspace_root_clone.clone();
         async move {
             // Defensive: empty commands are rejected before this point, but config can change
             // between validation and spawn, and degrading gracefully beats panicking.
@@ -250,7 +288,7 @@ async fn run_checks_with_limits(
 
             let output = tokio::process::Command::new(cmd)
                 .args(args)
-                .current_dir(&repository_root)
+                .current_dir(&workspace_root)
                 .output()
                 .await;
 
@@ -382,7 +420,10 @@ mod tests {
     use crate::{
         hashing::hash_string,
         project_config::approvals::approve_project_config,
-        test_helpers::{setup_isolated_xdg_config, setup_project_dir_with_config},
+        test_helpers::{
+            assert_approved_copy_ran_in, create_executable_script, setup_isolated_xdg_config,
+            setup_jj_main_and_secondary_workspace, setup_project_dir_with_config,
+        },
     };
 
     /// Isolates XDG config, writes `config` to a temp project's `.config/tools.toml`, and approves
@@ -422,7 +463,7 @@ mod tests {
             panic!("expected Ran");
         };
         assert_eq!(outputs.len(), 1);
-        assert!(failures.is_empty());
+        assert!(failures.is_empty(), "unexpected failures: {failures:?}");
     }
 
     #[tokio::test]
@@ -439,7 +480,68 @@ mod tests {
         let failure = &failures[0];
         assert!(failure.contains("fail"), "got: {failure}");
         assert!(failure.contains("exit code 1"), "got: {failure}");
+        // The reported command shows the verification-resolved program, an absolute
+        // machine-dependent path (e.g. /bin/sh vs a nix store path), so only the stable
+        // basename is asserted.
         assert!(failure.contains("sh"), "got: {failure}");
+    }
+
+    #[tokio::test]
+    async fn nonexistent_project_dir_inside_repository_fails_open() {
+        // The workspace-root failure branch is reachable even when repository-root detection
+        // succeeds: the jj walk finds an existing ancestor's `.jj/repo`, but canonicalizing the
+        // nonexistent project dir itself fails.
+        let _xdg = setup_isolated_xdg_config();
+        let base = TempDir::new().unwrap();
+        let main = base.path().join("main");
+        std::fs::create_dir_all(main.join(".jj/repo")).unwrap();
+
+        let outcome = run_configured_checks(&main.join("does-not-exist"))
+            .await
+            .unwrap();
+        let CheckRunOutcome::NoChecks(reason) = outcome else {
+            panic!("expected NoChecks");
+        };
+        assert!(reason.contains("workspace root"), "got: {reason}");
+    }
+
+    #[tokio::test]
+    async fn relative_check_program_runs_without_workspace_divergence() {
+        // Baseline for the ordinary case: no jj/git metadata, so repository root and workspace
+        // root coincide and a relative program must keep working exactly as before the root
+        // split.
+        let _xdg = setup_isolated_xdg_config();
+        let config = "[commands]\n[[checks]]\nname = \"rel\"\ncommand = [\"./check.sh\"]\n";
+        let project = setup_project_dir_with_config(config);
+        create_executable_script(&project.path().join("check.sh"), "echo baseline-copy");
+        approve_project_config(project.path(), config)
+            .await
+            .unwrap();
+
+        let outcome = run_configured_checks(project.path()).await.unwrap();
+        let CheckRunOutcome::Ran { outputs, failures } = outcome else {
+            panic!("expected Ran");
+        };
+        assert!(failures.is_empty(), "unexpected failures: {failures:?}");
+        assert!(outputs[0].contains("baseline-copy"), "got: {}", outputs[0]);
+    }
+
+    #[tokio::test]
+    async fn secondary_workspace_runs_approved_check_in_workspace_cwd() {
+        // One scenario proves both halves of the root split at once: the approved main-workspace
+        // `./check.sh` runs (a relative program must not re-resolve to the workspace's shadow
+        // copy), and its physical cwd is the secondary workspace, not the main one.
+        let _xdg = setup_isolated_xdg_config();
+        let config = "[commands]\n[[checks]]\nname = \"rel\"\ncommand = [\"./check.sh\"]\n";
+        let (_base, main, workspace) = setup_jj_main_and_secondary_workspace(config, "check.sh");
+        approve_project_config(&main, config).await.unwrap();
+
+        let outcome = run_configured_checks(&workspace).await.unwrap();
+        let CheckRunOutcome::Ran { outputs, failures } = outcome else {
+            panic!("expected Ran");
+        };
+        assert!(failures.is_empty(), "unexpected failures: {failures:?}");
+        assert_approved_copy_ran_in(&outputs[0], &main, &workspace);
     }
 
     #[tokio::test]

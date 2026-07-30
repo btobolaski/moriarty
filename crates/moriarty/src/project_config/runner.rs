@@ -26,13 +26,17 @@
 //! # }
 //! ```
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 use futures::stream::{self, StreamExt};
 use miette::{Context, IntoDiagnostic, Result};
 use tokio::process::Command;
 
 use super::{ProjectApprovals, ProjectConfig, VerificationResult, load_project_settings};
+use crate::repository::detect_repository_root;
 
 /// Maximum number of commands to run concurrently.
 ///
@@ -46,10 +50,19 @@ const MAX_CONCURRENT_COMMANDS: usize = 4;
 /// This struct represents a project that has been verified against stored approvals.
 /// All commands run through this struct are guaranteed to have been approved and
 /// their binaries verified.
+///
+/// `canonical_dir` is the directory commands execute in (the caller's project directory,
+/// canonicalized), while `settings` comes from the shared repository root — the file whose hash
+/// verification checked — so a jj secondary workspace or git worktree cannot substitute its own
+/// `tools.toml` for the approved one. The resolved-program maps record, per item, the absolute
+/// path verification hashed; execution spawns those instead of re-resolving `command[0]` against
+/// `canonical_dir`, where an unapproved local file could shadow the approved one.
 #[derive(Debug)]
 pub struct VerifiedProject {
     pub canonical_dir: PathBuf,
     pub settings: ProjectConfig,
+    resolved_commands: HashMap<String, PathBuf>,
+    resolved_checks: HashMap<String, PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -66,23 +79,33 @@ pub struct CommandOutput {
 /// This is the main entry point for safely executing project commands. It ensures
 /// that ALL configured commands have been explicitly approved before any execution
 /// can occur, preventing unauthorized command execution.
+///
+/// The configuration is loaded from the repository root rather than `project_dir`: approval
+/// verification hashes the repository root's `tools.toml`, so executing a `tools.toml` read from
+/// anywhere else (a jj secondary workspace or git worktree working copy) would run command arrays
+/// the hash check never covered. `project_dir` still determines where commands execute.
 pub async fn verify_and_load_project(project_dir: PathBuf) -> Result<VerifiedProject> {
     let canonical_dir = project_dir
         .canonicalize()
         .into_diagnostic()
         .with_context(|| format!("Failed to canonicalize path: {}", project_dir.display()))?;
 
-    let settings = load_project_settings(canonical_dir.clone()).await?;
+    let repository_root = detect_repository_root(&canonical_dir)?;
+
+    let settings = load_project_settings(repository_root.clone()).await?;
 
     let approvals = ProjectApprovals::load()
         .await
         .context("Failed to load project approvals")?;
 
-    verify_all_commands(&approvals, &canonical_dir, &settings).await?;
+    let (resolved_commands, resolved_checks) =
+        verify_all_commands(&approvals, &canonical_dir, &repository_root, &settings).await?;
 
     Ok(VerifiedProject {
         canonical_dir,
         settings,
+        resolved_commands,
+        resolved_checks,
     })
 }
 
@@ -96,9 +119,9 @@ fn handle_verification_result(
     result: VerificationResult,
     item_type_plural: &str,
     canonical_dir: &Path,
-) -> Result<()> {
+) -> Result<PathBuf> {
     match result {
-        VerificationResult::Approved => Ok(()),
+        VerificationResult::Approved { program } => Ok(program),
         VerificationResult::NotApproved => Err(miette::miette!(
             "Project {} not approved. {}",
             item_type_plural,
@@ -129,36 +152,48 @@ fn handle_verification_result(
     }
 }
 
-/// Verifies that all configured commands and checks in the project are approved.
+/// Verifies that all configured commands and checks in the project are approved, returning the
+/// per-item program paths verification resolved and hashed (commands map and checks map, in that
+/// order) for execution to spawn.
+///
+/// The `_at_root` verifiers take the already-detected `repository_root` so root detection (which
+/// can spawn a `git` subprocess) happens once per load instead of once per item;
+/// `canonical_dir` is kept only for the approve-project hint in error messages, which should
+/// name the directory the caller actually invoked.
 ///
 /// Fails fast on the first verification failure to prevent partial execution
 /// of items where some are approved and others are not.
 async fn verify_all_commands(
     approvals: &ProjectApprovals,
     canonical_dir: &Path,
+    repository_root: &Path,
     settings: &ProjectConfig,
-) -> Result<()> {
-    for (command_name, _) in &settings.commands.all() {
+) -> Result<(HashMap<String, PathBuf>, HashMap<String, PathBuf>)> {
+    let all_commands = settings.commands.all();
+    let mut resolved_commands = HashMap::with_capacity(all_commands.len());
+    for (command_name, _) in &all_commands {
         let verification_result = approvals
-            .verify_project(canonical_dir, command_name)
+            .verify_project_at_root(repository_root, command_name)
             .await
             .with_context(|| format!("Failed to verify command '{}'", command_name))?;
 
-        handle_verification_result(verification_result, "tools", canonical_dir)?;
+        let program = handle_verification_result(verification_result, "tools", canonical_dir)?;
+        resolved_commands.insert(command_name.clone(), program);
     }
 
-    if let Some(checks) = &settings.checks {
-        for check in checks {
-            let verification_result = approvals
-                .verify_check(canonical_dir, &check.name)
-                .await
-                .with_context(|| format!("Failed to verify check '{}'", check.name))?;
+    let checks = settings.checks.as_deref().unwrap_or(&[]);
+    let mut resolved_checks = HashMap::with_capacity(checks.len());
+    for check in checks {
+        let verification_result = approvals
+            .verify_check_at_root(repository_root, &check.name)
+            .await
+            .with_context(|| format!("Failed to verify check '{}'", check.name))?;
 
-            handle_verification_result(verification_result, "checks", canonical_dir)?;
-        }
+        let program = handle_verification_result(verification_result, "checks", canonical_dir)?;
+        resolved_checks.insert(check.name.clone(), program);
     }
 
-    Ok(())
+    Ok((resolved_commands, resolved_checks))
 }
 
 impl VerifiedProject {
@@ -190,7 +225,22 @@ impl VerifiedProject {
             ));
         }
 
-        self.execute_command(command_name, command).await
+        let program = Self::resolved_program(&self.resolved_commands, command_name)?;
+        self.execute_command(command_name, command, &program).await
+    }
+
+    /// Look up the program path verification resolved for `name`. Every configured item is
+    /// verified (and thus resolved) during [`verify_and_load_project`], so a miss means the
+    /// caller mutated `settings` after construction; erroring beats spawning an unverified
+    /// program. Takes the map rather than `&self` because the caller names which of the two
+    /// resolved maps applies.
+    fn resolved_program(resolved: &HashMap<String, PathBuf>, name: &str) -> Result<PathBuf> {
+        resolved.get(name).cloned().ok_or_else(|| {
+            miette::miette!(
+                "No verified program recorded for '{}'; refusing to execute",
+                name
+            )
+        })
     }
 
     /// Runs all configured commands in parallel with concurrency limit.
@@ -204,7 +254,13 @@ impl VerifiedProject {
             return Ok(Vec::new());
         }
 
-        let items: Vec<_> = all_commands.into_iter().collect();
+        let items = all_commands
+            .into_iter()
+            .map(|(name, command)| {
+                let program = Self::resolved_program(&self.resolved_commands, &name)?;
+                Ok((name, command, program))
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         // Sort to match Commands::all() order (lint→test→build→format).
         // This provides consistent output ordering despite parallel execution,
@@ -234,10 +290,13 @@ impl VerifiedProject {
             return Ok(Vec::new());
         }
 
-        let items: Vec<_> = checks
+        let items = checks
             .iter()
-            .map(|check| (check.name.clone(), check.command.clone()))
-            .collect();
+            .map(|check| {
+                let program = Self::resolved_program(&self.resolved_checks, &check.name)?;
+                Ok((check.name.clone(), check.command.clone(), program))
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         // Sort alphabetically by check name for consistent output
         let sort_fn = |output: &CommandOutput| output.name.clone();
@@ -249,18 +308,19 @@ impl VerifiedProject {
     /// while checks use alphabetical ordering.
     async fn run_items_parallel<K>(
         &self,
-        items: Vec<(String, Vec<String>)>,
+        items: Vec<(String, Vec<String>, PathBuf)>,
         item_type: &str,
         sort_fn: impl Fn(&CommandOutput) -> K,
     ) -> Result<Vec<CommandOutput>>
     where
         K: Ord,
     {
-        let item_futures = stream::iter(items.into_iter().map(|(name, command)| {
+        let item_futures = stream::iter(items.into_iter().map(|(name, command, program)| {
             // buffer_unordered requires owned values in closures, cannot share &self across tasks.
             let canonical_dir = self.canonical_dir.clone();
             async move {
-                let result = Self::execute_command_static(&canonical_dir, &name, &command).await;
+                let result =
+                    Self::execute_command_static(&canonical_dir, &name, &command, &program).await;
                 (name, command, result)
             }
         }))
@@ -284,8 +344,13 @@ impl VerifiedProject {
         Ok(outputs)
     }
 
-    async fn execute_command(&self, name: &str, command: &[String]) -> Result<CommandOutput> {
-        Self::execute_command_static(&self.canonical_dir, name, command).await
+    async fn execute_command(
+        &self,
+        name: &str,
+        command: &[String],
+        program: &Path,
+    ) -> Result<CommandOutput> {
+        Self::execute_command_static(&self.canonical_dir, name, command, program).await
     }
 
     /// Static method to enable calling from async closures without self.
@@ -294,16 +359,23 @@ impl VerifiedProject {
     /// Async closures capture `self` by move, but we need to call the same method
     /// from multiple parallel closures. The static method pattern avoids this by
     /// accepting borrowed parameters instead of requiring `self`.
+    ///
+    /// `program` (the path verification resolved for `command[0]`) is what gets spawned;
+    /// `command[0]` itself only appears in the reported [`CommandOutput`]. Spawning the raw
+    /// string would re-resolve a relative program against `canonical_dir`, which is not the
+    /// repository root verification hashed against when the caller is in a jj secondary
+    /// workspace or git worktree.
     async fn execute_command_static(
         canonical_dir: &Path,
         name: &str,
         command: &[String],
+        program: &Path,
     ) -> Result<CommandOutput> {
-        let (cmd, args) = command
+        let (_, args) = command
             .split_first()
             .expect("invariant: verify_all_commands ensures non-empty before execution");
 
-        let output = Command::new(cmd)
+        let output = Command::new(program)
             .args(args)
             .current_dir(canonical_dir)
             .output()
@@ -332,7 +404,8 @@ mod tests {
     use super::*;
     use crate::project_config::approvals;
     use crate::test_helpers::{
-        setup_isolated_xdg_config, setup_project_dir_with_config as setup_test_project,
+        assert_approved_copy_ran_in, setup_isolated_xdg_config,
+        setup_jj_main_and_secondary_workspace, setup_project_dir_with_config as setup_test_project,
     };
 
     async fn setup_test_project_with_approvals(config_content: &str) -> (TempDir, TempDir) {
@@ -466,12 +539,15 @@ format = ["echo", "format"]
 
     #[tokio::test]
     async fn test_handle_verification_result_approved() {
-        handle_verification_result(
-            VerificationResult::Approved,
+        let program = handle_verification_result(
+            VerificationResult::Approved {
+                program: PathBuf::from("/test/bin/echo"),
+            },
             "tools",
             Path::new("/test/path"),
         )
         .expect("Should succeed for Approved result");
+        assert_eq!(program, PathBuf::from("/test/bin/echo"));
     }
 
     #[tokio::test]
@@ -534,6 +610,59 @@ format = ["echo", "format"]
         .expect_err("Should fail for ItemNotApproved result");
         let err_msg = format!("{:?}", err);
         assert!(err_msg.contains("Item 'mycheck' not approved"));
+    }
+
+    #[tokio::test]
+    async fn resolved_program_missing_entry_is_an_error() {
+        // The maps are populated for every configured item at construction, so a miss can only
+        // mean `settings` was mutated afterwards; execution must refuse rather than spawn an
+        // unverified program.
+        let (_tmp, _xdg, project) =
+            approved_project("[commands]\nlint = [\"echo\", \"lint\"]\n").await;
+        let err = VerifiedProject::resolved_program(&project.resolved_commands, "not-recorded")
+            .expect_err("unrecorded item must not execute");
+        let err_msg = format!("{:?}", err);
+        assert!(
+            err_msg.contains("No verified program recorded"),
+            "got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn secondary_workspace_cannot_substitute_config_or_programs() {
+        // The one claim under test: nothing a divergent secondary workspace carries — its own
+        // tools.toml (naming a different check) or its own copy of a relative program — can
+        // influence what runs; only the execution cwd is workspace-local. `test` (a command) and
+        // `where` (a check) share one script so both resolved maps and all three entry points
+        // (`run_command`, `run_all_commands`, `run_all_checks`) are proven in one scenario.
+        let _xdg = setup_isolated_xdg_config();
+        let config = "[commands]\ntest = [\"./tool.sh\"]\n\n[[checks]]\nname = \"where\"\ncommand = [\"./tool.sh\"]\n";
+        let (_base, main, workspace) = setup_jj_main_and_secondary_workspace(config, "tool.sh");
+        approvals::approve_project_config(&main, config)
+            .await
+            .unwrap();
+        std::fs::create_dir_all(workspace.join(".config")).unwrap();
+        std::fs::write(
+            workspace.join(".config/tools.toml"),
+            "[commands]\n[[checks]]\nname = \"evil\"\ncommand = [\"./tool.sh\"]\n",
+        )
+        .unwrap();
+
+        let project = verify_and_load_project(workspace.clone())
+            .await
+            .expect("workspace should verify against the repository root's approved config");
+        assert_eq!(
+            project.settings.checks.as_ref().unwrap()[0].name,
+            "where",
+            "settings must come from the repository root's tools.toml, not the workspace copy"
+        );
+
+        let single = project.run_command("test").await.unwrap();
+        assert_approved_copy_ran_in(&single.stdout, &main, &workspace);
+        let all_commands = project.run_all_commands().await.unwrap();
+        assert_approved_copy_ran_in(&all_commands[0].stdout, &main, &workspace);
+        let all_checks = project.run_all_checks().await.unwrap();
+        assert_approved_copy_ran_in(&all_checks[0].stdout, &main, &workspace);
     }
 
     #[tokio::test]

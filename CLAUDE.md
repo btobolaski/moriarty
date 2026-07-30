@@ -170,11 +170,10 @@ test in a separate process, making this safe and preventing tests from clobberin
   this compaction; nullable so older records still parse), and a `summarizeMetadata` object on the compact-summary user
   turn (`SummarizeMetadata`, carrying `messagesSummarized` plus a `direction` string kept as `String` rather than a
   strict enum because its vocabulary — observed `from` — is undocumented and nothing downstream reads it; present only
-  alongside `isCompactSummary`, hence `Option`) (all added in Claude Code 2.1.214+), a `userFeedback`
-  field on user turns (`UserLogLine`, an optional free-form `String` carrying the instruction that
-  accompanied a rejected tool call), and an `isAbortedMidStream` field on assistant turns
-  (`AssistantLogLine`, an optional `bool` marking a response stopped before streaming completed;
-  partial responses remain billable) (both added in Claude Code 2.1.219+)
+  alongside `isCompactSummary`, hence `Option`) (all added in Claude Code 2.1.214+), a `userFeedback` field on user
+  turns (`UserLogLine`, an optional free-form `String` carrying the instruction that accompanied a rejected tool call),
+  and an `isAbortedMidStream` field on assistant turns (`AssistantLogLine`, an optional `bool` marking a response
+  stopped before streaming completed; partial responses remain billable) (both added in Claude Code 2.1.219+)
 - Also owns the structured view of the raw `model` string via `model::Model { family, version }` plus `ModelFamily` and
   `ModelVersion`. Both `cost_analyzer` (for pricing) and `moriarty::api_pricing` (for grouping/display) consume this one
   parser so family/version classification is not duplicated across crates. The parser preserves capability-decorated raw
@@ -301,7 +300,12 @@ with warnings, while explicit missing paths and having no available source are e
   shared `crate::checks::run_configured_checks` routine — the same approval verification (checks only, not commands),
   resource limits (5-min timeout, 1 MB/check + 10 MB total output caps), and fail-closed semantics as the Stop hook.
   That shared routine is intentionally distinct from `project_config::runner::run_all_checks` (no limits, verifies all
-  commands too), which the `moriarty test checks` CLI uses.
+  commands too), which the `moriarty test checks` CLI uses. Both runner paths load `tools.toml` from the repository root
+  (the file the approval hash covers) and spawn the program path `VerificationResult::Approved` carried back from
+  verification, so a jj secondary workspace or git worktree cannot substitute its own config or a shadow copy of a
+  relative script for the approved ones. Their execution cwd differs: `project_config::runner` keeps the caller's
+  canonicalized project dir, while the checks-runner uses `detect_workspace_root(project_dir)`, which can walk up past a
+  nested project dir to the enclosing workspace root.
 - Uses rmcp library with stdio transport for Claude Code integration
 - All servers run as stdin/stdout servers that Claude Code can invoke
 - `install` command configures all servers in Claude Code's MCP registry
@@ -341,7 +345,14 @@ with warnings, while explicit missing paths and having no available source are e
   - Evaluation order: tool_rules → bash_rules (for Bash) → passthrough (for non-Bash, defers to Claude Code)
 - **Stop hook**: Runs the project's configured checks before allowing execution, delegating to the shared
   `crate::checks::run_configured_checks` routine (see `mcp/` above); it maps the routine's `CheckRunOutcome` onto
-  allow/deny
+  allow/deny. Checks execute with the workspace root as their working directory (`detect_workspace_root`: nearest
+  `.jj/repo` walking up, else `git rev-parse --show-toplevel`), while `.config/tools.toml` loading and approval
+  verification stay keyed by the shared repository root, and each check's program is resolved against the repository
+  root to an absolute path before spawning — the original resolved path, whose canonicalization is the file the
+  approvals layer hashed, not the canonical path itself, since canonicalizing breaks symlinked multi-call binaries (nix
+  coreutils, busybox) that dispatch on argv[0] — so a jj secondary workspace or git worktree validates its own working
+  copy, but only approved (hashed) config and binaries from the repository root decide what runs (a workspace-local copy
+  of a relative script like `./check.sh` cannot shadow the approved one)
 - Structured logging with tracing crate for debugging hook execution. The "PreToolUse hook completed" log event records
   a clean `result` field (`allow`/`deny`/`ask`/`modify`/`passthrough`) classified from the typed `HookOutput` by
   `hooks::result::pretool_result`, alongside `tool_name`, `tool_args`, `cwd`, `rules_hash`, and `rule` — the name of the
@@ -451,6 +462,11 @@ with warnings, while explicit missing paths and having no available source are e
 - Detection order: resolving `.jj/repo` (store directory or pointer file) → `git rev-parse --git-common-dir` →
   canonicalized path
 - This allows approval sharing across jujutsu workspaces and git worktrees
+- `repository.rs` also provides `detect_workspace_root()`, the working-copy counterpart (nearest directory containing
+  `.jj/repo` → `git rev-parse --show-toplevel` → canonicalized path); the Stop hook and `run_checks` MCP tool
+  (`checks::run_configured_checks`) run checks there so a secondary workspace or worktree validates its own files while
+  sharing the main repository's approvals. `moriarty test checks` (via `project_config::runner`) instead executes at the
+  caller's canonicalized project directory, without the workspace-root walk
 - For jj: `.jj/repo` is the store directory itself in the main workspace and a pointer file in a secondary workspace.
   Absolute pointers are used as-is; a relative pointer is resolved against the `.jj` directory (jj 0.41+) with a
   fallback to the workspace directory (older jj), so both layouts share one repository root
@@ -463,6 +479,7 @@ with warnings, while explicit missing paths and having no available source are e
 
 **Shared Test Utilities**: Test helpers used across multiple modules (`setup_isolated_xdg_config`,
 `setup_isolated_xdg_state`, `setup_project_dir_with_config`, `write_tools_config`, `create_executable_script`,
+`run_git_command`, `setup_git_repo_with_commit`, `setup_jj_main_and_secondary_workspace`, `assert_approved_copy_ran_in`,
 `set_test_env_var`, `remove_test_env_var`, `TestEnvVarGuard`) live in `crates/moriarty/src/test_helpers.rs`. This module
 is compiled only in test builds (`#[cfg(test)]`). All test environment mutations go through `apply_test_env_var()` — the
 module's single `unsafe` block — with process isolation guaranteed by `cargo nextest`. New test-only helpers needed in

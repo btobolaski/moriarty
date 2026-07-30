@@ -79,8 +79,13 @@ pub enum ItemType {
 /// Result of verifying project approval status
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerificationResult {
-    /// Project is approved and all hashes match
-    Approved,
+    /// Project is approved and all hashes match. Carries the item's program resolved against the
+    /// repository root so callers spawn exactly the file that was verified instead of
+    /// re-resolving `command[0]` against a possibly different base (a workspace cwd, where an
+    /// unapproved local copy could shadow the approved one). This is the *original* resolved
+    /// path, not its canonicalization — both name the same hashed file, but canonicalizing
+    /// breaks symlinked multi-call binaries (nix coreutils, busybox) that dispatch on argv[0].
+    Approved { program: PathBuf },
     /// Project has not been approved yet
     NotApproved,
     /// tools.toml hash doesn't match (configuration changed)
@@ -156,36 +161,39 @@ impl ProjectApprovals {
         approvals.save().await
     }
 
-    /// Verify that a project command is approved and its hashes match
-    pub async fn verify_project(
+    /// Command variant of [`Self::verify_check_at_root`].
+    pub async fn verify_project_at_root(
         &self,
-        project_dir: &Path,
+        repository_root: &Path,
         command_name: &str,
     ) -> Result<VerificationResult> {
-        self.verify_item(project_dir, command_name, ItemType::Command)
+        self.verify_item_at_root(repository_root, command_name, ItemType::Command)
             .await
     }
 
-    /// Verify that a project check is approved and its hashes match
-    pub async fn verify_check(
+    /// Verify against an already-detected repository root. Root detection can spawn a `git`
+    /// subprocess, and every caller verifies items in a loop after detecting the root once — the
+    /// Stop hook's check loop and `verify_all_commands` — so taking the root directly keeps
+    /// detection at once per load, not once per item.
+    ///
+    /// The argument must be a root as returned by `detect_repository_root`; approvals are keyed
+    /// by root, so any other path fails closed as `NotApproved` rather than bypassing anything.
+    pub async fn verify_check_at_root(
         &self,
-        project_dir: &Path,
+        repository_root: &Path,
         check_name: &str,
     ) -> Result<VerificationResult> {
-        self.verify_item(project_dir, check_name, ItemType::Check)
+        self.verify_item_at_root(repository_root, check_name, ItemType::Check)
             .await
     }
 
-    /// Generic verification for commands or checks
-    async fn verify_item(
+    /// Generic verification for commands or checks against an already-detected repository root
+    async fn verify_item_at_root(
         &self,
-        project_dir: &Path,
+        repository_root: &Path,
         item_name: &str,
         item_type: ItemType,
     ) -> Result<VerificationResult> {
-        // Detect repository root (jj workspace root, git root, or canonicalized path)
-        let repository_root = repository::detect_repository_root(project_dir)?;
-
         let project_key = repository_root.to_string_lossy().to_string();
 
         // Check if project exists in approvals
@@ -278,7 +286,7 @@ impl ProjectApprovals {
 
         let binary_name = &command_array[0];
         let (original_path, canonical_path) =
-            resolve_binary_path_with_original(binary_name, &repository_root)?;
+            resolve_binary_path_with_original(binary_name, repository_root)?;
 
         // Hash immediately after resolution to prevent TOCTOU attacks
         let current_binary_hash = hashing::hash_file(&canonical_path).await?;
@@ -316,7 +324,9 @@ impl ProjectApprovals {
             });
         }
 
-        Ok(VerificationResult::Approved)
+        Ok(VerificationResult::Approved {
+            program: original_path,
+        })
     }
 
     /// Add or update approval for a project

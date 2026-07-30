@@ -1,9 +1,12 @@
-//! Repository root detection for jujutsu and git workspaces.
+//! Repository and workspace root detection for jujutsu and git workspaces.
 //!
-//! This module provides functionality to detect the repository root directory,
-//! supporting both jujutsu (jj) workspaces and git repositories. This enables
-//! shared approvals across multiple jj workspaces that reference the same
-//! repository.
+//! Two related but distinct roots are detected here:
+//! [`detect_repository_root`] resolves to the shared repository (following a jj
+//! secondary workspace's store pointer or a git worktree's common dir), which
+//! keys approvals so all workspaces of one repository share them;
+//! [`detect_workspace_root`] resolves to the root of the working copy
+//! containing the path, which is where project checks execute so they validate
+//! the files that were actually edited.
 
 use std::{
     path::{Path, PathBuf},
@@ -60,30 +63,127 @@ pub fn detect_repository_root(path: &Path) -> Result<PathBuf> {
     Ok(canonical)
 }
 
-/// Attempts to detect jujutsu workspace root.
+/// Detects the root of the workspace containing `path` — the working copy
+/// being operated on — as opposed to [`detect_repository_root`], which resolves
+/// a jj secondary workspace or git worktree to the shared repository it points
+/// at. Approvals are keyed by repository root so all workspaces share them;
+/// checks execute in the workspace root so they validate the working copy that
+/// was actually edited (and not a subdirectory of it, when the hook is invoked
+/// from one).
 ///
-/// Walks up the directory tree until it finds a `.jj/repo` entry, then resolves
-/// it to the repository root via [`resolve_jj_repo_root`].
+/// Strategies, in order:
+/// 1. Jujutsu: walks up to the nearest directory containing `.jj/repo`
+///    (the store directory in a main workspace, a pointer file in a secondary
+///    one — either way that directory is the workspace root, so no pointer
+///    resolution is needed)
+/// 2. Git: runs `git rev-parse --show-toplevel`, which returns the current
+///    worktree's root rather than the shared repository's
+/// 3. Canonicalized input path (fallback for non-repo projects)
+///
+/// The input is canonicalized before the jj walk so the returned root is
+/// canonical too (the walk returns an ancestor of its starting path verbatim).
+pub fn detect_workspace_root(path: &Path) -> Result<PathBuf> {
+    info!(path = %path.display(), "Detecting workspace root");
+
+    let canonical = path
+        .canonicalize()
+        .into_diagnostic()
+        .wrap_err_with(|| format!("Failed to canonicalize path: {}", path.display()))?;
+
+    if let Some(root) = nearest_jj_workspace_dir(&canonical) {
+        info!(root = %root.display(), "Detected jj workspace directory");
+        return Ok(root);
+    }
+
+    if let Some(root) = try_git_worktree_root(&canonical) {
+        info!(root = %root.display(), "Detected git worktree root");
+        return Ok(root);
+    }
+
+    info!(
+        root = %canonical.display(),
+        "Not in a repository, using canonicalized path as workspace root"
+    );
+    Ok(canonical)
+}
+
+/// Walks up from `path` to the nearest directory containing a `.jj/repo`
+/// entry — a workspace root, whether the entry is the store directory (main
+/// workspace) or a pointer file (secondary workspace). Shared by
+/// [`detect_workspace_root`] (which wants this directory itself) and
+/// [`try_jj_workspace_root`] (which resolves the entry to the repository root).
+fn nearest_jj_workspace_dir(path: &Path) -> Option<PathBuf> {
+    let mut current = path;
+    loop {
+        if current.join(".jj").join("repo").exists() {
+            return Some(current.to_path_buf());
+        }
+        current = current.parent()?;
+    }
+}
+
+/// Attempts to detect the current git worktree's root via
+/// `git rev-parse --show-toplevel`, which stays inside the worktree instead of
+/// following it back to the shared repository like `--git-common-dir` does.
+fn try_git_worktree_root(path: &Path) -> Option<PathBuf> {
+    debug!(path = %path.display(), "Attempting git worktree root detection");
+
+    let output = Command::new("git")
+        .arg("rev-parse")
+        .arg("--show-toplevel")
+        .current_dir(path)
+        .output();
+
+    match output {
+        Ok(output) if output.status.success() => {
+            let toplevel_str = String::from_utf8_lossy(&output.stdout);
+            let toplevel = Path::new(toplevel_str.trim());
+
+            match toplevel.canonicalize() {
+                Ok(root) => {
+                    debug!(root = %root.display(), "Successfully detected git worktree root");
+                    Some(root)
+                }
+                Err(e) => {
+                    debug!(
+                        error = %e,
+                        toplevel = %toplevel.display(),
+                        "Failed to canonicalize git worktree root"
+                    );
+                    None
+                }
+            }
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            debug!(
+                exit_code = output.status.code(),
+                stderr = %stderr,
+                "git rev-parse --show-toplevel failed"
+            );
+            None
+        }
+        Err(e) => {
+            debug!(error = %e, "Failed to execute git command (may not be installed)");
+            None
+        }
+    }
+}
+
+/// Attempts to detect jujutsu repository root: the nearest workspace's
+/// `.jj/repo` entry resolved to the repository it belongs to via
+/// [`resolve_jj_repo_root`].
 fn try_jj_workspace_root(path: &Path) -> Option<PathBuf> {
     debug!(path = %path.display(), "Attempting jj workspace root detection");
 
-    let mut current = path;
-    loop {
-        let jj_dir = current.join(".jj");
-        let jj_repo = jj_dir.join("repo");
+    let Some(workspace_dir) = nearest_jj_workspace_dir(path) else {
+        debug!("Reached filesystem root without finding .jj/repo");
+        return None;
+    };
 
-        if jj_repo.exists() {
-            return resolve_jj_repo_root(&jj_dir, &jj_repo);
-        }
-
-        match current.parent() {
-            Some(parent) => current = parent,
-            None => {
-                debug!("Reached filesystem root without finding .jj/repo");
-                return None;
-            }
-        }
-    }
+    let jj_dir = workspace_dir.join(".jj");
+    let jj_repo = jj_dir.join("repo");
+    resolve_jj_repo_root(&jj_dir, &jj_repo)
 }
 
 /// Resolves the jj repository root from a discovered `.jj/repo` entry.
@@ -242,6 +342,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::test_helpers::{run_git_command, setup_git_repo_with_commit};
 
     #[test]
     fn test_detect_non_repository() -> Result<()> {
@@ -435,6 +536,92 @@ mod tests {
         assert!(
             try_jj_workspace_root(temp_dir.path()).is_none(),
             "Relative pointer resolving to no existing store should return None"
+        );
+    }
+
+    #[test]
+    fn test_workspace_root_secondary_workspace() {
+        // The two detectors must disagree in a secondary workspace — the repository root follows
+        // the pointer to the main store while the workspace root stays at the directory holding
+        // the pointer file — and coincide in the main workspace.
+        let temp_base = TempDir::new().unwrap();
+        let (workspace_dir, pointer_file, store_root) =
+            build_jj_store_and_workspace(temp_base.path(), "mainrepo", "workspace");
+        let absolute_store = store_root.join(".jj").join("repo");
+        std::fs::write(&pointer_file, absolute_store.to_str().unwrap()).unwrap();
+
+        let nested = workspace_dir.join("src").join("inner");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let workspace_root = detect_workspace_root(&nested)
+            .expect("workspace root should resolve in a secondary workspace");
+        assert_eq!(workspace_root, workspace_dir.canonicalize().unwrap());
+
+        let repository_root = detect_repository_root(&nested)
+            .expect("repository root should resolve through the pointer");
+        assert_eq!(repository_root, store_root);
+        assert_ne!(workspace_root, repository_root);
+
+        assert_eq!(
+            detect_workspace_root(&store_root).unwrap(),
+            store_root,
+            "main workspace: the two roots should coincide"
+        );
+    }
+
+    #[test]
+    fn test_workspace_root_git_worktree() {
+        // The git analogue of the secondary-workspace divergence: the
+        // repository root follows --git-common-dir back to the main
+        // repository, while the workspace root stays at the worktree.
+        let temp_base = TempDir::new().unwrap();
+        let main = temp_base.path().join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        setup_git_repo_with_commit(&main);
+
+        let worktree = temp_base.path().join("worktree");
+        run_git_command(&["worktree", "add", worktree.to_str().unwrap()], &main);
+
+        let nested = worktree.join("src");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let workspace_root = detect_workspace_root(&nested)
+            .expect("workspace root should resolve inside a git worktree");
+        assert_eq!(workspace_root, worktree.canonicalize().unwrap());
+
+        let repository_root = detect_repository_root(&nested)
+            .expect("repository root should resolve to the main repository");
+        assert_eq!(repository_root, main.canonicalize().unwrap());
+        assert_ne!(workspace_root, repository_root);
+    }
+
+    #[test]
+    fn test_git_worktree_root_not_in_repo() {
+        let temp_dir = env::temp_dir();
+        let result = try_git_worktree_root(&temp_dir);
+        assert!(
+            result.is_none(),
+            "Temp directory should not be detected as a git worktree: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_workspace_root_not_in_repository() -> Result<()> {
+        let temp_dir = env::temp_dir();
+        let root = detect_workspace_root(&temp_dir)?;
+        assert_eq!(root, temp_dir.canonicalize().into_diagnostic()?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_workspace_root_nonexistent_directory() {
+        let fake_path = Path::new("/this/path/definitely/does/not/exist/moriarty-test-12345");
+        let err_msg = format!("{:?}", detect_workspace_root(fake_path).unwrap_err());
+        assert!(
+            err_msg.contains("Failed to canonicalize") || err_msg.contains("No such file"),
+            "Error should mention canonicalization or file not found failure, got: {}",
+            err_msg
         );
     }
 

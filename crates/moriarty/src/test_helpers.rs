@@ -5,6 +5,7 @@
 use std::{
     ffi::{OsStr, OsString},
     path::{Path, PathBuf},
+    process::Command,
 };
 
 use tempfile::TempDir;
@@ -152,6 +153,93 @@ pub fn create_executable_script(path: &Path, body: &str) {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
+}
+
+/// Lay out a jj main workspace plus a secondary workspace whose `.jj/repo` pointer file targets
+/// the main store, with `config` written to the main workspace's `.config/tools.toml` and a
+/// deliberately divergent `./<script>` in each working copy: the main (approvable) copy prints
+/// the markers [`assert_approved_copy_ran_in`] checks for — "approved-copy" plus its physical
+/// cwd — while the workspace copy prints "unapproved-workspace-copy".
+///
+/// Returns `(base_guard, main_dir, workspace_dir)`; the guard must outlive the test. Approval is
+/// left to the caller and must come after any additional files, since it hashes the referenced
+/// binaries.
+pub fn setup_jj_main_and_secondary_workspace(
+    config: &str,
+    script: &str,
+) -> (TempDir, PathBuf, PathBuf) {
+    let base = TempDir::new().unwrap();
+
+    let main = base.path().join("main");
+    std::fs::create_dir_all(main.join(".jj/repo")).unwrap();
+    std::fs::create_dir_all(main.join(".config")).unwrap();
+    std::fs::write(main.join(".config/tools.toml"), config).unwrap();
+    create_executable_script(&main.join(script), "echo approved-copy\npwd -P");
+
+    let workspace = base.path().join("workspace");
+    std::fs::create_dir_all(workspace.join(".jj")).unwrap();
+    std::fs::write(
+        workspace.join(".jj/repo"),
+        main.join(".jj/repo").to_str().unwrap(),
+    )
+    .unwrap();
+    create_executable_script(&workspace.join(script), "echo unapproved-workspace-copy");
+
+    (base, main, workspace)
+}
+
+/// Assert `output` proves the approved main-workspace script from
+/// [`setup_jj_main_and_secondary_workspace`] ran — not the workspace's shadow copy — with the
+/// secondary workspace as its physical working directory.
+pub fn assert_approved_copy_ran_in(output: &str, main: &Path, workspace: &Path) {
+    let workspace_root = workspace.canonicalize().unwrap();
+    let main_root = main.canonicalize().unwrap();
+    assert!(
+        output.contains("approved-copy"),
+        "the hashed repository copy must run, got: {output}"
+    );
+    assert!(
+        !output.contains("unapproved-workspace-copy"),
+        "the workspace copy must not shadow the approved one, got: {output}"
+    );
+    assert!(
+        output.contains(workspace_root.to_str().unwrap()),
+        "cwd must be the secondary workspace, got: {output}"
+    );
+    assert!(
+        !output.contains(main_root.to_str().unwrap()),
+        "cwd must not be the main workspace, got: {output}"
+    );
+}
+
+/// Run a git command in `current_dir`, panicking with git's stderr on failure.
+pub fn run_git_command(args: &[&str], current_dir: &Path) {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(current_dir)
+        .output()
+        .expect("Failed to execute git command");
+
+    assert!(
+        output.status.success(),
+        "git {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Create a git repository at `repo_path` with one initial commit (committing
+/// any files already present there).
+///
+/// Configures a local user identity rather than relying on global config,
+/// which may be absent in CI environments or isolated test setups.
+pub fn setup_git_repo_with_commit(repo_path: &Path) {
+    run_git_command(&["init"], repo_path);
+    run_git_command(&["config", "user.email", "test@example.com"], repo_path);
+    run_git_command(&["config", "user.name", "Test User"], repo_path);
+    std::fs::write(repo_path.join("README.md"), "test").unwrap();
+    run_git_command(&["add", "."], repo_path);
+    run_git_command(&["commit", "-m", "initial"], repo_path);
 }
 
 #[cfg(test)]

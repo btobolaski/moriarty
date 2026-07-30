@@ -18,7 +18,10 @@ use crate::{
     hashing,
     project_config::config::ProjectConfig,
     repository,
-    test_helpers::{create_executable_script, setup_isolated_xdg_config, write_tools_config},
+    test_helpers::{
+        create_executable_script, run_git_command, setup_git_repo_with_commit,
+        setup_isolated_xdg_config, write_tools_config,
+    },
 };
 
 use super::super::{
@@ -48,11 +51,13 @@ async fn assert_shared_repo_approval(repo_root: &Path, shared_path: &Path, label
     );
 
     let approvals = ProjectApprovals::load().await.unwrap();
-    let result = approvals.verify_project(shared_path, "lint").await.unwrap();
-    assert_eq!(
-        result,
-        VerificationResult::Approved,
-        "Approval from one {label} should work in the others"
+    let result = approvals
+        .verify_project_at_root(&shared_root, "lint")
+        .await
+        .unwrap();
+    assert!(
+        matches!(result, VerificationResult::Approved { .. }),
+        "Approval from one {label} should work in the others, got {result:?}"
     );
 
     let approval_key = repo_root.to_string_lossy().to_string();
@@ -65,7 +70,10 @@ async fn assert_shared_repo_approval(repo_root: &Path, shared_path: &Path, label
 /// Asserts a verification result is `Approved`, keeping the case label in the
 /// failure output for table-driven tests.
 fn assert_approved(result: VerificationResult, context: &str) {
-    assert_eq!(result, VerificationResult::Approved, "{context}");
+    assert!(
+        matches!(result, VerificationResult::Approved { .. }),
+        "{context}: expected Approved, got {result:?}"
+    );
 }
 
 /// Asserts a verification result is `ItemNotApproved` for the requested item.
@@ -87,12 +95,14 @@ command = ["echo", "test"]
 "#;
 
 /// Loads approvals and verifies `item`, returning the raw verification result so
-/// table-driven tests can assert the expected branch explicitly.
+/// table-driven tests can assert the expected branch explicitly. Detects the
+/// repository root the way production callers do before using the `_at_root` API.
 async fn verify_check_result(project_dir: &Path, item: &str) -> VerificationResult {
+    let repository_root = repository::detect_repository_root(project_dir).unwrap();
     ProjectApprovals::load()
         .await
         .unwrap()
-        .verify_check(project_dir, item)
+        .verify_check_at_root(&repository_root, item)
         .await
         .unwrap()
 }
@@ -234,22 +244,6 @@ pub async fn approve_project_config(project_dir: &Path, config_content: &str) ->
     Ok(repository_root)
 }
 
-/// Helper to run a git command and assert success
-fn run_git_command(args: &[&str], current_dir: &Path) {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(current_dir)
-        .output()
-        .expect("Failed to execute git command");
-
-    assert!(
-        output.status.success(),
-        "git {} failed: {}",
-        args.join(" "),
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
 /// Helper to run a jj command and assert success
 fn run_jj_command(args: &[&str], current_dir: &Path) {
     let output = Command::new("jj")
@@ -264,18 +258,6 @@ fn run_jj_command(args: &[&str], current_dir: &Path) {
         args.join(" "),
         String::from_utf8_lossy(&output.stderr)
     );
-}
-
-/// Helper to create a git repository with an initial commit
-fn setup_git_repo_with_commit(repo_path: &Path) {
-    run_git_command(&["init"], repo_path);
-    // Configure local user identity rather than relying on global config,
-    // which may be absent in CI environments or isolated test setups.
-    run_git_command(&["config", "user.email", "test@example.com"], repo_path);
-    run_git_command(&["config", "user.name", "Test User"], repo_path);
-    std::fs::write(repo_path.join("README.md"), "test").unwrap();
-    run_git_command(&["add", "."], repo_path);
-    run_git_command(&["commit", "-m", "initial"], repo_path);
 }
 
 /// Helper to create a jj repository
@@ -484,11 +466,7 @@ command = ["{}"]
     std::fs::write(&script_path, "#!/bin/bash\necho 'modified'\n").unwrap();
 
     // Verify should detect binary hash mismatch
-    let approvals = ProjectApprovals::load().await.unwrap();
-    let result = approvals
-        .verify_check(temp_dir.path(), "custom-check")
-        .await
-        .unwrap();
+    let result = verify_check_result(temp_dir.path(), "custom-check").await;
 
     match result {
         VerificationResult::BinaryHashMismatch { item, .. } => {
@@ -692,6 +670,38 @@ fn test_resolve_binary_with_subdirectory() {
     assert!(canonical.is_absolute());
     assert!(canonical.ends_with("build.sh"));
     assert!(canonical.to_string_lossy().contains("scripts"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn verify_check_program_is_original_not_canonical_for_symlink() {
+    // The `Approved { program }` field must carry the original (symlink) path, not its
+    // canonicalized target: symlinked multi-call binaries (nix coreutils, busybox) dispatch on
+    // argv[0], so spawning the canonical target would change behavior. The resolver's
+    // original-vs-canonical split is covered below; this locks in that `verify_item_at_root`
+    // forwards the original into `Approved`.
+    let _xdg = setup_isolated_xdg_config();
+    let project = TempDir::new().unwrap();
+    let real = project.path().join("real.sh");
+    create_executable_script(&real, "echo hi");
+    let link = project.path().join("link.sh");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    let config = "[commands]\n[[checks]]\nname = \"c\"\ncommand = [\"./link.sh\"]\n";
+    write_tools_config(project.path(), config);
+    approve_project_config(project.path(), config)
+        .await
+        .unwrap();
+
+    let result = verify_check_result(project.path(), "c").await;
+    let VerificationResult::Approved { program } = result else {
+        panic!("expected Approved, got {result:?}");
+    };
+    assert_eq!(
+        program,
+        project.path().canonicalize().unwrap().join("link.sh"),
+        "program must be the symlink, not its canonicalized target"
+    );
 }
 
 #[cfg(unix)]

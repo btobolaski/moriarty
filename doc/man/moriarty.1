@@ -1,6 +1,6 @@
 .\" Copyright (c) 2025 Moriarty contributors
 .\" SPDX-License-Identifier: GPL-3.0-only
-.Dd July 2025
+.Dd July 2026
 .Dt MORIARTY 1
 .Os
 .Sh NAME
@@ -236,12 +236,26 @@ subcommand opens a TUI to approve the project\-configured tools and checks
 defined in
 .Pa .config/tools.toml
 for the project\-tools MCP server.
+Approvals are keyed by the repository root, so jj workspaces and git worktrees
+share them.
+Approved tools and checks always load their configuration and resolve their
+program paths from the repository root's
+.Pa .config/tools.toml ,
+while executing in the directory they were invoked for.
 .Ss Hooks
 The
 .Cm hooks exec
 subcommand executes Claude Code hooks, reading input from stdin
 and applying configured tool and bash rules.
 This is the entry point used by Claude Code's hook system.
+For the Stop hook it runs the project's approved checks from
+.Pa .config/tools.toml .
+Checks execute in the invoking workspace's root
+.Pq the nearest jj workspace or git worktree root ,
+while the configuration, the approvals, and each check's program path are
+resolved from the shared repository root, so a jj secondary workspace or git
+worktree validates its own working copy using only the approved configuration
+and binaries.
 .Pp
 The
 .Cm hooks report
