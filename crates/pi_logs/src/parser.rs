@@ -3201,6 +3201,11 @@ pub struct McpDetails {
     /// How many of `servers` are currently connected (status mode).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connected_count: Option<u32>,
+    /// How many of `servers` the user has disabled (status mode); reported
+    /// separately from `connected_count` because a disabled server is neither
+    /// connected nor failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_count: Option<u32>,
     /// `mode: "list"` of tools exposed by a single server.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<String>>,
@@ -3257,6 +3262,7 @@ impl<'de> Deserialize<'de> for McpDetails {
                 servers: None,
                 total_tools: None,
                 connected_count: None,
+                disabled_count: None,
                 tools: None,
                 count: None,
                 has_instructions: None,
@@ -3297,6 +3303,8 @@ impl<'de> Deserialize<'de> for McpDetails {
             #[serde(default)]
             connected_count: Option<u32>,
             #[serde(default)]
+            disabled_count: Option<u32>,
+            #[serde(default)]
             tools: Option<Vec<String>>,
             #[serde(default)]
             count: Option<u32>,
@@ -3324,6 +3332,7 @@ impl<'de> Deserialize<'de> for McpDetails {
             servers: strict.servers,
             total_tools: strict.total_tools,
             connected_count: strict.connected_count,
+            disabled_count: strict.disabled_count,
             tools: strict.tools,
             count: strict.count,
             has_instructions: strict.has_instructions,

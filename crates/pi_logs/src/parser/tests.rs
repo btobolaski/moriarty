@@ -5635,8 +5635,8 @@ fn find_truncation_payload_lands_in_find_during_direct_details_deserialization()
 }
 
 /// McpDetails carries strict `deny_unknown_fields`, so a silent rename
-/// of `servers` / `connectedCount` / `totalTools` would leave callers parsing
-/// status responses with empty data. This pins all three plus the
+/// of `servers` / `connectedCount` / `disabledCount` / `totalTools` would leave
+/// callers parsing status responses with empty data. This pins all four plus the
 /// McpServerStatus shape.
 #[test]
 fn mcp_tool_result_accepts_status_mode() {
@@ -5651,7 +5651,8 @@ fn mcp_tool_result_accepts_status_mode() {
                 {"name": "flaky", "status": "failed", "toolCount": 0, "failedAgo": 12}
             ],
             "totalTools": 4,
-            "connectedCount": 1
+            "connectedCount": 1,
+            "disabledCount": 2
         })),
     ));
     let Some(ToolResultDetails::Mcp(details)) = tool_result.details else {
@@ -5660,6 +5661,7 @@ fn mcp_tool_result_accepts_status_mode() {
     assert_eq!(details.mode, Some(McpMode::Status));
     assert_eq!(details.total_tools, Some(4));
     assert_eq!(details.connected_count, Some(1));
+    assert_eq!(details.disabled_count, Some(2));
     let servers = details.servers.expect("expected servers");
     assert_eq!(servers.len(), 2);
     assert_eq!(servers[0].name, "git-read-only");
@@ -6005,6 +6007,7 @@ fn mcp_details_serialize_hint_server_as_camel_case() {
         servers: None,
         total_tools: None,
         connected_count: None,
+        disabled_count: None,
         tools: None,
         count: None,
         has_instructions: None,
