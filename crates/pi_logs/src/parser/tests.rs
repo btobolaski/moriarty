@@ -24,6 +24,7 @@ struct AssistantFixture<'a> {
     stop_reason: &'a str,
     response_id: Option<&'a str>,
     response_model: Option<&'a str>,
+    raw_stop_reason: Option<&'a str>,
     error_message: Option<&'a str>,
 }
 
@@ -36,6 +37,7 @@ impl<'a> AssistantFixture<'a> {
             stop_reason,
             response_id: None,
             response_model: None,
+            raw_stop_reason: None,
             error_message: None,
         }
     }
@@ -50,6 +52,13 @@ impl<'a> AssistantFixture<'a> {
     fn with_response_model(self, response_model: &'a str) -> Self {
         Self {
             response_model: Some(response_model),
+            ..self
+        }
+    }
+
+    fn with_raw_stop_reason(self, raw_stop_reason: &'a str) -> Self {
+        Self {
+            raw_stop_reason: Some(raw_stop_reason),
             ..self
         }
     }
@@ -245,6 +254,11 @@ fn assistant_message_json(content: Vec<Value>, fixture: AssistantFixture<'_>) ->
         &mut message,
         "responseModel",
         fixture.response_model.map(Value::from),
+    );
+    insert_optional_field(
+        &mut message,
+        "rawStopReason",
+        fixture.raw_stop_reason.map(Value::from),
     );
 
     message_line_json("a1", "u1", message)
@@ -1737,6 +1751,25 @@ fn assistant_stop_reason_length() {
     );
 
     assert_eq!(assistant.stop_reason, AssistantStopReason::Length);
+}
+
+/// The openai-codex-responses api reports the provider's own stop reason
+/// beside the one pi normalizes it to, so the two must survive independently.
+#[test]
+fn assistant_raw_stop_reason_kept_beside_normalized_stop_reason() {
+    let assistant = parse_assistant_message(
+        vec![json!({"type": "text", "text": "done"})],
+        AssistantFixture::new(
+            "openai-codex-responses",
+            "openai-codex",
+            "gpt-5.6-sol",
+            "toolUse",
+        )
+        .with_raw_stop_reason("completed"),
+    );
+
+    assert_eq!(assistant.stop_reason, AssistantStopReason::ToolUse);
+    assert_eq!(assistant.raw_stop_reason.as_deref(), Some("completed"));
 }
 
 #[test]

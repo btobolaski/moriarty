@@ -233,6 +233,10 @@ with warnings, while explicit missing paths and having no available source are e
   string (including model-invented names like `task` or `remove`) rather than rejecting unknown tools. Tool-specific
   result parsing still routes known tool names by string to their typed result-structs where structured post-parse
   handling is needed; unknown tool results fall through to shape-based deserialization.
+- `AssistantMessage.raw_stop_reason` carries the provider's own stop-reason string un-normalized beside the
+  `stop_reason` pi maps it onto (e.g. the openai-codex-responses `completed` that pi records as `toolUse` or `stop`).
+  Like tool names, it stays a `String` rather than a strict enum because the vocabulary belongs to whichever provider
+  served the turn; it is `Option` because only some providers emit it.
 - Hermes memory/session-search result details are modeled by their shared envelopes rather than per-action sub-schemas:
   search tools use the `success/count/message/output` summary shape, while `memory` and `skill` are routed by
   `tool_name` first because their error details can collapse to either `{}` or a bare `{error}`; once routed, the parser

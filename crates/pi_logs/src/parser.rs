@@ -433,6 +433,14 @@ pub struct AssistantMessage {
     pub response_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_model: Option<String>,
+    /// The provider's own stop-reason string, passed through un-normalized
+    /// beside the `stop_reason` pi maps it onto (e.g. the OpenAI Responses
+    /// `completed` that pi records as `toolUse` or `stop`). Kept as a
+    /// `String` rather than a strict enum because the vocabulary belongs to
+    /// whichever provider served the turn, so it is open-ended by
+    /// construction. Only some providers emit it, hence `Option`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_stop_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
     /// Provider diagnostics attached when the assistant turn fails due to
