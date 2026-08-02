@@ -7506,6 +7506,10 @@ fn subagent_result_summary_serializes_control_events_as_camel_case() {
             },
         )]),
         acceptance: None,
+        context: None,
+        launch_contract_digest: None,
+        effects: None,
+        thinking: None,
     })
     .expect("serialize subagent result summary");
 
@@ -7543,6 +7547,98 @@ fn subagent_tool_result_deserializes_timed_out() {
         };
         assert_eq!(details.results[0].timed_out, Some(expected));
     }
+}
+
+#[test]
+fn subagent_tool_result_deserializes_context_launch_digest_effects_thinking() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "subagent",
+        vec![json!({"type": "text", "text": "done"})],
+        false,
+        Some(json!({
+            "mode": "single",
+            "results": [{
+                "agent": "reviewer",
+                "context": "fork",
+                "launchContractDigest": "sha256:abc",
+                "thinking": "medium",
+                "effects": {
+                    "fileMutation": {
+                        "status": "mutated",
+                        "expected": true,
+                        "attempted": true
+                    }
+                }
+            }]
+        })),
+    ));
+    let Some(ToolResultDetails::Subagent(details)) = tool_result.details else {
+        panic!("expected Subagent details")
+    };
+    let r = &details.results[0];
+    assert_eq!(r.context.as_deref(), Some("fork"));
+    assert_eq!(r.launch_contract_digest.as_deref(), Some("sha256:abc"));
+    assert_eq!(r.thinking.as_deref(), Some("medium"));
+    let fm = r.effects.as_ref().unwrap().file_mutation.as_ref().unwrap();
+    assert_eq!(fm.status, "mutated");
+    assert!(fm.expected);
+    assert!(fm.attempted);
+}
+
+/// Pins strict rejection of extra fields on `SubagentEffects`.
+#[test]
+fn subagent_tool_result_rejects_unknown_effects_field() {
+    assert_parse_error_contains_any(
+        "rejects unknown effects field",
+        tool_result_message_json(
+            "subagent",
+            vec![json!({"type": "text", "text": "test"})],
+            false,
+            Some(json!({
+                "mode": "single",
+                "results": [{
+                    "agent": "reviewer",
+                    "effects": {
+                        "fileMutation": {
+                            "status": "mutated",
+                            "expected": false,
+                            "attempted": false
+                        },
+                        "unexpected": true
+                    }
+                }]
+            })),
+        ),
+        &["unknown field `unexpected`"],
+    );
+}
+
+/// Pins strict rejection of extra fields on `SubagentFileMutation`.
+#[test]
+fn subagent_tool_result_rejects_unknown_file_mutation_field() {
+    assert_parse_error_contains_any(
+        "rejects unknown file mutation field",
+        tool_result_message_json(
+            "subagent",
+            vec![json!({"type": "text", "text": "test"})],
+            false,
+            Some(json!({
+                "mode": "single",
+                "results": [{
+                    "agent": "reviewer",
+                    "effects": {
+                        "fileMutation": {
+                            "status": "mutated",
+                            "expected": false,
+                            "attempted": false,
+                            "unexpected": true
+                        }
+                    }
+                }]
+            })),
+        ),
+        &["unknown field `unexpected`"],
+    );
 }
 
 /// Pins strict rejection of extra fields on `SubagentControlEventPayload`.
@@ -7732,6 +7828,7 @@ fn subagent_tool_result_parse_acceptance_ledger() {
                 "agent": "code-quality-reviewer",
                 "acceptance": {
                     "status": "accepted",
+                    "evidenceStatus": "attested",
                     "explicit": true,
                     "effectiveAcceptance": {
                         "level": "strict",
@@ -7848,6 +7945,7 @@ fn subagent_tool_result_parse_acceptance_ledger() {
         .expect("expected acceptance ledger");
 
     assert_eq!(acceptance.status, "accepted");
+    assert_eq!(acceptance.evidence_status.as_deref(), Some("attested"));
     assert!(acceptance.explicit);
     assert_eq!(acceptance.effective_acceptance.level, "strict");
     assert_eq!(acceptance.criteria[0].id, "tests");
@@ -7898,6 +7996,48 @@ fn subagent_tool_result_parse_acceptance_ledger() {
     assert_eq!(fin.turns.len(), 1);
     assert_eq!(fin.turns[0].turn, 1);
     assert_eq!(fin.turns[0].status, "accepted");
+}
+
+/// Pins that an acceptance ledger without `evidenceStatus` (older pi
+/// output) deserializes with `evidence_status == None`.
+#[test]
+fn subagent_tool_result_acceptance_ledger_evidence_status_absent() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "subagent",
+        vec![json!({"type": "text", "text": "test"})],
+        false,
+        Some(json!({
+            "mode": "single",
+            "results": [{
+                "agent": "code-quality-reviewer",
+                "acceptance": {
+                    "status": "accepted",
+                    "explicit": false,
+                    "effectiveAcceptance": {
+                        "level": "none",
+                        "explicit": false,
+                        "inferredReason": [],
+                        "criteria": [],
+                        "evidence": [],
+                        "verify": [],
+                        "stopRules": []
+                    },
+                    "inferredReason": [],
+                    "criteria": [],
+                    "runtimeChecks": [],
+                    "verifyRuns": []
+                }
+            }]
+        })),
+    ));
+    let Some(ToolResultDetails::Subagent(details)) = tool_result.details else {
+        panic!("expected Subagent details")
+    };
+    let acceptance = details.results[0]
+        .acceptance
+        .as_ref()
+        .expect("expected acceptance ledger");
+    assert_eq!(acceptance.evidence_status, None);
 }
 
 #[test]

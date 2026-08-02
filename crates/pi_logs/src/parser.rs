@@ -2279,6 +2279,10 @@ pub struct SubagentProgressEntry {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AcceptanceLedger {
     pub status: String,
+    /// Acceptance evidence status (e.g. `"attested"`). Added in newer pi
+    /// versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_status: Option<String>,
     pub explicit: bool,
     pub effective_acceptance: ResolvedAcceptanceConfig,
     pub inferred_reason: Vec<String>,
@@ -2566,6 +2570,23 @@ pub struct SubagentResultSummary {
     /// not configured for the run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acceptance: Option<AcceptanceLedger>,
+    /// Inheritance mode the subagent was launched with (e.g. "fresh" or
+    /// "fork"). Added in newer pi versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+    /// Launch contract digest for the subagent run. Added in newer pi
+    /// versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_contract_digest: Option<String>,
+    /// Effects of the subagent's execution on the file system (currently
+    /// only `fileMutation`). Added in newer pi versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effects: Option<SubagentEffects>,
+    /// Thinking level for the subagent (e.g. `"medium"`). Kept as a
+    /// free-form `String` rather than a strict enum because pi may add new
+    /// levels in future releases. Added in newer pi versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -2575,6 +2596,29 @@ pub struct SubagentOutputReference {
     pub bytes: u64,
     pub lines: u64,
     pub message: String,
+}
+
+/// Outcome of a subagent's file mutations.
+///
+/// `status` is a free-form string (e.g. `"not-applicable"`, `"mutated"`).
+/// `expected` is true when the mutation was anticipated by the launch
+/// contract. `attempted` is true when the subagent tried to mutate files
+/// (independently of whether the mutation succeeded or was expected).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SubagentFileMutation {
+    pub status: String,
+    pub expected: bool,
+    pub attempted: bool,
+}
+
+/// Effects of a subagent's execution on the file system (currently only
+/// `fileMutation`).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SubagentEffects {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_mutation: Option<SubagentFileMutation>,
 }
 
 /// Internally-tagged on `type` because pi's subagent runtime emits each
