@@ -84,7 +84,7 @@ pub enum VerificationResult {
     /// re-resolving `command[0]` against a possibly different base (a workspace cwd, where an
     /// unapproved local copy could shadow the approved one). This is the *original* resolved
     /// path, not its canonicalization — both name the same hashed file, but canonicalizing
-    /// breaks symlinked multi-call binaries (nix coreutils, busybox) that dispatch on argv[0].
+    /// breaks symlinked multi-call binaries (nix coreutils, busybox) that dispatch on `argv[0]`.
     Approved { program: PathBuf },
     /// Project has not been approved yet
     NotApproved,

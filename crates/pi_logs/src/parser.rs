@@ -59,7 +59,7 @@
 //!   call) and the normal mode-based shape (all standard fields with
 //!   `mode` required). Both branches enforce strict unknown-field
 //!   rejection — the sessions-only path via
-//!   [`reject_unknown_object_fields`] and the mode-based path via an
+//!   `reject_unknown_object_fields` and the mode-based path via an
 //!   internally-derived `StrictMcpDetails` struct with
 //!   `#[serde(deny_unknown_fields)]`.
 //!

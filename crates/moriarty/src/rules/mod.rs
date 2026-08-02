@@ -1073,9 +1073,13 @@ fn print_replay(report: &ReplayReport) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::user_config::{BashRule, BashRuleAction, ToolRule, ToolRuleAction};
     use std::env;
+
+    use super::*;
+    use crate::{
+        test_helpers::setup_isolated_xdg_config,
+        user_config::{BashRule, BashRuleAction, ToolRule, ToolRuleAction},
+    };
 
     fn config_with_bash(rules: Vec<BashRule>) -> UserConfig {
         UserConfig {
@@ -1529,6 +1533,7 @@ mod tests {
     async fn suggest_json_smoke_over_an_explicit_dir() {
         // End-to-end through the async path: log reading, hash filtering (--all-rules), leaf
         // splitting, and JSON rendering all compose without error.
+        let _config_guard = setup_isolated_xdg_config();
         let dir = tempfile::tempdir().unwrap();
         let line = serde_json::json!({
             "timestamp": "2026-06-10T01:00:00Z",
@@ -1546,7 +1551,7 @@ mod tests {
             .await
             .unwrap();
 
-        suggest(SuggestOptions {
+        let opts = SuggestOptions {
             dir: Some(dir.path().to_path_buf()),
             start_time: None,
             end_time: None,
@@ -1559,9 +1564,27 @@ mod tests {
             all_rules: true,
             rules_hash: None,
             json: true,
-        })
-        .await
-        .expect("suggest should succeed over an explicit log dir");
+        };
+        let (suggestions, scope) = collect_suggestions(&opts)
+            .await
+            .expect("suggest should succeed over an explicit log dir");
+        assert_eq!(
+            scope,
+            "Rule set: all (--all-rules); no hash filter applied."
+        );
+        assert_eq!(suggestions.len(), 2);
+
+        let rendered = serde_json::to_value(&suggestions).unwrap();
+        let entries = rendered.as_array().unwrap();
+        for (entry, expected_pattern) in entries.iter().zip(["^git status$", "^ls$"]) {
+            assert_eq!(entry["rule"]["pattern"].as_str(), Some(expected_pattern));
+            assert_eq!(entry["rule"]["action"]["type"].as_str(), Some("Ask"));
+            assert_eq!(entry["count"].as_u64(), Some(1));
+            assert_eq!(
+                entry["observed_commands"],
+                serde_json::json!(["git status && ls"])
+            );
+        }
     }
 
     #[test]
@@ -1834,7 +1857,7 @@ mod tests {
     async fn suggest_with_active_config_filters_already_allowed_leaves() {
         // Uses --all-rules to skip the record-hash filter so the test doesn't need to match
         // the config's effective hash, while still exercising the engine-loading codepath.
-        let _config_guard = crate::test_helpers::setup_isolated_xdg_config();
+        let _config_guard = setup_isolated_xdg_config();
         let moriarty_dir = PathBuf::from(env::var("XDG_CONFIG_HOME").unwrap()).join("moriarty");
         tokio::fs::create_dir_all(&moriarty_dir).await.unwrap();
         tokio::fs::write(
@@ -1913,7 +1936,7 @@ action = { type = "Allow" }
 
     #[tokio::test]
     async fn suggest_empty_when_all_leaves_are_already_allowed() {
-        let _config_guard = crate::test_helpers::setup_isolated_xdg_config();
+        let _config_guard = setup_isolated_xdg_config();
         let moriarty_dir = PathBuf::from(env::var("XDG_CONFIG_HOME").unwrap()).join("moriarty");
         tokio::fs::create_dir_all(&moriarty_dir).await.unwrap();
         tokio::fs::write(

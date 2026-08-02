@@ -9,6 +9,8 @@ use std::{
 };
 
 use tempfile::TempDir;
+#[cfg(unix)]
+use which::which;
 
 // ---------------------------------------------------------------------------
 // Centralized unsafe environment mutation — one unsafe block for the crate
@@ -134,10 +136,9 @@ pub fn write_tools_config(project_dir: &Path, contents: &str) -> PathBuf {
     path
 }
 
-/// Create an executable shell script at `path` containing `body`.
-///
-/// The file begins with a `#!/bin/bash` shebang and, on Unix, is marked as
-/// executable (mode 0o755). Parent directories are created as needed.
+/// Fixture bodies must remain POSIX `sh` compatible so they behave consistently when `sh` is not
+/// Bash. On Unix, the interpreter is resolved from `PATH` because Nix environments need not expose
+/// FHS paths such as `/bin/bash`.
 pub fn create_executable_script(path: &Path, body: &str) {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -145,7 +146,14 @@ pub fn create_executable_script(path: &Path, body: &str) {
     {
         std::fs::create_dir_all(parent).unwrap();
     }
-    let contents = format!("#!/bin/bash\n{}\n", body);
+    #[cfg(unix)]
+    let shebang = which("sh")
+        .expect("test environment must provide sh in PATH")
+        .to_string_lossy()
+        .into_owned();
+    #[cfg(not(unix))]
+    let shebang = "/bin/bash";
+    let contents = format!("#!{shebang}\n{body}\n");
     std::fs::write(path, contents).unwrap();
 
     #[cfg(unix)]

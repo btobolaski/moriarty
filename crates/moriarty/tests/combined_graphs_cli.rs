@@ -127,7 +127,18 @@ fn directory_resolution_and_empty_state() {
     let missing = home.path().join("missing");
     let output = combined(claude.path(), &missing).output().unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("does not exist"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let normalized: String = stderr
+        .chars()
+        .filter(|character| !character.is_whitespace() && *character != '│')
+        .collect();
+    let missing: String = missing
+        .to_string_lossy()
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    let expected = format!("pisessionsdirectory'{missing}'doesnotexist");
+    assert!(normalized.contains(&expected), "{stderr}");
 
     let output = moriarty()
         .env("HOME", home.path())

@@ -12,8 +12,9 @@ slow-timeout = { period = "15s", terminate-after = 4 }
 # - `pi_cost_cli_defaults_to_local_timezone`: chrono's `Local` reads
 #   `/usr/share/zoneinfo` to interpret `TZ=America/New_York`; the sandbox has
 #   no tzdata so chrono silently falls back to UTC.
-# - `mcp::git_read_only::tests::*` and `mcp::jj_read_only::tests::*`: invoke
-#   the real `git`/`jj` binaries, which are not on PATH inside the sandbox.
+# - `mcp::git_read_only::tests::*`, `mcp::jj_read_only::tests::*`, and
+#   `repository::tests::test_workspace_root_git_worktree`: invoke the real
+#   `git`/`jj` binaries, which are not on PATH inside the sandbox.
 # - `mcp::tool_runner::tests::test_full_approval_lifecycle` and
 #   `mcp::tool_runner::tests::test_approval_lifecycle_with_binary_modification`,
 #   plus `project_config::runner::tests::{test_canonicalize_path,
@@ -24,8 +25,8 @@ slow-timeout = { period = "15s", terminate-after = 4 }
 #   `xdg::BaseDirectories::place_config_file` returns `Permission denied`.
 # - `project_config::approvals::tests::test_git_worktrees_share_approvals`
 #   and `test_jj_workspaces_share_approvals`: drive real git/jj workspaces.
-# - `pi_logs::parser_fixtures::parse_recent_fixture_file` and
-#   `pi_logs::parse_pi_sessions_binary::parse_pi_sessions_binary_succeeds_on_checked_in_fixture_dir`:
+# - `parser_fixtures::parse_recent_fixture_file` and
+#   `parse_pi_sessions_binary::parse_pi_sessions_binary_succeeds_on_checked_in_fixture_dir`:
 #   read JSONL fixtures stripped by `craneLib.cleanCargoSource`.
 [profile.nix]
 fail-fast = false
@@ -33,6 +34,7 @@ default-filter = """
   not test(=pi_cost_cli_defaults_to_local_timezone)
   and not test(/^mcp::git_read_only::tests::/)
   and not test(/^mcp::jj_read_only::tests::/)
+  and not test(=repository::tests::test_workspace_root_git_worktree)
   and not test(=mcp::tool_runner::tests::test_full_approval_lifecycle)
   and not test(=mcp::tool_runner::tests::test_approval_lifecycle_with_binary_modification)
   and not test(=project_config::approvals::tests::test_git_worktrees_share_approvals)
