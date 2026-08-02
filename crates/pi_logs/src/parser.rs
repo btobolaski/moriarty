@@ -3181,6 +3181,7 @@ pub struct GrepDetails {
 pub enum McpMode {
     Call,
     Describe,
+    Instructions,
     List,
     Search,
     Status,
@@ -3280,6 +3281,9 @@ pub struct McpDetails {
     /// MCP response exceeds pi's in-message byte cap. Stored as raw JSON.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_guard: Option<JsonBlob>,
+    /// Length of the server instructions text (`mode: "instructions"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub length: Option<u32>,
 }
 
 impl<'de> Deserialize<'de> for McpDetails {
@@ -3321,6 +3325,7 @@ impl<'de> Deserialize<'de> for McpDetails {
                 matches: None,
                 query: None,
                 output_guard,
+                length: None,
             });
         }
 
@@ -3368,6 +3373,8 @@ impl<'de> Deserialize<'de> for McpDetails {
             query: Option<String>,
             #[serde(default)]
             output_guard: Option<JsonBlob>,
+            #[serde(default)]
+            length: Option<u32>,
         }
 
         let strict = StrictMcpDetails::deserialize(value).map_err(de::Error::custom)?;
@@ -3391,6 +3398,7 @@ impl<'de> Deserialize<'de> for McpDetails {
             matches: strict.matches,
             query: strict.query,
             output_guard: strict.output_guard,
+            length: strict.length,
         })
     }
 }

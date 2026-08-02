@@ -5801,6 +5801,29 @@ fn mcp_tool_result_accepts_search_mode() {
     assert_eq!(details.count, Some(0));
 }
 
+/// `mode: "instructions"` carries `length` (the length of the server
+/// instructions text) alongside `server`. Pin the wire field names so a
+/// silent rename cannot quietly drop production data during parsing.
+#[test]
+fn mcp_tool_result_accepts_instructions_mode() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "mcp",
+        vec![json!({"type": "text", "text": "instructions"})],
+        false,
+        Some(json!({
+            "mode": "instructions",
+            "server": "jj-read-only",
+            "length": 152
+        })),
+    ));
+    let Some(ToolResultDetails::Mcp(details)) = tool_result.details else {
+        panic!("expected Mcp details")
+    };
+    assert_eq!(details.mode, Some(McpMode::Instructions));
+    assert_eq!(details.server.as_deref(), Some("jj-read-only"));
+    assert_eq!(details.length, Some(152));
+}
+
 /// Verify that every tool name routed through `McpToolResult` in
 /// `parse_tool_result_details` accepts a `{error, server}` payload.
 /// The table catches accidental removal of a match arm during
@@ -6047,6 +6070,7 @@ fn mcp_details_serialize_hint_server_as_camel_case() {
         matches: None,
         query: None,
         output_guard: None,
+        length: None,
     })
     .expect("serialize mcp details");
 
