@@ -9,7 +9,8 @@ use super::*;
 use crate::{
     project_config::approvals::ProjectApprovals,
     test_helpers::{
-        remove_test_env_var, set_test_env_var, setup_isolated_xdg_config, setup_isolated_xdg_state,
+        SUBAGENT_EXECUTION_RULES, remove_test_env_var, set_test_env_var, setup_isolated_xdg_config,
+        setup_isolated_xdg_state,
     },
 };
 
@@ -121,6 +122,12 @@ fn assert_pretool_ask(result: &HookOutput) {
     assert_eq!(output.permission_decision, Some(PermissionDecision::Ask));
     assert_eq!(output.permission_decision_reason, None);
     assert_eq!(output.updated_input, None);
+}
+
+fn assert_pretool_passthrough(result: &HookOutput) {
+    assert_eq!(result.hook_specific_output, None);
+    assert_eq!(result.permission_decision, None);
+    assert_eq!(result.decision, None);
 }
 
 async fn run_bash_hook(config: &str, command: &str) -> HookOutput {
@@ -2162,6 +2169,68 @@ action = { type = \"Allow\" }
             "case {label}: non-scalar field values never match"
         );
     }
+}
+
+#[tokio::test]
+async fn test_subagent_execution_conditions_allow_valid_and_deny_invalid_starts() {
+    let valid = serde_json::json!({
+        "agent": "worker",
+        "unrelated": ["allowed"],
+        "async": true,
+    });
+    let outcome = run_pretool_outcome(SUBAGENT_EXECUTION_RULES, "subagent", &valid, "").await;
+    assert_pretool_allow(&outcome.output);
+    assert_eq!(outcome.rule.as_deref(), Some("allow-valid-subagent-start"));
+
+    for input in [
+        serde_json::json!({}),
+        serde_json::json!({"async": false}),
+        serde_json::json!({"async": "true"}),
+        serde_json::json!({"async": null}),
+        serde_json::json!({"async": true, "turnBudget": {"maxTurns": 5}}),
+        serde_json::json!({"async": true, "turnBudget": {}}),
+        serde_json::json!({"async": true, "turnBudget": null}),
+    ] {
+        let outcome = run_pretool_outcome(SUBAGENT_EXECUTION_RULES, "subagent", &input, "").await;
+        assert_eq!(
+            unwrap_pretool_output(&outcome.output).permission_decision,
+            Some(PermissionDecision::Deny),
+            "input {input}"
+        );
+        assert_eq!(
+            outcome.rule.as_deref(),
+            Some("deny-invalid-subagent-start"),
+            "input {input}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_subagent_execution_conditions_bypass_action_and_other_tools() {
+    for (case, action) in [
+        ("null", Value::Null),
+        ("status", serde_json::json!("status")),
+        ("management", serde_json::json!("list")),
+    ] {
+        let input = serde_json::json!({
+            "action": action,
+            "async": false,
+            "turnBudget": {"maxTurns": 1},
+        });
+        let outcome = run_pretool_outcome(SUBAGENT_EXECUTION_RULES, "subagent", &input, "").await;
+        assert_pretool_passthrough(&outcome.output);
+        assert_eq!(outcome.rule, None, "action case {case}");
+    }
+
+    let outcome = run_pretool_outcome(
+        SUBAGENT_EXECUTION_RULES,
+        "other-tool",
+        &serde_json::json!({"async": false}),
+        "",
+    )
+    .await;
+    assert_pretool_passthrough(&outcome.output);
+    assert_eq!(outcome.rule, None);
 }
 
 #[tokio::test]

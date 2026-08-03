@@ -319,12 +319,14 @@ with warnings, while explicit missing paths and having no available source are e
 **`hooks/`** - Security hook system for Claude Code integration:
 
 - **PreToolUse hook**: Two-tier permission system from `~/.config/moriarty/tool_rules.toml`:
-  - `tool_rules`: Permission any tool call (Read, Write, Edit, Bash, etc.) with optional field-level regex matching and
-    optional `allow_local = true` checks on `path` / `file_path`. Actions: Allow, Deny, Ask. Checked first. Field values
-    that start with the hook input's `cwd` have that prefix stripped before regex matching, so rules can use relative
-    paths (e.g., `^src/` instead of absolute paths). `allow_local` canonicalizes the hook `cwd` and the target path; for
-    non-existent targets it canonicalizes the deepest existing ancestor and safely rebuilds the missing suffix so `..`
-    cannot escape above that ancestor.
+  - `tool_rules`: Permission any tool call (Read, Write, Edit, Bash, etc.) with optional legacy field-level regex
+    matching and an optional ANDed `conditions` list over literal top-level input keys: `Present`, `Absent`, typed raw
+    JSON `Equals`, and scalar-regex `Matches`. Separate ordered rules provide OR/fallback behavior. Actions: Allow,
+    Deny, Ask. Checked first. Regex field values that start with the hook input's `cwd` have that prefix stripped so
+    rules can use relative paths (e.g., `^src/` instead of absolute paths). `allow_local = true` canonicalizes every
+    `path` / `file_path` selected by presence-requiring conditions or the legacy field; for non-existent targets it
+    canonicalizes the deepest existing ancestor and safely rebuilds the missing suffix so `..` cannot escape above that
+    ancestor.
   - `bash_rules`: Bash-specific command validation with regex patterns. Actions: Allow, Deny, Modify, Ask,
     ArgumentFilter. Checked when no tool_rule matches a Bash call.
   - **Compound splitting** (`hooks/command_split.rs`): the hook parses each Bash command with `brush-parser` (a
@@ -376,18 +378,20 @@ with warnings, while explicit missing paths and having no available source are e
 - **Compile diagnostics & `rules` authoring tooling**: `BashRuleEngine::compile_with_diagnostics` and
   `ToolRuleEngine::compile_with_diagnostics` return the engine plus a `RuleDiagnostic` for every dropped rule
   (undefined/circular/over-depth fragment, invalid regex, or — tool rules only — a `field`/`pattern` given without its
-  partner); `from_config` delegates to them and logs each, preserving the fail-open-per-rule hot path. The
-  `crate::rules` command group surfaces them and helps author safe rules: `lint` (errors when a rule the user wrote is
-  silently dropped; `--strict` additionally warns on likely-shadowed and over-broad Allow rules), `list-fragments`,
-  `schema` (round-tripped against `UserConfig` in tests), `starter` (paste-ready read-only allow-rules that auto-allow
-  the north-star command), `suggest` (anchored rules mined from hook logs; each recorded command is split into the leaf
-  simple-commands the hook actually evaluates — normalized with the recorded cwd — before pattern generation, so
-  compounds yield per-leaf candidates with summed counts, and a bailed command stays whole; `--match exact|prefix|fuzzy`
-  picks the shape, where fuzzy clusters leaves by program and generalizes simple-identifier subcommands into a closed
-  alternation like `^cargo (build|check)(\s|$)`, falling back to a program prefix; never emits Allow unless
-  `--match exact`), and `replay` (re-evaluate recorded Bash decisions against a candidate config — the migration
-  acceptance gate is zero lost auto-approvals). `test bash-rules --explain [--cwd <dir>]` prints the per-leaf split,
-  normalized text, matching rule (with the expanded pattern), and merged decision via `BashRuleEngine::explain`.
+  partner); an invalid `Matches` condition drops the whole tool rule rather than broadening it by retaining only the
+  valid predicates. `from_config` delegates to these compilers and logs each diagnostic, preserving the
+  fail-open-per-rule hot path. The `crate::rules` command group surfaces them and helps author safe rules: `lint`
+  (errors when a rule the user wrote is silently dropped; `--strict` additionally warns on likely-shadowed and
+  over-broad Allow rules), `list-fragments`, `schema` (round-tripped against `UserConfig` in tests), `starter`
+  (paste-ready read-only allow-rules that auto-allow the north-star command), `suggest` (anchored rules mined from hook
+  logs; each recorded command is split into the leaf simple-commands the hook actually evaluates — normalized with the
+  recorded cwd — before pattern generation, so compounds yield per-leaf candidates with summed counts, and a bailed
+  command stays whole; `--match exact|prefix|fuzzy` picks the shape, where fuzzy clusters leaves by program and
+  generalizes simple-identifier subcommands into a closed alternation like `^cargo (build|check)(\s|$)`, falling back to
+  a program prefix; never emits Allow unless `--match exact`), and `replay` (re-evaluate recorded Bash decisions against
+  a candidate config — the migration acceptance gate is zero lost auto-approvals).
+  `test bash-rules --explain [--cwd <dir>]` prints the per-leaf split, normalized text, matching rule (with the expanded
+  pattern), and merged decision via `BashRuleEngine::explain`.
 - **Rule-set provenance**: each `PreToolUse hook completed` log line records `rules_hash`, a stable hash of the
   effective config (`UserConfig::effective_hash`, computed once per hook invocation). The hash covers the parsed config
   — tool rules, bash rules, and fragments — re-serialized via `serde_json::to_value` so map keys (`pattern_fragments`,
@@ -484,7 +488,8 @@ with warnings, while explicit missing paths and having no available source are e
 **Shared Test Utilities**: Test helpers used across multiple modules (`setup_isolated_xdg_config`,
 `setup_isolated_xdg_state`, `setup_project_dir_with_config`, `write_tools_config`, `create_executable_script`,
 `run_git_command`, `setup_git_repo_with_commit`, `setup_jj_main_and_secondary_workspace`, `assert_approved_copy_ran_in`,
-`set_test_env_var`, `remove_test_env_var`, `TestEnvVarGuard`) live in `crates/moriarty/src/test_helpers.rs`. This module
+`set_test_env_var`, `remove_test_env_var`, `TestEnvVarGuard`, `SUBAGENT_EXECUTION_RULES`) live in
+`crates/moriarty/src/test_helpers.rs`. This module
 is compiled only in test builds (`#[cfg(test)]`). All test environment mutations go through `apply_test_env_var()` — the
 module's single `unsafe` block — with process isolation guaranteed by `cargo nextest`. New test-only helpers needed in
 more than one module belong here rather than being duplicated.

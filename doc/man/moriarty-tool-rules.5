@@ -1,6 +1,6 @@
 .\" Copyright (c) 2025 Moriarty contributors
 .\" SPDX-License-Identifier: GPL-3.0-only
-.Dd July 2025
+.Dd August 2026
 .Dt MORIARTY\-TOOL\-RULES 5
 .Os
 .Sh NAME
@@ -34,8 +34,14 @@ Each tool rule is a TOML array\-of\-tables entry:
 name = "descriptive\-name"
 tool = "ToolName"
 allow_local = true          # optional
-field = "field_name"       # optional
-pattern = "regex\-pattern"  # optional
+field = "field_name"       # optional legacy pair
+pattern = "regex\-pattern"
+conditions = [              # optional; all must match
+  { type = "Present", field = "request" },
+  { type = "Absent", field = "dangerous" },
+  { type = "Equals", field = "enabled", value = true },
+  { type = "Matches", field = "path", pattern = "^src/" },
+]
 action = { type = "ActionType", value = "..." }
 .Ed
 .Ss Fields
@@ -60,21 +66,28 @@ When set to
 .Cm true ,
 the rule only matches if the relevant path field resolves to a canonical path within the hook's canonicalized
 .Ic cwd .
-If
+For a condition\-free legacy rule, a
 .Ic field
-is set to
+of
 .Ql path
 or
-.Ql file_path ,
-that specific field must be local.
-If
-.Ic field
-is absent, either field being local is sufficient.
-If
-.Ic field
-is set to any other value, the
-.Ic allow_local
-check always fails.
+.Ql file_path
+must be local; with no legacy field either local path field is sufficient, while a non\-path legacy field cannot satisfy locality.
+For a rule with
+.Ic conditions ,
+every distinct
+.Ql path
+or
+.Ql file_path
+referenced by
+.Cm Present ,
+.Cm Equals ,
+or
+.Cm Matches ,
+or by the legacy field when it names one of those path keys, must be local.
+.Cm Absent
+does not select a path.
+If no path is selected, the legacy fallback applies.
 Relative paths are resolved against
 .Ic cwd .
 Existing paths are fully canonicalized; non\-existent paths are checked by canonicalizing the deepest existing ancestor and safely rebuilding the missing suffix so
@@ -106,6 +119,16 @@ syntax.
 If
 .Ic allow_local
 is also enabled, both checks must pass.
+.It Ic conditions
+Optional list of typed predicates over literal top\-level tool input keys.
+Every condition is ANDed with every other condition and with the tool name,
+.Ic allow_local ,
+and the legacy
+.Ic field Ns / Ns Ic pattern
+pair.
+Separate ordered rules provide alternatives and fallback behavior.
+See
+.Sx CONDITIONS .
 .It Ic action
 The action to take when the rule matches.
 One of
@@ -116,6 +139,40 @@ or
 See
 .Sx ACTIONS .
 .El
+.Ss CONDITIONS
+A rule with conditions matches only when the tool input is a JSON object.
+Dots in a condition's
+.Ic field
+name are literal and do not denote a JSON path.
+.Bl -tag -width Ds
+.It Cm Present
+The named top\-level key exists, regardless of its value; a key whose value is JSON null is present.
+.It Cm Absent
+The named top\-level key does not exist.
+For object inputs this is the exact inverse of
+.Cm Present .
+.It Cm Equals
+The key exists and its raw JSON value equals the configured JSON\-compatible TOML
+.Ic value .
+Equality is recursive and type\-sensitive: boolean
+.Cm true
+differs from string
+.Ql true ,
+and arrays and inline tables may be compared exactly.
+.It Cm Matches
+The named scalar value matches
+.Ic pattern
+using the same extraction, cwd\-prefix stripping, and pattern\-fragment expansion as the legacy field/pattern pair.
+Strings match directly; numbers and booleans are stringified; arrays, objects, and null do not match.
+.El
+.Pp
+Missing or extra condition properties are configuration errors.
+If any
+.Cm Matches
+pattern cannot expand or compile, the entire rule is dropped and reported; Moriarty never retains only the valid conditions because that could broaden an Allow rule.
+Use
+.Cm moriarty rules lint
+to detect dropped rules.
 .Ss Field Pattern Matching
 When
 .Ic field
@@ -164,15 +221,9 @@ it is matched as\-is.
 .Pp
 When
 .Ic allow_local
-is enabled,
-.Nm moriarty
-also canonicalizes
-.Ic cwd
-and checks
-.Ic path
-and
-.Ic file_path
-against it before any regex match is considered successful.
+is enabled, a path regex uses the canonicalized local path before cwd stripping, while a non\-path regex still reads the raw input.
+.Cm Equals
+always compares the raw JSON value, including for path fields; locality is a separate gate.
 .Sh ACTIONS
 .Bl -tag -width Ds
 .It Cm Allow
@@ -205,7 +256,8 @@ PreToolUse event (any tool)
   +\-> tool_rules engine (first\-match\-wins)
   |     tool matches?
   |       \-> allow_local check (if enabled)
-  |       \-> field/pattern regex check (if configured)
+  |       \-> every condition matches (if configured)
+  |       \-> legacy field/pattern regex matches (if configured)
   |     Match found? \-> return Allow/Deny/Ask
   |     No match?    \-> continue
   |
@@ -268,6 +320,37 @@ field = "file_path"
 pattern = "^src/.*\e\.rs$"
 action = { type = "Allow" }
 .Ed
+.Pp
+Require ordinary subagent execution starts to use top\-level
+.Ic async = true
+and omit top\-level
+.Ic turnBudget ,
+while leaving action, status, and management calls outside the policy:
+.Bd -literal -offset indent
+[[tool_rules]]
+name = "allow\-valid\-subagent\-start"
+tool = "subagent"
+conditions = [
+  { type = "Absent", field = "action" },
+  { type = "Equals", field = "async", value = true },
+  { type = "Absent", field = "turnBudget" },
+]
+action = { type = "Allow" }
+
+[[tool_rules]]
+name = "deny\-invalid\-subagent\-start"
+tool = "subagent"
+conditions = [{ type = "Absent", field = "action" }]
+action = { type = "Deny", value = "Normal subagent starts require async=true and must omit turnBudget" }
+.Ed
+.Pp
+The Allow rule must come first because rules are first\-match\-wins.
+An input key
+.Ic action
+whose value is null is still present and bypasses both rules, while any present
+.Ic turnBudget ,
+including null, is denied.
+Unrelated execution fields do not affect the policy.
 .Sh FILES
 .Bl -tag -width Ds
 .It Pa ~/.config/moriarty/tool_rules.toml

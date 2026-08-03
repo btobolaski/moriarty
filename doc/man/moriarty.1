@@ -1,6 +1,6 @@
 .\" Copyright (c) 2025 Moriarty contributors
 .\" SPDX-License-Identifier: GPL-3.0-only
-.Dd July 2026
+.Dd August 2026
 .Dt MORIARTY 1
 .Os
 .Sh NAME
@@ -316,7 +316,7 @@ They never run the hook.
 .Bl -tag -width Ds
 .It Cm rules lint Op Fl \-strict
 Report rules the hook silently ignores
-.Pq dropped because of an undefined fragment, invalid regex, or incomplete field/pattern pair ,
+.Pq dropped because a legacy or Matches pattern has an unexpandable fragment or invalid regex, or because a legacy field/pattern pair is incomplete ,
 exiting nonzero if any exist.
 With
 .Fl \-strict ,

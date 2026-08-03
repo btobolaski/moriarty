@@ -12,6 +12,7 @@ use std::{collections::HashMap, path::Path};
 
 use miette::{Context, IntoDiagnostic, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::persistence::FileType;
 
@@ -152,21 +153,37 @@ pub enum BashRuleAction {
     },
 }
 
+/// Conditions target literal top-level input keys and are conjoined; ordered rules remain the
+/// mechanism for alternatives and fallback behavior.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "type", deny_unknown_fields)]
+pub enum ToolRuleCondition {
+    /// Key membership is sufficient, including when the input value is null.
+    Present { field: String },
+    /// This is the exact inverse of `Present` for object inputs.
+    Absent { field: String },
+    /// Raw JSON equality preserves booleans, strings, numbers, arrays, and objects.
+    Equals { field: String, value: Value },
+    /// Only strings, numbers, and booleans participate in regex matching.
+    Matches { field: String, pattern: String },
+}
+
 /// A rule for permissioning any Claude Code tool call (Read, Write, Edit, Bash, etc.).
 ///
 /// Rules are evaluated in order with first-match-wins semantics. The `tool` field is an exact
-/// string match against the tool name (or `"*"` for catch-all). Optional `allow_local = true`
-/// requires that the `path` or `file_path` input resolves to a canonical path within the hook
-/// cwd. Optional `field` + `pattern` provide regex matching against a specific field in the tool
-/// input.
+/// string match against the tool name (or `"*"` for catch-all). With `allow_local = true`,
+/// condition-free rules retain their legacy path selection, while condition-bearing rules require
+/// every `path` or `file_path` selected by a presence-requiring predicate or legacy path field to
+/// resolve within the hook cwd. Optional `field` + `pattern` provide legacy regex matching against
+/// one field, while `conditions` adds typed, presence-aware predicates over literal top-level input
+/// keys. Every configured check is conjoined.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ToolRule {
     pub name: String,
     /// Exact tool name to match (e.g., "Read", "Write", "Bash"), or `"*"` for any tool.
     pub tool: String,
-    /// When `true`, the rule only fires if the relevant path resolves within the
-    /// canonicalized hook `cwd`. Prevents rules from matching absolute paths that point
-    /// outside the current project, regardless of whether the regex would match.
+    /// When `true`, every path selected by the rule must resolve within the canonicalized hook
+    /// `cwd`; rules without conditions retain the legacy single-path or either-path fallback.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub allow_local: bool,
     /// Optional field name in tool_input to match against.
@@ -177,6 +194,10 @@ pub struct ToolRule {
     /// Must be paired with `field`; if only one is present, the rule is skipped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pattern: Option<String>,
+    /// Optional top-level input predicates that must all match. Separate ordered rules provide
+    /// alternatives and fallback behavior.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conditions: Vec<ToolRuleCondition>,
     pub action: ToolRuleAction,
 }
 
@@ -255,6 +276,8 @@ pub async fn load_user_config_from(path: Option<&Path>) -> Result<UserConfig> {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::{json, to_value};
+
     use super::*;
     use crate::test_helpers::setup_isolated_xdg_config;
 
@@ -545,6 +568,7 @@ reason = "Browser not needed""#;
             allow_local: false,
             field: Some("file_path".to_string()),
             pattern: Some("\\.env$".to_string()),
+            conditions: Vec::new(),
             action: ToolRuleAction::Deny {
                 value: "Cannot read .env files".to_string(),
             },
@@ -563,6 +587,7 @@ reason = "Browser not needed""#;
             allow_local: false,
             field: None,
             pattern: None,
+            conditions: Vec::new(),
             action: ToolRuleAction::Allow,
         };
 
@@ -570,9 +595,107 @@ reason = "Browser not needed""#;
         assert!(!toml.contains("field"));
         assert!(!toml.contains("pattern"));
         assert!(!toml.contains("allow_local"));
+        assert!(!toml.contains("conditions"));
 
         let deserialized: ToolRule = toml::from_str(&toml).unwrap();
         assert_eq!(rule, deserialized);
+    }
+
+    #[test]
+    fn tool_rule_conditions_round_trip_all_variants_and_nested_value() {
+        let config: UserConfig = toml::from_str(
+            r#"
+[[tool_rules]]
+name = "typed-conditions"
+tool = "subagent"
+conditions = [
+  { type = "Present", field = "action" },
+  { type = "Absent", field = "turnBudget" },
+  { type = "Equals", field = "settings", value = { mode = "safe" } },
+  { type = "Matches", field = "name", pattern = "^worker-{{number}}$" },
+]
+action = { type = "Allow" }
+"#,
+        )
+        .unwrap();
+
+        let conditions = &config.tool_rules.as_ref().unwrap()[0].conditions;
+        assert_eq!(
+            conditions,
+            &[
+                ToolRuleCondition::Present {
+                    field: "action".to_string(),
+                },
+                ToolRuleCondition::Absent {
+                    field: "turnBudget".to_string(),
+                },
+                ToolRuleCondition::Equals {
+                    field: "settings".to_string(),
+                    value: json!({"mode": "safe"}),
+                },
+                ToolRuleCondition::Matches {
+                    field: "name".to_string(),
+                    pattern: "^worker-{{number}}$".to_string(),
+                },
+            ]
+        );
+
+        let serialized = toml::to_string(&config).unwrap();
+        let round_tripped: UserConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(round_tripped, config);
+    }
+
+    #[test]
+    fn tool_rule_conditions_reject_missing_and_extra_variant_fields() {
+        let malformed_conditions = [
+            r#"{ type = "Equals", field = "async" }"#,
+            r#"{ type = "Present", field = "action", typo = true }"#,
+        ];
+
+        for condition in malformed_conditions {
+            let config = format!(
+                r#"
+[[tool_rules]]
+name = "malformed"
+tool = "subagent"
+conditions = [{condition}]
+action = {{ type = "Allow" }}
+"#,
+            );
+            assert!(
+                toml::from_str::<UserConfig>(&config).is_err(),
+                "condition should be rejected: {condition}"
+            );
+        }
+    }
+
+    #[test]
+    fn condition_free_tool_rule_keeps_legacy_hash_and_nonempty_conditions_change_it() {
+        let legacy: UserConfig = toml::from_str(
+            r#"
+[[tool_rules]]
+name = "allow-read"
+tool = "Read"
+action = { type = "Allow" }
+"#,
+        )
+        .unwrap();
+
+        let serialized = to_value(&legacy).unwrap();
+        let rule = &serialized["tool_rules"][0];
+        assert!(rule.get("conditions").is_none());
+
+        let legacy_hash = legacy.effective_hash();
+        let round_tripped: UserConfig = toml::from_str(&toml::to_string(&legacy).unwrap()).unwrap();
+        assert_eq!(round_tripped.effective_hash(), legacy_hash);
+
+        let mut conditioned = legacy.clone();
+        conditioned.tool_rules.as_mut().unwrap()[0]
+            .conditions
+            .push(ToolRuleCondition::Absent {
+                field: "action".to_string(),
+            });
+        assert_ne!(conditioned.effective_hash(), legacy.effective_hash());
     }
 
     #[test]
@@ -583,6 +706,7 @@ reason = "Browser not needed""#;
             allow_local: true,
             field: Some("file_path".to_string()),
             pattern: Some(r"^src/.*\.rs$".to_string()),
+            conditions: Vec::new(),
             action: ToolRuleAction::Allow,
         };
 
@@ -639,6 +763,7 @@ value = "not allowed""#;
             allow_local: false,
             field: None,
             pattern: None,
+            conditions: Vec::new(),
             action: ToolRuleAction::Ask,
         };
 
@@ -662,6 +787,7 @@ value = "not allowed""#;
                     allow_local: false,
                     field: None,
                     pattern: None,
+                    conditions: Vec::new(),
                     action: ToolRuleAction::Allow,
                 },
                 ToolRule {
@@ -670,6 +796,7 @@ value = "not allowed""#;
                     allow_local: false,
                     field: Some("file_path".to_string()),
                     pattern: Some(r"\.env$".to_string()),
+                    conditions: Vec::new(),
                     action: ToolRuleAction::Deny {
                         value: "Cannot write .env".to_string(),
                     },

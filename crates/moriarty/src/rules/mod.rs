@@ -436,6 +436,17 @@ name = "ask-local-edit"
 tool = "Edit"
 allow_local = true
 action = { type = "Ask" }
+
+[[tool_rules]]
+name = "ask-conditional-grep"
+tool = "Grep"
+conditions = [
+  { type = "Present", field = "pattern" },
+  { type = "Absent", field = "multiline" },
+  { type = "Equals", field = "output_mode", value = "files_with_matches" },
+  { type = "Matches", field = "path", pattern = "^src/" },
+]
+action = { type = "Ask" }
 "#;
 
 fn schema(json: bool) -> Result<()> {
@@ -1077,8 +1088,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        test_helpers::setup_isolated_xdg_config,
-        user_config::{BashRule, BashRuleAction, ToolRule, ToolRuleAction},
+        test_helpers::{SUBAGENT_EXECUTION_RULES, setup_isolated_xdg_config},
+        user_config::{BashRule, BashRuleAction, ToolRule, ToolRuleAction, ToolRuleCondition},
     };
 
     fn config_with_bash(rules: Vec<BashRule>) -> UserConfig {
@@ -1126,6 +1137,7 @@ mod tests {
                 allow_local: false,
                 field: Some("path".to_string()),
                 pattern: None,
+                conditions: Vec::new(),
                 action: ToolRuleAction::Allow,
             }]),
         };
@@ -1133,6 +1145,49 @@ mod tests {
         assert_eq!(report.errors.len(), 1);
         assert_eq!(report.errors[0].rule_kind, "tool");
         assert_eq!(report.errors[0].kind, "missing-field-or-pattern");
+    }
+
+    #[test]
+    fn reports_invalid_condition_regex_and_drops_the_rule() {
+        let config = UserConfig {
+            pattern_fragments: None,
+            bash_rules: None,
+            tool_rules: Some(vec![ToolRule {
+                name: "condition-regex".to_string(),
+                tool: "subagent".to_string(),
+                allow_local: false,
+                field: None,
+                pattern: None,
+                conditions: vec![
+                    ToolRuleCondition::Absent {
+                        field: "action".to_string(),
+                    },
+                    ToolRuleCondition::Matches {
+                        field: "agent".to_string(),
+                        pattern: "[invalid(".to_string(),
+                    },
+                ],
+                action: ToolRuleAction::Allow,
+            }]),
+        };
+
+        let report = build_lint_report(&config, false).unwrap();
+        assert_eq!(report.ignored_count, 1);
+        assert_eq!(report.errors.len(), 1);
+        assert_eq!(report.errors[0].rule_kind, "tool");
+        assert_eq!(report.errors[0].rule_name, "condition-regex");
+        assert_eq!(report.errors[0].pattern, "[invalid(");
+        assert_eq!(report.errors[0].kind, "invalid-regex");
+        assert!(report.errors[0].message.contains("field 'agent'"));
+    }
+
+    #[test]
+    fn valid_ordered_condition_policy_has_no_lint_errors() {
+        let config: UserConfig = toml::from_str(SUBAGENT_EXECUTION_RULES).unwrap();
+
+        let report = build_lint_report(&config, false).unwrap();
+        assert_eq!(report.ignored_count, 0);
+        assert!(report.errors.is_empty());
     }
 
     #[test]

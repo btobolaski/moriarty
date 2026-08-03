@@ -64,30 +64,54 @@ action = { type = "Ask" }
 name = "descriptive-name"
 tool = "ToolName"           # Exact tool name or "*" for any tool
 allow_local = true           # Optional: require local path/file_path under cwd
-field = "field_name"        # Optional: field in tool_input to match
-pattern = "regex-pattern"   # Optional: regex pattern for the field value
+field = "field_name"        # Optional legacy field/pattern pair
+pattern = "regex-pattern"
+conditions = [               # Optional: every condition must match
+  { type = "Present", field = "request" },
+  { type = "Absent", field = "dangerous" },
+  { type = "Equals", field = "enabled", value = true },
+  { type = "Matches", field = "path", pattern = "^src/" },
+]
 action = { type = "ActionType", ... }
 ```
 
 - **name**: A descriptive name for the rule (used in logs)
 - **tool**: Exact tool name to match (e.g., `"Read"`, `"Write"`, `"Edit"`, `"Bash"`, `"Glob"`, `"Grep"`), or `"*"` to
   match any tool
-- **allow_local**: Optional boolean. When `true`, the rule only matches if the relevant path field resolves to a
-  canonical path within the hook's canonicalized `cwd`. If `field = "path"` or `field = "file_path"`, that specific
-  field must be local. If `field` is omitted, either `path` or `file_path` being local is sufficient. If `field` is any
-  other value, the `allow_local` check always fails. Relative inputs are resolved against `cwd`; existing paths are
-  fully canonicalized; non-existent paths are checked by canonicalizing the deepest existing ancestor and safely
-  rebuilding the missing suffix so `..` cannot escape above that ancestor. Symlinks are followed during
-  canonicalization, so symlinks that resolve outside `cwd` are rejected, and broken symlinks are treated as non-local.
-  Hard links are treated as local filesystem entries and are not distinguished from ordinary files.
-- **field** + **pattern**: Optional pair. When both present, the regex `pattern` matches against the named field's value
-  in `tool_input`. When absent, the rule applies to any invocation of the tool. If only one is present, the rule is
-  skipped (configuration error, logged). If `allow_local = true` is also set, **both** the local-path check and the
-  regex check must pass.
+- **allow_local**: Optional boolean. For a condition-free legacy rule, behavior is unchanged: a legacy `field` of `path`
+  or `file_path` must be local, no legacy field accepts either local path field, and a non-path legacy field cannot
+  satisfy locality. For a rule with `conditions`, every distinct `path` or `file_path` referenced by `Present`,
+  `Equals`, or `Matches`, or by the legacy `field` when it names one of those path keys, must resolve locally; `Absent`
+  does not select a path. If no path is selected, the legacy fallback still applies. Relative inputs are resolved
+  against `cwd`; existing paths are fully canonicalized; non-existent paths are checked by canonicalizing the deepest
+  existing ancestor and safely rebuilding the missing suffix so `..` cannot escape above that ancestor. Symlinks that
+  resolve outside `cwd` and broken symlinks are rejected. Hard links are treated as ordinary local filesystem entries.
+- **field** + **pattern**: Optional legacy pair. When both are present, the regex matches the named top-level field. If
+  only one is present, the entire rule is skipped and reported as a configuration error.
+- **conditions**: Optional list of typed top-level input predicates. Conditions are ANDed with each other and with the
+  tool name, `allow_local`, and legacy `field`/`pattern`. Use separate ordered rules for alternatives and fallback.
 - **action**: `Allow`, `Deny`, or `Ask` (see [Rule Actions](#rule-actions)). Note: `Modify` and `ArgumentFilter` are
   Bash-specific and not available for tool rules.
 
-### Field Pattern Matching
+### Conditions
+
+Conditions address literal top-level keys; dots in `field` names are not JSON-path syntax. A rule with any condition
+only matches when `tool_input` is an object.
+
+- `{ type = "Present", field = "name" }`: the key exists, including when its value is `null`.
+- `{ type = "Absent", field = "name" }`: the key does not exist. This is the exact inverse of `Present` for object
+  inputs.
+- `{ type = "Equals", field = "name", value = ... }`: the key exists and its raw JSON value equals the configured
+  JSON-compatible TOML value. Equality is recursive and type-sensitive, so boolean `true` differs from string `"true"`;
+  arrays and inline tables can be compared exactly.
+- `{ type = "Matches", field = "name", pattern = "..." }`: scalar regex matching with the same extraction, cwd-prefix
+  stripping, and pattern-fragment expansion as legacy `field`/`pattern`.
+
+Missing or extra condition properties are configuration errors. If any `Matches` pattern cannot expand or compile,
+Moriarty drops and reports the **whole rule**, never just the bad condition, because partial compilation could broaden
+an Allow rule. Run `moriarty rules lint` to detect dropped rules.
+
+### Regex Field Matching
 
 When `field` and `pattern` are specified, Moriarty extracts the field value from the tool input:
 
@@ -99,7 +123,9 @@ When `field` and `pattern` are specified, Moriarty extracts the field value from
 **CWD prefix stripping**: Claude Code sends absolute paths in tool inputs (e.g., `/home/user/project/src/main.rs`).
 Before regex matching, Moriarty strips the hook input's `cwd` prefix from field values, so rules can use relative paths.
 For example, with `cwd = "/home/user/project"`, a field value of `/home/user/project/src/main.rs` becomes `src/main.rs`
-for matching purposes. If the value doesn't start with `cwd`, it's matched as-is.
+for matching purposes. If the value doesn't start with `cwd`, it's matched as-is. Under `allow_local`, path regexes use
+the canonicalized local path before stripping; non-path regexes still read the raw input. `Equals` always compares the
+raw JSON value, including for paths, with locality enforced as a separate gate.
 
 ### Evaluation Order
 
@@ -109,7 +135,8 @@ PreToolUse event (any tool)
   +-> tool_rules engine (first-match-wins)
   |     tool matches?
   |       -> allow_local check (if enabled)
-  |       -> field/pattern regex check (if configured)
+  |       -> every condition matches (if configured)
+  |       -> legacy field/pattern regex matches (if configured)
   |     Match found? -> return Allow/Deny/Ask
   |     NoMatch? -> continue
   |
@@ -191,6 +218,31 @@ This rule checks both:
 
 - the `file_path` resolves within the canonicalized hook `cwd`
 - after cwd-prefix stripping, the relative path matches `^src/.*\\.rs$`
+
+Require ordinary `subagent` execution starts to use top-level `async = true` and omit top-level `turnBudget`, while
+leaving action/status/management calls outside this policy:
+
+```toml
+[[tool_rules]]
+name = "allow-valid-subagent-start"
+tool = "subagent"
+conditions = [
+  { type = "Absent", field = "action" },
+  { type = "Equals", field = "async", value = true },
+  { type = "Absent", field = "turnBudget" },
+]
+action = { type = "Allow" }
+
+[[tool_rules]]
+name = "deny-invalid-subagent-start"
+tool = "subagent"
+conditions = [{ type = "Absent", field = "action" }]
+action = { type = "Deny", value = "Normal subagent starts require async=true and must omit turnBudget" }
+```
+
+The Allow rule must come first because tool rules are first-match-wins. An input containing `"action": null` treats the
+key as present and therefore bypasses both rules, while `"turnBudget": null` is present and denied. Extra unrelated
+execution fields do not affect either rule.
 
 ## Configuration File
 

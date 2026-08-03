@@ -12,6 +12,26 @@ use tempfile::TempDir;
 #[cfg(unix)]
 use which::which;
 
+pub(crate) const SUBAGENT_EXECUTION_RULES: &str = r#"
+[[tool_rules]]
+name = "allow-valid-subagent-start"
+tool = "subagent"
+conditions = [
+  { type = "Absent", field = "action" },
+  { type = "Equals", field = "async", value = true },
+  { type = "Absent", field = "turnBudget" },
+]
+action = { type = "Allow" }
+
+[[tool_rules]]
+name = "deny-invalid-subagent-start"
+tool = "subagent"
+conditions = [
+  { type = "Absent", field = "action" },
+]
+action = { type = "Deny", value = "Normal subagent starts require async=true and must omit turnBudget" }
+"#;
+
 // ---------------------------------------------------------------------------
 // Centralized unsafe environment mutation — one unsafe block for the crate
 // ---------------------------------------------------------------------------
