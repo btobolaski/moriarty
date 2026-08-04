@@ -291,8 +291,8 @@ with warnings, while explicit missing paths and having no available source are e
 
 **`mcp/`** - Model Context Protocol servers:
 
-- Three MCP servers: `git_read_only` (status, diff, log, show), `jj_read_only` (status, diff, log, show, op log), and
-  `tool_runner` (lint, test, build, format, checks)
+- Three MCP servers: `git_read_only` (status, diff, log, show), `jj_read_only` (status, diff, log, show, op log, file
+  show, file list), and `tool_runner` (lint, test, build, format, checks)
 - `read_only`: Shared infrastructure used by both `git_read_only` and `jj_read_only`. Provides `CommandResult`,
   `validate_project_dir`, and the generic `run_read_only_command`. It rejects parent-traversal and non-directory targets
   before canonicalizing the working directory, while the per-server wrappers add command-specific flag restrictions
@@ -489,10 +489,10 @@ with warnings, while explicit missing paths and having no available source are e
 `setup_isolated_xdg_state`, `setup_project_dir_with_config`, `write_tools_config`, `create_executable_script`,
 `run_git_command`, `setup_git_repo_with_commit`, `setup_jj_main_and_secondary_workspace`, `assert_approved_copy_ran_in`,
 `set_test_env_var`, `remove_test_env_var`, `TestEnvVarGuard`, `SUBAGENT_EXECUTION_RULES`) live in
-`crates/moriarty/src/test_helpers.rs`. This module
-is compiled only in test builds (`#[cfg(test)]`). All test environment mutations go through `apply_test_env_var()` — the
-module's single `unsafe` block — with process isolation guaranteed by `cargo nextest`. New test-only helpers needed in
-more than one module belong here rather than being duplicated.
+`crates/moriarty/src/test_helpers.rs`. This module is compiled only in test builds (`#[cfg(test)]`). All test
+environment mutations go through `apply_test_env_var()` — the module's single `unsafe` block — with process isolation
+guaranteed by `cargo nextest`. New test-only helpers needed in more than one module belong here rather than being
+duplicated.
 
 **Logging**: Hook execution is logged via tracing as JSON lines to `~/.local/state/moriarty/hooks/` (daily-rotated); the
 `hooks report` command consumes these. Cost-report commands log to stderr instead. Sensitive env vars (TOKEN, SECRET,

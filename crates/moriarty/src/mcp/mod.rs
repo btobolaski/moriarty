@@ -3,8 +3,8 @@
 //! This module provides three MCP servers:
 //!
 //! - [`git_read_only`]: Read-only git operations (status, diff, log, show)
-//! - [`jj_read_only`]: Read-only jj (jujutsu) operations (status, diff, log, show, op log)
-//! - [`tool_runner`]: Project-configured tool execution (lint, test, build, format)
+//! - [`jj_read_only`]: Read-only jj operations (status, diff, log, show, op log, file show, file list)
+//! - [`tool_runner`]: Project-configured tool execution (lint, test, build, format, checks)
 //!
 //! # Usage
 //!

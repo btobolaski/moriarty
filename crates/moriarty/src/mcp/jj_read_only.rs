@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use super::read_only::{CommandResult, run_read_only_command};
 
 /// Supported jj commands that can be executed via the MCP server.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum JjCommand {
     Status,
@@ -40,6 +40,8 @@ pub enum JjCommand {
     Log,
     Show,
     OpLog,
+    FileShow,
+    FileList,
 }
 
 impl JjCommand {
@@ -51,6 +53,8 @@ impl JjCommand {
             Self::Log => vec!["log"],
             Self::Show => vec!["show"],
             Self::OpLog => vec!["op", "log"],
+            Self::FileShow => vec!["file", "show"],
+            Self::FileList => vec!["file", "list"],
         }
     }
 
@@ -61,6 +65,8 @@ impl JjCommand {
             Self::Log => "log",
             Self::Show => "show",
             Self::OpLog => "op log",
+            Self::FileShow => "file show",
+            Self::FileList => "file list",
         }
     }
 }
@@ -77,11 +83,13 @@ pub struct JjArgs {
 ///
 /// This server exposes a single tool that accepts a `JjCommand` enum to specify
 /// which jj command to run. Supported commands:
-/// - `Status`: Run `jj status`
-/// - `Diff`: Run `jj diff`
-/// - `Log`: Run `jj log`
-/// - `Show`: Run `jj show`
-/// - `OpLog`: Run `jj op log`
+/// - `status`: Run `jj status`
+/// - `diff`: Run `jj diff`
+/// - `log`: Run `jj log`
+/// - `show`: Run `jj show`
+/// - `op-log`: Run `jj op log`
+/// - `file-show`: Run `jj file show`
+/// - `file-list`: Run `jj file list`
 ///
 /// # Security
 ///
@@ -136,7 +144,9 @@ impl JjReadOnly {
 
 #[tool_router(router = tool_router)]
 impl JjReadOnly {
-    #[tool(description = "Runs a jj (jujutsu) command with the provided command type and args")]
+    #[tool(
+        description = "Runs read-only jj commands: status, diff, log, show, op-log, file-show, or file-list"
+    )]
     async fn run(
         &self,
         Parameters(args): Parameters<JjArgs>,
@@ -159,8 +169,8 @@ impl ServerHandler for JjReadOnly {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "This server provides a tool for executing read-only jj (jujutsu) commands. \
-                 Use the `run` tool with a JjCommand enum to specify which command to execute."
+                "This server provides one `run` tool for read-only jj commands. Select status, \
+                 diff, log, show, op-log, file-show, or file-list with the command field."
                     .to_string(),
             )
     }
@@ -174,19 +184,24 @@ impl Default for JjReadOnly {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::path::Path;
+
     use tempfile::TempDir;
+
+    use super::*;
+
+    fn run_jj(path: &Path, args: &[&str]) {
+        let status = std::process::Command::new("jj")
+            .args(args)
+            .current_dir(path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "jj command {args:?} failed: {status:?}");
+    }
 
     async fn setup_jj_repo() -> TempDir {
         let temp_dir = TempDir::new().unwrap();
-
-        let status = std::process::Command::new("jj")
-            .args(["git", "init", "--colocate"])
-            .current_dir(temp_dir.path())
-            .status()
-            .unwrap();
-        assert!(status.success(), "jj git init failed: {status:?}");
-
+        run_jj(temp_dir.path(), &["git", "init", "--colocate"]);
         temp_dir
     }
 
@@ -197,6 +212,24 @@ mod tests {
         assert_eq!(JjCommand::Log.as_args(), vec!["log"]);
         assert_eq!(JjCommand::Show.as_args(), vec!["show"]);
         assert_eq!(JjCommand::OpLog.as_args(), vec!["op", "log"]);
+        assert_eq!(JjCommand::FileShow.as_args(), vec!["file", "show"]);
+        assert_eq!(JjCommand::FileList.as_args(), vec!["file", "list"]);
+    }
+
+    #[test]
+    fn test_command_wire_values() {
+        for (command, wire) in [
+            (JjCommand::Status, "\"status\""),
+            (JjCommand::Diff, "\"diff\""),
+            (JjCommand::Log, "\"log\""),
+            (JjCommand::Show, "\"show\""),
+            (JjCommand::OpLog, "\"op-log\""),
+            (JjCommand::FileShow, "\"file-show\""),
+            (JjCommand::FileList, "\"file-list\""),
+        ] {
+            assert_eq!(serde_json::to_string(&command).unwrap(), wire);
+            assert_eq!(serde_json::from_str::<JjCommand>(wire).unwrap(), command);
+        }
     }
 
     /// Helper function to test shell injection protection for any jj command and operator.
@@ -248,6 +281,8 @@ mod tests {
             JjCommand::Log,
             JjCommand::Show,
             JjCommand::OpLog,
+            JjCommand::FileShow,
+            JjCommand::FileList,
         ];
         let operators = ["&&", "||", "|"];
 
@@ -295,14 +330,7 @@ mod tests {
             JjReadOnly::run_jj_command(JjCommand::Status, dir, args).await
         },
         setup_jj_repo(),
-        |path: &std::path::Path| {
-            let status = std::process::Command::new("jj")
-                .args(["git", "init", "--colocate"])
-                .current_dir(path)
-                .status()
-                .unwrap();
-            assert!(status.success(), "jj git init failed: {status:?}");
-        },
+        |path: &std::path::Path| run_jj(path, &["git", "init", "--colocate"]),
     );
 
     #[tokio::test]
@@ -310,12 +338,7 @@ mod tests {
         let temp_dir = setup_jj_repo().await;
         std::fs::write(temp_dir.path().join("test.txt"), "test content").unwrap();
 
-        let status = std::process::Command::new("jj")
-            .args(["commit", "-m", "Test change"])
-            .current_dir(temp_dir.path())
-            .status()
-            .unwrap();
-        assert!(status.success(), "jj commit failed: {status:?}");
+        run_jj(temp_dir.path(), &["commit", "-m", "Test change"]);
 
         let server = JjReadOnly;
         let args = JjArgs {
@@ -337,12 +360,7 @@ mod tests {
         let temp_dir = setup_jj_repo().await;
 
         std::fs::write(temp_dir.path().join("test.txt"), "content").unwrap();
-        let status = std::process::Command::new("jj")
-            .args(["describe", "-m", "Test commit"])
-            .current_dir(temp_dir.path())
-            .status()
-            .unwrap();
-        assert!(status.success(), "jj describe failed: {status:?}");
+        run_jj(temp_dir.path(), &["describe", "-m", "Test commit"]);
 
         let server = JjReadOnly;
         let args = JjArgs {
@@ -361,12 +379,7 @@ mod tests {
         let temp_dir = setup_jj_repo().await;
 
         std::fs::write(temp_dir.path().join("test.txt"), "test content").unwrap();
-        let status = std::process::Command::new("jj")
-            .args(["describe", "-m", "Test change"])
-            .current_dir(temp_dir.path())
-            .status()
-            .unwrap();
-        assert!(status.success(), "jj describe failed: {status:?}");
+        run_jj(temp_dir.path(), &["describe", "-m", "Test change"]);
 
         let server = JjReadOnly;
         let args = JjArgs {
@@ -382,6 +395,48 @@ mod tests {
             cmd_result.0.stdout.contains("Test change"),
             "show output should contain change description"
         );
+    }
+
+    #[tokio::test]
+    async fn test_file_list_command() {
+        let temp_dir = setup_jj_repo().await;
+        std::fs::create_dir(temp_dir.path().join("nested")).unwrap();
+        std::fs::write(temp_dir.path().join("nested/tracked.txt"), "nested").unwrap();
+        std::fs::write(temp_dir.path().join("outside.txt"), "outside").unwrap();
+        run_jj(temp_dir.path(), &["commit", "-m", "Record files"]);
+
+        let args = JjArgs {
+            project_dir: temp_dir.path().to_path_buf(),
+            command: JjCommand::FileList,
+            args: ["-r", "@-", "nested"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        };
+        let cmd_result = JjReadOnly.run(Parameters(args)).await.unwrap();
+        assert_eq!(cmd_result.0.exit_code, 0);
+        assert!(cmd_result.0.stdout.contains("nested/tracked.txt"));
+        assert!(!cmd_result.0.stdout.contains("outside.txt"));
+    }
+
+    #[tokio::test]
+    async fn test_file_show_command() {
+        let temp_dir = setup_jj_repo().await;
+        let content = "distinctive file contents\n";
+        std::fs::write(temp_dir.path().join("tracked.txt"), content).unwrap();
+        run_jj(temp_dir.path(), &["commit", "-m", "Record file"]);
+
+        let args = JjArgs {
+            project_dir: temp_dir.path().to_path_buf(),
+            command: JjCommand::FileShow,
+            args: ["-r", "@-", "tracked.txt"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        };
+        let cmd_result = JjReadOnly.run(Parameters(args)).await.unwrap();
+        assert_eq!(cmd_result.0.exit_code, 0);
+        assert_eq!(cmd_result.0.stdout, content);
     }
 
     #[tokio::test]
