@@ -2145,6 +2145,10 @@ pub struct SubagentResultDetails {
     /// new launch digest so lifecycle artifacts remain traceable across runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_launch_contract_digest: Option<String>,
+    /// Kept as raw JSON because the extension resolver's provenance envelope
+    /// can evolve without a corresponding log-schema release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_resolved_extensions: Option<Box<JsonBlob>>,
     /// Kept as raw JSON because this runtime-owned envelope evolves separately
     /// from the log format; `processTerminal` is one observed nested status.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -6251,7 +6251,7 @@ fn subagent_tool_result_rejects_unknown_outer_detail_field() {
 }
 
 #[test]
-fn subagent_tool_result_preserves_runtime_lifecycle_and_spawn_budget() {
+fn subagent_tool_result_preserves_runtime_owned_envelopes() {
     let lifecycle_status = json!({
         "processTerminal": {
             "version": 1,
@@ -6265,6 +6265,15 @@ fn subagent_tool_result_preserves_runtime_lifecycle_and_spawn_budget() {
         "configuredLimit": null,
         "futureBudgetField": "preserved"
     });
+    let launch_resolved_extensions = json!({
+        "version": 1,
+        "source": "launch-resolved",
+        "disableAmbientExtensions": false,
+        "runtime": ["sha256:runtime"],
+        "configured": [],
+        "effective": ["sha256:runtime"],
+        "omitted": {"runtime": 0, "configured": 0, "effective": 0}
+    });
     let tool_result = parse_tool_result_message(tool_result_message_json(
         "subagent",
         vec![json!({"type": "text", "text": "complete"})],
@@ -6273,33 +6282,42 @@ fn subagent_tool_result_preserves_runtime_lifecycle_and_spawn_budget() {
             "mode": "single",
             "results": [],
             "lifecycleStatus": lifecycle_status,
-            "spawnBudget": spawn_budget
+            "spawnBudget": spawn_budget,
+            "launchResolvedExtensions": launch_resolved_extensions
         })),
     ));
     let Some(ToolResultDetails::Subagent(details)) = tool_result.details else {
         panic!("expected Subagent details")
     };
 
-    assert_eq!(
-        details
-            .lifecycle_status
-            .as_ref()
-            .expect("expected lifecycle status")
-            .0,
-        lifecycle_status
-    );
-    assert_eq!(
-        details
-            .spawn_budget
-            .as_ref()
-            .expect("expected spawn budget")
-            .0,
-        spawn_budget
-    );
-
-    let serialized = serde_json::to_value(details).expect("serialize subagent details");
-    assert_eq!(serialized["lifecycleStatus"], lifecycle_status);
-    assert_eq!(serialized["spawnBudget"], spawn_budget);
+    let serialized = serde_json::to_value(&details).expect("serialize subagent details");
+    for (wire_key, parsed, expected) in [
+        (
+            "lifecycleStatus",
+            details.lifecycle_status.as_ref().map(|value| &value.0),
+            &lifecycle_status,
+        ),
+        (
+            "spawnBudget",
+            details.spawn_budget.as_ref().map(|value| &value.0),
+            &spawn_budget,
+        ),
+        (
+            "launchResolvedExtensions",
+            details
+                .launch_resolved_extensions
+                .as_deref()
+                .map(|value| &value.0),
+            &launch_resolved_extensions,
+        ),
+    ] {
+        assert_eq!(parsed, Some(expected), "{wire_key} should parse");
+        assert_eq!(
+            serialized.get(wire_key),
+            Some(expected),
+            "{wire_key} should serialize"
+        );
+    }
 }
 
 /// `parent_session` is the Rust field, but pi writes the camelCase wire key
