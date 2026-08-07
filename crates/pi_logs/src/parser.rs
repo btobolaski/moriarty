@@ -486,6 +486,11 @@ pub struct ToolResultMessage {
     pub timestamp: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<ToolResultDetails>,
+    /// Tools the model gained mid-turn (e.g. `contact_supervisor` after a
+    /// supervisor prompt). Pi appends this metadata to tool results in
+    /// newer runtimes; optional so older logs still parse. Not billable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub added_tool_names: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -498,6 +503,8 @@ struct RawToolResultMessage {
     pub timestamp: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub added_tool_names: Option<Vec<String>>,
 }
 
 /// Pi can emit `null` or omit `details` entirely when no structured result is
@@ -539,6 +546,7 @@ impl<'de> Deserialize<'de> for ToolResultMessage {
             is_error,
             timestamp,
             details: raw_details,
+            added_tool_names,
         } = RawToolResultMessage::deserialize(deserializer)?;
         let resolved = resolve_tool_result_details(raw_details, &tool_name, is_error);
         let details = resolved.map_err(de::Error::custom)?;
@@ -549,6 +557,7 @@ impl<'de> Deserialize<'de> for ToolResultMessage {
             is_error,
             timestamp,
             details,
+            added_tool_names,
         })
     }
 }
@@ -1833,7 +1842,7 @@ fn parse_tool_result_details(
         | "git_read_only_log"
         | "git_read_only_show"
         | "git_read_only_status" => {
-            serde_json::from_value(details).map(ToolResultDetails::GitReadOnly)
+            serde_json::from_value(details).map(ToolResultDetails::McpToolResult)
         }
         "instinct_write" => serde_json::from_value(details).map(ToolResultDetails::InstinctWrite),
         "intercom" => serde_json::from_value(details).map(ToolResultDetails::Intercom),
@@ -1877,43 +1886,53 @@ fn parse_tool_result_details(
     }
 }
 
-/// Handles the web_search cancelled-stale case where `details` omits
-/// `queryCount` and related fields.  A small strict helper struct
-/// preserves `deny_unknown_fields` and type validation; the normal
-/// (serde) path keeps `WebSearchDetails` fields required, which
-/// preserves the untagged-enum dispatch comment that `WebSearchDetails`
-/// cannot absorb a bare `{error}` payload.
+/// Handles the web_search lean cases where `details` omits `queryCount`
+/// and related fields: a cancelled-stale search or a failed search that
+/// records only `{error}`. A small strict helper struct preserves
+/// `deny_unknown_fields` and type validation; the normal (serde) path keeps
+/// `WebSearchDetails` fields required, which preserves the dispatch
+/// invariant documented on the untagged `ToolResultDetails` enum that
+/// `WebSearchDetails` cannot absorb a bare `{error}` payload.
 fn parse_web_search_details(details: Value) -> Result<ToolResultDetails, serde_json::Error> {
-    if details.get("cancelled").and_then(|v| v.as_bool()) == Some(true)
-        && details.get("queryCount").is_none()
-    {
-        let cancelled: WebSearchCancelledDetails = serde_json::from_value(details)?;
+    let is_lean = details.get("queryCount").is_none()
+        && (details.get("error").and_then(|v| v.as_str()).is_some()
+            || details.get("cancelled").and_then(|v| v.as_bool()) == Some(true));
+    if is_lean {
+        // The full shape always carries `queryCount`. A lean shape is a
+        // cancelled-stale search (`cancelled: true`) or a failed search
+        // recorded as a bare `{error}`, both of which omit the query fields.
+        // Requiring one of those discriminators keeps empty or arbitrary
+        // success payloads (e.g. `{}`) failing loudly on the strict path.
+        let lean: WebSearchLeanDetails = serde_json::from_value(details)?;
         Ok(ToolResultDetails::WebSearch(WebSearchDetails {
-            fetch_id: cancelled.fetch_id,
-            search_id: cancelled.search_id,
+            fetch_id: lean.fetch_id,
+            search_id: lean.search_id,
             fetch_urls: None,
             query_count: 0,
             successful_queries: 0,
             total_results: 0,
             include_content: false,
             queries: Vec::new(),
-            curated: cancelled.curated.unwrap_or(false),
-            curated_from: cancelled.curated_from,
+            curated: lean.curated.unwrap_or(false),
+            curated_from: lean.curated_from,
             curated_queries: None,
             summary: None,
-            cancelled: true,
-            error: cancelled.error,
-            cancel_reason: cancelled.cancel_reason,
+            cancelled: lean.cancelled.unwrap_or(false),
+            error: lean.error,
+            cancel_reason: lean.cancel_reason,
         }))
     } else {
         serde_json::from_value(details).map(ToolResultDetails::WebSearch)
     }
 }
 
-/// Strict helper for cancelled web_search results that omit query fields.
+/// Strict helper for web_search results that omit the query-count fields:
+/// a cancelled-stale search (`cancelled: true`, optional `cancel_reason`)
+/// or a failed search recorded as a bare `{error}`. Every field is optional
+/// because either shape may carry only a subset of them.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct WebSearchCancelledDetails {
+struct WebSearchLeanDetails {
     #[serde(default)]
     fetch_id: Option<String>,
     #[serde(default)]
@@ -1926,11 +1945,8 @@ struct WebSearchCancelledDetails {
     error: Option<String>,
     #[serde(default)]
     cancel_reason: Option<String>,
-    // Accepted so deny_unknown_fields doesn't reject it, but the
-    // value is already known to be `true` from the caller's guard.
     #[serde(default)]
-    #[allow(dead_code)]
-    cancelled: bool,
+    cancelled: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -1974,11 +1990,11 @@ pub enum ToolResultDetails {
     // rejected by LsDetails (deny_unknown_fields) and falls through to Find.
     Ls(LsDetails),
     Find(FindDetails),
-    // McpToolResult::Breadcrumb and GitReadOnly both declare `{server,
-    // tool}`; Breadcrumb hits first because McpToolResult is ordered
-    // above. `git_read_only_*` tools are still routed to `GitReadOnly`
-    // explicitly by `parse_tool_result_details`, so the variant ordering
-    // only affects the shape-based fallback path for unknown tools.
+    // `git_read_only_*` and other direct MCP tool results (also
+    // `project_tools_run_*`, `jj_read_only_run`) are dispatched explicitly
+    // by `parse_tool_result_details` to `McpToolResult`, whose Breadcrumb
+    // arm carries their `{server, tool}` breadcrumb and whose Error arm
+    // carries the pi client-side `{error, server}` failure shape.
     //
     // FetchContent has no shape overlap with anything above (it declares
     // `urls`, `urlCount`, ... that no other variant carries).
@@ -1992,7 +2008,6 @@ pub enum ToolResultDetails {
     // `mode`, `action`+`params`+`nextId`, `mode`+`results`,
     // `queryCount`+`successfulQueries`+...), so either error shape cannot
     // be absorbed by any of them and safely falls through here.
-    GitReadOnly(GitReadOnlyDetails),
     FetchContent(FetchContentDetails),
     GetSearchContent(GetSearchContentDetails),
     // Hermes `memory` and `skill` are intentionally parsed by `tool_name`
@@ -3072,26 +3087,6 @@ pub struct FindDetails {
     pub compression: Option<CompressionInfo>,
 }
 
-/// Tool-result details emitted by the flat `git_read_only_*` MCP tools.
-/// The pi-tool-display extension records which MCP `server` and `tool`
-/// the call was dispatched to; newer pi runtimes also attach overflow
-/// metadata when the MCP tool result exceeds the in-message byte cap.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct GitReadOnlyDetails {
-    pub server: String,
-    pub tool: String,
-    /// Overflow/truncation metadata added in newer pi versions when an
-    /// MCP tool result exceeds pi's in-message byte cap. Stored as raw
-    /// JSON because the schema is still evolving.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        rename = "outputGuard"
-    )]
-    pub output_guard: Option<JsonBlob>,
-}
-
 /// Summary metadata recorded by the `fetch_content` tool. Newer failed
 /// fetches can still emit the same breadcrumb shape with an added top-level
 /// error summary, so the field stays optional to preserve compatibility with
@@ -3496,10 +3491,10 @@ pub struct McpBreadcrumb {
 }
 
 /// Tool result details for MCP-based tools that are called directly (e.g.
-/// `project_tools_run_*`, `jj_read_only_run`). A successful call either
-/// passes through the MCP `CallToolResult` or records a compact
-/// `{server, tool}` breadcrumb; a client-side transport failure records
-/// only the server name and a compact error string.
+/// `project_tools_run_*`, `jj_read_only_run`, `git_read_only_*`). A
+/// successful call either passes through the MCP `CallToolResult` or records
+/// a compact `{server, tool}` breadcrumb; a client-side transport failure
+/// records only the server name and a compact error string.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum McpToolResult {

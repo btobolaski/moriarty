@@ -2971,20 +2971,88 @@ fn web_search_cancelled_without_query_fields_rejects_unknown_field() {
 }
 
 #[test]
-fn web_search_without_query_fields_requires_cancelled_true() {
+fn web_search_accepts_bare_error_without_query_fields() {
+    // Real-world case: a failed web_search (e.g. "No query provided")
+    // records only `{error}` in details with no `cancelled` flag and no
+    // query-count fields. Pi emits isError:false for this shape, so it
+    // must parse rather than surface a missing-field error.
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "web_search",
+        vec![json!({"type": "text", "text": "Error: No query provided."})],
+        false,
+        Some(json!({
+            "error": "No query provided"
+        })),
+    ));
+
+    let Some(ToolResultDetails::WebSearch(details)) = tool_result.details else {
+        panic!("expected WebSearch details")
+    };
+
+    assert!(!details.cancelled);
+    assert_eq!(details.error.as_deref(), Some("No query provided"));
+    assert_eq!(details.query_count, 0);
+    assert_eq!(details.successful_queries, 0);
+    assert_eq!(details.total_results, 0);
+    assert!(details.queries.is_empty());
+}
+
+/// A web_search with empty `{}` details (no error, no cancelled) is not one
+/// of the documented lean shapes, so it must still fail loudly on the
+/// strict `WebSearchDetails` path instead of parsing as a zeroed result.
+#[test]
+fn web_search_empty_details_rejects_without_query_fields() {
     assert_parse_error_contains_any(
-        "web_search without query fields requires cancelled true",
+        "web_search empty details rejects without query fields",
         tool_result_message_json(
             "web_search",
-            vec![json!({"type": "text", "text": "Search failed"})],
+            vec![json!({"type": "text", "text": "..."})],
             false,
-            Some(json!({
-                "error": "Search failed",
-                "cancelReason": "stale"
-            })),
+            Some(json!({})),
         ),
         &["missing field", "queryCount"],
     );
+}
+
+/// The strict `WebSearchDetails` path still requires its full field set: a
+/// payload that carries `queryCount` but omits a required sibling (here
+/// `totalResults`) must error, pinning the discriminant from the other
+/// direction so the `queryCount`-absence guard is not over-broadened.
+#[test]
+fn web_search_strict_path_requires_query_siblings() {
+    assert_parse_error_contains_any(
+        "web_search strict path requires query siblings",
+        tool_result_message_json(
+            "web_search",
+            vec![json!({"type": "text", "text": "..."})],
+            false,
+            Some(json!({
+                "queryCount": 1,
+                "successfulQueries": 0
+            })),
+        ),
+        &["missing field"],
+    );
+}
+
+/// A cancelled-stale search may carry no `error` at all, only
+/// `cancelled: true` plus a `cancelReason`. This pins the `cancelled`
+/// disjunct of the lean guard (independent of the `error`-present arm).
+#[test]
+fn web_search_accepts_cancelled_only_without_query_fields_or_error() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "web_search",
+        vec![json!({"type": "text", "text": "Search curation cancelled (stale)."})],
+        false,
+        Some(json!({"cancelled": true, "cancelReason": "stale"})),
+    ));
+
+    let Some(ToolResultDetails::WebSearch(details)) = tool_result.details else {
+        panic!("expected WebSearch details")
+    };
+    assert!(details.cancelled);
+    assert!(details.error.is_none());
+    assert_eq!(details.cancel_reason.as_deref(), Some("stale"));
 }
 
 #[test]
@@ -4309,12 +4377,34 @@ fn git_read_only_tool_results_route_all_flat_tool_names() {
             false,
             Some(json!({"server": "git-read-only", "tool": expected_tool})),
         ));
-        let Some(ToolResultDetails::GitReadOnly(details)) = tool_result.details else {
-            panic!("expected GitReadOnly details for {tool_name}")
+        let Some(ToolResultDetails::McpToolResult(McpToolResult::Breadcrumb(details))) =
+            tool_result.details
+        else {
+            panic!("expected McpToolResult::Breadcrumb details for {tool_name}")
         };
         assert_eq!(details.server, "git-read-only");
         assert_eq!(details.tool, expected_tool);
     }
+}
+
+/// Pi appends `addedToolNames` (tools the model gained mid-turn, e.g.
+/// `contact_supervisor`) to tool results in newer runtimes. It must not
+/// be rejected by the strict `toolResult` message parser.
+#[test]
+fn tool_result_accepts_added_tool_names() {
+    let mut value = tool_result_message_json(
+        "jj_read_only_run",
+        vec![json!({"type": "text", "text": "ok"})],
+        false,
+        Some(json!({"server": "jj-read-only", "tool": "run"})),
+    );
+    value["message"]["addedToolNames"] = json!(["contact_supervisor"]);
+
+    let tool_result = parse_tool_result_message(value);
+    assert_eq!(
+        tool_result.added_tool_names.as_deref(),
+        Some(&["contact_supervisor".to_string()][..])
+    );
 }
 
 #[test]
@@ -5837,6 +5927,10 @@ fn all_routed_mcp_tool_names_parse_client_errors() {
         ("project_tools_run_lint", "project-tools"),
         ("project_tools_run_tests", "project-tools"),
         ("jj_read_only_run", "jj-read-only"),
+        ("git_read_only_diff", "git-read-only"),
+        ("git_read_only_log", "git-read-only"),
+        ("git_read_only_show", "git-read-only"),
+        ("git_read_only_status", "git-read-only"),
     ] {
         let tool_result = parse_tool_result_message(tool_result_message_json(
             tool_name,
@@ -5963,9 +6057,9 @@ fn intercom_result_accepts_active_field() {
 }
 
 /// A successful direct MCP tool call emits a `{server, tool}` breadcrumb.
-/// This path was historically routed through the shape-based fallback
-/// (matching `GitReadOnlyDetails`); now `project_tools_run_*` and
-/// `jj_read_only_run` are explicitly dispatched to `McpToolResult`, so
+/// This path was historically routed through the shape-based fallback;
+/// now the direct MCP tools (`project_tools_run_*`, `jj_read_only_run`,
+/// `git_read_only_*`) are explicitly dispatched to `McpToolResult`, so
 /// this test ensures the breadcrumb is accepted there too.
 #[test]
 fn direct_mcp_tool_result_accepts_breadcrumb() {
@@ -6013,15 +6107,14 @@ fn jj_read_only_run_client_error_is_parsed() {
     assert_eq!(err.server, "jj-read-only");
 }
 
-/// Untagged enum dispatch is order-dependent: `McpToolResult` is ordered
-/// before `GitReadOnly`, so `{server, tool}` matches
-/// `McpToolResult::Breadcrumb` first. The test assertion pins this
-/// ordering.
+/// No other `ToolResultDetails` variant carries the `{server, tool}` or
+/// `{error, server}` field sets, so untagged dispatch lands on
+/// `McpToolResult`'s Breadcrumb and Error arms; this test pins that
+/// matching and the loud rejection of an ambiguous combined payload.
 #[test]
-fn mcp_client_error_vs_git_read_only_discrimination() {
+fn mcp_tool_result_breadcrumb_vs_error_dispatch() {
     // {server, tool} → McpToolResult::Breadcrumb (hits first because
-    // McpBreadcrumb and GitReadOnlyDetails have the same field set and
-    // McpToolResult is ordered before GitReadOnly in the untagged enum).
+    // no earlier untagged variant carries that exact field set).
     let details: ToolResultDetails =
         serde_json::from_value(json!({"server": "git", "tool": "status"}))
             .expect("expected direct ToolResultDetails parse");
@@ -6033,9 +6126,9 @@ fn mcp_client_error_vs_git_read_only_discrimination() {
             .expect("expected direct ToolResultDetails parse");
     assert!(matches!(details, ToolResultDetails::McpToolResult(_)));
 
-    // {server, tool, error} is rejected: GitReadOnlyDetails denies
-    // `error`, McpClientError denies `tool`, McpBreadcrumb denies
-    // `error`. The parser loudly surfaces the ambiguity.
+    // {server, tool, error} is rejected: McpClientError denies `tool`,
+    // McpBreadcrumb denies `error`, McpCallResult requires `isError`. The
+    // parser loudly surfaces the ambiguity.
     let err = serde_json::from_value::<ToolResultDetails>(json!({
         "server": "git",
         "tool": "status",
