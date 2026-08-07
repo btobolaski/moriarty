@@ -20,39 +20,61 @@ use crate::{
     repository,
     test_helpers::{
         create_executable_script, run_git_command, setup_git_repo_with_commit,
-        setup_isolated_xdg_config, write_tools_config,
+        setup_isolated_xdg_config, setup_jj_main_and_secondary_workspace, write_tools_config,
     },
 };
 
 use super::super::{
     CommandApproval, ProjectApprovals, VerificationResult, is_script, is_within_project,
-    is_writable, resolve_binary_path_with_original,
+    is_writable, normalize_path_for_storage, resolve_binary_path_with_original,
 };
 
-/// Builds a `CommandApproval` with stable dummy hash/path fields for tests that
-/// just need a named entry in the approvals map.
+/// Builds a `CommandApproval` with stable dummy hash/path fields and `argv: None` (the legacy
+/// shape) for tests that just need a named entry in the approvals map.
 fn make_command_approval(original: &str, canonical: &str, binary_hash: &str) -> CommandApproval {
     CommandApproval {
+        argv: None,
+        approved_at: None,
         original_path: original.to_string(),
         canonical_path: canonical.to_string(),
         binary_hash: binary_hash.to_string(),
     }
 }
 
-/// Verifies that `shared_path` resolves to the same repository root as
-/// `repo_root` and that an existing "lint" approval in that root also verifies
-/// from `shared_path`. Used to assert jj workspaces / git worktrees share
-/// approval state.
-async fn assert_shared_repo_approval(repo_root: &Path, shared_path: &Path, label: &str) {
-    let shared_root = repository::detect_repository_root(shared_path).unwrap();
+/// Asserts both paths and binary hash of `approval` equal the given values, using field-by-field
+/// comparison so a mismatch points at the offending field rather than the whole struct.
+fn assert_approval_paths(approval: &CommandApproval, original: &str, canonical: &str, hash: &str) {
+    assert_eq!(approval.original_path, original, "original_path");
+    assert_eq!(approval.canonical_path, canonical, "canonical_path");
+    assert_eq!(approval.binary_hash, hash, "binary_hash");
+}
+
+/// Verifies that `shared_path` resolves to the same repository root as `repo_root` and that an
+/// existing "lint" approval in that root also verifies from `shared_path`. The same `config_content`
+/// is written into the shared workspace so the workspace-root config load succeeds, and the PATH
+/// binary (`echo`) resolves identically in either workspace. Used to assert jj workspaces / git
+/// worktrees share approval state under repo-root keying plus workspace-relative path storage.
+async fn assert_shared_repo_approval(
+    repo_root: &Path,
+    shared_path: &Path,
+    config_content: &str,
+    label: &str,
+) {
+    let shared_workspace_root = repository::detect_workspace_root(shared_path).unwrap();
+    let shared_repo_root = repository::detect_repository_root(shared_path).unwrap();
     assert_eq!(
-        repo_root, shared_root,
+        repo_root, shared_repo_root,
         "Both {label} should resolve to the same repository root"
     );
 
+    // The shared workspace must carry the same tools.toml so the workspace-root config load
+    // yields the same command array verification matches against.
+    write_tools_config(&shared_workspace_root, config_content);
+
+    let config: ProjectConfig = toml::from_str(config_content).unwrap();
     let approvals = ProjectApprovals::load().await.unwrap();
     let result = approvals
-        .verify_project_at_root(&shared_root, "lint")
+        .verify_project_for_workspace(repo_root, &shared_workspace_root, &config, "lint")
         .await
         .unwrap();
     assert!(
@@ -86,23 +108,42 @@ fn assert_item_not_approved(result: VerificationResult, item: &str, context: &st
     }
 }
 
-const AUDIT_CHECK_CONFIG: &str = r#"
-[commands]
+/// Asserts a verification result is `ItemChanged` for the requested item, with the expected
+/// `args_changed` flag.
+fn assert_item_changed(result: VerificationResult, item: &str, args_changed: bool, context: &str) {
+    match result {
+        VerificationResult::ItemChanged {
+            item: actual,
+            args_changed: actual_args,
+            ..
+        } => {
+            assert_eq!(actual, item, "{context}");
+            assert_eq!(actual_args, args_changed, "{context}: args_changed flag");
+        }
+        other => panic!("{context}: expected ItemChanged for {item}, got {other:?}"),
+    }
+}
 
-[[checks]]
-name = "audit"
-command = ["echo", "test"]
-"#;
+fn audit_config(arg: &str) -> String {
+    format!("\n[commands]\n\n[[checks]]\nname = \"audit\"\ncommand = [\"echo\", \"{arg}\"]\n")
+}
 
 /// Loads approvals and verifies `item`, returning the raw verification result so
-/// table-driven tests can assert the expected branch explicitly. Detects the
-/// repository root the way production callers do before using the `_at_root` API.
+/// table-driven tests can assert the expected branch explicitly. Detects the repository and
+/// workspace roots and parses the workspace-root config the way production callers do before
+/// using the `_for_workspace` API.
 async fn verify_check_result(project_dir: &Path, item: &str) -> VerificationResult {
-    let repository_root = repository::detect_repository_root(project_dir).unwrap();
+    let canonical = project_dir.canonicalize().unwrap();
+    let repository_root = repository::detect_repository_root(&canonical).unwrap();
+    let workspace_root = repository::detect_workspace_root(&canonical).unwrap();
+    let config: ProjectConfig = toml::from_str(
+        &std::fs::read_to_string(workspace_root.join(".config/tools.toml")).unwrap(),
+    )
+    .unwrap();
     ProjectApprovals::load()
         .await
         .unwrap()
-        .verify_check_at_root(&repository_root, item)
+        .verify_check_for_workspace(&repository_root, &workspace_root, &config, item)
         .await
         .unwrap()
 }
@@ -137,16 +178,17 @@ fn canonical_key(dir: &Path) -> String {
 /// Approves a synthetic project with the given `commands` and `checks` maps and
 /// asserts the resulting `ProjectApproval` is stored under the canonical key.
 /// Returns the canonical key and the freshly-populated `ProjectApprovals`
-/// (by value) for further inspection.
+/// (by value) for further inspection. Entries keep whatever fields the caller supplied
+/// (typically `argv: None` via [`make_command_approval`]); `approve_project` stamps
+/// `approved_at` on insert.
 fn approve_fixture(
     dir: &Path,
-    tools_hash: &str,
     commands: HashMap<String, CommandApproval>,
     checks: HashMap<String, CommandApproval>,
 ) -> (String, ProjectApprovals) {
     let mut approvals = ProjectApprovals::default();
     approvals
-        .approve_project(dir.to_path_buf(), tools_hash.to_string(), commands, checks)
+        .approve_project(dir.to_path_buf(), commands, checks)
         .unwrap();
     let key = canonical_key(dir);
     assert!(approvals.projects.contains_key(&key));
@@ -179,69 +221,67 @@ fn isolated_project_with_config(config_content: &str) -> (TempDir, TempDir) {
 }
 
 /// Test helper to pre-approve a project with the given config content.
-/// This bypasses the approval TUI for integration tests.
-/// Returns the repository root path for use in assertions.
+/// This bypasses the approval TUI for integration tests. Approvals bind the full
+/// argv, normalized (workspace-relative where inside) paths, and the binary hash, mirroring what
+/// the TUI save path records. Returns the repository root path for use in assertions.
 ///
 /// # Errors
 /// Returns an error if:
-/// - Repository root detection fails (path doesn't exist, permission denied, etc.)
+/// - Workspace/repository root detection fails (path doesn't exist, permission denied, etc.)
 /// - Config parsing fails (invalid TOML)
 /// - Binary resolution fails (binary not found)
 /// - File hashing fails (I/O error)
 /// - Approval update fails (filesystem error)
 pub async fn approve_project_config(project_dir: &Path, config_content: &str) -> Result<PathBuf> {
-    // Detect repository root (jj workspace root, git root, or canonicalized path)
-    let repository_root = repository::detect_repository_root(project_dir)?;
+    let canonical = project_dir
+        .canonicalize()
+        .into_diagnostic()
+        .wrap_err("Failed to canonicalize project dir")?;
+    // Resolve binaries against the workspace root — the config that runs is the workspace's own.
+    let workspace_root = repository::detect_workspace_root(&canonical)?;
+    let repository_root = repository::detect_repository_root(&workspace_root)?;
     let config: ProjectConfig = toml::from_str(config_content)
         .into_diagnostic()
         .wrap_err("Failed to parse test config")?;
-    let tools_config_hash = hashing::hash_string(config_content);
 
-    // Process commands (use repository_root for binary resolution)
     let mut commands = HashMap::new();
     for (name, cmd_array) in config.commands.all() {
-        let binary_name = &cmd_array[0];
-        let (original_path, resolved_path) =
-            resolve_binary_path_with_original(binary_name, &repository_root)?;
-        let binary_hash = hashing::hash_file(&resolved_path).await?;
-
-        commands.insert(
-            name,
-            CommandApproval {
-                original_path: original_path.to_string_lossy().to_string(),
-                canonical_path: resolved_path.to_string_lossy().to_string(),
-                binary_hash,
-            },
-        );
+        commands.insert(name, build_approval(&cmd_array, &workspace_root).await?);
     }
 
-    // Process checks
     let mut checks = HashMap::new();
     if let Some(check_configs) = config.checks {
         for check in check_configs {
-            let binary_name = &check.command[0];
-            let (original_path, resolved_path) =
-                resolve_binary_path_with_original(binary_name, &repository_root)?;
-            let binary_hash = hashing::hash_file(&resolved_path).await?;
-
             checks.insert(
                 check.name,
-                CommandApproval {
-                    original_path: original_path.to_string_lossy().to_string(),
-                    canonical_path: resolved_path.to_string_lossy().to_string(),
-                    binary_hash,
-                },
+                build_approval(&check.command, &workspace_root).await?,
             );
         }
     }
 
-    let repository_root_clone = repository_root.clone();
+    let workspace_root_clone = workspace_root.clone();
     ProjectApprovals::update(move |approvals| {
-        approvals.approve_project(repository_root_clone, tools_config_hash, commands, checks)
+        approvals.approve_project(workspace_root_clone, commands, checks)
     })
     .await?;
 
     Ok(repository_root)
+}
+
+/// Resolves `command[0]` against `workspace_root`, hashes the binary, and builds a
+/// `CommandApproval` binding the full argv with storage-normalized paths — the same shape the
+/// TUI save path records.
+async fn build_approval(command: &[String], workspace_root: &Path) -> Result<CommandApproval> {
+    let (original_path, canonical_path) =
+        resolve_binary_path_with_original(&command[0], workspace_root)?;
+    let binary_hash = hashing::hash_file(&canonical_path).await?;
+    Ok(CommandApproval {
+        argv: Some(command.to_vec()),
+        approved_at: None,
+        original_path: normalize_path_for_storage(&original_path, workspace_root),
+        canonical_path: normalize_path_for_storage(&canonical_path, workspace_root),
+        binary_hash,
+    })
 }
 
 /// Helper to run a jj command and assert success
@@ -276,12 +316,6 @@ fn create_tools_config(repo_path: &Path, config_content: &str) {
     write_tools_config(repo_path, config_content);
 }
 
-#[test]
-fn test_project_approvals_default() {
-    let approvals = ProjectApprovals::default();
-    assert_eq!(approvals.projects.len(), 0);
-}
-
 /// Table-driven coverage for `approve_project`: every row supplies a `commands`
 /// and `checks` map, and the test asserts the stored `ProjectApproval` reflects
 /// them verbatim.
@@ -305,7 +339,6 @@ fn test_approve_project_matrix() {
         },
     ];
 
-    let tools_hash = "sha256:abc123";
     for case in cases {
         let temp_dir = TempDir::new().unwrap();
         let commands: HashMap<String, CommandApproval> = case
@@ -329,15 +362,9 @@ fn test_approve_project_matrix() {
             })
             .collect();
 
-        let (key, approvals) = approve_fixture(
-            temp_dir.path(),
-            tools_hash,
-            commands.clone(),
-            checks.clone(),
-        );
+        let (key, approvals) = approve_fixture(temp_dir.path(), commands.clone(), checks.clone());
 
         let approval = &approvals.projects[&key];
-        assert_eq!(approval.tools_config_hash, tools_hash, "{}", case.label);
         assert_eq!(
             approval.commands.len(),
             commands.len(),
@@ -387,9 +414,9 @@ async fn test_verify_check_basic_variants() {
     ];
 
     for (label, should_approve, item, expected) in cases {
-        let (_xdg_dir, temp_dir) = isolated_project_with_config(AUDIT_CHECK_CONFIG);
+        let (_xdg_dir, temp_dir) = isolated_project_with_config(&audit_config("test"));
         if should_approve {
-            approve_project_config(temp_dir.path(), AUDIT_CHECK_CONFIG)
+            approve_project_config(temp_dir.path(), &audit_config("test"))
                 .await
                 .unwrap();
         }
@@ -408,35 +435,71 @@ async fn test_verify_check_basic_variants() {
 }
 
 #[tokio::test]
-async fn test_verify_check_config_hash_mismatch() {
-    let (_xdg_dir, temp_dir) = isolated_project_with_config(AUDIT_CHECK_CONFIG);
+async fn test_argv_change_blocks_verification() {
+    // An argument change is one of the three things that trigger re-approval: the stored argv no
+    // longer equals the current command array, so verification returns ItemChanged (not the old
+    // ConfigHashMismatch, which fired even on cosmetic edits).
+    let (_xdg_dir, temp_dir) = isolated_project_with_config(&audit_config("test"));
 
-    match approve_mutate_and_verify_check(
+    let result = approve_mutate_and_verify_check(
         temp_dir.path(),
-        AUDIT_CHECK_CONFIG,
+        &audit_config("test"),
         "audit",
         |project_dir| {
-            write_tools_config(
-                project_dir,
-                r#"
-[commands]
-
-[[checks]]
-name = "audit"
-command = ["echo", "modified"]
-"#,
-            );
+            write_tools_config(project_dir, &audit_config("modified"));
         },
     )
-    .await
-    {
-        VerificationResult::ConfigHashMismatch { .. } => {}
-        other => panic!("Expected ConfigHashMismatch for modified config, got {other:?}"),
-    }
+    .await;
+
+    // The argv changed; no approved version carries the new argv → args_changed = true.
+    assert_item_changed(result, "audit", true, "argv change");
 }
 
 #[tokio::test]
-async fn test_verify_check_binary_hash_mismatch() {
+async fn test_argv_change_then_reapprove_passes() {
+    let (_xdg_dir, temp_dir) = isolated_project_with_config(&audit_config("test"));
+    approve_project_config(temp_dir.path(), &audit_config("test"))
+        .await
+        .unwrap();
+
+    // Change the argv and re-approve the new form.
+    let modified = audit_config("modified");
+    write_tools_config(temp_dir.path(), &modified);
+    approve_project_config(temp_dir.path(), &modified)
+        .await
+        .unwrap();
+
+    assert_approved(
+        verify_check_result(temp_dir.path(), "audit").await,
+        "after re-approve",
+    );
+}
+
+#[tokio::test]
+async fn test_config_edit_changing_no_argv_stays_approved() {
+    // The headlining behavior: a config edit that changes no argv (comment, whitespace,
+    // reordering, deleting an unrelated command) must not trigger re-approval. The old config-hash
+    // model fired here; argv+binary binding does not.
+    let (_xdg_dir, temp_dir) = isolated_project_with_config(&audit_config("test"));
+    approve_project_config(temp_dir.path(), &audit_config("test"))
+        .await
+        .unwrap();
+
+    // A comment-only edit changes the config hash but no argv — it must not trigger re-approval.
+    let with_comment = format!(
+        "# a comment that changes the config hash but no argv\n{}",
+        audit_config("test")
+    );
+    write_tools_config(temp_dir.path(), &with_comment);
+
+    assert_approved(
+        verify_check_result(temp_dir.path(), "audit").await,
+        "comment-only edit",
+    );
+}
+
+#[tokio::test]
+async fn test_binary_change_blocks_verification() {
     let _xdg_dir = setup_isolated_xdg_config();
 
     let temp_dir = TempDir::new().unwrap();
@@ -462,21 +525,61 @@ command = ["{}"]
         .await
         .unwrap();
 
-    // Modify the script (change the hash)
+    // Modify the script (change the hash) without changing argv
     std::fs::write(&script_path, "#!/bin/bash\necho 'modified'\n").unwrap();
 
-    // Verify should detect binary hash mismatch
+    // Verify should report ItemChanged: argv matches an approved version but the binary hash
+    // does not, so args_changed is false (an approved version carries the current argv).
     let result = verify_check_result(temp_dir.path(), "custom-check").await;
+    assert_item_changed(result, "custom-check", false, "binary change");
+}
 
-    match result {
-        VerificationResult::BinaryHashMismatch { item, .. } => {
-            assert_eq!(item, "custom-check");
-        }
-        _ => panic!(
-            "Expected BinaryHashMismatch for modified binary, got {:?}",
-            result
-        ),
-    }
+#[tokio::test]
+async fn test_match_any_approvals_across_workspaces() {
+    // Match-any + workspace-relative paths: approving a different binary in a second workspace
+    // adds a version rather than clobbering, and both workspaces then pass against their own
+    // binary. The jj secondary-workspace layout (shared store, divergent scripts printing
+    // main-copy/workspace-copy) comes from the shared helper.
+    let _xdg_dir = setup_isolated_xdg_config();
+    let config = "[commands]\n[[checks]]\nname = \"c\"\ncommand = [\"./check.sh\"]\n";
+    let (_base, main, workspace) = setup_jj_main_and_secondary_workspace(config, "check.sh", false);
+
+    // Approve from the main workspace first.
+    let repo_root = approve_project_config(&main, config).await.unwrap();
+    assert_approved(
+        verify_check_result(&main, "c").await,
+        "main approved after first approval",
+    );
+    // The secondary's own script has a different hash → not yet approved.
+    assert_item_changed(
+        verify_check_result(&workspace, "c").await,
+        "c",
+        false,
+        "workspace before its own approval",
+    );
+
+    // Approve from the secondary workspace: adds a version (same argv, different binary).
+    approve_project_config(&workspace, config).await.unwrap();
+
+    // Both workspaces now pass against their own binary — match-any, no clobbering.
+    assert_approved(
+        verify_check_result(&main, "c").await,
+        "main still approved after workspace approval",
+    );
+    assert_approved(
+        verify_check_result(&workspace, "c").await,
+        "workspace approved after its own approval",
+    );
+
+    // Exactly two versions accreted under the one repo-root key.
+    let approvals = ProjectApprovals::load().await.unwrap();
+    let key = repo_root.to_string_lossy().to_string();
+    let versions = &approvals.projects[&key].checks["c"];
+    assert_eq!(
+        versions.len(),
+        2,
+        "match-any should accrete both versions, got {versions:?}"
+    );
 }
 
 #[test]
@@ -487,6 +590,18 @@ fn test_is_within_project() {
 
     assert!(is_within_project(binary_inside, project_dir));
     assert!(!is_within_project(binary_outside, project_dir));
+}
+
+#[test]
+fn test_normalize_path_for_storage_inside_and_outside_workspace() {
+    let ws = Path::new("/home/user/project");
+    for (path, expected) in [
+        ("/home/user/project/scripts/build.sh", "scripts/build.sh"),
+        ("/usr/bin/cargo", "/usr/bin/cargo"),
+        ("./tool.sh", "./tool.sh"),
+    ] {
+        assert_eq!(normalize_path_for_storage(Path::new(path), ws), expected);
+    }
 }
 
 #[tokio::test]
@@ -678,8 +793,8 @@ async fn verify_check_program_is_original_not_canonical_for_symlink() {
     // The `Approved { program }` field must carry the original (symlink) path, not its
     // canonicalized target: symlinked multi-call binaries (nix coreutils, busybox) dispatch on
     // argv[0], so spawning the canonical target would change behavior. The resolver's
-    // original-vs-canonical split is covered below; this locks in that `verify_item_at_root`
-    // forwards the original into `Approved`.
+    // original-vs-canonical split is covered below; this locks in that
+    // `verify_item_for_workspace` forwards the original into `Approved`.
     let _xdg = setup_isolated_xdg_config();
     let project = TempDir::new().unwrap();
     let real = project.path().join("real.sh");
@@ -773,7 +888,6 @@ async fn test_concurrent_approvals_use_file_locking() {
     for i in 0..3 {
         let handle = tokio::spawn(async move {
             let project_dir = PathBuf::from(format!("/test/project{}", i));
-            let tools_hash = format!("sha256:hash{}", i);
             let mut commands = HashMap::new();
 
             commands.insert(
@@ -786,7 +900,7 @@ async fn test_concurrent_approvals_use_file_locking() {
             );
 
             ProjectApprovals::update(move |approvals| {
-                approvals.approve_project(project_dir, tools_hash, commands, HashMap::new())
+                approvals.approve_project(project_dir, commands, HashMap::new())
             })
             .await
             .expect("Concurrent approval should succeed");
@@ -818,7 +932,6 @@ async fn test_concurrent_approvals_use_file_locking() {
         );
 
         let approval = &final_approvals.projects[&project_key];
-        assert_eq!(approval.tools_config_hash, format!("sha256:hash{}", i));
         assert_eq!(approval.commands.len(), 1);
         assert!(approval.commands.contains_key(&format!("command{}", i)));
     }
@@ -840,7 +953,6 @@ async fn test_concurrent_updates_to_same_project() {
     for i in 0..3 {
         let project_dir = project_dir.clone();
         let handle = tokio::spawn(async move {
-            let tools_hash = format!("sha256:hash{}", i);
             let mut commands = HashMap::new();
 
             commands.insert(
@@ -853,7 +965,7 @@ async fn test_concurrent_updates_to_same_project() {
             );
 
             ProjectApprovals::update(move |approvals| {
-                approvals.approve_project(project_dir, tools_hash, commands, HashMap::new())
+                approvals.approve_project(project_dir, commands, HashMap::new())
             })
             .await
             .expect("Concurrent update should succeed");
@@ -880,7 +992,6 @@ async fn test_concurrent_updates_to_same_project() {
 
     // One of the updates should have won (last-write-wins semantics)
     let approval = &final_approvals.projects[project_key];
-    assert!(approval.tools_config_hash.starts_with("sha256:hash"));
     assert_eq!(approval.commands.len(), 1);
     assert!(approval.commands.contains_key("test"));
 }
@@ -904,12 +1015,13 @@ async fn test_file_locking_prevents_read_during_write() {
     // Start a long-running update operation
     let write_handle = tokio::spawn(async move {
         ProjectApprovals::update(|approvals| {
-            let tools_hash = "sha256:hash1".to_string();
             let mut commands = HashMap::new();
 
             commands.insert(
                 "test".to_string(),
                 CommandApproval {
+                    argv: None,
+                    approved_at: None,
                     original_path: "/usr/bin/test".to_string(),
                     canonical_path: "/usr/bin/test".to_string(),
                     binary_hash: "sha256:binary1".to_string(),
@@ -917,7 +1029,7 @@ async fn test_file_locking_prevents_read_during_write() {
             );
 
             approvals
-                .approve_project(project_dir, tools_hash, commands, HashMap::new())
+                .approve_project(project_dir, commands, HashMap::new())
                 .unwrap();
 
             // Simulate slow operation
@@ -936,7 +1048,6 @@ async fn test_file_locking_prevents_read_during_write() {
             Ok(approvals) => {
                 // If we read successfully, data should be consistent
                 if let Some(approval) = approvals.projects.get(&project_key_clone) {
-                    assert_eq!(approval.tools_config_hash, "sha256:hash1");
                     assert_eq!(approval.commands.len(), 1);
                 }
             }
@@ -953,7 +1064,6 @@ async fn test_file_locking_prevents_read_during_write() {
     // Verify final state is consistent
     let final_approvals = ProjectApprovals::load().await.unwrap();
     if let Some(approval) = final_approvals.projects.get(&project_key) {
-        assert_eq!(approval.tools_config_hash, "sha256:hash1");
         assert_eq!(approval.commands.len(), 1);
     }
 }
@@ -1001,10 +1111,18 @@ command = ["echo", "check"]
     assert!(approval.checks.contains_key("license-check"));
 
     // Verify check approvals contain correct data
-    let audit_approval = &approval.checks["security-audit"];
+    let audit_versions = &approval.checks["security-audit"];
+    let audit_approval = audit_versions
+        .first()
+        .expect("security-audit should have an approved version");
     assert!(
         !audit_approval.binary_hash.is_empty(),
         "Binary hash should be set"
+    );
+    assert_eq!(
+        audit_approval.argv.as_deref(),
+        Some(["echo".to_string(), "audit".to_string()].as_slice()),
+        "argv should be bound to the full command array",
     );
 }
 
@@ -1035,7 +1153,7 @@ lint = ["echo", "lint"]
         repo_path,
     );
 
-    assert_shared_repo_approval(&repo_root, &workspace2_path, "workspaces").await;
+    assert_shared_repo_approval(&repo_root, &workspace2_path, config_content, "workspaces").await;
 }
 
 #[tokio::test]
@@ -1065,46 +1183,261 @@ lint = ["echo", "lint"]
         repo_path,
     );
 
-    assert_shared_repo_approval(&repo_root, &worktree_path, "worktrees").await;
+    assert_shared_repo_approval(&repo_root, &worktree_path, config_content, "worktrees").await;
+}
+
+const LEGACY_LINT_CONFIG: &str = "[commands]\nlint = [\"./check.sh\"]\n";
+const LEGACY_WILDCARD_CONFIG: &str = "[commands]\nlint = [\"./check.sh\", \"extra-arg\"]\n";
+
+struct LegacyFixture {
+    _xdg: TempDir,
+    project: TempDir,
+    original: String,
+    canonical: String,
+    old_hash: String,
+}
+
+impl LegacyFixture {
+    fn root(&self) -> PathBuf {
+        self.project.path().canonicalize().unwrap()
+    }
+
+    fn write_script(&self, body: &str) {
+        create_executable_script(&self.project.path().join("check.sh"), body);
+    }
+
+    async fn verify(&self, source: &str) -> VerificationResult {
+        let root = self.root();
+        let config = toml::from_str(source).unwrap();
+        ProjectApprovals::load()
+            .await
+            .unwrap()
+            .verify_project_for_workspace(&root, &root, &config, "lint")
+            .await
+            .unwrap()
+    }
+
+    fn versions<'a>(&self, approvals: &'a ProjectApprovals) -> &'a [CommandApproval] {
+        &approvals.projects[&self.root().to_string_lossy().to_string()].commands["lint"]
+    }
+}
+
+async fn legacy_project_fixture() -> LegacyFixture {
+    let xdg = setup_isolated_xdg_config();
+    let project = TempDir::new().unwrap();
+    create_executable_script(&project.path().join("check.sh"), "echo legacy");
+    let root = project.path().canonicalize().unwrap();
+    let (original, canonical) = resolve_binary_path_with_original("./check.sh", &root).unwrap();
+    let old_hash = hashing::hash_file(&canonical).await.unwrap();
+    let original = original.to_string_lossy().into_owned();
+    let canonical = canonical.to_string_lossy().into_owned();
+    let dir = xdg.path().join("moriarty");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("project_approvals.toml"),
+        format!(
+            r#"[projects."{root}"]
+tools_config_hash = "legacy"
+last_approved = "2024-01-01T00:00:00Z"
+[projects."{root}".commands.lint]
+original_path = "{original}"
+canonical_path = "{canonical}"
+binary_hash = "{old_hash}"
+"#,
+            root = root.display(),
+        ),
+    )
+    .unwrap();
+    LegacyFixture {
+        _xdg: xdg,
+        project,
+        original,
+        canonical,
+        old_hash,
+    }
 }
 
 #[tokio::test]
-async fn test_load_approvals_without_checks_field() {
-    let xdg_dir = setup_isolated_xdg_config();
+async fn test_legacy_format_loads_and_verifies_argv_none() {
+    let f = legacy_project_fixture().await;
+    let approvals = ProjectApprovals::load().await.unwrap();
+    assert!(
+        approvals
+            .projects
+            .values()
+            .next()
+            .unwrap()
+            .checks
+            .is_empty()
+    );
+    let lint = &f.versions(&approvals)[0];
+    assert_approval_paths(lint, &f.original, &f.canonical, &f.old_hash);
+    assert!(lint.argv.is_none() && lint.approved_at.is_none());
+    assert_approved(f.verify(LEGACY_LINT_CONFIG).await, "legacy verification");
+}
 
-    // Create old-format approval TOML without checks field
-    let approvals_dir = xdg_dir.path().join("moriarty");
-    std::fs::create_dir_all(&approvals_dir).unwrap();
+#[tokio::test]
+async fn test_legacy_binary_change_and_wildcard_pre_upgrade() {
+    let f = legacy_project_fixture().await;
+    f.write_script("echo changed");
+    assert_item_changed(
+        f.verify(LEGACY_LINT_CONFIG).await,
+        "lint",
+        false,
+        "legacy binary change",
+    );
+    f.write_script("echo legacy");
+    assert_approved(f.verify(LEGACY_WILDCARD_CONFIG).await, "legacy wildcard");
+}
 
-    let old_format_toml = r#"
-[projects."/test/project"]
-tools_config_hash = "hash123"
+#[tokio::test]
+async fn test_legacy_upgrade_in_place_then_tightens() {
+    let f = legacy_project_fixture().await;
+    approve_project_config(&f.root(), LEGACY_LINT_CONFIG)
+        .await
+        .unwrap();
+    let approvals = ProjectApprovals::load().await.unwrap();
+    let versions = f.versions(&approvals);
+    assert_eq!(versions.len(), 1);
+    let lint = &versions[0];
+    assert_eq!(lint.argv.as_deref(), Some(&["./check.sh".to_string()][..]));
+    assert!(lint.approved_at.is_some());
+    assert_approval_paths(lint, "check.sh", "check.sh", &f.old_hash);
+    assert_item_changed(
+        f.verify(LEGACY_WILDCARD_CONFIG).await,
+        "lint",
+        true,
+        "post-upgrade argv",
+    );
+}
+
+#[tokio::test]
+async fn test_legacy_binary_change_reapproval_retires_stale_version() {
+    let f = legacy_project_fixture().await;
+    f.write_script("echo changed");
+    approve_project_config(&f.root(), LEGACY_LINT_CONFIG)
+        .await
+        .unwrap();
+    let new_hash = hashing::hash_file(&f.project.path().join("check.sh"))
+        .await
+        .unwrap();
+    let approvals = ProjectApprovals::load().await.unwrap();
+    let versions = f.versions(&approvals);
+    assert_eq!(versions.len(), 1);
+    assert_eq!(versions[0].binary_hash, new_hash);
+    assert!(versions[0].argv.is_some());
+    f.write_script("echo legacy");
+    assert_item_changed(
+        f.verify(LEGACY_LINT_CONFIG).await,
+        "lint",
+        false,
+        "old binary retired",
+    );
+}
+
+#[tokio::test]
+async fn test_legacy_absolute_paths_from_other_worktree_fail_closed() {
+    let (_base, main, workspace) =
+        setup_jj_main_and_secondary_workspace(LEGACY_LINT_CONFIG, "check.sh", true);
+    let repo = repository::detect_repository_root(&main).unwrap();
+    let workspace = repository::detect_workspace_root(&workspace).unwrap();
+    let (original, canonical) = resolve_binary_path_with_original("./check.sh", &main).unwrap();
+    let hash = hashing::hash_file(&canonical).await.unwrap();
+    let original = original.to_string_lossy();
+    let canonical = canonical.to_string_lossy();
+    let legacy = make_command_approval(&original, &canonical, &hash);
+    let commands = HashMap::from([("lint".to_string(), legacy)]);
+    let (_, approvals) = approve_fixture(&main, commands, HashMap::new());
+    let config = toml::from_str(LEGACY_LINT_CONFIG).unwrap();
+    let result = approvals
+        .verify_project_for_workspace(&repo, &workspace, &config, "lint")
+        .await
+        .unwrap();
+    assert_item_changed(result, "lint", false, "foreign legacy paths");
+}
+
+#[test]
+fn test_one_or_many_loads_mixed_legacy_and_array_forms() {
+    let approvals: ProjectApprovals = toml::from_str(
+        r#"[projects.repo]
 last_approved = "2024-01-01T00:00:00Z"
-
-[projects."/test/project".commands.lint]
-original_path = "/bin/echo"
-canonical_path = "/bin/echo"
-binary_hash = "abc123"
-"#;
-
-    std::fs::write(
-        approvals_dir.join("project_approvals.toml"),
-        old_format_toml,
+[projects.repo.commands.lint]
+original_path = "lint"
+canonical_path = "lint"
+binary_hash = "old"
+[[projects.repo.commands.test]]
+argv = ["test"]
+approved_at = "2024-01-01T00:00:00Z"
+original_path = "test"
+canonical_path = "test"
+binary_hash = "new"
+"#,
     )
     .unwrap();
-
-    // Load approvals - should succeed with checks field defaulting to empty HashMap
-    let approvals = ProjectApprovals::load().await.unwrap();
-    let approval = approvals
-        .projects
-        .get("/test/project")
-        .expect("Project should load");
-
-    assert_eq!(approval.commands.len(), 1);
+    let commands = &approvals.projects["repo"].commands;
+    assert_eq!(commands["lint"].len(), 1);
+    assert!(commands["lint"][0].argv.is_none());
     assert_eq!(
-        approval.checks.len(),
-        0,
-        "Checks should default to empty HashMap"
+        commands["test"][0].argv.as_deref(),
+        Some(&["test".to_string()][..])
     );
-    assert_eq!(approval.tools_config_hash, "hash123");
+}
+
+#[tokio::test]
+async fn test_reapprove_identical_dedupes_not_accretes() {
+    let config = audit_config("test");
+    let (_xdg, project) = isolated_project_with_config(&config);
+    approve_project_config(project.path(), &config)
+        .await
+        .unwrap();
+    let key = canonical_key(project.path());
+    let first = ProjectApprovals::load().await.unwrap().projects[&key].checks["audit"][0]
+        .approved_at
+        .unwrap();
+    sleep(Duration::from_millis(10)).await;
+    approve_project_config(project.path(), &config)
+        .await
+        .unwrap();
+    let approvals = ProjectApprovals::load().await.unwrap();
+    let versions = &approvals.projects[&key].checks["audit"];
+    assert_eq!(versions.len(), 1);
+    assert!(versions[0].approved_at.unwrap() > first);
+}
+
+#[tokio::test]
+async fn test_no_argv_change_with_removed_command_stays_approved() {
+    // Deleting an unrelated command changes the old config hash but no remaining argv — so the
+    // remaining approved item must still pass (the headlining behavior, extended to the
+    // removed-command case; stale approvals for the deleted item simply no longer match anything).
+    let base = "[commands]\nlint = [\"echo\", \"lint\"]\n\n[[checks]]\nname = \"audit\"\ncommand = [\"echo\", \"test\"]\n";
+    let (_xdg_dir, project) = isolated_project_with_config(base);
+    approve_project_config(project.path(), base).await.unwrap();
+
+    // Remove the `lint` command; `audit` (unchanged argv + binary) must still verify.
+    write_tools_config(
+        project.path(),
+        "[commands]\n\n[[checks]]\nname = \"audit\"\ncommand = [\"echo\", \"test\"]\n",
+    );
+    assert_approved(
+        verify_check_result(project.path(), "audit").await,
+        "audit after removing an unrelated command",
+    );
+
+    // The removed `lint` name is still in approvals but no longer in the config, so verifying it
+    // yields ItemNotApproved (the config lookup returns None), not ItemChanged.
+    let approvals = ProjectApprovals::load().await.unwrap();
+    let ws = project.path().canonicalize().unwrap();
+    let repo = ws.clone();
+    let config: ProjectConfig = toml::from_str(
+        "[commands]\n\n[[checks]]\nname = \"audit\"\ncommand = [\"echo\", \"test\"]\n",
+    )
+    .unwrap();
+    let result = approvals
+        .verify_project_for_workspace(&repo, &ws, &config, "lint")
+        .await
+        .unwrap();
+    match result {
+        VerificationResult::ItemNotApproved { item } => assert_eq!(item, "lint"),
+        other => panic!("removed lint should be ItemNotApproved, got {other:?}"),
+    }
 }

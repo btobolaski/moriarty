@@ -17,8 +17,10 @@ use tui_scrollview::ScrollViewState;
 use crate::{
     project_config::{
         CommandApproval, ProjectApprovals, ProjectConfig, is_script, is_within_project,
-        is_writable, read_script_contents, resolve_binary_path_with_original,
+        is_writable, normalize_path_for_storage, read_script_contents,
+        resolve_binary_path_with_original,
     },
+    repository::detect_workspace_root,
     tui::event_bus::{Event, UIEvent, input_stream},
 };
 
@@ -57,15 +59,18 @@ impl ApprovalApp {
         Ok(())
     }
 
-    /// Helper function to load command/check information with binary resolution and security analysis
+    /// Helper function to load command/check information with binary resolution and security analysis.
+    ///
+    /// `workspace_root` is the root binaries are resolved against (and the base for in-project
+    /// checks) — the directory whose `tools.toml` was loaded in `new()`.
     async fn load_command_info(
         name: String,
         command_array: Vec<String>,
-        canonical_dir: &Path,
+        workspace_root: &Path,
     ) -> Result<CommandInfo> {
         let binary_name = &command_array[0];
         let (original_path, canonical_path) =
-            resolve_binary_path_with_original(binary_name, canonical_dir)?;
+            resolve_binary_path_with_original(binary_name, workspace_root)?;
 
         let is_script_file = is_script(&canonical_path).await?;
         let is_writable_file = is_writable(&canonical_path).await?;
@@ -85,7 +90,7 @@ impl ApprovalApp {
             binary_hash,
             is_script: is_script_file,
             is_writable: is_writable_file,
-            is_in_project: is_within_project(&canonical_path, canonical_dir),
+            is_in_project: is_within_project(&canonical_path, workspace_root),
             script_contents,
             approved: false,
         })
@@ -97,26 +102,31 @@ impl ApprovalApp {
     /// Returns a Result containing the vector of loaded CommandInfo structs.
     async fn load_items_info(
         items: Vec<(String, Vec<String>)>,
-        canonical_dir: &Path,
+        workspace_root: &Path,
     ) -> Result<Vec<CommandInfo>> {
         let mut infos = Vec::new();
         for (name, command_array) in items {
-            infos.push(Self::load_command_info(name, command_array, canonical_dir).await?);
+            infos.push(Self::load_command_info(name, command_array, workspace_root).await?);
         }
         Ok(infos)
     }
 
     /// Create a new approval app for the given project directory
+    ///
+    /// Loads `.config/tools.toml` from the caller's **workspace root** and resolves/hashes
+    /// binaries against it, so approving from a nested subdirectory approves the workspace-root
+    /// config (previously it read the nested dir's own `.config/tools.toml` or failed). Display
+    /// keeps absolute paths; only the stored form is normalized.
     pub async fn new(project_dir: PathBuf) -> Result<Self> {
-        // Canonicalize for config loading and binary resolution
-        // (repository root detection will be done during approval save)
         let canonical_dir = project_dir
             .canonicalize()
             .into_diagnostic()
             .with_context(|| format!("Failed to canonicalize path: {}", project_dir.display()))?;
 
-        // Load and parse tools.toml
-        let tools_config_path = canonical_dir.join(".config/tools.toml");
+        let workspace_root = detect_workspace_root(&canonical_dir)?;
+
+        // Load and parse the workspace-root tools.toml — the config that will actually run.
+        let tools_config_path = workspace_root.join(".config/tools.toml");
         let tools_config_content = read_to_string(&tools_config_path)
             .await
             .into_diagnostic()
@@ -139,22 +149,21 @@ impl ApprovalApp {
             ));
         }
 
-        // Load command and check information using canonical_dir for binary resolution
-        let command_infos = Self::load_items_info(commands, &canonical_dir).await?;
+        // Load command and check information, resolving binaries against the workspace root so
+        // the paths and hashes match what verification will resolve.
+        let command_infos = Self::load_items_info(commands, &workspace_root).await?;
 
         let check_items: Vec<(String, Vec<String>)> = checks
             .into_iter()
             .map(|check| (check.name, check.command))
             .collect();
-        let check_infos = Self::load_items_info(check_items, &canonical_dir).await?;
-
-        let tools_config_hash = crate::hashing::hash_string(&tools_config_content);
+        let check_infos = Self::load_items_info(check_items, &workspace_root).await?;
 
         Ok(Self {
             state: ApprovalState {
-                // Store canonical_dir - repository root detection will happen in approve_project
-                project_dir: canonical_dir,
-                tools_config_hash,
+                // `project_dir` is the workspace root: approvals are keyed by repository root,
+                // which `approve_project` derives from this path.
+                project_dir: workspace_root,
                 commands: command_infos,
                 checks: check_infos,
                 current_section: Section::Commands,
@@ -385,8 +394,16 @@ impl ApprovalApp {
             commands.insert(
                 cmd_info.name.clone(),
                 CommandApproval {
-                    original_path: cmd_info.original_path.to_string_lossy().to_string(),
-                    canonical_path: cmd_info.canonical_path.to_string_lossy().to_string(),
+                    argv: Some(cmd_info.command_array.clone()),
+                    approved_at: None,
+                    original_path: normalize_path_for_storage(
+                        &cmd_info.original_path,
+                        &self.state.project_dir,
+                    ),
+                    canonical_path: normalize_path_for_storage(
+                        &cmd_info.canonical_path,
+                        &self.state.project_dir,
+                    ),
                     binary_hash: cmd_info.binary_hash.clone(),
                 },
             );
@@ -397,19 +414,27 @@ impl ApprovalApp {
             checks.insert(
                 check_info.name.clone(),
                 CommandApproval {
-                    original_path: check_info.original_path.to_string_lossy().to_string(),
-                    canonical_path: check_info.canonical_path.to_string_lossy().to_string(),
+                    argv: Some(check_info.command_array.clone()),
+                    approved_at: None,
+                    original_path: normalize_path_for_storage(
+                        &check_info.original_path,
+                        &self.state.project_dir,
+                    ),
+                    canonical_path: normalize_path_for_storage(
+                        &check_info.canonical_path,
+                        &self.state.project_dir,
+                    ),
                     binary_hash: check_info.binary_hash.clone(),
                 },
             );
         }
 
         let project_dir = self.state.project_dir.clone();
-        let tools_config_hash = self.state.tools_config_hash.clone();
 
-        // Atomically update approvals with file locking
+        // Atomically update approvals with file locking. `approve_project` derives the
+        // repository-root key from `project_dir` (the workspace root) and stamps `approved_at`.
         ProjectApprovals::update(move |approvals| {
-            approvals.approve_project(project_dir, tools_config_hash, commands, checks)
+            approvals.approve_project(project_dir, commands, checks)
         })
         .await
     }

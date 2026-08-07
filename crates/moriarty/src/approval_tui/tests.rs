@@ -2,8 +2,8 @@ use super::ApprovalApp;
 use crate::{
     approval_tui::approval_state::{Screen, Section},
     test_helpers::{
-        create_executable_script, setup_isolated_xdg_config, setup_project_dir_with_config,
-        write_tools_config,
+        create_executable_script, run_git_command, setup_isolated_xdg_config,
+        setup_project_dir_with_config, write_tools_config,
     },
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -87,12 +87,10 @@ async fn test_approval_app_initialization_with_empty_config() {
     // Test that empty tools.toml returns an error
     let temp_dir = project_with_config("[commands]\n");
 
-    let err_msg = format!(
-        "{:?}",
-        ApprovalApp::new(temp_dir.path().to_path_buf())
-            .await
-            .expect_err("Empty config should return error")
-    );
+    let err_msg = ApprovalApp::new(temp_dir.path().to_path_buf())
+        .await
+        .expect_err("Empty config should return error")
+        .to_string();
     assert!(
         err_msg.contains("No commands or checks configured"),
         "Error should mention no commands or checks configured"
@@ -104,15 +102,13 @@ async fn test_approval_app_initialization_with_missing_config() {
     // Test that missing tools.toml returns an error
     let temp_dir = TempDir::new().unwrap();
 
-    let err_msg = format!(
-        "{:?}",
-        ApprovalApp::new(temp_dir.path().to_path_buf())
-            .await
-            .expect_err("Missing config should return error")
-    );
+    let err_msg = ApprovalApp::new(temp_dir.path().to_path_buf())
+        .await
+        .expect_err("Missing config should return error")
+        .to_string();
     assert!(
-        err_msg.contains("failed to read project settings") || err_msg.contains("No such file"),
-        "Error should mention missing file, got: {}",
+        err_msg.contains("tools.toml"),
+        "Error should mention the missing config file, got: {}",
         err_msg
     );
 }
@@ -170,10 +166,9 @@ async fn test_save_approvals_validation() {
     // Try to save with unapproved commands
     let result = app.save_approvals().await;
 
-    let err_msg = format!(
-        "{:?}",
-        result.expect_err("Should fail with unapproved commands")
-    );
+    let err_msg = result
+        .expect_err("Should fail with unapproved commands")
+        .to_string();
     assert!(
         err_msg.contains("not approved"),
         "Error should mention unapproved commands"
@@ -196,6 +191,44 @@ async fn test_save_approvals_validation() {
     assert!(
         approvals.projects.contains_key(&project_key),
         "Project should be in approvals"
+    );
+
+    // The TUI save path must record the full argv and storage-normalized paths — the same shape
+    // production verification matches against. The `test` command points at an in-workspace
+    // script, so its paths normalize to a workspace-relative form.
+    use crate::project_config::CommandApproval;
+    let test_versions: &Vec<CommandApproval> = approvals
+        .projects
+        .get(&project_key)
+        .expect("project approval")
+        .commands
+        .get("test")
+        .expect("test command approval");
+    let test_approval = test_versions
+        .first()
+        .expect("test should have an approved version");
+    assert_eq!(
+        test_approval.argv.as_deref(),
+        Some(
+            app.state
+                .commands
+                .iter()
+                .find(|c| c.name == "test")
+                .expect("test")
+                .command_array
+                .as_slice()
+        ),
+        "TUI must bind the full argv",
+    );
+    assert_eq!(
+        test_approval.original_path, "test.sh",
+        "in-workspace script path must be stored workspace-relative: {}",
+        test_approval.original_path,
+    );
+    assert_eq!(
+        test_approval.canonical_path, "test.sh",
+        "canonical path must be stored workspace-relative: {}",
+        test_approval.canonical_path,
     );
 }
 
@@ -243,6 +276,39 @@ async fn test_command_info_metadata_loading() {
 }
 
 #[tokio::test]
+async fn test_new_from_nested_subdirectory_loads_workspace_root_config() {
+    // Approving from a nested subdirectory must detect the workspace root and load its
+    // .config/tools.toml (previously it read the nested dir's own config or failed). This needs a
+    // real repo so `detect_workspace_root` walks up from the nested dir to the repo root.
+    let _xdg_dir = setup_isolated_xdg_config();
+    let temp_dir = TempDir::new().unwrap();
+    run_git_command(&["init"], temp_dir.path());
+    run_git_command(&["config", "user.email", "t@example.com"], temp_dir.path());
+    run_git_command(&["config", "user.name", "T U"], temp_dir.path());
+    create_executable_script(&temp_dir.path().join("test.sh"), "echo test");
+    write_tools_config(temp_dir.path(), "[commands]\ntest = [\"./test.sh\"]\n");
+
+    // Invoke ApprovalApp from a nested subdirectory that has no tools.toml of its own.
+    let nested = temp_dir.path().join("src/inner");
+    std::fs::create_dir_all(&nested).unwrap();
+    let app = ApprovalApp::new(nested.clone())
+        .await
+        .expect("ApprovalApp should initialize from a nested subdir");
+
+    // project_dir is the workspace root (where tools.toml lives), not the nested dir.
+    assert_eq!(
+        app.state.project_dir,
+        temp_dir.path().canonicalize().unwrap(),
+        "project_dir should be the workspace root, not the nested invocation dir"
+    );
+    // The workspace-root commands were loaded.
+    assert!(
+        app.state.commands.iter().any(|c| c.name == "test"),
+        "commands should come from the workspace-root tools.toml"
+    );
+}
+
+#[tokio::test]
 async fn test_in_project_warning_flow() {
     // Test that in-project writeable scripts trigger warning screen
     let temp_dir = setup_test_project();
@@ -263,24 +329,6 @@ async fn test_in_project_warning_flow() {
     assert!(
         test_cmd.is_in_project && test_cmd.is_writable,
         "test.sh should trigger in-project warning"
-    );
-}
-
-#[tokio::test]
-async fn test_tools_config_hash_captured() {
-    // Test that tools.toml hash is correctly computed and stored
-    let temp_dir = setup_test_project();
-
-    let app = new_test_app(&temp_dir).await;
-
-    assert!(
-        app.state.tools_config_hash.starts_with("sha256:"),
-        "Config hash should have sha256 prefix"
-    );
-    assert_eq!(
-        app.state.tools_config_hash.len(),
-        71,
-        "SHA-256 hash should be 7 (prefix) + 64 (hex) = 71 chars"
     );
 }
 
@@ -417,10 +465,9 @@ async fn test_save_approvals_requires_all_checks_approved() {
 
     // Should fail because checks not approved
     let result = app.save_approvals().await;
-    let err_msg = format!(
-        "{:?}",
-        result.expect_err("Should fail when checks not approved")
-    );
+    let err_msg = result
+        .expect_err("Should fail when checks not approved")
+        .to_string();
     assert!(
         err_msg.contains("security"),
         "Error should mention unapproved check"

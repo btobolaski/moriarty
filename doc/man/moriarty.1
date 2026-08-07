@@ -238,10 +238,18 @@ defined in
 for the project\-tools MCP server.
 Approvals are keyed by the repository root, so jj workspaces and git worktrees
 share them.
-Approved tools and checks always load their configuration and resolve their
-program paths from the repository root's
-.Pa .config/tools.toml ,
-while executing in the directory they were invoked for.
+Approved tools and checks load their configuration and resolve their program
+paths from the invoking workspace root's
+.Pa .config/tools.toml
+(commands execute in the directory they were invoked for; checks execute in
+the workspace root, as the Hooks section below describes), so each worktree runs
+its own tooling; only the approvals are shared by repository root, so identical
+content across worktrees needs no re-approval.
+Each approval binds the command's argv plus the resolved binary paths and
+binary SHA-256, so only a new name, an argument change, or a binary change
+triggers re-approval (cosmetic edits to
+.Pa .config/tools.toml
+do not).
 .Ss Hooks
 The
 .Cm hooks exec
@@ -252,10 +260,10 @@ For the Stop hook it runs the project's approved checks from
 .Pa .config/tools.toml .
 Checks execute in the invoking workspace's root
 .Pq the nearest jj workspace or git worktree root ,
-while the configuration, the approvals, and each check's program path are
-resolved from the shared repository root, so a jj secondary workspace or git
-worktree validates its own working copy using only the approved configuration
-and binaries.
+and load their configuration and resolve their program paths from that same
+workspace root, so a jj secondary workspace or git worktree runs its own
+approved configuration and binaries; approvals stay keyed by the shared
+repository root so identical content across worktrees shares one approval.
 .Pp
 The
 .Cm hooks report

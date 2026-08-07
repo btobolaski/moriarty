@@ -18,16 +18,32 @@
 //! # Security Model
 //!
 //! **IMPORTANT**: The four command tools (`run_lint`/`run_build`/`run_formatter`/`run_tests`)
-//! execute arbitrary commands from `.config/tools.toml` without validation or sandboxing.
-//! (`run_checks` differs: it requires each `[[check]]` to be approved and verifies the config and
-//! binary hashes before running anything — see [`crate::checks`].) The security model assumes:
+//! execute arbitrary **approved** commands from `.config/tools.toml`. `verify_and_load_project`
+//! verifies the configured commands and checks against their approved argv, resolved paths, and
+//! binary hashes before anything runs; `run_checks` applies the same identity checks to each
+//! `[[check]]` through [`crate::checks`]. Approval gates *what* runs, but does not inspect command
+//! semantics or sandbox execution. The security model assumes:
 //!
 //! - **Trusted configuration files**: Only use with project directories where you
 //!   trust the contents of `.config/tools.toml`
-//! - **No runtime validation of commands**: the four command tools execute their configured
-//!   command as-is, without checking for dangerous patterns or operations (checks are verified)
+//! - **No content validation or sandboxing**: Approved commands run as configured, without
+//!   checking for dangerous patterns or operations
 //! - **Full filesystem access**: Commands run with the same permissions as the MCP
 //!   server process
+//!
+//! ## Approval binding (commands and checks alike)
+//!
+//! Project tools are not approved by hashing `tools.toml` wholesale (that fired on comments,
+//! whitespace, reordering, and unrelated commands). Instead each approval binds **exactly what
+//! executes**: the command's argv from `tools.toml`, the resolved binary paths, and the binary's
+//! SHA-256, stored as a **match-any set of approved versions per command name**. Only three things
+//! ever trigger re-approval — a new command/check name, an argument change, or a binary change —
+//! so cosmetic config edits and deleted commands never do. Approvals are keyed by **repository
+//! root** (shared across jj workspaces and git worktrees), while the configuration that runs is
+//! loaded from the caller's **workspace root** (`detect_workspace_root`), so each worktree runs
+//! its own tooling while identical content across worktrees needs no re-approval. Stored binary
+//! paths are normalized relative to the workspace root when inside it, so a byte-identical
+//! `./script.sh` in a second worktree matches the first worktree's approval.
 //!
 //! ## Security Best Practices
 //!

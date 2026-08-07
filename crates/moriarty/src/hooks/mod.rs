@@ -21,18 +21,21 @@
 //! `CheckRunOutcome` onto allow/deny. That shared routine takes a **fail-open** approach,
 //! reporting "no checks to run" (which the handler maps to `Allow`) when:
 //! - Project directory doesn't exist or cannot be canonicalized
-//! - `.config/tools.toml` cannot be loaded or parsed
+//! - `.config/tools.toml` cannot be loaded or parsed, except for duplicate check names
 //! - No checks are defined in the configuration
+//!
+//! Duplicate check names fail **closed** because approvals and resolved programs are name-keyed;
+//! allowing duplicates could authorize one check's arguments using another check's approval.
 //!
 //! **Rationale**: This design prioritizes developer experience and avoids breaking workflows
 //! when projects don't use the checks feature. Since checks are opt-in security validations,
-//! their absence or misconfiguration should not block execution.
+//! their absence or ordinary load/parse failures should not block execution.
 //!
 //! **Trade-offs**: An attacker who can manipulate the environment or filesystem to cause
 //! config loading failures could bypass checks. However, this requires the same level of
 //! access needed to modify approved binaries directly, so it doesn't meaningfully weaken
 //! the security model. Once checks are configured and approved, the handler fails **closed**
-//! on all verification failures (unapproved checks, hash mismatches, check failures).
+//! on all verification failures (unapproved checks, argv/binary changes, check failures).
 //!
 //! ## Hook Output Fields: `reason` vs `system_message`
 //!

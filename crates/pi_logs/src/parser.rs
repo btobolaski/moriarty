@@ -3470,8 +3470,8 @@ pub struct McpCallResult {
 }
 
 /// Client-side MCP call failure recorded when pi's MCP transport itself
-/// rejects a tool call before it reaches the server (e.g. config hash
-/// mismatch after approval).
+/// rejects a tool call before it reaches the server (e.g. an item not approved
+/// or changed since approval).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct McpClientError {

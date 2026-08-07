@@ -36,10 +36,8 @@ pub enum Section {
 /// between what's displayed and what's approved.
 #[derive(Debug)]
 pub struct ApprovalState {
-    /// Canonical path to the project directory
+    /// Canonical path to the project directory (the workspace root whose tools.toml was loaded)
     pub project_dir: PathBuf,
-    /// SHA-256 hash of the tools.toml configuration
-    pub tools_config_hash: String,
     /// All commands from the project configuration
     pub commands: Vec<CommandInfo>,
     /// All checks from the project configuration
@@ -145,7 +143,6 @@ mod tests {
     ) -> ApprovalState {
         ApprovalState {
             project_dir: PathBuf::from("/test"),
-            tools_config_hash: "hash".to_string(),
             commands,
             checks,
             current_section: section,

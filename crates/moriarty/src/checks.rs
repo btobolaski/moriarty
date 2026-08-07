@@ -22,8 +22,8 @@ use tracing::{error, info};
 
 use crate::{
     project_config::{
-        approvals::{ProjectApprovals, VerificationResult},
-        config::{Check, load_project_settings},
+        approvals::{ItemType, ProjectApprovals, VerificationResult},
+        config::{Check, is_duplicate_check_name, load_project_settings},
     },
     repository::{detect_repository_root, detect_workspace_root},
 };
@@ -76,12 +76,12 @@ impl CheckLimits {
 /// without embedding either output format.
 pub(crate) enum CheckRunOutcome {
     /// Fail-open: the repository or workspace root could not be detected, `.config/tools.toml`
-    /// could not be loaded, or no checks are configured. Carries a human-readable explanation that
-    /// the MCP tool surfaces and the hook ignores (it simply allows).
+    /// could not be loaded (except for duplicate check names), or no checks are configured. Carries
+    /// a human-readable explanation that the MCP tool surfaces and the hook ignores (it allows).
     NoChecks(String),
-    /// Fail-closed: a pre-execution gate failed (empty command, unapproved, config- or
-    /// binary-hash mismatch) or a global limit was hit (timeout, total-output cap). Carries the
-    /// reason the run was blocked.
+    /// Fail-closed: a pre-execution gate failed (duplicate check name, empty command, unapproved,
+    /// or an argv/binary change since approval) or a global limit was hit (timeout, total-output
+    /// cap). Carries the reason the run was blocked.
     Blocked(String),
     /// Every check executed. `outputs` holds one formatted entry per check; `failures` is
     /// non-empty iff at least one check failed (non-zero exit or spawn error).
@@ -92,15 +92,17 @@ pub(crate) enum CheckRunOutcome {
 }
 
 /// The shared path behind both the Stop hook and the `run_checks` MCP tool: detect the repository
-/// root, load `.config/tools.toml`, verify the checks (checks only, not commands), and run them
-/// in the workspace root under the Stop hook's resource limits.
+/// root, load `.config/tools.toml` from the **workspace root**, verify the checks (checks only,
+/// not commands) against approvals keyed by the repository root, and run them in the workspace
+/// root under the Stop hook's resource limits.
 ///
 /// Two distinct roots are in play. The repository root (shared across jj workspaces and git
-/// worktrees) keys the approvals, is where the config is loaded from, and is the base a relative
-/// check program resolves against — everything that decides *what* runs must come from the files
-/// the approvals layer hashes, so a workspace-local `tools.toml` or script edit cannot run
-/// unapproved code. The workspace root is only the working directory the checks execute in, so a
-/// secondary workspace validates its own working copy instead of the main one's.
+/// worktrees) keys the approvals, so identical content across worktrees needs no re-approval.
+/// The workspace root is where the config is loaded from, where a relative check program resolves
+/// against, and where the checks execute — so a secondary workspace runs its own tooling and
+/// validates its own working copy. Per-command approvals bind the argv, resolved binary paths,
+/// and binary hash as match-any versions, so only a new name, an argument change, or a binary
+/// change triggers re-approval; cosmetic config edits do not.
 ///
 /// `Err` is reserved for unexpected failures the caller should surface as an error (e.g. the
 /// approvals store failing to load). Every check-level decision is encoded in [`CheckRunOutcome`]
@@ -150,19 +152,22 @@ pub(crate) async fn run_configured_checks(project_dir: &Path) -> Result<CheckRun
         }
     };
 
-    let config = match load_project_settings(repository_root.clone()).await {
+    let config = match load_project_settings(workspace_root.clone()).await {
         Ok(config) => config,
+        Err(e) if is_duplicate_check_name(&e) => {
+            return Ok(CheckRunOutcome::Blocked(e.to_string()));
+        }
         Err(e) => {
             info!(error = %e, "No .config/tools.toml found, allowing without checks");
             return Ok(CheckRunOutcome::NoChecks(format!(
                 "no usable {}/.config/tools.toml: {e}",
-                repository_root.display()
+                workspace_root.display()
             )));
         }
     };
-
-    let checks = match config.checks {
-        Some(checks) if !checks.is_empty() => checks,
+    // Keep `config` whole because verification borrows each check's name-keyed command array.
+    let checks: Vec<Check> = match &config.checks {
+        Some(checks) if !checks.is_empty() => checks.clone(),
         _ => {
             info!("No checks defined in config, allowing");
             return Ok(CheckRunOutcome::NoChecks(
@@ -180,7 +185,7 @@ pub(crate) async fn run_configured_checks(project_dir: &Path) -> Result<CheckRun
                 "Check '{}' has empty command array in {}/.config/tools.toml\n\
                  Expected format: command = [\"binary\", \"arg1\", \"arg2\"]",
                 check.name,
-                repository_root.display()
+                workspace_root.display()
             )));
         }
     }
@@ -195,7 +200,7 @@ pub(crate) async fn run_configured_checks(project_dir: &Path) -> Result<CheckRun
     let mut resolved_checks = Vec::with_capacity(checks.len());
     for mut check in checks {
         let verification = approvals
-            .verify_check_at_root(&repository_root, &check.name)
+            .verify_check_for_workspace(&repository_root, &workspace_root, &config, &check.name)
             .await?;
 
         match verification {
@@ -209,37 +214,7 @@ pub(crate) async fn run_configured_checks(project_dir: &Path) -> Result<CheckRun
                 return Ok(CheckRunOutcome::Blocked(format!(
                     "Check '{}' is not approved. Run: moriarty approve-project {}",
                     check.name,
-                    repository_root.display()
-                )));
-            }
-            VerificationResult::ConfigHashMismatch { expected, actual } => {
-                error!(
-                    check_name = %check.name,
-                    expected = %expected,
-                    actual = %actual,
-                    "Config hash mismatch"
-                );
-                return Ok(CheckRunOutcome::Blocked(format!(
-                    "Project configuration changed. Run: moriarty approve-project {}",
-                    repository_root.display()
-                )));
-            }
-            VerificationResult::BinaryHashMismatch {
-                item,
-                expected,
-                actual,
-            } => {
-                error!(
-                    check_name = %check.name,
-                    item = %item,
-                    expected = %expected,
-                    actual = %actual,
-                    "Binary hash mismatch"
-                );
-                return Ok(CheckRunOutcome::Blocked(format!(
-                    "Check '{}' binary changed. Run: moriarty approve-project {}",
-                    check.name,
-                    repository_root.display()
+                    workspace_root.display()
                 )));
             }
             VerificationResult::ItemNotApproved { item } => {
@@ -247,7 +222,30 @@ pub(crate) async fn run_configured_checks(project_dir: &Path) -> Result<CheckRun
                 return Ok(CheckRunOutcome::Blocked(format!(
                     "Check '{}' not in approvals. Run: moriarty approve-project {}",
                     item,
-                    repository_root.display()
+                    workspace_root.display()
+                )));
+            }
+            VerificationResult::ItemChanged {
+                item,
+                args_changed,
+                approved_versions,
+            } => {
+                // Defer to the shared, kind-typed sentence so the checks runner and command runner
+                // wording cannot drift and the kind is always "Check".
+                let sentence = VerificationResult::item_changed_sentence(
+                    ItemType::Check,
+                    &item,
+                    args_changed,
+                    approved_versions,
+                );
+                error!(
+                    check_name = %check.name,
+                    "Check argv or binary changed since approval"
+                );
+                return Ok(CheckRunOutcome::Blocked(format!(
+                    "{}. Run: moriarty approve-project {}",
+                    sentence,
+                    workspace_root.display()
                 )));
             }
         }
@@ -418,10 +416,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        hashing::hash_string,
         project_config::approvals::approve_project_config,
         test_helpers::{
-            assert_approved_copy_ran_in, create_executable_script, setup_isolated_xdg_config,
+            assert_workspace_local_copy_ran, create_executable_script, setup_isolated_xdg_config,
             setup_jj_main_and_secondary_workspace, setup_project_dir_with_config,
         },
     };
@@ -528,20 +525,20 @@ mod tests {
 
     #[tokio::test]
     async fn secondary_workspace_runs_approved_check_in_workspace_cwd() {
-        // One scenario proves both halves of the root split at once: the approved main-workspace
-        // `./check.sh` runs (a relative program must not re-resolve to the workspace's shadow
-        // copy), and its physical cwd is the secondary workspace, not the main one.
+        // Per-workspace config: once the workspace's own ./check.sh is approved, it runs (not
+        // main's copy), and its physical cwd is the secondary workspace.
         let _xdg = setup_isolated_xdg_config();
         let config = "[commands]\n[[checks]]\nname = \"rel\"\ncommand = [\"./check.sh\"]\n";
-        let (_base, main, workspace) = setup_jj_main_and_secondary_workspace(config, "check.sh");
-        approve_project_config(&main, config).await.unwrap();
+        let (_base, _main, workspace) =
+            setup_jj_main_and_secondary_workspace(config, "check.sh", false);
+        approve_project_config(&workspace, config).await.unwrap();
 
         let outcome = run_configured_checks(&workspace).await.unwrap();
         let CheckRunOutcome::Ran { outputs, failures } = outcome else {
             panic!("expected Ran");
         };
         assert!(failures.is_empty(), "unexpected failures: {failures:?}");
-        assert_approved_copy_ran_in(&outputs[0], &main, &workspace);
+        assert_workspace_local_copy_ran(&outputs[0], &workspace);
     }
 
     #[tokio::test]
@@ -573,22 +570,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn changed_config_is_blocked() {
+    async fn config_edit_changing_no_argv_is_allowed() {
+        // The headlining behavior inverted from the old config-hash model: a config edit that
+        // changes no argv (here, a comment) must NOT trigger re-approval.
         let (project, _xdg) = approved_project(
             "[commands]\n[[checks]]\nname = \"ok\"\ncommand = [\"echo\", \"v1\"]\n",
         )
         .await;
-        // Modify tools.toml after approval: its hash no longer matches the recorded one.
+        std::fs::write(
+            project.path().join(".config/tools.toml"),
+            "# comment that changes the config hash but no argv\n[commands]\n[[checks]]\nname = \"ok\"\ncommand = [\"echo\", \"v1\"]\n",
+        )
+        .unwrap();
+        let outcome = run_configured_checks(project.path()).await.unwrap();
+        let CheckRunOutcome::Ran { outputs, failures } = outcome else {
+            panic!("expected Ran after a no-argv config edit");
+        };
+        assert!(failures.is_empty(), "unexpected failures: {failures:?}");
+        assert_eq!(outputs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn argv_change_blocks_check() {
+        // An argument change is one of the three things that trigger re-approval.
+        let (project, _xdg) = approved_project(
+            "[commands]\n[[checks]]\nname = \"ok\"\ncommand = [\"echo\", \"v1\"]\n",
+        )
+        .await;
         std::fs::write(
             project.path().join(".config/tools.toml"),
             "[commands]\n[[checks]]\nname = \"ok\"\ncommand = [\"echo\", \"v2\"]\n",
         )
         .unwrap();
         let outcome = run_configured_checks(project.path()).await.unwrap();
-        let CheckRunOutcome::Blocked(reason) = outcome else {
-            panic!("expected Blocked");
-        };
-        assert!(reason.contains("configuration changed"), "got: {reason}");
+        assert!(
+            matches!(outcome, CheckRunOutcome::Blocked(_)),
+            "an argv change must block the run"
+        );
     }
 
     #[tokio::test]
@@ -608,13 +626,14 @@ mod tests {
             .unwrap();
 
         // Swap the approved binary's contents; verification catches the hash change before running.
+        // argv is unchanged, so the wording reports a binary change.
         std::fs::write(&binary, "tampered").unwrap();
 
         let outcome = run_configured_checks(project.path()).await.unwrap();
-        let CheckRunOutcome::Blocked(reason) = outcome else {
-            panic!("expected Blocked");
-        };
-        assert!(reason.contains("binary changed"), "got: {reason}");
+        assert!(
+            matches!(outcome, CheckRunOutcome::Blocked(_)),
+            "a binary change must block the run"
+        );
     }
 
     #[tokio::test]
@@ -623,12 +642,12 @@ mod tests {
         let config = "[commands]\n[[checks]]\nname = \"present\"\ncommand = [\"echo\", \"hi\"]\n";
         let project = setup_project_dir_with_config(config);
         let project_path = project.path().to_path_buf();
-        // Record an approval whose config hash matches but whose checks map omits "present",
-        // exercising ItemNotApproved (distinct from a wholly-unapproved project -> NotApproved).
+        // Record an approval for the project (so it is keyed and `last_approved` is set) but with
+        // an empty checks map, exercising ItemNotApproved (distinct from a wholly-unapproved
+        // project -> NotApproved): "present" is configured but has no approved version.
         let approve_path = project_path.clone();
-        let hash = hash_string(config);
         ProjectApprovals::update(move |a| {
-            a.approve_project(approve_path, hash, HashMap::new(), HashMap::new())
+            a.approve_project(approve_path, HashMap::new(), HashMap::new())
         })
         .await
         .unwrap();

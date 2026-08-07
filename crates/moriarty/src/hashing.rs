@@ -48,7 +48,9 @@ pub async fn hash_file<P: AsRef<Path>>(path: P) -> Result<String> {
 
 /// Computes the SHA-256 hash of string content.
 ///
-/// This is primarily used for hashing the contents of tools.toml configuration files.
+/// This is primarily used for hashing rule-set configurations (`UserConfig::effective_hash`, the
+/// rule-set provenance recorded by the PreToolUse hook) and for short rule-name disambiguation
+/// hashes (`rules::short_hash`).
 ///
 /// # Arguments
 ///

@@ -666,6 +666,23 @@ lint = ["echo", "lint"]
 }
 
 #[tokio::test]
+async fn test_stop_hook_duplicate_check_names_blocked() {
+    let _xdg_dir = setup_isolated_xdg_state();
+    let _project = setup_project_with_config(
+        r#"[commands]
+[[checks]]
+name = "audit"
+command = ["echo", "safe"]
+[[checks]]
+name = "audit"
+command = ["echo", "--dangerous"]
+"#,
+    );
+    let result = run_stop_hook().await;
+    assert_eq!(result.decision, Some(HookDecision::Block));
+}
+
+#[tokio::test]
 async fn test_stop_hook_empty_command_array() {
     let _xdg_dir = setup_isolated_xdg_state();
 
@@ -813,7 +830,11 @@ async fn test_stop_hook_check_binary_hash_mismatch() {
     let project_key = canonical_dir.to_string_lossy().to_string();
 
     if let Some(project) = approvals.projects.get_mut(&project_key) {
-        if let Some(check_approval) = project.checks.get_mut("test-check") {
+        if let Some(check_versions) = project.checks.get_mut("test-check") {
+            // Corrupt the first (and only) approved version's binary hash.
+            let check_approval = check_versions
+                .first_mut()
+                .expect("test-check should have an approved version");
             check_approval.binary_hash = "corrupted_hash_value".to_string();
         } else {
             panic!("test-check not found in approvals");
@@ -829,7 +850,7 @@ async fn test_stop_hook_check_binary_hash_mismatch() {
 
     set_test_env_var("CLAUDE_PROJECT_DIR", temp_dir.path());
     let result = handle_stop_hook().await.expect("Should succeed");
-    assert_stop_blocked_with(&result, &["binary changed", "test-check"]);
+    assert_stop_blocked_with(&result, &["test-check"]);
 }
 
 /// Helper to set up an approved project with checks
@@ -857,42 +878,11 @@ async fn setup_approved_project_with_checks(
     std::fs::write(config_dir.join("tools.toml"), &config_content)
         .expect("Failed to write tools.toml");
 
-    // Set up approvals
-    use crate::hashing;
-    use crate::project_config::approvals::{CommandApproval, ProjectApproval, ProjectApprovals};
-    use crate::project_config::resolve_binary_path_with_original;
-
-    let canonical_dir = temp_dir.path().canonicalize().unwrap();
-    let tools_config_hash = hashing::hash_string(&config_content);
-
-    let mut check_approvals = std::collections::HashMap::new();
-    for (name, command, _args) in check_specs {
-        let (original_path, canonical_path) =
-            resolve_binary_path_with_original(command, &canonical_dir).unwrap();
-        let binary_hash = hashing::hash_file(&canonical_path).await.unwrap();
-
-        check_approvals.insert(
-            name.to_string(),
-            CommandApproval {
-                original_path: original_path.to_string_lossy().to_string(),
-                canonical_path: canonical_path.to_string_lossy().to_string(),
-                binary_hash,
-            },
-        );
-    }
-
-    let mut approvals = ProjectApprovals::default();
-    approvals.projects.insert(
-        canonical_dir.to_string_lossy().to_string(),
-        ProjectApproval {
-            tools_config_hash,
-            last_approved: chrono::Utc::now(),
-            commands: std::collections::HashMap::new(),
-            checks: check_approvals,
-        },
-    );
-
-    approvals.save().await.expect("Failed to save approvals");
+    // Approve via the canonical helper so approvals bind the full argv, storage-normalized
+    // paths, and the binary hash — the same shape production approval produces.
+    crate::project_config::approvals::approve_project_config(temp_dir.path(), &config_content)
+        .await
+        .expect("Failed to approve project with checks");
 
     temp_dir
 }

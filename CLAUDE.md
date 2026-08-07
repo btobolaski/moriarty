@@ -304,12 +304,14 @@ with warnings, while explicit missing paths and having no available source are e
   shared `crate::checks::run_configured_checks` routine — the same approval verification (checks only, not commands),
   resource limits (5-min timeout, 1 MB/check + 10 MB total output caps), and fail-closed semantics as the Stop hook.
   That shared routine is intentionally distinct from `project_config::runner::run_all_checks` (no limits, verifies all
-  commands too), which the `moriarty test checks` CLI uses. Both runner paths load `tools.toml` from the repository root
-  (the file the approval hash covers) and spawn the program path `VerificationResult::Approved` carried back from
-  verification, so a jj secondary workspace or git worktree cannot substitute its own config or a shadow copy of a
-  relative script for the approved ones. Their execution cwd differs: `project_config::runner` keeps the caller's
-  canonicalized project dir, while the checks-runner uses `detect_workspace_root(project_dir)`, which can walk up past a
-  nested project dir to the enclosing workspace root.
+  commands too), which the `moriarty test checks` CLI uses. Both runner paths load `tools.toml` from the caller's
+  **workspace root** (`detect_workspace_root`) — so each jj secondary workspace or git worktree runs its own config and
+  its own relative programs — while approvals stay keyed by the shared **repository root**, so identical content across
+  worktrees needs no re-approval. Both spawn the program path `VerificationResult::Approved` carried back from
+  verification (never the raw `command[0]`), so an unapproved local copy cannot shadow the approved binary. Their
+  execution cwd differs: `project_config::runner` keeps the caller's canonicalized project dir, while the checks-runner
+  uses `detect_workspace_root(project_dir)`, which can walk up past a nested project dir to the enclosing workspace
+  root.
 - Uses rmcp library with stdio transport for Claude Code integration
 - All servers run as stdin/stdout servers that Claude Code can invoke
 - `install` command configures all servers in Claude Code's MCP registry
@@ -352,13 +354,13 @@ with warnings, while explicit missing paths and having no available source are e
 - **Stop hook**: Runs the project's configured checks before allowing execution, delegating to the shared
   `crate::checks::run_configured_checks` routine (see `mcp/` above); it maps the routine's `CheckRunOutcome` onto
   allow/deny. Checks execute with the workspace root as their working directory (`detect_workspace_root`: nearest
-  `.jj/repo` walking up, else `git rev-parse --show-toplevel`), while `.config/tools.toml` loading and approval
-  verification stay keyed by the shared repository root, and each check's program is resolved against the repository
-  root to an absolute path before spawning — the original resolved path, whose canonicalization is the file the
-  approvals layer hashed, not the canonical path itself, since canonicalizing breaks symlinked multi-call binaries (nix
-  coreutils, busybox) that dispatch on argv[0] — so a jj secondary workspace or git worktree validates its own working
-  copy, but only approved (hashed) config and binaries from the repository root decide what runs (a workspace-local copy
-  of a relative script like `./check.sh` cannot shadow the approved one)
+  `.jj/repo` walking up, else `git rev-parse --show-toplevel`); `.config/tools.toml` is loaded from that same workspace
+  root and each check's program is resolved against it, so a secondary workspace or worktree runs its own config and its
+  own relative programs. Approvals stay keyed by the shared repository root, binding each check's argv plus resolved
+  binary paths and binary hash as match-any versions; each check's program is spawned as the original resolved path
+  verification hashed — not the canonical path, since canonicalizing breaks symlinked multi-call binaries (nix
+  coreutils, busybox) that dispatch on argv[0], and not the raw `command[0]`, so an unapproved local copy cannot shadow
+  the approved one (a workspace-local `./check.sh` runs only if that exact argv+binary was approved)
 - Structured logging with tracing crate for debugging hook execution. The "PreToolUse hook completed" log event records
   a clean `result` field (`allow`/`deny`/`ask`/`modify`/`passthrough`) classified from the typed `HookOutput` by
   `hooks::result::pretool_result`, alongside `tool_name`, `tool_args`, `cwd`, `rules_hash`, and `rule` — the name of the
@@ -416,8 +418,10 @@ with warnings, while explicit missing paths and having no available source are e
 - Three submodules: `config` (loads `.config/tools.toml`), `approvals` (SHA-256 verification), `runner` (verified
   execution)
 - **Design asymmetry**: Commands are fixed struct (lint/test/build/format) for MCP, Checks are dynamic `Vec<Check>` for
-  user validations
-- Tracks config and binary hashes to detect changes; uses file locking for atomic persistence
+  user validations. Check names must be unique: config loading rejects duplicates because approvals and resolved
+  programs are keyed by name, preventing one check's approved argv from authorizing another duplicate's arguments
+- Binds each command's argv plus resolved binary paths and binary hash as match-any approved versions, keyed by
+  repository root with config loaded from the workspace root; uses file locking for atomic persistence
 
 ### Key Design Patterns
 
@@ -426,9 +430,22 @@ with warnings, while explicit missing paths and having no available source are e
 - **Default to Ask for Bash when unconfigured**: If no bash rules configured, Bash defaults to "Ask". Non-Bash tools
   with no matching tool rules return no decision, deferring to Claude Code's native permission system.
 - **Fail-closed when configured**: Once security measures are in place, any verification failure blocks execution:
-  - ConfigHashMismatch: tools.toml was modified after approval
-  - BinaryHashMismatch: Binary changed (update, corruption, tampering)
-  - ItemNotApproved: New command/check added to config
+  - ItemNotApproved: a command/check name is configured but has no approved version (e.g. a brand-new name added to
+    tools.toml)
+  - ItemChanged: an approved item's argv or binary changed since approval (no approved version matches the current
+    argv + resolved binary paths + binary hash); the result also reports whether the argv specifically changed and how
+    many approved versions exist
+  - (`ConfigHashMismatch` and `BinaryHashMismatch` are gone: approvals no longer hash `tools.toml` wholesale, so
+    cosmetic edits and deleted commands never trigger re-approval — only a new name, an argument change, or a binary
+    change does)
+- **Match-any approval sets**: each command/check name maps to a `Vec` of approved versions (argv + storage-normalized
+  paths + binary hash); argv-bound versions accrete additively and only match if that exact argv+binary reappears. A
+  binary-change re-approval retires legacy `argv: None` versions for the same normalized paths, so reverting to the old
+  binary fails closed instead of restoring its wildcard approval. Approvals are keyed by repository root (shared across
+  worktrees); the config that runs is loaded from the workspace root, so each worktree runs its own tooling while
+  identical content needs no re-approval. Stored binary paths are normalized
+  relative to the workspace root when inside it, so a byte-identical `./script.sh` in a second worktree matches the
+  first's approval
 - **SHA-256 verification**: All binaries hashed, symlinks resolved before hashing
 - **Dual path tracking**: Stores both original and canonical paths to detect symlink changes
 - **Atomic updates**: File locking (fs2 crate) prevents race conditions during approval saves
@@ -461,20 +478,30 @@ with warnings, while explicit missing paths and having no available source are e
 
 - `~/.config/moriarty/tool_rules.toml` - Tool and Bash validation rules
 - `<project>/.config/tools.toml` - Project commands and checks
-- `~/.config/moriarty/project_approvals.toml` - SHA-256 approval hashes
+- `~/.config/moriarty/project_approvals.toml` - Per-command approval sets (argv + resolved binary paths + binary
+  SHA-256, match-any versions keyed by repository root)
 - `~/.local/state/moriarty/hooks/` - Hook execution logs (JSON lines, daily-rotated)
 
 **Repository Root Detection**:
 
-- Approvals are keyed by repository root, not workspace directory
+- Approvals are keyed by **repository root**, not workspace directory, so identical content across jujutsu workspaces
+  and git worktrees shares one approval. The configuration that verification parses (and the binaries it resolves) comes
+  from the caller's **workspace root** (`detect_workspace_root`), which is what gives each worktree tooling
+  independence: a worktree on a branch with different tooling runs its own `tools.toml`. Per-command approvals bind the
+  argv, resolved binary paths, and binary hash as match-any versions, so only a new name, an argument change, or a
+  binary change triggers re-approval
 - Detection order: resolving `.jj/repo` (store directory or pointer file) → `git rev-parse --git-common-dir` →
   canonicalized path
 - This allows approval sharing across jujutsu workspaces and git worktrees
 - `repository.rs` also provides `detect_workspace_root()`, the working-copy counterpart (nearest directory containing
   `.jj/repo` → `git rev-parse --show-toplevel` → canonicalized path); the Stop hook and `run_checks` MCP tool
-  (`checks::run_configured_checks`) run checks there so a secondary workspace or worktree validates its own files while
-  sharing the main repository's approvals. `moriarty test checks` (via `project_config::runner`) instead executes at the
-  caller's canonicalized project directory, without the workspace-root walk
+  (`checks::run_configured_checks`) load the config from and run checks in the workspace root, so a secondary workspace
+  or worktree runs its own config and validates its own working copy while sharing the main repository's approvals.
+  `moriarty test checks` (via `project_config::runner`) instead executes at the caller's canonicalized project
+  directory, without the workspace-root walk
+- Stored binary paths are normalized relative to the workspace root when inside it (`normalize_path_for_storage`), so an
+  approval made in worktree A matches byte-identical content in worktree B; PATH-resolved binaries (`which cargo`) live
+  outside the workspace and stay absolute
 - For jj: `.jj/repo` is the store directory itself in the main workspace and a pointer file in a secondary workspace.
   Absolute pointers are used as-is; a relative pointer is resolved against the `.jj` directory (jj 0.41+) with a
   fallback to the workspace directory (older jj), so both layouts share one repository root
@@ -487,12 +514,12 @@ with warnings, while explicit missing paths and having no available source are e
 
 **Shared Test Utilities**: Test helpers used across multiple modules (`setup_isolated_xdg_config`,
 `setup_isolated_xdg_state`, `setup_project_dir_with_config`, `write_tools_config`, `create_executable_script`,
-`run_git_command`, `setup_git_repo_with_commit`, `setup_jj_main_and_secondary_workspace`, `assert_approved_copy_ran_in`,
-`set_test_env_var`, `remove_test_env_var`, `TestEnvVarGuard`, `SUBAGENT_EXECUTION_RULES`) live in
-`crates/moriarty/src/test_helpers.rs`. This module is compiled only in test builds (`#[cfg(test)]`). All test
-environment mutations go through `apply_test_env_var()` — the module's single `unsafe` block — with process isolation
-guaranteed by `cargo nextest`. New test-only helpers needed in more than one module belong here rather than being
-duplicated.
+`run_git_command`, `setup_git_repo_with_commit`, `setup_jj_main_and_secondary_workspace`,
+`assert_workspace_local_copy_ran`, `set_test_env_var`, `remove_test_env_var`, `TestEnvVarGuard`,
+`SUBAGENT_EXECUTION_RULES`) live in `crates/moriarty/src/test_helpers.rs`. This module is compiled only in test builds
+(`#[cfg(test)]`). All test environment mutations go through `apply_test_env_var()` — the module's single `unsafe` block
+— with process isolation guaranteed by `cargo nextest`. New test-only helpers needed in more than one module belong here
+rather than being duplicated.
 
 **Logging**: Hook execution is logged via tracing as JSON lines to `~/.local/state/moriarty/hooks/` (daily-rotated); the
 `hooks report` command consumes these. Cost-report commands log to stderr instead. Sensitive env vars (TOKEN, SECRET,
@@ -680,3 +707,4 @@ across sessions.
 After you have modified code, you are not allowed to stop until all of the quality checks have passed. If you need to
 ask the user a question, use the dedicated user-question tool rather than writing the question in plain text and then
 waiting for the user's next input.
+

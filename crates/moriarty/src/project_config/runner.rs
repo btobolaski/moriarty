@@ -4,9 +4,13 @@
 //! commands (lint, test, build, format). It ensures that:
 //!
 //! 1. Project directories are canonicalized to prevent path traversal attacks
-//! 2. Configuration files are loaded and validated
-//! 3. Commands are verified against stored approvals before execution
-//! 4. Binary hashes match approved versions
+//! 2. Configuration files are loaded from the caller's **workspace root** (so each worktree runs
+//!    its own tooling) and validated
+//! 3. Commands are verified against stored approvals (keyed by repository root, shared across
+//!    worktrees) before execution — each approved version binds the argv, resolved binary paths,
+//!    and binary hash as a match-any set
+//! 4. The verified program path is spawned, never the raw `command[0]`, so an unapproved local
+//!    copy cannot shadow the approved binary
 //!
 //! # Usage
 //!
@@ -35,8 +39,8 @@ use futures::stream::{self, StreamExt};
 use miette::{Context, IntoDiagnostic, Result};
 use tokio::process::Command;
 
-use super::{ProjectApprovals, ProjectConfig, VerificationResult, load_project_settings};
-use crate::repository::detect_repository_root;
+use super::{ItemType, ProjectApprovals, ProjectConfig, VerificationResult, load_project_settings};
+use crate::repository::{detect_repository_root, detect_workspace_root};
 
 /// Maximum number of commands to run concurrently.
 ///
@@ -52,11 +56,12 @@ const MAX_CONCURRENT_COMMANDS: usize = 4;
 /// their binaries verified.
 ///
 /// `canonical_dir` is the directory commands execute in (the caller's project directory,
-/// canonicalized), while `settings` comes from the shared repository root — the file whose hash
-/// verification checked — so a jj secondary workspace or git worktree cannot substitute its own
-/// `tools.toml` for the approved one. The resolved-program maps record, per item, the absolute
-/// path verification hashed; execution spawns those instead of re-resolving `command[0]` against
-/// `canonical_dir`, where an unapproved local file could shadow the approved one.
+/// canonicalized). `settings` comes from the **workspace root** — the file verification parsed and
+/// resolved binaries against — so a jj secondary workspace or git worktree runs its own
+/// `tools.toml` and its own relative programs, while approvals stay keyed by the shared repository
+/// root. The resolved-program maps record, per item, the absolute path verification hashed;
+/// execution spawns those instead of re-resolving `command[0]` against `canonical_dir`, where an
+/// unapproved local file could shadow the approved one.
 #[derive(Debug)]
 pub struct VerifiedProject {
     pub canonical_dir: PathBuf,
@@ -80,10 +85,12 @@ pub struct CommandOutput {
 /// that ALL configured commands have been explicitly approved before any execution
 /// can occur, preventing unauthorized command execution.
 ///
-/// The configuration is loaded from the repository root rather than `project_dir`: approval
-/// verification hashes the repository root's `tools.toml`, so executing a `tools.toml` read from
-/// anywhere else (a jj secondary workspace or git worktree working copy) would run command arrays
-/// the hash check never covered. `project_dir` still determines where commands execute.
+/// The configuration is loaded from the caller's **workspace root** (`detect_workspace_root`),
+/// which is what gives each worktree tooling independence: a worktree on a branch with different
+/// tooling runs its own `tools.toml`. Approvals stay keyed by the **repository root**
+/// (`detect_repository_root`), shared across worktrees, so identical content needs no re-approval
+/// per worktree. `canonical_dir` (the caller's project directory, canonicalized) is where commands
+/// execute.
 pub async fn verify_and_load_project(project_dir: PathBuf) -> Result<VerifiedProject> {
     let canonical_dir = project_dir
         .canonicalize()
@@ -91,15 +98,16 @@ pub async fn verify_and_load_project(project_dir: PathBuf) -> Result<VerifiedPro
         .with_context(|| format!("Failed to canonicalize path: {}", project_dir.display()))?;
 
     let repository_root = detect_repository_root(&canonical_dir)?;
+    let workspace_root = detect_workspace_root(&canonical_dir)?;
 
-    let settings = load_project_settings(repository_root.clone()).await?;
+    let settings = load_project_settings(workspace_root.clone()).await?;
 
     let approvals = ProjectApprovals::load()
         .await
         .context("Failed to load project approvals")?;
 
     let (resolved_commands, resolved_checks) =
-        verify_all_commands(&approvals, &canonical_dir, &repository_root, &settings).await?;
+        verify_all_commands(&approvals, &repository_root, &workspace_root, &settings).await?;
 
     Ok(VerifiedProject {
         canonical_dir,
@@ -109,46 +117,52 @@ pub async fn verify_and_load_project(project_dir: PathBuf) -> Result<VerifiedPro
     })
 }
 
-/// Formats the `"Run: moriarty approve-project <dir>"` fragment used by every
-/// non-Approved verification error, so the advice stays worded the same way.
-fn approve_hint(canonical_dir: &Path) -> String {
-    format!("Run: moriarty approve-project {}", canonical_dir.display())
+/// Formats the `"Run: moriarty approve-project <dir>"` fragment used by every non-Approved
+/// verification error. Names the workspace root — the directory whose `tools.toml` is being
+/// approved — not the caller's `canonical_dir` or the repository root.
+fn approve_hint(workspace_root: &Path) -> String {
+    format!("Run: moriarty approve-project {}", workspace_root.display())
 }
 
 fn handle_verification_result(
     result: VerificationResult,
-    item_type_plural: &str,
-    canonical_dir: &Path,
+    item_type: ItemType,
+    workspace_root: &Path,
 ) -> Result<PathBuf> {
     match result {
         VerificationResult::Approved { program } => Ok(program),
         VerificationResult::NotApproved => Err(miette::miette!(
             "Project {} not approved. {}",
-            item_type_plural,
-            approve_hint(canonical_dir)
-        )),
-        VerificationResult::ConfigHashMismatch { expected, actual } => Err(miette::miette!(
-            "tools.toml has been modified since approval. {} (expected: {}, actual: {})",
-            approve_hint(canonical_dir),
-            expected,
-            actual
-        )),
-        VerificationResult::BinaryHashMismatch {
-            item,
-            expected,
-            actual,
-        } => Err(miette::miette!(
-            "Binary for '{}' has been modified since approval. {} (expected: {}, actual: {})",
-            item,
-            approve_hint(canonical_dir),
-            expected,
-            actual
+            match item_type {
+                ItemType::Command => "tools",
+                ItemType::Check => "checks",
+            },
+            approve_hint(workspace_root)
         )),
         VerificationResult::ItemNotApproved { item } => Err(miette::miette!(
             "Item '{}' not approved. {}",
             item,
-            approve_hint(canonical_dir)
+            approve_hint(workspace_root)
         )),
+        VerificationResult::ItemChanged {
+            item,
+            args_changed,
+            approved_versions,
+        } => {
+            // Defer to the shared, kind-typed sentence so runner and checks wording cannot drift
+            // and a check can never be labeled "Command".
+            let sentence = VerificationResult::item_changed_sentence(
+                item_type,
+                &item,
+                args_changed,
+                approved_versions,
+            );
+            Err(miette::miette!(
+                "{}. {}",
+                sentence,
+                approve_hint(workspace_root),
+            ))
+        }
     }
 }
 
@@ -156,28 +170,32 @@ fn handle_verification_result(
 /// per-item program paths verification resolved and hashed (commands map and checks map, in that
 /// order) for execution to spawn.
 ///
-/// The `_at_root` verifiers take the already-detected `repository_root` so root detection (which
-/// can spawn a `git` subprocess) happens once per load instead of once per item;
-/// `canonical_dir` is kept only for the approve-project hint in error messages, which should
-/// name the directory the caller actually invoked.
+/// `repository_root` keys the approvals (shared across worktrees); `workspace_root` is where the
+/// config was loaded from and binaries are resolved against (the workspace's own tooling), and is
+/// also what the approve-project hint names (the config being approved).
+///
+/// The `_for_workspace` verifiers take the already-detected roots so detection (which can spawn a
+/// `git` subprocess) happens once per load instead of once per item, and take the already-parsed
+/// `settings` so what is verified is literally what runs (no file re-read).
 ///
 /// Fails fast on the first verification failure to prevent partial execution
 /// of items where some are approved and others are not.
 async fn verify_all_commands(
     approvals: &ProjectApprovals,
-    canonical_dir: &Path,
     repository_root: &Path,
+    workspace_root: &Path,
     settings: &ProjectConfig,
 ) -> Result<(HashMap<String, PathBuf>, HashMap<String, PathBuf>)> {
     let all_commands = settings.commands.all();
     let mut resolved_commands = HashMap::with_capacity(all_commands.len());
     for (command_name, _) in &all_commands {
         let verification_result = approvals
-            .verify_project_at_root(repository_root, command_name)
+            .verify_project_for_workspace(repository_root, workspace_root, settings, command_name)
             .await
             .with_context(|| format!("Failed to verify command '{}'", command_name))?;
 
-        let program = handle_verification_result(verification_result, "tools", canonical_dir)?;
+        let program =
+            handle_verification_result(verification_result, ItemType::Command, workspace_root)?;
         resolved_commands.insert(command_name.clone(), program);
     }
 
@@ -185,11 +203,12 @@ async fn verify_all_commands(
     let mut resolved_checks = HashMap::with_capacity(checks.len());
     for check in checks {
         let verification_result = approvals
-            .verify_check_at_root(repository_root, &check.name)
+            .verify_check_for_workspace(repository_root, workspace_root, settings, &check.name)
             .await
             .with_context(|| format!("Failed to verify check '{}'", check.name))?;
 
-        let program = handle_verification_result(verification_result, "checks", canonical_dir)?;
+        let program =
+            handle_verification_result(verification_result, ItemType::Check, workspace_root)?;
         resolved_checks.insert(check.name.clone(), program);
     }
 
@@ -363,8 +382,8 @@ impl VerifiedProject {
     /// `program` (the path verification resolved for `command[0]`) is what gets spawned;
     /// `command[0]` itself only appears in the reported [`CommandOutput`]. Spawning the raw
     /// string would re-resolve a relative program against `canonical_dir`, which is not the
-    /// repository root verification hashed against when the caller is in a jj secondary
-    /// workspace or git worktree.
+    /// workspace root verification resolved and hashed against, so an unapproved local copy
+    /// could shadow the approved binary.
     async fn execute_command_static(
         canonical_dir: &Path,
         name: &str,
@@ -404,7 +423,7 @@ mod tests {
     use super::*;
     use crate::project_config::approvals;
     use crate::test_helpers::{
-        assert_approved_copy_ran_in, setup_isolated_xdg_config,
+        assert_workspace_local_copy_ran, setup_isolated_xdg_config,
         setup_jj_main_and_secondary_workspace, setup_project_dir_with_config as setup_test_project,
     };
 
@@ -543,7 +562,7 @@ format = ["echo", "format"]
             VerificationResult::Approved {
                 program: PathBuf::from("/test/bin/echo"),
             },
-            "tools",
+            ItemType::Command,
             Path::new("/test/path"),
         )
         .expect("Should succeed for Approved result");
@@ -552,64 +571,48 @@ format = ["echo", "format"]
 
     #[tokio::test]
     async fn test_handle_verification_result_not_approved() {
-        let err = handle_verification_result(
+        // NotApproved is a failure variant — verification refuses the whole project. The wording is
+        // a static template; the structural contract is Err-vs-Ok.
+        handle_verification_result(
             VerificationResult::NotApproved,
-            "tools",
+            ItemType::Command,
             Path::new("/test/path"),
         )
         .expect_err("Should fail for NotApproved result");
-        let err_msg = format!("{:?}", err);
-        assert!(err_msg.contains("Project tools not approved"));
-        assert!(err_msg.contains("moriarty approve-project"));
     }
 
     #[tokio::test]
-    async fn test_handle_verification_result_config_hash_mismatch() {
-        let err = handle_verification_result(
-            VerificationResult::ConfigHashMismatch {
-                expected: "abc123".to_string(),
-                actual: "def456".to_string(),
-            },
-            "checks",
-            Path::new("/test/path"),
-        )
-        .expect_err("Should fail for ConfigHashMismatch result");
-        let err_msg = format!("{:?}", err);
-        assert!(err_msg.contains("tools.toml has been modified"));
-        assert!(err_msg.contains("abc123"));
-        assert!(err_msg.contains("def456"));
-    }
-
-    #[tokio::test]
-    async fn test_handle_verification_result_binary_hash_mismatch() {
-        let err = handle_verification_result(
-            VerificationResult::BinaryHashMismatch {
-                item: "mycheck".to_string(),
-                expected: "hash1".to_string(),
-                actual: "hash2".to_string(),
-            },
-            "checks",
-            Path::new("/test/path"),
-        )
-        .expect_err("Should fail for BinaryHashMismatch result");
-        let err_msg = format!("{:?}", err);
-        assert!(err_msg.contains("Binary for 'mycheck' has been modified"));
-        assert!(err_msg.contains("hash1"));
-        assert!(err_msg.contains("hash2"));
+    async fn test_handle_verification_result_item_changed_is_an_error() {
+        // ItemChanged (either an argv or a binary change) is a failure variant — verification
+        // refuses the item. The sentence wording is a static template (asserted nowhere); the
+        // structural contract is Err-vs-Ok, matching the other failure variants. Both args_changed
+        // values route through the same arm.
+        for args_changed in [true, false] {
+            handle_verification_result(
+                VerificationResult::ItemChanged {
+                    item: "lint".to_string(),
+                    args_changed,
+                    approved_versions: 1,
+                },
+                ItemType::Command,
+                Path::new("/test/path"),
+            )
+            .expect_err("ItemChanged must surface as an error");
+        }
     }
 
     #[tokio::test]
     async fn test_handle_verification_result_item_not_approved() {
-        let err = handle_verification_result(
+        // ItemNotApproved (the item name is configured-but-unapproved, or removed from config) is a
+        // failure variant — verification refuses the item.
+        handle_verification_result(
             VerificationResult::ItemNotApproved {
                 item: "mycheck".to_string(),
             },
-            "checks",
+            ItemType::Check,
             Path::new("/test/path"),
         )
         .expect_err("Should fail for ItemNotApproved result");
-        let err_msg = format!("{:?}", err);
-        assert!(err_msg.contains("Item 'mycheck' not approved"));
     }
 
     #[tokio::test]
@@ -621,48 +624,101 @@ format = ["echo", "format"]
             approved_project("[commands]\nlint = [\"echo\", \"lint\"]\n").await;
         let err = VerifiedProject::resolved_program(&project.resolved_commands, "not-recorded")
             .expect_err("unrecorded item must not execute");
-        let err_msg = format!("{:?}", err);
+        let err_msg = err.to_string();
         assert!(
             err_msg.contains("No verified program recorded"),
             "got: {err_msg}"
         );
     }
 
+    const DIVERGENT_MAIN_CONFIG: &str = "[commands]\ntest = [\"./tool.sh\"]\n\n[[checks]]\nname = \"where\"\ncommand = [\"./tool.sh\"]\n";
+    const DIVERGENT_WORKSPACE_CONFIG: &str = "[commands]\ntest = [\"./tool.sh\"]\n\n[[checks]]\nname = \"evil\"\ncommand = [\"./tool.sh\"]\n";
+
     #[tokio::test]
-    async fn secondary_workspace_cannot_substitute_config_or_programs() {
-        // The one claim under test: nothing a divergent secondary workspace carries — its own
-        // tools.toml (naming a different check) or its own copy of a relative program — can
-        // influence what runs; only the execution cwd is workspace-local. `test` (a command) and
-        // `where` (a check) share one script so both resolved maps and all three entry points
-        // (`run_command`, `run_all_commands`, `run_all_checks`) are proven in one scenario.
+    async fn secondary_workspace_with_divergent_binary_is_refused_until_approved() {
+        // Per-workspace config: approving main only does not let a secondary workspace run its own
+        // divergent ./tool.sh — its binary hash differs from main's approved copy, so verification
+        // refuses it until the workspace is approved on its own.
         let _xdg = setup_isolated_xdg_config();
-        let config = "[commands]\ntest = [\"./tool.sh\"]\n\n[[checks]]\nname = \"where\"\ncommand = [\"./tool.sh\"]\n";
-        let (_base, main, workspace) = setup_jj_main_and_secondary_workspace(config, "tool.sh");
-        approvals::approve_project_config(&main, config)
-            .await
-            .unwrap();
-        std::fs::create_dir_all(workspace.join(".config")).unwrap();
+        let (_base, main, workspace) =
+            setup_jj_main_and_secondary_workspace(DIVERGENT_MAIN_CONFIG, "tool.sh", false);
+        // The helper wrote the main config into the workspace too; overwrite it with the workspace's
+        // own divergent config (a different check name) so the workspace differs from main.
         std::fs::write(
             workspace.join(".config/tools.toml"),
-            "[commands]\n[[checks]]\nname = \"evil\"\ncommand = [\"./tool.sh\"]\n",
+            DIVERGENT_WORKSPACE_CONFIG,
         )
         .unwrap();
 
+        approvals::approve_project_config(&main, DIVERGENT_MAIN_CONFIG)
+            .await
+            .unwrap();
+        verify_and_load_project(workspace.clone())
+            .await
+            .expect_err("divergent workspace binary must be refused until approved");
+    }
+
+    #[tokio::test]
+    async fn approved_secondary_workspace_runs_its_own_config_and_copy() {
+        // Once the workspace's own config + binary are approved, it runs its own ./tool.sh (not
+        // main's) under its own tools.toml (the "evil" check, not main's "where"), with the
+        // workspace as cwd.
+        let _xdg = setup_isolated_xdg_config();
+        let (_base, _main, workspace) =
+            setup_jj_main_and_secondary_workspace(DIVERGENT_MAIN_CONFIG, "tool.sh", false);
+        std::fs::write(
+            workspace.join(".config/tools.toml"),
+            DIVERGENT_WORKSPACE_CONFIG,
+        )
+        .unwrap();
+
+        approvals::approve_project_config(&workspace, DIVERGENT_WORKSPACE_CONFIG)
+            .await
+            .unwrap();
         let project = verify_and_load_project(workspace.clone())
             .await
-            .expect("workspace should verify against the repository root's approved config");
+            .expect("workspace should verify against its own approved config");
         assert_eq!(
             project.settings.checks.as_ref().unwrap()[0].name,
-            "where",
-            "settings must come from the repository root's tools.toml, not the workspace copy"
+            "evil",
+            "settings must come from the workspace's own tools.toml"
         );
+        let out = project.run_command("test").await.unwrap();
+        assert_workspace_local_copy_ran(&out.stdout, &workspace);
+    }
 
-        let single = project.run_command("test").await.unwrap();
-        assert_approved_copy_ran_in(&single.stdout, &main, &workspace);
-        let all_commands = project.run_all_commands().await.unwrap();
-        assert_approved_copy_ran_in(&all_commands[0].stdout, &main, &workspace);
-        let all_checks = project.run_all_checks().await.unwrap();
-        assert_approved_copy_ran_in(&all_checks[0].stdout, &main, &workspace);
+    #[tokio::test]
+    async fn identical_secondary_workspace_shares_approval_without_reapproval() {
+        // Relative-path normalization + repo-root keying: an identical tools.toml AND byte-identical
+        // script in a secondary workspace run with NO separate approval — the main-workspace
+        // approval matches because the stored paths are workspace-relative and the binary hashes
+        // agree. This is the cross-worktree sharing the per-workspace model preserves.
+        let _xdg = setup_isolated_xdg_config();
+        let config = "[commands]\ntest = [\"./tool.sh\"]\n";
+        let (_base, main, workspace) =
+            setup_jj_main_and_secondary_workspace(config, "tool.sh", true);
+
+        // Approve main only.
+        approvals::approve_project_config(&main, config)
+            .await
+            .unwrap();
+
+        // The workspace verifies and runs against the shared approval — no separate approval.
+        let project = verify_and_load_project(workspace.clone())
+            .await
+            .expect("workspace should share the main approval");
+        let out = project.run_command("test").await.unwrap();
+        assert!(
+            out.stdout.contains("shared-copy"),
+            "the shared approved script must run, got: {}",
+            out.stdout
+        );
+        assert!(
+            out.stdout
+                .contains(workspace.canonicalize().unwrap().to_str().unwrap()),
+            "cwd should be the secondary workspace, got: {}",
+            out.stdout
+        );
     }
 
     #[tokio::test]
@@ -710,7 +766,7 @@ command = ["echo", "check"]
         let err = verify_and_load_project(temp_dir.path().to_path_buf())
             .await
             .expect_err("Should fail for unapproved check");
-        let err_msg = format!("{:?}", err);
+        let err_msg = err.to_string();
         assert!(err_msg.contains("not approved"));
     }
 

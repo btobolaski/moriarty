@@ -7,12 +7,16 @@
 //!   function for reading configuration files.
 //!
 //! - **[`approvals`]**: Security approval system for verifying that project tools haven't changed.
-//!   Tracks SHA-256 hashes of configuration files and binaries, provides verification logic,
-//!   and manages approval persistence with file locking.
+//!   Binds each command's argv plus its resolved binary paths and SHA-256 hash as match-any approved
+//!   versions per command name, keyed by repository root (shared across worktrees) with the config
+//!   loaded from the workspace root. Provides verification logic and manages approval persistence
+//!   with file locking.
 //!
 //! - **[`runner`]**: Verified command execution for project tools. Combines configuration loading
-//!   and approval verification into a safe execution model. Provides [`verify_and_load_project`]
-//!   for loading verified projects and [`VerifiedProject`] for running commands.
+//!   and approval verification into a safe execution model. The configuration is loaded from the
+//!   caller's workspace root (so each worktree runs its own tooling) while approvals stay keyed by
+//!   repository root. Provides [`verify_and_load_project`] for loading verified projects and
+//!   [`VerifiedProject`] for running commands.
 //!
 //! ## Usage
 //!
@@ -44,8 +48,9 @@ pub mod runner;
 
 // Re-export commonly used types and functions
 pub use approvals::{
-    CommandApproval, ProjectApprovals, VerificationResult, is_script, is_within_project,
-    is_writable, read_script_contents, resolve_binary_path_with_original,
+    CommandApproval, ItemType, ProjectApprovals, VerificationResult, is_script, is_within_project,
+    is_writable, normalize_path_for_storage, read_script_contents,
+    resolve_binary_path_with_original,
 };
 pub use config::{ProjectConfig, load_project_settings};
 // Allow unused imports warning for re-exports that are part of the public API

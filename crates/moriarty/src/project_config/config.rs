@@ -15,11 +15,39 @@
 //! format = ["cargo", "fmt"]
 //! ```
 
-use std::path::PathBuf;
+use std::{
+    collections::HashSet,
+    error::Error as StdError,
+    fmt::{Display, Formatter, Result as FmtResult},
+    path::PathBuf,
+};
 
-use miette::IntoDiagnostic;
+use miette::{Diagnostic, IntoDiagnostic};
 use serde::{Deserialize, Serialize};
 use tokio::fs::read_to_string;
+
+#[derive(Debug)]
+struct DuplicateCheckName {
+    name: String,
+    config_path: String,
+}
+
+impl Display for DuplicateCheckName {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
+        write!(
+            formatter,
+            "duplicate check name '{}' in {}",
+            self.name, self.config_path
+        )
+    }
+}
+
+impl StdError for DuplicateCheckName {}
+impl Diagnostic for DuplicateCheckName {}
+
+pub(crate) fn is_duplicate_check_name(error: &miette::Error) -> bool {
+    error.downcast_ref::<DuplicateCheckName>().is_some()
+}
 
 /// Project configuration loaded from `.config/tools.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,7 +135,9 @@ impl Commands {
 /// - Commands (lint, test, build, format) are predefined project tools
 /// - Checks are arbitrary validation scripts (e.g., security audits, license checks)
 ///
-/// Both undergo the same approval process with binary verification and security checks.
+/// Both undergo the same approval process with binary verification and security checks. Check
+/// names key their approvals, so [`load_project_settings`] rejects duplicates before anything can
+/// verify or execute against an ambiguous name.
 ///
 /// # Fields
 ///
@@ -150,6 +180,7 @@ pub struct Check {
 /// - The file cannot be read
 /// - The file contains invalid TOML syntax
 /// - The TOML structure doesn't match the expected schema
+/// - Two checks use the same name
 pub async fn load_project_settings(canonical_dir: PathBuf) -> miette::Result<ProjectConfig> {
     // Path is already canonicalized by the caller to prevent traversal attacks
     let mut config_path = canonical_dir.clone();
@@ -169,6 +200,16 @@ pub async fn load_project_settings(canonical_dir: PathBuf) -> miette::Result<Pro
     let settings: ProjectConfig = toml::from_str(project_settings_contents.as_str())
         .into_diagnostic()
         .map_err(|error| error.context("failed to parse project settings"))?;
+
+    let mut check_names = HashSet::new();
+    for check in settings.checks.as_deref().unwrap_or_default() {
+        if !check_names.insert(check.name.as_str()) {
+            return Err(miette::Error::new(DuplicateCheckName {
+                name: check.name.clone(),
+                config_path: config_path.to_string_lossy().into_owned(),
+            }));
+        }
+    }
 
     Ok(settings)
 }
@@ -432,6 +473,28 @@ command = ["./scripts/check-licenses.sh"]
             checks[1].command,
             vec!["./scripts/check-licenses.sh".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn test_load_project_settings_rejects_duplicate_check_names() {
+        let temp_dir = setup_project_with_config(
+            r#"
+[commands]
+
+[[checks]]
+name = "audit"
+command = ["cargo", "audit"]
+
+[[checks]]
+name = "audit"
+command = ["cargo", "audit", "--dangerous"]
+"#,
+        );
+
+        let error = load_project_settings(temp_dir.path().to_path_buf())
+            .await
+            .expect_err("duplicate check names must fail closed");
+        assert!(is_duplicate_check_name(&error));
     }
 
     #[tokio::test]

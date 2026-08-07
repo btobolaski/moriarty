@@ -183,26 +183,26 @@ pub fn create_executable_script(path: &Path, body: &str) {
     }
 }
 
-/// Lay out a jj main workspace plus a secondary workspace whose `.jj/repo` pointer file targets
-/// the main store, with `config` written to the main workspace's `.config/tools.toml` and a
-/// deliberately divergent `./<script>` in each working copy: the main (approvable) copy prints
-/// the markers [`assert_approved_copy_ran_in`] checks for — "approved-copy" plus its physical
-/// cwd — while the workspace copy prints "unapproved-workspace-copy".
-///
-/// Returns `(base_guard, main_dir, workspace_dir)`; the guard must outlive the test. Approval is
-/// left to the caller and must come after any additional files, since it hashes the referenced
-/// binaries.
+/// Lay out jj main/secondary workspaces with `config` in both. `identical_scripts` selects
+/// byte-identical scripts; otherwise the scripts diverge for binary-mismatch tests. The returned
+/// base guard must outlive the test, and approval must follow any fixture edits.
 pub fn setup_jj_main_and_secondary_workspace(
     config: &str,
     script: &str,
+    identical_scripts: bool,
 ) -> (TempDir, PathBuf, PathBuf) {
     let base = TempDir::new().unwrap();
+    let (main_marker, workspace_marker) = if identical_scripts {
+        ("shared-copy", "shared-copy")
+    } else {
+        ("main-copy", "workspace-copy")
+    };
 
     let main = base.path().join("main");
     std::fs::create_dir_all(main.join(".jj/repo")).unwrap();
     std::fs::create_dir_all(main.join(".config")).unwrap();
     std::fs::write(main.join(".config/tools.toml"), config).unwrap();
-    create_executable_script(&main.join(script), "echo approved-copy\npwd -P");
+    create_executable_script(&main.join(script), &format!("echo {main_marker}\npwd -P"));
 
     let workspace = base.path().join("workspace");
     std::fs::create_dir_all(workspace.join(".jj")).unwrap();
@@ -211,32 +211,34 @@ pub fn setup_jj_main_and_secondary_workspace(
         main.join(".jj/repo").to_str().unwrap(),
     )
     .unwrap();
-    create_executable_script(&workspace.join(script), "echo unapproved-workspace-copy");
+    std::fs::create_dir_all(workspace.join(".config")).unwrap();
+    std::fs::write(workspace.join(".config/tools.toml"), config).unwrap();
+    create_executable_script(
+        &workspace.join(script),
+        &format!("echo {workspace_marker}\npwd -P"),
+    );
 
     (base, main, workspace)
 }
 
-/// Assert `output` proves the approved main-workspace script from
-/// [`setup_jj_main_and_secondary_workspace`] ran — not the workspace's shadow copy — with the
-/// secondary workspace as its physical working directory.
-pub fn assert_approved_copy_ran_in(output: &str, main: &Path, workspace: &Path) {
+/// Assert `output` proves the workspace-local script from
+/// [`setup_jj_main_and_secondary_workspace`] ran once the workspace was approved — not the main
+/// copy — with the secondary workspace as its physical working directory. In the per-workspace
+/// model the approved copy that runs is the one verification resolved against the workspace root,
+/// so approving the workspace makes its own `./<script>` (printing `workspace-copy`) run.
+pub fn assert_workspace_local_copy_ran(output: &str, workspace: &Path) {
     let workspace_root = workspace.canonicalize().unwrap();
-    let main_root = main.canonicalize().unwrap();
     assert!(
-        output.contains("approved-copy"),
-        "the hashed repository copy must run, got: {output}"
+        output.contains("workspace-copy"),
+        "the approved workspace-local copy must run, got: {output}"
     );
     assert!(
-        !output.contains("unapproved-workspace-copy"),
-        "the workspace copy must not shadow the approved one, got: {output}"
+        !output.contains("main-copy"),
+        "the main copy must not run once the workspace is approved, got: {output}"
     );
     assert!(
         output.contains(workspace_root.to_str().unwrap()),
         "cwd must be the secondary workspace, got: {output}"
-    );
-    assert!(
-        !output.contains(main_root.to_str().unwrap()),
-        "cwd must not be the main workspace, got: {output}"
     );
 }
 
