@@ -80,6 +80,7 @@
 .Op Fl \-json
 .Op Fl \-explain
 .Op Fl \-cwd Ar dir
+.Op Fl \-mode Ar default|plan|acceptEdits|auto|dontAsk|bypassPermissions
 .Op Ar command
 .Nm
 .Cm rules lint
@@ -255,6 +256,16 @@ The
 .Cm hooks exec
 subcommand executes Claude Code hooks, reading input from stdin
 and applying configured tool and bash rules.
+Both rule kinds may use an optional
+.Ic modes
+allow\-list; omitted applies in every mode and an empty list disables the rule.
+Restricted rules require the event's exact
+.Cm default , plan , acceptEdits , auto , dontAsk ,
+or
+.Cm bypassPermissions
+value; Manual arrives as
+.Cm default .
+Ineligible rules are skipped in place, preserving first\-match order among eligible rules.
 This is the entry point used by Claude Code's hook system.
 For the Stop hook it runs the project's approved checks from
 .Pa .config/tools.toml .
@@ -272,6 +283,8 @@ subcommand reads the JSON-lines hook logs from
 .Pq or the directory given by the \-d / \-\-dir option
 and prints a JSON report of recorded PreToolUse results, aggregated by the
 exact tool, arguments, result, and deciding rule with a count per group.
+Permission mode is retained internally for replay and suggestions but deliberately does not change this public grouping
+or JSON shape.
 Each row names the rule whose action produced the decision; the field is omitted
 when no rule decided
 .Pq passthrough, an unconfigured Ask, or a compound whose merged leaves matched no rule .
@@ -313,6 +326,13 @@ output reports the single\-command result and is unchanged.
 .It Fl \-cwd Ar dir
 Simulate the hook working directory for in\-cwd absolute\-path normalization.
 Defaults to the process working directory.
+.It Fl \-mode Ar mode
+Simulate the hook permission mode for normal and
+.Fl \-explain
+evaluation.
+Accepted values are
+.Cm default , plan , acceptEdits , auto , dontAsk , bypassPermissions .
+Omitting this option runs a mode\-less test evaluation, so only unrestricted rules participate.
 .El
 .El
 .Ss Rules
@@ -328,7 +348,10 @@ Report rules the hook silently ignores
 exiting nonzero if any exist.
 With
 .Fl \-strict ,
-additionally warn about likely\-shadowed and over\-broad Allow rules.
+additionally warn about permanently disabled
+.Ic modes = [] ,
+likely\-shadowed rules, and over\-broad Allow rules.
+A shadow warning requires overlapping permission\-mode eligibility.
 .It Cm rules list\-fragments
 List the merged pattern fragments
 .Pq built\-in defaults plus user\-defined ,
@@ -366,6 +389,8 @@ closed alternation
 falling back to the program prefix when any observed leaf has a flag, path, or bare
 invocation in subcommand position.
 The suggestion lists every observed command it covers so the generalization is reviewable.
+Generated rules carry the canonical union of contributing recorded modes; if any contributor is mode\-less,
+the rule is unrestricted because its mode cannot be reconstructed.
 By default only log lines recorded under the rule set currently installed at
 .Pa ~/.config/moriarty/tool_rules.toml
 are mined, so suggestions reflect the rules in force;
@@ -396,6 +421,8 @@ so the baseline is coherent;
 pins a specific rule\-set hash and
 .Fl \-all\-rules
 replays every recorded line.
+Each recorded row is replayed under its recorded permission mode, and divergence rows include that mode.
+Mode\-less rows enable only unrestricted candidate rules.
 Each hook decision is stamped in the log with a hash of the effective rule set that
 produced it, which is what these filters match.
 .El

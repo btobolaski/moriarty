@@ -71,9 +71,10 @@ use ::tracing::{debug, error, info, warn};
 use miette::Result;
 use serde_json::{Map, Value};
 
-use crate::HooksCommand;
-use crate::checks::CheckRunOutcome;
-use crate::user_config::load_user_config;
+use crate::{
+    HooksCommand, checks::CheckRunOutcome, permission_mode::PermissionMode,
+    user_config::load_user_config,
+};
 use parser::{
     HookDecision, HookEventData, HookInput, HookOutput, HookSpecificOutput, PermissionDecision,
     PreToolUseOutput,
@@ -268,7 +269,13 @@ async fn exec_hook_impl<R: Read>(reader: R) -> Result<()> {
         ref tool_input,
     } = hook_input.event_data
     {
-        let outcome = handle_pretool_hook(tool_name, tool_input, &hook_input.cwd).await?;
+        let outcome = handle_pretool_hook(
+            tool_name,
+            tool_input,
+            &hook_input.cwd,
+            Some(hook_input.permission_mode),
+        )
+        .await?;
         let hook_output = outcome.output;
 
         let json_output = serde_json::to_string(&hook_output)
@@ -278,10 +285,12 @@ async fn exec_hook_impl<R: Read>(reader: R) -> Result<()> {
 
         let tool_args = tool_args_for_log(tool_input);
         let result = pretool_result(&hook_output);
+        let permission_mode = hook_input.permission_mode.to_string();
         info!(
             tool_name = %tool_name,
             tool_args = %tool_args,
             cwd = %hook_input.cwd,
+            permission_mode = %permission_mode,
             rules_hash = outcome.rules_hash.as_deref().unwrap_or_default(),
             rule = outcome.rule.as_deref().unwrap_or_default(),
             result = result.as_str(),
@@ -375,8 +384,8 @@ async fn load_config_or_ask() -> std::result::Result<crate::user_config::UserCon
 
 /// A decision plus the provenance the completion log records. Grouped because the three values are
 /// produced together and only meaningful as a unit: the log line must attribute the decision to the
-/// rule set and rule that made it, and `None` (not an empty string) marks "no rules involved" so
-/// the report layer can distinguish legacy lines from genuinely unattributed decisions.
+/// rule set and rule that made it; `None` (not an empty string) preserves "no rules involved"
+/// until the completion event is serialized.
 struct PretoolOutcome {
     output: HookOutput,
     /// Hash of the rule set that produced this decision (see
@@ -396,6 +405,7 @@ async fn handle_pretool_hook(
     tool_name: &str,
     tool_input: &serde_json::Value,
     cwd: &str,
+    mode: Option<PermissionMode>,
 ) -> Result<PretoolOutcome> {
     let config = match load_config_or_ask().await {
         Ok(c) => c,
@@ -422,7 +432,7 @@ async fn handle_pretool_hook(
             rules.clone(),
             config.pattern_fragments.clone(),
         );
-        let result = engine.apply_rules(tool_name, tool_input, cwd).await;
+        let result = engine.apply_rules(tool_name, tool_input, cwd, mode).await;
 
         match result {
             tool_rules::ToolRuleResult::Allowed { rule_name } => {
@@ -457,7 +467,8 @@ async fn handle_pretool_hook(
     }
 
     if tool_name == "Bash" {
-        let (output, rule) = handle_bash_pretool_hook_with_config(tool_input, config, cwd).await?;
+        let (output, rule) =
+            handle_bash_pretool_hook_with_config(tool_input, config, cwd, mode).await?;
         Ok(outcome(output, rule))
     } else {
         debug!(tool_name = %tool_name, "No tool rules matched for non-Bash tool, deferring to Claude Code");
@@ -475,7 +486,7 @@ async fn handle_bash_pretool_hook(tool_input: &serde_json::Value, cwd: &str) -> 
         Ok(c) => c,
         Err(fallback) => return Ok(fallback),
     };
-    handle_bash_pretool_hook_with_config(tool_input, config, cwd)
+    handle_bash_pretool_hook_with_config(tool_input, config, cwd, None)
         .await
         .map(|(output, _rule)| output)
 }
@@ -492,6 +503,7 @@ async fn handle_bash_pretool_hook_with_config(
     tool_input: &serde_json::Value,
     config: crate::user_config::UserConfig,
     cwd: &str,
+    mode: Option<PermissionMode>,
 ) -> Result<(HookOutput, Option<String>)> {
     use bash_rules::{BashRuleEngine, RuleResult};
 
@@ -511,7 +523,7 @@ async fn handle_bash_pretool_hook_with_config(
     };
 
     let engine = BashRuleEngine::from_config(bash_rules, config.pattern_fragments)?;
-    let result = engine.apply_rules_compound(command, cwd);
+    let result = engine.apply_rules_compound(command, cwd, mode);
 
     match result {
         RuleResult::Allowed { rule_name } => {
@@ -573,7 +585,7 @@ async fn handle_bash_pretool_hook_with_config(
                 "Command arguments filtered, re-validating"
             );
 
-            let recheck_result = engine.apply_rules_compound(&new_command, cwd);
+            let recheck_result = engine.apply_rules_compound(&new_command, cwd, mode);
 
             match recheck_result {
                 RuleResult::Allowed {

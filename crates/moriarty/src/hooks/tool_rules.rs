@@ -8,7 +8,7 @@
 //! non-existent targets. Regex values under `cwd` are normalized to relative paths.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     ffi::OsString,
     fs, io,
     path::{Component, Path, PathBuf},
@@ -22,7 +22,10 @@ use super::bash_rules::{
     RuleDiagnostic, RuleDiagnosticKind, classify_fragment_error, default_fragments,
     expand_fragments,
 };
-use crate::user_config::{ToolRule, ToolRuleAction, ToolRuleCondition};
+use crate::{
+    permission_mode::{PermissionMode, is_mode_eligible},
+    user_config::{ToolRule, ToolRuleAction, ToolRuleCondition},
+};
 
 const PATH_FIELD: &str = "path";
 const FILE_PATH_FIELD: &str = "file_path";
@@ -67,6 +70,7 @@ struct LegacyPattern {
 struct CompiledToolRule {
     name: String,
     tool: String,
+    modes: Option<BTreeSet<PermissionMode>>,
     allow_local: bool,
     legacy: Option<LegacyPattern>,
     conditions: Vec<CompiledCondition>,
@@ -139,20 +143,6 @@ pub enum ToolRuleResult {
 #[derive(Debug)]
 pub struct ToolRuleEngine {
     rules: Vec<CompiledToolRule>,
-    allow_local_tools: HashSet<String>,
-    has_wildcard_allow_local: bool,
-}
-
-fn record_allow_local_tool(
-    allow_local_tools: &mut HashSet<String>,
-    has_wildcard_allow_local: &mut bool,
-    tool: &str,
-) {
-    if tool == "*" {
-        *has_wildcard_allow_local = true;
-    } else {
-        allow_local_tools.insert(tool.to_string());
-    }
 }
 
 /// Extracts only the `path` and `file_path` fields from the tool input so that only those
@@ -261,8 +251,6 @@ impl ToolRuleEngine {
         }
 
         let mut compiled = Vec::new();
-        let mut allow_local_tools = HashSet::new();
-        let mut has_wildcard_allow_local = false;
         let mut diagnostics = Vec::new();
 
         for mut rule in rules {
@@ -313,16 +301,10 @@ impl ToolRuleEngine {
                 }
             };
 
-            if rule.allow_local {
-                record_allow_local_tool(
-                    &mut allow_local_tools,
-                    &mut has_wildcard_allow_local,
-                    &rule.tool,
-                );
-            }
             compiled.push(CompiledToolRule {
                 name: rule.name,
                 tool: rule.tool,
+                modes: rule.modes,
                 allow_local: rule.allow_local,
                 legacy,
                 conditions: compiled_conditions,
@@ -330,18 +312,15 @@ impl ToolRuleEngine {
             });
         }
 
-        (
-            Self {
-                rules: compiled,
-                allow_local_tools,
-                has_wildcard_allow_local,
-            },
-            diagnostics,
-        )
+        (Self { rules: compiled }, diagnostics)
     }
 
-    fn has_matching_allow_local_rule(&self, tool_name: &str) -> bool {
-        self.has_wildcard_allow_local || self.allow_local_tools.contains(tool_name)
+    fn has_matching_allow_local_rule(&self, tool_name: &str, mode: Option<PermissionMode>) -> bool {
+        self.rules.iter().any(|rule| {
+            rule.allow_local
+                && (rule.tool == "*" || rule.tool == tool_name)
+                && is_mode_eligible(rule.modes.as_ref(), mode)
+        })
     }
 
     fn apply_rules_core(
@@ -349,9 +328,14 @@ impl ToolRuleEngine {
         tool_name: &str,
         tool_input: &serde_json::Value,
         cwd: &str,
+        mode: Option<PermissionMode>,
         local_evaluation: Option<&LocalPathEvaluation>,
     ) -> ToolRuleResult {
         for rule in &self.rules {
+            if !is_mode_eligible(rule.modes.as_ref(), mode) {
+                continue;
+            }
+
             if rule.tool != "*" && rule.tool != tool_name {
                 continue;
             }
@@ -413,8 +397,9 @@ impl ToolRuleEngine {
         tool_name: &str,
         tool_input: &serde_json::Value,
         cwd: &str,
+        mode: Option<PermissionMode>,
     ) -> ToolRuleResult {
-        let local_evaluation = if self.has_matching_allow_local_rule(tool_name) {
+        let local_evaluation = if self.has_matching_allow_local_rule(tool_name, mode) {
             let locality_value = locality_input(tool_input);
             let cwd_owned = cwd.to_string();
             match spawn_blocking(move || {
@@ -435,7 +420,7 @@ impl ToolRuleEngine {
             None
         };
 
-        self.apply_rules_core(tool_name, tool_input, cwd, local_evaluation.as_ref())
+        self.apply_rules_core(tool_name, tool_input, cwd, mode, local_evaluation.as_ref())
     }
 
     #[cfg(test)]
@@ -444,13 +429,14 @@ impl ToolRuleEngine {
         tool_name: &str,
         tool_input: &serde_json::Value,
         cwd: &str,
+        mode: Option<PermissionMode>,
     ) -> ToolRuleResult {
         let local_evaluation = self
-            .has_matching_allow_local_rule(tool_name)
+            .has_matching_allow_local_rule(tool_name, mode)
             .then(|| evaluate_local_paths(&locality_input(tool_input), Path::new(cwd)))
             .flatten();
 
-        self.apply_rules_core(tool_name, tool_input, cwd, local_evaluation.as_ref())
+        self.apply_rules_core(tool_name, tool_input, cwd, mode, local_evaluation.as_ref())
     }
 }
 
@@ -769,6 +755,7 @@ mod tests {
         ToolRule {
             name: name.to_string(),
             tool: tool.to_string(),
+            modes: None,
             allow_local: false,
             field: None,
             pattern: None,
@@ -787,6 +774,7 @@ mod tests {
         fn with_pattern(self, pattern: &str) -> Self;
         fn with_legacy(self, field: &str, pattern: &str) -> Self;
         fn with_conditions(self, conditions: Vec<ToolRuleCondition>) -> Self;
+        fn with_modes(self, modes: impl IntoIterator<Item = PermissionMode>) -> Self;
         fn with_action(self, action: ToolRuleAction) -> Self;
     }
 
@@ -812,6 +800,11 @@ mod tests {
 
         fn with_conditions(mut self, conditions: Vec<ToolRuleCondition>) -> Self {
             self.conditions = conditions;
+            self
+        }
+
+        fn with_modes(mut self, modes: impl IntoIterator<Item = PermissionMode>) -> Self {
+            self.modes = Some(modes.into_iter().collect());
             self
         }
 
@@ -894,7 +887,7 @@ mod tests {
         cwd: &str,
         expected: ToolRuleResult,
     ) {
-        assert_eq!(engine.apply_rules_sync(tool, &input, cwd), expected);
+        assert_eq!(engine.apply_rules_sync(tool, &input, cwd, None), expected);
     }
 
     fn assert_allow_cases(
@@ -910,14 +903,14 @@ mod tests {
         let engine = ToolRuleEngine::from_config(vec![rule], None);
         for input in matches {
             assert_eq!(
-                engine.apply_rules_sync(tool, input, cwd),
+                engine.apply_rules_sync(tool, input, cwd, None),
                 expected,
                 "expected match for {input}"
             );
         }
         for input in misses {
             assert_eq!(
-                engine.apply_rules_sync(tool, input, cwd),
+                engine.apply_rules_sync(tool, input, cwd, None),
                 ToolRuleResult::NoMatch,
                 "expected no match for {input}"
             );
@@ -965,7 +958,7 @@ mod tests {
         input: &serde_json::Value,
         cwd: &str,
     ) -> ToolRuleResult {
-        ToolRuleEngine::from_config(rules, fragments).apply_rules_sync(tool, input, cwd)
+        ToolRuleEngine::from_config(rules, fragments).apply_rules_sync(tool, input, cwd, None)
     }
 
     #[test]
@@ -1004,6 +997,75 @@ mod tests {
             "",
             ToolRuleResult::NoMatch,
         );
+    }
+
+    #[test]
+    fn permission_modes_gate_ordered_tool_rules() {
+        let plan_deny = make_rule("plan-only", "Read")
+            .with_modes([PermissionMode::Plan])
+            .with_action(ToolRuleAction::Deny {
+                value: "plan deny".to_string(),
+            });
+        let disabled =
+            make_rule("disabled", "Read")
+                .with_modes([])
+                .with_action(ToolRuleAction::Deny {
+                    value: "disabled".to_string(),
+                });
+        let engine = ToolRuleEngine::from_config(
+            vec![disabled, plan_deny, make_rule("fallback", "Read")],
+            None,
+        );
+        let input = serde_json::json!({});
+
+        assert_eq!(
+            engine.apply_rules_sync("Read", &input, "", Some(PermissionMode::Plan)),
+            ToolRuleResult::Denied {
+                rule_name: "plan-only".to_string(),
+                reason: "plan deny".to_string(),
+            }
+        );
+        assert_eq!(
+            engine.apply_rules_sync("Read", &input, "", Some(PermissionMode::Default)),
+            ToolRuleResult::Allowed {
+                rule_name: "fallback".to_string(),
+            }
+        );
+        assert_eq!(
+            engine.apply_rules_sync("Read", &input, "", None),
+            ToolRuleResult::Allowed {
+                rule_name: "fallback".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn unrestricted_tool_rule_applies_with_or_without_a_current_mode() {
+        let engine = ToolRuleEngine::from_config(vec![make_rule("all", "Read")], None);
+        let input = serde_json::json!({});
+        assert!(matches!(
+            engine.apply_rules_sync("Read", &input, "", Some(PermissionMode::Plan)),
+            ToolRuleResult::Allowed { .. }
+        ));
+        assert!(matches!(
+            engine.apply_rules_sync("Read", &input, "", None),
+            ToolRuleResult::Allowed { .. }
+        ));
+    }
+
+    #[test]
+    fn locality_preflight_requires_a_mode_eligible_rule() {
+        let engine = ToolRuleEngine::from_config(
+            vec![
+                make_rule("plan-local", "Read")
+                    .local()
+                    .with_modes([PermissionMode::Plan]),
+            ],
+            None,
+        );
+        assert!(!engine.has_matching_allow_local_rule("Read", Some(PermissionMode::Default)));
+        assert!(!engine.has_matching_allow_local_rule("Read", None));
+        assert!(engine.has_matching_allow_local_rule("Read", Some(PermissionMode::Plan)));
     }
 
     #[test]
@@ -1240,14 +1302,20 @@ mod tests {
             engine.apply_rules_sync(
                 "Read",
                 &serde_json::json!({"file_path": "/home/user/project/src/main.rs"}),
-                ""
+                "",
+                None,
             ),
             ToolRuleResult::Allowed {
                 rule_name: "allow-project-read".to_string()
             }
         );
         assert_eq!(
-            engine.apply_rules_sync("Read", &serde_json::json!({"file_path": "/other/path"}), ""),
+            engine.apply_rules_sync(
+                "Read",
+                &serde_json::json!({"file_path": "/other/path"}),
+                "",
+                None,
+            ),
             ToolRuleResult::NoMatch
         );
     }
@@ -1261,13 +1329,13 @@ mod tests {
         let engine = ToolRuleEngine::from_config(rules, None);
 
         assert_eq!(
-            engine.apply_rules_sync("Read", &serde_json::json!({}), ""),
+            engine.apply_rules_sync("Read", &serde_json::json!({}), "", None),
             ToolRuleResult::Allowed {
                 rule_name: "allow-read".to_string()
             }
         );
         assert_eq!(
-            engine.apply_rules_sync("Write", &serde_json::json!({}), ""),
+            engine.apply_rules_sync("Write", &serde_json::json!({}), "", None),
             ToolRuleResult::Asked {
                 rule_name: "ask-all".to_string()
             }
@@ -1540,7 +1608,8 @@ mod tests {
                 engine.apply_rules_sync(
                     "Edit",
                     &serde_json::json!({"path": cwd.join(matching_path)}),
-                    cwd_str
+                    cwd_str,
+                    None,
                 ),
                 matching_expected,
                 "case {label}: matching path"
@@ -1550,7 +1619,7 @@ mod tests {
                 None => serde_json::json!({"path": "/outside/local.txt"}),
             };
             assert_eq!(
-                engine.apply_rules_sync("Write", &nonmatching_input, cwd_str),
+                engine.apply_rules_sync("Write", &nonmatching_input, cwd_str, None),
                 nonmatching_expected,
                 "case {label}: nonmatching path"
             );
@@ -1844,7 +1913,7 @@ mod tests {
         assert_eq!(engine.rules.len(), 1);
         // The valid tool-name-only rule still compiled and is enforced.
         assert_eq!(
-            engine.apply_rules_sync("Read", &serde_json::json!({}), ""),
+            engine.apply_rules_sync("Read", &serde_json::json!({}), "", None),
             ToolRuleResult::Allowed {
                 rule_name: "good".to_string()
             }

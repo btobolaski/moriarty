@@ -17,11 +17,11 @@ use chrono::{DateTime, Utc};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tracing::warn;
 
 // local / workspace deps
 use super::result::PreToolResult;
-use crate::cost_report::TimeRangeFilter;
-use crate::persistence::FileType;
+use crate::{cost_report::TimeRangeFilter, permission_mode::PermissionMode, persistence::FileType};
 
 const COMPLETION_MESSAGE: &str = "PreToolUse hook completed";
 
@@ -43,10 +43,12 @@ struct LogEventFields {
     result: Option<PreToolResult>,
     // Provenance the rules commands need; optional because lines predating each field still parse.
     cwd: Option<String>,
+    permission_mode: Option<String>,
     rules_hash: Option<String>,
     rule: Option<String>,
 }
 
+#[derive(Clone)]
 struct HookRecord {
     timestamp: DateTime<Utc>,
     tool_name: String,
@@ -54,21 +56,23 @@ struct HookRecord {
     result: PreToolResult,
     /// The hook's working directory, used by the rules path to normalize commands as the hook did.
     cwd: Option<String>,
+    /// Missing or unrecognized modes enable only unrestricted rules during replay.
+    permission_mode: Option<PermissionMode>,
     /// Hash of the rule set in force when this decision was made (see [`crate::rules`]).
     rules_hash: Option<String>,
     /// Name of the rule whose action produced the decision; `None` when no rule decided.
     rule: Option<String>,
 }
 
-#[derive(Debug, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub(crate) struct ReportRow {
     pub(crate) tool_name: String,
     pub(crate) arguments: Value,
     pub(crate) result: PreToolResult,
     pub(crate) count: u64,
     /// The rule that decided these calls. Part of the grouping key, so one row never mixes
-    /// decisions from different rules; omitted from the JSON when no rule decided (legacy lines and
-    /// passthrough/unconfigured outcomes), keeping those rows' serialization unchanged.
+    /// decisions from different rules; omitted from the JSON when no rule decided (historical lines
+    /// and passthrough/unconfigured outcomes), keeping those rows' serialization unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) rule: Option<String>,
     /// The cwd these calls ran under. Skipped in `hooks report` output, which groups without cwd so
@@ -76,6 +80,9 @@ pub(crate) struct ReportRow {
     /// rules path via [`aggregate_with_cwd`]. Empty string for the `hooks report` grouping.
     #[serde(skip)]
     pub(crate) cwd: String,
+    /// Internal rules utilities group and evaluate by mode; the public report deliberately omits it.
+    #[serde(skip)]
+    pub(crate) permission_mode: Option<PermissionMode>,
 }
 
 impl ReportRow {
@@ -119,8 +126,15 @@ pub(crate) struct CwdAggregation {
     pub(crate) skipped: HashSkipStats,
 }
 
-/// Grouping key for [`build_rows`]: tool name, raw `tool_args`, result, deciding rule, cwd.
-type RowKey = (String, String, PreToolResult, Option<String>, String);
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct RowKey {
+    tool_name: String,
+    tool_args: String,
+    result: PreToolResult,
+    rule: Option<String>,
+    cwd: String,
+    permission_mode: Option<PermissionMode>,
+}
 
 pub async fn run(
     dir: Option<PathBuf>,
@@ -231,12 +245,24 @@ fn parse_record(line: &str) -> Option<HookRecord> {
         tool_args: envelope.fields.tool_args?,
         result: envelope.fields.result?,
         cwd: envelope.fields.cwd,
+        permission_mode: parse_recorded_permission_mode(envelope.fields.permission_mode),
         // The log writes `""` (not an absent key) for "no rules hash" / "no deciding rule", so an
         // empty value must mean None here — otherwise the hash filter would misclassify a
         // config-load-failure line as belonging to some other rule set.
         rules_hash: envelope.fields.rules_hash.filter(|hash| !hash.is_empty()),
         rule: envelope.fields.rule.filter(|rule| !rule.is_empty()),
     })
+}
+
+fn parse_recorded_permission_mode(mode: Option<String>) -> Option<PermissionMode> {
+    let mode = mode.filter(|mode| !mode.is_empty())?;
+    match serde_json::from_value(Value::String(mode.clone())) {
+        Ok(mode) => Some(mode),
+        Err(error) => {
+            warn!(permission_mode = %mode, %error, "Treating unrecognized recorded permission mode as mode-less");
+            None
+        }
+    }
 }
 
 /// Groups records by `(tool, arguments, result)`. When `include_cwd` is set, the cwd also joins the
@@ -282,19 +308,20 @@ fn build_rows(
             }
         }
 
-        let cwd = if include_cwd {
-            record.cwd.unwrap_or_default()
+        let (cwd, permission_mode) = if include_cwd {
+            (record.cwd.unwrap_or_default(), record.permission_mode)
         } else {
-            String::new()
+            (String::new(), None)
         };
         *counts
-            .entry((
-                record.tool_name,
-                record.tool_args,
-                record.result,
-                record.rule,
+            .entry(RowKey {
+                tool_name: record.tool_name,
+                tool_args: record.tool_args,
+                result: record.result,
+                rule: record.rule,
                 cwd,
-            ))
+                permission_mode,
+            })
             .or_insert(0) += 1;
     }
 
@@ -303,31 +330,28 @@ fn build_rows(
     // Most frequent first; tool name, raw arguments, result, rule, then cwd fully order ties so the
     // report is deterministic regardless of HashMap iteration order. Sorting on the raw `tool_args`
     // key also avoids re-serializing the parsed arguments for every comparison.
-    entries.sort_by(
-        |((a_tool, a_args, a_result, a_rule, a_cwd), a_count),
-         ((b_tool, b_args, b_result, b_rule, b_cwd), b_count)| {
-            b_count
-                .cmp(a_count)
-                .then_with(|| a_tool.cmp(b_tool))
-                .then_with(|| a_args.cmp(b_args))
-                .then_with(|| a_result.as_str().cmp(b_result.as_str()))
-                .then_with(|| a_rule.cmp(b_rule))
-                .then_with(|| a_cwd.cmp(b_cwd))
-        },
-    );
+    entries.sort_by(|(a, a_count), (b, b_count)| {
+        b_count
+            .cmp(a_count)
+            .then_with(|| a.tool_name.cmp(&b.tool_name))
+            .then_with(|| a.tool_args.cmp(&b.tool_args))
+            .then_with(|| a.result.as_str().cmp(b.result.as_str()))
+            .then_with(|| a.rule.cmp(&b.rule))
+            .then_with(|| a.cwd.cmp(&b.cwd))
+            .then_with(|| a.permission_mode.cmp(&b.permission_mode))
+    });
 
     let rows = entries
         .into_iter()
-        .map(
-            |((tool_name, tool_args, result, rule, cwd), count)| ReportRow {
-                arguments: arguments_value(tool_args),
-                tool_name,
-                result,
-                count,
-                rule,
-                cwd,
-            },
-        )
+        .map(|(key, count)| ReportRow {
+            arguments: arguments_value(key.tool_args),
+            tool_name: key.tool_name,
+            result: key.result,
+            count,
+            rule: key.rule,
+            cwd: key.cwd,
+            permission_mode: key.permission_mode,
+        })
         .collect();
     CwdAggregation { rows, skipped }
 }
@@ -341,6 +365,8 @@ fn arguments_value(tool_args: String) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
     use crate::cost_report::DateTimezone;
 
@@ -355,6 +381,7 @@ mod tests {
             tool_args: args.to_string(),
             result,
             cwd: None,
+            permission_mode: None,
             rules_hash: None,
             rule: None,
         }
@@ -372,6 +399,7 @@ mod tests {
             tool_args: args.to_string(),
             result,
             cwd: None,
+            permission_mode: None,
             rules_hash: rules_hash.map(str::to_string),
             rule: None,
         }
@@ -410,7 +438,7 @@ mod tests {
             &RulesHashFilter::Only("h1".to_string()),
         );
 
-        // Only the h1 record survives; the other-rule-set and the unstamped legacy record are
+        // Only the h1 record survives; the other-rule-set and the record without a hash are
         // excluded but counted so the caller can report them.
         assert_eq!(aggregation.rows.len(), 1);
         assert_eq!(
@@ -437,6 +465,7 @@ mod tests {
             tool_args: r#"{"command":"ls"}"#.to_string(),
             result: PreToolResult::Allow,
             cwd: None,
+            permission_mode: None,
             rules_hash: None,
             rule: rule.map(str::to_string),
         };
@@ -485,7 +514,7 @@ mod tests {
     #[test]
     fn parse_record_treats_empty_provenance_as_absent() {
         // The completion log writes "" (not an absent key) when there is no rules hash or deciding
-        // rule; both must come back as None so the hash filter classifies them as legacy/no-hash.
+        // rule; both must come back as None so the hash filter classifies them as no-hash.
         let line = serde_json::json!({
             "timestamp": "2026-06-03T12:00:00Z",
             "fields": {
@@ -493,6 +522,7 @@ mod tests {
                 "tool_name": "Bash",
                 "tool_args": "{\"command\":\"ls\"}",
                 "cwd": "/work",
+                "permission_mode": "",
                 "rules_hash": "",
                 "rule": "",
                 "result": "ask"
@@ -501,9 +531,85 @@ mod tests {
         .to_string();
 
         let record = parse_record(&line).expect("the line should parse");
+        assert_eq!(record.permission_mode, None);
         assert_eq!(record.rules_hash, None);
         assert_eq!(record.rule, None);
         assert_eq!(record.cwd.as_deref(), Some("/work"));
+    }
+
+    #[test]
+    fn recorded_mode_parsing_handles_known_and_missing_values() {
+        let line = serde_json::json!({
+            "timestamp": "2026-06-03T12:00:00Z",
+            "fields": {
+                "message": COMPLETION_MESSAGE,
+                "tool_name": "Bash",
+                "tool_args": "{\"command\":\"ls\"}",
+                "permission_mode": "dontAsk",
+                "result": "ask"
+            }
+        })
+        .to_string();
+        assert_eq!(
+            parse_record(&line).unwrap().permission_mode,
+            Some(PermissionMode::DontAsk)
+        );
+        let mode_less =
+            completion_line("2026-06-03T12:00:00Z", "Bash", r#"{"command":"ls"}"#, "ask");
+        assert_eq!(parse_record(&mode_less).unwrap().permission_mode, None);
+    }
+
+    #[test]
+    fn only_internal_cwd_aware_rows_split_by_mode() {
+        let make = |permission_mode| HookRecord {
+            timestamp: ts("2026-06-03T12:00:00Z"),
+            tool_name: "Bash".to_string(),
+            tool_args: r#"{"command":"ls"}"#.to_string(),
+            result: PreToolResult::Ask,
+            cwd: Some("/work".to_string()),
+            permission_mode,
+            rules_hash: None,
+            rule: None,
+        };
+        let records = vec![
+            make(Some(PermissionMode::Plan)),
+            make(Some(PermissionMode::Default)),
+        ];
+        let filter = TimeRangeFilter::new(None, None, DateTimezone::Utc).unwrap();
+        let public = build_rows(
+            records.clone(),
+            &filter,
+            None,
+            None,
+            false,
+            &RulesHashFilter::Any,
+        )
+        .rows;
+        assert_eq!((public.len(), public[0].count), (1, 2));
+        assert!(
+            serde_json::to_value(&public[0])
+                .unwrap()
+                .get("permission_mode")
+                .is_none()
+        );
+
+        let internal = build_rows(records, &filter, None, None, true, &RulesHashFilter::Any).rows;
+        assert_eq!(internal.len(), 2);
+        assert_eq!(
+            internal
+                .iter()
+                .map(|row| row.permission_mode)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([Some(PermissionMode::Default), Some(PermissionMode::Plan)])
+        );
+    }
+
+    #[test]
+    fn unknown_recorded_mode_is_fail_closed_as_mode_less() {
+        assert_eq!(
+            parse_recorded_permission_mode(Some("futureMode".to_string())),
+            None
+        );
     }
 
     #[test]
@@ -515,6 +621,7 @@ mod tests {
             count: 1,
             rule: None,
             cwd: String::new(),
+            permission_mode: None,
         };
 
         assert_eq!(
@@ -612,7 +719,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_record_skips_legacy_lines_without_result() {
+    fn parse_record_skips_historical_lines_without_result() {
         // A completion line written before the clean result field existed.
         let line = serde_json::json!({
             "timestamp": "2026-06-03T12:00:00Z",
@@ -698,6 +805,7 @@ mod tests {
                     count: 2,
                     rule: None,
                     cwd: String::new(),
+                    permission_mode: None,
                 },
                 ReportRow {
                     tool_name: "Bash".to_string(),
@@ -706,6 +814,7 @@ mod tests {
                     count: 1,
                     rule: None,
                     cwd: String::new(),
+                    permission_mode: None,
                 },
                 ReportRow {
                     tool_name: "Read".to_string(),
@@ -714,6 +823,7 @@ mod tests {
                     count: 1,
                     rule: None,
                     cwd: String::new(),
+                    permission_mode: None,
                 },
             ]
         );

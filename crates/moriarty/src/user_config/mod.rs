@@ -8,13 +8,16 @@
 //! the approval/hashing system since it represents the user's personal preferences
 //! rather than untrusted project settings.
 
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::{BTreeSet, HashMap},
+    path::Path,
+};
 
 use miette::{Context, IntoDiagnostic, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::persistence::FileType;
+use crate::{permission_mode::PermissionMode, persistence::FileType};
 
 /// Miette's `into_diagnostic()` converts io::Error to miette::Report, losing type information.
 /// We must check the error message for ENOENT (os error 2) which indicates file not found.
@@ -71,7 +74,7 @@ impl UserConfig {
     /// rules currently in force.
     ///
     /// The parsed config is hashed — not the file bytes — so comment, whitespace, and key-order edits
-    /// do not fragment history, while any pattern/action/rule-order/fragment change yields a new hash.
+    /// do not fragment history, while any pattern/action/mode/rule-order/fragment change yields a new hash.
     /// Hashing goes through `serde_json::to_value`, whose objects are `BTreeMap`-backed (the
     /// `preserve_order` feature is off), so the map keys (`pattern_fragments` and an ArgumentFilter
     /// `replace` table) serialize in sorted order and the hash is reproducible; rule `Vec` order, which
@@ -104,6 +107,10 @@ impl UserConfig {
 pub struct BashRule {
     pub name: String,
     pub pattern: String,
+    /// Omission is the permanently supported unrestricted form and applies in every permission
+    /// mode; an empty set intentionally disables the rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modes: Option<BTreeSet<PermissionMode>>,
     pub action: BashRuleAction,
 }
 
@@ -182,6 +189,10 @@ pub struct ToolRule {
     pub name: String,
     /// Exact tool name to match (e.g., "Read", "Write", "Bash"), or `"*"` for any tool.
     pub tool: String,
+    /// Omission is the permanently supported unrestricted form and applies in every permission
+    /// mode; an empty set intentionally disables the rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modes: Option<BTreeSet<PermissionMode>>,
     /// When `true`, every path selected by the rule must resolve within the canonicalized hook
     /// `cwd`; rules without conditions retain the legacy single-path or either-path fallback.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -306,6 +317,7 @@ mod tests {
         BashRule {
             name: name.to_string(),
             pattern: pattern.to_string(),
+            modes: None,
             action: BashRuleAction::Allow,
         }
     }
@@ -352,10 +364,63 @@ mod tests {
     }
 
     #[test]
+    fn mode_restrictions_round_trip_canonically() {
+        let config: UserConfig = toml::from_str(
+            r#"
+[[bash_rules]]
+name = "allow-ls"
+pattern = "^ls"
+modes = ["plan", "default", "plan"]
+action = { type = "Allow" }
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.bash_rules.as_ref().unwrap()[0].modes,
+            Some(BTreeSet::from([
+                PermissionMode::Default,
+                PermissionMode::Plan,
+            ]))
+        );
+        let serialized = toml::to_string(&config).unwrap();
+        assert!(serialized.contains("modes = [\"default\", \"plan\"]"));
+        assert_eq!(toml::from_str::<UserConfig>(&serialized).unwrap(), config);
+
+        let mut disabled = allow("disabled", "^never");
+        disabled.modes = Some(BTreeSet::new());
+        let round_tripped: BashRule = toml::from_str(&toml::to_string(&disabled).unwrap()).unwrap();
+        assert_eq!(round_tripped.modes, Some(BTreeSet::new()));
+    }
+
+    #[test]
+    fn rules_without_modes_keep_the_pre_feature_hash() {
+        let unrestricted = sample_config(Some(vec![allow("ls", "^ls")]), None);
+        let json = serde_json::to_value(&unrestricted).unwrap();
+        assert!(json["bash_rules"][0].get("modes").is_none());
+        let expected = r#"{"bash_rules":[{"action":{"type":"Allow"},"name":"ls","pattern":"^ls"}],"pattern_fragments":null,"tool_rules":null}"#;
+        assert_eq!(
+            unrestricted.effective_hash(),
+            crate::hashing::hash_string(expected)
+        );
+    }
+
+    #[test]
+    fn adding_a_mode_restriction_changes_the_hash() {
+        let unrestricted = sample_config(Some(vec![allow("ls", "^ls")]), None);
+        let mut restricted = unrestricted.clone();
+        restricted.bash_rules.as_mut().unwrap()[0].modes =
+            Some(BTreeSet::from([PermissionMode::Plan]));
+
+        assert_ne!(restricted.effective_hash(), unrestricted.effective_hash());
+    }
+
+    #[test]
     fn test_bash_rule_serialization() {
         let rule = BashRule {
             name: "test-rule".to_string(),
             pattern: "^test".to_string(),
+            modes: None,
             action: BashRuleAction::Deny {
                 value: "test reason".to_string(),
             },
@@ -516,6 +581,7 @@ reason = "Browser not needed""#;
                 BashRule {
                     name: "test-deny".to_string(),
                     pattern: "^rm".to_string(),
+                    modes: None,
                     action: BashRuleAction::Deny {
                         value: "rm not allowed".to_string(),
                     },
@@ -523,6 +589,7 @@ reason = "Browser not needed""#;
                 BashRule {
                     name: "test-allow".to_string(),
                     pattern: "^ls".to_string(),
+                    modes: None,
                     action: BashRuleAction::Allow,
                 },
             ]),
@@ -565,6 +632,7 @@ reason = "Browser not needed""#;
         let rule = ToolRule {
             name: "test-rule".to_string(),
             tool: "Read".to_string(),
+            modes: None,
             allow_local: false,
             field: Some("file_path".to_string()),
             pattern: Some("\\.env$".to_string()),
@@ -584,6 +652,7 @@ reason = "Browser not needed""#;
         let rule = ToolRule {
             name: "allow-read".to_string(),
             tool: "Read".to_string(),
+            modes: None,
             allow_local: false,
             field: None,
             pattern: None,
@@ -703,6 +772,7 @@ action = { type = "Allow" }
         let rule = ToolRule {
             name: "allow-local-read".to_string(),
             tool: "Read".to_string(),
+            modes: None,
             allow_local: true,
             field: Some("file_path".to_string()),
             pattern: Some(r"^src/.*\.rs$".to_string()),
@@ -760,6 +830,7 @@ value = "not allowed""#;
         let rule = ToolRule {
             name: "catch-all".to_string(),
             tool: "*".to_string(),
+            modes: None,
             allow_local: false,
             field: None,
             pattern: None,
@@ -778,12 +849,14 @@ value = "not allowed""#;
             Some(vec![BashRule {
                 name: "allow-ls".to_string(),
                 pattern: "^ls".to_string(),
+                modes: None,
                 action: BashRuleAction::Allow,
             }]),
             Some(vec![
                 ToolRule {
                     name: "allow-read".to_string(),
                     tool: "Read".to_string(),
+                    modes: None,
                     allow_local: false,
                     field: None,
                     pattern: None,
@@ -793,6 +866,7 @@ value = "not allowed""#;
                 ToolRule {
                     name: "deny-env-write".to_string(),
                     tool: "Write".to_string(),
+                    modes: None,
                     allow_local: false,
                     field: Some("file_path".to_string()),
                     pattern: Some(r"\.env$".to_string()),

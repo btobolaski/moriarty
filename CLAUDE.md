@@ -69,7 +69,7 @@ cargo run -- hooks exec
 cargo run -- hooks report --tool Bash --result deny
 
 # Inspect, validate, and author bash/tool rules
-cargo run -- rules lint --strict          # report rules the hook silently ignores; warn on shadow/over-broad
+cargo run -- rules lint --strict          # report ignored rules; warn on empty modes/shadow/over-broad
 cargo run -- rules list-fragments         # show built-in + user pattern fragments
 cargo run -- rules schema                 # print a canonical example tool_rules.toml
 cargo run -- rules starter                # paste-ready allow-rules for common read-only commands
@@ -321,6 +321,15 @@ with warnings, while explicit missing paths and having no available source are e
 **`hooks/`** - Security hook system for Claude Code integration:
 
 - **PreToolUse hook**: Two-tier permission system from `~/.config/moriarty/tool_rules.toml`:
+  - **Permission-mode eligibility**: both rule kinds accept `modes`, an optional set of the six exact hook values
+    (`default`, `plan`, `acceptEdits`, `auto`, `dontAsk`, `bypassPermissions`; Manual arrives as `default`). Omitted
+    means the rule is permanently unrestricted in all modes and remains omitted from serialization so existing effective
+    hashes stay stable; `[]` means no modes. Hook events require `permission_mode`; a restricted rule cannot match a
+    mode-less replay or test row. Ineligible rules stay in declaration order and are skipped before other gates, so
+    first-match-wins applies among eligible rules; the same mode threads through tool-to-Bash fallback, locality
+    preflight, compound/bail evaluation, ArgumentFilter recheck, explain, replay, and suggestion de-duplication. Public
+    `hooks report` grouping/JSON remains mode-agnostic, but cwd-aware internal rows split by mode; suggestions union
+    known contributing modes and become unrestricted if any contributor is mode-less.
   - `tool_rules`: Permission any tool call (Read, Write, Edit, Bash, etc.) with optional legacy field-level regex
     matching and an optional ANDed `conditions` list over literal top-level input keys: `Present`, `Absent`, typed raw
     JSON `Equals`, and scalar-regex `Matches`. Separate ordered rules provide OR/fallback behavior. Actions: Allow,
@@ -348,8 +357,8 @@ with warnings, while explicit missing paths and having no available source are e
     explicit Deny matching the whole command is honored; every other outcome becomes a prompt.
   - **Bash cwd stripping**: like the tool-rules field stripping, a leaf's in-cwd absolute paths are normalized to their
     relative remainder before matching (no `..`-escaping remainder is rewritten), so `^cat src/` matches
-    `cat /abs/cwd/src/x`. `apply_rules(command)` stays the single-command primitive;
-    `apply_rules_compound(command, cwd)` is what the hook calls.
+    `cat /abs/cwd/src/x`. `apply_rules(command, mode)` stays the single-command primitive;
+    `apply_rules_compound(command, cwd, mode)` is what the hook calls.
   - Evaluation order: tool_rules → bash_rules (for Bash) → passthrough (for non-Bash, defers to Claude Code)
 - **Stop hook**: Runs the project's configured checks before allowing execution, delegating to the shared
   `crate::checks::run_configured_checks` routine (see `mcp/` above); it maps the routine's `CheckRunOutcome` onto
@@ -363,14 +372,15 @@ with warnings, while explicit missing paths and having no available source are e
   the approved one (a workspace-local `./check.sh` runs only if that exact argv+binary was approved)
 - Structured logging with tracing crate for debugging hook execution. The "PreToolUse hook completed" log event records
   a clean `result` field (`allow`/`deny`/`ask`/`modify`/`passthrough`) classified from the typed `HookOutput` by
-  `hooks::result::pretool_result`, alongside `tool_name`, `tool_args`, `cwd`, `rules_hash`, and `rule` — the name of the
-  rule whose action produced the decision (empty when no rule decided: passthrough, unconfigured-Ask, merged `NoMatch`
-  prompt, or a post-filter re-validation that matched nothing). For a compound command this is the deciding leaf's rule,
-  mirroring `merge_results` precedence, so attribution survives the per-leaf merge
+  `hooks::result::pretool_result`, alongside `tool_name`, `tool_args`, `cwd`, `permission_mode`, `rules_hash`, and
+  `rule` — the name of the rule whose action produced the decision (empty when no rule decided: passthrough,
+  unconfigured-Ask, merged `NoMatch` prompt, or a post-filter re-validation that matched nothing). For a compound
+  command this is the deciding leaf's rule, mirroring `merge_results` precedence, so attribution survives the per-leaf
+  merge
 - **`hooks report` subcommand**: `hooks/report.rs` reads the JSON-lines hook logs, keeps completed PreToolUse records
-  that carry the clean `result` field (legacy lines lacking it are skipped), and aggregates them by the exact
+  that carry the clean `result` field (historical lines lacking it are skipped), and aggregates them by the exact
   `(tool name, arguments, result, rule)` key into a JSON report with counts; `rule` is omitted from a row's JSON when no
-  rule decided, so legacy rows serialize exactly as before. Reuses `cost_report::TimeRangeFilter` for
+  rule decided, so historical rows serialize exactly as before. Reuses `cost_report::TimeRangeFilter` for
   `--start-time`/`--end-time` and supports `--tool` and `--result` filters. `report::aggregate` (used by `hooks report`)
   and `ReportRow` are `pub(crate)`. `report.rs` parses the completion line's `cwd` back into `HookRecord`;
   `rules suggest`/`rules replay` call `report::aggregate_with_cwd`, which joins `cwd` into the grouping key and
@@ -383,17 +393,18 @@ with warnings, while explicit missing paths and having no available source are e
   partner); an invalid `Matches` condition drops the whole tool rule rather than broadening it by retaining only the
   valid predicates. `from_config` delegates to these compilers and logs each diagnostic, preserving the
   fail-open-per-rule hot path. The `crate::rules` command group surfaces them and helps author safe rules: `lint`
-  (errors when a rule the user wrote is silently dropped; `--strict` additionally warns on likely-shadowed and
-  over-broad Allow rules), `list-fragments`, `schema` (round-tripped against `UserConfig` in tests), `starter`
-  (paste-ready read-only allow-rules that auto-allow the north-star command), `suggest` (anchored rules mined from hook
-  logs; each recorded command is split into the leaf simple-commands the hook actually evaluates — normalized with the
-  recorded cwd — before pattern generation, so compounds yield per-leaf candidates with summed counts, and a bailed
-  command stays whole; `--match exact|prefix|fuzzy` picks the shape, where fuzzy clusters leaves by program and
-  generalizes simple-identifier subcommands into a closed alternation like `^cargo (build|check)(\s|$)`, falling back to
-  a program prefix; never emits Allow unless `--match exact`), and `replay` (re-evaluate recorded Bash decisions against
-  a candidate config — the migration acceptance gate is zero lost auto-approvals).
-  `test bash-rules --explain [--cwd <dir>]` prints the per-leaf split, normalized text, matching rule (with the expanded
-  pattern), and merged decision via `BashRuleEngine::explain`.
+  (errors when a rule the user wrote is silently dropped; `--strict` additionally warns on permanently disabled
+  `modes = []`, likely-shadowed rules, and over-broad Allow rules), `list-fragments`, `schema` (round-tripped against
+  `UserConfig` in tests), `starter` (paste-ready read-only allow-rules that auto-allow the north-star command),
+  `suggest` (anchored rules mined from hook logs; each recorded command is split into the leaf simple-commands the hook
+  actually evaluates — normalized with the recorded cwd — before pattern generation, so compounds yield per-leaf
+  candidates with summed counts, and a bailed command stays whole; `--match exact|prefix|fuzzy` picks the shape, where
+  fuzzy clusters leaves by program and generalizes simple-identifier subcommands into a closed alternation like
+  `^cargo (build|check)(\s|$)`, falling back to a program prefix; never emits Allow unless `--match exact`), and
+  `replay` (re-evaluate recorded Bash decisions against a candidate config — the migration acceptance gate is zero lost
+  auto-approvals). `test bash-rules --explain [--cwd <dir>] [--mode <mode>]` prints the per-leaf split, normalized text,
+  matching rule (with the expanded pattern), and merged decision via `BashRuleEngine::explain`; omitting `--mode` runs a
+  mode-less test evaluation.
 - **Rule-set provenance**: each `PreToolUse hook completed` log line records `rules_hash`, a stable hash of the
   effective config (`UserConfig::effective_hash`, computed once per hook invocation). The hash covers the parsed config
   — tool rules, bash rules, and fragments — re-serialized via `serde_json::to_value` so map keys (`pattern_fragments`,
@@ -443,9 +454,8 @@ with warnings, while explicit missing paths and having no available source are e
   binary-change re-approval retires legacy `argv: None` versions for the same normalized paths, so reverting to the old
   binary fails closed instead of restoring its wildcard approval. Approvals are keyed by repository root (shared across
   worktrees); the config that runs is loaded from the workspace root, so each worktree runs its own tooling while
-  identical content needs no re-approval. Stored binary paths are normalized
-  relative to the workspace root when inside it, so a byte-identical `./script.sh` in a second worktree matches the
-  first's approval
+  identical content needs no re-approval. Stored binary paths are normalized relative to the workspace root when inside
+  it, so a byte-identical `./script.sh` in a second worktree matches the first's approval
 - **SHA-256 verification**: All binaries hashed, symlinks resolved before hashing
 - **Dual path tracking**: Stores both original and canonical paths to detect symlink changes
 - **Atomic updates**: File locking (fs2 crate) prevents race conditions during approval saves
@@ -707,4 +717,3 @@ across sessions.
 After you have modified code, you are not allowed to stop until all of the quality checks have passed. If you need to
 ask the user a question, use the dedicated user-question tool rather than writing the question in plain text and then
 waiting for the user's next input.
-

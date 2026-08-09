@@ -33,6 +33,7 @@ Each tool rule is a TOML array\-of\-tables entry:
 [[tool_rules]]
 name = "descriptive\-name"
 tool = "ToolName"
+modes = ["default", "plan"] # optional
 allow_local = true          # optional
 field = "field_name"       # optional legacy pair
 pattern = "regex\-pattern"
@@ -60,6 +61,26 @@ Known tools include:
 .Cm Glob ,
 and
 .Cm Grep .
+.It Ic modes
+Optional permission\-mode allow\-list.
+Accepted values are exactly
+.Cm default ,
+.Cm plan ,
+.Cm acceptEdits ,
+.Cm auto ,
+.Cm dontAsk ,
+and
+.Cm bypassPermissions .
+The UI's Manual mode arrives as
+.Cm default ;
+.Cm manual
+is invalid.
+Omitting the field permanently defines an unrestricted rule enabled in every mode;
+this is a fully supported configuration, not a deprecated compatibility form.
+An empty array disables the rule.
+Current hook events require a permission mode.
+Ineligible rules are skipped in place, so a matching restricted rule falls through to the next eligible tool rule and,
+for Bash, eventually to the bash engine with the same mode.
 .It Ic allow_local
 Optional.
 When set to
@@ -253,11 +274,12 @@ actions are only available in bash rules.
 .Bd -literal -offset indent
 PreToolUse event (any tool)
   |
-  +\-> tool_rules engine (first\-match\-wins)
-  |     tool matches?
-  |       \-> allow_local check (if enabled)
-  |       \-> every condition matches (if configured)
-  |       \-> legacy field/pattern regex matches (if configured)
+  +\-> tool_rules engine (first\-match\-wins among eligible rules)
+  |     permission mode is eligible?
+  |       \-> tool matches?
+  |         \-> allow_local check (if enabled)
+  |         \-> every condition matches (if configured)
+  |         \-> legacy field/pattern regex matches (if configured)
   |     Match found? \-> return Allow/Deny/Ask
   |     No match?    \-> continue
   |
@@ -267,7 +289,10 @@ PreToolUse event (any tool)
 .Ed
 .Pp
 Rules are evaluated in order.
-The first matching rule determines the action
+Mode eligibility is checked before tool, locality, condition, and regex gates, so an ineligible
+.Ic allow_local
+rule does not trigger filesystem preflight.
+The first eligible matching rule determines the action
 .Pq first\-match\-wins semantics .
 .Sh EXAMPLES
 Allow read\-only tools, deny writing to

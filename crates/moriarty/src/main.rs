@@ -17,6 +17,7 @@ mod cost_report;
 mod hashing;
 mod hooks;
 mod mcp;
+mod permission_mode;
 mod persistence;
 mod pi_cost;
 mod project_config;
@@ -388,7 +389,7 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum RulesCommand {
-    /// Report rules the hook silently ignores; with --strict, also likely-shadowed/over-broad rules
+    /// Report ignored rules; with --strict, also empty-mode, likely-shadowed, and over-broad rules
     Lint {
         /// Custom config file path (defaults to ~/.config/moriarty/tool_rules.toml)
         #[arg(short, long)]
@@ -396,7 +397,7 @@ enum RulesCommand {
         /// Output as JSON instead of human-readable text
         #[arg(long)]
         json: bool,
-        /// Also warn about likely-shadowed rules and over-broad Allow rules
+        /// Also warn about empty modes, likely-shadowed rules, and over-broad Allow rules
         #[arg(long)]
         strict: bool,
     },
@@ -421,7 +422,7 @@ enum RulesCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Suggest anchored rules for commands the hook frequently prompted on (from the hook logs)
+    /// Suggest anchored rules from hook logs, using recorded mode scope when reconstructable
     Suggest {
         /// Directory containing hook logs (defaults to ~/.local/state/moriarty/hooks)
         #[arg(short, long)]
@@ -461,7 +462,7 @@ enum RulesCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Re-evaluate recorded Bash decisions against a candidate config and report divergences
+    /// Replay Bash decisions in their recorded permission modes against a candidate config
     Replay {
         /// Directory containing hook logs (defaults to ~/.local/state/moriarty/hooks)
         #[arg(short, long)]
@@ -600,6 +601,10 @@ enum TestCommand {
         /// Simulate the hook working directory for path normalization (defaults to the process cwd)
         #[arg(long)]
         cwd: Option<PathBuf>,
+
+        /// Simulate a permission mode (omit for a mode-less test evaluation)
+        #[arg(long, value_enum)]
+        mode: Option<permission_mode::PermissionMode>,
     },
 }
 
@@ -615,10 +620,12 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        Cli, Command, GraphsCommand, HooksCommand, PiCommand, RulesCommand, parse_date_timezone,
-        resolve_claude_logs_dir, resolve_pi_sessions_dir,
+        Cli, Command, GraphsCommand, HooksCommand, PiCommand, RulesCommand, TestCommand,
+        parse_date_timezone, resolve_claude_logs_dir, resolve_pi_sessions_dir,
     };
-    use crate::{cost_report::DateTimezone, test_helpers::TestEnvVarGuard};
+    use crate::{
+        cost_report::DateTimezone, permission_mode::PermissionMode, test_helpers::TestEnvVarGuard,
+    };
 
     fn with_home<R>(home: Option<&Path>, f: impl FnOnce() -> R) -> R {
         let _guard = match home {
@@ -1134,6 +1141,23 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn cli_wires_permission_mode_into_bash_rule_tests() {
+        let cli = Cli::try_parse_from(["moriarty", "test", "bash-rules", "ls", "--mode", "plan"])
+            .unwrap();
+        match cli.command {
+            Command::Test {
+                subcommand: TestCommand::BashRules { mode, .. },
+            } => assert_eq!(mode, Some(PermissionMode::Plan)),
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        assert!(
+            Cli::try_parse_from(["moriarty", "test", "bash-rules", "ls", "--mode", "manual",])
+                .is_err()
+        );
     }
 
     #[test]

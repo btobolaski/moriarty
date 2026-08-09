@@ -2,7 +2,7 @@
 
 use std::{fs, io::Cursor};
 
-use serde_json::Value;
+use serde_json::{Value, to_value};
 use tempfile::TempDir;
 
 use super::*;
@@ -161,8 +161,18 @@ async fn run_pretool_outcome(
     input: &serde_json::Value,
     cwd: &str,
 ) -> PretoolOutcome {
+    run_pretool_outcome_mode(config, tool, input, cwd, None).await
+}
+
+async fn run_pretool_outcome_mode(
+    config: &str,
+    tool: &str,
+    input: &serde_json::Value,
+    cwd: &str,
+    mode: Option<PermissionMode>,
+) -> PretoolOutcome {
     let _xdg_config = setup_user_bash_rules(config).await;
-    handle_pretool_hook(tool, input, cwd)
+    handle_pretool_hook(tool, input, cwd, mode)
         .await
         .expect("Should succeed")
 }
@@ -309,6 +319,45 @@ async fn read_hooks_log_file() -> String {
     fs::read_to_string(log_entry.path()).expect("Hooks log file should be readable")
 }
 
+async fn pretool_completion_fields() -> Value {
+    read_hooks_log_file()
+        .await
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|event| {
+            event.pointer("/fields/message").and_then(Value::as_str)
+                == Some("PreToolUse hook completed")
+        })
+        .expect("PreToolUse completion log event should be present")["fields"]
+        .clone()
+}
+
+const PLAN_ONLY_ALLOW_RULE: &str = r#"[[bash_rules]]
+name = "plan-allow"
+pattern = "^echo"
+modes = ["plan"]
+action = { type = "Allow" }
+"#;
+
+async fn exec_pretool_with_mode(config: &str, mode: PermissionMode) -> Value {
+    let _xdg_state = setup_isolated_xdg_state();
+    let _xdg_config = setup_user_bash_rules(config).await;
+    let mut input = serde_json::json!({
+        "session_id": "test-session",
+        "transcript_path": "/tmp/transcript.json",
+        "cwd": "/tmp/project",
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": "echo hello"}
+    });
+    input["permission_mode"] = to_value(mode).unwrap();
+
+    exec_hook_impl(Cursor::new(input.to_string()))
+        .await
+        .unwrap();
+    pretool_completion_fields().await
+}
+
 #[tokio::test]
 async fn test_exec_hook_empty_input_returns_error() {
     let _xdg_dir = setup_isolated_xdg_state();
@@ -430,6 +479,11 @@ async fn test_exec_hook_pretool_completion_log_includes_tool_context() {
         Some("/tmp/project"),
         "completion log should record the hook cwd for exact replay"
     );
+    assert_eq!(
+        fields.get("permission_mode").and_then(Value::as_str),
+        Some("default"),
+        "completion log should record the canonical permission mode"
+    );
     // A passthrough has no deciding rule, but the (default, empty) config still loaded, so the
     // rule-set hash must be stamped for the replay/suggest provenance filter.
     assert_eq!(
@@ -498,6 +552,132 @@ async fn test_exec_hook_completion_log_attributes_the_deciding_rule() {
         rules_hash.starts_with("sha256:"),
         "rules_hash should be the effective-config hash, got: {rules_hash}"
     );
+}
+
+#[tokio::test]
+async fn permission_mode_threads_through_tool_and_bash_fallback_order() {
+    let config = r#"
+[[tool_rules]]
+name = "plan-tool-ask"
+tool = "Bash"
+modes = ["plan"]
+action = { type = "Ask" }
+
+[[bash_rules]]
+name = "default-deny"
+pattern = "^echo"
+modes = ["default"]
+action = { type = "Deny", value = "default denied" }
+
+[[bash_rules]]
+name = "auto-allow"
+pattern = "^echo"
+modes = ["auto"]
+action = { type = "Allow" }
+"#;
+    let input = serde_json::json!({"command": "echo hi"});
+
+    let plan =
+        run_pretool_outcome_mode(config, "Bash", &input, "", Some(PermissionMode::Plan)).await;
+    assert_pretool_ask(&plan.output);
+    assert_eq!(plan.rule.as_deref(), Some("plan-tool-ask"));
+
+    let default =
+        run_pretool_outcome_mode(config, "Bash", &input, "", Some(PermissionMode::Default)).await;
+    assert_pretool_deny(&default.output, "default denied");
+    assert_eq!(default.rule.as_deref(), Some("default-deny"));
+
+    let auto =
+        run_pretool_outcome_mode(config, "Bash", &input, "", Some(PermissionMode::Auto)).await;
+    assert_pretool_allow(&auto.output);
+    assert_eq!(auto.rule.as_deref(), Some("auto-allow"));
+
+    let missing = run_pretool_outcome_mode(config, "Bash", &input, "", None).await;
+    assert_pretool_ask(&missing.output);
+    assert_eq!(missing.rule, None);
+}
+
+#[tokio::test]
+async fn argument_filter_recheck_uses_the_same_permission_mode() {
+    let config = |follow_up_mode: PermissionMode| {
+        let follow_up_mode = follow_up_mode.to_string();
+        format!(
+            r#"
+[[bash_rules]]
+name = "strip-open"
+pattern = "^cargo doc.*--open"
+modes = ["plan"]
+action = {{ type = "ArgumentFilter", remove = ["--open"] }}
+
+[[bash_rules]]
+name = "allow-filtered"
+pattern = "^cargo doc$"
+modes = ["{follow_up_mode}"]
+action = {{ type = "Allow" }}
+"#
+        )
+    };
+    let input = serde_json::json!({"command": "cargo doc --open"});
+    let same_mode = config(PermissionMode::Plan);
+    let allowed =
+        run_pretool_outcome_mode(&same_mode, "Bash", &input, "", Some(PermissionMode::Plan)).await;
+    assert_pretool_modified_case(&allowed.output, "cargo doc", "same mode");
+    assert_eq!(allowed.rule.as_deref(), Some("strip-open"));
+
+    let different_mode = config(PermissionMode::Default);
+    let asked = run_pretool_outcome_mode(
+        &different_mode,
+        "Bash",
+        &input,
+        "",
+        Some(PermissionMode::Plan),
+    )
+    .await;
+    assert_pretool_ask(&asked.output);
+    assert_eq!(asked.rule, None);
+}
+
+#[tokio::test]
+async fn exec_hook_mode_selects_rule_and_logs_canonical_value() {
+    let fields = exec_pretool_with_mode(PLAN_ONLY_ALLOW_RULE, PermissionMode::Plan).await;
+    assert_eq!(fields["result"], "allow");
+    assert_eq!(fields["rule"], "plan-allow");
+    assert_eq!(fields["permission_mode"], "plan");
+}
+
+#[tokio::test]
+async fn exec_hook_ineligible_mode_falls_through_and_logs_canonical_value() {
+    let config = format!(
+        r#"{PLAN_ONLY_ALLOW_RULE}
+[[bash_rules]]
+name = "fallback-deny"
+pattern = "^echo"
+action = {{ type = "Deny", value = "fallback" }}
+"#
+    );
+    let fields = exec_pretool_with_mode(&config, PermissionMode::Default).await;
+    assert_eq!(fields["result"], "deny");
+    assert_eq!(fields["rule"], "fallback-deny");
+    assert_eq!(fields["permission_mode"], "default");
+}
+
+#[tokio::test]
+async fn exec_hook_without_mode_is_rejected() {
+    let _xdg_state = setup_isolated_xdg_state();
+    let _xdg_config = setup_user_bash_rules(PLAN_ONLY_ALLOW_RULE).await;
+    let input = serde_json::json!({
+        "session_id": "test-session",
+        "transcript_path": "/tmp/transcript.json",
+        "cwd": "/tmp/project",
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": "echo hello"}
+    });
+
+    let error = exec_hook_impl(Cursor::new(input.to_string()))
+        .await
+        .expect_err("permission_mode is required");
+    assert!(error.to_string().contains("permission_mode"));
 }
 
 #[test]
@@ -1625,7 +1805,7 @@ async fn test_non_bash_tool_no_rules_returns_passthrough() {
     let _xdg_config = setup_isolated_xdg_config();
 
     let tool_input = serde_json::json!({"file_path": "/tmp/foo"});
-    let result = handle_pretool_hook("Read", &tool_input, "")
+    let result = handle_pretool_hook("Read", &tool_input, "", None)
         .await
         .expect("Should succeed")
         .output;
@@ -1646,10 +1826,15 @@ async fn test_non_bash_tool_no_matching_rule_returns_passthrough() {
     let _xdg_config = setup_user_bash_rules(&config).await;
 
     // Config exists with rules, but none match Read — should passthrough
-    let result = handle_pretool_hook("Read", &serde_json::json!({"file_path": "/tmp/foo"}), "")
-        .await
-        .expect("Should succeed")
-        .output;
+    let result = handle_pretool_hook(
+        "Read",
+        &serde_json::json!({"file_path": "/tmp/foo"}),
+        "",
+        None,
+    )
+    .await
+    .expect("Should succeed")
+    .output;
 
     assert_eq!(result.hook_specific_output, None);
     assert_eq!(result.permission_decision, None);
@@ -1739,7 +1924,7 @@ async fn test_pretool_hook_invalid_config_defaults_to_ask() {
     .unwrap();
 
     let tool_input = serde_json::json!({"file_path": "/tmp/foo.rs"});
-    let result = handle_pretool_hook("Read", &tool_input, "")
+    let result = handle_pretool_hook("Read", &tool_input, "", None)
         .await
         .expect("Should succeed with Ask fallback")
         .output;
@@ -1820,6 +2005,7 @@ async fn run_allow_local_read(
         "Read",
         &serde_json::json!({ "path": path.into() }),
         cwd.to_str().unwrap(),
+        None,
     )
     .await
     .expect("Should succeed")
@@ -1847,6 +2033,7 @@ async fn test_tool_rule_allow_local_matches_existing_path() {
         "Read",
         &serde_json::json!({"file_path": existing}),
         cwd.to_str().unwrap(),
+        None,
     )
     .await
     .expect("Should succeed")
@@ -1872,6 +2059,7 @@ async fn test_tool_rule_allow_local_matches_nonexistent_path() {
         "Read",
         &serde_json::json!({"file_path": "src/generated.rs"}),
         cwd.to_str().unwrap(),
+        None,
     )
     .await
     .expect("Should succeed")
@@ -1895,6 +2083,7 @@ async fn test_tool_rule_allow_local_rejects_path_escape() {
         "Read",
         &serde_json::json!({"path": sibling.join("src/lib.rs")}),
         cwd.to_str().unwrap(),
+        None,
     )
     .await
     .expect("Should succeed")
@@ -1920,6 +2109,7 @@ async fn test_tool_rule_allow_local_no_match_for_regex_miss() {
         "Read",
         &serde_json::json!({"path": cwd.join("Cargo.toml")}),
         cwd.to_str().unwrap(),
+        None,
     )
     .await
     .expect("Should succeed")
@@ -1955,6 +2145,7 @@ allow_local = true
             "content": "updated",
         }),
         cwd.to_str().unwrap(),
+        None,
     )
     .await
     .expect("Should succeed")
@@ -1992,6 +2183,7 @@ async fn test_tool_rule_allow_local_with_non_path_field_does_not_match() {
             "path": cwd.join("local.txt"),
         }),
         cwd.to_str().unwrap(),
+        None,
     )
     .await
     .expect("Should succeed")
@@ -2058,6 +2250,7 @@ async fn test_tool_rule_allow_local_with_wildcard_tool() {
         "Write",
         &serde_json::json!({"path": cwd.join("local.txt"), "content": "x"}),
         cwd.to_str().unwrap(),
+        None,
     )
     .await
     .expect("Should succeed")
@@ -2070,6 +2263,7 @@ async fn test_tool_rule_allow_local_with_wildcard_tool() {
         "Write",
         &serde_json::json!({"path": outside, "content": "x"}),
         cwd.join("nested-cwd").to_str().unwrap(),
+        None,
     )
     .await
     .expect("Should succeed")
@@ -2100,13 +2294,13 @@ action = { type = \"Allow\" }
 ";
     let _xdg_config = setup_user_bash_rules(config).await;
 
-    let number = handle_pretool_hook("Read", &serde_json::json!({"limit": 42}), "")
+    let number = handle_pretool_hook("Read", &serde_json::json!({"limit": 42}), "", None)
         .await
         .expect("Should succeed")
         .output;
     assert_pretool_allow(&number);
 
-    let other_number = handle_pretool_hook("Read", &serde_json::json!({"limit": 7}), "")
+    let other_number = handle_pretool_hook("Read", &serde_json::json!({"limit": 7}), "", None)
         .await
         .expect("Should succeed")
         .output;
@@ -2115,16 +2309,17 @@ action = { type = \"Allow\" }
         "7 does not match ^42$"
     );
 
-    let boolean = handle_pretool_hook("Grep", &serde_json::json!({"recursive": true}), "")
+    let boolean = handle_pretool_hook("Grep", &serde_json::json!({"recursive": true}), "", None)
         .await
         .expect("Should succeed")
         .output;
     assert_pretool_allow(&boolean);
 
-    let false_boolean = handle_pretool_hook("Grep", &serde_json::json!({"recursive": false}), "")
-        .await
-        .expect("Should succeed")
-        .output;
+    let false_boolean =
+        handle_pretool_hook("Grep", &serde_json::json!({"recursive": false}), "", None)
+            .await
+            .expect("Should succeed")
+            .output;
     assert_eq!(
         false_boolean.hook_specific_output, None,
         "false does not match ^true$"
@@ -2150,7 +2345,7 @@ action = { type = \"Allow\" }
         ("null", serde_json::json!({"paths": null})),
         ("object", serde_json::json!({"paths": {"k": "v"}})),
     ] {
-        let result = handle_pretool_hook("Read", &input, "")
+        let result = handle_pretool_hook("Read", &input, "", None)
             .await
             .expect("Should succeed")
             .output;

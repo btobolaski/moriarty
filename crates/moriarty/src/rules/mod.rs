@@ -29,7 +29,10 @@ use crate::{
         result::PreToolResult,
         tool_rules::ToolRuleEngine,
     },
-    user_config::{BashRule, BashRuleAction, UserConfig, load_user_config, load_user_config_from},
+    permission_mode::{PermissionMode, mode_restrictions_overlap},
+    user_config::{
+        BashRule, BashRuleAction, ToolRule, UserConfig, load_user_config, load_user_config_from,
+    },
 };
 
 /// Generated-pattern shape for `rules suggest`.
@@ -120,8 +123,8 @@ pub async fn exec_rules(cmd: RulesCommand) -> Result<()> {
     }
 }
 
-/// One reported issue. `kind` is the diagnostic label for errors, or `over-broad-allow` /
-/// `shadowed` for `--strict` warnings.
+/// One reported issue. `kind` is the diagnostic label for errors or a stable advisory label for
+/// `--strict` warnings.
 #[derive(Debug, Serialize, PartialEq, Eq)]
 struct LintFinding {
     rule_kind: &'static str,
@@ -147,7 +150,7 @@ impl LintFinding {
 struct LintReport {
     /// Rules the hook silently drops (a rule the user wrote is not in effect).
     errors: Vec<LintFinding>,
-    /// `--strict` advisories: likely-shadowed and over-broad rules.
+    /// `--strict` advisories: empty-mode, likely-shadowed, and over-broad rules.
     warnings: Vec<LintFinding>,
     /// Number of dropped rules; nonzero means the lint fails.
     ignored_count: usize,
@@ -190,7 +193,7 @@ fn build_lint_report(config: &UserConfig, strict: bool) -> Result<LintReport> {
     );
 
     let (_engine, tool_diagnostics) =
-        ToolRuleEngine::compile_with_diagnostics(tool_rules, fragments.clone());
+        ToolRuleEngine::compile_with_diagnostics(tool_rules.clone(), fragments.clone());
     errors.extend(
         tool_diagnostics
             .iter()
@@ -198,7 +201,9 @@ fn build_lint_report(config: &UserConfig, strict: bool) -> Result<LintReport> {
     );
 
     let warnings = if strict {
-        strict_bash_warnings(&bash_rules, fragments.as_ref())
+        let mut warnings = strict_bash_warnings(&bash_rules, fragments.as_ref());
+        warnings.extend(empty_mode_set_warnings(&bash_rules, &tool_rules));
+        warnings
     } else {
         Vec::new()
     };
@@ -235,6 +240,35 @@ fn strict_bash_warnings(
     warnings
 }
 
+fn empty_mode_set_warnings(bash_rules: &[BashRule], tool_rules: &[ToolRule]) -> Vec<LintFinding> {
+    let mut warnings = Vec::new();
+    for rule in bash_rules
+        .iter()
+        .filter(|rule| rule.modes.as_ref().is_some_and(BTreeSet::is_empty))
+    {
+        warnings.push(LintFinding {
+            rule_kind: "bash",
+            rule_name: rule.name.clone(),
+            pattern: rule.pattern.clone(),
+            kind: "empty-modes".to_string(),
+            message: "modes = [] makes this rule permanently ineligible".to_string(),
+        });
+    }
+    for rule in tool_rules
+        .iter()
+        .filter(|rule| rule.modes.as_ref().is_some_and(BTreeSet::is_empty))
+    {
+        warnings.push(LintFinding {
+            rule_kind: "tool",
+            rule_name: rule.name.clone(),
+            pattern: rule.pattern.clone().unwrap_or_else(|| rule.tool.clone()),
+            kind: "empty-modes".to_string(),
+            message: "modes = [] makes this rule permanently ineligible".to_string(),
+        });
+    }
+    warnings
+}
+
 /// Flags a rule when an earlier rule's regex matches a literal probe derived from this rule's
 /// pattern — i.e. the earlier rule fires first and this one is unreachable for that input. This is
 /// deliberately approximate (a single literal probe per rule), so it can miss or over-report.
@@ -262,9 +296,15 @@ fn shadow_warnings(
         if probe.is_empty() {
             continue;
         }
-        if let Some((earlier_rule, _)) = compiled[..later_index]
-            .iter()
-            .find(|(_, earlier_regex)| earlier_regex.is_match(&probe))
+        if let Some((earlier_rule, _)) =
+            compiled[..later_index]
+                .iter()
+                .find(|(earlier_rule, earlier_regex)| {
+                    mode_restrictions_overlap(
+                        earlier_rule.modes.as_ref(),
+                        later_rule.modes.as_ref(),
+                    ) && earlier_regex.is_match(&probe)
+                })
         {
             warnings.push(LintFinding {
                 rule_kind: "bash",
@@ -406,6 +446,7 @@ action = { type = "Modify", value = "$1 --dry-run" }
 [[bash_rules]]
 name = "allow-ls"
 pattern = "^ls\\b"
+modes = ["default", "plan"]
 action = { type = "Allow" }
 
 [[bash_rules]]
@@ -434,6 +475,7 @@ action = { type = "Deny", value = "Cannot write .env files" }
 [[tool_rules]]
 name = "ask-local-edit"
 tool = "Edit"
+modes = ["acceptEdits", "auto", "dontAsk", "bypassPermissions"]
 allow_local = true
 action = { type = "Ask" }
 
@@ -481,6 +523,7 @@ fn starter_rules() -> Vec<BashRule> {
             // `\b` after the program name matches `echo`, `echo hi`, and `echo "x"` but not
             // `echoes`. Operators are already split off, so no `{{safe_arg}}` exclusion is needed.
             pattern: format!(r"^{command}\b"),
+            modes: None,
             action: BashRuleAction::Allow,
         })
         .collect()
@@ -692,33 +735,71 @@ fn match_mode_label(mode: MatchMode) -> &'static str {
     }
 }
 
-/// Accumulates everything observed for one leaf text (or one generated pattern): the summed
-/// occurrence count and the full commands it came from, kept sorted for deterministic output.
-#[derive(Default)]
 struct ObservedGroup {
     count: u64,
     observed: BTreeSet<String>,
+    /// `None` is sticky because any mode-less contributor requires an unrestricted suggestion;
+    /// otherwise this set is the union of every recorded contributing mode.
+    modes: Option<BTreeSet<PermissionMode>>,
+}
+
+impl Default for ObservedGroup {
+    fn default() -> Self {
+        Self {
+            count: 0,
+            observed: BTreeSet::new(),
+            modes: Some(BTreeSet::new()),
+        }
+    }
 }
 
 impl ObservedGroup {
-    fn absorb(&mut self, count: u64, observed_command: &str) {
+    fn absorb(&mut self, count: u64, observed_command: &str, mode: Option<PermissionMode>) {
         self.count += count;
         self.observed.insert(observed_command.to_string());
+        match mode {
+            Some(mode) => {
+                if let Some(modes) = &mut self.modes {
+                    modes.insert(mode);
+                }
+            }
+            None => self.modes = None,
+        }
     }
 
     fn merge(&mut self, other: &ObservedGroup) {
         self.count += other.count;
         self.observed.extend(other.observed.iter().cloned());
+        match &other.modes {
+            Some(other_modes) => {
+                if let Some(modes) = &mut self.modes {
+                    modes.extend(other_modes);
+                }
+            }
+            None => self.modes = None,
+        }
+    }
+
+    fn rule_modes(&self) -> Option<BTreeSet<PermissionMode>> {
+        self.modes
+            .as_ref()
+            .filter(|modes| !modes.is_empty())
+            .cloned()
     }
 }
 
 /// True when the current `BashRuleEngine` already allows a leaf and the leaf doesn't write to a
 /// real file — i.e. the leaf won't prompt the user even without a new rule. `real_file_write` caps
 /// Allow → Ask in the compound engine, so a write-redirecting leaf must stay in the suggestions.
-fn is_already_allowed(engine: Option<&BashRuleEngine>, text: &str, real_file_write: bool) -> bool {
+fn is_already_allowed(
+    engine: Option<&BashRuleEngine>,
+    text: &str,
+    real_file_write: bool,
+    mode: Option<PermissionMode>,
+) -> bool {
     match engine {
         Some(engine) => {
-            !real_file_write && matches!(engine.apply_rules(text), RuleResult::Allowed { .. })
+            !real_file_write && matches!(engine.apply_rules(text, mode), RuleResult::Allowed { .. })
         }
         None => false,
     }
@@ -749,13 +830,23 @@ fn build_suggestions(
         let texts: BTreeSet<String> = match split_command(command, &row.cwd) {
             SplitOutcome::Commands(parts) => parts
                 .into_iter()
-                .filter(|leaf| !is_already_allowed(engine, &leaf.text, leaf.real_file_write))
+                .filter(|leaf| {
+                    !is_already_allowed(
+                        engine,
+                        &leaf.text,
+                        leaf.real_file_write,
+                        row.permission_mode,
+                    )
+                })
                 .map(|leaf| leaf.text)
                 .collect(),
             SplitOutcome::Bail(_) => BTreeSet::from([command.to_string()]),
         };
         for text in texts {
-            leaves.entry(text).or_default().absorb(row.count, command);
+            leaves
+                .entry(text)
+                .or_default()
+                .absorb(row.count, command, row.permission_mode);
         }
     }
 
@@ -799,6 +890,7 @@ fn build_suggestions(
             rule: BashRule {
                 name: format!("suggested-{}-{}", program, short_hash(&pattern)),
                 pattern,
+                modes: group.rule_modes(),
                 action: to_bash_action(action),
             },
             count: group.count,
@@ -905,6 +997,8 @@ fn to_bash_action(action: SuggestAction) -> BashRuleAction {
 #[derive(Debug, Serialize, PartialEq, Eq)]
 struct ReplayRow {
     command: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    permission_mode: Option<PermissionMode>,
     recorded: PreToolResult,
     computed: PreToolResult,
     count: u64,
@@ -990,7 +1084,8 @@ fn build_replay_report(
         };
         total_evaluated += 1;
 
-        let computed = classify_result(&engine.apply_rules_compound(command, &row.cwd));
+        let computed =
+            classify_result(&engine.apply_rules_compound(command, &row.cwd, row.permission_mode));
         if computed == row.result {
             continue;
         }
@@ -1007,6 +1102,7 @@ fn build_replay_report(
 
         divergences.push(ReplayRow {
             command: command.to_string(),
+            permission_mode: row.permission_mode,
             recorded: row.result,
             computed,
             count: row.count,
@@ -1069,7 +1165,7 @@ fn print_replay(report: &ReplayReport) {
                 row.recorded.as_str(),
                 row.computed.as_str(),
                 row.count,
-                row.command
+                replay_command_label(&row.command, row.permission_mode)
             );
         }
     }
@@ -1079,6 +1175,13 @@ fn print_replay(report: &ReplayReport) {
             "\nFAIL: {} previously-auto-approved command(s) would now prompt or be denied.",
             report.lost_allow_count
         );
+    }
+}
+
+fn replay_command_label(command: &str, permission_mode: Option<PermissionMode>) -> String {
+    match permission_mode {
+        Some(mode) => format!("{command} [mode={mode}]"),
+        None => command.to_string(),
     }
 }
 
@@ -1104,7 +1207,21 @@ mod tests {
         BashRule {
             name: name.to_string(),
             pattern: pattern.to_string(),
+            modes: None,
             action: BashRuleAction::Allow,
+        }
+    }
+
+    fn tool_rule(name: &str, tool: &str) -> ToolRule {
+        ToolRule {
+            name: name.to_string(),
+            tool: tool.to_string(),
+            modes: None,
+            allow_local: false,
+            field: None,
+            pattern: None,
+            conditions: Vec::new(),
+            action: ToolRuleAction::Allow,
         }
     }
 
@@ -1128,18 +1245,12 @@ mod tests {
 
     #[test]
     fn reports_tool_rule_missing_field_pattern() {
+        let mut rule = tool_rule("half", "Read");
+        rule.field = Some("path".to_string());
         let config = UserConfig {
             pattern_fragments: None,
             bash_rules: None,
-            tool_rules: Some(vec![ToolRule {
-                name: "half".to_string(),
-                tool: "Read".to_string(),
-                allow_local: false,
-                field: Some("path".to_string()),
-                pattern: None,
-                conditions: Vec::new(),
-                action: ToolRuleAction::Allow,
-            }]),
+            tool_rules: Some(vec![rule]),
         };
         let report = build_lint_report(&config, false).unwrap();
         assert_eq!(report.errors.len(), 1);
@@ -1149,26 +1260,20 @@ mod tests {
 
     #[test]
     fn reports_invalid_condition_regex_and_drops_the_rule() {
+        let mut rule = tool_rule("condition-regex", "subagent");
+        rule.conditions = vec![
+            ToolRuleCondition::Absent {
+                field: "action".to_string(),
+            },
+            ToolRuleCondition::Matches {
+                field: "agent".to_string(),
+                pattern: "[invalid(".to_string(),
+            },
+        ];
         let config = UserConfig {
             pattern_fragments: None,
             bash_rules: None,
-            tool_rules: Some(vec![ToolRule {
-                name: "condition-regex".to_string(),
-                tool: "subagent".to_string(),
-                allow_local: false,
-                field: None,
-                pattern: None,
-                conditions: vec![
-                    ToolRuleCondition::Absent {
-                        field: "action".to_string(),
-                    },
-                    ToolRuleCondition::Matches {
-                        field: "agent".to_string(),
-                        pattern: "[invalid(".to_string(),
-                    },
-                ],
-                action: ToolRuleAction::Allow,
-            }]),
+            tool_rules: Some(vec![rule]),
         };
 
         let report = build_lint_report(&config, false).unwrap();
@@ -1192,10 +1297,14 @@ mod tests {
 
     #[test]
     fn clean_config_has_no_errors() {
-        let config = config_with_bash(vec![allow("ls", r"^ls($|\s)")]);
+        let mut plan = allow("plan-pwd", r"^pwd$");
+        plan.modes = Some(BTreeSet::from([PermissionMode::Plan]));
+        let config = config_with_bash(vec![allow("ls", r"^ls($|\s)"), plan]);
+
         let report = build_lint_report(&config, true).unwrap();
         assert_eq!(report.ignored_count, 0);
         assert!(report.errors.is_empty());
+        assert!(report.warnings.is_empty());
     }
 
     #[test]
@@ -1227,6 +1336,61 @@ mod tests {
             .collect();
         assert_eq!(shadowed.len(), 1, "warnings: {:?}", report.warnings);
         assert_eq!(shadowed[0].rule_name, "specific-ls");
+    }
+
+    #[test]
+    fn strict_shadow_warnings_require_overlapping_mode_eligibility() {
+        let mut plan = allow("plan-broad", r"^ls");
+        plan.modes = Some(BTreeSet::from([PermissionMode::Plan]));
+        let mut default = allow("default-specific", r"^ls -la$");
+        default.modes = Some(BTreeSet::from([PermissionMode::Default]));
+        let mut disabled = allow("disabled", r"^ls -la$");
+        disabled.modes = Some(BTreeSet::new());
+        let unrestricted = allow("unrestricted", r"^ls -la$");
+
+        let disjoint = build_lint_report(
+            &config_with_bash(vec![plan.clone(), default, disabled]),
+            true,
+        )
+        .unwrap();
+        assert!(
+            disjoint
+                .warnings
+                .iter()
+                .all(|warning| warning.kind != "shadowed")
+        );
+
+        let overlapping =
+            build_lint_report(&config_with_bash(vec![plan, unrestricted]), true).unwrap();
+        assert!(
+            overlapping
+                .warnings
+                .iter()
+                .any(|warning| warning.kind == "shadowed")
+        );
+    }
+
+    #[test]
+    fn strict_warns_when_bash_or_tool_modes_are_empty() {
+        let mut bash = allow("disabled-bash", r"^ls");
+        bash.modes = Some(BTreeSet::new());
+        let mut tool = tool_rule("disabled-tool", "Read");
+        tool.modes = Some(BTreeSet::new());
+        let config = UserConfig {
+            pattern_fragments: None,
+            bash_rules: Some(vec![bash]),
+            tool_rules: Some(vec![tool]),
+        };
+
+        let report = build_lint_report(&config, true).unwrap();
+        let disabled: Vec<_> = report
+            .warnings
+            .iter()
+            .filter(|warning| warning.kind == "empty-modes")
+            .collect();
+        assert_eq!(disabled.len(), 2, "warnings: {:?}", report.warnings);
+        assert_eq!(disabled[0].rule_kind, "bash");
+        assert_eq!(disabled[1].rule_kind, "tool");
     }
 
     #[test]
@@ -1279,7 +1443,7 @@ mod tests {
         let engine = BashRuleEngine::from_config(starter_rules(), None).unwrap();
         assert!(
             matches!(
-                engine.apply_rules_compound(NORTH_STAR, ""),
+                engine.apply_rules_compound(NORTH_STAR, "", None),
                 RuleResult::Allowed { .. }
             ),
             "starter pack should auto-allow the north-star command"
@@ -1293,6 +1457,16 @@ mod tests {
     }
 
     fn bash_row_in(command: &str, count: u64, result: PreToolResult, cwd: &str) -> ReportRow {
+        bash_row_mode(command, count, result, cwd, None)
+    }
+
+    fn bash_row_mode(
+        command: &str,
+        count: u64,
+        result: PreToolResult,
+        cwd: &str,
+        permission_mode: Option<PermissionMode>,
+    ) -> ReportRow {
         ReportRow {
             tool_name: "Bash".to_string(),
             arguments: serde_json::json!({ "command": command }),
@@ -1300,6 +1474,7 @@ mod tests {
             count,
             rule: None,
             cwd: cwd.to_string(),
+            permission_mode,
         }
     }
 
@@ -1337,6 +1512,85 @@ mod tests {
         assert!(
             !regex.is_match("cargolike"),
             "prefix must respect a word boundary"
+        );
+    }
+
+    #[test]
+    fn empty_observed_mode_state_cannot_disable_a_suggestion() {
+        assert_eq!(ObservedGroup::default().rule_modes(), None);
+    }
+
+    #[test]
+    fn suggestions_union_known_modes_and_become_unrestricted_for_mode_less_rows() {
+        let known = vec![
+            bash_row_mode(
+                "cargo build",
+                2,
+                PreToolResult::Ask,
+                "",
+                Some(PermissionMode::Plan),
+            ),
+            bash_row_mode(
+                "cargo check",
+                3,
+                PreToolResult::Ask,
+                "",
+                Some(PermissionMode::Default),
+            ),
+        ];
+        let suggestions =
+            build_suggestions(&known, MatchMode::Prefix, SuggestAction::Ask, 1, 10, None);
+        assert_eq!(
+            suggestions[0].rule.modes,
+            Some(BTreeSet::from([
+                PermissionMode::Default,
+                PermissionMode::Plan,
+            ]))
+        );
+
+        let mixed = vec![
+            bash_row("cargo build", 1, PreToolResult::Ask),
+            known[1].clone(),
+        ];
+        let suggestions =
+            build_suggestions(&mixed, MatchMode::Prefix, SuggestAction::Ask, 1, 10, None);
+        assert_eq!(suggestions[0].rule.modes, None);
+    }
+
+    #[test]
+    fn suggestion_already_allowed_filter_uses_each_rows_mode() {
+        let mut plan_allow = allow("plan-head", r"^head");
+        plan_allow.modes = Some(BTreeSet::from([PermissionMode::Plan]));
+        let engine = BashRuleEngine::from_config(vec![plan_allow], None).unwrap();
+        let rows = vec![
+            bash_row_mode(
+                "head -5 Cargo.toml",
+                2,
+                PreToolResult::Ask,
+                "",
+                Some(PermissionMode::Plan),
+            ),
+            bash_row_mode(
+                "head -5 Cargo.toml",
+                3,
+                PreToolResult::Ask,
+                "",
+                Some(PermissionMode::Default),
+            ),
+        ];
+        let suggestions = build_suggestions(
+            &rows,
+            MatchMode::Exact,
+            SuggestAction::Ask,
+            1,
+            10,
+            Some(&engine),
+        );
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].count, 3);
+        assert_eq!(
+            suggestions[0].rule.modes,
+            Some(BTreeSet::from([PermissionMode::Default]))
         );
     }
 
@@ -1434,7 +1688,7 @@ mod tests {
         let engine = BashRuleEngine::from_config(rules, None).unwrap();
         assert!(
             matches!(
-                engine.apply_rules_compound("git status && ls -la", ""),
+                engine.apply_rules_compound("git status && ls -la", "", None),
                 RuleResult::Allowed { .. }
             ),
             "adopting the suggestions must allow the observed compound"
@@ -1715,6 +1969,42 @@ mod tests {
     }
 
     #[test]
+    fn replay_human_labels_include_known_modes() {
+        assert_eq!(
+            replay_command_label("ls", Some(PermissionMode::Plan)),
+            "ls [mode=plan]"
+        );
+        assert_eq!(replay_command_label("ls", None), "ls");
+    }
+
+    #[test]
+    fn replay_uses_recorded_mode_and_reports_it_on_divergence() {
+        let mut plan_allow = allow("plan-ls", r"^ls");
+        plan_allow.modes = Some(BTreeSet::from([PermissionMode::Plan]));
+        let engine = BashRuleEngine::from_config(vec![plan_allow], None).unwrap();
+        let rows = vec![
+            bash_row_mode("ls", 1, PreToolResult::Ask, "", Some(PermissionMode::Plan)),
+            bash_row_mode(
+                "ls",
+                1,
+                PreToolResult::Ask,
+                "",
+                Some(PermissionMode::Default),
+            ),
+            bash_row("ls", 1, PreToolResult::Ask),
+        ];
+
+        let report = build_replay_report(&rows, &engine, None, None, Default::default());
+        assert_eq!(report.total_evaluated, 3);
+        assert_eq!(report.newly_allowed_count, 1);
+        assert_eq!(report.divergences.len(), 1);
+        assert_eq!(
+            report.divergences[0].permission_mode,
+            Some(PermissionMode::Plan)
+        );
+    }
+
+    #[test]
     fn replay_result_filter_limits_scope() {
         let engine =
             BashRuleEngine::from_config(vec![allow("allow-ls", r"^ls($|\s)")], None).unwrap();
@@ -1756,6 +2046,7 @@ mod tests {
             count: 3,
             rule: None,
             cwd: String::new(),
+            permission_mode: None,
         }];
         let report = build_replay_report(&rows, &engine, None, None, Default::default());
         // A Bash row missing its command is skipped, not counted or misclassified.
@@ -1788,7 +2079,7 @@ mod tests {
 
     #[test]
     fn replay_without_recorded_cwd_skips_normalization() {
-        // A legacy row (empty cwd) cannot be normalized, so the same absolute-path command no longer
+        // A historical row without cwd cannot be normalized, so the same absolute-path command no longer
         // matches the relative allow-rule and is reported as a lost auto-approval.
         let engine =
             BashRuleEngine::from_config(vec![allow("allow-cat-src", r"^cat src/")], None).unwrap();

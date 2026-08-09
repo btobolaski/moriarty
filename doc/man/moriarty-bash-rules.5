@@ -1,6 +1,6 @@
 .\" Copyright (c) 2025 Moriarty contributors
 .\" SPDX-License-Identifier: GPL-3.0-only
-.Dd July 2025
+.Dd August 2026
 .Dt MORIARTY\-BASH\-RULES 5
 .Os
 .Sh NAME
@@ -19,7 +19,8 @@ has matched the Bash tool call.
 .Pp
 Rules are evaluated top\-to\-bottom with
 .Em first\-match\-wins
-semantics.
+semantics among rules eligible for the current permission mode.
+An ineligible matching rule is skipped without changing its declared position.
 Place more specific rules before general ones.
 .Sh COMPOUND COMMANDS
 Before matching, the hook parses each Bash command with a real shell parser and evaluates every
@@ -67,8 +68,8 @@ ability to run code or write files
 .Pq for example Ql find -exec , sed -i, or xargs ,
 which are not shell\-level and so are invisible to the splitter.
 Use
-.Ql moriarty test bash-rules --explain
-to see how a command splits and which rule matches each leaf, and
+.Ql moriarty test bash-rules --mode plan --explain
+to simulate a mode and see how a command splits and which rule matches each leaf, and
 .Ql moriarty rules lint
 to find rules the hook silently ignores.
 .Sh CONFIGURATION
@@ -83,6 +84,7 @@ if set.
 [[bash_rules]]
 name = "descriptive\-name"
 pattern = "regex\-pattern"
+modes = ["default", "plan"] # optional
 action = { type = "ActionType", ... }
 .Ed
 .Ss Fields
@@ -97,6 +99,26 @@ Pattern fragments may be used with
 .Ql {{fragment_name}}
 syntax; see
 .Sx PATTERN FRAGMENTS .
+.It Ic modes
+Optional permission\-mode allow\-list.
+Accepted values are exactly
+.Cm default ,
+.Cm plan ,
+.Cm acceptEdits ,
+.Cm auto ,
+.Cm dontAsk ,
+and
+.Cm bypassPermissions .
+The UI's Manual mode arrives as
+.Cm default ;
+.Cm manual
+is invalid.
+Omitting the field permanently defines an unrestricted rule enabled in every mode;
+this is a fully supported configuration, not a deprecated compatibility form.
+An empty array disables the rule.
+Current hook events require a permission mode.
+A restricted rule is ineligible during a mode\-less historical replay or test evaluation.
+The same mode is used for every compound leaf, whole\-command bail evaluation, and ArgumentFilter revalidation.
 .It Ic action
 The action to take when the pattern matches.
 See
@@ -407,9 +429,14 @@ action = { type = "Allow" }
 .Sh TROUBLESHOOTING
 .Bl -tag -width Ds
 .It Em Rule not matching
+Check both the regex and the rule's
+.Ic modes ;
+a restricted rule is skipped when the current mode is absent or unlisted.
+Reproduce the hook with
+.Cm moriarty test bash\-rules \-\-mode Ar mode \-\-explain Ar command .
 Check logs at
 .Pa ~/.local/state/moriarty/hooks/
-to see which rule matched:
+to see the recorded mode and which rule matched:
 .Pp
 .Dl tail \-f ~/.local/state/moriarty/hooks/hooks.log* | grep \(lqBash rule matched\(rq
 .It Em Pattern expansion errors
@@ -428,8 +455,14 @@ Verify the config file exists at the expected path,
 check TOML syntax, and look for parse errors in the logs.
 .It Em Testing patterns
 Use
-.Cm moriarty test bash\-rules \-\-explain Ar command
-to see how a command splits into leaves and which rule matches each,
+.Cm moriarty test bash\-rules \-\-mode Ar mode \-\-explain Ar command
+to simulate the hook mode and see how a command splits into leaves and which rule matches each.
+Omitting
+.Fl \-mode
+runs a mode\-less test evaluation.
+Use this when a rule's regex matches but its
+.Ic modes
+may make it ineligible,
 or use an online regex tester with the Rust regex flavor.
 .El
 .Sh FILES

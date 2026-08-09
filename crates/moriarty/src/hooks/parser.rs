@@ -12,6 +12,8 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::permission_mode::PermissionMode;
+
 /// Hook event types that can trigger scripts
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -71,17 +73,6 @@ pub enum PreCompactMatcher {
 #[allow(dead_code)]
 pub enum HookType {
     Command,
-}
-
-/// Permission mode levels
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum PermissionMode {
-    Default,
-    Plan,
-    AcceptEdits,
-    BypassPermissions,
-    Auto,
 }
 
 /// Hook definition with command and execution parameters
@@ -578,14 +569,13 @@ mod tests {
     }
 
     #[test]
-    fn test_permission_mode_serialization() {
-        assert_json_roundtrip(&[
-            (PermissionMode::Default, r#""default""#),
-            (PermissionMode::Plan, r#""plan""#),
-            (PermissionMode::AcceptEdits, r#""acceptEdits""#),
-            (PermissionMode::BypassPermissions, r#""bypassPermissions""#),
-            (PermissionMode::Auto, r#""auto""#),
-        ]);
+    fn hook_input_without_permission_mode_is_rejected() {
+        for event in [
+            r#"{"session_id":"s","transcript_path":"/t","cwd":"/c","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"ls"}}"#,
+            r#"{"session_id":"s","transcript_path":"/t","cwd":"/c","hook_event_name":"Stop"}"#,
+        ] {
+            assert!(parse_hook_input(event).is_err());
+        }
     }
 
     #[test]
@@ -635,11 +625,6 @@ mod tests {
             serde_json::from_str::<HookType>(r#""invalid""#),
             &["unknown variant", "invalid"],
         );
-        assert_err_contains(
-            serde_json::from_str::<PermissionMode>(r#""invalid""#),
-            &["unknown variant", "invalid"],
-        );
-
         // Missing required fields
         assert_err_contains(
             parse_hook_input(r#"{"session_id": "abc"}"#),
@@ -806,13 +791,24 @@ mod tests {
     /// Build a hook input JSON envelope for the given event name with optional
     /// extra JSON fields (a comma-separated fragment, no surrounding braces).
     fn hook_envelope(event_name: &str, extras: &str) -> String {
+        hook_envelope_with_mode(event_name, extras, Some("default"))
+    }
+
+    fn hook_envelope_with_mode(
+        event_name: &str,
+        extras: &str,
+        permission_mode: Option<&str>,
+    ) -> String {
+        let mode = permission_mode
+            .map(|mode| format!(r#""permission_mode": "{mode}","#))
+            .unwrap_or_default();
         let sep = if extras.is_empty() { "" } else { "," };
         format!(
             r#"{{
                 "session_id": "test",
                 "transcript_path": "/path",
                 "cwd": "/cwd",
-                "permission_mode": "default",
+                {mode}
                 "hook_event_name": "{event_name}"{sep}{extras}
             }}"#
         )

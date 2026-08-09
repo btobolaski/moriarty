@@ -27,6 +27,7 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 
 use crate::{
     hooks::bash_rules::{BashRuleEngine, CommandTrace, RuleResult},
+    permission_mode::PermissionMode,
     project_config::runner::{CommandOutput, VerifiedProject, verify_and_load_project},
     user_config::load_user_config_from,
 };
@@ -41,7 +42,10 @@ pub async fn exec_test(cmd: crate::TestCommand) -> Result<()> {
             json,
             explain,
             cwd,
-        } => test_bash_rules(command, config, json, explain, cwd).await,
+            mode,
+        } => test_bash_rules(command, config, json, explain, cwd, mode)
+            .await
+            .map(|_| ()),
     }
 }
 
@@ -208,7 +212,8 @@ async fn test_bash_rules(
     json: bool,
     explain: bool,
     cwd: Option<PathBuf>,
-) -> Result<()> {
+    mode: Option<PermissionMode>,
+) -> Result<RuleResult> {
     // Initialize tracing to stderr for debug output (RUST_LOG env var controls level)
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let _ = tracing_subscriber::registry()
@@ -255,7 +260,7 @@ async fn test_bash_rules(
                     "\nConfigure rules in ~/.config/moriarty/tool_rules.toml to test against them."
                 );
             }
-            return Ok(());
+            return Ok(RuleResult::NoMatch);
         }
     };
 
@@ -264,7 +269,7 @@ async fn test_bash_rules(
 
     if explain {
         let cwd = resolve_explain_cwd(cwd);
-        let trace = engine.explain(&command, &cwd);
+        let trace = engine.explain(&command, &cwd, mode);
         if json {
             let rendered = serde_json::to_string_pretty(&trace)
                 .into_diagnostic()
@@ -273,11 +278,11 @@ async fn test_bash_rules(
         } else {
             output_explain(&trace);
         }
-        return Ok(());
+        return Ok(trace.final_result);
     }
 
     // Apply rules
-    let result = engine.apply_rules(&command);
+    let result = engine.apply_rules(&command, mode);
 
     // Output result
     if json {
@@ -286,7 +291,7 @@ async fn test_bash_rules(
         output_pretty(&command, &result);
     }
 
-    Ok(())
+    Ok(result)
 }
 
 /// Resolves the simulated hook cwd for `--explain`: the explicit `--cwd`, else the process working
@@ -448,7 +453,7 @@ fn output_pretty(command: &str, result: &RuleResult) {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
 
     use tempfile::TempDir;
 
@@ -481,16 +486,25 @@ mod tests {
     ///
     /// Callers are expected to `.unwrap_or_else(|e| panic!("case {label:?}: {e}"))`
     /// so table-driven tests identify the failing case in panic output.
-    async fn run_once(rule: BashRule, command: &str, json: bool) -> miette::Result<()> {
+    async fn run_once(rule: BashRule, command: &str, json: bool) -> miette::Result<RuleResult> {
         let dir = setup_isolated_xdg_config();
         let cfg = create_test_config(&dir, vec![rule]).await;
-        test_bash_rules(Some(command.to_string()), Some(cfg), json, false, None).await
+        test_bash_rules(
+            Some(command.to_string()),
+            Some(cfg),
+            json,
+            false,
+            None,
+            None,
+        )
+        .await
     }
 
     fn allow(name: &str, pattern: &str) -> BashRule {
         BashRule {
             name: name.to_string(),
             pattern: pattern.to_string(),
+            modes: None,
             action: BashRuleAction::Allow,
         }
     }
@@ -498,6 +512,7 @@ mod tests {
         BashRule {
             name: name.to_string(),
             pattern: pattern.to_string(),
+            modes: None,
             action: BashRuleAction::Deny {
                 value: value.to_string(),
             },
@@ -507,6 +522,7 @@ mod tests {
         BashRule {
             name: name.to_string(),
             pattern: pattern.to_string(),
+            modes: None,
             action: BashRuleAction::Modify {
                 value: value.to_string(),
             },
@@ -516,6 +532,7 @@ mod tests {
         BashRule {
             name: name.to_string(),
             pattern: pattern.to_string(),
+            modes: None,
             action: BashRuleAction::Ask,
         }
     }
@@ -644,7 +661,7 @@ mod tests {
             ],
         )
         .await;
-        test_bash_rules(Some("ls".to_string()), Some(cfg), false, false, None)
+        test_bash_rules(Some("ls".to_string()), Some(cfg), false, false, None, None)
             .await
             .unwrap();
     }
@@ -653,9 +670,16 @@ mod tests {
     async fn test_bash_rules_no_rules_configured() {
         let dir = setup_isolated_xdg_config();
         let cfg = create_test_config(&dir, vec![]).await;
-        test_bash_rules(Some("ls -la".to_string()), Some(cfg), false, false, None)
-            .await
-            .unwrap();
+        test_bash_rules(
+            Some("ls -la".to_string()),
+            Some(cfg),
+            false,
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -683,6 +707,7 @@ mod tests {
             false,
             false,
             None,
+            None,
         )
         .await
         .unwrap_or_else(|e| panic!("pattern_fragments ls -la: {e}"));
@@ -697,6 +722,7 @@ mod tests {
             false,
             false,
             None,
+            None,
         )
         .await
         .unwrap_or_else(|e| panic!("pattern_fragments ls | grep foo: {e}"));
@@ -706,7 +732,7 @@ mod tests {
     async fn test_bash_rules_empty_command() {
         let dir = setup_isolated_xdg_config();
         let cfg = create_test_config(&dir, vec![allow("allow-ls", r"^ls")]).await;
-        let err = test_bash_rules(Some(String::new()), Some(cfg), false, false, None)
+        let err = test_bash_rules(Some(String::new()), Some(cfg), false, false, None, None)
             .await
             .expect_err("Should fail with empty command");
         assert!(err.to_string().contains("No command provided"));
@@ -719,6 +745,7 @@ mod tests {
             Some(PathBuf::from("/nonexistent/path/config.toml")),
             false,
             false,
+            None,
             None,
         )
         .await
@@ -735,10 +762,50 @@ mod tests {
         tokio::fs::write(&cfg, "this is not valid [[[ toml")
             .await
             .unwrap();
-        let err = test_bash_rules(Some("ls".to_string()), Some(cfg), false, false, None)
+        let err = test_bash_rules(Some("ls".to_string()), Some(cfg), false, false, None, None)
             .await
             .expect_err("Should fail with malformed TOML");
         assert!(err.to_string().contains("Failed to parse config file"));
+    }
+
+    #[tokio::test]
+    async fn permission_mode_selects_rules_in_normal_and_explain_execution() {
+        let dir = setup_isolated_xdg_config();
+        let mut plan_deny = deny("plan-deny", r"^ls", "plan denied");
+        plan_deny.modes = Some(BTreeSet::from([PermissionMode::Plan]));
+        let cfg =
+            create_test_config(&dir, vec![plan_deny, allow("unrestricted-allow", r"^ls")]).await;
+
+        for explain in [false, true] {
+            let plan = test_bash_rules(
+                Some("ls".to_string()),
+                Some(cfg.clone()),
+                false,
+                explain,
+                None,
+                Some(PermissionMode::Plan),
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                plan,
+                RuleResult::Denied { ref rule_name, .. } if rule_name == "plan-deny"
+            ));
+
+            assert!(matches!(
+                test_bash_rules(
+                    Some("ls".to_string()),
+                    Some(cfg.clone()),
+                    false,
+                    explain,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap(),
+                RuleResult::Allowed { ref rule_name } if rule_name == "unrestricted-allow"
+            ));
+        }
     }
 
     #[tokio::test]
@@ -755,6 +822,7 @@ mod tests {
                     Some(cfg.clone()),
                     json,
                     true,
+                    None,
                     None,
                 )
                 .await

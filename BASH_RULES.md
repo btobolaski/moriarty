@@ -9,6 +9,7 @@ command-level validation specifically for Bash tool calls.
 - [Quick Start](#quick-start)
 - [Tool Rules](#tool-rules)
 - [Configuration File](#configuration-file)
+- [Permission Modes](#permission-modes)
 - [Rule Actions](#rule-actions)
 - [Pattern Fragments](#pattern-fragments)
 - [Security Best Practices](#security-best-practices)
@@ -63,6 +64,7 @@ action = { type = "Ask" }
 [[tool_rules]]
 name = "descriptive-name"
 tool = "ToolName"           # Exact tool name or "*" for any tool
+modes = ["default", "plan"] # Optional: participate only in these permission modes
 allow_local = true           # Optional: require local path/file_path under cwd
 field = "field_name"        # Optional legacy field/pattern pair
 pattern = "regex-pattern"
@@ -78,6 +80,7 @@ action = { type = "ActionType", ... }
 - **name**: A descriptive name for the rule (used in logs)
 - **tool**: Exact tool name to match (e.g., `"Read"`, `"Write"`, `"Edit"`, `"Bash"`, `"Glob"`, `"Grep"`), or `"*"` to
   match any tool
+- **modes**: Optional permission-mode allow-list; see [Permission Modes](#permission-modes).
 - **allow_local**: Optional boolean. For a condition-free legacy rule, behavior is unchanged: a legacy `field` of `path`
   or `file_path` must be local, no legacy field accepts either local path field, and a non-path legacy field cannot
   satisfy locality. For a rule with `conditions`, every distinct `path` or `file_path` referenced by `Present`,
@@ -132,16 +135,17 @@ raw JSON value, including for paths, with locality enforced as a separate gate.
 ```
 PreToolUse event (any tool)
   |
-  +-> tool_rules engine (first-match-wins)
-  |     tool matches?
-  |       -> allow_local check (if enabled)
-  |       -> every condition matches (if configured)
-  |       -> legacy field/pattern regex matches (if configured)
+  +-> tool_rules engine (first-match-wins among eligible rules)
+  |     rule's permission mode is eligible?
+  |       -> tool matches?
+  |         -> allow_local check (if enabled)
+  |         -> every condition matches (if configured)
+  |         -> legacy field/pattern regex matches (if configured)
   |     Match found? -> return Allow/Deny/Ask
   |     NoMatch? -> continue
   |
   +-> tool_name == "Bash"?
-  |     Yes -> bash_rules engine (existing behavior)
+  |     Yes -> bash_rules engine (same permission mode)
   |     No  -> defer to Claude Code (no decision)
 ```
 
@@ -240,14 +244,15 @@ conditions = [{ type = "Absent", field = "action" }]
 action = { type = "Deny", value = "Normal subagent starts require async=true and must omit turnBudget" }
 ```
 
-The Allow rule must come first because tool rules are first-match-wins. An input containing `"action": null` treats the
-key as present and therefore bypasses both rules, while `"turnBudget": null` is present and denied. Extra unrelated
-execution fields do not affect either rule.
+The Allow rule must come first because tool rules are first-match-wins among eligible rules. An input containing
+`"action": null` treats the key as present and therefore bypasses both rules, while `"turnBudget": null` is present and
+denied. Extra unrelated execution fields do not affect either rule.
 
 ## Configuration File
 
 Bash rules are configured in `~/.config/moriarty/tool_rules.toml`. Rules are evaluated in order with
-**first-match-wins** semantics - the first rule that matches a command determines the action.
+**first-match-wins** semantics among eligible rules—the first eligible rule that matches a command determines the
+action.
 
 ### Basic Structure
 
@@ -255,16 +260,18 @@ Bash rules are configured in `~/.config/moriarty/tool_rules.toml`. Rules are eva
 [[bash_rules]]
 name = "descriptive-name"
 pattern = "regex-pattern"
+modes = ["default", "plan"] # Optional
 action = { type = "ActionType", ... }
 ```
 
 - **name**: A descriptive name for the rule (used in logs)
 - **pattern**: A regular expression pattern to match commands
+- **modes**: Optional permission-mode allow-list; see [Permission Modes](#permission-modes).
 - **action**: What to do when the pattern matches (see [Rule Actions](#rule-actions))
 
 ### Rule Evaluation Order
 
-Rules are evaluated top-to-bottom. The first matching rule determines the action:
+Rules are evaluated top-to-bottom. The first eligible matching rule determines the action:
 
 ```toml
 # This rule is checked first
@@ -273,7 +280,7 @@ name = "deny-dangerous-docker"
 pattern = "^docker\\s+system\\s+prune"
 action = { type = "Deny", value = "Docker system prune is dangerous" }
 
-# This rule is only reached if the command doesn't match the first rule
+# This rule is reached if the first rule is ineligible or doesn't match
 [[bash_rules]]
 name = "allow-other-docker"
 pattern = "^docker"
@@ -281,6 +288,48 @@ action = { type = "Allow" }
 ```
 
 **Important**: Place more specific rules before general ones!
+
+## Permission Modes
+
+Both `tool_rules` and `bash_rules` accept an optional `modes` array with these exact values, matching Claude Code's hook
+wire format: `default`, `plan`, `acceptEdits`, `auto`, `dontAsk`, and `bypassPermissions`. Claude Code's UI label
+**Manual** arrives as `default`; `manual` is not a valid configuration value.
+
+```toml
+[[bash_rules]]
+name = "allow-plan-inspection"
+pattern = "^git (status|diff)\\b"
+modes = ["plan"]
+action = { type = "Allow" }
+
+[[tool_rules]]
+name = "ask-default-writes"
+tool = "Write"
+modes = ["default"]
+action = { type = "Ask" }
+```
+
+- Omitted `modes` means the rule is unrestricted and participates in every mode. This is a permanent, fully supported
+  configuration, not a deprecated compatibility form; omission also preserves existing effective hashes.
+- `modes = []` means the rule never participates and intentionally disables it.
+- Duplicates are removed and values are stored in canonical order.
+- Current hook events require `permission_mode`. A restricted rule cannot match a mode-less historical log row or
+  explicit test evaluation; unrestricted rules still can. Unknown configuration and live-hook values are rejected. An
+  unrecognized historical log value is warned about and treated as mode-less, so replay remains fail-closed for
+  restricted rules.
+- Ineligible rules remain in place but are skipped. Evaluation falls through to the next eligible rule, preserving
+  first-match-wins among eligible rules. Tool-to-Bash fallback, every compound leaf, bail handling, and an
+  `ArgumentFilter` recheck all use the same mode.
+- `allow_local` filesystem preflight only runs when an eligible local rule could apply.
+
+Use `moriarty test bash-rules --mode plan '<command>'` to simulate a mode. Omitting `--mode` intentionally runs a
+mode-less test evaluation; `--mode` works with `--explain` and `--json` too.
+
+Current completion logs always record the required mode. `hooks report` deliberately keeps its existing public grouping
+and JSON shape, while `rules replay` evaluates each internal row under its recorded mode and includes the mode on
+divergences. `rules suggest` tags generated rules with the canonical union of contributing known modes; if any
+contributing record is mode-less, the suggestion is unrestricted because its original mode cannot be reconstructed.
+Strict lint warns on `modes = []` and warns about shadowing only when two rules' mode eligibility overlaps.
 
 ## Rule Actions
 
@@ -576,7 +625,7 @@ A pattern still has to guard a program's **own** ability to run code or write fi
 Preview exactly how a command splits and which rule matches each leaf with:
 
 ```bash
-moriarty test bash-rules --explain '<command>'
+moriarty test bash-rules --mode plan --explain '<command>'
 ```
 
 ## Security Best Practices
@@ -757,7 +806,9 @@ action = { type = "Allow" }
 
 **Problem**: Your rule isn't matching commands you expect.
 
-**Solution**: Check the logs at `~/.local/state/moriarty/hooks/` to see which rule (if any) matched.
+**Solution**: Check both its regex and `modes`. A mode-restricted rule is skipped when the current mode is absent or not
+listed; run `moriarty test bash-rules --mode <mode> --explain '<command>'` to reproduce the hook. Check the logs at
+`~/.local/state/moriarty/hooks/` to see the recorded mode and which rule (if any) matched.
 
 ```bash
 tail -f ~/.local/state/moriarty/hooks/hooks.log* | grep "Bash rule matched"
@@ -768,8 +819,8 @@ tail -f ~/.local/state/moriarty/hooks/hooks.log* | grep "Bash rule matched"
 **Problem**: A rule you wrote silently has no effect (undefined fragment, circular fragment, or invalid regex), so the
 hook drops it.
 
-**Solution**: Run `moriarty rules lint` (add `--strict` to also flag likely-shadowed and over-broad rules). It reports
-every rule the hook silently ignores and exits nonzero if any exist:
+**Solution**: Run `moriarty rules lint` (add `--strict` to also flag permanently disabled `modes = []`, likely-shadowed,
+and over-broad rules). It reports every rule the hook silently ignores and exits nonzero if any exist:
 
 ```bash
 moriarty rules lint --strict
@@ -801,7 +852,7 @@ Test a command against your rules with `moriarty test bash-rules`. Add `--explai
 leaves, which rule matches each leaf, and the merged decision:
 
 ```bash
-moriarty test bash-rules --explain 'git status && rm -rf /'
+moriarty test bash-rules --mode default --explain 'git status && rm -rf /'
 ```
 
 For regex-syntax questions, online testers like [regex101.com](https://regex101.com/) help — but remember:

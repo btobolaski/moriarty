@@ -18,6 +18,9 @@ security hooks for command validation.
     top-level key presence, absence, typed equality, and scalar regex matching, plus optional `allow_local` checks for
     `path` / `file_path` under the session's working directory. Legacy single-field regex rules remain supported; an
     unexpandable or invalid condition regex drops the whole rule rather than broadening it.
+  - **Permission-mode restrictions**: Both tool and Bash rules can opt into exact Claude Code modes with `modes`; an
+    omitted restriction is a permanently supported unrestricted form that applies everywhere, while `modes = []`
+    disables the rule.
   - **Bash rules**: Fine-grained command validation with pattern matching, modification, and argument filtering
   - See [BASH_RULES.md](./BASH_RULES.md) for complete configuration guide
 
