@@ -316,13 +316,14 @@ Defaults to
 .It Fl \-json
 Output results as JSON instead of pretty\-printed text.
 .It Fl \-explain
-Show how the command splits into leaf commands, the normalized text and matching
-rule for each leaf, and the merged decision the hook would make.
-This reflects the real per\-leaf evaluation
-.Pq see Xr moriarty\-bash\-rules 5 ;
-the default
-.Pq non\-explain
-output reports the single\-command result and is unchanged.
+Show how the command splits into leaf commands, including original source,
+path\-alias bindings and expansion, normalized match text, confirmation reasons,
+matching rules, and the merged decision the hook would make.
+Normal and
+.Fl \-explain
+modes use the same compound and path\-alias analysis as the live hook
+.Pq see Xr moriarty\-bash\-rules 5 .
+Normal mode prints only the final merged decision.
 .It Fl \-cwd Ar dir
 Simulate the hook working directory for in\-cwd absolute\-path normalization.
 Defaults to the process working directory.
@@ -367,9 +368,12 @@ the per\-leaf engine.
 Suggest anchored rules for commands the hook frequently prompted on, mined from the
 hook logs.
 Each recorded command is first split into the leaf simple\-commands the hook actually
-evaluates (normalized with the recorded working directory), so a compound like
+evaluates, including configured path\-alias expansion and recorded working\-directory
+normalization, so a compound like
 .Ql git status && ls
 yields one candidate per leaf and a leaf shared by several compounds accumulates their counts.
+Consumed alias declarations are omitted, and confirmation\-required alias leaves are
+excluded rather than proposed as rules.
 .Fl \-result
 selects the recorded outcome to mine
 .Pq Cm ask No or Cm deny ;

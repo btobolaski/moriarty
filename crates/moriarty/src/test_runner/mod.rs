@@ -203,9 +203,9 @@ async fn run_checks(project_dir: PathBuf) -> Result<()> {
 
 /// Test a bash command against configured rules.
 ///
-/// Without `explain`, output is the single-command rule result (unchanged historical behavior).
-/// With `explain`, it shows the compound split, each leaf's normalized text and matching rule, and
-/// the merged decision the hook would actually make for `cwd`.
+/// Both normal and explain output use the same compound analysis as the live hook. Explain adds the
+/// source, alias expansion, cwd-normalized match text, confirmation caps, and matching rule for each
+/// leaf.
 async fn test_bash_rules(
     command: Option<String>,
     config_path: Option<PathBuf>,
@@ -243,32 +243,33 @@ async fn test_bash_rules(
     let config = load_user_config_from(config_path.as_deref()).await?;
 
     // Extract bash rules
-    let bash_rules = match config.bash_rules {
-        Some(rules) if !rules.is_empty() => rules,
-        _ => {
-            if json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "result": "no_match",
-                        "reason": "No bash rules configured"
-                    })
-                );
-            } else {
-                println!("○ NO MATCH (no bash rules configured)");
-                println!(
-                    "\nConfigure rules in ~/.config/moriarty/tool_rules.toml to test against them."
-                );
-            }
-            return Ok(RuleResult::NoMatch);
+    if config
+        .bash_rules
+        .as_ref()
+        .is_none_or(|rules| rules.is_empty())
+    {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "result": "no_match",
+                    "reason": "No bash rules configured"
+                })
+            );
+        } else {
+            println!("○ NO MATCH (no bash rules configured)");
+            println!(
+                "\nConfigure rules in ~/.config/moriarty/tool_rules.toml to test against them."
+            );
         }
-    };
+        return Ok(RuleResult::NoMatch);
+    }
 
     // Create engine
-    let engine = BashRuleEngine::from_config(bash_rules, config.pattern_fragments)?;
+    let engine = BashRuleEngine::from_config(config)?;
 
+    let cwd = resolve_test_cwd(cwd);
     if explain {
-        let cwd = resolve_explain_cwd(cwd);
         let trace = engine.explain(&command, &cwd, mode);
         if json {
             let rendered = serde_json::to_string_pretty(&trace)
@@ -281,8 +282,8 @@ async fn test_bash_rules(
         return Ok(trace.final_result);
     }
 
-    // Apply rules
-    let result = engine.apply_rules(&command, mode);
+    // Apply the exact compound analysis used by the hook.
+    let result = engine.apply_rules_compound(&command, &cwd, mode);
 
     // Output result
     if json {
@@ -294,9 +295,7 @@ async fn test_bash_rules(
     Ok(result)
 }
 
-/// Resolves the simulated hook cwd for `--explain`: the explicit `--cwd`, else the process working
-/// directory, else empty (which disables path normalization).
-fn resolve_explain_cwd(cwd: Option<PathBuf>) -> String {
+fn resolve_test_cwd(cwd: Option<PathBuf>) -> String {
     match cwd {
         Some(path) => path.to_string_lossy().into_owned(),
         None => std::env::current_dir()
@@ -307,30 +306,44 @@ fn resolve_explain_cwd(cwd: Option<PathBuf>) -> String {
 
 fn output_explain(trace: &CommandTrace) {
     println!("Command: {}", trace.original);
+    for binding in &trace.bindings {
+        println!(
+            "  Binding: {}={} (analysis metadata only; grants no permission)",
+            binding.name, binding.value
+        );
+    }
 
     if let Some(reason) = &trace.bail {
         println!(
             "  Could not analyze ({reason:?}); only an explicit Deny on the whole command is honored."
         );
-    } else {
-        for (index, sub) in trace.sub_commands.iter().enumerate() {
-            println!("  Leaf {}: {}", index + 1, sub.normalized);
-            if sub.original != sub.normalized {
-                println!("    (before cwd normalization: {})", sub.original);
+    }
+    for (index, sub) in trace.sub_commands.iter().enumerate() {
+        println!("  Leaf {}: {}", index + 1, sub.original);
+        if let Some(expanded) = &sub.alias_expanded {
+            println!("    alias-expanded: {expanded}");
+        }
+        if sub.original != sub.normalized {
+            println!("    analyzed for matching: {}", sub.normalized);
+        }
+        for binding in &sub.bindings {
+            println!("    consumed binding: {}={}", binding.name, binding.value);
+        }
+        if sub.real_file_write {
+            println!("    writes a real file → any Allow is capped at Ask");
+        }
+        if let Some(reason) = &sub.requires_confirmation {
+            println!("    requires confirmation → {reason}");
+        }
+        match &sub.matched {
+            Some(explanation) => {
+                println!(
+                    "    matched rule '{}'  [{}]",
+                    explanation.rule_name, explanation.action_summary
+                );
+                println!("      pattern: {}", explanation.expanded_pattern);
             }
-            if sub.real_file_write {
-                println!("    writes a real file → any Allow is capped at Ask");
-            }
-            match &sub.matched {
-                Some(explanation) => {
-                    println!(
-                        "    matched rule '{}'  [{}]",
-                        explanation.rule_name, explanation.action_summary
-                    );
-                    println!("      pattern: {}", explanation.expanded_pattern);
-                }
-                None => println!("    no rule matched"),
-            }
+            None => println!("    no rule matched"),
         }
     }
 
@@ -458,7 +471,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::test_helpers::setup_isolated_xdg_config;
+    use crate::test_helpers::{
+        PATH_ALIAS_COMMAND, PATH_ALIAS_READ_RULES, setup_isolated_xdg_config,
+    };
     use crate::user_config::{BashRule, BashRuleAction, UserConfig};
 
     async fn create_test_config(dir: &TempDir, rules: Vec<BashRule>) -> PathBuf {
@@ -466,6 +481,7 @@ mod tests {
             dir,
             UserConfig {
                 pattern_fragments: None,
+                bash_path_aliases: BTreeSet::new(),
                 bash_rules: Some(rules),
                 tool_rules: None,
             },
@@ -691,6 +707,7 @@ mod tests {
             &dir,
             UserConfig {
                 pattern_fragments: Some(fragments),
+                bash_path_aliases: BTreeSet::new(),
                 bash_rules: Some(vec![allow(
                     "allow-ls-with-fragment",
                     r"^ls{{safe_chars}}*$",
@@ -806,6 +823,36 @@ mod tests {
                 RuleResult::Allowed { ref rule_name } if rule_name == "unrestricted-allow"
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn normal_and_explain_modes_share_alias_aware_compound_analysis() {
+        let dir = setup_isolated_xdg_config();
+        let config = toml::from_str(&format!(
+            "bash_path_aliases = [\"P\"]\n{PATH_ALIAS_READ_RULES}"
+        ))
+        .unwrap();
+        let cfg = write_user_config(&dir, config).await;
+        let command = PATH_ALIAS_COMMAND;
+
+        let mut results = Vec::new();
+        for explain in [false, true] {
+            results.push(
+                test_bash_rules(
+                    Some(command.to_string()),
+                    Some(cfg.clone()),
+                    explain,
+                    explain,
+                    Some(PathBuf::from("/work/project")),
+                    None,
+                )
+                .await
+                .unwrap(),
+            );
+        }
+
+        assert_eq!(results[0], results[1]);
+        assert!(matches!(results[0], RuleResult::Allowed { .. }));
     }
 
     #[tokio::test]

@@ -348,17 +348,29 @@ with warnings, while explicit missing paths and having no available source are e
     (or a multi-leaf `Modified`/`ArgumentFiltered`, which are not stitched back together) ⇒ prompt; only an
     all-`Allowed` command ⇒ Allow. A single-leaf command returns its decision verbatim, preserving the `ArgumentFilter`
     re-validation loop.
+  - **Configured path-alias preprocessing**: the optional top-level `bash_path_aliases` ordered set names trusted shell
+    variables that may be bound by an exact leading `NAME=/literal/path;` declaration or newline-terminated equivalent.
+    `command_split` expands only parser-identified unquoted plain `$NAME`/`${NAME}` references, then applies normal cwd
+    stripping; the declaration is analysis metadata only after a later supported reference consumes it. Unsupported
+    declarations/references and command-position expansion remain leaves with an independent Allow-to-Ask confirmation
+    cap, so later Denies still win. Rather than model per-builtin mutation targets, any other assignment, dynamic
+    command name, wrapper, `exec`, or recognized shell-state builtin invalidates all active aliases and requires
+    confirmation. This deliberately trades extra prompts for a small fail-closed implementation that cannot retain stale
+    bindings. Config deserialization validates shell identifiers and rejects the fixed shell-control names before any
+    tool rule can short-circuit Bash analysis. No aliases is the omitted/hash-compatible default; configured aliases are
+    trusted policy and must not be application/tool behavior variables.
   - **`real_file_write` cap**: a leaf with a `>`/`>>`/`>|`/`&>` redirect to a real file (not `/dev/null`, not an fd
     duplication like `2>&1`) has any `Allow` capped at Ask, so a read-only allow-rule (`^echo`) can't green-light
     `echo secret > file`.
-  - **Bail ⇒ fail safe**: a command containing command substitution `$(...)`, backticks, a value-carrying parameter
-    expansion (`${x:-$(…)}`), a subshell, process substitution, a here-doc/here-string, a compound construct
+  - **Bail ⇒ fail safe**: a command containing command substitution `$(...)`, backticks, an uninspectable value-carrying
+    parameter expansion (`${x:-$(…)}`), a subshell, process substitution, a here-doc/here-string, a compound construct
     (`if`/`for`/`while`/`case`/`[[ ]]`/`((…))`/brace group/function), or that fails to parse is un-analyzable: only an
     explicit Deny matching the whole command is honored; every other outcome becomes a prompt.
-  - **Bash cwd stripping**: like the tool-rules field stripping, a leaf's in-cwd absolute paths are normalized to their
+  - **Bash cwd stripping**: after any known path-alias expansion, a leaf's in-cwd absolute paths are normalized to their
     relative remainder before matching (no `..`-escaping remainder is rewritten), so `^cat src/` matches
     `cat /abs/cwd/src/x`. `apply_rules(command, mode)` stays the single-command primitive;
-    `apply_rules_compound(command, cwd, mode)` is what the hook calls.
+    `apply_rules_compound(command, cwd, mode)` is what the hook, replay, and normal test-runner mode call. Explain mode
+    uses `BashRuleEngine::explain`, which mirrors the same split and evaluation.
   - Evaluation order: tool_rules → bash_rules (for Bash) → passthrough (for non-Bash, defers to Claude Code)
 - **Stop hook**: Runs the project's configured checks before allowing execution, delegating to the shared
   `crate::checks::run_configured_checks` routine (see `mcp/` above); it maps the routine's `CheckRunOutcome` onto
@@ -398,22 +410,25 @@ with warnings, while explicit missing paths and having no available source are e
   `UserConfig` in tests), `starter` (paste-ready read-only allow-rules that auto-allow the north-star command),
   `suggest` (anchored rules mined from hook logs; each recorded command is split into the leaf simple-commands the hook
   actually evaluates — normalized with the recorded cwd — before pattern generation, so compounds yield per-leaf
-  candidates with summed counts, and a bailed command stays whole; `--match exact|prefix|fuzzy` picks the shape, where
-  fuzzy clusters leaves by program and generalizes simple-identifier subcommands into a closed alternation like
-  `^cargo (build|check)(\s|$)`, falling back to a program prefix; never emits Allow unless `--match exact`), and
-  `replay` (re-evaluate recorded Bash decisions against a candidate config — the migration acceptance gate is zero lost
-  auto-approvals). `test bash-rules --explain [--cwd <dir>] [--mode <mode>]` prints the per-leaf split, normalized text,
-  matching rule (with the expanded pattern), and merged decision via `BashRuleEngine::explain`; omitting `--mode` runs a
-  mode-less test evaluation.
+  candidates with summed counts, consumed alias declarations omitted, and confirmation-required alias leaves excluded; a
+  bailed command stays whole. `--match exact|prefix|fuzzy` picks the shape, where fuzzy clusters leaves by program and
+  generalizes simple-identifier subcommands into a closed alternation like `^cargo (build|check)(\s|$)`, falling back to
+  a program prefix; Allow is emitted only with `--match exact`), and `replay` (re-evaluate recorded Bash decisions
+  against the full candidate config, including aliases — the migration acceptance gate is zero lost auto-approvals).
+  `test bash-rules --explain [--cwd <dir>] [--mode <mode>]` prints consumed bindings, original/alias-expanded/normalized
+  leaf text, confirmation caps, matching rules, and the merged decision via `BashRuleEngine::explain`; normal mode uses
+  the same compound path. Omitted `--mode` runs a mode-less evaluation. Alias coverage spans `user_config`, splitter,
+  engine, authoring commands, CLI, and hook tests and must run under Nextest like every XDG-mutating test.
 - **Rule-set provenance**: each `PreToolUse hook completed` log line records `rules_hash`, a stable hash of the
   effective config (`UserConfig::effective_hash`, computed once per hook invocation). The hash covers the parsed config
-  — tool rules, bash rules, and fragments — re-serialized via `serde_json::to_value` so map keys (`pattern_fragments`,
-  an ArgumentFilter `replace` table) sort deterministically while rule order (significant for first-match-wins) is
-  preserved; cosmetic edits don't change it but any semantic change does. `rules suggest`/`rules replay` default to only
-  the records whose `rules_hash` matches the rule set currently installed at the default config path (for `replay` this
-  is the migration source, independent of the `--config` candidate); `--rules-hash <hash>` pins a specific set and
-  `--all-rules` disables the filter. Both commands report the active hash and how many records the filter excluded
-  (`report::RulesHashFilter`/`HashSkipStats`/`CwdAggregation`); excluded counts are never hidden.
+  — tool rules, bash rules, fragments, and the deterministically ordered path-alias policy — re-serialized via
+  `serde_json::to_value` so map keys (`pattern_fragments`, an ArgumentFilter `replace` table) sort deterministically
+  while rule order (significant for first-match-wins) is preserved; cosmetic edits don't change it but any semantic
+  change does. The empty alias set is omitted so pre-feature hashes remain unchanged. `rules suggest`/`rules replay`
+  default to only the records whose `rules_hash` matches the rule set currently installed at the default config path
+  (for `replay` this is the migration source, independent of the `--config` candidate); `--rules-hash <hash>` pins a
+  specific set and `--all-rules` disables the filter. Both commands report the active hash and how many records the
+  filter excluded (`report::RulesHashFilter`/`HashSkipStats`/`CwdAggregation`); excluded counts are never hidden.
 - Security model: Defaults to "Ask" when unconfigured, fail-closed once configured (verification failures block
   execution)
 

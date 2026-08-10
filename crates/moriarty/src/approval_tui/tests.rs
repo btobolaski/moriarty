@@ -1,8 +1,10 @@
+use std::{env, fs};
+
 use super::ApprovalApp;
 use crate::{
     approval_tui::approval_state::{Screen, Section},
     test_helpers::{
-        create_executable_script, run_git_command, setup_isolated_xdg_config,
+        TestEnvVarGuard, create_executable_script, run_git_command, setup_isolated_xdg_config,
         setup_project_dir_with_config, write_tools_config,
     },
 };
@@ -157,7 +159,10 @@ async fn test_approve_current_and_advance() {
 
 #[tokio::test]
 async fn test_save_approvals_validation() {
-    // Test that save_approvals validates all commands are approved
+    // macOS exposes /var as a symlink to /private/var; keeping tempfile's root canonical ensures
+    // the fixture tests approval normalization rather than two spellings of the same directory.
+    let canonical_tmp = fs::canonicalize(env::temp_dir()).unwrap();
+    let _tmpdir_guard = TestEnvVarGuard::set("TMPDIR", canonical_tmp);
     let temp_dir = setup_test_project();
     let _xdg_dir = setup_isolated_xdg_config();
 

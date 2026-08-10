@@ -428,7 +428,10 @@ async fn list_fragments(config_path: Option<PathBuf>, json: bool) -> Result<()> 
 
 /// Canonical example config exercising every rule kind and action variant. Kept in sync with the
 /// config types by the `schema_round_trips_through_user_config` test.
-const SCHEMA_TOML: &str = r#"# Reusable regex fragments, referenced from patterns as {{name}}.
+const SCHEMA_TOML: &str = r#"# Trusted shell variables eligible for conservative path-alias analysis.
+bash_path_aliases = ["P"]
+
+# Reusable regex fragments, referenced from patterns as {{name}}.
 [pattern_fragments]
 safe_chars = "[^|&;$`]"
 
@@ -542,6 +545,7 @@ fn starter(json: bool) -> Result<()> {
 
     let config = UserConfig {
         pattern_fragments: None,
+        bash_path_aliases: BTreeSet::new(),
         bash_rules: Some(rules),
         tool_rules: None,
     };
@@ -655,13 +659,7 @@ async fn collect_suggestions(opts: &SuggestOptions) -> Result<(Vec<Suggestion>, 
     )?;
     let (hash_filter, active_hash) =
         resolve_hash_filter(opts.all_rules, opts.rules_hash.clone()).await?;
-    let engine = {
-        let config = load_user_config().await?;
-        BashRuleEngine::from_config(
-            config.bash_rules.unwrap_or_default(),
-            config.pattern_fragments,
-        )?
-    };
+    let engine = BashRuleEngine::from_config(load_user_config().await?)?;
     let CwdAggregation { rows, skipped } = aggregate_with_cwd(
         opts.dir.clone(),
         &filter,
@@ -703,6 +701,7 @@ async fn suggest(opts: SuggestOptions) -> Result<()> {
 
     let config = UserConfig {
         pattern_fragments: None,
+        bash_path_aliases: BTreeSet::new(),
         bash_rules: Some(suggestions.iter().map(|s| s.rule.clone()).collect()),
         tool_rules: None,
     };
@@ -827,18 +826,23 @@ fn build_suggestions(
         };
         // A leaf repeated within one compound counts once per recorded occurrence, not once per
         // appearance, so the count still reflects how often the user saw a prompt.
-        let texts: BTreeSet<String> = match split_command(command, &row.cwd) {
+        let split = match engine {
+            Some(engine) => engine.split_command(command, &row.cwd),
+            None => split_command(command, &row.cwd, &BTreeSet::new()),
+        };
+        let texts: BTreeSet<String> = match split {
             SplitOutcome::Commands(parts) => parts
                 .into_iter()
+                .filter(|leaf| leaf.requires_confirmation.is_none())
                 .filter(|leaf| {
                     !is_already_allowed(
                         engine,
-                        &leaf.text,
+                        &leaf.match_text,
                         leaf.real_file_write,
                         row.permission_mode,
                     )
                 })
-                .map(|leaf| leaf.text)
+                .map(|leaf| leaf.match_text)
                 .collect(),
             SplitOutcome::Bail(_) => BTreeSet::from([command.to_string()]),
         };
@@ -1026,13 +1030,7 @@ struct ReplayReport {
 
 async fn replay(opts: ReplayOptions) -> Result<()> {
     let config = load_user_config_from(opts.config.as_deref()).await?;
-    let engine = BashRuleEngine::from_config(
-        config.bash_rules.unwrap_or_default(),
-        config.pattern_fragments,
-    )?;
-
-    // Replay defaults to all recorded history, but `--start-time`/`--end-time` bound the window so a
-    // long-lived log doesn't force every candidate to clear every command ever run.
+    let engine = BashRuleEngine::from_config(config)?;
     let filter = TimeRangeFilter::new(
         opts.start_time,
         opts.end_time,
@@ -1187,20 +1185,25 @@ fn replay_command_label(command: &str, permission_mode: Option<PermissionMode>) 
 
 #[cfg(test)]
 mod tests {
-    use std::env;
+    use std::{env, path::Path};
 
     use super::*;
     use crate::{
-        test_helpers::{SUBAGENT_EXECUTION_RULES, setup_isolated_xdg_config},
+        test_helpers::{PATH_ALIAS_COMMAND, SUBAGENT_EXECUTION_RULES, setup_isolated_xdg_config},
         user_config::{BashRule, BashRuleAction, ToolRule, ToolRuleAction, ToolRuleCondition},
     };
 
     fn config_with_bash(rules: Vec<BashRule>) -> UserConfig {
         UserConfig {
             pattern_fragments: None,
+            bash_path_aliases: BTreeSet::new(),
             bash_rules: Some(rules),
             tool_rules: None,
         }
+    }
+
+    fn engine_with_bash(rules: Vec<BashRule>) -> BashRuleEngine {
+        BashRuleEngine::from_config(config_with_bash(rules)).unwrap()
     }
 
     fn allow(name: &str, pattern: &str) -> BashRule {
@@ -1223,6 +1226,48 @@ mod tests {
             conditions: Vec::new(),
             action: ToolRuleAction::Allow,
         }
+    }
+
+    fn suggest_options(dir: PathBuf) -> SuggestOptions {
+        SuggestOptions {
+            dir: Some(dir),
+            start_time: None,
+            end_time: None,
+            timezone: "utc".to_string(),
+            result: PreToolResult::Ask,
+            limit: 10,
+            min_count: 1,
+            match_mode: MatchMode::Exact,
+            action: None,
+            all_rules: true,
+            rules_hash: None,
+            json: true,
+        }
+    }
+
+    async fn write_bash_log(dir: &Path, records: &[(&str, &str)]) {
+        let lines = records
+            .iter()
+            .enumerate()
+            .map(|(index, (command, cwd))| {
+                serde_json::json!({
+                    "timestamp": format!("2026-06-10T{:02}:00:00Z", index + 1),
+                    "fields": {
+                        "message": "PreToolUse hook completed",
+                        "tool_name": "Bash",
+                        "tool_args": serde_json::json!({"command": command}).to_string(),
+                        "cwd": cwd,
+                        "rules_hash": "sha256:test",
+                        "result": "ask"
+                    }
+                })
+                .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        tokio::fs::write(dir.join("hooks.log.2026-06-10"), format!("{lines}\n"))
+            .await
+            .unwrap();
     }
 
     #[test]
@@ -1249,6 +1294,7 @@ mod tests {
         rule.field = Some("path".to_string());
         let config = UserConfig {
             pattern_fragments: None,
+            bash_path_aliases: BTreeSet::new(),
             bash_rules: None,
             tool_rules: Some(vec![rule]),
         };
@@ -1272,6 +1318,7 @@ mod tests {
         ];
         let config = UserConfig {
             pattern_fragments: None,
+            bash_path_aliases: BTreeSet::new(),
             bash_rules: None,
             tool_rules: Some(vec![rule]),
         };
@@ -1378,6 +1425,7 @@ mod tests {
         tool.modes = Some(BTreeSet::new());
         let config = UserConfig {
             pattern_fragments: None,
+            bash_path_aliases: BTreeSet::new(),
             bash_rules: Some(vec![bash]),
             tool_rules: Some(vec![tool]),
         };
@@ -1426,6 +1474,7 @@ mod tests {
     fn starter_rules_round_trip_through_toml() {
         let config = UserConfig {
             pattern_fragments: None,
+            bash_path_aliases: BTreeSet::new(),
             bash_rules: Some(starter_rules()),
             tool_rules: None,
         };
@@ -1440,7 +1489,7 @@ mod tests {
 
         const NORTH_STAR: &str = r#"echo "===== Is there a lib.rs? =====" && ls crates/moriarty/src/lib.rs 2>/dev/null && echo "FOUND lib.rs" || echo "NO lib.rs (binary only via main.rs)"; echo; echo "===== Cargo.toml deps =====" && cat crates/moriarty/Cargo.toml; echo; cat Cargo.toml 2>/dev/null | head -60"#;
 
-        let engine = BashRuleEngine::from_config(starter_rules(), None).unwrap();
+        let engine = engine_with_bash(starter_rules());
         assert!(
             matches!(
                 engine.apply_rules_compound(NORTH_STAR, "", None),
@@ -1561,7 +1610,7 @@ mod tests {
     fn suggestion_already_allowed_filter_uses_each_rows_mode() {
         let mut plan_allow = allow("plan-head", r"^head");
         plan_allow.modes = Some(BTreeSet::from([PermissionMode::Plan]));
-        let engine = BashRuleEngine::from_config(vec![plan_allow], None).unwrap();
+        let engine = engine_with_bash(vec![plan_allow]);
         let rows = vec![
             bash_row_mode(
                 "head -5 Cargo.toml",
@@ -1627,25 +1676,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn suggest_rejects_allow_with_prefix_match() {
+    async fn suggest_rejects_allow_with_nonexact_match() {
         // The guard runs before any log reading, so the (unused) dir is irrelevant.
-        let err = suggest(SuggestOptions {
-            dir: Some(PathBuf::from("/tmp/moriarty-suggest-guard")),
-            start_time: None,
-            end_time: None,
-            timezone: "utc".to_string(),
-            result: PreToolResult::Ask,
-            limit: 10,
-            min_count: 2,
-            match_mode: MatchMode::Prefix,
-            action: Some(SuggestAction::Allow),
-            all_rules: false,
-            rules_hash: None,
-            json: false,
-        })
-        .await
-        .expect_err("Allow + prefix must be rejected");
-        assert!(err.to_string().contains("Allow rules with --match prefix"));
+        for (match_mode, label) in [(MatchMode::Prefix, "prefix"), (MatchMode::Fuzzy, "fuzzy")] {
+            let err = suggest(SuggestOptions {
+                min_count: 2,
+                match_mode,
+                action: Some(SuggestAction::Allow),
+                all_rules: false,
+                json: false,
+                ..suggest_options(PathBuf::from("/tmp/moriarty-suggest-guard"))
+            })
+            .await
+            .expect_err("Allow + non-exact match must be rejected");
+            assert!(err.to_string().contains(&format!("--match {label}")));
+        }
     }
 
     #[test]
@@ -1655,6 +1700,7 @@ mod tests {
             build_suggestions(&rows, MatchMode::Exact, SuggestAction::Ask, 2, 10, None);
         let config = UserConfig {
             pattern_fragments: None,
+            bash_path_aliases: BTreeSet::new(),
             bash_rules: Some(suggestions.iter().map(|s| s.rule.clone()).collect()),
             tool_rules: None,
         };
@@ -1685,7 +1731,7 @@ mod tests {
         }
 
         let rules: Vec<BashRule> = suggestions.iter().map(|s| s.rule.clone()).collect();
-        let engine = BashRuleEngine::from_config(rules, None).unwrap();
+        let engine = engine_with_bash(rules);
         assert!(
             matches!(
                 engine.apply_rules_compound("git status && ls -la", "", None),
@@ -1839,60 +1885,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn suggest_json_smoke_over_an_explicit_dir() {
-        // End-to-end through the async path: log reading, hash filtering (--all-rules), leaf
-        // splitting, and JSON rendering all compose without error.
-        let _config_guard = setup_isolated_xdg_config();
-        let dir = tempfile::tempdir().unwrap();
-        let line = serde_json::json!({
-            "timestamp": "2026-06-10T01:00:00Z",
-            "fields": {
-                "message": "PreToolUse hook completed",
-                "tool_name": "Bash",
-                "tool_args": "{\"command\":\"git status && ls\"}",
-                "cwd": "/tmp",
-                "rules_hash": "sha256:test",
-                "result": "ask"
-            }
-        })
-        .to_string();
-        tokio::fs::write(dir.path().join("hooks.log.2026-06-10"), format!("{line}\n"))
+    async fn collect_suggestions_loads_alias_policy_from_real_config() {
+        // A helper-only test would still pass if the production loader stopped threading alias
+        // policy into splitting, so this uses both the installed config and recorded hook logs.
+        let config_guard = setup_isolated_xdg_config();
+        let config_dir = config_guard.path().join("moriarty");
+        tokio::fs::create_dir_all(&config_dir).await.unwrap();
+        tokio::fs::write(
+            config_dir.join("tool_rules.toml"),
+            "bash_path_aliases = [\"P\"]\n",
+        )
+        .await
+        .unwrap();
+        let log_dir = tempfile::tempdir().unwrap();
+        write_bash_log(
+            log_dir.path(),
+            &[
+                (PATH_ALIAS_COMMAND, "/work/project"),
+                ("P='/work/project'; echo $P/file", "/work/project"),
+            ],
+        )
+        .await;
+
+        let (suggestions, _) = collect_suggestions(&suggest_options(log_dir.path().to_path_buf()))
             .await
             .unwrap();
-
-        let opts = SuggestOptions {
-            dir: Some(dir.path().to_path_buf()),
-            start_time: None,
-            end_time: None,
-            timezone: "utc".to_string(),
-            result: PreToolResult::Ask,
-            limit: 10,
-            min_count: 1,
-            match_mode: MatchMode::Exact,
-            action: None,
-            all_rules: true,
-            rules_hash: None,
-            json: true,
-        };
-        let (suggestions, scope) = collect_suggestions(&opts)
-            .await
-            .expect("suggest should succeed over an explicit log dir");
-        assert_eq!(
-            scope,
-            "Rule set: all (--all-rules); no hash filter applied."
-        );
         assert_eq!(suggestions.len(), 2);
-
-        let rendered = serde_json::to_value(&suggestions).unwrap();
-        let entries = rendered.as_array().unwrap();
-        for (entry, expected_pattern) in entries.iter().zip(["^git status$", "^ls$"]) {
-            assert_eq!(entry["rule"]["pattern"].as_str(), Some(expected_pattern));
-            assert_eq!(entry["rule"]["action"]["type"].as_str(), Some("Ask"));
-            assert_eq!(entry["count"].as_u64(), Some(1));
-            assert_eq!(
-                entry["observed_commands"],
-                serde_json::json!(["git status && ls"])
-            );
+        let patterns = suggestions
+            .iter()
+            .map(|suggestion| suggestion.rule.pattern.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            patterns,
+            BTreeSet::from([r"^head \-5$", r"^rg needle node_modules/pkg/output\.d\.ts$"])
+        );
+        for suggestion in suggestions {
+            assert!(matches!(suggestion.rule.action, BashRuleAction::Ask));
+            assert_eq!(suggestion.count, 1);
+            assert_eq!(suggestion.observed_commands, vec![PATH_ALIAS_COMMAND]);
         }
     }
 
@@ -1911,33 +1941,11 @@ mod tests {
         assert_eq!(suggestions[0].rule.pattern, r"^cargo(\s|$)");
     }
 
-    #[tokio::test]
-    async fn suggest_rejects_allow_with_fuzzy_match() {
-        let err = suggest(SuggestOptions {
-            dir: Some(PathBuf::from("/tmp/moriarty-suggest-guard")),
-            start_time: None,
-            end_time: None,
-            timezone: "utc".to_string(),
-            result: PreToolResult::Ask,
-            limit: 10,
-            min_count: 2,
-            match_mode: MatchMode::Fuzzy,
-            action: Some(SuggestAction::Allow),
-            all_rules: false,
-            rules_hash: None,
-            json: false,
-        })
-        .await
-        .expect_err("Allow + fuzzy must be rejected");
-        assert!(err.to_string().contains("Allow rules with --match fuzzy"));
-    }
-
     // ===== replay =====
 
     #[test]
     fn replay_flags_lost_allow_regression() {
-        let engine =
-            BashRuleEngine::from_config(vec![allow("allow-ls", r"^ls($|\s)")], None).unwrap();
+        let engine = engine_with_bash(vec![allow("allow-ls", r"^ls($|\s)")]);
         let rows = vec![
             bash_row("ls -la", 5, PreToolResult::Allow), // still allowed → unchanged
             bash_row("git status", 3, PreToolResult::Allow), // candidate no longer allows → lost
@@ -1958,8 +1966,7 @@ mod tests {
 
     #[test]
     fn replay_reports_newly_allowed_as_improvement() {
-        let engine =
-            BashRuleEngine::from_config(vec![allow("allow-ls", r"^ls($|\s)")], None).unwrap();
+        let engine = engine_with_bash(vec![allow("allow-ls", r"^ls($|\s)")]);
         let rows = vec![bash_row("ls -la", 4, PreToolResult::Ask)]; // was prompted, now allowed
         let report = build_replay_report(&rows, &engine, None, None, Default::default());
 
@@ -1981,7 +1988,7 @@ mod tests {
     fn replay_uses_recorded_mode_and_reports_it_on_divergence() {
         let mut plan_allow = allow("plan-ls", r"^ls");
         plan_allow.modes = Some(BTreeSet::from([PermissionMode::Plan]));
-        let engine = BashRuleEngine::from_config(vec![plan_allow], None).unwrap();
+        let engine = engine_with_bash(vec![plan_allow]);
         let rows = vec![
             bash_row_mode("ls", 1, PreToolResult::Ask, "", Some(PermissionMode::Plan)),
             bash_row_mode(
@@ -2006,8 +2013,7 @@ mod tests {
 
     #[test]
     fn replay_result_filter_limits_scope() {
-        let engine =
-            BashRuleEngine::from_config(vec![allow("allow-ls", r"^ls($|\s)")], None).unwrap();
+        let engine = engine_with_bash(vec![allow("allow-ls", r"^ls($|\s)")]);
         let rows = vec![
             bash_row("ls -la", 4, PreToolResult::Ask), // ask → would be newly-allowed
             bash_row("git x", 2, PreToolResult::Allow), // allow → would be lost-allow
@@ -2028,7 +2034,7 @@ mod tests {
 
     #[test]
     fn replay_empty_rows_yield_an_empty_report() {
-        let engine = BashRuleEngine::from_config(vec![], None).unwrap();
+        let engine = engine_with_bash(vec![]);
         let report = build_replay_report(&[], &engine, None, None, Default::default());
         assert_eq!(report.total_evaluated, 0);
         assert_eq!(report.lost_allow_count, 0);
@@ -2038,7 +2044,7 @@ mod tests {
 
     #[test]
     fn replay_skips_rows_without_a_command_field() {
-        let engine = BashRuleEngine::from_config(vec![allow("allow-ls", r"^ls")], None).unwrap();
+        let engine = engine_with_bash(vec![allow("allow-ls", r"^ls")]);
         let rows = vec![ReportRow {
             tool_name: "Bash".to_string(),
             arguments: serde_json::json!({ "not_command": "ls" }),
@@ -2059,8 +2065,7 @@ mod tests {
         // The hook recorded an Allow for an in-cwd absolute path. A relative-path allow-rule only
         // matches once the command is normalized against the cwd it ran under, so replaying with the
         // recorded cwd must reproduce the Allow (no lost-approval) rather than diverging.
-        let engine =
-            BashRuleEngine::from_config(vec![allow("allow-cat-src", r"^cat src/")], None).unwrap();
+        let engine = engine_with_bash(vec![allow("allow-cat-src", r"^cat src/")]);
         let rows = vec![bash_row_in(
             "cat /work/proj/src/main.rs",
             1,
@@ -2081,8 +2086,7 @@ mod tests {
     fn replay_without_recorded_cwd_skips_normalization() {
         // A historical row without cwd cannot be normalized, so the same absolute-path command no longer
         // matches the relative allow-rule and is reported as a lost auto-approval.
-        let engine =
-            BashRuleEngine::from_config(vec![allow("allow-cat-src", r"^cat src/")], None).unwrap();
+        let engine = engine_with_bash(vec![allow("allow-cat-src", r"^cat src/")]);
         let rows = vec![bash_row_in(
             "cat /work/proj/src/main.rs",
             1,
@@ -2106,8 +2110,7 @@ mod tests {
     fn suggest_filters_already_allowed_leaves() {
         // Already-allowed leaves wouldn't prompt the user, so suggesting a rule for them would
         // be noise.
-        let engine =
-            BashRuleEngine::from_config(vec![allow("allow-head", r"^head($|\s)")], None).unwrap();
+        let engine = engine_with_bash(vec![allow("allow-head", r"^head($|\s)")]);
         let rows = vec![
             bash_row("head -5 Cargo.toml", 4, PreToolResult::Ask),
             bash_row("tail -20 Cargo.toml", 3, PreToolResult::Ask),
@@ -2129,8 +2132,7 @@ mod tests {
 
     #[test]
     fn suggest_filters_leaves_in_a_compound_command() {
-        let engine =
-            BashRuleEngine::from_config(vec![allow("allow-head", r"^head($|\s)")], None).unwrap();
+        let engine = engine_with_bash(vec![allow("allow-head", r"^head($|\s)")]);
         let rows = vec![bash_row(
             "head -5 Cargo.toml && tail -20 Cargo.toml",
             4,
@@ -2155,8 +2157,7 @@ mod tests {
         // The compound engine caps Allow → Ask when a leaf writes to a real file, so those
         // leaves still reach the user. The filter must not drop them even when `apply_rules`
         // alone says Allowed.
-        let engine =
-            BashRuleEngine::from_config(vec![allow("allow-echo", r"^echo($|\s)")], None).unwrap();
+        let engine = engine_with_bash(vec![allow("allow-echo", r"^echo($|\s)")]);
         let rows = vec![bash_row("echo hi > output.txt", 5, PreToolResult::Ask)];
         let suggestions = build_suggestions(
             &rows,
@@ -2180,8 +2181,7 @@ mod tests {
         // A bailed command (e.g., one with command substitution) is never `Allowed` by the
         // compound engine — it is capped to Ask — so `apply_rules()` alone returning `Allowed`
         // for a bailed leaf must not filter it out.
-        let engine =
-            BashRuleEngine::from_config(vec![allow("allow-echo", r"^echo($|\s)")], None).unwrap();
+        let engine = engine_with_bash(vec![allow("allow-echo", r"^echo($|\s)")]);
         let rows = vec![bash_row("echo $(date)", 4, PreToolResult::Ask)];
         let suggestions = build_suggestions(
             &rows,
@@ -2218,51 +2218,16 @@ action = { type = "Allow" }
         .unwrap();
 
         let log_dir = tempfile::tempdir().unwrap();
-        let line = serde_json::json!({
-            "timestamp": "2026-06-10T01:00:00Z",
-            "fields": {
-                "message": "PreToolUse hook completed",
-                "tool_name": "Bash",
-                "tool_args": r#"{"command":"head -5 Cargo.toml"}"#,
-                "cwd": "/tmp",
-                "rules_hash": "sha256:test",
-                "result": "ask"
-            }
-        })
-        .to_string();
-        let line2 = serde_json::json!({
-            "timestamp": "2026-06-10T02:00:00Z",
-            "fields": {
-                "message": "PreToolUse hook completed",
-                "tool_name": "Bash",
-                "tool_args": r#"{"command":"tail -20 Cargo.toml"}"#,
-                "cwd": "/tmp",
-                "rules_hash": "sha256:test",
-                "result": "ask"
-            }
-        })
-        .to_string();
-        tokio::fs::write(
-            log_dir.path().join("hooks.log.2026-06-10"),
-            format!("{line}\n{line2}\n"),
+        write_bash_log(
+            log_dir.path(),
+            &[
+                ("head -5 Cargo.toml", "/tmp"),
+                ("tail -20 Cargo.toml", "/tmp"),
+            ],
         )
-        .await
-        .unwrap();
+        .await;
 
-        let opts = SuggestOptions {
-            dir: Some(log_dir.path().to_path_buf()),
-            start_time: None,
-            end_time: None,
-            timezone: "utc".to_string(),
-            result: PreToolResult::Ask,
-            limit: 10,
-            min_count: 1,
-            match_mode: MatchMode::Exact,
-            action: None,
-            all_rules: true,
-            rules_hash: None,
-            json: true,
-        };
+        let opts = suggest_options(log_dir.path().to_path_buf());
         let (suggestions, _scope) = collect_suggestions(&opts).await.unwrap();
 
         assert_eq!(
@@ -2297,39 +2262,9 @@ action = { type = "Allow" }
         .unwrap();
 
         let log_dir = tempfile::tempdir().unwrap();
-        let line = serde_json::json!({
-            "timestamp": "2026-06-10T01:00:00Z",
-            "fields": {
-                "message": "PreToolUse hook completed",
-                "tool_name": "Bash",
-                "tool_args": r#"{"command":"head -5 Cargo.toml"}"#,
-                "cwd": "/tmp",
-                "rules_hash": "sha256:test",
-                "result": "ask"
-            }
-        })
-        .to_string();
-        tokio::fs::write(
-            log_dir.path().join("hooks.log.2026-06-10"),
-            format!("{line}\n"),
-        )
-        .await
-        .unwrap();
+        write_bash_log(log_dir.path(), &[("head -5 Cargo.toml", "/tmp")]).await;
 
-        let opts = SuggestOptions {
-            dir: Some(log_dir.path().to_path_buf()),
-            start_time: None,
-            end_time: None,
-            timezone: "utc".to_string(),
-            result: PreToolResult::Ask,
-            limit: 10,
-            min_count: 1,
-            match_mode: MatchMode::Exact,
-            action: None,
-            all_rules: true,
-            rules_hash: None,
-            json: true,
-        };
+        let opts = suggest_options(log_dir.path().to_path_buf());
         let (suggestions, _scope) = collect_suggestions(&opts).await.unwrap();
 
         assert!(
@@ -2344,6 +2279,7 @@ action = { type = "Allow" }
         // Some(vec![]) (an explicitly-empty list) must not error, unlike a dropped rule.
         let config = UserConfig {
             pattern_fragments: None,
+            bash_path_aliases: BTreeSet::new(),
             bash_rules: Some(vec![]),
             tool_rules: Some(vec![]),
         };

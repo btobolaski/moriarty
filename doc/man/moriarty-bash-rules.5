@@ -72,6 +72,112 @@ Use
 to simulate a mode and see how a command splits and which rule matches each leaf, and
 .Ql moriarty rules lint
 to find rules the hook silently ignores.
+.Sh PATH ALIAS ANALYSIS
+Claude Code sometimes assigns a long workspace path to a shell variable and
+reuses it in later leaf commands.
+Selected variables can participate in conservative static expansion through
+the top\-level option:
+.Bd -literal -offset indent
+bash_path_aliases = ["P"]
+.Ed
+.Pp
+For example:
+.Bd -literal -offset indent
+P=/work/project/node_modules/pkg; rg needle $P/output.d.ts | head \-5
+.Ed
+.Pp
+With
+.Ql cwd=/work/project ,
+the
+.Ql rg
+leaf is matched as
+.Ql rg needle node_modules/pkg/output.d.ts .
+This is exactly the treatment of the equivalent literal path.
+The declaration grants no permission: every analyzed leaf must still match
+the ordered rules, out\-of\-cwd paths remain absolute, and paths containing
+.Ql ..
+are not presented as safe relative paths.
+.Ss Trusted Policy
+Names must match
+.Ql [A\-Za\-z_][A\-Za\-z0\-9_]* .
+Duplicates are removed and names are stored in canonical order.
+The following shell\-control names are rejected when the configuration is
+loaded:
+.Cm PATH , IFS , CDPATH , GLOBIGNORE , BASH_ENV , ENV ,
+.Cm SHELLOPTS , BASHOPTS , FPATH , PS4 ,
+and
+.Cm PROMPT_COMMAND .
+.Pp
+.Sy Security Warning :
+This option is trusted policy, not a generic assignment allowance.
+Do not configure variables that change application or tool behavior,
+including compiler flags, package\-manager settings, credentials, or
+configuration selectors.
+.Nm
+cannot know every program's environment\-variable semantics.
+.Ss Supported Form
+A binding is recognized only as a leading, synchronous, assignment\-only
+simple command terminated by a semicolon or newline.
+It must contain one scalar, non\-append assignment and no command, redirect,
+pipeline peer,
+.Ql ! ,
+.Ql time ,
+boolean operator, or background separator.
+The unquoted value must match exactly:
+.Pp
+.Dl ^/[A\-Za\-z0\-9/._@+,:=%\-]*$
+.Pp
+Later words may use one unquoted plain
+.Ql $NAME
+or
+.Ql ${NAME}
+with literal prefix or suffix text, including
+.Ql $P/output.d.ts
+and
+.Ql --file=$P/input .
+Expansion uses parser nodes, not textual replacement:
+single\-quoted references stay literal and similarly prefixed names do not
+match.
+Quoted, indirect, length, default\-value, transform, multiple\-expansion,
+array, append, temporary environment, conditional, pipeline, background, and
+relative\-path forms are unsupported.
+.Pp
+A consumed declaration is analysis metadata rather than an executable leaf.
+An unused declaration, unsupported configured\-alias form, unresolved
+reference, or expansion in command position is still matched normally, but
+any Allow is capped at Ask.
+A Deny remains effective, including a Deny on a later dangerous leaf.
+Existing whole\-command fail\-safe behavior remains for command substitution,
+backticks, arithmetic or process substitution, here documents, and
+uninspectable shell compounds.
+.Ss Mutation Barriers
+Moriarty deliberately does not model individual Bash mutation targets.
+After a supported declaration, any other assignment or dynamic command name
+invalidates all active aliases and requires confirmation.
+The same conservative barrier applies to
+.Cm command , builtin , exec , eval , source , . , trap , let , unset ,
+.Cm export , readonly , declare , typeset , local , read , mapfile ,
+.Cm readarray , getopts ,
+and
+.Cm printf .
+This may prompt for a harmless form, but later references cannot use stale
+bindings and no per\-builtin option semantics are required.
+.Pp
+Redirect targets are classified after known expansion, so an exact expanded
+.Pa /dev/null
+keeps the discard exemption; other writable targets keep the real\-file
+Allow\-to\-Ask cap.
+An expansion in command position requires confirmation, while
+.Cm exec
+and wrapper barriers prevent an alias from auto\-authorizing a derived
+executable.
+.Pp
+.Cm moriarty test bash\-rules Fl \-cwd Ar dir Fl \-explain Ar command
+shows consumed bindings, original source, alias\-expanded text,
+cwd\-normalized match text, confirmation reasons, matching rules, and the
+final decision.
+Normal test execution uses the same compound and alias analysis as explain
+mode and the live hook.
 .Sh CONFIGURATION
 .Ss File Location
 .Pa ~/.config/moriarty/tool_rules.toml

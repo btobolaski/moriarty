@@ -9,6 +9,7 @@ command-level validation specifically for Bash tool calls.
 - [Quick Start](#quick-start)
 - [Tool Rules](#tool-rules)
 - [Configuration File](#configuration-file)
+- [Path Alias Analysis](#path-alias-analysis)
 - [Permission Modes](#permission-modes)
 - [Rule Actions](#rule-actions)
 - [Pattern Fragments](#pattern-fragments)
@@ -257,6 +258,9 @@ action.
 ### Basic Structure
 
 ```toml
+# Optional trusted shell variables eligible for conservative path-alias analysis.
+bash_path_aliases = ["P"]
+
 [[bash_rules]]
 name = "descriptive-name"
 pattern = "regex-pattern"
@@ -288,6 +292,73 @@ action = { type = "Allow" }
 ```
 
 **Important**: Place more specific rules before general ones!
+
+## Path Alias Analysis
+
+Claude Code sometimes shortens a long workspace path with a leading shell assignment and reuses it in later commands.
+Moriarty can statically expand selected variables before matching Bash rules:
+
+```toml
+bash_path_aliases = ["P"]
+```
+
+```bash
+P=/work/project/node_modules/.pnpm/@pulumi+pulumi@3.247.0/node_modules/@pulumi/pulumi; \
+  rg -n "isUnknown" $P/output.d.ts | head -5
+```
+
+With `cwd = /work/project`, the `rg` leaf above is matched as `rg -n "isUnknown" node_modules/.pnpm/.../output.d.ts`,
+exactly like the equivalent command containing the literal absolute path. The binding itself grants no permission: every
+expanded leaf still has to match the existing ordered rules, out-of-cwd paths remain absolute, and a path containing
+`..` is not presented as a safe relative path.
+
+### Trusted Policy
+
+`bash_path_aliases` is an opt-in top-level allow-list. Names must match `[A-Za-z_][A-Za-z0-9_]*`; duplicates are removed
+and names are stored in canonical order. Moriarty rejects these shell-control variables at configuration-load time:
+`PATH`, `IFS`, `CDPATH`, `GLOBIGNORE`, `BASH_ENV`, `ENV`, `SHELLOPTS`, `BASHOPTS`, `FPATH`, `PS4`, and `PROMPT_COMMAND`.
+
+**Security warning:** configured names are trusted policy. Do not configure variables that change application or tool
+behavior, such as compiler flags, package-manager settings, credentials, or configuration-file selectors. Moriarty only
+rejects the fixed shell-control set; it cannot know the semantics of every program's environment variables.
+
+### Supported v1 Form
+
+A binding is recognized only when all of these conditions hold:
+
+- it is a leading, synchronous, assignment-only simple command, terminated by `;` or a newline;
+- it contains exactly one scalar, non-append assignment and no command, redirect, pipeline peer, `!`, `time`, `&&`,
+  `||`, or background `&` separator;
+- its name appears in `bash_path_aliases`;
+- its unquoted value is an absolute literal matching `^/[A-Za-z0-9/._@+,:=%-]*$`.
+
+Later words may use one unquoted plain `$NAME` or `${NAME}` expansion with literal text around it, including
+`$P/output.d.ts` and `--file=$P/input`. Expansion is parser-identified, not textual: single-quoted `$P` stays literal,
+`$PP` does not match `P`, and command, arithmetic, process, indirect, length, default-value, transform, quoted, and
+multiple-expansion forms are not treated as known aliases. A consumed declaration becomes analysis metadata and is not
+matched as an executable leaf. An unused declaration remains a leaf requiring confirmation.
+
+Unsupported configured-alias assignments or references do **not** make Moriarty abandon all leaf analysis. The affected
+leaf is matched normally, but an Allow is capped at Ask; a Deny still applies, including a Deny on a dangerous later
+leaf. Command substitution, backticks, arithmetic substitution, process substitution, and the other existing shell bail
+conditions remain whole-command fail-safe cases.
+
+### Mutation Barriers
+
+Moriarty deliberately avoids modeling Bash mutation targets. After a supported declaration, any other assignment, a
+dynamic command name, or one of these shell-state commands invalidates **all** active aliases and requires confirmation:
+`command`, `builtin`, `exec`, `eval`, `source`, `.`, `trap`, `let`, `unset`, `export`, `readonly`, `declare`, `typeset`,
+`local`, `read`, `mapfile`, `readarray`, `getopts`, or `printf`. This conservative rule may prompt for a harmless form,
+but it prevents later references from being matched against stale paths without needing per-builtin option semantics.
+
+Redirect targets are classified after known alias expansion, so an exact alias-expanded `/dev/null` keeps the discard
+exemption while every other writable target retains the real-file Allow-to-Ask cap. An alias expansion in command
+position also requires confirmation; `exec` and wrapper barriers likewise prevent a path alias from auto-authorizing a
+derived executable name.
+
+Use `moriarty test bash-rules --cwd <dir> --explain '<command>'` to see consumed bindings, original leaf source,
+alias-expanded text, final cwd-normalized match text, confirmation reasons, matching rules, and the merged decision.
+Normal `moriarty test bash-rules` execution uses the same compound and alias analysis as `--explain` and the live hook.
 
 ## Permission Modes
 
@@ -604,6 +675,9 @@ The hook parses each Bash command with a real shell parser and evaluates every l
 (`a && b | c ; d`) **independently**, then merges the per-leaf decisions. A `pattern` therefore only needs to describe a
 single command, not a whole pipeline.
 
+- **Configured path aliases are expanded structurally before matching** when they use the exact supported form described
+  in [Path Alias Analysis](#path-alias-analysis). Cwd normalization then applies to the expanded value, preserving
+  direct-literal rule behavior.
 - **Operators and redirects are split off each leaf**, so a simple `^ls` matches the `ls` leaf of `ls | wc -l` and of
   `cmd && ls`. An allow-rule no longer needs to spell out pipes, `&&`/`||`/`;` chaining, or shell-metacharacter
   exclusions.
@@ -671,7 +745,13 @@ pattern = "^npm\\s+install$"
 pattern = "^npm.install$"
 ```
 
-### 4. Place Specific Rules Before General Ones
+### 4. Treat Path Alias Names as Trusted Policy
+
+Only configure variables whose sole intended meaning is a reusable path. Never use `bash_path_aliases` as a generic
+assignment allow-list; unsupported forms prompt, and the option does not make an assignment or expanded path safe by
+itself.
+
+### 5. Place Specific Rules Before General Ones
 
 ```toml
 # Good order
@@ -686,7 +766,7 @@ pattern = "^rm\\s+[^-]"
 action = { type = "Allow" }
 ```
 
-### 5. Use Fragments for Security Patterns
+### 6. Use Fragments for Security Patterns
 
 Define security patterns once as fragments and reuse them:
 

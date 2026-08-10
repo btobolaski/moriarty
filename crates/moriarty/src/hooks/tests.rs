@@ -9,8 +9,8 @@ use super::*;
 use crate::{
     project_config::approvals::ProjectApprovals,
     test_helpers::{
-        SUBAGENT_EXECUTION_RULES, remove_test_env_var, set_test_env_var, setup_isolated_xdg_config,
-        setup_isolated_xdg_state,
+        PATH_ALIAS_COMMAND, PATH_ALIAS_READ_RULES, SUBAGENT_EXECUTION_RULES, remove_test_env_var,
+        set_test_env_var, setup_isolated_xdg_config, setup_isolated_xdg_state,
     },
 };
 
@@ -2558,6 +2558,69 @@ async fn test_bash_hook_compound_dangerous_tail_is_denied() {
 async fn test_bash_hook_compound_all_safe_leaves_allowed() {
     let result = run_bash_hook(COMPOUND_TEST_CONFIG, "echo hi && ls -la").await;
     assert_pretool_allow(&result);
+}
+
+#[tokio::test]
+async fn configured_path_alias_allows_the_equivalent_safe_compound() {
+    let config = format!("bash_path_aliases = [\"P\"]\n{PATH_ALIAS_READ_RULES}");
+    let command = "P=/work/project/node_modules/.pnpm/@scope+pkg@1.0.0/node_modules/pkg; rg needle $P/output.d.ts | head -5; rg other ${P}/runtime.d.ts | head -5";
+
+    let result = run_bash_hook_cwd(&config, command, "/work/project").await;
+    assert_pretool_allow(&result);
+}
+
+#[tokio::test]
+async fn absent_path_alias_policy_preserves_the_assignment_prompt() {
+    let result =
+        run_bash_hook_cwd(PATH_ALIAS_READ_RULES, PATH_ALIAS_COMMAND, "/work/project").await;
+    assert_pretool_ask(&result);
+}
+
+#[tokio::test]
+async fn invalid_alias_policy_cannot_hide_behind_an_allowing_tool_rule() {
+    let config = r#"
+bash_path_aliases = ["PATH"]
+
+[[tool_rules]]
+name = "allow-bash"
+tool = "Bash"
+action = { type = "Allow" }
+"#;
+    let result = run_pretool_hook(
+        config,
+        "Bash",
+        &serde_json::json!({"command": "echo safe"}),
+        "",
+    )
+    .await;
+
+    assert_pretool_ask(&result);
+}
+
+#[tokio::test]
+async fn alias_mutation_forces_confirmation_but_does_not_hide_a_later_deny() {
+    let config = r#"
+bash_path_aliases = ["P"]
+
+[[bash_rules]]
+name = "allow-echo"
+pattern = "^echo($|\\s)"
+action = { type = "Allow" }
+
+[[bash_rules]]
+name = "allow-unset"
+pattern = "^unset($|\\s)"
+action = { type = "Allow" }
+
+[[bash_rules]]
+name = "deny-rm"
+pattern = "^rm\\s+-rf"
+action = { type = "Deny", value = "No recursive delete" }
+"#;
+    let command = "P=/work/project; echo $P/file; unset P; echo $P/after; rm -rf /";
+
+    let result = run_bash_hook_cwd(config, command, "/work/project").await;
+    assert_pretool_deny(&result, "No recursive delete");
 }
 
 #[tokio::test]

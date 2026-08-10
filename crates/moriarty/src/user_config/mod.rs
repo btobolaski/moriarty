@@ -9,12 +9,13 @@
 //! rather than untrusted project settings.
 
 use std::{
+    borrow::Borrow,
     collections::{BTreeSet, HashMap},
     path::Path,
 };
 
 use miette::{Context, IntoDiagnostic, Result};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::Value;
 
 use crate::{permission_mode::PermissionMode, persistence::FileType};
@@ -38,9 +39,68 @@ fn is_not_found_error(error: &miette::Report) -> bool {
     false
 }
 
+/// Serde validation prevents malformed or shell-control names from entering the analysis policy,
+/// even when a tool rule would short-circuit Bash evaluation before engine construction.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
+pub struct BashPathAlias(String);
+
+impl Borrow<str> for BashPathAlias {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+impl BashPathAlias {
+    pub(crate) fn validate(value: String) -> std::result::Result<Self, String> {
+        const SHELL_CONTROL_NAMES: &[&str] = &[
+            "PATH",
+            "IFS",
+            "CDPATH",
+            "GLOBIGNORE",
+            "BASH_ENV",
+            "ENV",
+            "SHELLOPTS",
+            "BASHOPTS",
+            "FPATH",
+            "PS4",
+            "PROMPT_COMMAND",
+        ];
+
+        let mut chars = value.chars();
+        let valid_identifier = chars
+            .next()
+            .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+            && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_');
+        if !valid_identifier {
+            return Err(format!(
+                "invalid bash path alias `{value}`: expected a shell identifier matching [A-Za-z_][A-Za-z0-9_]*"
+            ));
+        }
+        if SHELL_CONTROL_NAMES.contains(&value.as_str()) {
+            return Err(format!(
+                "unsafe bash path alias `{value}`: shell-control variables cannot be configured as path aliases"
+            ));
+        }
+
+        Ok(Self(value))
+    }
+}
+
+impl<'de> Deserialize<'de> for BashPathAlias {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::validate(String::deserialize(deserializer)?).map_err(de::Error::custom)
+    }
+}
+
 /// # Example
 ///
 /// ```toml
+/// bash_path_aliases = ["P"]
+///
 /// [pattern_fragments]
 /// safe_chars = "[^|&;$`]"
 ///
@@ -61,6 +121,10 @@ pub struct UserConfig {
     #[serde(default)]
     pub pattern_fragments: Option<HashMap<String, String>>,
 
+    /// Only these trusted shell variables may participate in path-alias analysis.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub bash_path_aliases: BTreeSet<BashPathAlias>,
+
     #[serde(default)]
     pub bash_rules: Option<Vec<BashRule>>,
 
@@ -74,7 +138,7 @@ impl UserConfig {
     /// rules currently in force.
     ///
     /// The parsed config is hashed — not the file bytes — so comment, whitespace, and key-order edits
-    /// do not fragment history, while any pattern/action/mode/rule-order/fragment change yields a new hash.
+    /// do not fragment history, while any rule, fragment, mode, or alias-policy change yields a new hash.
     /// Hashing goes through `serde_json::to_value`, whose objects are `BTreeMap`-backed (the
     /// `preserve_order` feature is off), so the map keys (`pattern_fragments` and an ArgumentFilter
     /// `replace` table) serialize in sorted order and the hash is reproducible; rule `Vec` order, which
@@ -300,17 +364,46 @@ mod tests {
     ) -> UserConfig {
         UserConfig {
             pattern_fragments: None,
+            bash_path_aliases: BTreeSet::new(),
             bash_rules,
             tool_rules,
         }
     }
 
     #[test]
-    fn test_user_config_default() {
-        let config = UserConfig::default();
-        assert_eq!(config.bash_rules, None);
-        assert_eq!(config.pattern_fragments, None);
-        assert_eq!(config.tool_rules, None);
+    fn empty_bash_path_aliases_are_omitted() {
+        let absent = UserConfig::default();
+        let explicit: UserConfig = toml::from_str("bash_path_aliases = []").unwrap();
+        let serialized = serde_json::to_value(&explicit).unwrap();
+
+        assert_eq!(explicit, absent);
+        assert_eq!(explicit.effective_hash(), absent.effective_hash());
+        assert!(serialized.get("bash_path_aliases").is_none());
+        assert!(
+            !toml::to_string(&explicit)
+                .unwrap()
+                .contains("bash_path_aliases")
+        );
+    }
+
+    #[test]
+    fn unsafe_bash_path_alias_names_are_rejected() {
+        let malformed = ["", "1P", "P-X", "P X", "Å"]
+            .into_iter()
+            .map(|alias| (alias, "shell identifier"));
+        let shell_control =
+            "PATH IFS CDPATH GLOBIGNORE BASH_ENV ENV SHELLOPTS BASHOPTS FPATH PS4 PROMPT_COMMAND"
+                .split_whitespace()
+                .map(|alias| (alias, "shell-control"));
+
+        for (alias, reason) in malformed.chain(shell_control) {
+            let error = BashPathAlias::validate(alias.to_string()).unwrap_err();
+            assert!(
+                error.contains(alias),
+                "error should name {alias:?}: {error}"
+            );
+            assert!(error.contains(reason), "error: {error}");
+        }
     }
 
     fn allow(name: &str, pattern: &str) -> BashRule {
@@ -336,11 +429,13 @@ mod tests {
 
         let config_a = UserConfig {
             pattern_fragments: Some(a),
+            bash_path_aliases: BTreeSet::new(),
             bash_rules: Some(vec![allow("ls", "^ls")]),
             tool_rules: None,
         };
         let config_b = UserConfig {
             pattern_fragments: Some(b),
+            bash_path_aliases: BTreeSet::new(),
             bash_rules: Some(vec![allow("ls", "^ls")]),
             tool_rules: None,
         };
@@ -413,6 +508,29 @@ action = { type = "Allow" }
             Some(BTreeSet::from([PermissionMode::Plan]));
 
         assert_ne!(restricted.effective_hash(), unrestricted.effective_hash());
+    }
+
+    #[test]
+    fn adding_or_removing_a_path_alias_changes_the_hash_deterministically() {
+        let without_alias = sample_config(Some(vec![allow("ls", "^ls")]), None);
+        let mut with_alias = without_alias.clone();
+        let mut reordered_aliases = without_alias.clone();
+        for alias in ["Z", "P"] {
+            with_alias
+                .bash_path_aliases
+                .insert(BashPathAlias::validate(alias.to_string()).unwrap());
+        }
+        for alias in ["P", "Z", "P"] {
+            reordered_aliases
+                .bash_path_aliases
+                .insert(BashPathAlias::validate(alias.to_string()).unwrap());
+        }
+
+        assert_ne!(with_alias.effective_hash(), without_alias.effective_hash());
+        assert_eq!(
+            with_alias.effective_hash(),
+            reordered_aliases.effective_hash()
+        );
     }
 
     #[test]

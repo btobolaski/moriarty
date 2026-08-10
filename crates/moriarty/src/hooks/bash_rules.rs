@@ -11,10 +11,10 @@ use regex::{Regex, RegexSet};
 use serde::Serialize;
 use tracing::debug;
 
-use super::command_split::{BailReason, SplitOutcome, split_command};
+use super::command_split::{AliasBinding, BailReason, LeafCommand, SplitOutcome, split_command};
 use crate::{
     permission_mode::{PermissionMode, is_mode_eligible},
-    user_config::{BashRule, BashRuleAction},
+    user_config::{BashPathAlias, BashRule, BashRuleAction, UserConfig},
 };
 
 /// Runtime representation of a rule with pre-compiled regex for efficient matching.
@@ -65,6 +65,7 @@ pub enum RuleResult {
 pub struct BashRuleEngine {
     regex_set: RegexSet,
     rules: Vec<CompiledRule>,
+    path_aliases: BTreeSet<BashPathAlias>,
 }
 
 /// A reason a rule was dropped at compile time. Surfaced by `compile_with_diagnostics` so the
@@ -280,12 +281,15 @@ pub(crate) struct RuleMatchExplanation {
 /// How one leaf of a command was evaluated.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct SubCommandTrace {
-    /// The leaf text before cwd normalization.
     pub original: String,
-    /// The cwd-normalized leaf text that was matched against the rules.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alias_expanded: Option<String>,
     pub normalized: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub bindings: Vec<AliasBinding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requires_confirmation: Option<String>,
     pub real_file_write: bool,
-    /// The first rule that matched this leaf, if any.
     pub matched: Option<RuleMatchExplanation>,
 }
 
@@ -293,6 +297,9 @@ pub(crate) struct SubCommandTrace {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct CommandTrace {
     pub original: String,
+    /// Bindings that were consumed as analysis metadata rather than executable leaves.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub bindings: Vec<AliasBinding>,
     /// Per-leaf evaluation in execution order; empty when `bail` is set.
     pub sub_commands: Vec<SubCommandTrace>,
     /// Set when the command could not be analyzed and fell back to whole-command evaluation.
@@ -317,11 +324,12 @@ fn action_summary(action: &BashRuleAction) -> String {
 impl BashRuleEngine {
     /// Compiles rules with pattern fragment expansion, logging and skipping any rule that fails to
     /// expand or compile (fail-open per rule, preserving the hook hot path's behavior).
-    pub fn from_config(
-        rules: Vec<BashRule>,
-        user_fragments: Option<HashMap<String, String>>,
-    ) -> Result<Self> {
-        let (engine, diagnostics) = Self::compile_with_diagnostics(rules, user_fragments)?;
+    pub fn from_config(config: UserConfig) -> Result<Self> {
+        let (mut engine, diagnostics) = Self::compile_with_diagnostics(
+            config.bash_rules.unwrap_or_default(),
+            config.pattern_fragments,
+        )?;
+        engine.path_aliases = config.bash_path_aliases;
         for diagnostic in &diagnostics {
             tracing::error!(
                 rule_name = %diagnostic.rule_name,
@@ -395,6 +403,7 @@ impl BashRuleEngine {
             Self {
                 regex_set,
                 rules: compiled_rules,
+                path_aliases: BTreeSet::new(),
             },
             diagnostics,
         ))
@@ -509,19 +518,12 @@ impl BashRuleEngine {
         cwd: &str,
         mode: Option<PermissionMode>,
     ) -> RuleResult {
-        match split_command(command, cwd) {
+        match self.split_command(command, cwd) {
             SplitOutcome::Bail(_) => downgrade_non_deny_to_ask(self.apply_rules(command, mode)),
             SplitOutcome::Commands(leaves) => merge_results(
                 leaves
                     .iter()
-                    .map(|leaf| {
-                        let result = self.apply_rules(&leaf.text, mode);
-                        if leaf.real_file_write {
-                            cap_allow_at_ask(result)
-                        } else {
-                            result
-                        }
-                    })
+                    .map(|leaf| self.evaluate_leaf(leaf, mode))
                     .collect(),
             ),
         }
@@ -536,49 +538,60 @@ impl BashRuleEngine {
         cwd: &str,
         mode: Option<PermissionMode>,
     ) -> CommandTrace {
-        match split_command(command, cwd) {
+        match self.split_command(command, cwd) {
             SplitOutcome::Bail(reason) => CommandTrace {
                 original: command.to_string(),
+                bindings: Vec::new(),
                 sub_commands: Vec::new(),
                 bail: Some(reason),
                 final_result: downgrade_non_deny_to_ask(self.apply_rules(command, mode)),
             },
             SplitOutcome::Commands(leaves) => {
-                // A second split without cwd recovers the pre-normalization leaf text for display.
-                // Both parses share the same structure, so leaves line up by index.
-                let originals = match split_command(command, "") {
-                    SplitOutcome::Commands(originals) => originals,
-                    SplitOutcome::Bail(_) => leaves.clone(),
-                };
-
                 let mut sub_commands = Vec::with_capacity(leaves.len());
                 let mut results = Vec::with_capacity(leaves.len());
-                for (index, leaf) in leaves.iter().enumerate() {
-                    let result = self.apply_rules(&leaf.text, mode);
-                    let final_for_leaf = if leaf.real_file_write {
-                        cap_allow_at_ask(result)
-                    } else {
-                        result
-                    };
+                let mut bindings = Vec::new();
+                for leaf in &leaves {
+                    for binding in &leaf.bindings {
+                        if !bindings.contains(binding) {
+                            bindings.push(binding.clone());
+                        }
+                    }
                     sub_commands.push(SubCommandTrace {
-                        original: originals
-                            .get(index)
-                            .map_or_else(|| leaf.text.clone(), |original| original.text.clone()),
-                        normalized: leaf.text.clone(),
+                        original: leaf.original.clone(),
+                        alias_expanded: leaf.alias_expanded.clone(),
+                        normalized: leaf.match_text.clone(),
+                        bindings: leaf.bindings.clone(),
+                        requires_confirmation: leaf.requires_confirmation.clone(),
                         real_file_write: leaf.real_file_write,
-                        matched: self.match_explanation(&leaf.text, mode),
+                        matched: self.match_explanation(&leaf.match_text, mode),
                     });
-                    results.push(final_for_leaf);
+                    results.push(self.evaluate_leaf(leaf, mode));
                 }
 
                 CommandTrace {
                     original: command.to_string(),
+                    bindings,
                     sub_commands,
                     bail: None,
                     final_result: merge_results(results),
                 }
             }
         }
+    }
+
+    pub(crate) fn split_command(&self, command: &str, cwd: &str) -> SplitOutcome {
+        split_command(command, cwd, &self.path_aliases)
+    }
+
+    fn evaluate_leaf(&self, leaf: &LeafCommand, mode: Option<PermissionMode>) -> RuleResult {
+        let mut result = self.apply_rules(&leaf.match_text, mode);
+        if leaf.real_file_write {
+            result = cap_allow_at_ask(result);
+        }
+        if leaf.requires_confirmation.is_some() {
+            result = cap_allow_at_ask(result);
+        }
+        result
     }
 
     /// The first rule matching `command`, rendered for explain output.
@@ -821,6 +834,7 @@ fn filter_arguments(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_helpers::PATH_ALIAS_COMMAND;
 
     fn filter_remove(cmd: &str, remove: &[&str]) -> String {
         let remove = Some(remove.iter().map(|s| s.to_string()).collect());
@@ -881,7 +895,35 @@ mod tests {
     }
 
     fn make_engine(rules: Vec<BashRule>) -> BashRuleEngine {
-        BashRuleEngine::from_config(rules, None).unwrap()
+        make_engine_with_fragments(rules, None)
+    }
+
+    fn make_engine_with_fragments(
+        rules: Vec<BashRule>,
+        pattern_fragments: Option<HashMap<String, String>>,
+    ) -> BashRuleEngine {
+        make_engine_with_aliases_and_fragments(rules, &[], pattern_fragments)
+    }
+
+    fn make_engine_with_aliases(rules: Vec<BashRule>, aliases: &[&str]) -> BashRuleEngine {
+        make_engine_with_aliases_and_fragments(rules, aliases, None)
+    }
+
+    fn make_engine_with_aliases_and_fragments(
+        rules: Vec<BashRule>,
+        aliases: &[&str],
+        pattern_fragments: Option<HashMap<String, String>>,
+    ) -> BashRuleEngine {
+        BashRuleEngine::from_config(UserConfig {
+            pattern_fragments,
+            bash_path_aliases: aliases
+                .iter()
+                .map(|alias| BashPathAlias::validate((*alias).to_string()).unwrap())
+                .collect(),
+            bash_rules: Some(rules),
+            tool_rules: None,
+        })
+        .unwrap()
     }
 
     #[test]
@@ -1100,8 +1142,7 @@ mod tests {
             allow_rule("good-rule", r"^ls"),
         ];
 
-        let engine = BashRuleEngine::from_config(rules, None)
-            .expect("Should succeed, skipping invalid rules");
+        let engine = make_engine(rules);
 
         let result = engine.apply_rules("ls -la", None);
         assert_eq!(
@@ -1409,7 +1450,7 @@ mod tests {
         fragments.insert("safe".to_string(), "[^|&;$`]".to_string());
 
         let rules = vec![allow_rule("allow-ls", "^ls{{safe}}*$")];
-        let engine = BashRuleEngine::from_config(rules, Some(fragments)).unwrap();
+        let engine = make_engine_with_fragments(rules, Some(fragments));
 
         let result = engine.apply_rules("ls -la", None);
         assert!(matches!(result, RuleResult::Allowed { .. }));
@@ -1459,7 +1500,7 @@ mod tests {
         user_fragments.insert("safe_chars".to_string(), "[a-z]".to_string());
 
         let rules = vec![allow_rule("test", "^{{safe_chars}}+$")];
-        let engine = BashRuleEngine::from_config(rules, Some(user_fragments)).unwrap();
+        let engine = make_engine_with_fragments(rules, Some(user_fragments));
 
         let result = engine.apply_rules("abc", None);
         assert!(matches!(result, RuleResult::Allowed { .. }));
@@ -1478,7 +1519,7 @@ mod tests {
             allow_rule("good-rule", "^{{valid}}+$"),
         ];
 
-        let engine = BashRuleEngine::from_config(rules, Some(fragments)).unwrap();
+        let engine = make_engine_with_fragments(rules, Some(fragments));
 
         let result = engine.apply_rules("abc", None);
         assert!(matches!(result, RuleResult::Allowed { .. }));
@@ -1494,7 +1535,7 @@ mod tests {
             "^(docker{{safe}}+)$",
             "$1 --dry-run",
         )];
-        let engine = BashRuleEngine::from_config(rules, Some(fragments)).unwrap();
+        let engine = make_engine_with_fragments(rules, Some(fragments));
         let result = engine.apply_rules("docker build", None);
 
         match result {
@@ -2151,6 +2192,82 @@ mod tests {
             engine.apply_rules_compound("cat /abs/cwd/src/lib.rs", "/abs/cwd", None),
             allowed("allow-cat-src")
         );
+    }
+
+    #[test]
+    fn configured_path_alias_matches_the_equivalent_literal_command() {
+        let engine = make_engine_with_aliases(
+            vec![
+                allow_rule("allow-rg", r"^rg($|\s)"),
+                allow_rule("allow-head", r"^head($|\s)"),
+            ],
+            &["P"],
+        );
+        let aliased = PATH_ALIAS_COMMAND;
+        let literal = "rg needle /work/project/node_modules/pkg/output.d.ts | head -5";
+
+        assert_eq!(
+            engine.apply_rules_compound(aliased, "/work/project", None),
+            engine.apply_rules_compound(literal, "/work/project", None)
+        );
+        assert!(matches!(
+            engine.apply_rules_compound(aliased, "/work/project", None),
+            RuleResult::Allowed { .. }
+        ));
+    }
+
+    #[test]
+    fn alias_uncertainty_and_command_position_cap_otherwise_allowed_leaves() {
+        let engine = make_engine_with_aliases(
+            vec![
+                allow_rule("allow-assignment", r"^P="),
+                allow_rule("allow-echo", r"^echo($|\s)"),
+                allow_rule("allow-bin", r"^bin/tool($|\s)"),
+                allow_rule("allow-exec", r"^exec($|\s)"),
+                allow_rule("allow-command", r"^command($|\s)"),
+            ],
+            &["P"],
+        );
+
+        assert!(matches!(
+            engine.apply_rules_compound("P='/work/project'; echo $P/file", "/work/project", None,),
+            RuleResult::Asked { .. }
+        ));
+        for (command, rule) in [
+            ("P=/work/project/bin; $P/tool --version", "allow-bin"),
+            ("P=/work/project/bin; exec $P/tool --version", "allow-exec"),
+            (
+                "P=/work/project/bin; command exec $P/tool --version",
+                "allow-command",
+            ),
+        ] {
+            assert_eq!(
+                engine.apply_rules_compound(command, "/work/project", None),
+                asked(rule),
+                "case {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn out_of_cwd_alias_value_remains_visible_to_ask_rules() {
+        let engine = make_engine_with_aliases(
+            vec![
+                ask_rule("ask-absolute", r"^cat /"),
+                allow_rule("allow-cat", r"^cat($|\s)"),
+            ],
+            &["P"],
+        );
+        for command in [
+            "P=/etc; cat $P/passwd",
+            "P=/work/project/../secret; cat $P/file",
+        ] {
+            assert_eq!(
+                engine.apply_rules_compound(command, "/work/project", None),
+                asked("ask-absolute"),
+                "case {command:?}"
+            );
+        }
     }
 
     // ===== compile_with_diagnostics =====

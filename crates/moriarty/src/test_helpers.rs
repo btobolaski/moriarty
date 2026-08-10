@@ -12,6 +12,21 @@ use tempfile::TempDir;
 #[cfg(unix)]
 use which::which;
 
+pub(crate) const PATH_ALIAS_COMMAND: &str =
+    "P=/work/project/node_modules/pkg; rg needle $P/output.d.ts | head -5";
+
+pub(crate) const PATH_ALIAS_READ_RULES: &str = r#"
+[[bash_rules]]
+name = "allow-rg"
+pattern = "^rg($|\\s)"
+action = { type = "Allow" }
+
+[[bash_rules]]
+name = "allow-head"
+pattern = "^head($|\\s)"
+action = { type = "Allow" }
+"#;
+
 pub(crate) const SUBAGENT_EXECUTION_RULES: &str = r#"
 [[tool_rules]]
 name = "allow-valid-subagent-start"

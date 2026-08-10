@@ -514,15 +514,16 @@ async fn handle_bash_pretool_hook_with_config(
 
     info!(command = %command, "Processing Bash PreToolUse hook");
 
-    let bash_rules = match config.bash_rules {
-        Some(rules) if !rules.is_empty() => rules,
-        _ => {
-            info!("No bash_rules configured, defaulting to Ask");
-            return Ok((pretool_ask_hook(), None));
-        }
-    };
+    if config
+        .bash_rules
+        .as_ref()
+        .is_none_or(|rules| rules.is_empty())
+    {
+        info!("No bash_rules configured, defaulting to Ask");
+        return Ok((pretool_ask_hook(), None));
+    }
 
-    let engine = BashRuleEngine::from_config(bash_rules, config.pattern_fragments)?;
+    let engine = BashRuleEngine::from_config(config)?;
     let result = engine.apply_rules_compound(command, cwd, mode);
 
     match result {
