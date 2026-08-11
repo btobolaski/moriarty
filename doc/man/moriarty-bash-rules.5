@@ -152,8 +152,12 @@ backticks, arithmetic or process substitution, here documents, and
 uninspectable shell compounds.
 .Ss Mutation Barriers
 Moriarty deliberately does not model individual Bash mutation targets.
-After a supported declaration, any other assignment or dynamic command name
-invalidates all active aliases and requires confirmation.
+An assignment invalidates all aliases only when a binding is active or the
+assignment targets a configured alias.
+Unrelated standalone environment assignments remain eligible for normal
+rules.
+A dynamic command name invalidates all active aliases and requires
+confirmation.
 The same conservative barrier applies to
 .Cm command , builtin , exec , eval , source , . , trap , let , unset ,
 .Cm export , readonly , declare , typeset , local , read , mapfile ,

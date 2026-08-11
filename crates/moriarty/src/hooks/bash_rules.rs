@@ -2217,6 +2217,40 @@ mod tests {
     }
 
     #[test]
+    fn unrelated_environment_assignments_remain_eligible_for_allow() {
+        let engine = make_engine_with_aliases(
+            vec![
+                allow_rule(
+                    "rustdoc-deny-warnings-cargo-doc-safe",
+                    r"^RUSTDOCFLAGS=-Dwarnings cargo doc$",
+                ),
+                allow_rule(
+                    "pulumi-help-safe",
+                    r"^PULUMI_SKIP_UPDATE_CHECK=true pulumi help$",
+                ),
+            ],
+            &["P"],
+        );
+
+        for (command, rule) in [
+            (
+                "RUSTDOCFLAGS=-Dwarnings cargo doc",
+                "rustdoc-deny-warnings-cargo-doc-safe",
+            ),
+            (
+                "PULUMI_SKIP_UPDATE_CHECK=true pulumi help",
+                "pulumi-help-safe",
+            ),
+        ] {
+            assert_eq!(
+                engine.apply_rules_compound(command, "", None),
+                allowed(rule),
+                "case {command:?}"
+            );
+        }
+    }
+
+    #[test]
     fn alias_uncertainty_and_command_position_cap_otherwise_allowed_leaves() {
         let engine = make_engine_with_aliases(
             vec![

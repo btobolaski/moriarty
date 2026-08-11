@@ -794,12 +794,8 @@ fn apply_mutation_barriers(
     state: &mut AliasState,
     requires_confirmation: &mut Option<String>,
 ) {
-    if has_assignment(simple) && !state.configured.is_empty() {
-        add_confirmation(
-            requires_confirmation,
-            "assignments outside the supported path-alias declaration invalidate all active aliases"
-                .to_string(),
-        );
+    if let Some(reason) = assignment_barrier_reason(simple, state) {
+        add_confirmation(requires_confirmation, reason);
         state.active.clear();
     }
 
@@ -825,13 +821,31 @@ fn apply_mutation_barriers(
     }
 }
 
-fn has_assignment(simple: &SimpleCommand) -> bool {
-    simple
+fn assignment_barrier_reason(simple: &SimpleCommand, state: &AliasState) -> Option<String> {
+    let mut has_assignment = false;
+    for item in simple
         .prefix
         .iter()
         .flat_map(|prefix| &prefix.0)
         .chain(simple.suffix.iter().flat_map(|suffix| &suffix.0))
-        .any(|item| matches!(item, CommandPrefixOrSuffixItem::AssignmentWord(_, _)))
+    {
+        let CommandPrefixOrSuffixItem::AssignmentWord(assignment, _) = item else {
+            continue;
+        };
+        has_assignment = true;
+        let name = match &assignment.name {
+            AssignmentName::VariableName(name) | AssignmentName::ArrayElementName(name, _) => name,
+        };
+        if state.is_configured(name) {
+            return Some(format!(
+                "path alias `{name}` is assigned outside the supported declaration"
+            ));
+        }
+    }
+
+    (has_assignment && !state.active.is_empty()).then(|| {
+        "an assignment may mutate shell state; all active path aliases were invalidated".to_string()
+    })
 }
 
 fn literal_command_name(value: &str) -> Option<&str> {
@@ -1168,7 +1182,7 @@ mod tests {
     #[test]
     fn alias_assignments_remain_visible_and_do_not_consume_bindings() {
         assert!(
-            leaves("X=value; echo ok", "")
+            p_leaves("RUSTDOCFLAGS=-Dwarnings cargo doc; echo ok")
                 .iter()
                 .all(|leaf| leaf.requires_confirmation.is_none())
         );

@@ -345,8 +345,9 @@ conditions remain whole-command fail-safe cases.
 
 ### Mutation Barriers
 
-Moriarty deliberately avoids modeling Bash mutation targets. After a supported declaration, any other assignment, a
-dynamic command name, or one of these shell-state commands invalidates **all** active aliases and requires confirmation:
+Moriarty deliberately avoids modeling Bash mutation targets. An assignment invalidates all aliases only when a binding
+is active or the assignment targets a configured alias; unrelated standalone environment assignments remain eligible
+for normal rules. A dynamic command name or one of these shell-state commands invalidates **all** active aliases and requires confirmation:
 `command`, `builtin`, `exec`, `eval`, `source`, `.`, `trap`, `let`, `unset`, `export`, `readonly`, `declare`, `typeset`,
 `local`, `read`, `mapfile`, `readarray`, `getopts`, or `printf`. This conservative rule may prompt for a harmless form,
 but it prevents later references from being matched against stale paths without needing per-builtin option semantics.

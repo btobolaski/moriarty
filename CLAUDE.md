@@ -353,10 +353,10 @@ with warnings, while explicit missing paths and having no available source are e
     `command_split` expands only parser-identified unquoted plain `$NAME`/`${NAME}` references, then applies normal cwd
     stripping; the declaration is analysis metadata only after a later supported reference consumes it. Unsupported
     declarations/references and command-position expansion remain leaves with an independent Allow-to-Ask confirmation
-    cap, so later Denies still win. Rather than model per-builtin mutation targets, any other assignment, dynamic
-    command name, wrapper, `exec`, or recognized shell-state builtin invalidates all active aliases and requires
-    confirmation. This deliberately trades extra prompts for a small fail-closed implementation that cannot retain stale
-    bindings. Config deserialization validates shell identifiers and rejects the fixed shell-control names before any
+    cap, so later Denies still win. Rather than model per-builtin mutation targets, an assignment invalidates all aliases
+    only when a binding is active or it targets a configured alias; unrelated standalone environment assignments remain
+    eligible for normal rules. Dynamic command names, wrappers, `exec`, and recognized shell-state builtins invalidate
+    all active aliases. This trades extra prompts for a small fail-closed implementation without retaining stale bindings. Config deserialization validates shell identifiers and rejects the fixed shell-control names before any
     tool rule can short-circuit Bash analysis. No aliases is the omitted/hash-compatible default; configured aliases are
     trusted policy and must not be application/tool behavior variables.
   - **`real_file_write` cap**: a leaf with a `>`/`>>`/`>|`/`&>` redirect to a real file (not `/dev/null`, not an fd
