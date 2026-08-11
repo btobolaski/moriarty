@@ -3184,6 +3184,10 @@ pub enum McpMode {
     List,
     Search,
     Status,
+    #[serde(rename = "auth-start")]
+    AuthStart,
+    #[serde(rename = "auth-complete")]
+    AuthComplete,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -3728,6 +3732,32 @@ pub struct IntercomResultDetails {
     /// optional for backward compatibility.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sessions: Vec<JsonBlob>,
+    /// Subagent runs awaiting a decision from the parent (e.g. `need_decision`).
+    /// Added in newer pi versions; optional for backward compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending: Option<Vec<IntercomPendingItem>>,
+}
+
+/// A subagent run that is waiting for a parent decision via intercom.
+/// Pi populates this on the `intercom` tool result's `details.pending`
+/// when child subagents reach a `need_decision` state.
+///
+/// This mirrors [`PendingSupervisorRequest`] used by the
+/// `subagent_supervisor` tool, but keeps `child_index` and
+/// `expects_reply` optional because the `intercom` tool result
+/// wire shape may omit them while the `subagent_supervisor`
+/// shape always includes them.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct IntercomPendingItem {
+    pub id: String,
+    pub run_id: String,
+    pub agent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_index: Option<u32>,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expects_reply: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

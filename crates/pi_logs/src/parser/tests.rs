@@ -5914,6 +5914,30 @@ fn mcp_tool_result_accepts_instructions_mode() {
     assert_eq!(details.length, Some(152));
 }
 
+/// `mode: "auth-start"` and `"auth-complete"` use explicit
+/// `#[serde(rename)]` overrides because the enum's `rename_all =
+/// "lowercase"` would otherwise produce `authstart`/`authcomplete`.
+/// Pin both wire names so a dropped attribute cannot silently change
+/// the accepted variant and reject real pi MCP auth-flow log lines.
+#[test]
+fn mcp_tool_result_accepts_auth_modes() {
+    for (wire, expected) in [
+        ("auth-start", McpMode::AuthStart),
+        ("auth-complete", McpMode::AuthComplete),
+    ] {
+        let tool_result = parse_tool_result_message(tool_result_message_json(
+            "mcp",
+            vec![json!({"type": "text", "text": wire})],
+            false,
+            Some(json!({"mode": wire, "server": "github"})),
+        ));
+        let Some(ToolResultDetails::Mcp(details)) = tool_result.details else {
+            panic!("expected Mcp details")
+        };
+        assert_eq!(details.mode, Some(expected));
+    }
+}
+
 /// Verify that every tool name routed through `McpToolResult` in
 /// `parse_tool_result_details` accepts a `{error, server}` payload.
 /// The table catches accidental removal of a match arm during
@@ -8393,4 +8417,46 @@ fn intercom_result_accepts_sessions_field() {
 
     let empty: IntercomResultDetails = serde_json::from_value(json!({"sessions": []})).unwrap();
     assert!(empty.sessions.is_empty());
+}
+
+/// `pending` is a new optional field added in newer pi versions for
+/// subagent runs awaiting a parent decision via intercom. Pin the
+/// camelCase wire names and the required-vs-optional field split so a
+/// rename or attribute drop cannot silently reject real production
+/// intercom tool results.
+#[test]
+fn intercom_result_accepts_pending_items() {
+    let details: IntercomResultDetails = serde_json::from_value(json!({
+        "pending": [
+            {
+                "id": "req-1",
+                "runId": "run-42",
+                "agent": "reviewer",
+                "childIndex": 2,
+                "reason": "need_decision",
+                "expectsReply": true
+            },
+            {
+                "id": "req-2",
+                "runId": "run-43",
+                "agent": "worker",
+                "reason": "ask"
+            }
+        ]
+    }))
+    .expect("intercom result with pending items should parse");
+    let pending = details.pending.expect("pending should be present");
+    assert_eq!(pending[0].id, "req-1");
+    assert_eq!(pending[0].run_id, "run-42");
+    assert_eq!(pending[0].agent, "reviewer");
+    assert_eq!(pending[0].child_index, Some(2));
+    assert_eq!(pending[0].reason, "need_decision");
+    assert_eq!(pending[0].expects_reply, Some(true));
+    // Sparse item: optional fields omitted from the wire must default to None.
+    assert_eq!(pending[1].id, "req-2");
+    assert_eq!(pending[1].run_id, "run-43");
+    assert_eq!(pending[1].agent, "worker");
+    assert_eq!(pending[1].reason, "ask");
+    assert_eq!(pending[1].child_index, None);
+    assert_eq!(pending[1].expects_reply, None);
 }
