@@ -571,24 +571,26 @@ format = ["echo", "format"]
 
     #[tokio::test]
     async fn test_handle_verification_result_not_approved() {
-        // NotApproved is a failure variant — verification refuses the whole project. The wording is
-        // a static template; the structural contract is Err-vs-Ok.
-        handle_verification_result(
+        // NotApproved is a failure variant — verification refuses the whole project.
+        let err = handle_verification_result(
             VerificationResult::NotApproved,
             ItemType::Command,
             Path::new("/test/path"),
         )
         .expect_err("Should fail for NotApproved result");
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("Project tools not approved"),
+            "got: {err_msg}"
+        );
     }
 
     #[tokio::test]
     async fn test_handle_verification_result_item_changed_is_an_error() {
         // ItemChanged (either an argv or a binary change) is a failure variant — verification
-        // refuses the item. The sentence wording is a static template (asserted nowhere); the
-        // structural contract is Err-vs-Ok, matching the other failure variants. Both args_changed
-        // values route through the same arm.
+        // refuses the item, and the message names which of the two changed.
         for args_changed in [true, false] {
-            handle_verification_result(
+            let err = handle_verification_result(
                 VerificationResult::ItemChanged {
                     item: "lint".to_string(),
                     args_changed,
@@ -598,6 +600,13 @@ format = ["echo", "format"]
                 Path::new("/test/path"),
             )
             .expect_err("ItemChanged must surface as an error");
+            let err_msg = err.to_string();
+            let expected = if args_changed {
+                "its arguments changed"
+            } else {
+                "its binary changed"
+            };
+            assert!(err_msg.contains(expected), "got: {err_msg}");
         }
     }
 
@@ -605,7 +614,7 @@ format = ["echo", "format"]
     async fn test_handle_verification_result_item_not_approved() {
         // ItemNotApproved (the item name is configured-but-unapproved, or removed from config) is a
         // failure variant — verification refuses the item.
-        handle_verification_result(
+        let err = handle_verification_result(
             VerificationResult::ItemNotApproved {
                 item: "mycheck".to_string(),
             },
@@ -613,6 +622,11 @@ format = ["echo", "format"]
             Path::new("/test/path"),
         )
         .expect_err("Should fail for ItemNotApproved result");
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("Item 'mycheck' not approved"),
+            "got: {err_msg}"
+        );
     }
 
     #[tokio::test]
@@ -653,9 +667,14 @@ format = ["echo", "format"]
         approvals::approve_project_config(&main, DIVERGENT_MAIN_CONFIG)
             .await
             .unwrap();
-        verify_and_load_project(workspace.clone())
+        let err = verify_and_load_project(workspace.clone())
             .await
             .expect_err("divergent workspace binary must be refused until approved");
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("its binary changed since approval"),
+            "got: {err_msg}"
+        );
     }
 
     #[tokio::test]

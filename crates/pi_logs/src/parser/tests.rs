@@ -6391,6 +6391,14 @@ fn subagent_tool_result_preserves_runtime_owned_envelopes() {
         "effective": ["sha256:runtime"],
         "omitted": {"runtime": 0, "configured": 0, "effective": 0}
     });
+    let mission = json!({
+        "schemaVersion": 1,
+        "id": "2d15e86e-3891-4147-b7b3-89969ca9cd5c",
+        "title": "code-review workflow",
+        "status": "active",
+        "runs": [{"runId": "run_42", "mode": "workflow", "status": "active"}],
+        "futureMissionField": "preserved"
+    });
     let tool_result = parse_tool_result_message(tool_result_message_json(
         "subagent",
         vec![json!({"type": "text", "text": "complete"})],
@@ -6400,7 +6408,8 @@ fn subagent_tool_result_preserves_runtime_owned_envelopes() {
             "results": [],
             "lifecycleStatus": lifecycle_status,
             "spawnBudget": spawn_budget,
-            "launchResolvedExtensions": launch_resolved_extensions
+            "launchResolvedExtensions": launch_resolved_extensions,
+            "mission": mission
         })),
     ));
     let Some(ToolResultDetails::Subagent(details)) = tool_result.details else {
@@ -6426,6 +6435,11 @@ fn subagent_tool_result_preserves_runtime_owned_envelopes() {
                 .as_deref()
                 .map(|value| &value.0),
             &launch_resolved_extensions,
+        ),
+        (
+            "mission",
+            details.mission.as_deref().map(|value| &value.0),
+            &mission,
         ),
     ] {
         assert_eq!(parsed, Some(expected), "{wire_key} should parse");
@@ -6899,6 +6913,7 @@ fn subagent_tool_result_accepts_all_mode_values() {
         ("management", SubagentResultMode::Management),
         ("parallel", SubagentResultMode::Parallel),
         ("single", SubagentResultMode::Single),
+        ("workflow", SubagentResultMode::Workflow),
     ] {
         let tool_result = parse_tool_result_message(tool_result_message_json(
             "subagent",
@@ -7483,6 +7498,74 @@ fn subagent_tool_result_rejects_unknown_steering_target_field() {
                     "targets": [
                         {"index": 0, "state": "pending", "bogus": true}
                     ]
+                }
+            })),
+        ),
+        &["bogus", "unknown field", "did not match any variant"],
+    );
+}
+
+/// A detached `mode: "workflow"` launch echoes the spawning call's id plus
+/// the mission bookkeeping (`chatProgress`, `missionId`, `missionPath`) into
+/// the details; this pins the typed fields those additions map onto.
+#[test]
+fn subagent_tool_result_accepts_detached_workflow_launch_details() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "subagent",
+        vec![json!({"type": "text", "text": "Async workflow [run_42]"})],
+        false,
+        Some(json!({
+            "mode": "workflow",
+            "runId": "run_42",
+            "toolCallId": "call_abc|fc_def",
+            "asyncId": "run_42",
+            "asyncDir": "/tmp/pi-subagents/async-subagent-runs/run_42",
+            "results": [],
+            "chatProgress": {
+                "mode": "off",
+                "repoRelation": "same",
+                "repoLabel": "pi-subagents"
+            },
+            "missionId": "2d15e86e-3891-4147-b7b3-89969ca9cd5c",
+            "missionPath": "/repo/.pi/subagents/missions/2d15e86e.json"
+        })),
+    ));
+    let Some(ToolResultDetails::Subagent(details)) = tool_result.details else {
+        panic!("expected Subagent details")
+    };
+    assert_eq!(details.mode, SubagentResultMode::Workflow);
+    assert_eq!(details.tool_call_id.as_deref(), Some("call_abc|fc_def"));
+    let chat_progress = details.chat_progress.expect("expected chat progress");
+    assert_eq!(chat_progress.mode, "off");
+    assert_eq!(chat_progress.repo_relation, "same");
+    assert_eq!(chat_progress.repo_label.as_deref(), Some("pi-subagents"));
+    assert_eq!(
+        details.mission_id.as_deref(),
+        Some("2d15e86e-3891-4147-b7b3-89969ca9cd5c")
+    );
+    assert_eq!(
+        details.mission_path,
+        Some(PathBuf::from("/repo/.pi/subagents/missions/2d15e86e.json"))
+    );
+}
+
+#[test]
+fn subagent_tool_result_rejects_unknown_chat_progress_field() {
+    // Pins `deny_unknown_fields` on `SubagentChatProgress` so pi-side schema
+    // additions to the chat-progress payload surface as loud errors.
+    assert_parse_error_contains_any(
+        "subagent rejects unknown chat progress field",
+        tool_result_message_json(
+            "subagent",
+            vec![json!({"type": "text", "text": "queued"})],
+            false,
+            Some(json!({
+                "mode": "workflow",
+                "results": [],
+                "chatProgress": {
+                    "mode": "off",
+                    "repoRelation": "other",
+                    "bogus": true
                 }
             })),
         ),

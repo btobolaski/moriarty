@@ -1953,7 +1953,9 @@ struct WebSearchLeanDetails {
 #[serde(untagged)]
 pub enum ToolResultDetails {
     Edit(EditDetails),
-    Subagent(SubagentResultDetails),
+    // Boxed because SubagentResultDetails dwarfs every other variant and
+    // would otherwise set the size of the whole enum.
+    Subagent(Box<SubagentResultDetails>),
     SubagentSupervisor(SubagentSupervisorResultDetails),
     AskUser(AskUserDetails),
     CodeSearch(CodeSearchDetails),
@@ -2090,6 +2092,7 @@ pub enum SubagentResultMode {
     Management,
     Parallel,
     Single,
+    Workflow,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -2205,6 +2208,44 @@ pub struct SubagentResultDetails {
     /// for normal invocations and completed-from-launch runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub steering: Option<SubagentSteeringDetails>,
+    /// Configuration for mirroring the run's progress into the parent chat,
+    /// including how the run's repository relates to the parent session's.
+    /// Added in newer pi versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_progress: Option<SubagentChatProgress>,
+    /// The launching tool call's id echoed into the details so detached-run
+    /// lifecycle artifacts can be correlated back to the call that spawned
+    /// them. Added in newer pi versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// Id of the mission the run belongs to; keys the mission file echoed
+    /// in `mission`/`mission_path`. Added in newer pi versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mission_id: Option<String>,
+    /// Path to the mission file whose content is echoed in `mission`.
+    /// Added in newer pi versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mission_path: Option<PathBuf>,
+    /// Snapshot of the mission file at `mission_path`. Kept as raw JSON
+    /// because the extension owns this envelope and versions it
+    /// independently of the log format (it carries its own `schemaVersion`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mission: Option<Box<JsonBlob>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SubagentChatProgress {
+    /// Kept as `String` rather than a strict enum because the mode
+    /// vocabulary (observed: `off`) is undocumented and volatile.
+    pub mode: String,
+    /// Kept as `String` — observed values are `same` and `other`, but the
+    /// vocabulary is undocumented and volatile.
+    pub repo_relation: String,
+    /// Human-readable label for the run's repository; observed only when
+    /// `repo_relation` is `same`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_label: Option<String>,
 }
 
 /// Steering details for an async subagent run, recorded when an external
