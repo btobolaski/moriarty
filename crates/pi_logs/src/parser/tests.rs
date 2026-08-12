@@ -7507,75 +7507,88 @@ fn subagent_tool_result_rejects_unknown_steering_target_field() {
 
 #[test]
 fn subagent_wait_tool_result_accepts_management_completions() {
-    let tool_result = parse_tool_result_message(tool_result_message_json(
-        "subagent_wait",
-        vec![json!({"type": "text", "text": "Waited 2m34s; done. Outcome: 1 complete."})],
-        false,
-        Some(json!({
-            "mode": "management",
-            "results": [],
-            "completions": [{
-                "runId": "8ed59eb6-c8f5-4814-9b93-bace8d289649",
-                "agent": "workflow",
-                "mode": "workflow",
-                "state": "complete",
-                "success": true,
-                "results": [
-                    {
-                        "agent": "code-reviewer",
-                        "runId": "6fdd5244",
-                        "success": true,
-                        "outputState": "present",
-                        "artifactPaths": {"outputPath": "/sessions/6fdd5244/run-0/session.jsonl"}
-                    },
-                    {
-                        "agent": "code-reviewer",
-                        "runId": "8b898e80",
-                        "success": false,
-                        "outputState": "present"
-                    }
-                ],
-                "archivePath": "/tmp/output-archives/8ed59eb6.json"
-            }]
-        })),
-    ));
-    let Some(ToolResultDetails::Subagent(details)) = tool_result.details else {
-        panic!("expected Subagent details")
-    };
-    assert_eq!(details.mode, SubagentResultMode::Management);
-    assert!(details.results.is_empty());
-    let completions = details.completions.as_ref().expect("expected completions");
-    assert_eq!(completions.len(), 1);
-    let completion = &completions[0];
-    assert_eq!(completion.run_id, "8ed59eb6-c8f5-4814-9b93-bace8d289649");
-    assert_eq!(completion.agent, "workflow");
-    assert_eq!(completion.mode, SubagentResultMode::Workflow);
-    assert_eq!(completion.state, "complete");
-    assert!(completion.success);
-    assert_eq!(
-        completion.archive_path,
-        PathBuf::from("/tmp/output-archives/8ed59eb6.json")
-    );
-    assert_eq!(completion.results.len(), 2);
-    let result = &completion.results[0];
-    assert_eq!(result.agent, "code-reviewer");
-    assert_eq!(result.run_id, "6fdd5244");
-    assert!(result.success);
-    assert_eq!(result.output_state, "present");
-    assert_eq!(
-        result
-            .artifact_paths
-            .as_ref()
-            .expect("expected artifact paths")
-            .output_path,
-        PathBuf::from("/sessions/6fdd5244/run-0/session.jsonl")
-    );
-    // A failed child run reports no saved output path even though its
-    // `outputState` still says `present`.
-    let failed = &completion.results[1];
-    assert!(!failed.success);
-    assert_eq!(failed.output_state, "present");
-    assert_eq!(failed.artifact_paths, None);
+    for (archive_path, expected_archive_path) in [
+        (None, None),
+        (
+            Some("/tmp/output-archives/8ed59eb6.json"),
+            Some(PathBuf::from("/tmp/output-archives/8ed59eb6.json")),
+        ),
+    ] {
+        let mut completion = json!({
+            "runId": "8ed59eb6-c8f5-4814-9b93-bace8d289649",
+            "agent": "workflow",
+            "mode": "workflow",
+            "state": "complete",
+            "success": true,
+            "results": [
+                {
+                    "agent": "code-reviewer",
+                    "runId": "6fdd5244",
+                    "success": true,
+                    "outputState": "present",
+                    "artifactPaths": {"outputPath": "/sessions/6fdd5244/run-0/session.jsonl"}
+                },
+                {
+                    "agent": "code-reviewer",
+                    "runId": "8b898e80",
+                    "success": false,
+                    "outputState": "present"
+                }
+            ]
+        });
+        if let Some(archive_path) = archive_path {
+            completion
+                .as_object_mut()
+                .expect("completion is an object")
+                .insert("archivePath".to_string(), json!(archive_path));
+        }
+
+        let tool_result = parse_tool_result_message(tool_result_message_json(
+            "subagent_wait",
+            vec![json!({"type": "text", "text": "Waited 2m34s; done. Outcome: 1 complete."})],
+            false,
+            Some(json!({
+                "mode": "management",
+                "results": [],
+                "completions": [completion]
+            })),
+        ));
+        let Some(ToolResultDetails::Subagent(details)) = tool_result.details else {
+            panic!("expected Subagent details")
+        };
+        assert_eq!(details.mode, SubagentResultMode::Management);
+        assert!(details.results.is_empty());
+        let [completion] = details
+            .completions
+            .as_deref()
+            .expect("expected one completion")
+        else {
+            panic!("expected exactly one completion")
+        };
+        assert_eq!(completion.run_id, "8ed59eb6-c8f5-4814-9b93-bace8d289649");
+        assert_eq!(completion.agent, "workflow");
+        assert_eq!(completion.mode, SubagentResultMode::Workflow);
+        assert_eq!(completion.state, "complete");
+        assert!(completion.success);
+        assert_eq!(completion.archive_path, expected_archive_path);
+        let [succeeded, failed] = completion.results.as_slice() else {
+            panic!("expected succeeded and failed child results")
+        };
+        assert_eq!(succeeded.agent, "code-reviewer");
+        assert_eq!(succeeded.run_id, "6fdd5244");
+        assert!(succeeded.success);
+        assert_eq!(succeeded.output_state, "present");
+        assert_eq!(
+            succeeded
+                .artifact_paths
+                .as_ref()
+                .expect("successful child has an output path")
+                .output_path,
+            PathBuf::from("/sessions/6fdd5244/run-0/session.jsonl")
+        );
+        assert!(!failed.success);
+        assert_eq!(failed.artifact_paths, None);
+    }
 }
 
 #[test]

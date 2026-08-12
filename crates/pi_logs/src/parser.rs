@@ -1876,7 +1876,9 @@ fn parse_tool_result_details(
                 serde_json::from_value(details).map(ToolResultDetails::Skill)
             }
         }
-        "subagent" => serde_json::from_value(details).map(ToolResultDetails::Subagent),
+        "subagent" | "subagent_wait" => {
+            serde_json::from_value(details).map(ToolResultDetails::Subagent)
+        }
         "subagent_supervisor" => {
             serde_json::from_value(details).map(ToolResultDetails::SubagentSupervisor)
         }
@@ -2249,7 +2251,10 @@ pub struct SubagentWaitCompletion {
     pub state: String,
     pub success: bool,
     pub results: Vec<SubagentWaitCompletionResult>,
-    pub archive_path: PathBuf,
+    /// A wait result can arrive before the runtime writes its output archive,
+    /// so no archive path is guaranteed even after the run completes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_path: Option<PathBuf>,
 }
 
 /// Per-agent result summary inside a [`SubagentWaitCompletion`]. Leaner than
@@ -2271,8 +2276,8 @@ pub struct SubagentWaitCompletionResult {
     pub artifact_paths: Option<SubagentWaitArtifactPaths>,
 }
 
-/// Wait completions record only the saved output path, unlike the full
-/// [`SubagentArtifactPaths`] set recorded on launch results.
+/// When present, wait completions record only the saved output path, unlike
+/// the full [`SubagentArtifactPaths`] set recorded on launch results.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SubagentWaitArtifactPaths {
