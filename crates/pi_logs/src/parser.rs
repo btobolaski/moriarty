@@ -2264,7 +2264,11 @@ pub struct SubagentWaitCompletionResult {
     /// Kept as `String` rather than a strict enum because the vocabulary
     /// (observed: `present`) is undocumented and volatile.
     pub output_state: String,
-    pub artifact_paths: SubagentWaitArtifactPaths,
+    /// Omitted for a failed child run — the only observed omission carries
+    /// `success: false` — so a saved output path cannot be assumed even when
+    /// `output_state` says `present`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_paths: Option<SubagentWaitArtifactPaths>,
 }
 
 /// Wait completions record only the saved output path, unlike the full

@@ -7531,9 +7531,8 @@ fn subagent_wait_tool_result_accepts_management_completions() {
                     {
                         "agent": "code-reviewer",
                         "runId": "8b898e80",
-                        "success": true,
-                        "outputState": "present",
-                        "artifactPaths": {"outputPath": "/sessions/8b898e80/run-0/session.jsonl"}
+                        "success": false,
+                        "outputState": "present"
                     }
                 ],
                 "archivePath": "/tmp/output-archives/8ed59eb6.json"
@@ -7564,9 +7563,19 @@ fn subagent_wait_tool_result_accepts_management_completions() {
     assert!(result.success);
     assert_eq!(result.output_state, "present");
     assert_eq!(
-        result.artifact_paths.output_path,
+        result
+            .artifact_paths
+            .as_ref()
+            .expect("expected artifact paths")
+            .output_path,
         PathBuf::from("/sessions/6fdd5244/run-0/session.jsonl")
     );
+    // A failed child run reports no saved output path even though its
+    // `outputState` still says `present`.
+    let failed = &completion.results[1];
+    assert!(!failed.success);
+    assert_eq!(failed.output_state, "present");
+    assert_eq!(failed.artifact_paths, None);
 }
 
 #[test]
