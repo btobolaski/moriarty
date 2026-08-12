@@ -7505,6 +7505,99 @@ fn subagent_tool_result_rejects_unknown_steering_target_field() {
     );
 }
 
+#[test]
+fn subagent_wait_tool_result_accepts_management_completions() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "subagent_wait",
+        vec![json!({"type": "text", "text": "Waited 2m34s; done. Outcome: 1 complete."})],
+        false,
+        Some(json!({
+            "mode": "management",
+            "results": [],
+            "completions": [{
+                "runId": "8ed59eb6-c8f5-4814-9b93-bace8d289649",
+                "agent": "workflow",
+                "mode": "workflow",
+                "state": "complete",
+                "success": true,
+                "results": [
+                    {
+                        "agent": "code-reviewer",
+                        "runId": "6fdd5244",
+                        "success": true,
+                        "outputState": "present",
+                        "artifactPaths": {"outputPath": "/sessions/6fdd5244/run-0/session.jsonl"}
+                    },
+                    {
+                        "agent": "code-reviewer",
+                        "runId": "8b898e80",
+                        "success": true,
+                        "outputState": "present",
+                        "artifactPaths": {"outputPath": "/sessions/8b898e80/run-0/session.jsonl"}
+                    }
+                ],
+                "archivePath": "/tmp/output-archives/8ed59eb6.json"
+            }]
+        })),
+    ));
+    let Some(ToolResultDetails::Subagent(details)) = tool_result.details else {
+        panic!("expected Subagent details")
+    };
+    assert_eq!(details.mode, SubagentResultMode::Management);
+    assert!(details.results.is_empty());
+    let completions = details.completions.as_ref().expect("expected completions");
+    assert_eq!(completions.len(), 1);
+    let completion = &completions[0];
+    assert_eq!(completion.run_id, "8ed59eb6-c8f5-4814-9b93-bace8d289649");
+    assert_eq!(completion.agent, "workflow");
+    assert_eq!(completion.mode, SubagentResultMode::Workflow);
+    assert_eq!(completion.state, "complete");
+    assert!(completion.success);
+    assert_eq!(
+        completion.archive_path,
+        PathBuf::from("/tmp/output-archives/8ed59eb6.json")
+    );
+    assert_eq!(completion.results.len(), 2);
+    let result = &completion.results[0];
+    assert_eq!(result.agent, "code-reviewer");
+    assert_eq!(result.run_id, "6fdd5244");
+    assert!(result.success);
+    assert_eq!(result.output_state, "present");
+    assert_eq!(
+        result.artifact_paths.output_path,
+        PathBuf::from("/sessions/6fdd5244/run-0/session.jsonl")
+    );
+}
+
+#[test]
+fn subagent_wait_tool_result_rejects_unknown_completion_field() {
+    // Pins `deny_unknown_fields` on `SubagentWaitCompletion` so pi-side
+    // schema additions to a wait completion surface as loud errors.
+    assert_parse_error_contains_any(
+        "subagent_wait rejects unknown completion field",
+        tool_result_message_json(
+            "subagent_wait",
+            vec![json!({"type": "text", "text": "done"})],
+            false,
+            Some(json!({
+                "mode": "management",
+                "results": [],
+                "completions": [{
+                    "runId": "run",
+                    "agent": "workflow",
+                    "mode": "workflow",
+                    "state": "complete",
+                    "success": true,
+                    "results": [],
+                    "archivePath": "/tmp/archive.json",
+                    "bogus": true
+                }]
+            })),
+        ),
+        &["bogus", "unknown field", "did not match any variant"],
+    );
+}
+
 /// A detached `mode: "workflow"` launch echoes the spawning call's id plus
 /// the mission bookkeeping (`chatProgress`, `missionId`, `missionPath`) into
 /// the details; this pins the typed fields those additions map onto.

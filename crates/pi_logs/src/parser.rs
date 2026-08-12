@@ -2231,6 +2231,48 @@ pub struct SubagentResultDetails {
     /// independently of the log format (it carries its own `schemaVersion`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mission: Option<Box<JsonBlob>>,
+    /// Async runs that finished while a `subagent_wait` management call was
+    /// blocking, one entry per awaited run. Added in newer pi versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completions: Option<Vec<SubagentWaitCompletion>>,
+}
+
+/// One awaited async run reported by a `subagent_wait` management result.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SubagentWaitCompletion {
+    pub run_id: String,
+    pub agent: String,
+    pub mode: SubagentResultMode,
+    /// Kept as `String` rather than a strict enum because the run-lifecycle
+    /// vocabulary (observed: `complete`) is undocumented and volatile.
+    pub state: String,
+    pub success: bool,
+    pub results: Vec<SubagentWaitCompletionResult>,
+    pub archive_path: PathBuf,
+}
+
+/// Per-agent result summary inside a [`SubagentWaitCompletion`]. Leaner than
+/// [`SubagentResultSummary`]: the wait call reports only identity, outcome,
+/// and where the archived output lives.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SubagentWaitCompletionResult {
+    pub agent: String,
+    pub run_id: String,
+    pub success: bool,
+    /// Kept as `String` rather than a strict enum because the vocabulary
+    /// (observed: `present`) is undocumented and volatile.
+    pub output_state: String,
+    pub artifact_paths: SubagentWaitArtifactPaths,
+}
+
+/// Wait completions record only the saved output path, unlike the full
+/// [`SubagentArtifactPaths`] set recorded on launch results.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SubagentWaitArtifactPaths {
+    pub output_path: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
