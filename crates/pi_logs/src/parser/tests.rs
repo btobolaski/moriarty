@@ -5107,6 +5107,18 @@ fn custom_message_web_search_content_ready_rejects_details() {
 }
 
 #[test]
+fn custom_message_subagent_compaction_resume_has_no_details() {
+    assert!(matches!(
+        parse_custom_message_payload(
+            "Compaction is complete. Resume the parent task now; background subagent results will arrive separately when ready.",
+            "subagent-compaction-resume",
+            None,
+        ),
+        CustomMessagePayload::SubagentCompactionResume
+    ));
+}
+
+#[test]
 fn custom_message_intercom_message() {
     let payload = parse_custom_message_payload(
         "subagent needs attention",
@@ -7413,43 +7425,54 @@ fn subagent_tool_result_accepts_budget_transcript_timeout_and_deadline_fields() 
 
 #[test]
 fn subagent_tool_result_accepts_steering_details() {
-    let tool_result = parse_tool_result_message(tool_result_message_json(
-        "subagent",
-        vec![json!({"type": "text", "text": "Steering delivered"})],
-        false,
-        Some(json!({
-            "mode": "management",
-            "results": [],
-            "steering": {
-                "requestId": "c50b508f-1203-416c-a07b-390e49ea6c7a",
-                "state": "delivered",
-                "sourceRunId": "47ee1204-caf9-4740-bc72-0c51685e5808",
-                "targets": [
-                    {"index": 0, "state": "delivered", "deliveredAt": 1785310395431_u64},
-                    {"index": 1, "state": "pending"}
-                ]
-            }
-        })),
-    ));
-    let Some(ToolResultDetails::Subagent(details)) = tool_result.details else {
-        panic!("expected Subagent details")
-    };
-    assert_eq!(details.mode, SubagentResultMode::Management);
-    assert!(details.results.is_empty());
-    let steering = details.steering.as_ref().expect("expected steering");
-    assert_eq!(steering.request_id, "c50b508f-1203-416c-a07b-390e49ea6c7a");
-    assert_eq!(steering.state, "delivered");
-    assert_eq!(
-        steering.source_run_id,
-        "47ee1204-caf9-4740-bc72-0c51685e5808"
-    );
-    assert_eq!(steering.targets.len(), 2);
-    assert_eq!(steering.targets[0].index, 0);
-    assert_eq!(steering.targets[0].state, "delivered");
-    assert_eq!(steering.targets[0].delivered_at, Some(1785310395431));
-    assert_eq!(steering.targets[1].index, 1);
-    assert_eq!(steering.targets[1].state, "pending");
-    assert_eq!(steering.targets[1].delivered_at, None);
+    for delivery_status in [None, Some("delivered")] {
+        let mut steering = json!({
+            "requestId": "c50b508f-1203-416c-a07b-390e49ea6c7a",
+            "state": "delivered",
+            "sourceRunId": "47ee1204-caf9-4740-bc72-0c51685e5808",
+            "targets": [
+                {"index": 0, "state": "delivered", "deliveredAt": 1785310395431_u64},
+                {"index": 1, "state": "pending"}
+            ]
+        });
+        if let Some(delivery_status) = delivery_status {
+            steering
+                .as_object_mut()
+                .expect("steering is an object")
+                .insert("deliveryStatus".to_string(), json!(delivery_status));
+        }
+
+        let tool_result = parse_tool_result_message(tool_result_message_json(
+            "subagent",
+            vec![json!({"type": "text", "text": "Steering delivered"})],
+            false,
+            Some(json!({
+                "mode": "management",
+                "results": [],
+                "steering": steering
+            })),
+        ));
+        let Some(ToolResultDetails::Subagent(details)) = tool_result.details else {
+            panic!("expected Subagent details")
+        };
+        assert_eq!(details.mode, SubagentResultMode::Management);
+        assert!(details.results.is_empty());
+        let steering = details.steering.as_ref().expect("expected steering");
+        assert_eq!(steering.request_id, "c50b508f-1203-416c-a07b-390e49ea6c7a");
+        assert_eq!(steering.state, "delivered");
+        assert_eq!(steering.delivery_status.as_deref(), delivery_status);
+        assert_eq!(
+            steering.source_run_id,
+            "47ee1204-caf9-4740-bc72-0c51685e5808"
+        );
+        assert_eq!(steering.targets.len(), 2);
+        assert_eq!(steering.targets[0].index, 0);
+        assert_eq!(steering.targets[0].state, "delivered");
+        assert_eq!(steering.targets[0].delivered_at, Some(1785310395431));
+        assert_eq!(steering.targets[1].index, 1);
+        assert_eq!(steering.targets[1].state, "pending");
+        assert_eq!(steering.targets[1].delivered_at, None);
+    }
 }
 
 #[test]
@@ -7533,6 +7556,23 @@ fn subagent_wait_tool_result_accepts_management_completions() {
                     "runId": "8b898e80",
                     "success": false,
                     "outputState": "present"
+                },
+                {
+                    "success": false,
+                    "outputState": "present"
+                },
+                {
+                    "agent": "code-quality-reviewer",
+                    "success": true,
+                    "outputState": "present",
+                    "model": "openai-codex/gpt-5.6-sol:high",
+                    "artifactPaths": {
+                        "inputPath": "/artifacts/0c1574bd_input.md",
+                        "outputPath": "/artifacts/0c1574bd_output.md",
+                        "jsonlPath": "/artifacts/0c1574bd.jsonl",
+                        "transcriptPath": "/artifacts/0c1574bd_transcript.jsonl",
+                        "metadataPath": "/artifacts/0c1574bd_meta.json"
+                    }
                 }
             ]
         });
@@ -7571,23 +7611,66 @@ fn subagent_wait_tool_result_accepts_management_completions() {
         assert_eq!(completion.state, "complete");
         assert!(completion.success);
         assert_eq!(completion.archive_path, expected_archive_path);
-        let [succeeded, failed] = completion.results.as_slice() else {
-            panic!("expected succeeded and failed child results")
+        let [succeeded, failed, unidentified, full_artifacts] = completion.results.as_slice()
+        else {
+            panic!("expected four child results")
         };
-        assert_eq!(succeeded.agent, "code-reviewer");
-        assert_eq!(succeeded.run_id, "6fdd5244");
+        assert_eq!(succeeded.agent.as_deref(), Some("code-reviewer"));
+        assert_eq!(succeeded.run_id.as_deref(), Some("6fdd5244"));
         assert!(succeeded.success);
         assert_eq!(succeeded.output_state, "present");
+        assert_eq!(succeeded.model, None);
+        let succeeded_paths = succeeded
+            .artifact_paths
+            .as_ref()
+            .expect("successful child has an output path");
         assert_eq!(
-            succeeded
-                .artifact_paths
-                .as_ref()
-                .expect("successful child has an output path")
-                .output_path,
+            succeeded_paths.output_path,
             PathBuf::from("/sessions/6fdd5244/run-0/session.jsonl")
         );
+        assert_eq!(succeeded_paths.input_path, None);
+        assert_eq!(succeeded_paths.jsonl_path, None);
+        assert_eq!(succeeded_paths.metadata_path, None);
+        assert_eq!(succeeded_paths.transcript_path, None);
         assert!(!failed.success);
         assert_eq!(failed.artifact_paths, None);
+        assert_eq!(unidentified.agent, None);
+        assert_eq!(unidentified.run_id, None);
+        assert!(!unidentified.success);
+        assert_eq!(unidentified.artifact_paths, None);
+        assert_eq!(
+            full_artifacts.agent.as_deref(),
+            Some("code-quality-reviewer")
+        );
+        assert_eq!(full_artifacts.run_id, None);
+        assert_eq!(
+            full_artifacts.model.as_deref(),
+            Some("openai-codex/gpt-5.6-sol:high")
+        );
+        let full_paths = full_artifacts
+            .artifact_paths
+            .as_ref()
+            .expect("expected the full artifact path set");
+        assert_eq!(
+            full_paths.output_path,
+            PathBuf::from("/artifacts/0c1574bd_output.md")
+        );
+        assert_eq!(
+            full_paths.input_path,
+            Some(PathBuf::from("/artifacts/0c1574bd_input.md"))
+        );
+        assert_eq!(
+            full_paths.jsonl_path,
+            Some(PathBuf::from("/artifacts/0c1574bd.jsonl"))
+        );
+        assert_eq!(
+            full_paths.metadata_path,
+            Some(PathBuf::from("/artifacts/0c1574bd_meta.json"))
+        );
+        assert_eq!(
+            full_paths.transcript_path,
+            Some(PathBuf::from("/artifacts/0c1574bd_transcript.jsonl"))
+        );
     }
 }
 

@@ -384,6 +384,11 @@ pub enum CustomMessagePayload {
     /// the outer `content` field; no structured `details` payload.
     #[serde(rename = "web-search-content-ready")]
     WebSearchContentReady,
+    /// Injected after a compaction that interrupted a parent task, telling
+    /// the assistant to pick the task back up. Carries no `details`
+    /// payload; the resume instruction lives in the outer `content` field.
+    #[serde(rename = "subagent-compaction-resume")]
+    SubagentCompactionResume,
 }
 
 // ---------------------------------------------------------------------------
@@ -2263,12 +2268,23 @@ pub struct SubagentWaitCompletion {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SubagentWaitCompletionResult {
-    pub agent: String,
-    pub run_id: String,
+    /// Absent on a child run that failed before the harness bound it to an
+    /// agent; such an entry carries only its outcome.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// Independent of `agent`: an identified, successful child that reports
+    /// its full artifact set has still been observed without a run id, so
+    /// neither field implies the other.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     pub success: bool,
     /// Kept as `String` rather than a strict enum because the vocabulary
     /// (observed: `present`) is undocumented and volatile.
     pub output_state: String,
+    /// The model that served the child run, recorded only for runs that
+    /// reached a provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// Omitted for a failed child run — the only observed omission carries
     /// `success: false` — so a saved output path cannot be assumed even when
     /// `output_state` says `present`.
@@ -2276,12 +2292,21 @@ pub struct SubagentWaitCompletionResult {
     pub artifact_paths: Option<SubagentWaitArtifactPaths>,
 }
 
-/// When present, wait completions record only the saved output path, unlike
-/// the full [`SubagentArtifactPaths`] set recorded on launch results.
+/// Wait completions record either the saved output path alone or the full
+/// launch-result set, so only `output_path` is guaranteed; the rest mirror
+/// [`SubagentArtifactPaths`] but stay optional.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SubagentWaitArtifactPaths {
     pub output_path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jsonl_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -2308,6 +2333,11 @@ pub struct SubagentSteeringDetails {
     /// Kept as `String` rather than a strict enum because the steering
     /// lifecycle vocabulary is undocumented and volatile.
     pub state: String,
+    /// Delivery outcome reported beside `state`; the two have been observed
+    /// carrying the same value, but pi records them separately so neither is
+    /// derived from the other. Added in newer pi versions, hence optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_status: Option<String>,
     pub source_run_id: String,
     pub targets: Vec<SubagentSteeringTarget>,
 }
