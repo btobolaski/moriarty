@@ -30,12 +30,14 @@ A pattern therefore needs to describe only a single command, not a whole
 pipeline.
 .Bl -bullet
 .It
-Operators and redirects are split off each leaf, so a simple
+Operators split compound commands into leaves, so a simple
 .Ql ^ls
 matches the
 .Ql ls
 leaf of
 .Ql ls | wc -l .
+Redirect syntax remains in each leaf's match text; redirect targets are also
+inspected separately so real file writes can cap Allow at Ask.
 .It
 Merge precedence: any denied leaf denies the whole command; otherwise any leaf that asks, or that
 matches no rule, prompts; only an all\-allowed command is allowed.
@@ -54,10 +56,23 @@ backticks, a subshell, process substitution, a here\-document, or another compou
 cannot be analyzed: only an explicit Deny matching the whole command is honored, and every other
 outcome becomes a prompt.
 .It
-In\-cwd absolute paths in a leaf are normalized to their relative remainder before matching, so
+Static paths, including ordinary quoted values, escaped literals, and glob
+patterns with no dot\-prefixed component, are normalized when their in\-cwd
+relative remainder contains no
+.Ql ..
+component.
+Thus
 .Ql ^cat src/
-matches
-.Ql cat /abs/cwd/src/x .
+matches both
+.Ql cat \(dq/abs/cwd/src/x\(dq
+and
+.Ql cat /abs/cwd/src/*.rs .
+Parent\-containing paths, unquoted brace syntax, and glob paths with
+dot\-prefixed components remain unchanged; quoted or escaped braces are
+literal and do not block normalization.
+An operand equal to the cwd becomes
+.Ql .
+rather than disappearing.
 .El
 .Pp
 Allow\-rules can therefore be simple prefixes without enumerating pipes, operators, or
@@ -127,20 +142,31 @@ The unquoted value must match exactly:
 .Pp
 .Dl ^/[A\-Za\-z0\-9/._@+,:=%\-]*$
 .Pp
-Later words may use one unquoted plain
+Later words may use one plain
 .Ql $NAME
 or
 .Ql ${NAME}
-with literal prefix or suffix text, including
-.Ql $P/output.d.ts
+with literal prefix or suffix text, either unquoted or inside ordinary
+double quotes.
+Examples include
+.Ql $P/output.d.ts ,
+.Ql --file=$P/input ,
+.Li \(dq$P/runtime/mocks.js\(dq ,
 and
-.Ql --file=$P/input .
+.Li \(dq$P\(dq/runtime/mocks.js .
 Expansion uses parser nodes, not textual replacement:
 single\-quoted references stay literal and similarly prefixed names do not
 match.
-Quoted, indirect, length, default\-value, transform, multiple\-expansion,
-array, append, temporary environment, conditional, pipeline, background, and
-relative\-path forms are unsupported.
+Locale\-translated double\-quoted, indirect, length, default\-value,
+transform, multiple\-expansion, array, append, temporary environment,
+conditional, and pipeline or background declaration forms are unsupported.
+Paths containing
+.Ql ..
+may be expanded, but are not presented as safe relative paths and remain
+unchanged during cwd normalization; relative alias declarations remain
+unsupported.
+Other quoting or escaping in an alias\-expanded word is likewise unsupported
+and caps an otherwise allowed leaf at Ask.
 .Pp
 A consumed declaration is analysis metadata rather than an executable leaf.
 An unused declaration, unsupported configured\-alias form, unresolved

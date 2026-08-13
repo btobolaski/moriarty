@@ -2561,12 +2561,22 @@ async fn test_bash_hook_compound_all_safe_leaves_allowed() {
 }
 
 #[tokio::test]
-async fn configured_path_alias_allows_the_equivalent_safe_compound() {
+async fn configured_path_alias_supports_ordinary_but_not_localized_quotes() {
     let config = format!("bash_path_aliases = [\"P\"]\n{PATH_ALIAS_READ_RULES}");
-    let command = "P=/work/project/node_modules/.pnpm/@scope+pkg@1.0.0/node_modules/pkg; rg needle $P/output.d.ts | head -5; rg other ${P}/runtime.d.ts | head -5";
-
-    let result = run_bash_hook_cwd(&config, command, "/work/project").await;
-    assert_pretool_allow(&result);
+    for (command, allowed) in [
+        (
+            "P=/work/project/node_modules/.pnpm/@scope+pkg@1.0.0/node_modules/pkg; rg needle $P/output.d.ts | head -5; rg other \"${P}/runtime.d.ts\" | head -5",
+            true,
+        ),
+        (r#"P=/work/project; rg needle $"$P/runtime.d.ts""#, false),
+    ] {
+        let result = run_bash_hook_cwd(&config, command, "/work/project").await;
+        if allowed {
+            assert_pretool_allow(&result);
+        } else {
+            assert_pretool_ask(&result);
+        }
+    }
 }
 
 #[tokio::test]

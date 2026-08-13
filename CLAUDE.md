@@ -353,8 +353,11 @@ with warnings, while explicit missing paths and having no available source are e
     re-validation loop.
   - **Configured path-alias preprocessing**: the optional top-level `bash_path_aliases` ordered set names trusted shell
     variables that may be bound by an exact leading `NAME=/literal/path;` declaration or newline-terminated equivalent.
-    `command_split` expands only parser-identified unquoted plain `$NAME`/`${NAME}` references, then applies normal cwd
-    stripping; the declaration is analysis metadata only after a later supported reference consumes it. Unsupported
+    `command_split` expands parser-identified plain `$NAME`/`${NAME}` references in either unquoted or ordinary
+    double-quoted words, including `"$P/runtime/mocks.js"` and `"$P"/runtime/mocks.js`, then applies quote-aware cwd
+    stripping. Single-quoted `'$P'` remains literal; localized `$"…"`, indirect, dynamic, and other quoted or escaped
+    compositions stay unsupported and cap Allow at Ask. The declaration is analysis metadata only after a later
+    supported reference consumes it. Unsupported
     declarations/references and command-position expansion remain leaves with an independent Allow-to-Ask confirmation
     cap, so later Denies still win. Rather than model per-builtin mutation targets, an assignment invalidates all aliases
     only when a binding is active or it targets a configured alias; unrelated standalone environment assignments remain
@@ -369,9 +372,11 @@ with warnings, while explicit missing paths and having no available source are e
     parameter expansion (`${x:-$(…)}`), a subshell, process substitution, a here-doc/here-string, a compound construct
     (`if`/`for`/`while`/`case`/`[[ ]]`/`((…))`/brace group/function), or that fails to parse is un-analyzable: only an
     explicit Deny matching the whole command is honored; every other outcome becomes a prompt.
-  - **Bash cwd stripping**: after any known path-alias expansion, a leaf's in-cwd absolute paths are normalized to their
-    relative remainder before matching (no `..`-escaping remainder is rewritten), so `^cat src/` matches
-    `cat /abs/cwd/src/x`. `apply_rules(command, mode)` stays the single-command primitive;
+  - **Bash cwd stripping**: static paths—including ordinary quoted values, escaped literals, safe glob patterns, and
+    known alias expansions—are normalized only when their in-cwd relative remainder contains no `..` component.
+    Parent-containing paths, unquoted brace syntax, and glob paths with dot-prefixed components remain unchanged; quoted
+    or escaped braces stay literal. An exact-cwd operand becomes `.` rather than disappearing. Thus `^cat src/` matches
+    `cat "/abs/cwd/src/x"`. `apply_rules(command, mode)` stays the single-command primitive;
     `apply_rules_compound(command, cwd, mode)` is what the hook, replay, and normal test-runner mode call. Explain mode
     uses `BashRuleEngine::explain`, which mirrors the same split and evaluation.
   - Evaluation order: tool_rules → bash_rules (for Bash) → passthrough (for non-Bash, defers to Claude Code)

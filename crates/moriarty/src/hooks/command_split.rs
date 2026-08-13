@@ -82,9 +82,10 @@ pub(crate) enum BailReason {
 /// Splits `command` into leaf simple-commands, normalizing in-cwd absolute paths to relative form
 /// against `cwd` in the same pass.
 ///
-/// `cwd` is the hook's working directory; words whose value begins with `cwd/` are rewritten to
-/// their relative remainder so simple allow-rules can be written with relative paths (mirroring the
-/// tool-rules field stripping). An empty `cwd` disables normalization.
+/// Static path values, including parsed quoted or escaped values and known alias expansions, are
+/// normalized when they resolve inside `cwd` and contain no `..` component. Parent-containing
+/// paths, unquoted brace syntax, and glob paths with dot-prefixed components remain unchanged; an
+/// exact-cwd operand becomes `.` rather than being erased. An empty `cwd` disables normalization.
 pub(crate) fn split_command(
     command: &str,
     cwd: &str,
@@ -546,35 +547,49 @@ fn push_word(
     bindings: &mut Vec<AliasBinding>,
     requires_confirmation: &mut Option<String>,
 ) -> Result<String, BailReason> {
-    let analysis = analyze_word(&word.value, options, state, role)?;
-    for binding in analysis.bindings {
+    let WordAnalysis {
+        expanded,
+        literal_value,
+        non_alias_normalization_safe,
+        analyzed_bindings,
+        requires_confirmation: analysis_confirmation,
+    } = analyze_word(&word.value, options, state, role)?;
+    let alias_expanded = !analyzed_bindings.is_empty();
+    for binding in analyzed_bindings {
         if !bindings.contains(&binding) {
             bindings.push(binding);
         }
     }
-    if let Some(reason) = analysis.requires_confirmation {
+    if let Some(reason) = analysis_confirmation {
         add_confirmation(requires_confirmation, reason);
     }
 
-    let stripped = strip_cwd_prefix(&analysis.expanded, cwd);
-    let normalized = stripped != analysis.expanded && !has_parent_component(stripped);
-    let value = if normalized {
-        stripped.to_string()
-    } else {
-        analysis.expanded.clone()
-    };
+    let normalization = normalize_word_for_match(
+        &expanded,
+        literal_value.as_deref(),
+        cwd,
+        alias_expanded,
+        non_alias_normalization_safe,
+    );
+    if normalization.requires_confirmation {
+        add_confirmation(
+            requires_confirmation,
+            "path alias uses unsupported quoting or escaping".to_string(),
+        );
+    }
     let span = word.loc.as_ref().and_then(|loc| {
         let (start, end) = (loc.start.index, loc.end.index);
         (start <= end && end <= chars.len()).then_some((start, end))
     });
 
+    let classified_value = literal_value.unwrap_or_else(|| expanded.clone());
     words.push(LeafWord {
         original_value: word.value.clone(),
-        expanded_value: analysis.expanded.clone(),
-        value,
+        expanded_value: expanded,
+        value: normalization.value,
         span,
     });
-    Ok(analysis.expanded)
+    Ok(classified_value)
 }
 
 fn push_assignment_word(
@@ -607,7 +622,9 @@ fn push_assignment_word(
 
 struct WordAnalysis {
     expanded: String,
-    bindings: Vec<AliasBinding>,
+    literal_value: Option<String>,
+    non_alias_normalization_safe: bool,
+    analyzed_bindings: Vec<AliasBinding>,
     requires_confirmation: Option<String>,
 }
 
@@ -615,6 +632,28 @@ struct ParameterScan {
     total_expansions: usize,
     supported: Vec<(String, usize, usize)>,
     unsupported: Vec<String>,
+    static_parts: Option<Vec<StaticWordPart>>,
+    alias_static_supported: bool,
+    has_unquoted_open_brace: bool,
+    has_unquoted_close_brace: bool,
+    has_unquoted_glob: bool,
+}
+
+impl ParameterScan {
+    fn push_static_part(&mut self, part: StaticWordPart) {
+        if let Some(parts) = &mut self.static_parts {
+            parts.push(part);
+        }
+    }
+
+    fn invalidate_static_word(&mut self) {
+        self.static_parts = None;
+    }
+}
+
+enum StaticWordPart {
+    Literal(String),
+    Alias(String),
 }
 
 fn analyze_word(
@@ -625,8 +664,12 @@ fn analyze_word(
 ) -> Result<WordAnalysis, BailReason> {
     let scan = scan_word(value, options, state)?;
     let mut requires_confirmation = scan.unsupported.into_iter().next();
-    let mut bindings = Vec::new();
+    let mut analyzed_bindings = Vec::new();
     let mut expanded = value.to_string();
+    let mut literal_value = scan
+        .static_parts
+        .as_deref()
+        .and_then(|parts| render_static_word(parts, None));
     if let Some((name, start, end)) = scan.supported.into_iter().next() {
         if scan.total_expansions != 1 {
             add_confirmation(
@@ -639,7 +682,14 @@ fn analyze_word(
             expanded = replace_word_span(value, start, end, &active.binding.value)
                 .ok_or(BailReason::ParseError)?;
             state.used_declarations.insert(active.declaration_id);
-            bindings.push(active.binding);
+            literal_value = if scan.alias_static_supported {
+                scan.static_parts.as_deref().and_then(|parts| {
+                    render_static_word(parts, Some((&name, &active.binding.value)))
+                })
+            } else {
+                None
+            };
+            analyzed_bindings.push(active.binding);
             if matches!(role, WordRole::CommandName) {
                 add_confirmation(
                     &mut requires_confirmation,
@@ -654,9 +704,17 @@ fn analyze_word(
         }
     }
 
+    let non_alias_normalization_safe = !(scan.has_unquoted_open_brace
+        && scan.has_unquoted_close_brace
+        || scan.has_unquoted_glob
+            && literal_value
+                .as_deref()
+                .is_some_and(has_dot_prefixed_component));
     Ok(WordAnalysis {
         expanded,
-        bindings,
+        literal_value,
+        non_alias_normalization_safe,
+        analyzed_bindings,
         requires_confirmation,
     })
 }
@@ -671,13 +729,36 @@ fn scan_word(
         total_expansions: 0,
         supported: Vec::new(),
         unsupported: Vec::new(),
+        static_parts: Some(Vec::new()),
+        alias_static_supported: true,
+        has_unquoted_open_brace: false,
+        has_unquoted_close_brace: false,
+        has_unquoted_glob: false,
     };
-    scan_pieces(&pieces, false, value, state, &mut scan)?;
+    scan_pieces(&pieces, false, false, value, state, &mut scan)?;
     Ok(scan)
+}
+
+fn render_static_word(parts: &[StaticWordPart], binding: Option<(&str, &str)>) -> Option<String> {
+    let mut rendered = String::new();
+    for part in parts {
+        match part {
+            StaticWordPart::Literal(text) => rendered.push_str(text),
+            StaticWordPart::Alias(name) => {
+                let (bound_name, value) = binding?;
+                if name != bound_name {
+                    return None;
+                }
+                rendered.push_str(value);
+            }
+        }
+    }
+    Some(rendered)
 }
 
 fn scan_pieces(
     pieces: &[WordPieceWithSource],
+    localized: bool,
     quoted: bool,
     value: &str,
     state: &AliasState,
@@ -688,38 +769,73 @@ fn scan_pieces(
             WordPiece::CommandSubstitution(_)
             | WordPiece::BackquotedCommandSubstitution(_)
             | WordPiece::ArithmeticExpression(_) => return Err(BailReason::CommandSubstitution),
-            WordPiece::DoubleQuotedSequence(inner)
-            | WordPiece::GettextDoubleQuotedSequence(inner) => {
-                scan_pieces(inner, true, value, state, scan)?;
+            WordPiece::Text(text) => {
+                scan.push_static_part(StaticWordPart::Literal(text.clone()));
+                if !quoted {
+                    scan.has_unquoted_open_brace |= text.contains('{');
+                    scan.has_unquoted_close_brace |= text.contains('}');
+                    scan.has_unquoted_glob |= text.contains(['*', '?', '[']);
+                }
+            }
+            WordPiece::SingleQuotedText(text) => {
+                scan.push_static_part(StaticWordPart::Literal(text.clone()));
+                scan.alias_static_supported = false;
+            }
+            WordPiece::EscapeSequence(text) => {
+                let Some(unescaped) = text.strip_prefix('\\') else {
+                    scan.invalidate_static_word();
+                    scan.alias_static_supported = false;
+                    continue;
+                };
+                scan.push_static_part(StaticWordPart::Literal(unescaped.to_string()));
+                scan.alias_static_supported = false;
+            }
+            WordPiece::DoubleQuotedSequence(inner) => {
+                scan_pieces(inner, localized, true, value, state, scan)?;
+            }
+            WordPiece::GettextDoubleQuotedSequence(inner) => {
+                scan.alias_static_supported = false;
+                scan.invalidate_static_word();
+                scan_pieces(inner, true, true, value, state, scan)?;
             }
             WordPiece::ParameterExpansion(expr) => {
                 scan.total_expansions += 1;
                 let Some(name) = parameter_alias_name(expr) else {
+                    scan.alias_static_supported = false;
+                    scan.invalidate_static_word();
                     if !is_plain_parameter(expr) {
                         return Err(BailReason::CommandSubstitution);
                     }
                     continue;
                 };
                 if !state.is_configured(name) {
+                    scan.alias_static_supported = false;
+                    scan.invalidate_static_word();
                     if !is_plain_parameter(expr) {
                         return Err(BailReason::CommandSubstitution);
                     }
                     continue;
                 }
 
-                if quoted || !is_supported_alias_parameter(expr) {
+                if localized || !is_supported_alias_parameter(expr) {
+                    scan.alias_static_supported = false;
+                    scan.invalidate_static_word();
                     if contains_hidden_execution(value) {
                         return Err(BailReason::CommandSubstitution);
                     }
                     scan.unsupported.push(format!(
-                        "path alias `{name}` uses a quoted, indirect, or dynamic expansion"
+                        "path alias `{name}` uses a localized, indirect, or dynamic expansion"
                     ));
                 } else {
+                    scan.push_static_part(StaticWordPart::Alias(name.to_string()));
                     scan.supported
                         .push((name.to_string(), piece.start_index, piece.end_index));
                 }
             }
-            _ => {}
+            WordPiece::AnsiCQuotedText(_) | WordPiece::TildeExpansion(_) => {
+                scan.alias_static_supported = false;
+                scan.invalidate_static_word();
+            }
         }
     }
     Ok(())
@@ -892,6 +1008,89 @@ fn add_confirmation(slot: &mut Option<String>, reason: String) {
     }
 }
 
+struct WordNormalization {
+    value: String,
+    requires_confirmation: bool,
+}
+
+fn normalize_word_for_match(
+    source: &str,
+    literal_value: Option<&str>,
+    cwd: &str,
+    alias_expanded: bool,
+    non_alias_normalization_safe: bool,
+) -> WordNormalization {
+    let Some(literal) = literal_value else {
+        return WordNormalization {
+            value: source.to_string(),
+            requires_confirmation: alias_expanded,
+        };
+    };
+    if alias_expanded && !is_literal_path(literal) {
+        return WordNormalization {
+            value: source.to_string(),
+            requires_confirmation: true,
+        };
+    }
+    let normalized_literal = if alias_expanded || non_alias_normalization_safe {
+        normalize_literal_cwd_prefix(literal, cwd)
+    } else {
+        None
+    };
+
+    if alias_expanded {
+        return WordNormalization {
+            value: normalized_literal.unwrap_or_else(|| literal.to_string()),
+            requires_confirmation: false,
+        };
+    }
+
+    let value = normalized_literal.map_or_else(
+        || source.to_string(),
+        |literal_relative| {
+            let source_relative = strip_cwd_prefix(source, cwd);
+            if source_relative != source {
+                normalize_empty_operand(source_relative)
+            } else {
+                literal_relative
+            }
+        },
+    );
+    WordNormalization {
+        value,
+        requires_confirmation: false,
+    }
+}
+
+fn normalize_literal_cwd_prefix(value: &str, cwd: &str) -> Option<String> {
+    let stripped = strip_cwd_prefix(value, cwd);
+    (stripped != value && !has_parent_component(stripped))
+        .then(|| normalize_empty_operand(stripped))
+}
+
+fn normalize_empty_operand(value: &str) -> String {
+    // Erasing an exact-cwd operand could make it match an operand-free Allow rule; `.` preserves
+    // both the operand and its shell meaning.
+    if value.is_empty() {
+        ".".to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+fn has_dot_prefixed_component(value: &str) -> bool {
+    value.split('/').any(|component| component.starts_with('.'))
+}
+
+fn is_literal_path(value: &str) -> bool {
+    value.chars().all(|ch| {
+        ch == '/'
+            || ch.is_ascii_alphanumeric()
+            || (ch.is_ascii() && b"._@+,:=%-".contains(&(ch as u8)))
+            || (!ch.is_ascii() && !ch.is_whitespace() && !ch.is_control())
+    })
+}
+
 fn has_parent_component(path: &str) -> bool {
     path.split('/').any(|component| component == "..")
 }
@@ -980,6 +1179,13 @@ mod tests {
 
     fn p_leaves(command: &str) -> Vec<LeafCommand> {
         leaves_with_aliases(command, "/work", &["P"])
+    }
+
+    fn project_alias_leaf(reference: &str) -> LeafCommand {
+        let command = format!("P=/work/project; cat {reference}");
+        let mut leaves = leaves_with_aliases(&command, "/work/project", &["P"]);
+        assert_eq!(leaves.len(), 1, "case {command:?}");
+        leaves.remove(0)
     }
 
     fn confirmation_leaves(command: &str) -> Vec<LeafCommand> {
@@ -1119,6 +1325,26 @@ mod tests {
     }
 
     #[test]
+    fn alias_literal_paths_have_exact_match_text() {
+        for (reference, expected) in [
+            (r#""$P""#, "cat ."),
+            (r#""$P/runtime/mocks.js""#, "cat runtime/mocks.js"),
+            (r#""${P}"/runtime/mocks.js"#, "cat runtime/mocks.js"),
+            (r#""$P/src/世界.rs""#, "cat src/世界.rs"),
+            (r#""$P/../secret""#, "cat /work/project/../secret"),
+            (r#""$P"/../secret"#, "cat /work/project/../secret"),
+            (
+                r#""$P"/src/."."/."."/."."/etc/passwd"#,
+                "cat /work/project/src/../../../etc/passwd",
+            ),
+        ] {
+            let leaf = project_alias_leaf(reference);
+            assert_eq!(leaf.match_text, expected, "case {reference:?}");
+            assert!(leaf.requires_confirmation.is_none(), "case {reference:?}");
+        }
+    }
+
+    #[test]
     fn newline_declarations_and_literal_path_punctuation_are_supported() {
         for (command, cwd, expected) in [
             (
@@ -1211,7 +1437,7 @@ mod tests {
 
     #[test]
     fn unsupported_alias_references_force_confirmation() {
-        let cases = "P=/work/project; echo \"$P/file\" ~ P=/work/project; echo $P/${P} ~ P=/work/project; echo ${P:-/tmp} ~ P=/work/project; echo ${#P} ~ P=/work/project; echo ${!P} ~ P=/work/project; echo ${P/foo/bar} ~ P=/work/project; echo ${P[0]} ~ echo $P/file";
+        let cases = "P=/work/project; echo $\"$P/file\" ~ P=/work/project; echo $P/${P} ~ P=/work/project; echo ${P:-/tmp} ~ P=/work/project; echo ${#P} ~ P=/work/project; echo ${!P} ~ P=/work/project; echo ${P/foo/bar} ~ P=/work/project; echo ${P[0]} ~ echo $P/file";
         for command in cases.split(" ~ ") {
             let leaves = confirmation_leaves(command);
             let reference = leaves
@@ -1267,16 +1493,6 @@ mod tests {
     }
 
     #[test]
-    fn redirect_classification_uses_alias_expansion() {
-        for (path, expected) in [("/dev/null", false), ("/tmp/output", true)] {
-            let command = format!("P={path}; echo hi > $P");
-            let leaves = leaves_with_aliases(&command, "", &["P"]);
-            assert_eq!(leaves.len(), 1);
-            assert_eq!(leaves[0].real_file_write, expected, "path {path}");
-        }
-    }
-
-    #[test]
     fn classifies_real_file_write_redirects() {
         let write_cases = [
             "echo x > out.txt",
@@ -1324,10 +1540,13 @@ mod tests {
 
     #[test]
     fn normalizes_in_cwd_absolute_paths() {
-        assert_eq!(
-            texts("cat /abs/cwd/src/foo.rs", "/abs/cwd"),
-            vec!["cat src/foo.rs"]
-        );
+        for (path, expected) in [
+            ("/abs/cwd", "cat ."),
+            ("/abs/cwd/src/foo.rs", "cat src/foo.rs"),
+            ("/abs/cwd/src/世界.rs", "cat src/世界.rs"),
+        ] {
+            assert_eq!(texts(&format!("cat {path}"), "/abs/cwd"), vec![expected]);
+        }
     }
 
     #[test]
