@@ -173,7 +173,10 @@ test in a separate process, making this safe and preventing tests from clobberin
   alongside `isCompactSummary`, hence `Option`) (all added in Claude Code 2.1.214+), a `userFeedback` field on user
   turns (`UserLogLine`, an optional free-form `String` carrying the instruction that accompanied a rejected tool call),
   and an `isAbortedMidStream` field on assistant turns (`AssistantLogLine`, an optional `bool` marking a response
-  stopped before streaming completed; partial responses remain billable) (both added in Claude Code 2.1.219+)
+  stopped before streaming completed; partial responses remain billable), and a `preCheckpoint` field on
+  `file-history-snapshot` records' inner snapshot (`FileHistorySnapshotSnapshot`, an optional `bool` marking a snapshot
+  taken ahead of a checkpoint rather than as part of ordinary file tracking; nullable because ordinary snapshots omit
+  it) (all added in Claude Code 2.1.219+)
 - Also owns the structured view of the raw `model` string via `model::Model { family, version }` plus `ModelFamily` and
   `ModelVersion`. Both `cost_analyzer` (for pricing) and `moriarty::api_pricing` (for grouping/display) consume this one
   parser so family/version classification is not duplicated across crates. The parser preserves capability-decorated raw

@@ -861,6 +861,32 @@ fn test_parse_file_history_snapshot_with_update() {
     }
 }
 
+// Checkpoint snapshots (Claude Code 2.1.219+) carry `preCheckpoint`; ordinary ones omit it.
+#[test]
+fn test_parse_file_history_snapshot_with_pre_checkpoint() {
+    let json = serde_json::json!({
+        "type": "file-history-snapshot",
+        "messageId": "550e8400-e29b-41d4-a716-446655440010",
+        "snapshot": {
+            "messageId": "550e8400-e29b-41d4-a716-446655440010",
+            "trackedFileBackups": {},
+            "timestamp": "2025-01-01T00:00:00Z",
+            "preCheckpoint": true
+        },
+        "isSnapshotUpdate": false
+    });
+
+    let line: LogLine = serde_json::from_value(json)
+        .expect("Failed to parse file-history-snapshot with preCheckpoint");
+
+    match line {
+        LogLine::FileHistorySnapshot(snapshot) => {
+            assert_eq!(snapshot.snapshot.pre_checkpoint, Some(true));
+        }
+        _ => panic!("Expected FileHistorySnapshot variant"),
+    }
+}
+
 #[test]
 fn test_parse_file_history_snapshot_inner_rejects_unknown_fields() {
     let json = serde_json::json!({

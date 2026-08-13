@@ -1371,6 +1371,10 @@ pub struct FileHistorySnapshotSnapshot {
     pub message_id: Uuid,
     pub tracked_file_backups: HashMap<String, serde_json::Value>,
     pub timestamp: DateTime<Utc>,
+    /// Marks a snapshot taken before a checkpoint rather than as part of ordinary file tracking.
+    /// Optional because Claude Code only emits it on checkpoint snapshots.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pre_checkpoint: Option<bool>,
 }
 
 /// Task execution state tracked in Claude Code's todo system. These states enable Claude Code
