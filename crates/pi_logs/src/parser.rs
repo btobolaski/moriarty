@@ -389,6 +389,12 @@ pub enum CustomMessagePayload {
     /// payload; the resume instruction lives in the outer `content` field.
     #[serde(rename = "subagent-compaction-resume")]
     SubagentCompactionResume,
+    /// Framing instruction injected by the plannotator extension at the
+    /// start of a planning phase. The structured `details` carry only the
+    /// phase; the full framing text, including the applicable rules, lives
+    /// in the outer `content` field.
+    #[serde(rename = "plannotator-framing")]
+    PlannotatorFraming(PlannotatorFramingDetails),
 }
 
 // ---------------------------------------------------------------------------
@@ -2255,6 +2261,9 @@ pub struct SubagentWaitCompletion {
     /// vocabulary (observed: `complete`) is undocumented and volatile.
     pub state: String,
     pub success: bool,
+    /// Defaults empty because newer pi versions omit `results` from a
+    /// completion entry when the run had no child results to summarise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub results: Vec<SubagentWaitCompletionResult>,
     /// A wait result can arrive before the runtime writes its output archive,
     /// so no archive path is guaranteed even after the run completes.
@@ -2290,6 +2299,9 @@ pub struct SubagentWaitCompletionResult {
     /// `output_state` says `present`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_paths: Option<SubagentWaitArtifactPaths>,
+    /// Error message for a failed child run; absent on success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// Wait completions record either the saved output path alone or the full
@@ -3928,6 +3940,20 @@ pub struct PlannotatorData {
     /// Defaults empty because older records predate phase-specific tool tracking.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub phase_added_tools: Vec<String>,
+    /// True once the `plannotator-framing` custom message has been delivered
+    /// for the current phase. Defaults false because older records predate
+    /// framing delivery.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub framing_delivered: bool,
+}
+
+/// Structured payload of a `plannotator-framing` custom message. Carries
+/// only the phase; the full framing text (rules, instructions) lives in
+/// the custom message's outer `content` field.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PlannotatorFramingDetails {
+    pub phase: PlannotatorPhase,
 }
 
 /// Plannotator originally serialised `savedState` as an opaque marker

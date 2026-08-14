@@ -447,6 +447,19 @@ fn parse_tool_result_message(value: Value) -> ToolResultMessage {
     *tool_result
 }
 
+fn parse_subagent_wait_completions(completions: Value) -> Vec<SubagentWaitCompletion> {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "subagent_wait",
+        vec![json!({"type": "text", "text": "done"})],
+        false,
+        Some(json!({"mode": "management", "results": [], "completions": completions})),
+    ));
+    let Some(ToolResultDetails::Subagent(details)) = tool_result.details else {
+        panic!("expected Subagent details")
+    };
+    details.completions.expect("expected completions")
+}
+
 // Keep this overlapping Ls/Find details shape shared so the augmentation
 // and dispatch tests cannot drift away from the same serde case.
 fn parse_ls_lean_ctx_fixture(truncated: bool, compression: Value) -> ToolResultMessage {
@@ -3505,7 +3518,10 @@ fn custom_plannotator() {
 #[test]
 fn custom_plannotator_defaults_phase_added_tools_when_omitted() {
     match parse_custom_payload("plannotator", json!({"phase": "idle"})) {
-        CustomPayload::Plannotator(details) => assert!(details.phase_added_tools.is_empty()),
+        CustomPayload::Plannotator(details) => {
+            assert!(details.phase_added_tools.is_empty());
+            assert!(!details.framing_delivered);
+        }
         other => panic!("expected Plannotator, got {other:?}"),
     }
 }
@@ -8740,4 +8756,85 @@ fn intercom_result_accepts_pending_items() {
     assert_eq!(pending[1].reason, "ask");
     assert_eq!(pending[1].child_index, None);
     assert_eq!(pending[1].expects_reply, None);
+}
+
+#[test]
+fn custom_message_plannotator_framing() {
+    match parse_custom_message_payload(
+        "Planning phase framing",
+        "plannotator-framing",
+        Some(json!({"phase": "planning"})),
+    ) {
+        CustomMessagePayload::PlannotatorFraming(details) => {
+            assert_eq!(details.phase, PlannotatorPhase::Planning);
+        }
+        other => panic!("expected PlannotatorFraming, got {other:?}"),
+    }
+}
+
+#[test]
+fn subagent_wait_tool_result_accepts_completion_without_results() {
+    let completions = parse_subagent_wait_completions(json!([{
+        "runId": "run-1",
+        "agent": "workflow",
+        "mode": "workflow",
+        "state": "failed",
+        "success": false,
+        "archivePath": "/tmp/archive.json"
+    }]));
+    let [completion] = completions.as_slice() else {
+        panic!("expected exactly one completion")
+    };
+    assert!(
+        completion.results.is_empty(),
+        "omitted results must default to empty"
+    );
+}
+
+#[test]
+fn subagent_wait_tool_result_accepts_error_on_completion_result() {
+    let completions = parse_subagent_wait_completions(json!([{
+        "runId": "run-1",
+        "agent": "crate-researcher",
+        "mode": "single",
+        "state": "failed",
+        "success": false,
+        "results": [{
+            "agent": "crate-researcher",
+            "success": false,
+            "outputState": "absent",
+            "error": "No API key found for anthropic.",
+            "model": "anthropic/claude-sonnet-4-6:medium"
+        }],
+        "archivePath": "/tmp/archive.json"
+    }]));
+    let [completion] = completions.as_slice() else {
+        panic!("expected exactly one completion")
+    };
+    let [child] = completion.results.as_slice() else {
+        panic!("expected one child result")
+    };
+    assert!(!child.success);
+    assert_eq!(child.output_state, "absent");
+    assert_eq!(
+        child.error.as_deref(),
+        Some("No API key found for anthropic.")
+    );
+    assert_eq!(
+        child.model.as_deref(),
+        Some("anthropic/claude-sonnet-4-6:medium")
+    );
+}
+
+#[test]
+fn custom_plannotator_accepts_framing_delivered() {
+    match parse_custom_payload(
+        "plannotator",
+        json!({"phase": "idle", "framingDelivered": true}),
+    ) {
+        CustomPayload::Plannotator(details) => {
+            assert!(details.framing_delivered);
+        }
+        other => panic!("expected Plannotator, got {other:?}"),
+    }
 }
