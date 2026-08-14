@@ -16,7 +16,7 @@ use std::{
 #[cfg(test)]
 use std::fs;
 
-use miette::{IntoDiagnostic, Result, WrapErr};
+use miette::{IntoDiagnostic, WrapErr};
 use tracing::{debug, info};
 
 /// Detects the repository root directory for the given path.
@@ -38,7 +38,7 @@ use tracing::{debug, info};
 /// // In a git repo: /workspace
 /// // Not in repo: /workspace/src/project (canonicalized)
 /// ```
-pub fn detect_repository_root(path: &Path) -> Result<PathBuf> {
+pub fn detect_repository_root(path: &Path) -> miette::Result<PathBuf> {
     info!(path = %path.display(), "Detecting repository root");
 
     if let Some(jj_root) = try_jj_workspace_root(path) {
@@ -82,7 +82,7 @@ pub fn detect_repository_root(path: &Path) -> Result<PathBuf> {
 ///
 /// The input is canonicalized before the jj walk so the returned root is
 /// canonical too (the walk returns an ancestor of its starting path verbatim).
-pub fn detect_workspace_root(path: &Path) -> Result<PathBuf> {
+pub fn detect_workspace_root(path: &Path) -> miette::Result<PathBuf> {
     info!(path = %path.display(), "Detecting workspace root");
 
     let canonical = path
@@ -345,7 +345,7 @@ mod tests {
     use crate::test_helpers::{run_git_command, setup_git_repo_with_commit};
 
     #[test]
-    fn test_detect_non_repository() -> Result<()> {
+    fn test_detect_non_repository() -> miette::Result<()> {
         // Use a temporary directory that's definitely not in a repo
         let temp_dir = env::temp_dir();
         let root = detect_repository_root(&temp_dir)?;
@@ -356,7 +356,7 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_git_repository() -> Result<()> {
+    fn test_detect_git_repository() -> miette::Result<()> {
         // Test with current directory (which should be in git or jj)
         let current_dir = env::current_dir().into_diagnostic()?;
         let root = detect_repository_root(&current_dir)?;
@@ -607,7 +607,7 @@ mod tests {
     }
 
     #[test]
-    fn test_workspace_root_not_in_repository() -> Result<()> {
+    fn test_workspace_root_not_in_repository() -> miette::Result<()> {
         let temp_dir = env::temp_dir();
         let root = detect_workspace_root(&temp_dir)?;
         assert_eq!(root, temp_dir.canonicalize().into_diagnostic()?);

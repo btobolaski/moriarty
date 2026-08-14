@@ -17,7 +17,6 @@ use std::{
 };
 
 use futures::stream::StreamExt;
-use miette::Result;
 use tracing::{error, info};
 
 use crate::{
@@ -107,7 +106,7 @@ pub(crate) enum CheckRunOutcome {
 /// `Err` is reserved for unexpected failures the caller should surface as an error (e.g. the
 /// approvals store failing to load). Every check-level decision is encoded in [`CheckRunOutcome`]
 /// instead, so both callers share one control flow.
-pub(crate) async fn run_configured_checks(project_dir: &Path) -> Result<CheckRunOutcome> {
+pub(crate) async fn run_configured_checks(project_dir: &Path) -> miette::Result<CheckRunOutcome> {
     let repository_root = match detect_repository_root(project_dir) {
         Ok(root) => {
             info!(

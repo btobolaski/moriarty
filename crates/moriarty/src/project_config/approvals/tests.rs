@@ -10,7 +10,7 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-use miette::{IntoDiagnostic, Result, WrapErr};
+use miette::{IntoDiagnostic, WrapErr};
 use tempfile::{NamedTempFile, TempDir};
 use tokio::time::{Duration, sleep};
 
@@ -232,7 +232,10 @@ fn isolated_project_with_config(config_content: &str) -> (TempDir, TempDir) {
 /// - Binary resolution fails (binary not found)
 /// - File hashing fails (I/O error)
 /// - Approval update fails (filesystem error)
-pub async fn approve_project_config(project_dir: &Path, config_content: &str) -> Result<PathBuf> {
+pub async fn approve_project_config(
+    project_dir: &Path,
+    config_content: &str,
+) -> miette::Result<PathBuf> {
     let canonical = project_dir
         .canonicalize()
         .into_diagnostic()
@@ -271,7 +274,10 @@ pub async fn approve_project_config(project_dir: &Path, config_content: &str) ->
 /// Resolves `command[0]` against `workspace_root`, hashes the binary, and builds a
 /// `CommandApproval` binding the full argv with storage-normalized paths — the same shape the
 /// TUI save path records.
-async fn build_approval(command: &[String], workspace_root: &Path) -> Result<CommandApproval> {
+async fn build_approval(
+    command: &[String],
+    workspace_root: &Path,
+) -> miette::Result<CommandApproval> {
     let (original_path, canonical_path) =
         resolve_binary_path_with_original(&command[0], workspace_root)?;
     let binary_hash = hashing::hash_file(&canonical_path).await?;

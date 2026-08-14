@@ -6,11 +6,12 @@
 //!
 //! Event handlers are async to support atomic file I/O with locking during final approval.
 
+use std::path::{Path, PathBuf};
+
 use crossterm::event::{KeyCode, KeyEvent};
 use futures::StreamExt;
-use miette::{Context, IntoDiagnostic, Result};
+use miette::{Context, IntoDiagnostic};
 use ratatui::DefaultTerminal;
-use std::path::{Path, PathBuf};
 use tokio::fs::read_to_string;
 use tui_scrollview::ScrollViewState;
 
@@ -45,7 +46,7 @@ pub struct ApprovalApp {
 }
 
 impl ApprovalApp {
-    fn render_frame(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
+    fn render_frame(&mut self, terminal: &mut DefaultTerminal) -> miette::Result<()> {
         terminal
             .draw(|frame| {
                 renderer::render(
@@ -67,7 +68,7 @@ impl ApprovalApp {
         name: String,
         command_array: Vec<String>,
         workspace_root: &Path,
-    ) -> Result<CommandInfo> {
+    ) -> miette::Result<CommandInfo> {
         let binary_name = &command_array[0];
         let (original_path, canonical_path) =
             resolve_binary_path_with_original(binary_name, workspace_root)?;
@@ -103,7 +104,7 @@ impl ApprovalApp {
     async fn load_items_info(
         items: Vec<(String, Vec<String>)>,
         workspace_root: &Path,
-    ) -> Result<Vec<CommandInfo>> {
+    ) -> miette::Result<Vec<CommandInfo>> {
         let mut infos = Vec::new();
         for (name, command_array) in items {
             infos.push(Self::load_command_info(name, command_array, workspace_root).await?);
@@ -117,7 +118,7 @@ impl ApprovalApp {
     /// binaries against it, so approving from a nested subdirectory approves the workspace-root
     /// config (previously it read the nested dir's own `.config/tools.toml` or failed). Display
     /// keeps absolute paths; only the stored form is normalized.
-    pub async fn new(project_dir: PathBuf) -> Result<Self> {
+    pub async fn new(project_dir: PathBuf) -> miette::Result<Self> {
         let canonical_dir = project_dir
             .canonicalize()
             .into_diagnostic()
@@ -177,7 +178,7 @@ impl ApprovalApp {
     }
 
     /// Run the approval app
-    pub async fn run(mut self, mut terminal: DefaultTerminal) -> Result<bool> {
+    pub async fn run(mut self, mut terminal: DefaultTerminal) -> miette::Result<bool> {
         let mut event_stream = input_stream();
 
         // Initial render
@@ -197,7 +198,7 @@ impl ApprovalApp {
         Ok(self.state.screen == Screen::Approved)
     }
 
-    async fn handle_event(&mut self, event: Event) -> Result<()> {
+    async fn handle_event(&mut self, event: Event) -> miette::Result<()> {
         match event {
             Event::UI(ui_event) => match ui_event {
                 UIEvent::Key(key) => self.handle_key(key).await,
@@ -372,7 +373,7 @@ impl ApprovalApp {
         }
     }
 
-    async fn save_approvals(&self) -> Result<()> {
+    async fn save_approvals(&self) -> miette::Result<()> {
         // Verify all commands and checks are approved before saving
         let unapproved: Vec<&str> = self
             .state

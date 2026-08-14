@@ -13,7 +13,7 @@ fn test_compile_with_diagnostics_reports_dropped_rules_and_keeps_good_ones() {
 
     // The valid rule still compiled and is enforced.
     assert!(matches!(
-        engine.apply_rules("ls -la", None),
+        command_result(&engine, "ls -la", None),
         RuleResult::Allowed { .. }
     ));
 

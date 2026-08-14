@@ -36,7 +36,7 @@ use std::{
 };
 
 use futures::stream::{self, StreamExt};
-use miette::{Context, IntoDiagnostic, Result};
+use miette::{Context, IntoDiagnostic};
 use tokio::process::Command;
 
 use super::{ItemType, ProjectApprovals, ProjectConfig, VerificationResult, load_project_settings};
@@ -91,7 +91,7 @@ pub struct CommandOutput {
 /// (`detect_repository_root`), shared across worktrees, so identical content needs no re-approval
 /// per worktree. `canonical_dir` (the caller's project directory, canonicalized) is where commands
 /// execute.
-pub async fn verify_and_load_project(project_dir: PathBuf) -> Result<VerifiedProject> {
+pub async fn verify_and_load_project(project_dir: PathBuf) -> miette::Result<VerifiedProject> {
     let canonical_dir = project_dir
         .canonicalize()
         .into_diagnostic()
@@ -128,7 +128,7 @@ fn handle_verification_result(
     result: VerificationResult,
     item_type: ItemType,
     workspace_root: &Path,
-) -> Result<PathBuf> {
+) -> miette::Result<PathBuf> {
     match result {
         VerificationResult::Approved { program } => Ok(program),
         VerificationResult::NotApproved => Err(miette::miette!(
@@ -185,7 +185,7 @@ async fn verify_all_commands(
     repository_root: &Path,
     workspace_root: &Path,
     settings: &ProjectConfig,
-) -> Result<(HashMap<String, PathBuf>, HashMap<String, PathBuf>)> {
+) -> miette::Result<(HashMap<String, PathBuf>, HashMap<String, PathBuf>)> {
     let all_commands = settings.commands.all();
     let mut resolved_commands = HashMap::with_capacity(all_commands.len());
     for (command_name, _) in &all_commands {
@@ -216,7 +216,7 @@ async fn verify_all_commands(
 }
 
 impl VerifiedProject {
-    pub async fn run_command(&self, command_name: &str) -> Result<CommandOutput> {
+    pub async fn run_command(&self, command_name: &str) -> miette::Result<CommandOutput> {
         let maybe_command = match command_name {
             "lint" => &self.settings.commands.lint,
             "test" => &self.settings.commands.test,
@@ -253,7 +253,10 @@ impl VerifiedProject {
     /// caller mutated `settings` after construction; erroring beats spawning an unverified
     /// program. Takes the map rather than `&self` because the caller names which of the two
     /// resolved maps applies.
-    fn resolved_program(resolved: &HashMap<String, PathBuf>, name: &str) -> Result<PathBuf> {
+    fn resolved_program(
+        resolved: &HashMap<String, PathBuf>,
+        name: &str,
+    ) -> miette::Result<PathBuf> {
         resolved.get(name).cloned().ok_or_else(|| {
             miette::miette!(
                 "No verified program recorded for '{}'; refusing to execute",
@@ -266,7 +269,7 @@ impl VerifiedProject {
     ///
     /// Commands that exit with non-zero status are captured in the output,
     /// not treated as errors. Only execution failures (binary not found, etc) error out.
-    pub async fn run_all_commands(&self) -> Result<Vec<CommandOutput>> {
+    pub async fn run_all_commands(&self) -> miette::Result<Vec<CommandOutput>> {
         let all_commands = self.settings.commands.all();
 
         if all_commands.is_empty() {
@@ -279,7 +282,7 @@ impl VerifiedProject {
                 let program = Self::resolved_program(&self.resolved_commands, &name)?;
                 Ok((name, command, program))
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<miette::Result<Vec<_>>>()?;
 
         // Sort to match Commands::all() order (lint→test→build→format).
         // This provides consistent output ordering despite parallel execution,
@@ -299,7 +302,7 @@ impl VerifiedProject {
     ///
     /// Checks that exit with non-zero status are captured in the output,
     /// not treated as errors. Only execution failures (binary not found, etc) error out.
-    pub async fn run_all_checks(&self) -> Result<Vec<CommandOutput>> {
+    pub async fn run_all_checks(&self) -> miette::Result<Vec<CommandOutput>> {
         let checks = match &self.settings.checks {
             Some(checks) => checks,
             None => return Ok(Vec::new()),
@@ -315,7 +318,7 @@ impl VerifiedProject {
                 let program = Self::resolved_program(&self.resolved_checks, &check.name)?;
                 Ok((check.name.clone(), check.command.clone(), program))
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<miette::Result<Vec<_>>>()?;
 
         // Sort alphabetically by check name for consistent output
         let sort_fn = |output: &CommandOutput| output.name.clone();
@@ -330,7 +333,7 @@ impl VerifiedProject {
         items: Vec<(String, Vec<String>, PathBuf)>,
         item_type: &str,
         sort_fn: impl Fn(&CommandOutput) -> K,
-    ) -> Result<Vec<CommandOutput>>
+    ) -> miette::Result<Vec<CommandOutput>>
     where
         K: Ord,
     {
@@ -368,7 +371,7 @@ impl VerifiedProject {
         name: &str,
         command: &[String],
         program: &Path,
-    ) -> Result<CommandOutput> {
+    ) -> miette::Result<CommandOutput> {
         Self::execute_command_static(&self.canonical_dir, name, command, program).await
     }
 
@@ -389,7 +392,7 @@ impl VerifiedProject {
         name: &str,
         command: &[String],
         program: &Path,
-    ) -> Result<CommandOutput> {
+    ) -> miette::Result<CommandOutput> {
         let (_, args) = command
             .split_first()
             .expect("invariant: verify_all_commands ensures non-empty before execution");

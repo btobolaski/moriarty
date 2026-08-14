@@ -14,7 +14,7 @@ use std::{
     path::Path,
 };
 
-use miette::{Context, IntoDiagnostic, Result};
+use miette::{Context, IntoDiagnostic};
 use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::Value;
 
@@ -52,9 +52,10 @@ impl Borrow<str> for BashPathAlias {
 }
 
 impl BashPathAlias {
-    pub(crate) fn validate(value: String) -> std::result::Result<Self, String> {
+    pub(crate) fn validate(value: String) -> Result<Self, String> {
         const SHELL_CONTROL_NAMES: &[&str] = &[
             "PATH",
+            "HOME",
             "IFS",
             "CDPATH",
             "GLOBIGNORE",
@@ -88,7 +89,7 @@ impl BashPathAlias {
 }
 
 impl<'de> Deserialize<'de> for BashPathAlias {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
@@ -152,16 +153,18 @@ impl UserConfig {
     }
 }
 
-/// Rules evaluated in order with first-match-wins semantics.
+/// Command actions and `AllowRedirect` actions use separate declaration-ordered domains, so a
+/// match in one cannot shadow or authorize the other.
 ///
 /// # Compound commands
 ///
 /// The hook splits each Bash command into leaf simple-commands and matches `pattern` against each
 /// leaf independently (see `hooks::command_split`), so a pattern only needs to describe one command
 /// — not a whole `a && b | c` pipeline. Operators are split off, command substitution/subshells bail
-/// to a prompt, and writes to real files are capped at Ask, so allow-rules can be simple prefixes
-/// (`^ls`) without spelling out pipes or shell-metacharacter exclusions. A pattern still guards a
-/// program's *own* dangerous flags (e.g. `find -exec`, `sed -i`), which are invisible to the splitter.
+/// to a prompt, and output endpoints require separate redirect rules, so allow-rules can be simple
+/// prefixes (`^ls`) without spelling out pipes or shell-metacharacter exclusions. A pattern still
+/// guards a program's *own* dangerous flags (e.g. `find -exec`, `sed -i`), which are invisible to
+/// the splitter.
 ///
 /// # Security: Shell Injection Risk
 ///
@@ -175,10 +178,11 @@ pub struct BashRule {
     /// mode; an empty set intentionally disables the rule.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modes: Option<BTreeSet<PermissionMode>>,
+    #[serde(deserialize_with = "deserialize_bash_rule_action")]
     pub action: BashRuleAction,
 }
 
-/// Action to take when a Bash rule matches a command.
+/// Action to take when a Bash rule matches its command or redirect-endpoint domain.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "type")]
 pub enum BashRuleAction {
@@ -188,6 +192,16 @@ pub enum BashRuleAction {
     Modify { value: String },
     /// Explicitly allow the command to execute.
     Allow,
+    /// Authorize a matched output-redirect endpoint without granting command execution.
+    ///
+    /// When `allow_local` is true, the resolved ordinary path must remain within the canonical hook
+    /// cwd; devices, special files, and descriptors require an unrestricted target rule.
+    /// Redirect rules form a separate rule domain and never participate in command first-match
+    /// selection.
+    AllowRedirect {
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        allow_local: bool,
+    },
     /// Defer to the user when a command requires explicit authorization but shouldn't be auto-approved.
     /// Use this for potentially dangerous operations that need case-by-case evaluation.
     Ask,
@@ -222,6 +236,33 @@ pub enum BashRuleAction {
         #[serde(skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AllowRedirectFields {
+    #[serde(default)]
+    allow_local: bool,
+}
+
+/// Action tables historically tolerated extra metadata, so existing variants retain that config
+/// compatibility. AllowRedirect stays strict because misspelling `allow_local` widens path scope.
+fn deserialize_bash_rule_action<'de, D>(deserializer: D) -> Result<BashRuleAction, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let mut value = Value::deserialize(deserializer)?;
+    if let Value::Object(fields) = &mut value
+        && fields.get("type").and_then(Value::as_str) == Some("AllowRedirect")
+    {
+        fields.remove("type");
+        let fields =
+            serde_json::from_value::<AllowRedirectFields>(value).map_err(de::Error::custom)?;
+        return Ok(BashRuleAction::AllowRedirect {
+            allow_local: fields.allow_local,
+        });
+    }
+    serde_json::from_value(value).map_err(de::Error::custom)
 }
 
 /// Conditions target literal top-level input keys and are conjoined; ordered rules remain the
@@ -316,7 +357,7 @@ pub enum ToolRuleAction {
 /// # Ok(())
 /// # }
 /// ```
-pub async fn load_user_config() -> Result<UserConfig> {
+pub async fn load_user_config() -> miette::Result<UserConfig> {
     let result = FileType::Config.load::<UserConfig>("tool_rules.toml").await;
 
     match result {
@@ -335,7 +376,7 @@ pub async fn load_user_config() -> Result<UserConfig> {
 ///
 /// Unlike [`load_user_config`], an explicit path that is missing or malformed is a hard error: the
 /// user named the file, so silently falling back to defaults would mask a typo.
-pub async fn load_user_config_from(path: Option<&Path>) -> Result<UserConfig> {
+pub async fn load_user_config_from(path: Option<&Path>) -> miette::Result<UserConfig> {
     let Some(path) = path else {
         return load_user_config().await;
     };
@@ -387,12 +428,46 @@ mod tests {
     }
 
     #[test]
+    fn existing_bash_actions_tolerate_unknown_fields() {
+        let config = r#"
+            [[bash_rules]]
+            name = "compatible"
+            pattern = ".*"
+            action = { type = "Allow", note = "read only" }
+        "#;
+
+        let config = toml::from_str::<UserConfig>(config).unwrap();
+        assert_eq!(config.bash_rules.unwrap()[0].action, BashRuleAction::Allow);
+    }
+
+    #[test]
+    fn allow_redirect_rejects_invalid_shapes() {
+        let config = r#"
+            [[bash_rules]]
+            name = "typo"
+            pattern = ".*"
+            action = { type = "AllowRedirect", allow_locl = true }
+        "#;
+
+        let error = toml::from_str::<UserConfig>(config)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("allow_locl"), "error: {error}");
+
+        let scalar = config.replace(
+            "{ type = \"AllowRedirect\", allow_locl = true }",
+            "\"AllowRedirect\"",
+        );
+        assert!(toml::from_str::<UserConfig>(&scalar).is_err());
+    }
+
+    #[test]
     fn unsafe_bash_path_alias_names_are_rejected() {
         let malformed = ["", "1P", "P-X", "P X", "Å"]
             .into_iter()
             .map(|alias| (alias, "shell identifier"));
         let shell_control =
-            "PATH IFS CDPATH GLOBIGNORE BASH_ENV ENV SHELLOPTS BASHOPTS FPATH PS4 PROMPT_COMMAND"
+            "PATH HOME IFS CDPATH GLOBIGNORE BASH_ENV ENV SHELLOPTS BASHOPTS FPATH PS4 PROMPT_COMMAND"
                 .split_whitespace()
                 .map(|alias| (alias, "shell-control"));
 
@@ -501,6 +576,23 @@ action = { type = "Allow" }
     }
 
     #[test]
+    fn redirect_actions_change_the_legacy_allow_hash() {
+        let legacy = sample_config(Some(vec![allow("ls", "^ls")]), None);
+        let redirect = |allow_local| {
+            let mut config = legacy.clone();
+            config.bash_rules.as_mut().unwrap()[0].action =
+                BashRuleAction::AllowRedirect { allow_local };
+            config
+        };
+        let unrestricted = redirect(false);
+        let local = redirect(true);
+
+        assert_ne!(unrestricted.effective_hash(), legacy.effective_hash());
+        assert_ne!(local.effective_hash(), legacy.effective_hash());
+        assert_ne!(unrestricted.effective_hash(), local.effective_hash());
+    }
+
+    #[test]
     fn adding_a_mode_restriction_changes_the_hash() {
         let unrestricted = sample_config(Some(vec![allow("ls", "^ls")]), None);
         let mut restricted = unrestricted.clone();
@@ -559,6 +651,8 @@ action = { type = "Allow" }
                 value: "$1 --flag".to_string(),
             },
             BashRuleAction::Allow,
+            BashRuleAction::AllowRedirect { allow_local: false },
+            BashRuleAction::AllowRedirect { allow_local: true },
             BashRuleAction::Ask,
         ];
 
@@ -650,6 +744,12 @@ value = "$1 --flag""#;
         let toml_allow = r#"type = "Allow""#;
         let action: BashRuleAction = toml::from_str(toml_allow).unwrap();
         assert_eq!(action, BashRuleAction::Allow);
+
+        let redirect = BashRuleAction::AllowRedirect { allow_local: false };
+        assert_eq!(
+            toml::to_string(&redirect).unwrap(),
+            "type = \"AllowRedirect\"\n"
+        );
 
         // Test Ask action
         let toml_ask = r#"type = "Ask""#;

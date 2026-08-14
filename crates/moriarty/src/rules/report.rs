@@ -4,7 +4,6 @@
 use std::{collections::BTreeMap, path::PathBuf};
 
 // 3rd party crates
-use miette::Result;
 use tabled::Tabled;
 
 // local / workspace deps
@@ -25,7 +24,7 @@ pub(super) async fn run(
     timezone: String,
     directories: bool,
     current_rules: bool,
-) -> Result<()> {
+) -> miette::Result<()> {
     let timezone = parse_timezone(&timezone)?;
     let filter = TimeRangeFilter::new(start_time, end_time, timezone)?;
     let LoadedReport {
@@ -57,7 +56,7 @@ async fn load_report(
     timezone: DateTimezone,
     directories: bool,
     current_rules: bool,
-) -> Result<LoadedReport> {
+) -> miette::Result<LoadedReport> {
     let (hash_filter, active_hash) = super::resolve_hash_filter(!current_rules, None).await?;
     let (value, skipped) = fold_outcomes(
         dir,

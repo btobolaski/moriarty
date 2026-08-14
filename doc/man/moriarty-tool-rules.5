@@ -118,6 +118,10 @@ Symlinks that resolve outside
 .Ic cwd
 are rejected, and broken symlinks are treated as non\-local.
 Hard links are treated as ordinary local filesystem entries and are not distinguished from regular files.
+In the live hook, if locality inspection does not finish within two seconds, every
+.Ic allow_local
+rule is skipped and evaluation falls through to a later rule or no match;
+synchronous analysis runs without this latency deadline.
 .It Ic field
 Optional.
 The name of a field in the tool input to match against.

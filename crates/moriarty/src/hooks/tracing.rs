@@ -8,12 +8,13 @@
 //!
 //! Logs are written in JSON format to XDG_STATE_HOME/moriarty/hooks/hooks.log with daily rotation.
 
-use crate::persistence::FileType;
-use miette::Result;
 #[cfg(test)]
 use std::path::PathBuf;
+
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
+
+use crate::persistence::FileType;
 
 /// Initialize tracing for hooks with file-based JSON logging
 ///
@@ -49,7 +50,7 @@ use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberI
 ///     Ok(())
 /// }
 /// ```
-pub async fn init_tracing() -> Result<WorkerGuard> {
+pub async fn init_tracing() -> miette::Result<WorkerGuard> {
     // Get the log directory by building path to a dummy file and taking its parent
     let log_file_path = FileType::State.build_path("hooks/hooks.log").await?;
     let log_dir = log_file_path
@@ -98,7 +99,7 @@ pub async fn init_tracing() -> Result<WorkerGuard> {
 ///
 /// Returns the path to the active log file (today's log).
 #[cfg(test)]
-pub async fn get_current_log_path() -> Result<PathBuf> {
+pub async fn get_current_log_path() -> miette::Result<PathBuf> {
     FileType::State.build_path("hooks/hooks.log").await
 }
 

@@ -14,7 +14,7 @@ use std::{
 };
 
 // 3rd party crates
-use miette::{IntoDiagnostic, Result, WrapErr};
+use miette::{IntoDiagnostic, WrapErr};
 use regex::Regex;
 use serde::Serialize;
 use tabled::{Table, Tabled};
@@ -25,9 +25,11 @@ use crate::{
     cost_report::TimeRangeFilter,
     hooks::{
         bash_rules::{
-            BashRuleEngine, RuleDiagnostic, RuleResult, default_fragments, expand_fragments,
+            BashRuleEngine, EndpointAnalysis, EndpointFailureStage, EvaluationContext,
+            EvaluationPurpose, FilesystemAnalysis, PolicyAnalysis, PolicyOutcome, RuleDiagnostic,
+            RuleResult, default_fragments, expand_fragments,
         },
-        command_split::{SplitOutcome, split_command},
+        command_split::FilterCommand,
         report::{CwdAggregation, HashSkipStats, ReportRow, RulesHashFilter, aggregate_with_cwd},
         result::PreToolResult,
         tool_rules::ToolRuleEngine,
@@ -57,9 +59,10 @@ pub enum SuggestAction {
     Ask,
     Deny,
     Allow,
+    AllowRedirect,
 }
 
-pub async fn exec_rules(cmd: RulesCommand) -> Result<()> {
+pub async fn exec_rules(cmd: RulesCommand) -> miette::Result<()> {
     match cmd {
         RulesCommand::Lint {
             config,
@@ -171,13 +174,13 @@ impl LintFinding {
 struct LintReport {
     /// Rules the hook silently drops (a rule the user wrote is not in effect).
     errors: Vec<LintFinding>,
-    /// `--strict` advisories: empty-mode, likely-shadowed, and over-broad rules.
+    /// `--strict` advisories: empty-mode, likely-shadowed, over-broad, and incomplete redirect policy.
     warnings: Vec<LintFinding>,
     /// Number of dropped rules; nonzero means the lint fails.
     ignored_count: usize,
 }
 
-async fn lint(config_path: Option<PathBuf>, json: bool, strict: bool) -> Result<()> {
+async fn lint(config_path: Option<PathBuf>, json: bool, strict: bool) -> miette::Result<()> {
     let config = load_user_config_from(config_path.as_deref()).await?;
     let report = build_lint_report(&config, strict)?;
 
@@ -198,7 +201,7 @@ async fn lint(config_path: Option<PathBuf>, json: bool, strict: bool) -> Result<
     Ok(())
 }
 
-fn build_lint_report(config: &UserConfig, strict: bool) -> Result<LintReport> {
+fn build_lint_report(config: &UserConfig, strict: bool) -> miette::Result<LintReport> {
     let fragments = config.pattern_fragments.clone();
     let bash_rules = config.bash_rules.clone().unwrap_or_default();
     let tool_rules = config.tool_rules.clone().unwrap_or_default();
@@ -237,8 +240,7 @@ fn build_lint_report(config: &UserConfig, strict: bool) -> Result<LintReport> {
     })
 }
 
-/// Best-effort `--strict` advisories over the bash rules: over-broad Allow rules and rules an
-/// earlier rule likely shadows. Both are heuristic, so they are warnings, never errors.
+/// Best-effort `--strict` advisories over the bash rules. They are warnings, never errors.
 fn strict_bash_warnings(
     rules: &[BashRule],
     user_fragments: Option<&HashMap<String, String>>,
@@ -246,17 +248,50 @@ fn strict_bash_warnings(
     let mut warnings = Vec::new();
 
     for rule in rules {
-        if matches!(rule.action, BashRuleAction::Allow) && is_over_broad(&rule.pattern) {
-            warnings.push(LintFinding {
-                rule_kind: "bash",
-                rule_name: rule.name.clone(),
-                pattern: rule.pattern.clone(),
-                kind: "over-broad-allow".to_string(),
-                message: "Allow rule matches effectively every command".to_string(),
-            });
+        if !is_over_broad(&rule.pattern) {
+            continue;
         }
+        let (kind, message) = match rule.action {
+            BashRuleAction::Allow => (
+                "over-broad-allow",
+                "Allow rule matches effectively every command",
+            ),
+            BashRuleAction::AllowRedirect { allow_local: false } => (
+                "over-broad-redirect",
+                "Non-local AllowRedirect rule authorizes every resolved filesystem or descriptor endpoint",
+            ),
+            BashRuleAction::AllowRedirect { allow_local: true } => (
+                "broad-local-redirect",
+                "Local AllowRedirect rule authorizes every resolved path within the project cwd",
+            ),
+            _ => continue,
+        };
+        warnings.push(LintFinding {
+            rule_kind: "bash",
+            rule_name: rule.name.clone(),
+            pattern: rule.pattern.clone(),
+            kind: kind.to_string(),
+            message: message.to_string(),
+        });
     }
 
+    for rule in rules.iter().filter(|rule| {
+        matches!(rule.action, BashRuleAction::Allow)
+            && !rule.modes.as_ref().is_some_and(BTreeSet::is_empty)
+            && !rules.iter().any(|redirect| {
+                matches!(redirect.action, BashRuleAction::AllowRedirect { .. })
+                    && mode_restrictions_overlap(rule.modes.as_ref(), redirect.modes.as_ref())
+            })
+    }) {
+        warnings.push(LintFinding {
+            rule_kind: "bash",
+            rule_name: rule.name.clone(),
+            pattern: rule.pattern.clone(),
+            kind: "missing-redirect-policy".to_string(),
+            message: "Command Allow rule has no mode-overlapping redirect policy; its output redirects will prompt"
+                .to_string(),
+        });
+    }
     warnings.extend(shadow_warnings(rules, user_fragments));
     warnings
 }
@@ -321,10 +356,12 @@ fn shadow_warnings(
             compiled[..later_index]
                 .iter()
                 .find(|(earlier_rule, earlier_regex)| {
-                    mode_restrictions_overlap(
-                        earlier_rule.modes.as_ref(),
-                        later_rule.modes.as_ref(),
-                    ) && earlier_regex.is_match(&probe)
+                    bash_rule_can_shadow(earlier_rule, later_rule)
+                        && mode_restrictions_overlap(
+                            earlier_rule.modes.as_ref(),
+                            later_rule.modes.as_ref(),
+                        )
+                        && earlier_regex.is_match(&probe)
                 })
         {
             warnings.push(LintFinding {
@@ -340,6 +377,23 @@ fn shadow_warnings(
         }
     }
     warnings
+}
+
+fn bash_rule_can_shadow(earlier: &BashRule, later: &BashRule) -> bool {
+    match (&earlier.action, &later.action) {
+        (
+            BashRuleAction::AllowRedirect {
+                allow_local: earlier_local,
+            },
+            BashRuleAction::AllowRedirect {
+                allow_local: later_local,
+            },
+        ) => !earlier_local || *later_local,
+        (BashRuleAction::AllowRedirect { .. }, _) | (_, BashRuleAction::AllowRedirect { .. }) => {
+            false
+        }
+        _ => true,
+    }
 }
 
 fn is_over_broad(pattern: &str) -> bool {
@@ -426,7 +480,7 @@ fn fragment_rows(user: Option<&HashMap<String, String>>) -> Vec<FragmentRow> {
         .collect()
 }
 
-async fn list_fragments(config_path: Option<PathBuf>, json: bool) -> Result<()> {
+async fn list_fragments(config_path: Option<PathBuf>, json: bool) -> miette::Result<()> {
     let config = load_user_config_from(config_path.as_deref()).await?;
     let rows = fragment_rows(config.pattern_fragments.as_ref());
 
@@ -473,6 +527,27 @@ pattern = "^ls\\b"
 modes = ["default", "plan"]
 action = { type = "Allow" }
 
+# AllowRedirect rules authorize only output endpoints; they never authorize commands.
+[[bash_rules]]
+name = "allow-project-build-redirects"
+pattern = "^build/"
+action = { type = "AllowRedirect", allow_local = true }
+
+[[bash_rules]]
+name = "allow-tool-cache-redirects"
+pattern = "^~/.cache/tool/"
+action = { type = "AllowRedirect" }
+
+[[bash_rules]]
+name = "allow-dev-null-redirect"
+pattern = "^/dev/null$"
+action = { type = "AllowRedirect" }
+
+[[bash_rules]]
+name = "allow-stdout-descriptor"
+pattern = "^&1$"
+action = { type = "AllowRedirect" }
+
 [[bash_rules]]
 name = "ask-docker"
 pattern = "^docker\\b"
@@ -515,7 +590,7 @@ conditions = [
 action = { type = "Ask" }
 "#;
 
-fn schema(json: bool) -> Result<()> {
+fn schema(json: bool) -> miette::Result<()> {
     if json {
         let config: UserConfig = toml::from_str(SCHEMA_TOML)
             .into_diagnostic()
@@ -533,14 +608,14 @@ fn schema(json: bool) -> Result<()> {
 // ===== rules starter =====
 
 /// Common read-only commands that are safe to auto-allow once compound splitting has separated
-/// them from any operators. Writes via redirection are still capped at Ask by the engine.
+/// them from any operators. Output endpoints still require their own redirect-domain rule.
 const STARTER_COMMANDS: &[&str] = &[
     "echo", "ls", "cat", "head", "tail", "wc", "sort", "uniq", "grep", "rg", "pwd", "which",
     "file", "stat", "basename", "dirname", "true", "date", "env",
 ];
 
 fn starter_rules() -> Vec<BashRule> {
-    STARTER_COMMANDS
+    let mut rules: Vec<_> = STARTER_COMMANDS
         .iter()
         .map(|command| BashRule {
             name: format!("allow-{command}"),
@@ -550,10 +625,23 @@ fn starter_rules() -> Vec<BashRule> {
             modes: None,
             action: BashRuleAction::Allow,
         })
-        .collect()
+        .collect();
+    rules.push(BashRule {
+        name: "allow-dev-null-redirect".to_string(),
+        pattern: r"^/dev/null$".to_string(),
+        modes: None,
+        action: BashRuleAction::AllowRedirect { allow_local: false },
+    });
+    rules.push(BashRule {
+        name: "allow-standard-descriptor-redirects".to_string(),
+        pattern: r"^&(1|2|-)$".to_string(),
+        modes: None,
+        action: BashRuleAction::AllowRedirect { allow_local: false },
+    });
+    rules
 }
 
-fn starter(json: bool) -> Result<()> {
+fn starter(json: bool) -> miette::Result<()> {
     let rules = starter_rules();
 
     if json {
@@ -577,7 +665,9 @@ fn starter(json: bool) -> Result<()> {
     println!("# Starter pack: allow-rules for common read-only commands.");
     println!("# The compound splitter evaluates each leaf of a command independently, so these");
     println!("# simple prefix patterns stay safe inside `&&` / `||` / `|` / `;` chains.");
-    println!("# A redirect to a real file (e.g. `> out.txt`) is still capped at Ask, even here.");
+    println!(
+        "# Output endpoints require separate AllowRedirect rules; this pack includes /dev/null and standard descriptors."
+    );
     println!();
     print!("{toml}");
     Ok(())
@@ -623,7 +713,7 @@ struct ReplayOptions {
 async fn resolve_hash_filter(
     all_rules: bool,
     rules_hash: Option<String>,
-) -> Result<(RulesHashFilter, Option<String>)> {
+) -> miette::Result<(RulesHashFilter, Option<String>)> {
     if all_rules {
         return Ok((RulesHashFilter::Any, None));
     }
@@ -667,15 +757,22 @@ struct Suggestion {
 
 /// Returns suggestions and a scope note without rendering, so callers can assert on the raw
 /// results without capturing stdout.
-async fn collect_suggestions(opts: &SuggestOptions) -> Result<(Vec<Suggestion>, String)> {
+async fn collect_suggestions(opts: &SuggestOptions) -> miette::Result<(Vec<Suggestion>, String)> {
     let action = opts.action.unwrap_or_else(|| default_action(opts.result));
 
-    // Allow rules must be exact: a prefix or fuzzy Allow would auto-approve more than was observed.
-    if matches!(action, SuggestAction::Allow) && !matches!(opts.match_mode, MatchMode::Exact) {
-        return Err(miette::miette!(
-            "Refusing to suggest Allow rules with --match {}; use --match exact for literal, fully-anchored Allow rules",
-            match_mode_label(opts.match_mode)
-        ));
+    // Auto-authorization suggestions must never generalize beyond observed commands or targets.
+    if !matches!(opts.match_mode, MatchMode::Exact) {
+        let label = match action {
+            SuggestAction::Allow => "Allow",
+            SuggestAction::AllowRedirect => "AllowRedirect",
+            _ => "",
+        };
+        if !label.is_empty() {
+            return Err(miette::miette!(
+                "Refusing to suggest {label} rules with --match {}; use --match exact for literal, fully-anchored {label} rules",
+                match_mode_label(opts.match_mode)
+            ));
+        }
     }
 
     let filter = TimeRangeFilter::new(
@@ -694,19 +791,38 @@ async fn collect_suggestions(opts: &SuggestOptions) -> Result<(Vec<Suggestion>, 
         &hash_filter,
     )
     .await?;
-    let suggestions = build_suggestions(
-        &rows,
-        opts.match_mode,
-        action,
-        opts.min_count,
-        opts.limit,
-        Some(&engine),
-    );
-    let scope = rules_scope_note(&active_hash, &skipped);
+    let skipped_no_cwd: u64 = rows
+        .iter()
+        .filter(|row| row.cwd.is_empty() && row.bash_command().is_some())
+        .map(|row| row.count)
+        .sum();
+    let suggestions = if matches!(action, SuggestAction::AllowRedirect) {
+        build_redirect_suggestions(&rows, opts.min_count, opts.limit, &engine)
+    } else {
+        build_suggestions(
+            &rows,
+            opts.match_mode,
+            action,
+            opts.min_count,
+            opts.limit,
+            &engine,
+        )
+    };
+    let mut scope = rules_scope_note(&active_hash, &skipped);
+    if skipped_no_cwd > 0 {
+        scope.push_str(&format!(
+            " Skipped {skipped_no_cwd} historical record(s) without a recorded cwd."
+        ));
+    }
+    if matches!(action, SuggestAction::AllowRedirect) {
+        scope.push_str(
+            " Local redirect patterns are cwd-relative and therefore apply in every project.",
+        );
+    }
     Ok((suggestions, scope))
 }
 
-async fn suggest(opts: SuggestOptions) -> Result<()> {
+async fn suggest(opts: SuggestOptions) -> miette::Result<()> {
     let (suggestions, scope) = collect_suggestions(&opts).await?;
 
     if opts.json {
@@ -813,21 +929,9 @@ impl ObservedGroup {
     }
 }
 
-/// True when the current `BashRuleEngine` already allows a leaf and the leaf doesn't write to a
-/// real file — i.e. the leaf won't prompt the user even without a new rule. `real_file_write` caps
-/// Allow → Ask in the compound engine, so a write-redirecting leaf must stay in the suggestions.
-fn is_already_allowed(
-    engine: Option<&BashRuleEngine>,
-    text: &str,
-    real_file_write: bool,
-    mode: Option<PermissionMode>,
-) -> bool {
-    match engine {
-        Some(engine) => {
-            !real_file_write && matches!(engine.apply_rules(text, mode), RuleResult::Allowed { .. })
-        }
-        None => false,
-    }
+struct ObservedLeaf {
+    group: ObservedGroup,
+    filter_command: Option<FilterCommand>,
 }
 
 /// Pure core of `suggest`: turns aggregated Bash rows into anchored rule suggestions.
@@ -843,39 +947,51 @@ fn build_suggestions(
     action: SuggestAction,
     min_count: u64,
     limit: usize,
-    engine: Option<&BashRuleEngine>,
+    engine: &BashRuleEngine,
 ) -> Vec<Suggestion> {
-    let mut leaves: BTreeMap<String, ObservedGroup> = BTreeMap::new();
+    let mut leaves: BTreeMap<String, ObservedLeaf> = BTreeMap::new();
+    let mut contexts = BTreeMap::new();
     for row in rows {
+        if row.cwd.is_empty() {
+            continue;
+        }
         let Some(command) = row.bash_command() else {
             continue;
         };
         // A leaf repeated within one compound counts once per recorded occurrence, not once per
         // appearance, so the count still reflects how often the user saw a prompt.
-        let split = match engine {
-            Some(engine) => engine.split_command(command, &row.cwd),
-            None => split_command(command, &row.cwd, &BTreeSet::new()),
-        };
-        let texts: BTreeSet<String> = match split {
-            SplitOutcome::Commands(parts) => parts
-                .into_iter()
-                .filter(|leaf| leaf.requires_confirmation.is_none())
+        let context = contexts
+            .entry((row.cwd.clone(), row.permission_mode))
+            .or_insert_with(|| EvaluationContext::new(&row.cwd, row.permission_mode));
+        let analysis = engine.evaluate_original(command, context, EvaluationPurpose::Decision);
+        let texts: BTreeMap<String, Option<FilterCommand>> = match &analysis {
+            PolicyAnalysis::Leaves(parts) => parts
+                .iter()
                 .filter(|leaf| {
-                    !is_already_allowed(
-                        engine,
-                        &leaf.match_text,
-                        leaf.real_file_write,
-                        row.permission_mode,
+                    let already_allowed = if matches!(action, SuggestAction::Allow) {
+                        leaf.source_command_allowed()
+                    } else {
+                        matches!(leaf.outcome(), PolicyOutcome::Allow { .. })
+                    };
+                    leaf.identity().requires_confirmation().is_none() && !already_allowed
+                })
+                .map(|leaf| {
+                    (
+                        leaf.identity().normalized().to_string(),
+                        leaf.identity().command_shape().cloned(),
                     )
                 })
-                .map(|leaf| leaf.match_text)
                 .collect(),
-            SplitOutcome::Bail(_) => BTreeSet::from([command.to_string()]),
+            PolicyAnalysis::Bail { .. } => BTreeMap::from([(command.to_string(), None)]),
         };
-        for text in texts {
+        for (text, filter_command) in texts {
             leaves
                 .entry(text)
-                .or_default()
+                .or_insert_with(|| ObservedLeaf {
+                    group: ObservedGroup::default(),
+                    filter_command,
+                })
+                .group
                 .absorb(row.count, command, row.permission_mode);
         }
     }
@@ -885,12 +1001,15 @@ fn build_suggestions(
     let mut patterns: BTreeMap<String, (String, ObservedGroup)> = BTreeMap::new();
     match match_mode {
         MatchMode::Exact => {
-            for (text, group) in &leaves {
+            for (text, leaf) in &leaves {
                 let pattern = format!("^{}$", regex::escape(text));
-                let entry = patterns
-                    .entry(pattern)
-                    .or_insert_with(|| (program_token(text), ObservedGroup::default()));
-                entry.1.merge(group);
+                let entry = patterns.entry(pattern).or_insert_with(|| {
+                    (
+                        exact_program_name(text, leaf.filter_command.as_ref()),
+                        ObservedGroup::default(),
+                    )
+                });
+                entry.1.merge(&leaf.group);
             }
         }
         MatchMode::Prefix => {
@@ -898,7 +1017,7 @@ fn build_suggestions(
                 let pattern = format!(r"^{}(\s|$)", regex::escape(&program));
                 let entry = patterns
                     .entry(pattern)
-                    .or_insert_with(|| (program_token(&program), ObservedGroup::default()));
+                    .or_insert_with(|| (program_name(Some(&program)), ObservedGroup::default()));
                 entry.1.merge(&cluster.merged);
             }
         }
@@ -907,7 +1026,7 @@ fn build_suggestions(
                 let pattern = fuzzy_pattern(&program, &cluster.subcommands);
                 let entry = patterns
                     .entry(pattern)
-                    .or_insert_with(|| (program_token(&program), ObservedGroup::default()));
+                    .or_insert_with(|| (program_name(Some(&program)), ObservedGroup::default()));
                 entry.1.merge(&cluster.merged);
             }
         }
@@ -938,6 +1057,103 @@ fn build_suggestions(
     suggestions
 }
 
+fn build_redirect_suggestions(
+    rows: &[ReportRow],
+    min_count: u64,
+    limit: usize,
+    engine: &BashRuleEngine,
+) -> Vec<Suggestion> {
+    let mut targets: BTreeMap<(String, bool), ObservedGroup> = BTreeMap::new();
+    let mut contexts = BTreeMap::new();
+    for row in rows {
+        if row.cwd.is_empty() {
+            continue;
+        }
+        let Some(command) = row.bash_command() else {
+            continue;
+        };
+        let context = contexts
+            .entry((row.cwd.clone(), row.permission_mode))
+            .or_insert_with(|| EvaluationContext::new(&row.cwd, row.permission_mode));
+        let analysis = engine.evaluate_original(command, context, EvaluationPurpose::Decision);
+        let Some(leaves) = analysis.leaves() else {
+            continue;
+        };
+        let mut observed_targets = BTreeSet::new();
+        for leaf in leaves {
+            if !leaf.source_command_allowed() || leaf.identity().requires_confirmation().is_some() {
+                continue;
+            }
+            let Some(endpoints) = leaf.endpoints().analyzed() else {
+                continue;
+            };
+            if endpoints.iter().any(|endpoint| {
+                endpoint.failure_stage() == Some(EndpointFailureStage::StaticAnalysis)
+            }) {
+                continue;
+            }
+            for endpoint in endpoints {
+                match endpoint {
+                    EndpointAnalysis::Descriptor {
+                        match_text,
+                        matched_rule: None,
+                        ..
+                    } => {
+                        observed_targets.insert((match_text.clone(), false));
+                    }
+                    EndpointAnalysis::Filesystem {
+                        resolution:
+                            FilesystemAnalysis::Resolved {
+                                target,
+                                matched_rule: None,
+                            },
+                        ..
+                    } => {
+                        observed_targets.insert((
+                            target.match_text().to_string(),
+                            target.kind().is_filesystem() && target.is_local(),
+                        ));
+                    }
+                    EndpointAnalysis::Descriptor { .. } | EndpointAnalysis::Filesystem { .. } => {}
+                }
+            }
+        }
+        for (match_text, is_local) in observed_targets {
+            targets.entry((match_text, is_local)).or_default().absorb(
+                row.count,
+                command,
+                row.permission_mode,
+            );
+        }
+    }
+
+    let mut suggestions: Vec<_> = targets
+        .into_iter()
+        .filter(|(_, group)| group.count >= min_count)
+        .map(|((match_text, allow_local), group)| {
+            let pattern = format!("^{}$", regex::escape(&match_text));
+            Suggestion {
+                rule: BashRule {
+                    name: redirect_suggestion_name(&pattern, allow_local),
+                    pattern,
+                    modes: group.rule_modes(),
+                    action: BashRuleAction::AllowRedirect { allow_local },
+                },
+                count: group.count,
+                observed_commands: group.observed.into_iter().collect(),
+            }
+        })
+        .collect();
+    suggestions.sort_by(|left, right| {
+        right
+            .count
+            .cmp(&left.count)
+            .then_with(|| left.rule.pattern.cmp(&right.rule.pattern))
+    });
+    suggestions.truncate(limit);
+    suggestions
+}
+
 /// One program's worth of observed leaves for prefix/fuzzy clustering.
 #[derive(Default)]
 struct ProgramCluster {
@@ -947,22 +1163,25 @@ struct ProgramCluster {
     subcommands: Vec<Option<String>>,
 }
 
-/// Groups leaves by their program (first token). Leaves that cannot be tokenized are dropped: with
-/// no reliable program there is nothing safe to anchor a generalized pattern on.
-fn cluster_by_program(
-    leaves: &BTreeMap<String, ObservedGroup>,
-) -> BTreeMap<String, ProgramCluster> {
+/// Groups leaves whose normalized match text starts with their brush-parsed program. Other leaves
+/// cannot match a program-anchored pattern, so prefix and fuzzy suggestions omit them.
+fn cluster_by_program(leaves: &BTreeMap<String, ObservedLeaf>) -> BTreeMap<String, ProgramCluster> {
     let mut clusters: BTreeMap<String, ProgramCluster> = BTreeMap::new();
-    for (text, group) in leaves {
-        let Ok(tokens) = shell_words::split(text) else {
+    for (text, leaf) in leaves {
+        let Some(command) = leaf.filter_command.as_ref().filter(|command| {
+            command.program.range.start == 0
+                && text.get(command.program.range.clone()) == Some(command.program.value.as_str())
+        }) else {
             continue;
         };
-        let Some(program) = tokens.first().filter(|program| !program.is_empty()) else {
-            continue;
-        };
-        let cluster = clusters.entry(program.clone()).or_default();
-        cluster.merged.merge(group);
-        cluster.subcommands.push(tokens.get(1).cloned());
+        let cluster = clusters.entry(command.program.value.clone()).or_default();
+        cluster.merged.merge(&leaf.group);
+        cluster.subcommands.push(
+            command
+                .arguments
+                .first()
+                .map(|argument| argument.value.clone()),
+        );
     }
     clusters
 }
@@ -991,14 +1210,22 @@ fn fuzzy_pattern(program: &str, subcommands: &[Option<String>]) -> String {
     format!(r"^{} ({})(\s|$)", regex::escape(program), alternation)
 }
 
+fn exact_program_name(command: &str, filter_command: Option<&FilterCommand>) -> String {
+    // The raw fallback affects only a cosmetic label; bailed text never informs matching policy.
+    program_name(
+        filter_command
+            .map(|command| command.program.value.as_str())
+            .or_else(|| command.split_whitespace().next()),
+    )
+}
+
 /// The command's program basename, for a readable rule name (`/usr/bin/ls` → `ls`).
-fn program_token(command: &str) -> String {
-    shell_words::split(command)
-        .ok()
-        .and_then(|parts| parts.into_iter().next())
-        .map(|program| program.rsplit('/').next().unwrap_or(&program).to_string())
+fn program_name(program: Option<&str>) -> String {
+    program
+        .and_then(|program| program.rsplit('/').next())
         .filter(|program| !program.is_empty())
-        .unwrap_or_else(|| "cmd".to_string())
+        .unwrap_or("cmd")
+        .to_string()
 }
 
 /// A short, stable hash of the full command, disambiguating rule names for the same program.
@@ -1011,10 +1238,18 @@ fn short_hash(command: &str) -> String {
         .collect()
 }
 
+fn redirect_suggestion_name(pattern: &str, allow_local: bool) -> String {
+    let identity = format!("{pattern}\nallow_local={allow_local}");
+    format!("suggested-redirect-{}", short_hash(&identity))
+}
+
 fn to_bash_action(action: SuggestAction) -> BashRuleAction {
     match action {
         SuggestAction::Ask => BashRuleAction::Ask,
         SuggestAction::Allow => BashRuleAction::Allow,
+        SuggestAction::AllowRedirect => {
+            unreachable!("redirect suggestions use the target-specific builder")
+        }
         SuggestAction::Deny => BashRuleAction::Deny {
             value: "Suggested deny — review before keeping".to_string(),
         },
@@ -1040,21 +1275,23 @@ struct ReplayRow {
 struct ReplayReport {
     /// Only the commands whose decision changed; unchanged commands are omitted.
     divergences: Vec<ReplayRow>,
-    /// Previously-Allowed commands that the candidate no longer auto-allows (the regression gate).
-    lost_allow_count: usize,
-    /// Commands the candidate now auto-allows that previously prompted/denied (the migration goal).
-    newly_allowed_count: usize,
-    /// Total recorded commands evaluated (after any `--result` filter).
-    total_evaluated: usize,
+    /// Previously-Allowed events that the candidate no longer auto-allows (the regression gate).
+    lost_allow_count: u64,
+    /// Events the candidate now auto-allows that previously prompted/denied (the migration goal).
+    newly_allowed_count: u64,
+    /// Total recorded command events evaluated (after any `--result` filter).
+    total_evaluated: u64,
     /// Hash of the rule set whose recorded decisions were replayed (`None` under `--all-rules`).
     replayed_rules_hash: Option<String>,
     /// Records excluded because they came from a different rule set.
     skipped_other_rules: u64,
     /// Records excluded because they have no recorded rule hash.
     skipped_no_hash: u64,
+    /// Historical records excluded because redirect policy cannot reproduce an unknown cwd.
+    skipped_no_cwd: u64,
 }
 
-async fn replay(opts: ReplayOptions) -> Result<()> {
+async fn replay(opts: ReplayOptions) -> miette::Result<()> {
     let config = load_user_config_from(opts.config.as_deref()).await?;
     let engine = BashRuleEngine::from_config(config)?;
     let filter = TimeRangeFilter::new(
@@ -1076,17 +1313,22 @@ async fn replay(opts: ReplayOptions) -> Result<()> {
         print_replay(&report);
     }
 
-    // The migration acceptance gate: a candidate that drops a previously-auto-approved command is a
-    // regression, so fail loudly for CI/scripts.
-    if report.lost_allow_count > 0 {
-        std::process::exit(1);
+    // The migration gate fails regressions and runs whose in-scope history all lacks cwd.
+    if let Some(failure) = replay_failure(&report) {
+        if opts.json
+            && let Some(message) = replay_failure_message(&report)
+        {
+            eprintln!("{message}");
+        }
+        std::process::exit(failure.exit_code());
     }
     Ok(())
 }
 
 /// Pure core of `replay`: recompute each recorded Bash command through the candidate engine and
 /// classify the divergences. Each row carries the cwd it ran under so commands normalize exactly as
-/// the hook did; rows from before cwd was logged fall back to an empty cwd (normalization disabled).
+/// the hook did; historical rows from before cwd logging are excluded because their path policy
+/// cannot be reproduced safely.
 fn build_replay_report(
     rows: &[ReportRow],
     engine: &BashRuleEngine,
@@ -1098,6 +1340,7 @@ fn build_replay_report(
     let mut lost_allow_count = 0;
     let mut newly_allowed_count = 0;
     let mut total_evaluated = 0;
+    let mut skipped_no_cwd = 0;
 
     for row in rows {
         if result_filter.is_some_and(|filter| filter != row.result) {
@@ -1106,19 +1349,27 @@ fn build_replay_report(
         let Some(command) = row.bash_command() else {
             continue;
         };
-        total_evaluated += 1;
+        if row.cwd.is_empty() {
+            skipped_no_cwd += row.count;
+            continue;
+        }
+        total_evaluated += row.count;
 
-        let computed =
-            classify_result(&engine.apply_rules_compound(command, &row.cwd, row.permission_mode));
+        let context = EvaluationContext::new(&row.cwd, row.permission_mode);
+        let computed = classify_result(
+            &engine
+                .evaluate_sync(command, &context, EvaluationPurpose::Decision)
+                .rule_result(),
+        );
         if computed == row.result {
             continue;
         }
 
         let classification = if row.result == PreToolResult::Allow {
-            lost_allow_count += 1;
+            lost_allow_count += row.count;
             "lost-allow"
         } else if computed == PreToolResult::Allow {
-            newly_allowed_count += 1;
+            newly_allowed_count += row.count;
             "newly-allowed"
         } else {
             "changed"
@@ -1142,6 +1393,7 @@ fn build_replay_report(
         replayed_rules_hash,
         skipped_other_rules: skipped.other_rules,
         skipped_no_hash: skipped.no_hash,
+        skipped_no_cwd,
     }
 }
 
@@ -1153,6 +1405,40 @@ fn classify_result(result: &RuleResult) -> PreToolResult {
         RuleResult::Denied { .. } => PreToolResult::Deny,
         RuleResult::Modified { .. } | RuleResult::ArgumentFiltered { .. } => PreToolResult::Modify,
         RuleResult::Asked { .. } | RuleResult::NoMatch => PreToolResult::Ask,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplayFailure {
+    LostAllow,
+    NoReproducibleCwd,
+}
+
+impl ReplayFailure {
+    fn exit_code(self) -> i32 {
+        match self {
+            Self::LostAllow => 1,
+            Self::NoReproducibleCwd => 2,
+        }
+    }
+}
+
+fn replay_failure(report: &ReplayReport) -> Option<ReplayFailure> {
+    if report.total_evaluated == 0 && report.skipped_no_cwd > 0 {
+        Some(ReplayFailure::NoReproducibleCwd)
+    } else if report.lost_allow_count > 0 {
+        Some(ReplayFailure::LostAllow)
+    } else {
+        None
+    }
+}
+
+fn replay_failure_message(report: &ReplayReport) -> Option<&'static str> {
+    match replay_failure(report) {
+        Some(ReplayFailure::NoReproducibleCwd) => {
+            Some("Replay cannot verify the candidate: every in-scope historical record lacks cwd")
+        }
+        Some(ReplayFailure::LostAllow) | None => None,
     }
 }
 
@@ -1169,6 +1455,12 @@ fn print_replay(report: &ReplayReport) {
         "Replayed {} recorded Bash command(s) against the candidate config.",
         report.total_evaluated
     );
+    if report.skipped_no_cwd > 0 {
+        println!(
+            "  Skipped historical records without cwd: {}",
+            report.skipped_no_cwd
+        );
+    }
     println!(
         "  Lost auto-approval (regression): {}",
         report.lost_allow_count
@@ -1194,11 +1486,15 @@ fn print_replay(report: &ReplayReport) {
         }
     }
 
-    if report.lost_allow_count > 0 {
-        println!(
+    match replay_failure(report) {
+        Some(ReplayFailure::NoReproducibleCwd) => {
+            println!("\nFAIL: replay evaluated no records with a reproducible cwd.")
+        }
+        Some(ReplayFailure::LostAllow) => println!(
             "\nFAIL: {} previously-auto-approved command(s) would now prompt or be denied.",
             report.lost_allow_count
-        );
+        ),
+        None => {}
     }
 }
 
@@ -1211,7 +1507,7 @@ fn replay_command_label(command: &str, permission_mode: Option<PermissionMode>) 
 
 #[cfg(test)]
 mod tests {
-    use std::{env, path::Path};
+    use std::{env, path::Path, slice::from_ref};
 
     use super::*;
     use crate::{
@@ -1232,12 +1528,82 @@ mod tests {
         BashRuleEngine::from_config(config_with_bash(rules)).unwrap()
     }
 
+    fn empty_engine() -> BashRuleEngine {
+        engine_with_bash(Vec::new())
+    }
+
+    fn evaluation_result(
+        engine: &BashRuleEngine,
+        command: &str,
+        cwd: &str,
+        mode: Option<PermissionMode>,
+    ) -> RuleResult {
+        let context = EvaluationContext::new(cwd, mode);
+        engine
+            .evaluate_sync(command, &context, EvaluationPurpose::Decision)
+            .rule_result()
+    }
+
     fn allow(name: &str, pattern: &str) -> BashRule {
         BashRule {
             name: name.to_string(),
             pattern: pattern.to_string(),
             modes: None,
             action: BashRuleAction::Allow,
+        }
+    }
+
+    fn modify(name: &str, pattern: &str, value: &str) -> BashRule {
+        BashRule {
+            name: name.to_string(),
+            pattern: pattern.to_string(),
+            modes: None,
+            action: BashRuleAction::Modify {
+                value: value.to_string(),
+            },
+        }
+    }
+
+    fn filter(name: &str, pattern: &str, remove: &str, reason: Option<&str>) -> BashRule {
+        BashRule {
+            name: name.to_string(),
+            pattern: pattern.to_string(),
+            modes: None,
+            action: BashRuleAction::ArgumentFilter {
+                remove: Some(vec![remove.to_string()]),
+                add: None,
+                replace: None,
+                reason: reason.map(str::to_string),
+            },
+        }
+    }
+
+    fn deny(name: &str, pattern: &str, value: &str) -> BashRule {
+        BashRule {
+            name: name.to_string(),
+            pattern: pattern.to_string(),
+            modes: None,
+            action: BashRuleAction::Deny {
+                value: value.to_string(),
+            },
+        }
+    }
+
+    fn ask(name: &str, pattern: &str) -> BashRule {
+        BashRule {
+            name: name.to_string(),
+            pattern: pattern.to_string(),
+            modes: None,
+            action: BashRuleAction::Ask,
+        }
+    }
+
+    fn redirect(name: &str, pattern: &str, allow_local: bool) -> BashRule {
+        BashRule {
+            name: name.to_string(),
+            pattern: pattern.to_string(),
+            modes: None,
+            action: BashRuleAction::AllowRedirect { allow_local },
         }
     }
 
@@ -1372,12 +1738,49 @@ mod tests {
     fn clean_config_has_no_errors() {
         let mut plan = allow("plan-pwd", r"^pwd$");
         plan.modes = Some(BTreeSet::from([PermissionMode::Plan]));
-        let config = config_with_bash(vec![allow("ls", r"^ls($|\s)"), plan]);
+        let config = config_with_bash(vec![
+            allow("ls", r"^ls($|\s)"),
+            plan,
+            redirect("dev-null", r"^/dev/null$", false),
+        ]);
 
         let report = build_lint_report(&config, true).unwrap();
         assert_eq!(report.ignored_count, 0);
         assert!(report.errors.is_empty());
         assert!(report.warnings.is_empty());
+    }
+
+    #[test]
+    fn strict_warns_for_every_command_allow_without_redirect_policy() {
+        let mut plan = allow("plan-ls", r"^ls");
+        plan.modes = Some(BTreeSet::from([PermissionMode::Plan]));
+        let mut default = allow("default-pwd", r"^pwd");
+        default.modes = Some(BTreeSet::from([PermissionMode::Default]));
+        let report = build_lint_report(&config_with_bash(vec![plan, default]), true).unwrap();
+
+        let names = report
+            .warnings
+            .iter()
+            .filter(|warning| warning.kind == "missing-redirect-policy")
+            .map(|warning| warning.rule_name.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(names, BTreeSet::from(["default-pwd", "plan-ls"]));
+    }
+
+    #[test]
+    fn strict_warns_when_redirect_policy_modes_do_not_overlap() {
+        let mut command = allow("default-ls", r"^ls");
+        command.modes = Some(BTreeSet::from([PermissionMode::Default]));
+        let mut redirect = redirect("plan-redirect", r"^out$", true);
+        redirect.modes = Some(BTreeSet::from([PermissionMode::Plan]));
+
+        let report = build_lint_report(&config_with_bash(vec![command, redirect]), true).unwrap();
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.kind == "missing-redirect-policy")
+        );
     }
 
     #[test]
@@ -1395,6 +1798,28 @@ mod tests {
     }
 
     #[test]
+    fn strict_describes_broad_redirect_authority() {
+        let config = config_with_bash(vec![
+            redirect("all-targets", ".*", false),
+            redirect("all-project-targets", ".*", true),
+        ]);
+        let report = build_lint_report(&config, true).unwrap();
+
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.kind == "over-broad-redirect")
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.kind == "broad-local-redirect")
+        );
+    }
+
+    #[test]
     fn strict_flags_shadowed_rule() {
         // `^ls` matches everything `^ls -la` does, so the later, more specific rule is unreachable.
         let config = config_with_bash(vec![
@@ -1409,6 +1834,34 @@ mod tests {
             .collect();
         assert_eq!(shadowed.len(), 1, "warnings: {:?}", report.warnings);
         assert_eq!(shadowed[0].rule_name, "specific-ls");
+    }
+
+    #[test]
+    fn strict_shadow_warnings_respect_rule_domains_and_locality() {
+        let config = config_with_bash(vec![
+            allow("allow-command", r"^echo"),
+            redirect("allow-local-redirect", r"^echo", true),
+            redirect("allow-external-redirect", r"^echo-out$", false),
+        ]);
+        assert!(
+            build_lint_report(&config, true)
+                .unwrap()
+                .warnings
+                .iter()
+                .all(|warning| warning.kind != "shadowed")
+        );
+
+        let shadowed = config_with_bash(vec![
+            redirect("all-outputs", r"^out", false),
+            redirect("local-output", r"^out/file$", true),
+        ]);
+        assert!(
+            build_lint_report(&shadowed, true)
+                .unwrap()
+                .warnings
+                .iter()
+                .any(|warning| warning.kind == "shadowed" && warning.rule_name == "local-output")
+        );
     }
 
     #[test]
@@ -1492,8 +1945,15 @@ mod tests {
 
     #[test]
     fn schema_round_trips_through_user_config() {
-        // Guards the canonical example against drift from the config types.
-        toml::from_str::<UserConfig>(SCHEMA_TOML).expect("schema TOML must parse");
+        let config = toml::from_str::<UserConfig>(SCHEMA_TOML).expect("schema TOML must parse");
+        let report = build_lint_report(&config, true).unwrap();
+
+        assert!(report.errors.is_empty());
+        assert!(
+            report.warnings.is_empty(),
+            "warnings: {:?}",
+            report.warnings
+        );
     }
 
     #[test]
@@ -1515,24 +1975,63 @@ mod tests {
 
         const NORTH_STAR: &str = r#"echo "===== Is there a lib.rs? =====" && ls crates/moriarty/src/lib.rs 2>/dev/null && echo "FOUND lib.rs" || echo "NO lib.rs (binary only via main.rs)"; echo; echo "===== Cargo.toml deps =====" && cat crates/moriarty/Cargo.toml; echo; cat Cargo.toml 2>/dev/null | head -60"#;
 
-        let engine = engine_with_bash(starter_rules());
+        let cwd = tempfile::tempdir().unwrap();
+        let rules = starter_rules();
+        assert!(
+            rules[..STARTER_COMMANDS.len()]
+                .iter()
+                .all(|rule| matches!(rule.action, BashRuleAction::Allow))
+        );
+        assert!(rules[STARTER_COMMANDS.len()..].iter().all(|rule| matches!(
+            rule.action,
+            BashRuleAction::AllowRedirect { allow_local: false }
+        )));
+        let engine = engine_with_bash(rules);
         assert!(
             matches!(
-                engine.apply_rules_compound(NORTH_STAR, "", None),
+                evaluation_result(&engine, NORTH_STAR, cwd.path().to_str().unwrap(), None),
                 RuleResult::Allowed { .. }
             ),
             "starter pack should auto-allow the north-star command"
         );
+        for cwd in [cwd.path().to_str().unwrap(), "/", "/dev"] {
+            assert!(
+                matches!(
+                    evaluation_result(&engine, "echo >/dev/null", cwd, None),
+                    RuleResult::Allowed { .. }
+                ),
+                "starter /dev/null rule should be independent of cwd {cwd:?}"
+            );
+        }
+        for command in ["ls 2>&1", "echo >&2", "echo >&-"] {
+            assert!(matches!(
+                evaluation_result(&engine, command, cwd.path().to_str().unwrap(), None),
+                RuleResult::Allowed { .. }
+            ));
+        }
     }
 
     // ===== suggest =====
 
     fn bash_row(command: &str, count: u64, result: PreToolResult) -> ReportRow {
-        bash_row_in(command, count, result, "")
+        bash_row_in(command, count, result, "/")
     }
 
     fn bash_row_in(command: &str, count: u64, result: PreToolResult, cwd: &str) -> ReportRow {
         bash_row_mode(command, count, result, cwd, None)
+    }
+
+    fn redirect_row(
+        command: &str,
+        count: u64,
+        cwd: &str,
+        mode: Option<PermissionMode>,
+    ) -> ReportRow {
+        bash_row_mode(command, count, PreToolResult::Ask, cwd, mode)
+    }
+
+    fn exact_ask_suggestions(rows: &[ReportRow], engine: &BashRuleEngine) -> Vec<Suggestion> {
+        build_suggestions(rows, MatchMode::Exact, SuggestAction::Ask, 1, 10, engine)
     }
 
     fn bash_row_mode(
@@ -1548,6 +2047,7 @@ mod tests {
             result,
             count,
             rule: None,
+            rules: Vec::new(),
             cwd: cwd.to_string(),
             permission_mode,
         }
@@ -1556,8 +2056,14 @@ mod tests {
     #[test]
     fn suggest_exact_produces_fully_anchored_literal() {
         let rows = vec![bash_row("ls -la", 3, PreToolResult::Ask)];
-        let suggestions =
-            build_suggestions(&rows, MatchMode::Exact, SuggestAction::Ask, 2, 10, None);
+        let suggestions = build_suggestions(
+            &rows,
+            MatchMode::Exact,
+            SuggestAction::Ask,
+            2,
+            10,
+            &empty_engine(),
+        );
 
         assert_eq!(suggestions.len(), 1);
         let suggestion = &suggestions[0];
@@ -1578,8 +2084,14 @@ mod tests {
     #[test]
     fn suggest_prefix_anchors_on_program_token() {
         let rows = vec![bash_row("cargo build --release", 5, PreToolResult::Ask)];
-        let suggestions =
-            build_suggestions(&rows, MatchMode::Prefix, SuggestAction::Ask, 2, 10, None);
+        let suggestions = build_suggestions(
+            &rows,
+            MatchMode::Prefix,
+            SuggestAction::Ask,
+            2,
+            10,
+            &empty_engine(),
+        );
 
         let regex = Regex::new(&suggestions[0].rule.pattern).unwrap();
         assert!(regex.is_match("cargo build --release"));
@@ -1587,6 +2099,32 @@ mod tests {
         assert!(
             !regex.is_match("cargolike"),
             "prefix must respect a word boundary"
+        );
+    }
+
+    #[test]
+    fn suggestions_use_brush_program_metadata() {
+        let rows = vec![bash_row(">report cargo build", 3, PreToolResult::Ask)];
+        let exact = build_suggestions(
+            &rows,
+            MatchMode::Exact,
+            SuggestAction::Ask,
+            2,
+            10,
+            &empty_engine(),
+        );
+        assert!(exact[0].rule.name.starts_with("suggested-cargo-"));
+        assert!(
+            build_suggestions(
+                &rows,
+                MatchMode::Prefix,
+                SuggestAction::Ask,
+                2,
+                10,
+                &empty_engine(),
+            )
+            .is_empty(),
+            "a program prefix cannot match a leaf whose redirect comes first"
         );
     }
 
@@ -1602,19 +2140,25 @@ mod tests {
                 "cargo build",
                 2,
                 PreToolResult::Ask,
-                "",
+                "/",
                 Some(PermissionMode::Plan),
             ),
             bash_row_mode(
                 "cargo check",
                 3,
                 PreToolResult::Ask,
-                "",
+                "/",
                 Some(PermissionMode::Default),
             ),
         ];
-        let suggestions =
-            build_suggestions(&known, MatchMode::Prefix, SuggestAction::Ask, 1, 10, None);
+        let suggestions = build_suggestions(
+            &known,
+            MatchMode::Prefix,
+            SuggestAction::Ask,
+            1,
+            10,
+            &empty_engine(),
+        );
         assert_eq!(
             suggestions[0].rule.modes,
             Some(BTreeSet::from([
@@ -1627,8 +2171,14 @@ mod tests {
             bash_row("cargo build", 1, PreToolResult::Ask),
             known[1].clone(),
         ];
-        let suggestions =
-            build_suggestions(&mixed, MatchMode::Prefix, SuggestAction::Ask, 1, 10, None);
+        let suggestions = build_suggestions(
+            &mixed,
+            MatchMode::Prefix,
+            SuggestAction::Ask,
+            1,
+            10,
+            &empty_engine(),
+        );
         assert_eq!(suggestions[0].rule.modes, None);
     }
 
@@ -1642,25 +2192,19 @@ mod tests {
                 "head -5 Cargo.toml",
                 2,
                 PreToolResult::Ask,
-                "",
+                "/",
                 Some(PermissionMode::Plan),
             ),
             bash_row_mode(
                 "head -5 Cargo.toml",
                 3,
                 PreToolResult::Ask,
-                "",
+                "/",
                 Some(PermissionMode::Default),
             ),
         ];
-        let suggestions = build_suggestions(
-            &rows,
-            MatchMode::Exact,
-            SuggestAction::Ask,
-            1,
-            10,
-            Some(&engine),
-        );
+        let suggestions =
+            build_suggestions(&rows, MatchMode::Exact, SuggestAction::Ask, 1, 10, &engine);
         assert_eq!(suggestions.len(), 1);
         assert_eq!(suggestions[0].count, 3);
         assert_eq!(
@@ -1677,8 +2221,14 @@ mod tests {
             bash_row("c", 4, PreToolResult::Ask),
             bash_row("d", 3, PreToolResult::Ask),
         ];
-        let suggestions =
-            build_suggestions(&rows, MatchMode::Exact, SuggestAction::Ask, 2, 2, None);
+        let suggestions = build_suggestions(
+            &rows,
+            MatchMode::Exact,
+            SuggestAction::Ask,
+            2,
+            2,
+            &empty_engine(),
+        );
 
         assert_eq!(
             suggestions.len(),
@@ -1702,28 +2252,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn suggest_rejects_allow_with_nonexact_match() {
+    async fn suggest_rejects_authorizing_actions_with_nonexact_match() {
         // The guard runs before any log reading, so the (unused) dir is irrelevant.
-        for (match_mode, label) in [(MatchMode::Prefix, "prefix"), (MatchMode::Fuzzy, "fuzzy")] {
-            let err = suggest(SuggestOptions {
-                min_count: 2,
-                match_mode,
-                action: Some(SuggestAction::Allow),
-                all_rules: false,
-                json: false,
-                ..suggest_options(PathBuf::from("/tmp/moriarty-suggest-guard"))
-            })
-            .await
-            .expect_err("Allow + non-exact match must be rejected");
-            assert!(err.to_string().contains(&format!("--match {label}")));
+        for action in [SuggestAction::Allow, SuggestAction::AllowRedirect] {
+            for (match_mode, label) in [(MatchMode::Prefix, "prefix"), (MatchMode::Fuzzy, "fuzzy")]
+            {
+                let err = suggest(SuggestOptions {
+                    min_count: 2,
+                    match_mode,
+                    action: Some(action),
+                    all_rules: false,
+                    json: false,
+                    ..suggest_options(PathBuf::from("/tmp/moriarty-suggest-guard"))
+                })
+                .await
+                .expect_err("authorizing non-exact match must be rejected");
+                assert!(err.to_string().contains(&format!("--match {label}")));
+            }
         }
     }
 
     #[test]
     fn suggested_rules_round_trip_through_toml() {
         let rows = vec![bash_row("git status", 3, PreToolResult::Ask)];
-        let suggestions =
-            build_suggestions(&rows, MatchMode::Exact, SuggestAction::Ask, 2, 10, None);
+        let suggestions = build_suggestions(
+            &rows,
+            MatchMode::Exact,
+            SuggestAction::Ask,
+            2,
+            10,
+            &empty_engine(),
+        );
         let config = UserConfig {
             pattern_fragments: None,
             bash_path_aliases: BTreeSet::new(),
@@ -1736,12 +2295,116 @@ mod tests {
     }
 
     #[test]
+    fn redirect_suggestion_policy_matrix() {
+        let cwd = tempfile::tempdir().unwrap();
+        let cwd = cwd.path().to_str().unwrap();
+        let rows = vec![
+            redirect_row("echo hi >/dev/null", 4, cwd, None),
+            redirect_row("echo hi >/dev/null", 6, "/dev", None),
+            redirect_row("echo hi 2>&1", 5, cwd, None),
+            redirect_row("echo hi > $OUT", 9, cwd, None),
+            redirect_row("echo hi > safe.txt 2> $OUT", 7, cwd, None),
+            redirect_row("cat x > safe.txt", 1, cwd, None),
+            redirect_row("echo hi > allowed", 3, cwd, None),
+            redirect_row("echo hi > mode.txt", 2, cwd, Some(PermissionMode::Plan)),
+            redirect_row("echo hi > mode.txt", 3, cwd, Some(PermissionMode::Default)),
+            redirect_row("cd /; echo hi > context.txt", 3, cwd, None),
+            redirect_row("cd /; echo hi 2>&1", 4, cwd, None),
+            redirect_row("echo $(date) > bailed.txt", 4, cwd, None),
+        ];
+        let engine = engine_with_bash(vec![
+            allow("allow-echo", r"^echo($|\s)"),
+            redirect("existing", r"^allowed$", true),
+        ]);
+        let suggestions = build_redirect_suggestions(&rows, 1, 10, &engine);
+        let by_pattern: BTreeMap<_, _> = suggestions
+            .iter()
+            .map(|suggestion| (suggestion.rule.pattern.as_str(), suggestion))
+            .collect();
+
+        assert_eq!(
+            by_pattern.len(),
+            3,
+            "leaves with unresolved or context-dependent endpoints and allowed targets are omitted"
+        );
+        for (pattern, allow_local) in [
+            (r"^mode\.txt$", true),
+            (r"^/dev/null$", false),
+            (r"^\&1$", false),
+        ] {
+            let suggestion = by_pattern.get(pattern).unwrap();
+            assert!(matches!(
+                suggestion.rule.action,
+                BashRuleAction::AllowRedirect { allow_local: actual } if actual == allow_local
+            ));
+        }
+        assert!(!by_pattern.contains_key(r"^safe\.txt$"));
+        assert!(!by_pattern.contains_key(r"^bailed\.txt$"));
+        assert_eq!(by_pattern[r"^\&1$"].count, 9);
+        assert_eq!(
+            by_pattern[r"^mode\.txt$"].rule.modes,
+            Some(BTreeSet::from([
+                PermissionMode::Default,
+                PermissionMode::Plan,
+            ]))
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn redirect_suggestions_keep_valid_targets_after_a_runtime_resolution_failure() {
+        let cwd = tempfile::tempdir().unwrap();
+        let cwd = cwd.path().to_str().unwrap();
+        let rows = [redirect_row(
+            "echo hi > partial.txt 2> /proc/self/fd/2",
+            3,
+            cwd,
+            None,
+        )];
+        let engine = engine_with_bash(vec![allow("allow-echo", r"^echo($|\s)")]);
+
+        let suggestions = build_redirect_suggestions(&rows, 1, 10, &engine);
+
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].rule.pattern, r"^partial\.txt$");
+        assert_eq!(suggestions[0].count, 3);
+        assert_eq!(
+            suggestions[0].observed_commands,
+            ["echo hi > partial.txt 2> /proc/self/fd/2"]
+        );
+        assert!(matches!(
+            suggestions[0].rule.action,
+            BashRuleAction::AllowRedirect { allow_local: true }
+        ));
+    }
+
+    #[test]
+    fn redirect_suggestions_respect_limit() {
+        let rows = [
+            redirect_row("echo hi >/dev/null", 10, "/dev", None),
+            redirect_row("echo hi 2>&1", 9, "/dev", None),
+        ];
+        let engine = engine_with_bash(vec![allow("allow-echo", r"^echo($|\s)")]);
+        let selected = build_redirect_suggestions(&rows, 6, 1, &engine);
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].rule.pattern, r"^/dev/null$");
+        assert_eq!(selected[0].count, 10);
+    }
+
+    #[test]
     fn suggest_splits_compounds_into_per_leaf_suggestions() {
         // A whole-compound literal could never match the per-leaf engine, so each leaf gets its own
         // exact suggestion, and the generated pattern must actually allow that leaf when adopted.
         let rows = vec![bash_row("git status && ls -la", 3, PreToolResult::Ask)];
-        let suggestions =
-            build_suggestions(&rows, MatchMode::Exact, SuggestAction::Allow, 2, 10, None);
+        let suggestions = build_suggestions(
+            &rows,
+            MatchMode::Exact,
+            SuggestAction::Allow,
+            2,
+            10,
+            &empty_engine(),
+        );
 
         let patterns: Vec<&str> = suggestions
             .iter()
@@ -1760,7 +2423,7 @@ mod tests {
         let engine = engine_with_bash(rules);
         assert!(
             matches!(
-                engine.apply_rules_compound("git status && ls -la", "", None),
+                evaluation_result(&engine, "git status && ls -la", "", None),
                 RuleResult::Allowed { .. }
             ),
             "adopting the suggestions must allow the observed compound"
@@ -1773,8 +2436,14 @@ mod tests {
             bash_row("git status && cargo test", 2, PreToolResult::Ask),
             bash_row("git status", 3, PreToolResult::Ask),
         ];
-        let suggestions =
-            build_suggestions(&rows, MatchMode::Exact, SuggestAction::Ask, 1, 10, None);
+        let suggestions = build_suggestions(
+            &rows,
+            MatchMode::Exact,
+            SuggestAction::Ask,
+            1,
+            10,
+            &empty_engine(),
+        );
 
         let git = suggestions
             .iter()
@@ -1802,8 +2471,14 @@ mod tests {
             PreToolResult::Ask,
             "/work/proj",
         )];
-        let suggestions =
-            build_suggestions(&rows, MatchMode::Exact, SuggestAction::Ask, 2, 10, None);
+        let suggestions = build_suggestions(
+            &rows,
+            MatchMode::Exact,
+            SuggestAction::Ask,
+            2,
+            10,
+            &empty_engine(),
+        );
 
         assert_eq!(
             suggestions[0].rule.pattern, r"^cat src/main\.rs$",
@@ -1816,10 +2491,17 @@ mod tests {
         // The hook cannot analyze a command with a substitution, so suggesting per-leaf pieces would
         // be meaningless; the whole observed text is kept, exactly as before.
         let rows = vec![bash_row("echo $(date)", 4, PreToolResult::Ask)];
-        let suggestions =
-            build_suggestions(&rows, MatchMode::Exact, SuggestAction::Ask, 2, 10, None);
+        let suggestions = build_suggestions(
+            &rows,
+            MatchMode::Exact,
+            SuggestAction::Ask,
+            2,
+            10,
+            &empty_engine(),
+        );
 
         assert_eq!(suggestions.len(), 1);
+        assert!(suggestions[0].rule.name.starts_with("suggested-echo-"));
         assert_eq!(
             suggestions[0].rule.pattern,
             format!("^{}$", regex::escape("echo $(date)"))
@@ -1832,8 +2514,14 @@ mod tests {
             bash_row("cargo build", 2, PreToolResult::Ask),
             bash_row("cargo check --all", 3, PreToolResult::Ask),
         ];
-        let suggestions =
-            build_suggestions(&rows, MatchMode::Prefix, SuggestAction::Ask, 2, 10, None);
+        let suggestions = build_suggestions(
+            &rows,
+            MatchMode::Prefix,
+            SuggestAction::Ask,
+            2,
+            10,
+            &empty_engine(),
+        );
 
         assert_eq!(suggestions.len(), 1, "one prefix rule per program");
         assert_eq!(suggestions[0].rule.pattern, r"^cargo(\s|$)");
@@ -1848,8 +2536,14 @@ mod tests {
             bash_row("cargo build --release", 3, PreToolResult::Ask),
             bash_row("cargo check", 2, PreToolResult::Ask),
         ];
-        let suggestions =
-            build_suggestions(&rows, MatchMode::Fuzzy, SuggestAction::Ask, 2, 10, None);
+        let suggestions = build_suggestions(
+            &rows,
+            MatchMode::Fuzzy,
+            SuggestAction::Ask,
+            2,
+            10,
+            &empty_engine(),
+        );
 
         assert_eq!(suggestions.len(), 1);
         let suggestion = &suggestions[0];
@@ -1879,8 +2573,14 @@ mod tests {
             bash_row("ls -la", 3, PreToolResult::Ask),
             bash_row("cat src/main.rs", 2, PreToolResult::Ask),
         ];
-        let suggestions =
-            build_suggestions(&rows, MatchMode::Fuzzy, SuggestAction::Ask, 2, 10, None);
+        let suggestions = build_suggestions(
+            &rows,
+            MatchMode::Fuzzy,
+            SuggestAction::Ask,
+            2,
+            10,
+            &empty_engine(),
+        );
 
         let patterns: Vec<&str> = suggestions
             .iter()
@@ -1897,8 +2597,14 @@ mod tests {
             bash_row("g++ -c main.cpp", 2, PreToolResult::Ask),
             bash_row("g++ -o out main.o", 2, PreToolResult::Ask),
         ];
-        let suggestions =
-            build_suggestions(&rows, MatchMode::Fuzzy, SuggestAction::Ask, 2, 10, None);
+        let suggestions = build_suggestions(
+            &rows,
+            MatchMode::Fuzzy,
+            SuggestAction::Ask,
+            2,
+            10,
+            &empty_engine(),
+        );
 
         assert_eq!(suggestions.len(), 1);
         let regex = Regex::new(&suggestions[0].rule.pattern)
@@ -1960,14 +2666,68 @@ mod tests {
             bash_row("cargo", 2, PreToolResult::Ask),
             bash_row("cargo build", 2, PreToolResult::Ask),
         ];
-        let suggestions =
-            build_suggestions(&rows, MatchMode::Fuzzy, SuggestAction::Ask, 2, 10, None);
+        let suggestions = build_suggestions(
+            &rows,
+            MatchMode::Fuzzy,
+            SuggestAction::Ask,
+            2,
+            10,
+            &empty_engine(),
+        );
 
         assert_eq!(suggestions.len(), 1);
         assert_eq!(suggestions[0].rule.pattern, r"^cargo(\s|$)");
     }
 
     // ===== replay =====
+
+    #[test]
+    fn replay_preserves_representative_command_and_redirect_decisions() {
+        let cwd = tempfile::tempdir().unwrap();
+        let cwd = cwd.path().to_str().unwrap();
+        let engine = engine_with_bash(vec![
+            filter(
+                "filter-open",
+                r"^cargo doc.*--open",
+                "--open",
+                Some("Removed --open"),
+            ),
+            allow("allow-cargo-doc", r"^cargo doc($|\s)"),
+            deny("deny-rm", r"^rm", "blocked"),
+            ask("ask-docker", r"^docker"),
+            allow("allow-echo", r"^echo($|\s)"),
+            redirect("allow-local", ".*", true),
+        ]);
+        let cases = [
+            ("echo hi > report.txt", PreToolResult::Allow),
+            ("rm file", PreToolResult::Deny),
+            ("docker build", PreToolResult::Ask),
+            ("cargo doc --open", PreToolResult::Modify),
+        ];
+        let rows: Vec<_> = cases
+            .iter()
+            .map(|(command, computed)| {
+                let recorded = if *computed == PreToolResult::Ask {
+                    PreToolResult::Allow
+                } else {
+                    PreToolResult::Ask
+                };
+                bash_row_in(command, 1, recorded, cwd)
+            })
+            .collect();
+
+        let report = build_replay_report(&rows, &engine, None, None, Default::default());
+        let computed: BTreeMap<_, _> = report
+            .divergences
+            .iter()
+            .map(|row| (row.command.as_str(), row.computed))
+            .collect();
+
+        assert_eq!(computed.len(), cases.len());
+        for (command, expected) in cases {
+            assert_eq!(computed[command], expected, "case {command:?}");
+        }
+    }
 
     #[test]
     fn replay_flags_lost_allow_regression() {
@@ -1979,8 +2739,9 @@ mod tests {
         ];
         let report = build_replay_report(&rows, &engine, None, None, Default::default());
 
-        assert_eq!(report.total_evaluated, 3);
-        assert_eq!(report.lost_allow_count, 1);
+        assert_eq!(report.total_evaluated, 10);
+        assert_eq!(report.lost_allow_count, 3);
+        assert_eq!(replay_failure(&report), Some(ReplayFailure::LostAllow));
         let lost: Vec<_> = report
             .divergences
             .iter()
@@ -1996,7 +2757,7 @@ mod tests {
         let rows = vec![bash_row("ls -la", 4, PreToolResult::Ask)]; // was prompted, now allowed
         let report = build_replay_report(&rows, &engine, None, None, Default::default());
 
-        assert_eq!(report.newly_allowed_count, 1);
+        assert_eq!(report.newly_allowed_count, 4);
         assert_eq!(report.lost_allow_count, 0);
         assert_eq!(report.divergences[0].classification, "newly-allowed");
     }
@@ -2016,12 +2777,12 @@ mod tests {
         plan_allow.modes = Some(BTreeSet::from([PermissionMode::Plan]));
         let engine = engine_with_bash(vec![plan_allow]);
         let rows = vec![
-            bash_row_mode("ls", 1, PreToolResult::Ask, "", Some(PermissionMode::Plan)),
+            bash_row_mode("ls", 1, PreToolResult::Ask, "/", Some(PermissionMode::Plan)),
             bash_row_mode(
                 "ls",
                 1,
                 PreToolResult::Ask,
-                "",
+                "/",
                 Some(PermissionMode::Default),
             ),
             bash_row("ls", 1, PreToolResult::Ask),
@@ -2053,8 +2814,8 @@ mod tests {
             Default::default(),
         );
 
-        assert_eq!(report.total_evaluated, 1);
-        assert_eq!(report.lost_allow_count, 1);
+        assert_eq!(report.total_evaluated, 2);
+        assert_eq!(report.lost_allow_count, 2);
         assert_eq!(report.newly_allowed_count, 0);
     }
 
@@ -2066,6 +2827,55 @@ mod tests {
         assert_eq!(report.lost_allow_count, 0);
         assert_eq!(report.newly_allowed_count, 0);
         assert!(report.divergences.is_empty());
+        assert_eq!(replay_failure(&report), None);
+    }
+
+    #[test]
+    fn replay_classifies_command_and_redirect_policy_as_newly_allowed() {
+        let rows = vec![bash_row_in(
+            "echo hi > out.txt",
+            2,
+            PreToolResult::Ask,
+            "/tmp",
+        )];
+        let engine = engine_with_bash(vec![
+            allow("allow-echo", r"^echo($|\s)"),
+            redirect("allow-local-redirect", ".*", true),
+        ]);
+
+        let report = build_replay_report(&rows, &engine, None, None, Default::default());
+        assert_eq!(report.newly_allowed_count, 2);
+        assert_eq!(report.divergences[0].classification, "newly-allowed");
+    }
+
+    #[test]
+    fn replay_applies_redirect_policy_to_rewritten_commands() {
+        let rows = vec![bash_row_in("echo", 1, PreToolResult::Modify, "/tmp")];
+        let engine = engine_with_bash(vec![modify(
+            "redirecting-echo",
+            r"^echo$",
+            "echo > report.txt",
+        )]);
+
+        let report = build_replay_report(&rows, &engine, None, None, Default::default());
+        assert_eq!(report.divergences[0].computed, PreToolResult::Ask);
+    }
+
+    #[test]
+    fn replay_revalidates_argument_filtered_redirects() {
+        let rows = vec![bash_row_in(
+            "cargo doc --open > report.txt",
+            1,
+            PreToolResult::Modify,
+            "/tmp",
+        )];
+        let engine = engine_with_bash(vec![
+            filter("strip-open", r"^cargo doc.*--open", "--open", None),
+            allow("allow-cargo-doc", r"^cargo doc"),
+        ]);
+
+        let report = build_replay_report(&rows, &engine, None, None, Default::default());
+        assert_eq!(report.divergences[0].computed, PreToolResult::Ask);
     }
 
     #[test]
@@ -2077,6 +2887,7 @@ mod tests {
             result: PreToolResult::Allow,
             count: 3,
             rule: None,
+            rules: Vec::new(),
             cwd: String::new(),
             permission_mode: None,
         }];
@@ -2109,27 +2920,75 @@ mod tests {
     }
 
     #[test]
-    fn replay_without_recorded_cwd_skips_normalization() {
-        // A historical row without cwd cannot be normalized, so the same absolute-path command no longer
-        // matches the relative allow-rule and is reported as a lost auto-approval.
-        let engine = engine_with_bash(vec![allow("allow-cat-src", r"^cat src/")]);
-        let rows = vec![bash_row_in(
-            "cat /work/proj/src/main.rs",
-            1,
-            PreToolResult::Allow,
-            "",
-        )];
+    fn historical_rows_without_cwd_are_filtered() {
+        let row = bash_row_in("echo hi > out.txt", 3, PreToolResult::Ask, "");
+        let engine = engine_with_bash(vec![]);
+        let report = build_replay_report(from_ref(&row), &engine, None, None, Default::default());
 
-        let report = build_replay_report(&rows, &engine, None, None, Default::default());
-
-        assert_eq!(report.lost_allow_count, 1);
+        assert_eq!((report.total_evaluated, report.skipped_no_cwd), (0, 3));
+        assert_eq!(
+            replay_failure(&report),
+            Some(ReplayFailure::NoReproducibleCwd)
+        );
+        assert_eq!(
+            replay_failure_message(&report),
+            Some("Replay cannot verify the candidate: every in-scope historical record lacks cwd")
+        );
+        assert!(exact_ask_suggestions(from_ref(&row), &engine).is_empty());
+        assert!(build_redirect_suggestions(&[row], 1, 10, &engine).is_empty());
     }
 
     #[test]
     fn suggest_empty_rows_yield_no_suggestions() {
         assert!(
-            build_suggestions(&[], MatchMode::Exact, SuggestAction::Ask, 2, 10, None).is_empty()
+            build_suggestions(
+                &[],
+                MatchMode::Exact,
+                SuggestAction::Ask,
+                2,
+                10,
+                &empty_engine()
+            )
+            .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn suggestion_scope_discloses_cwd_less_history() {
+        let _config_guard = setup_isolated_xdg_config();
+        let log_dir = tempfile::tempdir().unwrap();
+        write_bash_log(log_dir.path(), &[("echo hi", ""), ("echo hi", "")]).await;
+
+        let mut opts = suggest_options(log_dir.path().into());
+        opts.action = Some(SuggestAction::AllowRedirect);
+        let (suggestions, scope) = collect_suggestions(&opts).await.unwrap();
+        assert!(suggestions.is_empty());
+        assert!(scope.contains("Skipped 2 historical record(s) without a recorded cwd."));
+        assert!(scope.contains("apply in every project"));
+    }
+
+    #[test]
+    fn redirect_suggestion_names_include_locality() {
+        assert_ne!(
+            redirect_suggestion_name(r"^target$", false),
+            redirect_suggestion_name(r"^target$", true)
+        );
+    }
+
+    #[test]
+    fn suggest_omits_fully_authorized_redirect_leaf_with_stale_cwd() {
+        let engine = engine_with_bash(vec![
+            allow("allow-echo", r"^echo($|\s)"),
+            redirect("allow-dev-null", r"^/dev/null$", false),
+        ]);
+        let rows = vec![bash_row_in(
+            "echo hi >/dev/null",
+            4,
+            PreToolResult::Ask,
+            "/removed-worktree",
+        )];
+
+        assert!(exact_ask_suggestions(&rows, &engine).is_empty());
     }
 
     #[test]
@@ -2141,14 +3000,7 @@ mod tests {
             bash_row("head -5 Cargo.toml", 4, PreToolResult::Ask),
             bash_row("tail -20 Cargo.toml", 3, PreToolResult::Ask),
         ];
-        let suggestions = build_suggestions(
-            &rows,
-            MatchMode::Exact,
-            SuggestAction::Ask,
-            1,
-            10,
-            Some(&engine),
-        );
+        let suggestions = exact_ask_suggestions(&rows, &engine);
 
         assert_eq!(suggestions.len(), 1);
         let suggestion = &suggestions[0];
@@ -2164,14 +3016,7 @@ mod tests {
             4,
             PreToolResult::Ask,
         )];
-        let suggestions = build_suggestions(
-            &rows,
-            MatchMode::Exact,
-            SuggestAction::Ask,
-            1,
-            10,
-            Some(&engine),
-        );
+        let suggestions = exact_ask_suggestions(&rows, &engine);
 
         assert_eq!(suggestions.len(), 1);
         assert_eq!(suggestions[0].rule.pattern, r"^tail \-20 Cargo\.toml$",);
@@ -2179,44 +3024,34 @@ mod tests {
     }
 
     #[test]
-    fn suggest_keeps_real_file_write_leaves_even_when_allowed() {
-        // The compound engine caps Allow → Ask when a leaf writes to a real file, so those
-        // leaves still reach the user. The filter must not drop them even when `apply_rules`
-        // alone says Allowed.
+    fn suggest_keeps_redirect_prompted_leaves_for_ask_and_deny() {
         let engine = engine_with_bash(vec![allow("allow-echo", r"^echo($|\s)")]);
         let rows = vec![bash_row("echo hi > output.txt", 5, PreToolResult::Ask)];
-        let suggestions = build_suggestions(
-            &rows,
-            MatchMode::Exact,
-            SuggestAction::Ask,
-            1,
-            10,
-            Some(&engine),
-        );
 
-        assert_eq!(
-            suggestions.len(),
-            1,
-            "real-file-write leaf must survive the filter"
+        for action in [SuggestAction::Ask, SuggestAction::Deny] {
+            let suggestions = build_suggestions(&rows, MatchMode::Exact, action, 1, 10, &engine);
+            assert_eq!(suggestions.len(), 1, "action {action:?}");
+        }
+        assert!(
+            build_suggestions(
+                &rows,
+                MatchMode::Exact,
+                SuggestAction::Allow,
+                1,
+                10,
+                &engine,
+            )
+            .is_empty()
         );
-        assert_eq!(suggestions[0].rule.pattern, r"^echo hi > output\.txt$",);
     }
 
     #[test]
     fn suggest_keeps_bailed_commands_even_when_allowed() {
         // A bailed command (e.g., one with command substitution) is never `Allowed` by the
-        // compound engine — it is capped to Ask — so `apply_rules()` alone returning `Allowed`
-        // for a bailed leaf must not filter it out.
+        // canonical evaluation never allows a bailed command, so it must remain suggestible.
         let engine = engine_with_bash(vec![allow("allow-echo", r"^echo($|\s)")]);
         let rows = vec![bash_row("echo $(date)", 4, PreToolResult::Ask)];
-        let suggestions = build_suggestions(
-            &rows,
-            MatchMode::Exact,
-            SuggestAction::Ask,
-            1,
-            10,
-            Some(&engine),
-        );
+        let suggestions = exact_ask_suggestions(&rows, &engine);
 
         assert_eq!(suggestions.len(), 1);
         assert_eq!(

@@ -245,10 +245,10 @@ fn test_engine_with_fragments() {
     let rules = vec![allow_rule("allow-ls", "^ls{{safe}}*$")];
     let engine = make_engine_with_fragments(rules, Some(fragments));
 
-    let result = engine.apply_rules("ls -la", None);
+    let result = command_result(&engine, "ls -la", None);
     assert!(matches!(result, RuleResult::Allowed { .. }));
 
-    let result = engine.apply_rules("ls | grep foo", None);
+    let result = command_result(&engine, "ls | grep foo", None);
     assert!(matches!(result, RuleResult::NoMatch));
 }
 
@@ -295,10 +295,10 @@ fn test_user_fragments_override_defaults() {
     let rules = vec![allow_rule("test", "^{{safe_chars}}+$")];
     let engine = make_engine_with_fragments(rules, Some(user_fragments));
 
-    let result = engine.apply_rules("abc", None);
+    let result = command_result(&engine, "abc", None);
     assert!(matches!(result, RuleResult::Allowed { .. }));
 
-    let result = engine.apply_rules("ABC", None);
+    let result = command_result(&engine, "ABC", None);
     assert!(matches!(result, RuleResult::NoMatch));
 }
 
@@ -314,7 +314,7 @@ fn test_fragment_expansion_error_logged_and_skipped() {
 
     let engine = make_engine_with_fragments(rules, Some(fragments));
 
-    let result = engine.apply_rules("abc", None);
+    let result = command_result(&engine, "abc", None);
     assert!(matches!(result, RuleResult::Allowed { .. }));
 }
 
@@ -329,7 +329,7 @@ fn test_fragment_in_modify_action() {
         "$1 --dry-run",
     )];
     let engine = make_engine_with_fragments(rules, Some(fragments));
-    let result = engine.apply_rules("docker build", None);
+    let result = command_result(&engine, "docker build", None);
 
     match result {
         RuleResult::Modified { new_command, .. } => {

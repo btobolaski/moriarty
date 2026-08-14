@@ -45,10 +45,9 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-use fs2::FileExt;
-
 use chrono::{DateTime, Utc};
-use miette::{Context, IntoDiagnostic, Result};
+use fs2::FileExt;
+use miette::{Context, IntoDiagnostic};
 use serde::{Deserialize, Serialize};
 
 use crate::{hashing, persistence::FileType, repository};
@@ -215,7 +214,7 @@ impl VerificationResult {
 
 impl ProjectApprovals {
     /// Load approvals from disk
-    pub async fn load() -> Result<Self> {
+    pub async fn load() -> miette::Result<Self> {
         match FileType::Config.load::<Self>(APPROVALS_FILE).await {
             Ok(approvals) => Ok(approvals),
             Err(e) => {
@@ -233,7 +232,7 @@ impl ProjectApprovals {
     }
 
     /// Save approvals to disk
-    pub async fn save(&self) -> Result<()> {
+    pub async fn save(&self) -> miette::Result<()> {
         FileType::Config.persist(APPROVALS_FILE, self).await
     }
 
@@ -243,9 +242,9 @@ impl ProjectApprovals {
     /// don't race by using file locking to make the load-modify-save cycle atomic.
     /// Approval insertion happens inside this method, so concurrent approvals from two worktrees
     /// stay atomic.
-    pub async fn update<F>(f: F) -> Result<()>
+    pub async fn update<F>(f: F) -> miette::Result<()>
     where
-        F: FnOnce(&mut Self) -> Result<()>,
+        F: FnOnce(&mut Self) -> miette::Result<()>,
     {
         let approvals_path = FileType::Config.build_path(APPROVALS_FILE).await?;
         let lock_path = approvals_path.with_extension("lock");
@@ -285,7 +284,7 @@ impl ProjectApprovals {
         workspace_root: &Path,
         config: &ProjectConfig,
         command_name: &str,
-    ) -> Result<VerificationResult> {
+    ) -> miette::Result<VerificationResult> {
         self.verify_item_for_workspace(
             repository_root,
             workspace_root,
@@ -304,7 +303,7 @@ impl ProjectApprovals {
         workspace_root: &Path,
         config: &ProjectConfig,
         check_name: &str,
-    ) -> Result<VerificationResult> {
+    ) -> miette::Result<VerificationResult> {
         self.verify_item_for_workspace(
             repository_root,
             workspace_root,
@@ -337,7 +336,7 @@ impl ProjectApprovals {
         config: &ProjectConfig,
         item_name: &str,
         item_type: ItemType,
-    ) -> Result<VerificationResult> {
+    ) -> miette::Result<VerificationResult> {
         let project_key = repository_root.to_string_lossy().to_string();
 
         let Some(approval) = self.projects.get(&project_key) else {
@@ -444,7 +443,7 @@ impl ProjectApprovals {
         workspace_root: PathBuf,
         commands: HashMap<String, CommandApproval>,
         checks: HashMap<String, CommandApproval>,
-    ) -> Result<()> {
+    ) -> miette::Result<()> {
         // Detect repository root (jj workspace root, git root, or canonicalized path) — approvals
         // stay keyed by repository root so identical content across worktrees needs no re-approval.
         let repository_root = repository::detect_repository_root(&workspace_root)?;
@@ -559,7 +558,7 @@ pub fn normalize_path_for_storage(path: &Path, workspace_root: &Path) -> String 
 pub fn resolve_binary_path_with_original(
     binary_name: &str,
     project_dir: &Path,
-) -> Result<(PathBuf, PathBuf)> {
+) -> miette::Result<(PathBuf, PathBuf)> {
     let path = Path::new(binary_name);
 
     // Determine the original (non-canonicalized) path
@@ -594,7 +593,7 @@ pub fn resolve_binary_path_with_original(
 /// Scripts are treated specially in the approval flow: if a script is also writable,
 /// its full contents are displayed to the user during approval. This prevents hidden
 /// malicious code execution by ensuring users can review what will actually run.
-pub async fn is_script(path: &Path) -> Result<bool> {
+pub async fn is_script(path: &Path) -> miette::Result<bool> {
     use tokio::io::AsyncReadExt;
 
     let mut file = tokio::fs::File::open(path)
@@ -613,7 +612,7 @@ pub async fn is_script(path: &Path) -> Result<bool> {
 
 /// Check if a file is writable by the current user
 #[cfg(unix)]
-pub async fn is_writable(path: &Path) -> Result<bool> {
+pub async fn is_writable(path: &Path) -> miette::Result<bool> {
     let metadata = tokio::fs::metadata(path)
         .await
         .into_diagnostic()
@@ -634,7 +633,7 @@ pub fn is_within_project(binary_path: &Path, project_dir: &Path) -> bool {
 }
 
 /// Read script contents for display in TUI
-pub async fn read_script_contents(path: &Path) -> Result<String> {
+pub async fn read_script_contents(path: &Path) -> miette::Result<String> {
     tokio::fs::read_to_string(path)
         .await
         .into_diagnostic()

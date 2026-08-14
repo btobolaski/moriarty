@@ -470,7 +470,8 @@ enum RulesCommand {
         /// or a fuzzy per-program generalization over observed subcommands
         #[arg(long = "match", value_enum, default_value = "exact")]
         match_mode: rules::MatchMode,
-        /// Action for generated rules (defaults to ask, or deny when --result deny)
+        /// Action for generated rules (defaults to ask, or deny when --result deny).
+        /// allow and target-scoped allow-redirect require --match exact.
         #[arg(long, value_enum)]
         action: Option<rules::SuggestAction>,
         /// Mine every recorded line, not just those produced by the rules currently in force
@@ -1079,6 +1080,28 @@ mod tests {
                 assert_eq!(start_time.as_deref(), Some("2026-01-01"));
                 assert_eq!(match_mode, MatchMode::Prefix);
             }
+            other => panic!("expected rules suggest command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_allow_redirect_suggestion_action() {
+        use crate::rules::SuggestAction;
+
+        let cli = Cli::try_parse_from([
+            "moriarty",
+            "rules",
+            "suggest",
+            "--action",
+            "allow-redirect",
+            "--match",
+            "exact",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Rules {
+                subcommand: RulesCommand::Suggest { action, .. },
+            } => assert_eq!(action, Some(SuggestAction::AllowRedirect)),
             other => panic!("expected rules suggest command, got {other:?}"),
         }
     }

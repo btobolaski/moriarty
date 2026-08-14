@@ -2,10 +2,10 @@
 //!
 //! Reads the hooks tracing logs, keeps the completed PreToolUse records (those carrying the
 //! clean `result` field written by [`super::result`]), and groups them by the exact
-//! `(tool name, arguments, result, deciding rule)` key so each row reports how often that exact
-//! call occurred. Output is JSON on stdout; nothing else is written there. The same streaming
-//! parser/filter fold supplies timestamp-preserving outcomes to `rules report` without retaining
-//! every matching record.
+//! `(tool name, arguments, result, deciding rule, ordered contributors)` key so each row reports
+//! how often that exact call occurred. Output is JSON on stdout; nothing else is written there. The
+//! same streaming parser/filter fold supplies timestamp-preserving outcomes to `rules report`
+//! without retaining every matching record.
 
 // standard library
 use std::{
@@ -17,7 +17,7 @@ use std::{
 // 3rd party crates
 use chrono::{DateTime, Utc};
 use futures::{StreamExt, TryStreamExt, stream};
-use miette::{IntoDiagnostic, Result, WrapErr};
+use miette::{IntoDiagnostic, WrapErr};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::warn;
@@ -52,6 +52,7 @@ struct LogEventFields {
     permission_mode: Option<String>,
     rules_hash: Option<String>,
     rule: Option<String>,
+    rules: Option<String>,
 }
 
 #[derive(Clone)]
@@ -68,6 +69,8 @@ struct HookRecord {
     rules_hash: Option<String>,
     /// Name of the rule whose action produced the decision; `None` when no rule decided.
     rule: Option<String>,
+    /// Ordered rule contributors, falling back to the singular rule for historical records.
+    rules: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -77,13 +80,16 @@ pub(crate) struct ReportRow {
     pub(crate) result: PreToolResult,
     pub(crate) count: u64,
     /// The rule that decided these calls. Part of the grouping key, so one row never mixes
-    /// decisions from different rules; omitted from the JSON when no rule decided (historical lines
-    /// and passthrough/unconfigured outcomes), keeping those rows' serialization unchanged.
+    /// decisions from different rules; omitted when no rule decided, preserving the JSON shape of
+    /// unattributed historical and passthrough/unconfigured rows.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) rule: Option<String>,
-    /// The cwd these calls ran under. Skipped in `hooks report` output, which groups without cwd so
-    /// its rows and counts are unchanged; populated (and part of the grouping key) only for the
-    /// rules path via [`aggregate_with_cwd`]. Empty string for the `hooks report` grouping.
+    /// Complete ordered provenance; omitted only when no rule contributed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) rules: Vec<String>,
+    /// The cwd these calls ran under. Skipped in `hooks report` output and grouping; provenance
+    /// changes can still split otherwise identical calls because `rules` remains part of the key.
+    /// Populated only for the rules path via [`aggregate_with_cwd`].
     #[serde(skip)]
     pub(crate) cwd: String,
     /// Internal rules utilities group and evaluate by mode; the public report deliberately omits it.
@@ -147,6 +153,7 @@ struct RowKey {
     tool_args: String,
     result: PreToolResult,
     rule: Option<String>,
+    rules: Vec<String>,
     cwd: String,
     permission_mode: Option<PermissionMode>,
 }
@@ -158,7 +165,7 @@ pub async fn run(
     tool: Option<String>,
     result: Option<PreToolResult>,
     timezone: crate::cost_report::DateTimezone,
-) -> Result<()> {
+) -> miette::Result<()> {
     let filter = TimeRangeFilter::new(start_time, end_time, timezone)?;
     let rows = aggregate(dir, &filter, tool.as_deref(), result).await?;
 
@@ -169,7 +176,7 @@ pub async fn run(
     Ok(())
 }
 
-/// Reads the hook logs and aggregates them into `(tool, arguments, result)` rows, sorted by count.
+/// Reads the hook logs and aggregates by tool, arguments, result, deciding rule, and contributors.
 /// Used by `hooks report`; `cwd` is not part of the grouping key, so identical calls from different
 /// directories merge into one row (the report's historical behavior).
 pub(crate) async fn aggregate(
@@ -177,7 +184,7 @@ pub(crate) async fn aggregate(
     filter: &TimeRangeFilter,
     tool: Option<&str>,
     result: Option<PreToolResult>,
-) -> Result<Vec<ReportRow>> {
+) -> miette::Result<Vec<ReportRow>> {
     let aggregation =
         aggregate_rows(dir, filter, tool, result, false, &RulesHashFilter::Any).await?;
     Ok(aggregation.rows)
@@ -194,7 +201,7 @@ pub(crate) async fn aggregate_with_cwd(
     tool: Option<&str>,
     result: Option<PreToolResult>,
     hash_filter: &RulesHashFilter,
-) -> Result<CwdAggregation> {
+) -> miette::Result<CwdAggregation> {
     aggregate_rows(dir, filter, tool, result, true, hash_filter).await
 }
 
@@ -206,7 +213,7 @@ pub(crate) async fn fold_outcomes<T, F>(
     hash_filter: &RulesHashFilter,
     initial: T,
     mut fold: F,
-) -> Result<(T, HashSkipStats)>
+) -> miette::Result<(T, HashSkipStats)>
 where
     F: FnMut(&mut T, OutcomeRecord),
 {
@@ -229,7 +236,7 @@ where
     .await
 }
 
-async fn resolve_log_dir(dir: Option<PathBuf>) -> Result<PathBuf> {
+async fn resolve_log_dir(dir: Option<PathBuf>) -> miette::Result<PathBuf> {
     if let Some(dir) = dir {
         return Ok(dir);
     }
@@ -241,7 +248,7 @@ async fn resolve_log_dir(dir: Option<PathBuf>) -> Result<PathBuf> {
         .ok_or_else(|| miette::miette!("Could not determine the hooks log directory"))
 }
 
-async fn log_files(log_dir: &Path) -> Result<Vec<PathBuf>> {
+async fn log_files(log_dir: &Path) -> miette::Result<Vec<PathBuf>> {
     let mut entries = match tokio::fs::read_dir(log_dir).await {
         Ok(entries) => entries,
         // A missing log directory means no hooks have run yet; an empty report is correct.
@@ -263,7 +270,7 @@ async fn log_files(log_dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-async fn read_log_file(path: PathBuf) -> Result<String> {
+async fn read_log_file(path: PathBuf) -> miette::Result<String> {
     tokio::fs::read_to_string(&path)
         .await
         .into_diagnostic()
@@ -280,6 +287,8 @@ fn parse_record(line: &str) -> Option<HookRecord> {
         return None;
     }
 
+    let rule = envelope.fields.rule.filter(|rule| !rule.is_empty());
+    let rules = parse_rule_contributors(envelope.fields.rules, rule.as_deref());
     Some(HookRecord {
         timestamp: envelope.timestamp,
         tool_name: envelope.fields.tool_name?,
@@ -291,8 +300,24 @@ fn parse_record(line: &str) -> Option<HookRecord> {
         // empty value must mean None here — otherwise the hash filter would misclassify a
         // config-load-failure line as belonging to some other rule set.
         rules_hash: envelope.fields.rules_hash.filter(|hash| !hash.is_empty()),
-        rule: envelope.fields.rule.filter(|rule| !rule.is_empty()),
+        rule,
+        rules,
     })
+}
+
+fn parse_rule_contributors(encoded: Option<String>, legacy_rule: Option<&str>) -> Vec<String> {
+    let parsed = encoded
+        .filter(|value| !value.is_empty())
+        .and_then(|value| serde_json::from_str::<Vec<String>>(&value).ok());
+    parsed
+        .unwrap_or_else(|| {
+            legacy_rule
+                .map(|rule| vec![rule.to_string()])
+                .unwrap_or_default()
+        })
+        .into_iter()
+        .filter(|rule| !rule.is_empty())
+        .collect()
 }
 
 fn parse_recorded_permission_mode(mode: Option<String>) -> Option<PermissionMode> {
@@ -349,7 +374,7 @@ async fn fold_filtered_records<T, F>(
     filters: RecordFilters<'_>,
     mut value: T,
     mut fold: F,
-) -> Result<(T, HashSkipStats)>
+) -> miette::Result<(T, HashSkipStats)>
 where
     F: FnMut(&mut T, HookRecord),
 {
@@ -383,6 +408,7 @@ fn count_row(counts: &mut HashMap<RowKey, u64>, record: HookRecord, include_cwd:
             tool_args: record.tool_args,
             result: record.result,
             rule: record.rule,
+            rules: record.rules,
             cwd,
             permission_mode,
         })
@@ -401,6 +427,7 @@ fn finish_rows(counts: HashMap<RowKey, u64>, skipped: HashSkipStats) -> CwdAggre
             .then_with(|| a.tool_args.cmp(&b.tool_args))
             .then_with(|| a.result.as_str().cmp(b.result.as_str()))
             .then_with(|| a.rule.cmp(&b.rule))
+            .then_with(|| a.rules.cmp(&b.rules))
             .then_with(|| a.cwd.cmp(&b.cwd))
             .then_with(|| a.permission_mode.cmp(&b.permission_mode))
     });
@@ -413,6 +440,7 @@ fn finish_rows(counts: HashMap<RowKey, u64>, skipped: HashSkipStats) -> CwdAggre
             result: key.result,
             count,
             rule: key.rule,
+            rules: key.rules,
             cwd: key.cwd,
             permission_mode: key.permission_mode,
         })
@@ -427,7 +455,7 @@ async fn aggregate_rows(
     result: Option<PreToolResult>,
     include_cwd: bool,
     hash_filter: &RulesHashFilter,
-) -> Result<CwdAggregation> {
+) -> miette::Result<CwdAggregation> {
     let filters = RecordFilters {
         time: filter,
         tool,
@@ -470,6 +498,7 @@ mod tests {
             permission_mode: None,
             rules_hash: None,
             rule: None,
+            rules: Vec::new(),
         }
     }
 
@@ -488,6 +517,7 @@ mod tests {
             permission_mode: None,
             rules_hash: rules_hash.map(str::to_string),
             rule: None,
+            rules: Vec::new(),
         }
     }
 
@@ -659,10 +689,10 @@ mod tests {
 
     #[test]
     fn build_rows_groups_by_deciding_rule_and_omits_absent_rule_from_json() {
-        // Two identical calls decided by different rules must not merge into one row, and a row
-        // with no deciding rule must serialize exactly as before (no `rule` key).
+        // Two identical calls decided by different rules must not merge into one row. A row with
+        // no deciding rule or contributors preserves the historical JSON shape.
         let unrestricted = TimeRangeFilter::new(None, None, DateTimezone::Utc).unwrap();
-        let with_rule = |rule: Option<&str>| HookRecord {
+        let with_rule = |rule: Option<&str>, contributors: &[&str]| HookRecord {
             timestamp: ts("2026-06-03T01:00:00Z"),
             tool_name: "Bash".to_string(),
             tool_args: r#"{"command":"ls"}"#.to_string(),
@@ -671,11 +701,16 @@ mod tests {
             permission_mode: None,
             rules_hash: None,
             rule: rule.map(str::to_string),
+            rules: contributors
+                .iter()
+                .map(|rule| (*rule).to_string())
+                .collect(),
         };
         let records = vec![
-            with_rule(Some("allow-ls")),
-            with_rule(Some("allow-read-commands")),
-            with_rule(None),
+            with_rule(Some("allow-ls"), &["allow-ls", "allow-out"]),
+            with_rule(Some("allow-ls"), &["allow-ls", "allow-local"]),
+            with_rule(Some("allow-read-commands"), &["allow-read-commands"]),
+            with_rule(None, &[]),
         ];
 
         let rows = build_rows(
@@ -688,12 +723,17 @@ mod tests {
         )
         .rows;
 
-        assert_eq!(rows.len(), 3, "each deciding rule gets its own row");
+        assert_eq!(rows.len(), 4, "rules and contributor lists split rows");
         let mut rules: Vec<Option<&str>> = rows.iter().map(|row| row.rule.as_deref()).collect();
         rules.sort_unstable();
         assert_eq!(
             rules,
-            vec![None, Some("allow-ls"), Some("allow-read-commands")],
+            vec![
+                None,
+                Some("allow-ls"),
+                Some("allow-ls"),
+                Some("allow-read-commands"),
+            ],
             "rows carry exactly the rules that decided them"
         );
         let no_rule_row = rows
@@ -703,15 +743,25 @@ mod tests {
         let json = serde_json::to_value(no_rule_row).unwrap();
         assert!(
             json.get("rule").is_none(),
-            "a row without a deciding rule serializes without a rule key, exactly as before"
+            "a row without a deciding rule serializes without a rule key"
         );
-        let attributed = serde_json::to_value(
-            rows.iter()
-                .find(|row| row.rule.as_deref() == Some("allow-ls"))
-                .unwrap(),
-        )
-        .unwrap();
+        let allow_ls: Vec<_> = rows
+            .iter()
+            .filter(|row| row.rule.as_deref() == Some("allow-ls"))
+            .collect();
+        assert_eq!(
+            allow_ls
+                .iter()
+                .map(|row| row.rules.as_slice())
+                .collect::<Vec<_>>(),
+            [
+                &["allow-ls".to_string(), "allow-local".to_string()][..],
+                &["allow-ls".to_string(), "allow-out".to_string()][..],
+            ]
+        );
+        let attributed = serde_json::to_value(allow_ls[0]).unwrap();
         assert_eq!(attributed["rule"], "allow-ls");
+        assert!(attributed["rules"].is_array());
     }
 
     #[test]
@@ -737,7 +787,38 @@ mod tests {
         assert_eq!(record.permission_mode, None);
         assert_eq!(record.rules_hash, None);
         assert_eq!(record.rule, None);
+        assert!(record.rules.is_empty());
         assert_eq!(record.cwd.as_deref(), Some("/work"));
+    }
+
+    #[test]
+    fn parse_record_reads_contributors_and_falls_back_to_legacy_rule() {
+        let line = |rules: Option<&str>| {
+            serde_json::json!({
+                "timestamp": "2026-06-03T12:00:00Z",
+                "fields": {
+                    "message": COMPLETION_MESSAGE,
+                    "tool_name": "Bash",
+                    "tool_args": "{\"command\":\"echo hi > out\"}",
+                    "rule": "allow-echo",
+                    "rules": rules,
+                    "result": "allow"
+                }
+            })
+            .to_string()
+        };
+
+        assert_eq!(
+            parse_record(&line(Some(r#"["","allow-echo","allow-out","allow-out"]"#)))
+                .unwrap()
+                .rules,
+            ["allow-echo", "allow-out", "allow-out"]
+        );
+        assert_eq!(parse_record(&line(None)).unwrap().rules, ["allow-echo"]);
+        assert_eq!(
+            parse_record(&line(Some("not json"))).unwrap().rules,
+            ["allow-echo"]
+        );
     }
 
     #[test]
@@ -773,6 +854,7 @@ mod tests {
             permission_mode,
             rules_hash: None,
             rule: None,
+            rules: Vec::new(),
         };
         let records = vec![
             make(Some(PermissionMode::Plan)),
@@ -823,6 +905,7 @@ mod tests {
             result: PreToolResult::Allow,
             count: 1,
             rule: None,
+            rules: Vec::new(),
             cwd: String::new(),
             permission_mode: None,
         };
@@ -1007,6 +1090,7 @@ mod tests {
                     result: PreToolResult::Allow,
                     count: 2,
                     rule: None,
+                    rules: Vec::new(),
                     cwd: String::new(),
                     permission_mode: None,
                 },
@@ -1016,6 +1100,7 @@ mod tests {
                     result: PreToolResult::Deny,
                     count: 1,
                     rule: None,
+                    rules: Vec::new(),
                     cwd: String::new(),
                     permission_mode: None,
                 },
@@ -1025,6 +1110,7 @@ mod tests {
                     result: PreToolResult::Passthrough,
                     count: 1,
                     rule: None,
+                    rules: Vec::new(),
                     cwd: String::new(),
                     permission_mode: None,
                 },
@@ -1305,6 +1391,7 @@ mod tests {
                 result: PreToolResult::Allow,
                 count: 2,
                 rule: None,
+                rules: Vec::new(),
                 cwd: String::new(),
                 permission_mode: None,
             }]

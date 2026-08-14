@@ -9,18 +9,22 @@
 
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
-    ffi::OsString,
-    fs, io,
-    path::{Component, Path, PathBuf},
+    fs,
+    path::{Path, PathBuf},
 };
 
 use regex::Regex;
-use tokio::task::spawn_blocking;
+use tokio::{task::spawn_blocking, time::timeout};
 use tracing::{debug, warn};
 
-use super::bash_rules::{
-    RuleDiagnostic, RuleDiagnosticKind, classify_fragment_error, default_fragments,
-    expand_fragments,
+use super::{
+    FILESYSTEM_EVALUATION_TIMEOUT,
+    bash_rules::{
+        RuleDiagnostic, RuleDiagnosticKind, classify_fragment_error, default_fragments,
+        expand_fragments,
+    },
+    fail_closed_blocking,
+    path_resolution::canonicalize_allow_missing,
 };
 use crate::{
     permission_mode::{PermissionMode, is_mode_eligible},
@@ -86,8 +90,8 @@ struct CompiledToolRule {
 struct CandidatePathEvaluation {
     /// Whether the resolved path starts with the canonicalized `cwd`.
     is_local: bool,
-    /// The fully canonicalized path (existing portions) with any non-existent suffix safely
-    /// appended via [`rebuild_missing_suffix`].
+    /// The fully canonicalized path with any non-existent suffix safely rebuilt by the shared
+    /// path resolver.
     resolved_path: PathBuf,
 }
 
@@ -160,15 +164,6 @@ fn locality_input(tool_input: &serde_json::Value) -> serde_json::Value {
             })
             .collect(),
     )
-}
-
-fn is_missing_path_error(error: &io::Error) -> bool {
-    matches!(
-        error.kind(),
-        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
-    )
-        // Older Windows/Rust combinations may surface ERROR_DIRECTORY (267) as ErrorKind::Other.
-        || cfg!(windows) && error.raw_os_error() == Some(267)
 }
 
 fn compile_rule_pattern(
@@ -391,7 +386,8 @@ impl ToolRuleEngine {
     /// `^/home/user/project/src/`). With `allow_local = true`, condition-free rules retain their
     /// legacy path selection, while condition-bearing rules require every `path` or `file_path`
     /// selected by a presence-requiring predicate or legacy path field to resolve within the
-    /// canonicalized hook cwd. The filesystem work runs on the blocking thread pool.
+    /// canonicalized hook cwd. The filesystem work runs on the blocking thread pool with the
+    /// shared hook deadline; failure or timeout skips every `allow_local` rule.
     pub async fn apply_rules(
         &self,
         tool_name: &str,
@@ -402,20 +398,16 @@ impl ToolRuleEngine {
         let local_evaluation = if self.has_matching_allow_local_rule(tool_name, mode) {
             let locality_value = locality_input(tool_input);
             let cwd_owned = cwd.to_string();
-            match spawn_blocking(move || {
-                evaluate_local_paths(&locality_value, Path::new(&cwd_owned))
-            })
-            .await
-            {
-                Ok(evaluation) => evaluation,
-                Err(error) => {
-                    // Treat locality evaluation failures as a non-match so the hook never
-                    // panics. All allow_local rules are skipped in this case, so evaluation falls
-                    // through to any later non-allow_local rules or NoMatch.
-                    warn!(error = %error, "allow_local path evaluation task failed");
-                    None
-                }
-            }
+            fail_closed_blocking(
+                timeout(
+                    FILESYSTEM_EVALUATION_TIMEOUT,
+                    spawn_blocking(move || {
+                        evaluate_local_paths(&locality_value, Path::new(&cwd_owned))
+                    }),
+                )
+                .await,
+                "allow_local path evaluation",
+            )
         } else {
             None
         };
@@ -618,95 +610,6 @@ fn evaluate_candidate_path(
     }
 }
 
-fn canonicalize_allow_missing(path: &Path) -> io::Result<PathBuf> {
-    let mut current = path.to_path_buf();
-    let mut removed_components = Vec::new();
-
-    loop {
-        match fs::canonicalize(&current) {
-            Ok(canonical) => {
-                return rebuild_missing_suffix(canonical, removed_components.into_iter().rev());
-            }
-            Err(error) if is_missing_path_error(&error) => {
-                // TOCTOU note: between `canonicalize` failing and this `symlink_metadata`
-                // call, the entry at `current` can change. All possible races are fail-safe:
-                // we either correctly detect a broken symlink, or conservatively reject a
-                // path that has been concurrently replaced. We never incorrectly admit an
-                // escaping path.
-                if fs::symlink_metadata(&current)
-                    .is_ok_and(|metadata| metadata.file_type().is_symlink())
-                {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "broken symlink in path; cannot determine locality",
-                    ));
-                }
-
-                let Some(component) = current.components().next_back() else {
-                    return Err(error);
-                };
-
-                match component {
-                    Component::Prefix(_) | Component::RootDir => return Err(error),
-                    Component::CurDir => removed_components.push(MissingPathComponent::CurDir),
-                    Component::ParentDir => {
-                        removed_components.push(MissingPathComponent::ParentDir)
-                    }
-                    Component::Normal(name) => {
-                        removed_components.push(MissingPathComponent::Normal(name.to_os_string()))
-                    }
-                }
-
-                if !current.pop() {
-                    return Err(error);
-                }
-            }
-            Err(error) => return Err(error),
-        }
-    }
-}
-
-fn rebuild_missing_suffix(
-    mut base: PathBuf,
-    components: impl IntoIterator<Item = MissingPathComponent>,
-) -> io::Result<PathBuf> {
-    // `floor` is the component-depth of the canonicalized ancestor — the security boundary.
-    // Any `..` that would push depth below this level means the non-existent suffix is trying
-    // to climb above the verified canonical root, which must be rejected to prevent path
-    // traversal attacks (e.g., `cwd/missing/../../etc/passwd`).
-    let floor = base.components().count();
-    let mut depth = floor;
-
-    for component in components {
-        match component {
-            MissingPathComponent::CurDir => {}
-            MissingPathComponent::Normal(name) => {
-                base.push(name);
-                depth += 1;
-            }
-            MissingPathComponent::ParentDir => {
-                if depth == floor {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "path escapes canonicalized ancestor",
-                    ));
-                }
-                base.pop();
-                depth -= 1;
-            }
-        }
-    }
-
-    Ok(base)
-}
-
-#[derive(Debug)]
-enum MissingPathComponent {
-    CurDir,
-    ParentDir,
-    Normal(OsString),
-}
-
 /// Extract a string representation from a JSON value for regex matching.
 ///
 /// Strings use their raw value, numbers and bools use `to_string()`.
@@ -749,7 +652,59 @@ pub(crate) fn strip_cwd_prefix<'a>(value: &'a str, cwd: &str) -> &'a str {
 
 #[cfg(test)]
 mod tests {
+    use std::{io, time::Duration};
+
+    use tokio::time::timeout;
+
     use super::*;
+
+    #[tokio::test]
+    async fn allow_local_timeout_fails_closed() {
+        let evaluation = fail_closed_blocking(
+            timeout(
+                Duration::from_millis(1),
+                tokio::task::spawn_blocking(|| {
+                    std::thread::sleep(Duration::from_millis(25));
+                    Some(LocalPathEvaluation {
+                        canonical_cwd: PathBuf::from("/"),
+                        path: None,
+                        file_path: None,
+                    })
+                }),
+            )
+            .await,
+            "test locality evaluation",
+        );
+        assert!(evaluation.is_none());
+    }
+
+    #[tokio::test]
+    async fn allow_local_task_failure_fails_closed() {
+        let evaluation = fail_closed_blocking(
+            Ok(
+                tokio::task::spawn_blocking(|| -> Option<LocalPathEvaluation> {
+                    panic!("simulated locality evaluator failure")
+                })
+                .await,
+            ),
+            "test locality evaluation",
+        );
+        assert!(evaluation.is_none());
+    }
+
+    #[test]
+    fn successful_local_evaluation_passes_through() {
+        let evaluation = fail_closed_blocking(
+            Ok(Ok(Some(LocalPathEvaluation {
+                canonical_cwd: PathBuf::from("/project"),
+                path: None,
+                file_path: None,
+            }))),
+            "test locality evaluation",
+        )
+        .unwrap();
+        assert_eq!(evaluation.canonical_cwd, Path::new("/project"));
+    }
 
     fn make_rule(name: &str, tool: &str) -> ToolRule {
         ToolRule {

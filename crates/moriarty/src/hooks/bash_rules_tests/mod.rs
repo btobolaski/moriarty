@@ -1,13 +1,32 @@
 use super::*;
 
+fn filter_command_for_test(command: &str) -> Option<FilterCommand> {
+    let SplitOutcome::Commands(mut leaves) = split_command(command, "", &BTreeSet::new()) else {
+        return None;
+    };
+    (leaves.len() == 1)
+        .then(|| leaves.pop().and_then(|leaf| leaf.filter_command))
+        .flatten()
+}
+
+fn filter_for_test(
+    command: &str,
+    remove: &Option<Vec<String>>,
+    add: &Option<Vec<String>>,
+    replace: &Option<HashMap<String, String>>,
+) -> miette::Result<String> {
+    let filter_command = filter_command_for_test(command);
+    filter_arguments(command, filter_command.as_ref(), remove, add, replace)
+}
+
 fn filter_remove(cmd: &str, remove: &[&str]) -> String {
     let remove = Some(remove.iter().map(|s| s.to_string()).collect());
-    filter_arguments(cmd, &remove, &None, &None).unwrap()
+    filter_for_test(cmd, &remove, &None, &None).unwrap()
 }
 
 fn filter_add(cmd: &str, add: &[&str]) -> String {
     let add = Some(add.iter().map(|s| s.to_string()).collect());
-    filter_arguments(cmd, &None, &add, &None).unwrap()
+    filter_for_test(cmd, &None, &add, &None).unwrap()
 }
 
 fn filter_replace(cmd: &str, replacements: &[(&str, &str)]) -> String {
@@ -15,7 +34,7 @@ fn filter_replace(cmd: &str, replacements: &[(&str, &str)]) -> String {
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
-    filter_arguments(cmd, &None, &None, &Some(replace_map)).unwrap()
+    filter_for_test(cmd, &None, &None, &Some(replace_map)).unwrap()
 }
 
 fn allow_rule(name: &str, pattern: &str) -> BashRule {
@@ -24,6 +43,15 @@ fn allow_rule(name: &str, pattern: &str) -> BashRule {
         pattern: pattern.to_string(),
         modes: None,
         action: BashRuleAction::Allow,
+    }
+}
+
+fn redirect_rule(name: &str, pattern: &str, allow_local: bool) -> BashRule {
+    BashRule {
+        name: name.to_string(),
+        pattern: pattern.to_string(),
+        modes: None,
+        action: BashRuleAction::AllowRedirect { allow_local },
     }
 }
 
@@ -58,8 +86,47 @@ fn modify_rule(name: &str, pattern: &str, replacement: &str) -> BashRule {
     }
 }
 
+fn filter_rule(name: &str, pattern: &str, remove: &str, reason: Option<&str>) -> BashRule {
+    BashRule {
+        name: name.to_string(),
+        pattern: pattern.to_string(),
+        modes: None,
+        action: BashRuleAction::ArgumentFilter {
+            remove: Some(vec![remove.to_string()]),
+            add: None,
+            replace: None,
+            reason: reason.map(str::to_string),
+        },
+    }
+}
+
 fn make_engine(rules: Vec<BashRule>) -> BashRuleEngine {
     make_engine_with_fragments(rules, None)
+}
+
+fn echo_redirect_engine(redirect_rules: Vec<BashRule>) -> BashRuleEngine {
+    let mut rules = vec![allow_rule("allow-echo", r"^echo($|\s)")];
+    rules.extend(redirect_rules);
+    make_engine(rules)
+}
+
+fn local_echo_redirect_engine() -> BashRuleEngine {
+    echo_redirect_engine(vec![redirect_rule("allow-local", ".*", true)])
+}
+
+fn review_redirect_engine() -> BashRuleEngine {
+    make_engine(vec![
+        modify_rule("redirecting-echo", r"^rewrite-echo$", "echo > report.txt"),
+        modify_rule("safe-echo", r"^rewrite-safe$", "echo --safe"),
+        allow_rule(
+            "allow-context-change",
+            r"^(cd|builtin|eval|let|trap|printf|export|read|HOME=)",
+        ),
+        allow_rule("allow-echo", r"^echo($|\s)"),
+        redirect_rule("allow-local", ".*", true),
+        redirect_rule("allow-dev-null", r"^/dev/null$", false),
+        redirect_rule("allow-stdout", r"^&1$", false),
+    ])
 }
 
 fn make_engine_with_fragments(
@@ -88,6 +155,65 @@ fn make_engine_with_aliases_and_fragments(
         tool_rules: None,
     })
     .unwrap()
+}
+
+fn evaluate(
+    engine: &BashRuleEngine,
+    command: &str,
+    cwd: &str,
+    mode: Option<PermissionMode>,
+) -> Evaluation {
+    let context = EvaluationContext::new(cwd, mode);
+    engine.evaluate_sync(command, &context, EvaluationPurpose::Decision)
+}
+
+fn evaluation_result(
+    engine: &BashRuleEngine,
+    command: &str,
+    cwd: &str,
+    mode: Option<PermissionMode>,
+) -> RuleResult {
+    evaluate(engine, command, cwd, mode).rule_result()
+}
+
+fn explain(
+    engine: &BashRuleEngine,
+    command: &str,
+    cwd: &str,
+    mode: Option<PermissionMode>,
+) -> CommandTrace {
+    let context = EvaluationContext::new(cwd, mode);
+    let evaluation = engine.evaluate_sync(command, &context, EvaluationPurpose::Diagnostics);
+    crate::test_runner::command_trace(command, &evaluation)
+}
+
+fn command_result(
+    engine: &BashRuleEngine,
+    command: &str,
+    mode: Option<PermissionMode>,
+) -> RuleResult {
+    engine
+        .match_command_decision(command, None, mode)
+        .outcome()
+        .into()
+}
+
+fn leaf_command_result(
+    engine: &BashRuleEngine,
+    command: &str,
+    cwd: &str,
+    mode: Option<PermissionMode>,
+) -> RuleResult {
+    let SplitOutcome::Commands(leaves) = split_command(command, cwd, &engine.path_aliases) else {
+        return command_result(engine, command, mode);
+    };
+    let [leaf] = leaves.as_slice() else {
+        return RuleResult::NoMatch;
+    };
+    engine
+        .match_command_decision(&leaf.match_text, leaf.filter_command.as_ref(), mode)
+        .outcome()
+        .into()
 }
 
 fn allowed(name: &str) -> RuleResult {
@@ -119,6 +245,7 @@ fn read_only_starter_engine() -> BashRuleEngine {
         allow_rule("allow-ls", r"^ls($|\s)"),
         allow_rule("allow-cat", r"^cat($|\s)"),
         allow_rule("allow-head", r"^head($|\s)"),
+        redirect_rule("allow-dev-null", r"^/dev/null$", false),
     ])
 }
 
@@ -129,7 +256,7 @@ fn assert_compound_cases<'a>(
 ) {
     for (command, expected) in cases {
         assert_eq!(
-            engine.apply_rules_compound(command, cwd, None),
+            evaluation_result(engine, command, cwd, None),
             expected,
             "case {command:?}"
         );
@@ -141,5 +268,4 @@ mod compound;
 mod diagnostics;
 mod explain;
 mod fragments;
-mod merge;
 mod rule_engine;

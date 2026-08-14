@@ -4,9 +4,10 @@
 //! which are used to verify that project tools configurations and executables haven't
 //! been modified since they were approved.
 
-use miette::{Context, IntoDiagnostic, Result};
-use sha2::{Digest, Sha256};
 use std::path::Path;
+
+use miette::{Context, IntoDiagnostic};
+use sha2::{Digest, Sha256};
 
 /// Computes the SHA-256 hash of a file's contents.
 ///
@@ -26,7 +27,7 @@ use std::path::Path;
 /// - The path cannot be canonicalized
 /// - The file cannot be read
 /// - The file is a directory
-pub async fn hash_file<P: AsRef<Path>>(path: P) -> Result<String> {
+pub async fn hash_file<P: AsRef<Path>>(path: P) -> miette::Result<String> {
     let path = path.as_ref();
 
     let canonical_path = path

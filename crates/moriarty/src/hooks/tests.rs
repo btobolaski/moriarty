@@ -1,8 +1,14 @@
 //! Tests for hooks module
 
-use std::{fs, io::Cursor};
+use std::{
+    fs,
+    future::Future,
+    io::Cursor,
+    sync::mpsc::{SyncSender, sync_channel},
+    time::Duration,
+};
 
-use serde_json::{Value, to_value};
+use serde_json::Value;
 use tempfile::TempDir;
 
 use super::*;
@@ -13,6 +19,36 @@ use crate::{
         set_test_env_var, setup_isolated_xdg_config, setup_isolated_xdg_state,
     },
 };
+
+fn with_saturated_blocking_pool<F: Future>(future: F) -> F::Output {
+    struct ReleaseBlockingTask(Option<SyncSender<()>>);
+
+    impl Drop for ReleaseBlockingTask {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (started_tx, started_rx) = sync_channel(0);
+    let (release_tx, release_rx) = sync_channel(0);
+    runtime.spawn_blocking(move || {
+        started_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    });
+    started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let release = ReleaseBlockingTask(Some(release_tx));
+    let output = runtime.block_on(future);
+    drop(release);
+    output
+}
 
 async fn setup_user_bash_rules(rules_toml: &str) -> TempDir {
     let temp_dir = setup_isolated_xdg_config();
@@ -272,6 +308,12 @@ fn cfg_bash_rule(name: &str, pattern: &str, action_toml: &str) -> String {
     format!("[[bash_rules]]\nname = '{name}'\npattern = '{pattern}'\naction = {action_toml}\n")
 }
 
+fn cfg_bash_rules<const N: usize>(rules: [(&str, &str, &str); N]) -> String {
+    rules
+        .map(|(name, pattern, action)| cfg_bash_rule(name, pattern, action))
+        .join("\n")
+}
+
 /// Build an `[[tool_rules]]` fragment with `allow_local = true` plus a
 /// field+pattern constraint and an action. Used by the allow-local integration
 /// tests that differ only in which field/pattern they assert on.
@@ -339,23 +381,42 @@ modes = ["plan"]
 action = { type = "Allow" }
 "#;
 
-async fn exec_pretool_with_mode(config: &str, mode: PermissionMode) -> Value {
+const ALLOW_LOCAL_REDIRECT_RULE: &str = r#"[[bash_rules]]
+name = "allow-local-redirect"
+pattern = ".*"
+action = { type = "AllowRedirect", allow_local = true }
+"#;
+
+fn with_local_redirect(base: &str) -> String {
+    format!("{base}\n{ALLOW_LOCAL_REDIRECT_RULE}")
+}
+
+async fn exec_pretool_fields(
+    config: &str,
+    mode: PermissionMode,
+    cwd: &str,
+    command: &str,
+) -> Value {
     let _xdg_state = setup_isolated_xdg_state();
     let _xdg_config = setup_user_bash_rules(config).await;
-    let mut input = serde_json::json!({
+    let input = serde_json::json!({
         "session_id": "test-session",
         "transcript_path": "/tmp/transcript.json",
-        "cwd": "/tmp/project",
+        "cwd": cwd,
+        "permission_mode": mode,
         "hook_event_name": "PreToolUse",
         "tool_name": "Bash",
-        "tool_input": {"command": "echo hello"}
+        "tool_input": {"command": command}
     });
-    input["permission_mode"] = to_value(mode).unwrap();
 
     exec_hook_impl(Cursor::new(input.to_string()))
         .await
         .unwrap();
     pretool_completion_fields().await
+}
+
+async fn exec_pretool_with_mode(config: &str, mode: PermissionMode) -> Value {
+    exec_pretool_fields(config, mode, "/tmp/project", "echo hello").await
 }
 
 #[tokio::test]
@@ -491,6 +552,10 @@ async fn test_exec_hook_pretool_completion_log_includes_tool_context() {
         Some(""),
         "no rule decides a passthrough"
     );
+    assert_eq!(
+        serde_json::from_str::<Vec<String>>(fields["rules"].as_str().unwrap()).unwrap(),
+        Vec::<String>::new()
+    );
     let rules_hash = fields
         .get("rules_hash")
         .and_then(Value::as_str)
@@ -502,55 +567,32 @@ async fn test_exec_hook_pretool_completion_log_includes_tool_context() {
 }
 
 #[tokio::test]
-async fn test_exec_hook_completion_log_attributes_the_deciding_rule() {
-    let _xdg_state = setup_isolated_xdg_state();
-    let _xdg_config = setup_user_bash_rules(&cfg_bash_rule(
+async fn completion_log_attributes_deciding_and_contributing_rules() {
+    let config = with_local_redirect(&cfg_bash_rule(
         "allow-echo",
-        r"^echo\b",
+        r"^echo($|\s)",
         r#"{ type = "Allow" }"#,
-    ))
+    ));
+    let cwd = TempDir::new().unwrap();
+    let fields = exec_pretool_fields(
+        &config,
+        PermissionMode::Default,
+        cwd.path().to_str().unwrap(),
+        "echo hello > reports/status.txt",
+    )
     .await;
 
-    let input = r#"{
-        "session_id": "test-session",
-        "transcript_path": "/tmp/transcript.json",
-        "cwd": "/tmp/project",
-        "permission_mode": "default",
-        "hook_event_name": "PreToolUse",
-        "tool_name": "Bash",
-        "tool_input": {"command": "echo hello"}
-    }"#;
-
-    exec_hook_impl(Cursor::new(input))
-        .await
-        .expect("PreToolUse Bash event should succeed");
-
-    let content = read_hooks_log_file().await;
-    let fields = content
-        .lines()
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .find(|event| {
-            event.pointer("/fields/message").and_then(Value::as_str)
-                == Some("PreToolUse hook completed")
-        })
-        .expect("PreToolUse completion log event should be present")
-        .get("fields")
-        .cloned()
-        .expect("Tracing JSON event should contain fields");
-
-    assert_eq!(fields.get("result").and_then(Value::as_str), Some("allow"));
+    assert_eq!(fields["result"], "allow");
+    assert_eq!(fields["rule"], "allow-echo");
     assert_eq!(
-        fields.get("rule").and_then(Value::as_str),
-        Some("allow-echo"),
-        "completion log should attribute the decision to the matching rule"
+        serde_json::from_str::<Vec<String>>(fields["rules"].as_str().unwrap()).unwrap(),
+        ["allow-echo", "allow-local-redirect"]
     );
-    let rules_hash = fields
-        .get("rules_hash")
-        .and_then(Value::as_str)
-        .expect("rules_hash should be logged");
     assert!(
-        rules_hash.starts_with("sha256:"),
-        "rules_hash should be the effective-config hash, got: {rules_hash}"
+        fields["rules_hash"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:")
     );
 }
 
@@ -581,20 +623,24 @@ action = { type = "Allow" }
         run_pretool_outcome_mode(config, "Bash", &input, "", Some(PermissionMode::Plan)).await;
     assert_pretool_ask(&plan.output);
     assert_eq!(plan.rule.as_deref(), Some("plan-tool-ask"));
+    assert_eq!(plan.contributors, ["plan-tool-ask"]);
 
     let default =
         run_pretool_outcome_mode(config, "Bash", &input, "", Some(PermissionMode::Default)).await;
     assert_pretool_deny(&default.output, "default denied");
     assert_eq!(default.rule.as_deref(), Some("default-deny"));
+    assert_eq!(default.contributors, ["default-deny"]);
 
     let auto =
         run_pretool_outcome_mode(config, "Bash", &input, "", Some(PermissionMode::Auto)).await;
     assert_pretool_allow(&auto.output);
     assert_eq!(auto.rule.as_deref(), Some("auto-allow"));
+    assert_eq!(auto.contributors, ["auto-allow"]);
 
     let missing = run_pretool_outcome_mode(config, "Bash", &input, "", None).await;
     assert_pretool_ask(&missing.output);
     assert_eq!(missing.rule, None);
+    assert!(missing.contributors.is_empty());
 }
 
 #[tokio::test]
@@ -623,6 +669,7 @@ action = {{ type = "Allow" }}
         run_pretool_outcome_mode(&same_mode, "Bash", &input, "", Some(PermissionMode::Plan)).await;
     assert_pretool_modified_case(&allowed.output, "cargo doc", "same mode");
     assert_eq!(allowed.rule.as_deref(), Some("strip-open"));
+    assert_eq!(allowed.contributors, ["strip-open", "allow-filtered"]);
 
     let different_mode = config(PermissionMode::Default);
     let asked = run_pretool_outcome_mode(
@@ -635,6 +682,134 @@ action = {{ type = "Allow" }}
     .await;
     assert_pretool_ask(&asked.output);
     assert_eq!(asked.rule, None);
+    assert_eq!(asked.contributors, ["strip-open"]);
+}
+
+#[test]
+fn live_timeout_covers_the_whole_evaluation_without_provenance() {
+    let allow_echo = ("allow-echo", "^echo", r#"{ type = "Allow" }"#);
+    let allow_local = (
+        "allow-local",
+        ".*",
+        r#"{ type = "AllowRedirect", allow_local = true }"#,
+    );
+    let plain_config = toml::from_str(&cfg_bash_rules([allow_echo])).unwrap();
+    let filter_config = toml::from_str(&cfg_bash_rules([
+        (
+            "strip-open",
+            "^cargo doc.*--open",
+            r#"{ type = "ArgumentFilter", remove = ["--open"] }"#,
+        ),
+        ("allow-cargo-doc", "^cargo doc", r#"{ type = "Allow" }"#),
+        allow_local,
+    ]))
+    .unwrap();
+    let filesystem_config = toml::from_str(&cfg_bash_rules([allow_echo, allow_local])).unwrap();
+    let cwd = TempDir::new().unwrap();
+    let cwd = cwd.path().to_str().unwrap();
+
+    let (plain, filtered, filesystem) = with_saturated_blocking_pool(async {
+        let plain_input = serde_json::json!({"command": "echo hi"});
+        let filtered_input = serde_json::json!({"command": "cargo doc --open > report.txt"});
+        let filesystem_input = serde_json::json!({"command": "echo hi > report.txt"});
+        let (plain, filtered, filesystem) = tokio::join!(
+            handle_bash_pretool_hook_with_config(&plain_input, plain_config, cwd, None),
+            handle_bash_pretool_hook_with_config(&filtered_input, filter_config, cwd, None),
+            handle_bash_pretool_hook_with_config(&filesystem_input, filesystem_config, cwd, None),
+        );
+        (plain.unwrap(), filtered.unwrap(), filesystem.unwrap())
+    });
+
+    for (label, outcome) in [
+        ("plain command", plain),
+        ("ArgumentFilter recheck", filtered),
+        ("filesystem redirect", filesystem),
+    ] {
+        assert_pretool_ask(&outcome.0);
+        assert_eq!(outcome.1, None, "case {label}");
+        assert!(outcome.2.is_empty(), "case {label}");
+    }
+}
+
+#[tokio::test]
+async fn live_join_failure_asks_without_provenance() {
+    let join_error = tokio::task::spawn_blocking(|| panic!("simulated Bash evaluator failure"))
+        .await
+        .expect_err("the blocking task should fail");
+
+    let (output, rule, contributors) =
+        live_evaluation_failure_outcome(&bash_rules::LiveEvaluationFailure::Join(join_error));
+    assert_pretool_ask(&output);
+    assert_eq!(rule, None);
+    assert!(contributors.is_empty());
+}
+
+#[tokio::test]
+async fn rewritten_outputs_require_redirect_authorization() {
+    let strip_open = (
+        "strip-open",
+        r"^cargo doc.*--open",
+        r#"{ type = "ArgumentFilter", remove = ["--open"] }"#,
+    );
+    let cases = [
+        (
+            cfg_bash_rules([
+                strip_open,
+                (
+                    "allow-cargo-doc",
+                    r"^cargo doc($|\s)",
+                    r#"{ type = "Allow" }"#,
+                ),
+            ]),
+            "cargo doc --open > report.txt",
+            "cargo doc > report.txt",
+            "allow-cargo-doc",
+            &["strip-open"][..],
+        ),
+        (
+            cfg_bash_rules([(
+                "modify-echo",
+                r"^echo$",
+                r#"{ type = "Modify", value = "echo > report.txt" }"#,
+            )]),
+            "echo",
+            "echo > report.txt",
+            "modify-echo",
+            &[][..],
+        ),
+        (
+            cfg_bash_rules([
+                strip_open,
+                (
+                    "modify-cargo-doc",
+                    r"^cargo doc$",
+                    r#"{ type = "Modify", value = "cargo doc > report.txt" }"#,
+                ),
+            ]),
+            "cargo doc --open",
+            "cargo doc > report.txt",
+            "modify-cargo-doc",
+            &["strip-open"][..],
+        ),
+    ];
+    let cwd = TempDir::new().unwrap();
+    let cwd = cwd.path().to_str().unwrap();
+
+    for (base, command, modified, modify_rule, prior_rules) in cases {
+        let input = serde_json::json!({"command": command});
+        let asked = run_pretool_outcome(&base, "Bash", &input, cwd).await;
+        assert_pretool_ask(&asked.output);
+        assert_eq!(asked.rule.as_deref(), Some(modify_rule));
+        let mut expected = prior_rules.to_vec();
+        expected.push(modify_rule);
+        assert_eq!(asked.contributors, expected);
+
+        let with_redirect = with_local_redirect(&base);
+        let allowed = run_pretool_outcome(&with_redirect, "Bash", &input, cwd).await;
+        assert_pretool_modified_case(&allowed.output, modified, command);
+        expected.push("allow-local-redirect");
+        assert_eq!(allowed.contributors, expected);
+    }
 }
 
 #[tokio::test]
@@ -2652,11 +2827,36 @@ action = { type = "Modify", value = "$1 --dry-run" }
 }
 
 #[tokio::test]
-async fn test_bash_hook_real_file_write_caps_allow_at_ask() {
-    // `^echo` allows, but a redirect to a real file must not be silently auto-allowed.
+async fn test_bash_hook_output_redirect_requires_endpoint_rule() {
+    // `^echo` allows the command component but cannot authorize its output endpoint.
     let config = cfg_bash_rule("allow-echo", r"^echo($|\s)", r#"{ type = "Allow" }"#);
     let result = run_bash_hook(&config, "echo secret > out.txt").await;
     assert_pretool_ask(&result);
+}
+
+#[tokio::test]
+async fn test_bash_hook_authorizes_each_supported_endpoint_component() {
+    let config = format!(
+        "{}\n{}\n{}",
+        cfg_bash_rule("allow-echo", r"^echo($|\s)", r#"{ type = "Allow" }"#),
+        ALLOW_LOCAL_REDIRECT_RULE,
+        r#"[[bash_rules]]
+name = "allow-benign-endpoints"
+pattern = "^(/dev/null|&1)$"
+action = { type = "AllowRedirect" }"#
+    );
+    let cwd = TempDir::new().unwrap();
+    let cwd = cwd.path().to_str().unwrap();
+
+    for command in [
+        "echo hi > report.txt",
+        "echo hi >/dev/null",
+        "echo hi 2>&1",
+        "echo hi > one 2> two",
+    ] {
+        assert_pretool_allow(&run_bash_hook_cwd(&config, command, cwd).await);
+    }
+    assert_pretool_ask(&run_bash_hook_cwd(&config, "echo hi > $OUT", cwd).await);
 }
 
 #[tokio::test]

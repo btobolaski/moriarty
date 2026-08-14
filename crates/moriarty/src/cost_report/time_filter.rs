@@ -1,5 +1,4 @@
 use chrono::{DateTime, Duration, Local, NaiveDate, NaiveDateTime, TimeZone, Utc};
-use miette::Result;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DateTimezone {
@@ -17,7 +16,7 @@ impl DateTimezone {
 
     /// Convert a naive datetime (no timezone) to UTC using the command timezone:
     /// `Local` reads the naive as local wall-clock time; `Utc` reads it as UTC.
-    pub fn naive_to_utc(self, naive: NaiveDateTime) -> Result<DateTime<Utc>> {
+    pub fn naive_to_utc(self, naive: NaiveDateTime) -> miette::Result<DateTime<Utc>> {
         match self {
             Self::Utc => Ok(DateTime::from_naive_utc_and_offset(naive, Utc)),
             Self::Local => Local
@@ -36,7 +35,7 @@ impl DateTimezone {
     /// Convert a date to midnight in the command timezone, returning a UTC instant.
     /// Fails only when midnight does not exist or is ambiguous in the local timezone
     /// (an extreme edge case: timezone transitions like Samoa's 2011 date-line jump).
-    pub fn date_to_utc(self, date: NaiveDate) -> Result<DateTime<Utc>> {
+    pub fn date_to_utc(self, date: NaiveDate) -> miette::Result<DateTime<Utc>> {
         let naive = date
             .and_hms_opt(0, 0, 0)
             .expect("00:00:00 is always a valid time");
@@ -45,7 +44,7 @@ impl DateTimezone {
 
     /// The day after `date` at midnight in the command timezone (whole-day inclusive end
     /// convenience). Fails under the same conditions as [`Self::date_to_utc`].
-    pub fn next_midnight_to_utc(self, date: NaiveDate) -> Result<DateTime<Utc>> {
+    pub fn next_midnight_to_utc(self, date: NaiveDate) -> miette::Result<DateTime<Utc>> {
         let next = date
             .succ_opt()
             .expect("Date overflow only occurs beyond year 262000, unreachable for API logs");
@@ -64,7 +63,7 @@ impl DateTimezone {
 ///
 /// Accepted values (case-insensitive): `"local"` and `"utc"`.
 /// Returns an error with a descriptive message for any other value.
-pub fn parse_timezone(timezone: &str) -> Result<DateTimezone> {
+pub fn parse_timezone(timezone: &str) -> miette::Result<DateTimezone> {
     match timezone.to_ascii_lowercase().as_str() {
         "local" => Ok(DateTimezone::Local),
         "utc" => Ok(DateTimezone::Utc),
@@ -89,7 +88,11 @@ pub struct TimeRangeFilter {
 impl TimeRangeFilter {
     /// Date-only inputs map to whole-day bounds in `timezone` so callers can filter
     /// by day without having to spell out the exclusive end timestamp themselves.
-    pub fn new(start: Option<String>, end: Option<String>, timezone: DateTimezone) -> Result<Self> {
+    pub fn new(
+        start: Option<String>,
+        end: Option<String>,
+        timezone: DateTimezone,
+    ) -> miette::Result<Self> {
         let start_dt = start
             .map(|s| parse_datetime_for_start(&s, timezone))
             .transpose()?;
@@ -138,7 +141,11 @@ impl TimeRangeFilter {
     /// `days` must be ≥ 1 and must be small enough that the calendar
     /// arithmetic does not overflow chrono's internal duration or date
     /// representation; values that would overflow are rejected.
-    pub fn with_last_days(days: u64, timezone: DateTimezone, end: Option<String>) -> Result<Self> {
+    pub fn with_last_days(
+        days: u64,
+        timezone: DateTimezone,
+        end: Option<String>,
+    ) -> miette::Result<Self> {
         if days == 0 {
             return Err(miette::miette!(
                 "--last-days must be at least 1 (received 0)"
@@ -195,8 +202,8 @@ fn invalid_datetime_error(s: &str) -> miette::Report {
 fn parse_datetime_with(
     s: &str,
     tz: DateTimezone,
-    date_to_dt: impl FnOnce(NaiveDate) -> Result<DateTime<Utc>>,
-) -> Result<DateTime<Utc>> {
+    date_to_dt: impl FnOnce(NaiveDate) -> miette::Result<DateTime<Utc>>,
+) -> miette::Result<DateTime<Utc>> {
     // RFC 3339 with explicit offset: authoritative, ignore the command timezone.
     if let Some(dt) = try_parse_rfc3339(s) {
         return Ok(dt);
@@ -218,13 +225,13 @@ fn parse_datetime_with(
     Err(invalid_datetime_error(s))
 }
 
-fn parse_datetime_for_start(s: &str, tz: DateTimezone) -> Result<DateTime<Utc>> {
+fn parse_datetime_for_start(s: &str, tz: DateTimezone) -> miette::Result<DateTime<Utc>> {
     parse_datetime_with(s, tz, |date| tz.date_to_utc(date))
 }
 
 /// Date-only end bounds advance to the next midnight so whole-day filters keep
 /// the same inclusive-start / exclusive-end contract as timestamp inputs.
-fn parse_datetime_for_end(s: &str, tz: DateTimezone) -> Result<DateTime<Utc>> {
+fn parse_datetime_for_end(s: &str, tz: DateTimezone) -> miette::Result<DateTime<Utc>> {
     parse_datetime_with(s, tz, |date| tz.next_midnight_to_utc(date))
 }
 

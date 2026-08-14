@@ -60,16 +60,17 @@
 pub mod bash_rules;
 pub(crate) mod command_split;
 pub mod parser;
+pub(crate) mod path_resolution;
 pub mod report;
 pub mod result;
 pub mod tool_rules;
 pub mod tracing;
 
-use std::{io::Read, path::PathBuf};
+use std::{io::Read, path::PathBuf, result::Result as StdResult, sync::Arc, time::Duration};
 
 use ::tracing::{debug, error, info, warn};
-use miette::Result;
 use serde_json::{Map, Value};
+use tokio::{task::JoinError, time::error::Elapsed};
 
 use crate::{
     HooksCommand, checks::CheckRunOutcome, permission_mode::PermissionMode,
@@ -84,9 +85,28 @@ use result::pretool_result;
 const TOOL_ARGS_LOG_TRUNCATE_SIZE: usize = 50_000;
 const SAFE_LOG_STRING_TRUNCATE_SIZE: usize = 4_096;
 const REDACTED_LOG_VALUE: &str = "[redacted]";
+// Tokio cannot cancel a running blocking syscall; this bounds hook latency, not pool occupancy.
+const FILESYSTEM_EVALUATION_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn fail_closed_blocking<T: Default>(
+    result: StdResult<StdResult<T, JoinError>, Elapsed>,
+    operation: &'static str,
+) -> T {
+    match result {
+        Ok(Ok(value)) => value,
+        Ok(Err(error)) => {
+            warn!(%error, operation, "Blocking hook evaluation task failed; failing closed");
+            T::default()
+        }
+        Err(error) => {
+            warn!(%error, operation, "Blocking hook evaluation timed out; failing closed");
+            T::default()
+        }
+    }
+}
 
 /// Execute hooks command
-pub async fn exec_hooks(cmd: HooksCommand) -> Result<()> {
+pub async fn exec_hooks(cmd: HooksCommand) -> miette::Result<()> {
     match cmd {
         HooksCommand::Exec => exec_hook().await,
         HooksCommand::Report(args) => {
@@ -113,6 +133,10 @@ fn hook_input_for_log(hook_input: &HookInput) -> String {
 
 fn tool_args_for_log(tool_input: &Value) -> String {
     truncate_log_field(&tool_input.to_string(), TOOL_ARGS_LOG_TRUNCATE_SIZE)
+}
+
+fn rules_for_log(rules: &[String]) -> String {
+    serde_json::to_string(rules).unwrap_or_else(|_| "[]".to_string())
 }
 
 fn json_value_for_log(value: &Value) -> String {
@@ -186,11 +210,11 @@ fn truncate_log_field(field: &str, max_size: usize) -> String {
 
 /// Parse failures must surface as a nonzero exit code so Claude Code can distinguish a hook
 /// crash from a deliberate decision.
-async fn exec_hook() -> Result<()> {
+async fn exec_hook() -> miette::Result<()> {
     exec_hook_impl(std::io::stdin()).await
 }
 
-async fn exec_hook_impl<R: Read>(reader: R) -> Result<()> {
+async fn exec_hook_impl<R: Read>(reader: R) -> miette::Result<()> {
     // Global tracing subscriber initialization races are acceptable in tests because nextest's
     // process isolation guarantees no cross-contamination, and failed initialization doesn't
     // affect correctness.
@@ -286,6 +310,7 @@ async fn exec_hook_impl<R: Read>(reader: R) -> Result<()> {
         let tool_args = tool_args_for_log(tool_input);
         let result = pretool_result(&hook_output);
         let permission_mode = hook_input.permission_mode.to_string();
+        let rules = rules_for_log(&outcome.contributors);
         info!(
             tool_name = %tool_name,
             tool_args = %tool_args,
@@ -293,6 +318,7 @@ async fn exec_hook_impl<R: Read>(reader: R) -> Result<()> {
             permission_mode = %permission_mode,
             rules_hash = outcome.rules_hash.as_deref().unwrap_or_default(),
             rule = outcome.rule.as_deref().unwrap_or_default(),
+            rules = %rules,
             result = result.as_str(),
             ?hook_output,
             "PreToolUse hook completed"
@@ -382,10 +408,9 @@ async fn load_config_or_ask() -> std::result::Result<crate::user_config::UserCon
     }
 }
 
-/// A decision plus the provenance the completion log records. Grouped because the three values are
-/// produced together and only meaningful as a unit: the log line must attribute the decision to the
-/// rule set and rule that made it; `None` (not an empty string) preserves "no rules involved"
-/// until the completion event is serialized.
+/// A decision plus the provenance the completion log records. The hash, deciding rule, and ordered
+/// contributors are meaningful only for the matching output; `None` (not an empty string) preserves
+/// "no rules involved" until the completion event is serialized.
 struct PretoolOutcome {
     output: HookOutput,
     /// Hash of the rule set that produced this decision (see
@@ -394,8 +419,10 @@ struct PretoolOutcome {
     rules_hash: Option<String>,
     /// Name of the rule whose action produced `output`; `None` when no rule decided (passthrough,
     /// unconfigured-Ask, `NoMatch` prompt, or a post-filter re-validation that matched nothing).
-    /// For a compound command this is the deciding leaf's rule, mirroring `merge_results`.
+    /// For a compound command this is the deciding leaf's rule from canonical evaluation.
     rule: Option<String>,
+    /// Ordered rules that contributed to the evaluated decision; distinct same-named rules remain separate.
+    contributors: Vec<String>,
 }
 
 /// tool_rules are deliberately checked before bash_rules so a tool rule can short-circuit Bash
@@ -406,7 +433,7 @@ async fn handle_pretool_hook(
     tool_input: &serde_json::Value,
     cwd: &str,
     mode: Option<PermissionMode>,
-) -> Result<PretoolOutcome> {
+) -> miette::Result<PretoolOutcome> {
     let config = match load_config_or_ask().await {
         Ok(c) => c,
         Err(fallback) => {
@@ -414,15 +441,17 @@ async fn handle_pretool_hook(
                 output: fallback,
                 rules_hash: None,
                 rule: None,
+                contributors: Vec::new(),
             });
         }
     };
 
     let rules_hash = config.effective_hash();
-    let outcome = |output, rule: Option<String>| PretoolOutcome {
+    let outcome = |output, rule: Option<String>, contributors: Vec<String>| PretoolOutcome {
         output,
         rules_hash: Some(rules_hash.clone()),
         rule,
+        contributors,
     };
 
     if let Some(rules) = &config.tool_rules
@@ -441,7 +470,11 @@ async fn handle_pretool_hook(
                     rule = %rule_name,
                     "Tool call allowed by tool rule"
                 );
-                return Ok(outcome(pretool_allow_hook(None), Some(rule_name)));
+                return Ok(outcome(
+                    pretool_allow_hook(None),
+                    Some(rule_name.clone()),
+                    vec![rule_name],
+                ));
             }
             tool_rules::ToolRuleResult::Denied { rule_name, reason } => {
                 info!(
@@ -450,7 +483,11 @@ async fn handle_pretool_hook(
                     reason = %reason,
                     "Tool call denied by tool rule"
                 );
-                return Ok(outcome(pretool_deny_hook(reason), Some(rule_name)));
+                return Ok(outcome(
+                    pretool_deny_hook(reason),
+                    Some(rule_name.clone()),
+                    vec![rule_name],
+                ));
             }
             tool_rules::ToolRuleResult::Asked { rule_name } => {
                 info!(
@@ -458,7 +495,11 @@ async fn handle_pretool_hook(
                     rule = %rule_name,
                     "Tool rule requests user permission"
                 );
-                return Ok(outcome(pretool_ask_hook(), Some(rule_name)));
+                return Ok(outcome(
+                    pretool_ask_hook(),
+                    Some(rule_name.clone()),
+                    vec![rule_name],
+                ));
             }
             tool_rules::ToolRuleResult::NoMatch => {
                 debug!(tool_name = %tool_name, "No tool rules matched, continuing to engine-specific handling");
@@ -467,12 +508,12 @@ async fn handle_pretool_hook(
     }
 
     if tool_name == "Bash" {
-        let (output, rule) =
+        let (output, rule, contributors) =
             handle_bash_pretool_hook_with_config(tool_input, config, cwd, mode).await?;
-        Ok(outcome(output, rule))
+        Ok(outcome(output, rule, contributors))
     } else {
         debug!(tool_name = %tool_name, "No tool rules matched for non-Bash tool, deferring to Claude Code");
-        Ok(outcome(HookOutput::default(), None))
+        Ok(outcome(HookOutput::default(), None, Vec::new()))
     }
 }
 
@@ -481,14 +522,17 @@ async fn handle_pretool_hook(
 /// Production code routes through `handle_pretool_hook` instead. This wrapper is kept so
 /// existing bash-rule tests can call it directly without going through the tool_rules layer.
 #[cfg(test)]
-async fn handle_bash_pretool_hook(tool_input: &serde_json::Value, cwd: &str) -> Result<HookOutput> {
+async fn handle_bash_pretool_hook(
+    tool_input: &serde_json::Value,
+    cwd: &str,
+) -> miette::Result<HookOutput> {
     let config = match load_config_or_ask().await {
         Ok(c) => c,
         Err(fallback) => return Ok(fallback),
     };
     handle_bash_pretool_hook_with_config(tool_input, config, cwd, None)
         .await
-        .map(|(output, _rule)| output)
+        .map(|(output, _rule, _contributors)| output)
 }
 
 /// Apply bash_rules from a pre-loaded config to validate Bash commands.
@@ -504,15 +548,14 @@ async fn handle_bash_pretool_hook_with_config(
     config: crate::user_config::UserConfig,
     cwd: &str,
     mode: Option<PermissionMode>,
-) -> Result<(HookOutput, Option<String>)> {
-    use bash_rules::{BashRuleEngine, RuleResult};
+) -> miette::Result<(HookOutput, Option<String>, Vec<String>)> {
+    use bash_rules::{BashRuleEngine, PolicyOutcome, RuleResult};
 
     let command = tool_input
         .get("command")
-        .and_then(|v| v.as_str())
+        .and_then(|value| value.as_str())
         .ok_or_else(|| miette::miette!("Missing 'command' field in Bash tool_input"))?;
-
-    info!(command = %command, "Processing Bash PreToolUse hook");
+    info!(command, "Processing Bash PreToolUse hook");
 
     if config
         .bash_rules
@@ -520,167 +563,92 @@ async fn handle_bash_pretool_hook_with_config(
         .is_none_or(|rules| rules.is_empty())
     {
         info!("No bash_rules configured, defaulting to Ask");
-        return Ok((pretool_ask_hook(), None));
+        return Ok((pretool_ask_hook(), None, Vec::new()));
     }
 
-    let engine = BashRuleEngine::from_config(config)?;
-    let result = engine.apply_rules_compound(command, cwd, mode);
+    let engine = Arc::new(BashRuleEngine::from_config(config)?);
+    let evaluation = match engine.evaluate_live(command, cwd, mode).await {
+        Ok(evaluation) => evaluation,
+        Err(error) => return Ok(live_evaluation_failure_outcome(&error)),
+    };
+    let contributors = evaluation.contributors();
+    let original_outcome = evaluation.original_outcome();
 
-    match result {
+    match evaluation.rule_result() {
         RuleResult::Allowed { rule_name } => {
-            info!(
-                command = %command,
-                rule = %rule_name,
-                "Bash command allowed by rule"
-            );
-            Ok((pretool_allow_hook(None), Some(rule_name)))
+            info!(command, rule = %rule_name, "Bash command allowed by rule");
+            Ok((pretool_allow_hook(None), Some(rule_name), contributors))
         }
         RuleResult::Denied { rule_name, reason } => {
-            info!(
-                command = %command,
-                rule = %rule_name,
-                reason = %reason,
-                "Bash command denied by rule"
-            );
-            Ok((pretool_deny_hook(reason), Some(rule_name)))
+            info!(command, rule = %rule_name, reason, "Bash command denied by rule");
+            Ok((pretool_deny_hook(reason), Some(rule_name), contributors))
         }
         RuleResult::Modified {
             rule_name,
             new_command,
         } => {
-            info!(
-                original = %command,
-                modified = %new_command,
-                rule = %rule_name,
-                "Bash command modified by rule"
-            );
+            info!(original = command, modified = %new_command, rule = %rule_name, "Bash command modified by rule");
+            let reason = match original_outcome {
+                PolicyOutcome::ArgumentFilter { reason, .. } => reason.map(str::to_string),
+                _ => Some(format!(
+                    "Command modified by rule '{}' to: {}",
+                    rule_name, new_command
+                )),
+            };
             let mut updated_tool_input = tool_input.clone();
-            let reason = format!(
-                "Command modified by rule '{}' to: {}",
-                rule_name, new_command
-            );
             updated_tool_input["command"] = serde_json::Value::String(new_command);
-
             Ok((
-                pretool_modify_hook(updated_tool_input, Some(reason)),
+                pretool_modify_hook(updated_tool_input, reason),
                 Some(rule_name),
+                contributors,
             ))
         }
         RuleResult::Asked { rule_name } => {
-            info!(
-                command = %command,
-                rule = %rule_name,
-                "Bash rule requests user permission"
-            );
-            Ok((pretool_ask_hook(), Some(rule_name)))
+            info!(command, rule = %rule_name, "Bash rule requests user permission");
+            Ok((pretool_ask_hook(), Some(rule_name), contributors))
         }
         RuleResult::ArgumentFiltered {
             rule_name,
             new_command,
             reason,
         } => {
-            info!(
-                original = %command,
-                filtered = %new_command,
-                rule = %rule_name,
-                "Command arguments filtered, re-validating"
-            );
-
-            let recheck_result = engine.apply_rules_compound(&new_command, cwd, mode);
-
-            match recheck_result {
-                RuleResult::Allowed {
-                    rule_name: allow_rule,
-                } => {
-                    info!(
-                        filtered_command = %new_command,
-                        allowed_by = %allow_rule,
-                        "Filtered command validated and allowed"
-                    );
-
-                    let mut updated_tool_input = tool_input.clone();
-                    updated_tool_input["command"] = serde_json::Value::String(new_command);
-
-                    let final_reason = reason
-                        .unwrap_or_else(|| format!("Arguments filtered by rule '{}'", rule_name));
-
-                    // The visible effect (the rewritten command) is the filter rule's action, so
-                    // attribution names it rather than the allow rule that merely re-validated.
-                    Ok((
-                        pretool_modify_hook(updated_tool_input, Some(final_reason)),
-                        Some(rule_name),
-                    ))
-                }
-                RuleResult::Denied {
-                    rule_name: deny_rule,
-                    reason: deny_reason,
-                } => {
-                    warn!(
-                        filtered_command = %new_command,
-                        reason = %deny_reason,
-                        "Filtered command was denied by rules"
-                    );
-                    Ok((pretool_deny_hook(deny_reason), Some(deny_rule)))
-                }
-                RuleResult::NoMatch => {
-                    info!(
-                        filtered_command = %new_command,
-                        "Filtered command doesn't match any allow rule, asking user"
-                    );
-                    Ok((pretool_ask_hook(), None))
-                }
-                RuleResult::Asked {
-                    rule_name: ask_rule,
-                } => {
-                    info!(
-                        filtered_command = %new_command,
-                        "Filtered command requires user confirmation"
-                    );
-                    Ok((pretool_ask_hook(), Some(ask_rule)))
-                }
-                RuleResult::Modified {
-                    rule_name: modify_rule,
-                    new_command: further_modified,
-                } => {
-                    info!(
-                        filtered_command = %new_command,
-                        further_modified = %further_modified,
-                        "Filtered command was modified again by another rule"
-                    );
-
-                    let mut updated_tool_input = tool_input.clone();
-                    updated_tool_input["command"] = serde_json::Value::String(further_modified);
-
-                    Ok((
-                        pretool_modify_hook(updated_tool_input, reason),
-                        Some(modify_rule),
-                    ))
-                }
-                RuleResult::ArgumentFiltered {
-                    rule_name: chained_rule,
-                    ..
-                } => {
-                    // Prevent infinite loops - don't allow chained argument filtering
-                    warn!(
-                        filtered_command = %new_command,
-                        "Filtered command matched another ArgumentFilter rule, asking user to prevent loops"
-                    );
-                    Ok((pretool_ask_hook(), Some(chained_rule)))
-                }
-            }
+            info!(original = command, filtered = %new_command, rule = %rule_name, "Filtered command validated and allowed");
+            let mut updated_tool_input = tool_input.clone();
+            updated_tool_input["command"] = serde_json::Value::String(new_command);
+            let reason =
+                reason.unwrap_or_else(|| format!("Arguments filtered by rule '{}'", rule_name));
+            Ok((
+                pretool_modify_hook(updated_tool_input, Some(reason)),
+                Some(rule_name),
+                contributors,
+            ))
         }
         RuleResult::NoMatch => {
-            debug!(command = %command, "No bash rules matched, prompting user");
-            Ok((pretool_ask_hook(), None))
+            debug!(command, "No bash rules matched, prompting user");
+            Ok((pretool_ask_hook(), None, contributors))
         }
     }
+}
+
+fn live_evaluation_failure_outcome(
+    error: &bash_rules::LiveEvaluationFailure,
+) -> (HookOutput, Option<String>, Vec<String>) {
+    match error {
+        bash_rules::LiveEvaluationFailure::Timeout => {
+            warn!("Live Bash evaluation timed out; asking without provenance");
+        }
+        bash_rules::LiveEvaluationFailure::Join(error) => {
+            warn!(%error, "Live Bash evaluation task failed; asking without provenance");
+        }
+    }
+    (pretool_ask_hook(), None, Vec::new())
 }
 
 /// Reads `$CLAUDE_PROJECT_DIR` (fail-open if unset) and runs the project's configured checks via
 /// [`crate::checks::run_configured_checks`], mapping the outcome onto allow/deny. The fail-open /
 /// fail-closed policy and resource limits live in that shared routine (see its docs and the
 /// module-level "Security Model: Fail-Open Design").
-async fn handle_stop_hook() -> Result<HookOutput> {
+async fn handle_stop_hook() -> miette::Result<HookOutput> {
     let project_dir = match std::env::var("CLAUDE_PROJECT_DIR") {
         Ok(dir) => {
             info!(project_dir = %dir, "Found CLAUDE_PROJECT_DIR");

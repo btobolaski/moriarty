@@ -19,20 +19,32 @@
 //! # }
 //! ```
 
-use std::{io::Read, path::PathBuf};
+use std::{
+    io::{self, Read, Write},
+    path::PathBuf,
+};
 
-use miette::{IntoDiagnostic, Result, WrapErr};
+use miette::{IntoDiagnostic, WrapErr};
 use serde_json::json;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::{
-    hooks::bash_rules::{BashRuleEngine, CommandTrace, RuleResult},
+    hooks::{
+        bash_rules::{
+            BashRuleEngine, CommandTrace, EndpointAnalysis, Evaluation, EvaluationContext,
+            EvaluationPurpose, FilesystemAnalysis, FilterContinuation, LeafIdentity,
+            MatchedCommandRule, MatchedRedirectRule, OriginalContinuation, PolicyAnalysis,
+            RedirectCheckAnalysis, RedirectEndpointKind, RedirectEndpointTrace, RewrittenBailTrace,
+            RuleMatchExplanation, RuleResult, SubCommandTrace,
+        },
+        command_split::{AliasBinding, BailReason},
+    },
     permission_mode::PermissionMode,
     project_config::runner::{CommandOutput, VerifiedProject, verify_and_load_project},
     user_config::load_user_config_from,
 };
 
-pub async fn exec_test(cmd: crate::TestCommand) -> Result<()> {
+pub async fn exec_test(cmd: crate::TestCommand) -> miette::Result<()> {
     match cmd {
         crate::TestCommand::ProjectTools { project_dir } => run_project_tools(project_dir).await,
         crate::TestCommand::Checks { project_dir } => run_checks(project_dir).await,
@@ -59,10 +71,10 @@ async fn run_items<F, Fut>(
     item_type_plural: &str,
     get_item_names: impl FnOnce(&VerifiedProject) -> Option<Vec<String>>,
     run_items: F,
-) -> Result<()>
+) -> miette::Result<()>
 where
     F: FnOnce(VerifiedProject) -> Fut,
-    Fut: std::future::Future<Output = Result<Vec<CommandOutput>>>,
+    Fut: std::future::Future<Output = miette::Result<Vec<CommandOutput>>>,
 {
     let project = verify_and_load_project(project_dir).await?;
 
@@ -164,7 +176,7 @@ fn capitalize(s: &str) -> String {
     }
 }
 
-async fn run_project_tools(project_dir: PathBuf) -> Result<()> {
+async fn run_project_tools(project_dir: PathBuf) -> miette::Result<()> {
     run_items(
         project_dir,
         "tool",
@@ -182,7 +194,7 @@ async fn run_project_tools(project_dir: PathBuf) -> Result<()> {
     .await
 }
 
-async fn run_checks(project_dir: PathBuf) -> Result<()> {
+async fn run_checks(project_dir: PathBuf) -> miette::Result<()> {
     run_items(
         project_dir,
         "check",
@@ -203,9 +215,9 @@ async fn run_checks(project_dir: PathBuf) -> Result<()> {
 
 /// Test a bash command against configured rules.
 ///
-/// Both normal and explain output use the same compound analysis as the live hook. Explain adds the
-/// source, alias expansion, cwd-normalized match text, confirmation caps, and matching rule for each
-/// leaf.
+/// Both normal and explain output use the live hook's compound analysis. Explain additionally
+/// exposes command matches, redirect resolution/locality and authorization failures, and ordered
+/// rule contributors for each leaf.
 async fn test_bash_rules(
     command: Option<String>,
     config_path: Option<PathBuf>,
@@ -213,7 +225,7 @@ async fn test_bash_rules(
     explain: bool,
     cwd: Option<PathBuf>,
     mode: Option<PermissionMode>,
-) -> Result<RuleResult> {
+) -> miette::Result<RuleResult> {
     // Initialize tracing to stderr for debug output (RUST_LOG env var controls level)
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let _ = tracing_subscriber::registry()
@@ -270,20 +282,24 @@ async fn test_bash_rules(
 
     let cwd = resolve_test_cwd(cwd);
     if explain {
-        let trace = engine.explain(&command, &cwd, mode);
+        let context = EvaluationContext::new(&cwd, mode);
+        let evaluation = engine.evaluate_sync(&command, &context, EvaluationPurpose::Diagnostics);
+        let trace = command_trace(&command, &evaluation);
         if json {
             let rendered = serde_json::to_string_pretty(&trace)
                 .into_diagnostic()
                 .wrap_err("Failed to serialize explain trace")?;
             println!("{rendered}");
         } else {
-            output_explain(&trace);
+            output_explain(&trace)?;
         }
         return Ok(trace.final_result);
     }
 
-    // Apply the exact compound analysis used by the hook.
-    let result = engine.apply_rules_compound(&command, &cwd, mode);
+    let context = EvaluationContext::new(&cwd, mode);
+    let result = engine
+        .evaluate_sync(&command, &context, EvaluationPurpose::Decision)
+        .rule_result();
 
     // Output result
     if json {
@@ -304,76 +320,314 @@ fn resolve_test_cwd(cwd: Option<PathBuf>) -> String {
     }
 }
 
-fn output_explain(trace: &CommandTrace) {
-    println!("Command: {}", trace.original);
+pub(crate) fn command_trace(command: &str, evaluation: &Evaluation) -> CommandTrace {
+    let (bindings, sub_commands, bail) = policy_trace_parts(evaluation.original_analysis());
+    let mut rewritten_sub_commands = Vec::new();
+    let mut rewritten_bail = None;
+    match evaluation.continuation() {
+        OriginalContinuation::None => {}
+        OriginalContinuation::ModifyRedirectCheck(check) => {
+            (rewritten_sub_commands, rewritten_bail) = redirect_trace_parts(check);
+        }
+        OriginalContinuation::ArgumentFilterRecheck {
+            recheck,
+            continuation,
+        } => {
+            let (_, traces, _) = policy_trace_parts(recheck);
+            rewritten_sub_commands = traces;
+            if let FilterContinuation::ModifyRedirectCheck(check) = continuation {
+                let (mut traces, bail) = redirect_trace_parts(check);
+                rewritten_sub_commands.append(&mut traces);
+                rewritten_bail = bail;
+            }
+        }
+    }
+    CommandTrace {
+        original: command.to_string(),
+        bindings,
+        sub_commands,
+        rewritten_sub_commands,
+        rewritten_bail,
+        bail,
+        final_result: evaluation.rule_result(),
+        contributors: evaluation.contributors(),
+    }
+}
+
+fn policy_trace_parts(
+    analysis: &PolicyAnalysis,
+) -> (Vec<AliasBinding>, Vec<SubCommandTrace>, Option<BailReason>) {
+    match analysis {
+        PolicyAnalysis::Bail { reason, .. } => (Vec::new(), Vec::new(), Some(*reason)),
+        PolicyAnalysis::Leaves(leaves) => {
+            let mut bindings = Vec::new();
+            let sub_commands = leaves
+                .iter()
+                .map(|leaf| {
+                    let identity = leaf.identity();
+                    for binding in identity.bindings() {
+                        if !bindings.contains(binding) {
+                            bindings.push(binding.clone());
+                        }
+                    }
+                    sub_command_trace(
+                        identity,
+                        leaf.endpoints().analyzed().unwrap_or_default(),
+                        leaf.command().matched_rule().map(command_rule_explanation),
+                    )
+                })
+                .collect();
+            (bindings, sub_commands, None)
+        }
+    }
+}
+
+fn redirect_trace_parts(
+    analysis: &RedirectCheckAnalysis,
+) -> (Vec<SubCommandTrace>, Option<RewrittenBailTrace>) {
+    match analysis {
+        RedirectCheckAnalysis::Bail { command, reason } => (
+            Vec::new(),
+            Some(RewrittenBailTrace {
+                command: command.clone(),
+                reason: *reason,
+            }),
+        ),
+        RedirectCheckAnalysis::Leaves(leaves) => (
+            leaves
+                .iter()
+                .map(|leaf| sub_command_trace(leaf.identity(), leaf.endpoints(), None))
+                .collect(),
+            None,
+        ),
+    }
+}
+
+fn sub_command_trace(
+    identity: &LeafIdentity,
+    endpoints: &[EndpointAnalysis],
+    matched: Option<RuleMatchExplanation>,
+) -> SubCommandTrace {
+    SubCommandTrace {
+        original: identity.original().to_string(),
+        alias_expanded: identity.alias_expanded().map(str::to_string),
+        normalized: identity.normalized().to_string(),
+        bindings: identity.bindings().to_vec(),
+        requires_confirmation: identity.requires_confirmation().map(str::to_string),
+        output_redirects: endpoints.iter().map(endpoint_trace).collect(),
+        matched,
+    }
+}
+
+fn unmatched_redirect_failure(matched_rule: Option<&MatchedRedirectRule>) -> Option<String> {
+    matched_rule
+        .is_none()
+        .then(|| "no eligible AllowRedirect rule matched".to_string())
+}
+
+fn endpoint_trace(endpoint: &EndpointAnalysis) -> RedirectEndpointTrace {
+    match endpoint {
+        EndpointAnalysis::Descriptor {
+            original_target,
+            match_text,
+            matched_rule,
+        } => RedirectEndpointTrace {
+            original_target: original_target.clone(),
+            kind: RedirectEndpointKind::Descriptor.label(),
+            match_text: Some(match_text.clone()),
+            is_local: Some(false),
+            matched: matched_rule.as_ref().map(redirect_rule_explanation),
+            failure: unmatched_redirect_failure(matched_rule.as_ref()),
+        },
+        EndpointAnalysis::Filesystem {
+            original_target,
+            resolution:
+                FilesystemAnalysis::Resolved {
+                    target,
+                    matched_rule,
+                },
+        } => RedirectEndpointTrace {
+            original_target: original_target.clone(),
+            kind: target.kind().label(),
+            match_text: Some(target.match_text().to_string()),
+            is_local: Some(target.is_local()),
+            matched: matched_rule.as_ref().map(redirect_rule_explanation),
+            failure: unmatched_redirect_failure(matched_rule.as_ref()),
+        },
+        EndpointAnalysis::Filesystem {
+            original_target,
+            resolution: FilesystemAnalysis::Failed { reason, .. },
+        } => RedirectEndpointTrace {
+            original_target: original_target.clone(),
+            kind: RedirectEndpointKind::Filesystem.label(),
+            match_text: None,
+            is_local: None,
+            matched: None,
+            failure: Some(reason.clone()),
+        },
+    }
+}
+
+fn command_rule_explanation(rule: &MatchedCommandRule) -> RuleMatchExplanation {
+    RuleMatchExplanation {
+        rule_name: rule.rule_name().to_string(),
+        expanded_pattern: rule.expanded_pattern().to_string(),
+        action_summary: rule.action_summary().to_string(),
+    }
+}
+
+fn redirect_rule_explanation(rule: &MatchedRedirectRule) -> RuleMatchExplanation {
+    RuleMatchExplanation {
+        rule_name: rule.rule_name().to_string(),
+        expanded_pattern: rule.expanded_pattern().to_string(),
+        action_summary: rule.action_summary().to_string(),
+    }
+}
+
+fn output_explain(trace: &CommandTrace) -> miette::Result<()> {
+    let stdout = io::stdout();
+    write_explanation(&mut stdout.lock(), trace)
+        .into_diagnostic()
+        .wrap_err("Failed to render bash-rule explanation")
+}
+
+fn write_redirect_explanation(
+    writer: &mut impl Write,
+    endpoint: &RedirectEndpointTrace,
+) -> io::Result<()> {
+    writeln!(
+        writer,
+        "    {} redirect target: {}",
+        endpoint.kind, endpoint.original_target
+    )?;
+    if let Some(match_text) = &endpoint.match_text {
+        writeln!(writer, "      resolved for matching: {match_text}")?;
+    }
+    if let Some(is_local) = endpoint.is_local {
+        writeln!(writer, "      project-local: {is_local}")?;
+    }
+    if let Some(matched) = &endpoint.matched {
+        writeln!(
+            writer,
+            "      allowed by redirect rule '{}'  [{}]",
+            matched.rule_name, matched.action_summary
+        )?;
+        writeln!(writer, "        pattern: {}", matched.expanded_pattern)?;
+    }
+    if let Some(failure) = &endpoint.failure {
+        writeln!(writer, "      not authorized: {failure}")?;
+    }
+    Ok(())
+}
+
+fn write_sub_command_explanation(
+    writer: &mut impl Write,
+    label: &str,
+    index: usize,
+    sub: &SubCommandTrace,
+) -> io::Result<()> {
+    writeln!(writer, "  {label} {}: {}", index + 1, sub.original)?;
+    if let Some(expanded) = &sub.alias_expanded {
+        writeln!(writer, "    alias-expanded: {expanded}")?;
+    }
+    if sub.original != sub.normalized {
+        writeln!(writer, "    analyzed for matching: {}", sub.normalized)?;
+    }
+    for binding in &sub.bindings {
+        writeln!(
+            writer,
+            "    consumed binding: {}={}",
+            binding.name, binding.value
+        )?;
+    }
+    for endpoint in &sub.output_redirects {
+        write_redirect_explanation(writer, endpoint)?;
+    }
+    if let Some(reason) = &sub.requires_confirmation {
+        writeln!(writer, "    requires confirmation → {reason}")?;
+    }
+    match &sub.matched {
+        Some(explanation) => {
+            writeln!(
+                writer,
+                "    matched rule '{}'  [{}]",
+                explanation.rule_name, explanation.action_summary
+            )?;
+            writeln!(writer, "      pattern: {}", explanation.expanded_pattern)?;
+        }
+        None => writeln!(writer, "    no rule matched")?,
+    }
+    Ok(())
+}
+
+fn write_explanation(writer: &mut impl Write, trace: &CommandTrace) -> io::Result<()> {
+    writeln!(writer, "Command: {}", trace.original)?;
     for binding in &trace.bindings {
-        println!(
+        writeln!(
+            writer,
             "  Binding: {}={} (analysis metadata only; grants no permission)",
             binding.name, binding.value
-        );
+        )?;
     }
 
     if let Some(reason) = &trace.bail {
-        println!(
+        writeln!(
+            writer,
             "  Could not analyze ({reason:?}); only an explicit Deny on the whole command is honored."
-        );
+        )?;
     }
     for (index, sub) in trace.sub_commands.iter().enumerate() {
-        println!("  Leaf {}: {}", index + 1, sub.original);
-        if let Some(expanded) = &sub.alias_expanded {
-            println!("    alias-expanded: {expanded}");
-        }
-        if sub.original != sub.normalized {
-            println!("    analyzed for matching: {}", sub.normalized);
-        }
-        for binding in &sub.bindings {
-            println!("    consumed binding: {}={}", binding.name, binding.value);
-        }
-        if sub.real_file_write {
-            println!("    writes a real file → any Allow is capped at Ask");
-        }
-        if let Some(reason) = &sub.requires_confirmation {
-            println!("    requires confirmation → {reason}");
-        }
-        match &sub.matched {
-            Some(explanation) => {
-                println!(
-                    "    matched rule '{}'  [{}]",
-                    explanation.rule_name, explanation.action_summary
-                );
-                println!("      pattern: {}", explanation.expanded_pattern);
-            }
-            None => println!("    no rule matched"),
-        }
+        write_sub_command_explanation(writer, "Leaf", index, sub)?;
+    }
+    if let Some(rewritten) = &trace.rewritten_bail {
+        writeln!(writer, "  Rewritten command: {}", rewritten.command)?;
+        writeln!(
+            writer,
+            "    could not analyze rewrite ({:?})",
+            rewritten.reason
+        )?;
+    }
+    for (index, sub) in trace.rewritten_sub_commands.iter().enumerate() {
+        write_sub_command_explanation(writer, "Rewritten leaf", index, sub)?;
     }
 
-    println!();
-    print!("Final decision: ");
-    print_result_line(&trace.final_result);
+    writeln!(writer)?;
+    write!(writer, "Final decision: ")?;
+    write_result_line(writer, &trace.final_result)?;
+    if !trace.contributors.is_empty() {
+        writeln!(
+            writer,
+            "Contributing rules: {}",
+            trace.contributors.join(", ")
+        )?;
+    }
+    Ok(())
 }
 
-/// One-line rendering of a final decision for the `--explain` footer.
-fn print_result_line(result: &RuleResult) {
+fn write_result_line(writer: &mut impl Write, result: &RuleResult) -> io::Result<()> {
     match result {
-        RuleResult::Allowed { rule_name } => println!("✓ ALLOWED by rule: {rule_name}"),
+        RuleResult::Allowed { rule_name } => writeln!(writer, "✓ ALLOWED by rule: {rule_name}"),
         RuleResult::Denied { rule_name, reason } => {
-            println!("✗ DENIED by rule: {rule_name} ({reason})")
+            writeln!(writer, "✗ DENIED by rule: {rule_name} ({reason})")
         }
         RuleResult::Modified {
             rule_name,
             new_command,
-        } => println!("→ MODIFIED by rule: {rule_name} → {new_command}"),
-        RuleResult::Asked { rule_name } => println!("? ASK by rule: {rule_name}"),
+        } => writeln!(writer, "→ MODIFIED by rule: {rule_name} → {new_command}"),
+        RuleResult::Asked { rule_name } => writeln!(writer, "? ASK by rule: {rule_name}"),
         RuleResult::ArgumentFiltered {
             rule_name,
             new_command,
             ..
-        } => println!("⚙ ARGUMENT FILTERED by rule: {rule_name} → {new_command}"),
-        RuleResult::NoMatch => println!("○ NO MATCH — would prompt the user"),
+        } => writeln!(
+            writer,
+            "⚙ ARGUMENT FILTERED by rule: {rule_name} → {new_command}"
+        ),
+        RuleResult::NoMatch => writeln!(writer, "○ NO MATCH — would prompt the user"),
     }
 }
 
-fn output_json(command: &str, result: &RuleResult) -> Result<()> {
+fn output_json(command: &str, result: &RuleResult) -> miette::Result<()> {
     let output = match result {
         RuleResult::Allowed { rule_name } => json!({
             "command": command,
@@ -514,6 +768,17 @@ mod tests {
             None,
         )
         .await
+    }
+
+    fn explain(
+        engine: &BashRuleEngine,
+        command: &str,
+        cwd: &str,
+        mode: Option<PermissionMode>,
+    ) -> CommandTrace {
+        let context = EvaluationContext::new(cwd, mode);
+        let evaluation = engine.evaluate_sync(command, &context, EvaluationPurpose::Diagnostics);
+        command_trace(command, &evaluation)
     }
 
     fn allow(name: &str, pattern: &str) -> BashRule {
@@ -826,7 +1091,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn normal_and_explain_modes_share_alias_aware_compound_analysis() {
+    async fn normal_and_json_explain_modes_share_alias_aware_compound_analysis() {
         let dir = setup_isolated_xdg_config();
         let config = toml::from_str(&format!(
             "bash_path_aliases = [\"P\"]\n{PATH_ALIAS_READ_RULES}"
@@ -855,26 +1120,173 @@ mod tests {
         assert!(matches!(results[0], RuleResult::Allowed { .. }));
     }
 
-    #[tokio::test]
-    async fn test_bash_rules_explain_mode_succeeds() {
-        let dir = setup_isolated_xdg_config();
-        let cfg = create_test_config(&dir, vec![allow("allow-ls", r"^ls")]).await;
-        // Render both pretty and JSON explain, over a compound command (per-leaf branch) and a
-        // command-substitution command (bail branch), so both rendering paths are exercised.
-        // The trace content itself is asserted by BashRuleEngine::explain's own tests.
-        for command in ["ls && echo hi", "ls $(curl x)"] {
-            for json in [false, true] {
-                test_bash_rules(
-                    Some(command.to_string()),
-                    Some(cfg.clone()),
-                    json,
-                    true,
-                    None,
-                    None,
-                )
-                .await
-                .unwrap_or_else(|e| panic!("explain {command:?} json={json}: {e}"));
-            }
+    #[test]
+    fn text_explain_renders_rewritten_leaf_metadata() {
+        let trace = CommandTrace {
+            original: "filtered".to_string(),
+            bindings: Vec::new(),
+            sub_commands: Vec::new(),
+            rewritten_sub_commands: vec![SubCommandTrace {
+                original: "cat $P/file".to_string(),
+                alias_expanded: Some("cat /work/project/file".to_string()),
+                normalized: "cat file".to_string(),
+                bindings: vec![AliasBinding {
+                    name: "P".to_string(),
+                    value: "/work/project".to_string(),
+                }],
+                requires_confirmation: None,
+                output_redirects: Vec::new(),
+                matched: Some(RuleMatchExplanation {
+                    rule_name: "allow-cat".to_string(),
+                    expanded_pattern: "^cat ".to_string(),
+                    action_summary: "Allow".to_string(),
+                }),
+            }],
+            rewritten_bail: None,
+            bail: None,
+            final_result: RuleResult::NoMatch,
+            contributors: vec!["allow-cat".to_string()],
+        };
+        let mut output = Vec::new();
+        write_explanation(&mut output, &trace).unwrap();
+        let output = String::from_utf8(output).unwrap();
+
+        for expected in [
+            "Rewritten leaf 1: cat $P/file",
+            "alias-expanded: cat /work/project/file",
+            "consumed binding: P=/work/project",
+            "matched rule 'allow-cat'  [Allow]",
+            "pattern: ^cat ",
+        ] {
+            assert!(
+                output.contains(expected),
+                "missing {expected:?} in {output:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn explain_renderers_include_redirect_policy_and_provenance() {
+        let cwd = tempfile::tempdir().unwrap();
+        let cwd = cwd.path().to_str().unwrap();
+        let engine = BashRuleEngine::from_config(UserConfig {
+            pattern_fragments: None,
+            bash_path_aliases: BTreeSet::new(),
+            bash_rules: Some(vec![
+                modify("redirecting-echo", r"^rewrite$", "echo > report.txt"),
+                allow("allow-echo", r"^echo($|\s)"),
+                deny("deny-rm", r"^rm", "no removal"),
+                BashRule {
+                    name: "allow-local".to_string(),
+                    pattern: r"^reports/".to_string(),
+                    modes: None,
+                    action: BashRuleAction::AllowRedirect { allow_local: true },
+                },
+            ]),
+            tool_rules: None,
+        })
+        .unwrap();
+        let allowed = explain(&engine, "echo hi > reports/status.txt", cwd, None);
+        let unresolved = explain(&engine, "echo hi > $OUT", cwd, None);
+        let denied = explain(&engine, "rm > reports/denied.txt", cwd, None);
+        let rewritten = explain(&engine, "rewrite", cwd, None);
+        assert_eq!(
+            denied.sub_commands[0].output_redirects[0]
+                .matched
+                .as_ref()
+                .unwrap()
+                .rule_name,
+            "allow-local"
+        );
+
+        let mut output = Vec::new();
+        write_explanation(&mut output, &allowed).unwrap();
+        write_explanation(&mut output, &unresolved).unwrap();
+        write_explanation(&mut output, &denied).unwrap();
+        write_explanation(&mut output, &rewritten).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        for expected in [
+            "resolved for matching: reports/status.txt",
+            "project-local: true",
+            "allowed by redirect rule 'allow-local'",
+            "Contributing rules: allow-echo, allow-local",
+            "DENIED by rule: deny-rm",
+            "Rewritten leaf 1: echo > report.txt",
+        ] {
+            assert!(
+                output.contains(expected),
+                "missing {expected:?} in {output:?}"
+            );
+        }
+
+        assert_eq!(output.matches("not authorized:").count(), 2);
+        let unresolved_endpoint = &unresolved.sub_commands[0].output_redirects[0];
+        assert!(unresolved_endpoint.failure.is_some());
+        assert!(unresolved_endpoint.matched.is_none());
+        let rewritten_endpoint = &rewritten.rewritten_sub_commands[0].output_redirects[0];
+        assert!(rewritten_endpoint.failure.is_some());
+        assert!(rewritten_endpoint.matched.is_none());
+
+        let json = serde_json::to_value(&allowed).unwrap();
+        let endpoint = &json["sub_commands"][0]["output_redirects"][0];
+        assert_eq!(endpoint["match_text"], "reports/status.txt");
+        assert_eq!(endpoint["is_local"], true);
+        assert_eq!(endpoint["matched"]["rule_name"], "allow-local");
+        assert_eq!(json["contributors"], json!(["allow-echo", "allow-local"]));
+    }
+
+    #[test]
+    fn explanation_renders_bail_bindings_and_remaining_results() {
+        let mut config: UserConfig = toml::from_str(&format!(
+            "bash_path_aliases = [\"P\"]\n{PATH_ALIAS_READ_RULES}"
+        ))
+        .unwrap();
+        config.bash_rules.get_or_insert_default().push(modify(
+            "dynamic-rewrite",
+            r"^rewrite$",
+            "echo $(date)",
+        ));
+        let engine = BashRuleEngine::from_config(config).unwrap();
+        let traces = [
+            explain(&engine, PATH_ALIAS_COMMAND, "/work/project", None),
+            explain(&engine, "echo $(date)", "", None),
+            explain(&engine, "rewrite", "", None),
+        ];
+        let mut output = Vec::new();
+        for trace in &traces {
+            write_explanation(&mut output, trace).unwrap();
+        }
+        write_result_line(
+            &mut output,
+            &RuleResult::Modified {
+                rule_name: "modify".to_string(),
+                new_command: "echo hi".to_string(),
+            },
+        )
+        .unwrap();
+        write_result_line(
+            &mut output,
+            &RuleResult::ArgumentFiltered {
+                rule_name: "filter".to_string(),
+                new_command: "cargo doc".to_string(),
+                reason: None,
+            },
+        )
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        for expected in [
+            "Binding: P=/work/project/node_modules/pkg",
+            "Could not analyze",
+            "Rewritten command: echo $(date)",
+            "could not analyze rewrite (CommandSubstitution)",
+            "NO MATCH",
+            "MODIFIED by rule: modify",
+            "ARGUMENT FILTERED by rule: filter",
+        ] {
+            assert!(
+                output.contains(expected),
+                "missing {expected:?} in {output:?}"
+            );
         }
     }
 }

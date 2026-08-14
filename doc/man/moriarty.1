@@ -114,7 +114,7 @@
 .Op Fl \-limit Ar n
 .Op Fl \-min\-count Ar n
 .Op Fl \-match Ar exact|prefix|fuzzy
-.Op Fl \-action Ar ask|deny|allow
+.Op Fl \-action Ar ask|deny|allow|allow-redirect
 .Op Fl \-all\-rules
 .Op Fl \-rules\-hash Ar hash
 .Op Fl \-json
@@ -274,6 +274,11 @@ or
 value; Manual arrives as
 .Cm default .
 Ineligible rules are skipped in place, preserving first\-match order among eligible rules.
+For Bash, ordinary command rules and
+.Cm AllowRedirect
+endpoint rules are independent first\-match domains; auto\-Allow requires both an allowed command
+and authorization for every output endpoint
+.Pq see Xr moriarty\-bash\-rules 5 .
 This is the entry point used by Claude Code's hook system.
 For the Stop hook it runs the project's approved checks from
 .Pa .config/tools.toml .
@@ -289,13 +294,20 @@ The
 subcommand reads the JSON-lines hook logs from
 .Pa ~/.local/state/moriarty/hooks/
 .Pq or the directory given by the \-d / \-\-dir option
-and prints a JSON report of recorded PreToolUse results, aggregated by the
-exact tool, arguments, result, and deciding rule with a count per group.
-Permission mode is retained internally for replay and suggestions but deliberately does not change this public grouping
-or JSON shape.
-Each row names the rule whose action produced the decision; the field is omitted
-when no rule decided
+and prints a JSON report of recorded PreToolUse results, aggregated by the exact tool,
+arguments, result, deciding rule, and ordered contributor list with a count per group.
+Permission mode is retained internally for replay and suggestions but does not change this public grouping.
+Each row's
+.Ic rule
+field names the rule whose action decided the result, while
+.Ic rules
+lists every command, redirect, and filter rule that contributed in evaluation order.
+Both fields are omitted when no rule participated
 .Pq passthrough, an unconfigured Ask, or a compound whose merged leaves matched no rule .
+Historical records without
+.Ic rules
+fall back to their singular
+.Ic rule .
 The
 .Fl \-start\-time
 and
@@ -325,11 +337,13 @@ Defaults to
 Output results as JSON instead of pretty\-printed text.
 .It Fl \-explain
 Show how the command splits into leaf commands, including original source,
-path\-alias bindings and expansion, normalized match text, confirmation reasons,
-matching rules, and the merged decision the hook would make.
-Normal and
-.Fl \-explain
-modes use the same compound and path\-alias analysis as the live hook
+path\-alias bindings and expansion, normalized command match text, confirmation reasons,
+redirect endpoint match text and locality, resolution or authorization failures, unanalyzable Modify rewrites, matching rules,
+ordered contributors, and the merged decision the hook would make.
+Normal mode,
+.Fl \-explain ,
+and replay use the same completed compound, path\-alias, and one\-pass ArgumentFilter revalidation as the live hook.
+Suggestions reuse the same original policy analysis without computing unused continuations.
 .Pq see Xr moriarty\-bash\-rules 5 .
 Normal mode prints only the final merged decision.
 .It Fl \-cwd Ar dir
@@ -360,8 +374,13 @@ With
 .Fl \-strict ,
 additionally warn about permanently disabled
 .Ic modes = [] ,
-likely\-shadowed rules, and over\-broad Allow rules.
-A shadow warning requires overlapping permission\-mode eligibility.
+command Allow rules with no mode\-overlapping redirect policy, likely\-shadowed rules, over\-broad command Allow rules, and universal
+.Cm AllowRedirect
+rules.
+A universal local redirect rule is reported separately from an unrestricted rule that can authorize
+all resolved paths, devices, and descriptors.
+Shadow analysis compares only rules in the same command or redirect domain and requires overlapping
+permission\-mode eligibility.
 .It Cm rules list\-fragments
 List the merged pattern fragments
 .Pq built\-in defaults plus user\-defined ,
@@ -371,8 +390,12 @@ Print a canonical example
 .Pa tool_rules.toml
 covering every rule and action variant.
 .It Cm rules starter
-Print a paste\-ready set of allow\-rules for common read\-only commands, designed for
-the per\-leaf engine.
+Print a paste\-ready set of ordinary Allow rules for common read\-only commands, designed for
+the per\-leaf engine, plus exact redirect rules for
+.Pa /dev/null
+and standard descriptors
+.Pq Li &1 , &2 , &- .
+Other filesystem output endpoints continue to prompt.
 .It Cm rules report
 Summarize completed PreToolUse outcomes from the hook logs as a terminal table.
 By default, records are grouped by calendar day in
@@ -419,9 +442,13 @@ selects the recorded outcome to mine
 .Pq Cm ask No or Cm deny ;
 .Fl \-match Cm exact|prefix|fuzzy
 chooses the generated pattern shape; and
-.Fl \-action Cm ask|deny|allow
-sets the action
-.Pq Cm allow No is refused unless Fl \-match Cm exact .
+.Fl \-action Cm ask|deny|allow|allow-redirect
+sets the action.
+.Cm allow
+and
+.Cm allow-redirect
+are refused unless
+.Fl \-match Cm exact .
 .Cm exact
 emits one fully\-literal, fully\-anchored pattern per leaf;
 .Cm prefix
@@ -432,7 +459,31 @@ closed alternation
 .Pq for example Ql ^cargo (build|check)(\es|$) ,
 falling back to the program prefix when any observed leaf has a flag, path, or bare
 invocation in subcommand position.
+Prefix and fuzzy generation reuse the hook parser's program metadata and omit leaves whose
+normalized match text does not begin with that literal program, because the generated anchor
+would not match them; exact generation remains available for those leaves.
 The suggestion lists every observed command it covers so the generalization is reviewable.
+With
+.Fl \-action Cm allow-redirect ,
+Moriarty instead enumerates each static output endpoint, resolves all endpoints from one recorded\-cwd
+context, omits unresolved or already\-authorized targets, and emits one escaped fully anchored endpoint pattern.
+A leaf containing a relative or home\-relative filesystem endpoint in or after a shell path\-context barrier is
+omitted because its shell path context cannot be reconstructed.
+Barriers are assignments, dynamic commands,
+.Cm cd , pushd , popd ,
+and recognized shell\-state builtins.
+Leaves whose output endpoints are all statically resolvable from the recorded cwd remain eligible; leaves blocked by
+active command policy are also omitted.
+Ordinary
+.Cm Allow
+suggestions omit leaves already covered by active command policy;
+.Cm Ask
+and
+.Cm Deny
+suggestions retain command-allowed leaves that still prompt under redirect policy.
+Project\-local targets receive
+.Ic allow_local = true ;
+home, absolute, device, and descriptor targets remain unrestricted and exact.
 Generated rules carry the canonical union of contributing recorded modes; if any contributor is mode\-less,
 the rule is unrestricted because its mode cannot be reconstructed.
 By default only log lines recorded under the rule set currently installed at
@@ -450,6 +501,7 @@ With
 .Fl \-result Cm allow
 it exits nonzero if any previously auto\-approved command would no longer be allowed,
 guarding migrations against lost auto\-approvals.
+Replay also exits 2 when every in\-scope historical row lacks a recorded cwd and no decision can be reproduced.
 The
 .Fl \-start\-time
 and
@@ -466,7 +518,10 @@ pins a specific rule\-set hash and
 .Fl \-all\-rules
 replays every recorded line.
 Each recorded row is replayed under its recorded permission mode, and divergence rows include that mode.
+Lost and newly\-allowed summary counters count the recorded events represented by those rows, not aggregated rows.
 Mode\-less rows enable only unrestricted candidate rules.
+Historical rows without a recorded cwd are excluded from both replay and suggestion mining because their filesystem
+policy cannot be reproduced safely; Moriarty reports the excluded count.
 Each hook decision is stamped in the log with a hash of the effective rule set that
 produced it, which is what these filters match.
 .El
