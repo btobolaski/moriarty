@@ -68,11 +68,13 @@ cargo run -- hooks exec
 # --dir defaults to ~/.local/state/moriarty/hooks)
 cargo run -- hooks report --tool Bash --result deny
 
-# Inspect, validate, and author bash/tool rules
+# Inspect or evaluate rule behavior, and validate or author bash/tool rules
 cargo run -- rules lint --strict          # report ignored rules; warn on empty modes/shadow/over-broad
 cargo run -- rules list-fragments         # show built-in + user pattern fragments
 cargo run -- rules schema                 # print a canonical example tool_rules.toml
 cargo run -- rules starter                # paste-ready allow-rules for common read-only commands
+cargo run -- rules report --timezone utc  # daily counts and percentages for completed hook outcomes
+cargo run -- rules report --directories --current-rules  # directory totals for the active rule set
 cargo run -- rules suggest --result ask   # propose anchored rules from frequently-prompted commands (hook logs)
 cargo run -- rules replay --result allow  # check a candidate config keeps every prior auto-approval
 
@@ -402,17 +404,23 @@ with warnings, while explicit missing paths and having no available source are e
   `(tool name, arguments, result, rule)` key into a JSON report with counts; `rule` is omitted from a row's JSON when no
   rule decided, so historical rows serialize exactly as before. Reuses `cost_report::TimeRangeFilter` for
   `--start-time`/`--end-time` and supports `--tool` and `--result` filters. `report::aggregate` (used by `hooks report`)
-  and `ReportRow` are `pub(crate)`. `report.rs` parses the completion line's `cwd` back into `HookRecord`;
-  `rules suggest`/`rules replay` call `report::aggregate_with_cwd`, which joins `cwd` into the grouping key and
-  populates `ReportRow.cwd` (a `#[serde(skip)]` field) so each command is re-normalized with the directory it actually
-  ran under. `aggregate` keeps `cwd` out of its key and serialization, so `hooks report`'s rows and counts are
-  unchanged; rows recorded before `cwd` was logged fall back to an empty cwd (normalization disabled).
+  and `ReportRow` are `pub(crate)`. `report.rs` parses the completion line's `cwd` back into `HookRecord` and folds
+  filtered records directly into each caller's accumulator while reading rotated log files concurrently, so no vector
+  retains every matching event. `rules suggest`/`rules replay` call `report::aggregate_with_cwd`,
+  which joins `cwd` into the grouping key and populates `ReportRow.cwd` (a `#[serde(skip)]` field) so each command is
+  re-normalized with the directory it actually ran under. `rules report` calls `report::fold_outcomes`, preserving each
+  event's timestamp only until it has been folded into a timezone-aware daily or exact-directory bucket while sharing
+  the same time/hash filtering and skip accounting. `aggregate` keeps `cwd` out of its key and serialization, so
+  `hooks report`'s rows and counts are unchanged; rows recorded before `cwd` was logged fall back to an empty cwd for
+  replay/suggest and an explicit `Unknown` bucket in the effectiveness report.
 - **Compile diagnostics & `rules` authoring tooling**: `BashRuleEngine::compile_with_diagnostics` and
   `ToolRuleEngine::compile_with_diagnostics` return the engine plus a `RuleDiagnostic` for every dropped rule
   (undefined/circular/over-depth fragment, invalid regex, or — tool rules only — a `field`/`pattern` given without its
   partner); an invalid `Matches` condition drops the whole tool rule rather than broadening it by retaining only the
   valid predicates. `from_config` delegates to these compilers and logs each diagnostic, preserving the
-  fail-open-per-rule hot path. The `crate::rules` command group surfaces them and helps author safe rules: `lint`
+  fail-open-per-rule hot path. The `crate::rules` command group surfaces them and helps author safe rules: `report`
+  (daily outcome counts/percentages by default, exact recorded-cwd buckets with `--directories`, all recorded rule sets
+  by default, and opt-in active-hash filtering with `--current-rules`), `lint`
   (errors when a rule the user wrote is silently dropped; `--strict` additionally warns on permanently disabled
   `modes = []`, likely-shadowed rules, and over-broad Allow rules), `list-fragments`, `schema` (round-tripped against
   `UserConfig` in tests), `starter` (paste-ready read-only allow-rules that auto-allow the north-star command),
@@ -437,6 +445,7 @@ with warnings, while explicit missing paths and having no available source are e
   (for `replay` this is the migration source, independent of the `--config` candidate); `--rules-hash <hash>` pins a
   specific set and `--all-rules` disables the filter. Both commands report the active hash and how many records the
   filter excluded (`report::RulesHashFilter`/`HashSkipStats`/`CwdAggregation`); excluded counts are never hidden.
+  `rules report` follows the same disclosure rule under `--current-rules`, but defaults to all recorded history.
 - Security model: Defaults to "Ask" when unconfigured, fail-closed once configured (verification failures block
   execution)
 

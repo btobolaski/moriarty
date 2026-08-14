@@ -1,7 +1,10 @@
 //! `moriarty rules` — inspect, validate, and author the bash/tool permission rules.
 //!
-//! These subcommands operate on `~/.config/moriarty/tool_rules.toml` (or a `--config` override) and
-//! never run the hook; they help authors write rules that are safe and actually take effect.
+//! These subcommands never run the hook. Most inspect, validate, or author
+//! `~/.config/moriarty/tool_rules.toml` (or a `--config` override); `rules report` summarizes
+//! completed hook outcomes and consults the default config only for `--current-rules`.
+
+mod report;
 
 // standard library
 use std::{
@@ -25,7 +28,7 @@ use crate::{
             BashRuleEngine, RuleDiagnostic, RuleResult, default_fragments, expand_fragments,
         },
         command_split::{SplitOutcome, split_command},
-        report::{CwdAggregation, ReportRow, RulesHashFilter, aggregate_with_cwd},
+        report::{CwdAggregation, HashSkipStats, ReportRow, RulesHashFilter, aggregate_with_cwd},
         result::PreToolResult,
         tool_rules::ToolRuleEngine,
     },
@@ -63,6 +66,24 @@ pub async fn exec_rules(cmd: RulesCommand) -> Result<()> {
             json,
             strict,
         } => lint(config, json, strict).await,
+        RulesCommand::Report {
+            dir,
+            start_time,
+            end_time,
+            timezone,
+            directories,
+            current_rules,
+        } => {
+            report::run(
+                dir,
+                start_time,
+                end_time,
+                timezone,
+                directories,
+                current_rules,
+            )
+            .await
+        }
         RulesCommand::ListFragments { config, json } => list_fragments(config, json).await,
         RulesCommand::Schema { json } => schema(json),
         RulesCommand::Starter { json } => starter(json),
@@ -597,6 +618,8 @@ struct ReplayOptions {
 /// the hash to display (`None` under `--all-rules`). The default — neither `--all-rules` nor an
 /// explicit `--rules-hash` — is the rule set currently installed at the default config path, which
 /// for `replay` is the migration *source*, independent of any `--config` candidate being tested.
+/// `rules report` inverts its `--current-rules` flag into `all_rules` because that command defaults
+/// to all history rather than the active rule set.
 async fn resolve_hash_filter(
     all_rules: bool,
     rules_hash: Option<String>,
@@ -614,18 +637,21 @@ async fn resolve_hash_filter(
     ))
 }
 
-/// A filtered run must never silently look like it covered all of history, so every output mode
-/// (human, TOML header, JSON-on-stderr) renders this same scope line.
-fn rules_scope_note(
-    active_hash: &Option<String>,
-    skipped: &crate::hooks::report::HashSkipStats,
-) -> String {
+fn rules_hash_skip_note(skipped: &HashSkipStats) -> String {
+    format!(
+        "skipped {} record(s) from other rule sets and {} without a recorded rule hash",
+        skipped.other_rules, skipped.no_hash
+    )
+}
+
+/// A filtered run must never silently look like it covered all of history, so suggest output modes
+/// and human replay share this scope line.
+fn rules_scope_note(active_hash: &Option<String>, skipped: &HashSkipStats) -> String {
     match active_hash {
         None => "Rule set: all (--all-rules); no hash filter applied.".to_string(),
         Some(hash) => format!(
-            "Rule set: {hash}; skipped {} record(s) from other rule sets and {} predating rule-hash logging \
-             (use --all-rules to include them).",
-            skipped.other_rules, skipped.no_hash
+            "Rule set: {hash}; {} (use --all-rules to include them).",
+            rules_hash_skip_note(skipped)
         ),
     }
 }
@@ -1024,7 +1050,7 @@ struct ReplayReport {
     replayed_rules_hash: Option<String>,
     /// Records excluded because they came from a different rule set.
     skipped_other_rules: u64,
-    /// Records excluded because they predate rule-hash logging.
+    /// Records excluded because they have no recorded rule hash.
     skipped_no_hash: u64,
 }
 
@@ -1066,7 +1092,7 @@ fn build_replay_report(
     engine: &BashRuleEngine,
     result_filter: Option<PreToolResult>,
     replayed_rules_hash: Option<String>,
-    skipped: crate::hooks::report::HashSkipStats,
+    skipped: HashSkipStats,
 ) -> ReplayReport {
     let mut divergences = Vec::new();
     let mut lost_allow_count = 0;
@@ -1131,14 +1157,14 @@ fn classify_result(result: &RuleResult) -> PreToolResult {
 }
 
 fn print_replay(report: &ReplayReport) {
-    match &report.replayed_rules_hash {
-        Some(hash) => println!(
-            "Rule set: {hash}; skipped {} record(s) from other rule sets and {} predating rule-hash \
-             logging (use --all-rules to include them).",
-            report.skipped_other_rules, report.skipped_no_hash
-        ),
-        None => println!("Rule set: all (--all-rules); no hash filter applied."),
-    }
+    let skipped = HashSkipStats {
+        other_rules: report.skipped_other_rules,
+        no_hash: report.skipped_no_hash,
+    };
+    println!(
+        "{}",
+        rules_scope_note(&report.replayed_rules_hash, &skipped)
+    );
     println!(
         "Replayed {} recorded Bash command(s) against the candidate config.",
         report.total_evaluated

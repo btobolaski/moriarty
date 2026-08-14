@@ -3,7 +3,9 @@
 //! Reads the hooks tracing logs, keeps the completed PreToolUse records (those carrying the
 //! clean `result` field written by [`super::result`]), and groups them by the exact
 //! `(tool name, arguments, result, deciding rule)` key so each row reports how often that exact
-//! call occurred. Output is JSON on stdout; nothing else is written there.
+//! call occurred. Output is JSON on stdout; nothing else is written there. The same streaming
+//! parser/filter fold supplies timestamp-preserving outcomes to `rules report` without retaining
+//! every matching record.
 
 // standard library
 use std::{
@@ -14,6 +16,7 @@ use std::{
 
 // 3rd party crates
 use chrono::{DateTime, Utc};
+use futures::{StreamExt, TryStreamExt, stream};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -24,6 +27,9 @@ use super::result::PreToolResult;
 use crate::{cost_report::TimeRangeFilter, permission_mode::PermissionMode, persistence::FileType};
 
 const COMPLETION_MESSAGE: &str = "PreToolUse hook completed";
+/// Full files remain buffered while their records are folded, so bounding reads prevents old log
+/// histories from multiplying peak memory while still overlapping filesystem I/O.
+const MAX_CONCURRENT_LOG_READS: usize = 4;
 
 /// Tracing-subscriber's per-line JSON envelope. Only the fields the report needs are modeled and
 /// `deny_unknown_fields` is intentionally omitted: the envelope schema (`level`, `target`,
@@ -116,7 +122,7 @@ pub(crate) enum RulesHashFilter {
 pub(crate) struct HashSkipStats {
     /// Dropped because the record's `rules_hash` differs from the requested one.
     pub(crate) other_rules: u64,
-    /// Dropped because the record predates rule-hash logging (no `rules_hash`).
+    /// Dropped because no `rules_hash` was recorded (older logs and config-load failures).
     pub(crate) no_hash: u64,
 }
 
@@ -124,6 +130,15 @@ pub(crate) struct HashSkipStats {
 pub(crate) struct CwdAggregation {
     pub(crate) rows: Vec<ReportRow>,
     pub(crate) skipped: HashSkipStats,
+}
+
+/// The effectiveness report needs each event's timestamp intact; aggregating through
+/// [`ReportRow`] first would make timezone-aware daily grouping impossible.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OutcomeRecord {
+    pub(crate) timestamp: DateTime<Utc>,
+    pub(crate) cwd: Option<String>,
+    pub(crate) result: PreToolResult,
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -163,9 +178,9 @@ pub(crate) async fn aggregate(
     tool: Option<&str>,
     result: Option<PreToolResult>,
 ) -> Result<Vec<ReportRow>> {
-    let log_dir = resolve_log_dir(dir).await?;
-    let records = read_records(&log_dir).await?;
-    Ok(build_rows(records, filter, tool, result, false, &RulesHashFilter::Any).rows)
+    let aggregation =
+        aggregate_rows(dir, filter, tool, result, false, &RulesHashFilter::Any).await?;
+    Ok(aggregation.rows)
 }
 
 /// The rules path needs per-cwd rows (a command only re-normalizes correctly against the directory
@@ -180,9 +195,38 @@ pub(crate) async fn aggregate_with_cwd(
     result: Option<PreToolResult>,
     hash_filter: &RulesHashFilter,
 ) -> Result<CwdAggregation> {
-    let log_dir = resolve_log_dir(dir).await?;
-    let records = read_records(&log_dir).await?;
-    Ok(build_rows(records, filter, tool, result, true, hash_filter))
+    aggregate_rows(dir, filter, tool, result, true, hash_filter).await
+}
+
+/// Folds timestamp-preserving outcomes as their files are read, so daily/directory reports retain
+/// only their final buckets rather than every matching hook record.
+pub(crate) async fn fold_outcomes<T, F>(
+    dir: Option<PathBuf>,
+    filter: &TimeRangeFilter,
+    hash_filter: &RulesHashFilter,
+    initial: T,
+    mut fold: F,
+) -> Result<(T, HashSkipStats)>
+where
+    F: FnMut(&mut T, OutcomeRecord),
+{
+    let filters = RecordFilters {
+        time: filter,
+        tool: None,
+        result: None,
+        hash: hash_filter,
+    };
+    fold_filtered_records(dir, filters, initial, |value, record| {
+        fold(
+            value,
+            OutcomeRecord {
+                timestamp: record.timestamp,
+                cwd: record.cwd,
+                result: record.result,
+            },
+        );
+    })
+    .await
 }
 
 async fn resolve_log_dir(dir: Option<PathBuf>) -> Result<PathBuf> {
@@ -197,7 +241,7 @@ async fn resolve_log_dir(dir: Option<PathBuf>) -> Result<PathBuf> {
         .ok_or_else(|| miette::miette!("Could not determine the hooks log directory"))
 }
 
-async fn read_records(log_dir: &Path) -> Result<Vec<HookRecord>> {
+async fn log_files(log_dir: &Path) -> Result<Vec<PathBuf>> {
     let mut entries = match tokio::fs::read_dir(log_dir).await {
         Ok(entries) => entries,
         // A missing log directory means no hooks have run yet; an empty report is correct.
@@ -209,24 +253,21 @@ async fn read_records(log_dir: &Path) -> Result<Vec<HookRecord>> {
         }
     };
 
-    let mut records = Vec::new();
+    let mut paths = Vec::new();
     while let Some(entry) = entries.next_entry().await.into_diagnostic()? {
         // Daily rotation produces `hooks.log.YYYY-MM-DD`; match the whole family.
-        if !entry.file_name().to_string_lossy().starts_with("hooks.log") {
-            continue;
+        if entry.file_name().to_string_lossy().starts_with("hooks.log") {
+            paths.push(entry.path());
         }
-
-        let contents = tokio::fs::read_to_string(entry.path())
-            .await
-            .into_diagnostic()
-            .wrap_err_with(|| {
-                format!("Failed to read hooks log file {}", entry.path().display())
-            })?;
-
-        records.extend(contents.lines().filter_map(parse_record));
     }
+    Ok(paths)
+}
 
-    Ok(records)
+async fn read_log_file(path: PathBuf) -> Result<String> {
+    tokio::fs::read_to_string(&path)
+        .await
+        .into_diagnostic()
+        .wrap_err_with(|| format!("Failed to read hooks log file {}", path.display()))
 }
 
 /// Returns a record only for completed PreToolUse lines that carry the clean result field.
@@ -265,71 +306,94 @@ fn parse_recorded_permission_mode(mode: Option<String>) -> Option<PermissionMode
     }
 }
 
-/// Groups records by `(tool, arguments, result)`. When `include_cwd` is set, the cwd also joins the
-/// key (and is carried onto each row) so the rules path sees per-directory rows; otherwise cwd is
-/// the empty string and identical calls from different directories merge — `hooks report`'s shape.
-/// `hash_filter` drops records from other rule sets (counted in the returned [`HashSkipStats`]); the
-/// `hooks report` path passes [`RulesHashFilter::Any`], so it never drops on hash and reports zero.
-fn build_rows(
-    records: Vec<HookRecord>,
-    filter: &TimeRangeFilter,
-    tool: Option<&str>,
+struct RecordFilters<'a> {
+    time: &'a TimeRangeFilter,
+    tool: Option<&'a str>,
     result: Option<PreToolResult>,
-    include_cwd: bool,
-    hash_filter: &RulesHashFilter,
-) -> CwdAggregation {
-    let mut counts: HashMap<RowKey, u64> = HashMap::new();
-    let mut skipped = HashSkipStats::default();
+    hash: &'a RulesHashFilter,
+}
 
-    for record in records {
-        if tool.is_some_and(|tool| tool != record.tool_name) {
-            continue;
-        }
-        if result.is_some_and(|result| result != record.result) {
-            continue;
-        }
-        if !filter.contains(&record.timestamp) {
-            continue;
+impl RecordFilters<'_> {
+    /// Hash filtering follows the other predicates so skip counts describe only otherwise-in-scope
+    /// records; every report consumer shares this ordering.
+    fn keep(&self, record: HookRecord, skipped: &mut HashSkipStats) -> Option<HookRecord> {
+        if self
+            .tool
+            .is_some_and(|tool| tool != record.tool_name.as_str())
+            || self.result.is_some_and(|result| result != record.result)
+            || !self.time.contains(&record.timestamp)
+        {
+            return None;
         }
 
-        // Hash filtering runs after the tool/result/time filters so the skip counts reflect only
-        // records that were otherwise in scope.
-        if let RulesHashFilter::Only(wanted) = hash_filter {
+        if let RulesHashFilter::Only(wanted) = self.hash {
             match &record.rules_hash {
                 Some(hash) if hash == wanted => {}
                 Some(_) => {
                     skipped.other_rules += 1;
-                    continue;
+                    return None;
                 }
                 None => {
                     skipped.no_hash += 1;
-                    continue;
+                    return None;
                 }
             }
         }
 
-        let (cwd, permission_mode) = if include_cwd {
-            (record.cwd.unwrap_or_default(), record.permission_mode)
-        } else {
-            (String::new(), None)
-        };
-        *counts
-            .entry(RowKey {
-                tool_name: record.tool_name,
-                tool_args: record.tool_args,
-                result: record.result,
-                rule: record.rule,
-                cwd,
-                permission_mode,
-            })
-            .or_insert(0) += 1;
+        Some(record)
+    }
+}
+
+async fn fold_filtered_records<T, F>(
+    dir: Option<PathBuf>,
+    filters: RecordFilters<'_>,
+    mut value: T,
+    mut fold: F,
+) -> Result<(T, HashSkipStats)>
+where
+    F: FnMut(&mut T, HookRecord),
+{
+    let log_dir = resolve_log_dir(dir).await?;
+    let mut reads = stream::iter(log_files(&log_dir).await?)
+        .map(read_log_file)
+        .buffer_unordered(MAX_CONCURRENT_LOG_READS);
+
+    let mut skipped = HashSkipStats::default();
+
+    while let Some(contents) = reads.try_next().await? {
+        for record in contents.lines().filter_map(parse_record) {
+            if let Some(record) = filters.keep(record, &mut skipped) {
+                fold(&mut value, record);
+            }
+        }
     }
 
+    Ok((value, skipped))
+}
+
+fn count_row(counts: &mut HashMap<RowKey, u64>, record: HookRecord, include_cwd: bool) {
+    let (cwd, permission_mode) = if include_cwd {
+        (record.cwd.unwrap_or_default(), record.permission_mode)
+    } else {
+        (String::new(), None)
+    };
+    *counts
+        .entry(RowKey {
+            tool_name: record.tool_name,
+            tool_args: record.tool_args,
+            result: record.result,
+            rule: record.rule,
+            cwd,
+            permission_mode,
+        })
+        .or_insert(0) += 1;
+}
+
+fn finish_rows(counts: HashMap<RowKey, u64>, skipped: HashSkipStats) -> CwdAggregation {
     let mut entries: Vec<(RowKey, u64)> = counts.into_iter().collect();
 
-    // Most frequent first; tool name, raw arguments, result, rule, then cwd fully order ties so the
-    // report is deterministic regardless of HashMap iteration order. Sorting on the raw `tool_args`
-    // key also avoids re-serializing the parsed arguments for every comparison.
+    // Most frequent first; tool name, raw arguments, result, rule, then cwd fully order ties so
+    // output is deterministic regardless of HashMap or concurrent file-read order.
     entries.sort_by(|(a, a_count), (b, b_count)| {
         b_count
             .cmp(a_count)
@@ -354,6 +418,28 @@ fn build_rows(
         })
         .collect();
     CwdAggregation { rows, skipped }
+}
+
+async fn aggregate_rows(
+    dir: Option<PathBuf>,
+    filter: &TimeRangeFilter,
+    tool: Option<&str>,
+    result: Option<PreToolResult>,
+    include_cwd: bool,
+    hash_filter: &RulesHashFilter,
+) -> Result<CwdAggregation> {
+    let filters = RecordFilters {
+        time: filter,
+        tool,
+        result,
+        hash: hash_filter,
+    };
+    let (counts, skipped) =
+        fold_filtered_records(dir, filters, HashMap::new(), |counts, record| {
+            count_row(counts, record, include_cwd)
+        })
+        .await?;
+    Ok(finish_rows(counts, skipped))
 }
 
 /// `tool_args` is the tool input serialized to a JSON string, so parse it back to emit real JSON.
@@ -405,6 +491,32 @@ mod tests {
         }
     }
 
+    fn build_rows(
+        records: Vec<HookRecord>,
+        filter: &TimeRangeFilter,
+        tool: Option<&str>,
+        result: Option<PreToolResult>,
+        include_cwd: bool,
+        hash_filter: &RulesHashFilter,
+    ) -> CwdAggregation {
+        let filters = RecordFilters {
+            time: filter,
+            tool,
+            result,
+            hash: hash_filter,
+        };
+        let mut skipped = HashSkipStats::default();
+        let mut counts = HashMap::new();
+
+        for record in records {
+            if let Some(record) = filters.keep(record, &mut skipped) {
+                count_row(&mut counts, record, include_cwd);
+            }
+        }
+
+        finish_rows(counts, skipped)
+    }
+
     #[test]
     fn build_rows_only_filter_keeps_matching_hash_and_counts_skips() {
         let unrestricted = TimeRangeFilter::new(None, None, DateTimezone::Utc).unwrap();
@@ -452,6 +564,97 @@ mod tests {
                 no_hash: 1
             }
         );
+    }
+
+    #[tokio::test]
+    async fn outcome_fold_preserves_event_fields_and_applies_time_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = |timestamp: &str,
+                    tool: &str,
+                    result: &str,
+                    cwd: Option<&str>,
+                    rules_hash: Option<&str>| {
+            serde_json::json!({
+                "timestamp": timestamp,
+                "fields": {
+                    "message": COMPLETION_MESSAGE,
+                    "tool_name": tool,
+                    "tool_args": "{}",
+                    "result": result,
+                    "cwd": cwd,
+                    "rules_hash": rules_hash
+                }
+            })
+            .to_string()
+        };
+        let lines = [
+            line(
+                "2026-06-03T01:00:00Z",
+                "Bash",
+                "allow",
+                Some("/work/a"),
+                Some("h1"),
+            ),
+            line(
+                "2026-06-03T02:00:00Z",
+                "Read",
+                "deny",
+                Some("/work/b"),
+                Some("h1"),
+            ),
+            line("2026-06-03T03:00:00Z", "Edit", "ask", None, Some("h2")),
+            line("2026-06-03T04:00:00Z", "Write", "modify", None, None),
+            line(
+                "2026-06-04T00:00:00Z",
+                "Bash",
+                "passthrough",
+                None,
+                Some("h1"),
+            ),
+        ];
+        tokio::fs::write(
+            dir.path().join("hooks.log.2026-06-03"),
+            format!("{}\n", lines.join("\n")),
+        )
+        .await
+        .unwrap();
+        let filter = TimeRangeFilter::new(
+            Some("2026-06-03".to_string()),
+            Some("2026-06-03".to_string()),
+            DateTimezone::Utc,
+        )
+        .unwrap();
+
+        let (all_history, skipped) = fold_outcomes(
+            Some(dir.path().to_path_buf()),
+            &filter,
+            &RulesHashFilter::Any,
+            Vec::new(),
+            |records, record| records.push(record),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            all_history.len(),
+            4,
+            "the next day's record is filtered out"
+        );
+        assert_eq!(
+            &all_history[..2],
+            [
+                OutcomeRecord {
+                    timestamp: ts("2026-06-03T01:00:00Z"),
+                    cwd: Some("/work/a".to_string()),
+                    result: PreToolResult::Allow,
+                },
+                OutcomeRecord {
+                    timestamp: ts("2026-06-03T02:00:00Z"),
+                    cwd: Some("/work/b".to_string()),
+                    result: PreToolResult::Deny,
+                },
+            ]
+        );
+        assert_eq!(skipped, HashSkipStats::default());
     }
 
     #[test]
@@ -946,7 +1149,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_records_reads_rotated_files_and_skips_others() {
+    async fn streaming_aggregate_reads_rotated_files_in_deterministic_order() {
         let dir = tempfile::tempdir().unwrap();
         tokio::fs::write(
             dir.path().join("hooks.log.2026-06-03"),
@@ -979,15 +1182,20 @@ mod tests {
             .await
             .unwrap();
 
-        let mut records = read_records(dir.path()).await.unwrap();
-        records.sort_by(|a, b| a.tool_name.cmp(&b.tool_name));
+        let filter = TimeRangeFilter::new(None, None, DateTimezone::Utc).unwrap();
+        let rows = aggregate(Some(dir.path().to_path_buf()), &filter, None, None)
+            .await
+            .unwrap();
 
-        // The non-JSON line and the unrelated file are dropped; both rotated completion lines parse.
-        assert_eq!(records.len(), 2);
-        assert_eq!(records[0].tool_name, "Bash");
-        assert_eq!(records[0].timestamp, ts("2026-06-03T01:00:00Z"));
-        assert_eq!(records[1].tool_name, "Read");
-        assert_eq!(records[1].result, PreToolResult::Passthrough);
+        // Equal-count rows are fully ordered after the concurrent file reads; malformed lines and
+        // unrelated files never enter the aggregation.
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].tool_name, "Bash");
+        assert_eq!(rows[0].arguments, serde_json::json!({ "command": "ls" }));
+        assert_eq!(rows[0].result, PreToolResult::Allow);
+        assert_eq!(rows[1].tool_name, "Read");
+        assert_eq!(rows[1].arguments, serde_json::json!({ "file_path": "/a" }));
+        assert_eq!(rows[1].result, PreToolResult::Passthrough);
     }
 
     #[test]
@@ -1032,13 +1240,75 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_records_returns_empty_when_directory_missing() {
+    async fn aggregate_reports_log_file_read_errors_with_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let unreadable = dir.path().join("hooks.log.unreadable");
+        tokio::fs::create_dir(&unreadable).await.unwrap();
+        let filter = TimeRangeFilter::new(None, None, DateTimezone::Utc).unwrap();
+
+        let error = aggregate(Some(dir.path().to_path_buf()), &filter, None, None)
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains(&unreadable.display().to_string()),
+            "error should identify the unreadable log path: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_aggregate_returns_empty_when_directory_missing() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("does-not-exist");
+        let filter = TimeRangeFilter::new(None, None, DateTimezone::Utc).unwrap();
 
-        let records = read_records(&missing).await.unwrap();
+        let rows = aggregate(Some(missing), &filter, None, None).await.unwrap();
 
-        assert!(records.is_empty());
+        assert!(rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn aggregate_streams_and_merges_rows_without_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = |cwd: &str| {
+            serde_json::json!({
+                "timestamp": "2026-06-03T01:00:00Z",
+                "fields": {
+                    "message": COMPLETION_MESSAGE,
+                    "tool_name": "Bash",
+                    "tool_args": r#"{"command":"ls"}"#,
+                    "cwd": cwd,
+                    "result": "allow"
+                }
+            })
+            .to_string()
+        };
+        tokio::fs::write(
+            dir.path().join("hooks.log.2026-06-03"),
+            format!("{}\n{}\n", line("/work/a"), line("/work/b")),
+        )
+        .await
+        .unwrap();
+        let filter = TimeRangeFilter::new(None, None, DateTimezone::Utc).unwrap();
+
+        let rows = aggregate(Some(dir.path().to_path_buf()), &filter, None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            rows,
+            vec![ReportRow {
+                tool_name: "Bash".to_string(),
+                arguments: serde_json::json!({ "command": "ls" }),
+                result: PreToolResult::Allow,
+                count: 2,
+                rule: None,
+                cwd: String::new(),
+                permission_mode: None,
+            }]
+        );
     }
 
     #[tokio::test]
@@ -1059,8 +1329,7 @@ mod tests {
         .await
         .unwrap();
 
-        // Exercises the full path: resolve_log_dir (explicit dir) -> read_records -> build_rows ->
-        // JSON serialization. Output goes to stdout; we only assert the run itself succeeds.
+        // Exercises the full streaming fold through row aggregation and JSON serialization.
         run(
             Some(dir.path().to_path_buf()),
             None,

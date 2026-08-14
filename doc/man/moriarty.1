@@ -98,6 +98,14 @@
 .Cm rules starter
 .Op Fl \-json
 .Nm
+.Cm rules report
+.Op Fl d Ar dir
+.Op Fl \-start\-time Ar DATETIME
+.Op Fl \-end\-time Ar DATETIME
+.Op Fl \-timezone Ar local|utc
+.Op Fl \-directories
+.Op Fl \-current\-rules
+.Nm
 .Cm rules suggest
 .Op Fl d Ar dir
 .Op Fl \-start\-time Ar DATETIME
@@ -340,7 +348,8 @@ Omitting this option runs a mode\-less test evaluation, so only unrestricted rul
 The
 .Cm rules
 subcommands inspect, validate, and author the bash and tool rules in
-.Pa ~/.config/moriarty/tool_rules.toml .
+.Pa ~/.config/moriarty/tool_rules.toml ,
+or summarize completed PreToolUse outcomes recorded in the hook logs.
 They never run the hook.
 .Bl -tag -width Ds
 .It Cm rules lint Op Fl \-strict
@@ -364,6 +373,37 @@ covering every rule and action variant.
 .It Cm rules starter
 Print a paste\-ready set of allow\-rules for common read\-only commands, designed for
 the per\-leaf engine.
+.It Cm rules report
+Summarize completed PreToolUse outcomes from the hook logs as a terminal table.
+By default, records are grouped by calendar day in
+.Fl \-timezone
+.Pq Cm local No by default;
+.Fl \-directories
+instead groups by the exact recorded working directory, with records that have no directory under
+.Cm Unknown .
+Each row and the grand\-total row report raw counts and one\-decimal percentages for
+.Cm allow , deny , ask , modify ,
+and
+.Cm passthrough ,
+plus the total number of calls used as the percentage denominator.
+.Fl \-start\-time
+is inclusive and
+.Fl \-end\-time
+is exclusive for timestamp inputs.
+Date\-only and naive datetime inputs are interpreted in
+.Fl \-timezone ;
+a date\-only end includes that whole calendar day.
+All recorded rule sets are included by default.
+.Fl \-current\-rules
+restricts the report to the rule set currently installed at
+.Pa ~/.config/moriarty/tool_rules.toml
+and reports how many otherwise matching records came from other rule sets or had no recorded rule hash.
+.Fl d
+or
+.Fl \-dir
+selects a hook log directory instead of
+.Pa ~/.local/state/moriarty/hooks .
+There is no JSON output mode.
 .It Cm rules suggest
 Suggest anchored rules for commands the hook frequently prompted on, mined from the
 hook logs.

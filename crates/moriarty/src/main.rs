@@ -375,7 +375,7 @@ enum Command {
         #[command(subcommand)]
         subcommand: HooksCommand,
     },
-    /// Inspect, validate, and author bash/tool permission rules
+    /// Inspect or evaluate rule behavior, and validate or author bash/tool permission rules
     Rules {
         #[command(subcommand)]
         subcommand: RulesCommand,
@@ -400,6 +400,27 @@ enum RulesCommand {
         /// Also warn about empty modes, likely-shadowed rules, and over-broad Allow rules
         #[arg(long)]
         strict: bool,
+    },
+    /// Summarize completed hook outcomes by day or recorded working directory
+    Report {
+        /// Directory containing hook logs (defaults to ~/.local/state/moriarty/hooks)
+        #[arg(short, long)]
+        dir: Option<PathBuf>,
+        /// Only include results at or after this time (ISO 8601; date-only and naive inputs use --timezone)
+        #[arg(long, value_name = "DATETIME")]
+        start_time: Option<String>,
+        /// Only include results before this time (ISO 8601; date-only and naive inputs use --timezone)
+        #[arg(long, value_name = "DATETIME")]
+        end_time: Option<String>,
+        /// Timezone for date grouping and for interpreting date-only and naive datetime inputs (local or utc)
+        #[arg(long, default_value = "local")]
+        timezone: String,
+        /// Group by the exact recorded working directory instead of calendar day
+        #[arg(long)]
+        directories: bool,
+        /// Only include records produced by the currently installed rule set
+        #[arg(long)]
+        current_rules: bool,
     },
     /// List the merged pattern fragments (built-in defaults plus user-defined) usable in patterns
     ListFragments {
@@ -955,6 +976,75 @@ mod tests {
                 assert_eq!(args.tool.as_deref(), Some("Bash"));
             }
             other => panic!("expected hooks report command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_rules_report_defaults() {
+        let cli = Cli::try_parse_from(["moriarty", "rules", "report"]).unwrap();
+
+        match cli.command {
+            Command::Rules {
+                subcommand:
+                    RulesCommand::Report {
+                        dir,
+                        start_time,
+                        end_time,
+                        timezone,
+                        directories,
+                        current_rules,
+                    },
+            } => {
+                assert_eq!(dir, None);
+                assert_eq!(start_time, None);
+                assert_eq!(end_time, None);
+                assert_eq!(timezone, "local");
+                assert!(!directories);
+                assert!(!current_rules);
+            }
+            other => panic!("expected rules report command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_rules_report_flags() {
+        let cli = Cli::try_parse_from([
+            "moriarty",
+            "rules",
+            "report",
+            "--dir",
+            "logs/hooks",
+            "--start-time",
+            "2026-01-01",
+            "--end-time",
+            "2026-02-01",
+            "--timezone",
+            "utc",
+            "--directories",
+            "--current-rules",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Command::Rules {
+                subcommand:
+                    RulesCommand::Report {
+                        dir,
+                        start_time,
+                        end_time,
+                        timezone,
+                        directories,
+                        current_rules,
+                    },
+            } => {
+                assert_eq!(dir, Some(PathBuf::from("logs/hooks")));
+                assert_eq!(start_time.as_deref(), Some("2026-01-01"));
+                assert_eq!(end_time.as_deref(), Some("2026-02-01"));
+                assert_eq!(timezone, "utc");
+                assert!(directories);
+                assert!(current_rules);
+            }
+            other => panic!("expected rules report command, got {other:?}"),
         }
     }
 
