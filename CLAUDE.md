@@ -359,14 +359,15 @@ with warnings, while explicit missing paths and having no available source are e
     double-quoted words, including `"$P/runtime/mocks.js"` and `"$P"/runtime/mocks.js`, then applies quote-aware cwd
     stripping. Single-quoted `'$P'` remains literal; localized `$"…"`, indirect, dynamic, and other quoted or escaped
     compositions stay unsupported and cap Allow at Ask. The declaration is analysis metadata only after a later
-    supported reference consumes it. Unsupported
-    declarations/references and command-position expansion remain leaves with an independent Allow-to-Ask confirmation
-    cap, so later Denies still win. Rather than model per-builtin mutation targets, an assignment invalidates all aliases
-    only when a binding is active or it targets a configured alias; unrelated standalone environment assignments remain
-    eligible for normal rules. Dynamic command names, wrappers, `exec`, and recognized shell-state builtins invalidate
-    all active aliases. This trades extra prompts for a small fail-closed implementation without retaining stale bindings. Config deserialization validates shell identifiers and rejects the fixed shell-control names before any
-    tool rule can short-circuit Bash analysis. No aliases is the omitted/hash-compatible default; configured aliases are
-    trusted policy and must not be application/tool behavior variables.
+    supported reference consumes it. Unsupported declarations/references and command-position expansion remain leaves
+    with an independent Allow-to-Ask confirmation cap, so later Denies still win. Rather than model per-builtin mutation
+    targets, an assignment invalidates all aliases only when a binding is active or it targets a configured alias;
+    unrelated standalone environment assignments remain eligible for normal rules. Dynamic command names, wrappers,
+    `exec`, and recognized shell-state builtins invalidate all active aliases. This trades extra prompts for a small
+    fail-closed implementation without retaining stale bindings. Config deserialization validates shell identifiers and
+    rejects the fixed shell-control names before any tool rule can short-circuit Bash analysis. No aliases is the
+    omitted/hash-compatible default; configured aliases are trusted policy and must not be application/tool behavior
+    variables.
   - **`real_file_write` cap**: a leaf with a `>`/`>>`/`>|`/`&>` redirect to a real file (not `/dev/null`, not an fd
     duplication like `2>&1`) has any `Allow` capped at Ask, so a read-only allow-rule (`^echo`) can't green-light
     `echo secret > file`.
@@ -406,31 +407,31 @@ with warnings, while explicit missing paths and having no available source are e
   `--start-time`/`--end-time` and supports `--tool` and `--result` filters. `report::aggregate` (used by `hooks report`)
   and `ReportRow` are `pub(crate)`. `report.rs` parses the completion line's `cwd` back into `HookRecord` and folds
   filtered records directly into each caller's accumulator while reading rotated log files concurrently, so no vector
-  retains every matching event. `rules suggest`/`rules replay` call `report::aggregate_with_cwd`,
-  which joins `cwd` into the grouping key and populates `ReportRow.cwd` (a `#[serde(skip)]` field) so each command is
-  re-normalized with the directory it actually ran under. `rules report` calls `report::fold_outcomes`, preserving each
-  event's timestamp only until it has been folded into a timezone-aware daily or exact-directory bucket while sharing
-  the same time/hash filtering and skip accounting. `aggregate` keeps `cwd` out of its key and serialization, so
-  `hooks report`'s rows and counts are unchanged; rows recorded before `cwd` was logged fall back to an empty cwd for
-  replay/suggest and an explicit `Unknown` bucket in the effectiveness report.
+  retains every matching event. `rules suggest`/`rules replay` call `report::aggregate_with_cwd`, which joins `cwd` into
+  the grouping key and populates `ReportRow.cwd` (a `#[serde(skip)]` field) so each command is re-normalized with the
+  directory it actually ran under. `rules report` calls `report::fold_outcomes`, preserving each event's timestamp only
+  until it has been folded into a timezone-aware daily or exact-directory bucket while sharing the same time/hash
+  filtering and skip accounting. `aggregate` keeps `cwd` out of its key and serialization, so `hooks report`'s rows and
+  counts are unchanged; rows recorded before `cwd` was logged fall back to an empty cwd for replay/suggest and an
+  explicit `Unknown` bucket in the effectiveness report.
 - **Compile diagnostics & `rules` authoring tooling**: `BashRuleEngine::compile_with_diagnostics` and
   `ToolRuleEngine::compile_with_diagnostics` return the engine plus a `RuleDiagnostic` for every dropped rule
-  (undefined/circular/over-depth fragment, invalid regex, or — tool rules only — a `field`/`pattern` given without its
-  partner); an invalid `Matches` condition drops the whole tool rule rather than broadening it by retaining only the
-  valid predicates. `from_config` delegates to these compilers and logs each diagnostic, preserving the
+  (undefined/circular/over-depth/over-count fragment, invalid regex, or — tool rules only — a `field`/`pattern` given
+  without its partner); an invalid `Matches` condition drops the whole tool rule rather than broadening it by retaining
+  only the valid predicates. `from_config` delegates to these compilers and logs each diagnostic, preserving the
   fail-open-per-rule hot path. The `crate::rules` command group surfaces them and helps author safe rules: `report`
   (daily outcome counts/percentages by default, exact recorded-cwd buckets with `--directories`, all recorded rule sets
-  by default, and opt-in active-hash filtering with `--current-rules`), `lint`
-  (errors when a rule the user wrote is silently dropped; `--strict` additionally warns on permanently disabled
-  `modes = []`, likely-shadowed rules, and over-broad Allow rules), `list-fragments`, `schema` (round-tripped against
-  `UserConfig` in tests), `starter` (paste-ready read-only allow-rules that auto-allow the north-star command),
-  `suggest` (anchored rules mined from hook logs; each recorded command is split into the leaf simple-commands the hook
-  actually evaluates — normalized with the recorded cwd — before pattern generation, so compounds yield per-leaf
-  candidates with summed counts, consumed alias declarations omitted, and confirmation-required alias leaves excluded; a
-  bailed command stays whole. `--match exact|prefix|fuzzy` picks the shape, where fuzzy clusters leaves by program and
-  generalizes simple-identifier subcommands into a closed alternation like `^cargo (build|check)(\s|$)`, falling back to
-  a program prefix; Allow is emitted only with `--match exact`), and `replay` (re-evaluate recorded Bash decisions
-  against the full candidate config, including aliases — the migration acceptance gate is zero lost auto-approvals).
+  by default, and opt-in active-hash filtering with `--current-rules`), `lint` (errors when a rule the user wrote is
+  silently dropped; `--strict` additionally warns on permanently disabled `modes = []`, likely-shadowed rules, and
+  over-broad Allow rules), `list-fragments`, `schema` (round-tripped against `UserConfig` in tests), `starter`
+  (paste-ready read-only allow-rules that auto-allow the north-star command), `suggest` (anchored rules mined from hook
+  logs; each recorded command is split into the leaf simple-commands the hook actually evaluates — normalized with the
+  recorded cwd — before pattern generation, so compounds yield per-leaf candidates with summed counts, consumed alias
+  declarations omitted, and confirmation-required alias leaves excluded; a bailed command stays whole.
+  `--match exact|prefix|fuzzy` picks the shape, where fuzzy clusters leaves by program and generalizes simple-identifier
+  subcommands into a closed alternation like `^cargo (build|check)(\s|$)`, falling back to a program prefix; Allow is
+  emitted only with `--match exact`), and `replay` (re-evaluate recorded Bash decisions against the full candidate
+  config, including aliases — the migration acceptance gate is zero lost auto-approvals).
   `test bash-rules --explain [--cwd <dir>] [--mode <mode>]` prints consumed bindings, original/alias-expanded/normalized
   leaf text, confirmation caps, matching rules, and the merged decision via `BashRuleEngine::explain`; normal mode uses
   the same compound path. Omitted `--mode` runs a mode-less evaluation. Alias coverage spans `user_config`, splitter,

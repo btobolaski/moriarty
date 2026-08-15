@@ -44,6 +44,20 @@ fn test_expand_fragments_deeply_nested() {
     assert_eq!(expanded, "xyz");
 }
 
+/// A fragment reachable by more than one path is a DAG, not a cycle: `safe_arg` references
+/// `safe_chars`, and the pattern references both. Cycle detection must not flag the second
+/// occurrence just because the name was already expanded elsewhere.
+#[test]
+fn test_expand_fragments_shared_fragment_across_nesting_levels() {
+    let mut fragments = HashMap::new();
+    fragments.insert("safe_chars".to_string(), "[^|&;$]".to_string());
+    fragments.insert("safe_arg".to_string(), "( {{safe_chars}}+)".to_string());
+
+    let pattern = "^ls{{safe_arg}}*{{safe_chars}}$";
+    let expanded = expand_fragments(pattern, &fragments).unwrap();
+    assert_eq!(expanded, "^ls( [^|&;$]+)*[^|&;$]$");
+}
+
 #[test]
 fn test_expand_fragments_undefined() {
     let fragments = HashMap::new();
@@ -83,6 +97,26 @@ fn test_expand_fragments_circular_dependency() {
     );
 }
 
+/// A direct self-reference trips the active-chain check one frame earlier than the a → b → a
+/// case, so an off-by-one in when membership is tested relative to the push would pass one test
+/// and fail the other.
+#[test]
+fn test_expand_fragments_self_reference() {
+    let mut fragments = HashMap::new();
+    fragments.insert("a".to_string(), "{{a}}".to_string());
+
+    let result = expand_fragments("{{a}}", &fragments);
+
+    let error_msg = result
+        .expect_err("Should detect self-referencing cycle")
+        .to_string();
+    assert!(
+        error_msg.contains("Circular dependency"),
+        "Expected circular dependency error, got: {}",
+        error_msg
+    );
+}
+
 #[test]
 fn test_expand_fragments_depth_limit() {
     let mut fragments = HashMap::new();
@@ -107,6 +141,60 @@ fn test_expand_fragments_depth_limit() {
         .expect_err("Should fail due to depth limit")
         .to_string();
     assert!(error_msg.contains("exceeded maximum depth"));
+}
+
+/// Breadth escapes the depth limit: each level doubles, so a graph deliberately built one level
+/// inside `MAX_DEPTH` demands 2^10 - 1 = 1023 substitutions while never tripping the depth or
+/// cycle check. Only the total-expansion cap stops it.
+#[test]
+fn test_expand_fragments_expansion_count_limit() {
+    let deepest = FragmentExpander::MAX_DEPTH - 1;
+    let mut fragments = HashMap::new();
+    fragments.insert("f0".to_string(), "x".to_string());
+    for level in 1..=deepest {
+        fragments.insert(
+            format!("f{}", level),
+            format!("{{{{f{prev}}}}}{{{{f{prev}}}}}", prev = level - 1),
+        );
+    }
+
+    let result = expand_fragments(&format!("{{{{f{deepest}}}}}"), &fragments);
+
+    let error_msg = result
+        .expect_err("Should fail once total substitutions exceed the cap")
+        .to_string();
+    assert!(
+        error_msg.contains("exceeded maximum expansion count"),
+        "Expected expansion-count error, got: {}",
+        error_msg
+    );
+    assert!(
+        !error_msg.contains("exceeded maximum depth"),
+        "The graph is within the depth limit; breadth is what must be rejected"
+    );
+}
+
+/// Pins the exact edge rather than a comfortable margin, so an off-by-one in the `>` comparison
+/// cannot pass. Repeated references are ordinary usage, so the accepted side matters as much as
+/// the rejected one.
+#[test]
+fn test_expand_fragments_expansion_count_boundary() {
+    let mut fragments = HashMap::new();
+    fragments.insert("safe".to_string(), "[^|&;$]".to_string());
+
+    let at_limit = "{{safe}}".repeat(FragmentExpander::MAX_EXPANSIONS);
+    let expanded = expand_fragments(&at_limit, &fragments).unwrap();
+    assert_eq!(expanded, "[^|&;$]".repeat(FragmentExpander::MAX_EXPANSIONS));
+
+    let over_limit = "{{safe}}".repeat(FragmentExpander::MAX_EXPANSIONS + 1);
+    let error_msg = expand_fragments(&over_limit, &fragments)
+        .expect_err("One substitution past the cap must fail")
+        .to_string();
+    assert!(
+        error_msg.contains("exceeded maximum expansion count"),
+        "Expected expansion-count error, got: {}",
+        error_msg
+    );
 }
 
 #[test]
@@ -313,26 +401,6 @@ fn test_default_fragments_compile_to_valid_regex() {
             )
         });
     }
-}
-
-#[test]
-fn test_expand_fragments_circular_with_prefix() {
-    let mut fragments = HashMap::new();
-    fragments.insert("a".to_string(), "prefix{{b}}".to_string());
-    fragments.insert("b".to_string(), "middle{{a}}".to_string());
-
-    let pattern = "{{a}}";
-    let result = expand_fragments(pattern, &fragments);
-
-    let error_msg = result
-        .expect_err("Should detect circular dependency")
-        .to_string();
-
-    assert!(
-        error_msg.contains("Circular dependency"),
-        "Expected circular dependency error, got: {}",
-        error_msg
-    );
 }
 
 // Tests for command parsing and argument filtering functions

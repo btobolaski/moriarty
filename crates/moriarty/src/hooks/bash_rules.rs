@@ -4,7 +4,7 @@
 //! before they are executed by Claude Code. Rules can deny dangerous commands, modify
 //! commands to add safety flags, or explicitly allow specific patterns.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 
 use miette::{Result, miette};
 use regex::{Regex, RegexSet};
@@ -87,6 +87,10 @@ pub(crate) enum RuleDiagnosticKind {
     CircularFragment,
     /// Fragment expansion exceeded the maximum nesting depth.
     FragmentDepthExceeded,
+    /// Fragment expansion performed too many total substitutions. Distinct from
+    /// `FragmentDepthExceeded` because breadth blows up within the depth limit: a fragment
+    /// referencing several others multiplies at every level of an acyclic graph.
+    FragmentExpansionLimitExceeded,
     /// The expanded pattern was not a valid regex.
     InvalidRegex,
     /// A tool rule had only one of `field`/`pattern` (both are required together). Tool rules only.
@@ -99,6 +103,7 @@ impl RuleDiagnosticKind {
             Self::UndefinedFragment => "undefined-fragment",
             Self::CircularFragment => "circular-fragment",
             Self::FragmentDepthExceeded => "fragment-depth-exceeded",
+            Self::FragmentExpansionLimitExceeded => "fragment-expansion-limit-exceeded",
             Self::InvalidRegex => "invalid-regex",
             Self::MissingFieldOrPattern => "missing-field-or-pattern",
         }
@@ -112,18 +117,21 @@ pub(crate) fn classify_fragment_error(message: &str) -> RuleDiagnosticKind {
         RuleDiagnosticKind::CircularFragment
     } else if message.contains("exceeded maximum depth") {
         RuleDiagnosticKind::FragmentDepthExceeded
+    } else if message.contains("exceeded maximum expansion count") {
+        RuleDiagnosticKind::FragmentExpansionLimitExceeded
     } else {
         // The remaining `expand_fragments` failure is the undefined-fragment case.
         RuleDiagnosticKind::UndefinedFragment
     }
 }
 
-/// Expands {{fragment_name}} references in a pattern string using iterative substitution.
+/// Expands {{fragment_name}} references in a pattern string.
 ///
-/// Supports nested fragments (fragments referencing other fragments) by performing
-/// multiple expansion passes until no more fragment references remain. Detects circular
-/// dependencies by tracking which fragments have been expanded - if a fragment appears
-/// again after being expanded, a cycle exists (e.g., a → b → a).
+/// Supports nested fragments (fragments referencing other fragments) by expanding each
+/// reference depth-first. Cycle detection tracks the chain of fragments currently being
+/// expanded rather than every fragment ever expanded, because the same fragment legitimately
+/// appears at several points in a directed acyclic graph — a pattern using both `{{safe_arg}}`
+/// and `{{safe_chars}}` when `safe_arg` itself references `safe_chars` is not a cycle.
 ///
 /// # Arguments
 /// * `pattern` - The pattern string potentially containing {{fragment}} references
@@ -133,6 +141,7 @@ pub(crate) fn classify_fragment_error(message: &str) -> RuleDiagnosticKind {
 /// * Returns error if a referenced fragment doesn't exist in the map
 /// * Returns error if circular dependencies are detected (fragments referencing each other)
 /// * Returns error if nested expansion exceeds MAX_DEPTH (10 levels)
+/// * Returns error if total substitutions exceed MAX_EXPANSIONS (256)
 ///
 /// # Examples
 /// ```
@@ -150,84 +159,103 @@ pub(crate) fn expand_fragments(
     pattern: &str,
     fragments: &HashMap<String, String>,
 ) -> Result<String> {
-    // Maximum nesting depth chosen to allow reasonable fragment composition
-    // (e.g., safe_chars -> safe_arg -> safe_pipe) while preventing
-    // resource exhaustion from deeply nested or circular references.
-    const MAX_DEPTH: usize = 10;
-
     let fragment_pattern =
         Regex::new(r"\{\{([a-zA-Z_][a-zA-Z0-9_-]*)\}\}").expect("Fragment regex pattern is valid");
 
-    let mut result = pattern.to_string();
-    let mut depth = 0;
-    let mut all_expanded_fragments = HashSet::new();
+    FragmentExpander {
+        root_pattern: pattern,
+        fragments,
+        fragment_pattern: &fragment_pattern,
+        active: Vec::new(),
+        expansions: 0,
+    }
+    .expand(pattern)
+}
 
-    loop {
-        let mut changed = false;
-        let mut new_result = String::new();
+/// Depth-first expansion state for one [`expand_fragments`] call.
+struct FragmentExpander<'a> {
+    /// Reported in the undefined-fragment error so it names the pattern the user wrote rather than
+    /// the fragment body the dangling reference happened to sit in.
+    root_pattern: &'a str,
+    fragments: &'a HashMap<String, String>,
+    fragment_pattern: &'a Regex,
+    /// The chain of fragments whose bodies are currently being expanded, innermost last. A
+    /// reference to a name already on this chain is the only true cycle; the same fragment reached
+    /// by two different paths is an acyclic graph and expands normally.
+    active: Vec<String>,
+    /// Counted across the whole expansion rather than per branch, because it bounds the size of the
+    /// result and sibling references multiply.
+    expansions: usize,
+}
+
+impl FragmentExpander<'_> {
+    /// Maximum nesting depth chosen to allow reasonable fragment composition
+    /// (e.g., safe_chars -> safe_arg -> safe_pipe) while preventing
+    /// resource exhaustion from deeply nested or circular references.
+    const MAX_DEPTH: usize = 10;
+    /// Depth alone does not bound the expanded pattern: a fragment referencing several others
+    /// multiplies at every level, so an acyclic graph well inside [`Self::MAX_DEPTH`] can still
+    /// expand into an enormous regex. Set generously so no plausible hand-written set trips it.
+    const MAX_EXPANSIONS: usize = 256;
+
+    fn expand(&mut self, text: &str) -> Result<String> {
+        if self.active.len() > Self::MAX_DEPTH {
+            return Err(miette!(
+                "Pattern fragment expansion exceeded maximum depth of {}. \
+                 This likely indicates overly deep nesting.",
+                Self::MAX_DEPTH
+            ));
+        }
+
+        // Copied out of `self` so the borrows below are independent of the `&mut self` the
+        // recursive call needs.
+        let fragments = self.fragments;
+        let fragment_pattern = self.fragment_pattern;
+
+        let mut result = String::new();
         let mut last_end = 0;
-        let mut current_iteration_fragments = HashSet::new();
 
-        for cap in fragment_pattern.captures_iter(&result) {
+        for cap in fragment_pattern.captures_iter(text) {
             let full_match = cap.get(0).unwrap();
-            let fragment_name = cap[1].to_string();
+            let fragment_name = &cap[1];
 
-            // Collect unique fragments from current iteration for cycle detection against historical set
-            current_iteration_fragments.insert(fragment_name.clone());
-
-            // Look up fragment value
-            let fragment_value = fragments.get(&fragment_name).ok_or_else(|| {
+            let fragment_value = fragments.get(fragment_name).ok_or_else(|| {
                 miette!(
                     "Undefined pattern fragment '{}' referenced in pattern: {}",
                     fragment_name,
-                    pattern
+                    self.root_pattern
                 )
             })?;
 
-            // Build new result with expanded fragment
-            new_result.push_str(&result[last_end..full_match.start()]);
-            new_result.push_str(fragment_value);
-            last_end = full_match.end();
-
-            changed = true;
-        }
-
-        if !changed {
-            break;
-        }
-
-        // Append remaining text
-        new_result.push_str(&result[last_end..]);
-        result = new_result;
-
-        // Detect circular dependencies by checking if we're re-expanding fragments.
-        // Example: If 'a' → '{{b}}' and 'b' → '{{a}}', iterations will be:
-        //   Iteration 1: expand 'a' → '{{b}}' (record 'a')
-        //   Iteration 2: expand 'b' → '{{a}}' (record 'b')
-        //   Iteration 3: expand 'a' → cycle detected ('a' already in set)
-        for fragment_name in &current_iteration_fragments {
-            if all_expanded_fragments.contains(fragment_name) {
+            if self.active.iter().any(|name| name == fragment_name) {
                 return Err(miette!(
                     "Circular dependency detected in pattern fragments: '{}' references itself through other fragments",
                     fragment_name
                 ));
             }
+
+            self.expansions += 1;
+            if self.expansions > Self::MAX_EXPANSIONS {
+                return Err(miette!(
+                    "Pattern fragment expansion exceeded maximum expansion count of {}. \
+                     This likely indicates fragments that multiply across many references.",
+                    Self::MAX_EXPANSIONS
+                ));
+            }
+
+            result.push_str(&text[last_end..full_match.start()]);
+
+            self.active.push(fragment_name.to_string());
+            let expanded = self.expand(fragment_value);
+            self.active.pop();
+            result.push_str(&expanded?);
+
+            last_end = full_match.end();
         }
 
-        // Add current iteration's unique fragments to the all-time set
-        all_expanded_fragments.extend(current_iteration_fragments);
-
-        depth += 1;
-        if depth > MAX_DEPTH {
-            return Err(miette!(
-                "Pattern fragment expansion exceeded maximum depth of {}. \
-                 This likely indicates overly deep nesting.",
-                MAX_DEPTH
-            ));
-        }
+        result.push_str(&text[last_end..]);
+        Ok(result)
     }
-
-    Ok(result)
 }
 
 /// Returns default pattern fragments for common security patterns.

@@ -410,7 +410,7 @@ action = { type = "Allow" }
 .Ed
 .Ss Nested Fragments
 Fragments can reference other fragments.
-Expansion happens in multiple passes:
+Expansion happens depth\-first, fully resolving each reference before moving to the next:
 .Bd -literal -offset indent
 [pattern_fragments]
 safe_chars = "[^|&;$\`()<>{}]"
@@ -454,10 +454,29 @@ Fragment names must start with a letter or underscore
 .Pq Ql [a\-zA\-Z_]
 and may contain letters, numbers, underscores, and hyphens
 .Pq Ql [a\-zA\-Z0\-9_\-]* .
+.Ss Expansion Limits
+Nesting is limited to 10 levels, and a single pattern may perform at most
+256 fragment substitutions in total.
+The second limit exists because a fragment referencing several others
+multiplies at every level, so a shallow set of fragments can still expand
+into an enormous regex.
+Neither limit is reachable by hand\-written fragments.
 .Ss Circular Dependencies
 Fragments cannot reference each other in a cycle.
 The system detects circular dependencies and reports an error
 when loading the configuration.
+.Pp
+Referencing the same fragment from several places is not a cycle.
+A pattern may use both
+.Ql {{safe_arg}}
+and
+.Ql {{safe_chars}}
+even though
+.Ic safe_arg
+itself expands
+.Ql {{safe_chars}} ;
+that is a directed acyclic graph and expands without error.
+Only a fragment that reaches itself, directly or transitively, is rejected.
 .Sh SECURITY BEST PRACTICES
 .Bl -enum
 .It

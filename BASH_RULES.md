@@ -348,11 +348,12 @@ conditions remain whole-command fail-safe cases.
 ### Mutation Barriers
 
 Moriarty deliberately avoids modeling Bash mutation targets. An assignment invalidates all aliases only when a binding
-is active or the assignment targets a configured alias; unrelated standalone environment assignments remain eligible
-for normal rules. A dynamic command name or one of these shell-state commands invalidates **all** active aliases and requires confirmation:
-`command`, `builtin`, `exec`, `eval`, `source`, `.`, `trap`, `let`, `unset`, `export`, `readonly`, `declare`, `typeset`,
-`local`, `read`, `mapfile`, `readarray`, `getopts`, or `printf`. This conservative rule may prompt for a harmless form,
-but it prevents later references from being matched against stale paths without needing per-builtin option semantics.
+is active or the assignment targets a configured alias; unrelated standalone environment assignments remain eligible for
+normal rules. A dynamic command name or one of these shell-state commands invalidates **all** active aliases and
+requires confirmation: `command`, `builtin`, `exec`, `eval`, `source`, `.`, `trap`, `let`, `unset`, `export`,
+`readonly`, `declare`, `typeset`, `local`, `read`, `mapfile`, `readarray`, `getopts`, or `printf`. This conservative
+rule may prompt for a harmless form, but it prevents later references from being matched against stale paths without
+needing per-builtin option semantics.
 
 Redirect targets are classified after known alias expansion, so an exact alias-expanded `/dev/null` keeps the discard
 exemption while every other writable target retains the real-file Allow-to-Ask cap. An alias expansion in command
@@ -630,11 +631,15 @@ pattern = "^cargo (build|check){{safe_arg}}*{{safe_pipe}}?$"
 action = { type = "Allow" }
 ```
 
-Expansion happens in multiple passes:
+Expansion happens depth-first, fully resolving each `{{fragment}}` reference before moving to the next:
 
 1. `{{safe_arg}}` → `( [^|&;$`()<>{}]+)`
 2. `{{safe_pipe}}` → `( \\| (head|tail|grep)( [^|&;$`()<>{}]+)\*)`
 3. Final pattern is fully expanded
+
+Nesting is limited to 10 levels, and a single pattern may perform at most 256 fragment substitutions in total. The
+second limit exists because a fragment that references several others multiplies at every level, so a shallow set of
+fragments can still expand into an enormous regex. Neither limit is reachable by hand-written fragments.
 
 ### Built-in Default Fragments
 
@@ -671,6 +676,10 @@ b = "{{a}}"
 ```
 
 The system detects circular dependencies and reports an error when loading the config.
+
+Referencing the same fragment from several places is **not** a cycle. A pattern may use both `{{safe_arg}}` and
+`{{safe_chars}}` even though `safe_arg` itself expands `{{safe_chars}}` — that is a directed acyclic graph, and it
+expands without error. Only a fragment that reaches itself, directly or transitively, is rejected.
 
 ## How Bash Commands Are Evaluated
 
@@ -902,8 +911,8 @@ tail -f ~/.local/state/moriarty/hooks/hooks.log* | grep "Bash rule matched"
 
 ### Pattern Expansion Errors
 
-**Problem**: A rule you wrote silently has no effect (undefined fragment, circular fragment, or invalid regex), so the
-hook drops it.
+**Problem**: A rule you wrote silently has no effect (undefined fragment, circular fragment, a fragment exceeding the
+nesting or total-expansion limit, or invalid regex), so the hook drops it.
 
 **Solution**: Run `moriarty rules lint` (add `--strict` to also flag permanently disabled `modes = []`, likely-shadowed,
 and over-broad rules). It reports every rule the hook silently ignores and exits nonzero if any exist:

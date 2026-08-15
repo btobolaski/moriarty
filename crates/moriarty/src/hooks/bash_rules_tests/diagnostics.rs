@@ -53,4 +53,16 @@ fn test_classify_fragment_error_distinguishes_kinds() {
         classify_fragment_error(&circular_msg),
         RuleDiagnosticKind::CircularFragment
     );
+
+    // The classifier falls through to UndefinedFragment, so an unmatched limit message would be
+    // misreported rather than failing loudly.
+    let mut leaf = HashMap::new();
+    leaf.insert("a".to_string(), "x".to_string());
+    let over_count = expand_fragments(&"{{a}}".repeat(FragmentExpander::MAX_EXPANSIONS + 1), &leaf)
+        .expect_err("expansion count over the cap")
+        .to_string();
+    assert_eq!(
+        classify_fragment_error(&over_count),
+        RuleDiagnosticKind::FragmentExpansionLimitExceeded
+    );
 }
