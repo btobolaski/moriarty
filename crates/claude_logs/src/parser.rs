@@ -395,6 +395,7 @@ pub enum AttachmentData {
     SkillListing(SkillListing),
     TaskReminder(TaskReminder),
     TaskStatus(TaskStatus),
+    TotalTokensReminder(TotalTokensReminder),
 }
 
 /// The agent (subagent) analogue of `deferred_tools_delta`. Added in Claude Code 2.1.175+.
@@ -817,6 +818,15 @@ pub struct TaskStatus {
     pub status: String,
     pub delta_summary: String,
     pub output_file_path: String,
+}
+
+/// The `<total_tokens>` budget reminder Claude Code injects into a turn. Added in Claude Code
+/// 2.1.226+.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct TotalTokensReminder {
+    pub text: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

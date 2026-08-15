@@ -178,7 +178,9 @@ test in a separate process, making this safe and preventing tests from clobberin
   stopped before streaming completed; partial responses remain billable), and a `preCheckpoint` field on
   `file-history-snapshot` records' inner snapshot (`FileHistorySnapshotSnapshot`, an optional `bool` marking a snapshot
   taken ahead of a checkpoint rather than as part of ordinary file tracking; nullable because ordinary snapshots omit
-  it) (all added in Claude Code 2.1.219+)
+  it) (all added in Claude Code 2.1.219+), and a `total_tokens_reminder` attachment
+  (`TotalTokensReminder`, the `<total_tokens>` budget reminder Claude Code injects into a turn, carrying just its
+  `text`; added in Claude Code 2.1.226+)
 - Also owns the structured view of the raw `model` string via `model::Model { family, version }` plus `ModelFamily` and
   `ModelVersion`. Both `cost_analyzer` (for pricing) and `moriarty::api_pricing` (for grouping/display) consume this one
   parser so family/version classification is not duplicated across crates. The parser preserves capability-decorated raw

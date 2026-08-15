@@ -9285,6 +9285,43 @@ fn test_parse_attachment_task_status_rejects_unknown_fields() {
     );
 }
 
+// `total_tokens_reminder` attachment (Claude Code 2.1.226+) carries the token-budget reminder
+// injected into a turn.
+#[test]
+fn test_parse_attachment_total_tokens_reminder() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": "f6221c76-a900-483e-aaec-68f20e63d421",
+        "isSidechain": false,
+        "attachment": {
+            "type": "total_tokens_reminder",
+            "text": "<total_tokens>15000000 tokens left</total_tokens>"
+        },
+        "uuid": "11dadebc-702c-41a8-a8b2-c25b8663ad0c",
+        "timestamp": "2026-08-15T18:13:27.286Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "e08517b4-1b95-4443-ae90-15654bc60c49",
+        "version": "2.1.226",
+        "gitBranch": "HEAD"
+    });
+    let log_line: LogLine = serde_json::from_value(json).unwrap();
+    match log_line {
+        LogLine::Attachment(att) => {
+            if let AttachmentData::TotalTokensReminder(reminder) = &att.attachment {
+                assert_eq!(
+                    reminder.text,
+                    "<total_tokens>15000000 tokens left</total_tokens>"
+                );
+            } else {
+                panic!("Expected TotalTokensReminder, got {:?}", att.attachment);
+            }
+        }
+        other => panic!("Expected Attachment, got {:?}", other),
+    }
+}
+
 #[test]
 fn test_parse_attachment_rejects_unknown_fields() {
     let json = serde_json::json!({
