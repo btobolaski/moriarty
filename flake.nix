@@ -242,6 +242,7 @@
           packages = with pkgs; [
             alejandra
             cargo-hakari
+            mandoc
             prettier
             treefmt
             taplo
