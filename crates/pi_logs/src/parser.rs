@@ -2054,11 +2054,16 @@ pub enum ToolResultSource {
     LeanCtx,
 }
 
-/// `contact_supervisor` results currently only route an `error` marker in
-/// `details`; the human-readable outcome remains in the tool-result text.
+/// `contact_supervisor` results carry `requestId` and `reason` when a human
+/// supervisor reply is needed, plus an optional `error` marker for failures.
+/// The human-readable outcome remains in the tool-result text.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ContactSupervisorResultDetails {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<bool>,
 }
