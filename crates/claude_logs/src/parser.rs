@@ -410,11 +410,32 @@ pub struct AgentListingDelta {
     pub show_concurrency_note: bool,
 }
 
+/// Two mutually exclusive `auto_mode` payloads: the original reminder, and the behavior flags
+/// Claude Code 2.1.226 emits instead (never alongside `reminderType`). Untagged because the wire
+/// shape carries no discriminator beyond which keys are present; each variant stays strict, so a
+/// genuinely new third shape still fails to parse — as an untagged mismatch rather than the more
+/// precise unknown-field error.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum AutoMode {
+    Reminder(AutoModeReminder),
+    BehaviorFlags(AutoModeBehaviorFlags),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
-pub struct AutoMode {
+pub struct AutoModeReminder {
     pub reminder_type: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct AutoModeBehaviorFlags {
+    pub auto_mode_consent_flow: bool,
+    pub bash_first: bool,
+    pub steer_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]

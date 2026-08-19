@@ -9694,8 +9694,44 @@ fn test_parse_attachment_auto_mode() {
     let log_line: LogLine = serde_json::from_value(json).unwrap();
     match log_line {
         LogLine::Attachment(att) => {
-            if let AttachmentData::AutoMode(auto) = &att.attachment {
-                assert_eq!(auto.reminder_type, "full");
+            if let AttachmentData::AutoMode(AutoMode::Reminder(reminder)) = &att.attachment {
+                assert_eq!(reminder.reminder_type, "full");
+            } else {
+                panic!("Expected AutoMode, got {:?}", att.attachment);
+            }
+        }
+        other => panic!("Expected Attachment, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_attachment_auto_mode_behavior_flags() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": null,
+        "isSidechain": false,
+        "attachment": {
+            "type": "auto_mode",
+            "autoModeConsentFlow": false,
+            "bashFirst": true,
+            "steerOnly": true
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2026-08-18T21:23:05.353Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.226",
+        "gitBranch": "HEAD"
+    });
+    let log_line: LogLine = serde_json::from_value(json).unwrap();
+    match log_line {
+        LogLine::Attachment(att) => {
+            if let AttachmentData::AutoMode(AutoMode::BehaviorFlags(flags)) = &att.attachment {
+                assert!(!flags.auto_mode_consent_flow);
+                assert!(flags.bash_first);
+                assert!(flags.steer_only);
             } else {
                 panic!("Expected AutoMode, got {:?}", att.attachment);
             }

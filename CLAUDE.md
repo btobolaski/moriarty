@@ -178,9 +178,14 @@ test in a separate process, making this safe and preventing tests from clobberin
   stopped before streaming completed; partial responses remain billable), and a `preCheckpoint` field on
   `file-history-snapshot` records' inner snapshot (`FileHistorySnapshotSnapshot`, an optional `bool` marking a snapshot
   taken ahead of a checkpoint rather than as part of ordinary file tracking; nullable because ordinary snapshots omit
-  it) (all added in Claude Code 2.1.219+), and a `total_tokens_reminder` attachment
-  (`TotalTokensReminder`, the `<total_tokens>` budget reminder Claude Code injects into a turn, carrying just its
-  `text`; added in Claude Code 2.1.226+)
+  it) (all added in Claude Code 2.1.219+), and a `total_tokens_reminder` attachment (`TotalTokensReminder`, the
+  `<total_tokens>` budget reminder Claude Code injects into a turn, carrying just its `text`; added in Claude Code
+  2.1.226+), and a second `auto_mode` attachment payload carrying `autoModeConsentFlow`/`bashFirst`/`steerOnly` (auto
+  mode's negotiated behavior flags, emitted instead of `reminderType` rather than alongside it; `AutoMode` therefore
+  became an untagged enum over the two mutually exclusive shapes — `AutoModeReminder` and `AutoModeBehaviorFlags`, each
+  still `deny_unknown_fields` — so neither an all-absent nor a both-present payload is representable. Untagged is the
+  cost of a wire shape with no discriminator beyond which keys are present: a new third shape still fails to parse, but
+  as an untagged mismatch rather than the more precise unknown-field error; added in Claude Code 2.1.226+)
 - Also owns the structured view of the raw `model` string via `model::Model { family, version }` plus `ModelFamily` and
   `ModelVersion`. Both `cost_analyzer` (for pricing) and `moriarty::api_pricing` (for grouping/display) consume this one
   parser so family/version classification is not duplicated across crates. The parser preserves capability-decorated raw
