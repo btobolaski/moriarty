@@ -2827,23 +2827,50 @@ action = { type = "Modify", value = "$1 --dry-run" }
 }
 
 #[tokio::test]
-async fn test_bash_hook_output_redirect_requires_endpoint_rule() {
-    // `^echo` allows the command component but cannot authorize its output endpoint.
-    let config = cfg_bash_rule("allow-echo", r"^echo($|\s)", r#"{ type = "Allow" }"#);
-    let result = run_bash_hook(&config, "echo secret > out.txt").await;
-    assert_pretool_ask(&result);
+async fn test_bash_hook_redirects_require_endpoint_rules() {
+    for (name, pattern, command) in [
+        ("allow-echo", r"^echo$", "echo > out.txt"),
+        ("allow-cat", r"^cat$", "cat < input.txt"),
+    ] {
+        let config = cfg_bash_rule(name, pattern, r#"{ type = "Allow" }"#);
+        assert_pretool_ask(&run_bash_hook(&config, command).await);
+    }
+}
+
+#[tokio::test]
+async fn test_bash_hook_exact_command_match_requires_descriptor_policy() {
+    let command_rule = cfg_bash_rule(
+        "allow-hakari",
+        r"^cargo hakari verify$",
+        r#"{ type = "Allow" }"#,
+    );
+    assert_pretool_ask(&run_bash_hook(&command_rule, "cargo hakari verify 2>&1").await);
+
+    let config = format!(
+        "{command_rule}\n[[bash_rules]]\nname = \"standard-descriptors\"\npattern = \"^&(1|2|-)$\"\naction = {{ type = \"AllowRedirect\" }}"
+    );
+    assert_pretool_allow(&run_bash_hook(&config, "cargo hakari verify 2>&1").await);
 }
 
 #[tokio::test]
 async fn test_bash_hook_authorizes_each_supported_endpoint_component() {
     let config = format!(
-        "{}\n{}\n{}",
+        "{}\n{}\n{}\n{}\n{}\n{}",
         cfg_bash_rule("allow-echo", r"^echo($|\s)", r#"{ type = "Allow" }"#),
+        cfg_bash_rule("allow-cat", r"^cat$", r#"{ type = "Allow" }"#),
         ALLOW_LOCAL_REDIRECT_RULE,
         r#"[[bash_rules]]
-name = "allow-benign-endpoints"
+name = "allow-local-input"
+pattern = ".*"
+action = { type = "AllowRedirect", allow_local = true, direction = "input" }"#,
+        r#"[[bash_rules]]
+name = "allow-benign-output-endpoints"
 pattern = "^(/dev/null|&1)$"
-action = { type = "AllowRedirect" }"#
+action = { type = "AllowRedirect" }"#,
+        r#"[[bash_rules]]
+name = "allow-benign-input-endpoints"
+pattern = "^(/dev/null|&1)$"
+action = { type = "AllowRedirect", direction = "input" }"#
     );
     let cwd = TempDir::new().unwrap();
     let cwd = cwd.path().to_str().unwrap();
@@ -2853,10 +2880,45 @@ action = { type = "AllowRedirect" }"#
         "echo hi >/dev/null",
         "echo hi 2>&1",
         "echo hi > one 2> two",
+        "cat < input.txt",
+        "cat 0<&1",
     ] {
         assert_pretool_allow(&run_bash_hook_cwd(&config, command, cwd).await);
     }
     assert_pretool_ask(&run_bash_hook_cwd(&config, "echo hi > $OUT", cwd).await);
+}
+
+#[tokio::test]
+async fn test_bash_hook_redirect_directions_and_denial() {
+    let cwd = TempDir::new().unwrap();
+    let cwd = cwd.path().to_str().unwrap();
+    let allow_cat = cfg_bash_rule("allow-cat", r"^cat$", r#"{ type = "Allow" }"#);
+    let output_only = format!("{allow_cat}\n{ALLOW_LOCAL_REDIRECT_RULE}");
+    assert_pretool_ask(&run_bash_hook_cwd(&output_only, "cat < .env", cwd).await);
+
+    let input = format!(
+        "{allow_cat}\n{}",
+        cfg_bash_rule(
+            "allow-local-input",
+            ".*",
+            r#"{ type = "AllowRedirect", allow_local = true, direction = "input" }"#,
+        )
+    );
+    assert_pretool_allow(&run_bash_hook_cwd(&input, "cat < .env", cwd).await);
+
+    let denied = format!(
+        "{}\n{}\n{ALLOW_LOCAL_REDIRECT_RULE}",
+        cfg_bash_rule("allow-echo", r"^echo($|\s)", r#"{ type = "Allow" }"#),
+        cfg_bash_rule(
+            "deny-protected",
+            r"^protected\.txt$",
+            r#"{ type = "DenyRedirect", value = "protected output" }"#,
+        )
+    );
+    assert_pretool_deny(
+        &run_bash_hook_cwd(&denied, "echo replacement > protected.txt", cwd).await,
+        "protected output",
+    );
 }
 
 #[tokio::test]

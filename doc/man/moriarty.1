@@ -274,10 +274,10 @@ or
 value; Manual arrives as
 .Cm default .
 Ineligible rules are skipped in place, preserving first\-match order among eligible rules.
-For Bash, ordinary command rules and
-.Cm AllowRedirect
-endpoint rules are independent first\-match domains; auto\-Allow requires both an allowed command
-and authorization for every output endpoint
+For Bash, ordinary command rules and directional
+.Cm AllowRedirect / DenyRedirect
+endpoint rules are independent first\-match domains; auto\-Allow requires an allowed command,
+no endpoint denial, and authorization for every redirect endpoint
 .Pq see Xr moriarty\-bash\-rules 5 .
 This is the entry point used by Claude Code's hook system.
 For the Stop hook it runs the project's approved checks from
@@ -335,11 +335,22 @@ Defaults to
 .Pa ~/.config/moriarty/tool_rules.toml .
 .It Fl \-json
 Output results as JSON instead of pretty\-printed text.
+Redirect endpoint arrays use the direction\-neutral
+.Ic redirects
+key.
+A matched endpoint carries an
+.Ic allowed
+or
+.Ic denied
+.Ic decision ;
+.Ic failure
+is reserved for resolution failures and endpoints with no eligible allow rule.
 .It Fl \-explain
 Show how the command splits into leaf commands, including original source,
-path\-alias bindings and expansion, normalized command match text, confirmation reasons,
-redirect endpoint match text and locality, resolution or authorization failures, unanalyzable Modify rewrites, matching rules,
-ordered contributors, and the merged decision the hook would make.
+path\-alias bindings and expansion, redirect\-free normalized command match
+text, confirmation reasons, redirect endpoint direction, match text, locality,
+the allowing or denying redirect rule, resolution or authorization failures,
+unanalyzable Modify rewrites, ordered contributors, and the merged decision the hook would make.
 Normal mode,
 .Fl \-explain ,
 and replay use the same completed compound, path\-alias, and one\-pass ArgumentFilter revalidation as the live hook.
@@ -381,6 +392,13 @@ A universal local redirect rule is reported separately from an unrestricted rule
 all resolved paths, devices, and descriptors.
 Shadow analysis compares only rules in the same command or redirect domain and requires overlapping
 permission\-mode eligibility.
+Within the redirect domain it includes both
+.Cm AllowRedirect
+and
+.Cm DenyRedirect ;
+the earlier rule must cover every endpoint direction and locality class
+the later rule could match,
+not merely overlap it.
 .It Cm rules list\-fragments
 List the merged pattern fragments
 .Pq built\-in defaults plus user\-defined ,
@@ -393,9 +411,11 @@ covering every rule and action variant.
 Print a paste\-ready set of ordinary Allow rules for common read\-only commands, designed for
 the per\-leaf engine, plus exact redirect rules for
 .Pa /dev/null
-and standard descriptors
-.Pq Li &1 , &2 , &- .
-Other filesystem output endpoints continue to prompt.
+and standard descriptors: output duplication or closure to
+.Li &1 , &2 , &- ,
+plus stdin input duplication from
+.Li &0 .
+Other filesystem redirect endpoints continue to prompt.
 .It Cm rules report
 Summarize completed PreToolUse outcomes from the hook logs as a terminal table.
 By default, records are grouped by calendar day in
@@ -450,7 +470,7 @@ and
 are refused unless
 .Fl \-match Cm exact .
 .Cm exact
-emits one fully\-literal, fully\-anchored pattern per leaf;
+emits one fully\-literal, fully\-anchored pattern per redirect\-free command match;
 .Cm prefix
 one program\-name pattern per program; and
 .Cm fuzzy
@@ -459,21 +479,29 @@ closed alternation
 .Pq for example Ql ^cargo (build|check)(\es|$) ,
 falling back to the program prefix when any observed leaf has a flag, path, or bare
 invocation in subcommand position.
-Prefix and fuzzy generation reuse the hook parser's program metadata and omit leaves whose
-normalized match text does not begin with that literal program, because the generated anchor
-would not match them; exact generation remains available for those leaves.
+Prefix and fuzzy generation reuse the hook parser's program metadata, so a
+prefix redirect such as
+.Ql >report cargo build
+clusters under
+.Ql cargo .
+They omit leaves whose normalized command text still does not begin with that
+literal program, because the generated anchor would not match them; exact
+generation remains available for those leaves.
 The suggestion lists every observed command it covers so the generalization is reviewable.
 With
 .Fl \-action Cm allow-redirect ,
-Moriarty instead enumerates each static output endpoint, resolves all endpoints from one recorded\-cwd
-context, omits unresolved or already\-authorized targets, and emits one escaped fully anchored endpoint pattern.
+Moriarty instead enumerates each static redirect endpoint, resolves all
+endpoints from one recorded\-cwd context, omits unresolved or
+already\-authorized targets, and emits one escaped fully anchored endpoint pattern with that
+endpoint's input, output, or both direction.
 A leaf containing a relative or home\-relative filesystem endpoint in or after a shell path\-context barrier is
 omitted because its shell path context cannot be reconstructed.
 Barriers are assignments, dynamic commands,
 .Cm cd , pushd , popd ,
 and recognized shell\-state builtins.
-Leaves whose output endpoints are all statically resolvable from the recorded cwd remain eligible; leaves blocked by
-active command policy are also omitted.
+Leaves whose redirect endpoints are all statically resolvable from the
+recorded cwd remain eligible; leaves blocked by active command policy are also
+omitted.
 Ordinary
 .Cm Allow
 suggestions omit leaves already covered by active command policy;

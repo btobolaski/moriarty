@@ -14,12 +14,21 @@ fn expected_match(rule_name: &str, expanded_pattern: &str, action_summary: &str)
 
 fn expected_leaf(
     command: &str,
-    output_redirects: Vec<Value>,
+    redirects: Vec<Value>,
     matched: Option<(&str, &str, &str)>,
 ) -> Value {
-    let mut leaf = json!({"original": command, "normalized": command});
-    if !output_redirects.is_empty() {
-        leaf["output_redirects"] = Value::Array(output_redirects);
+    expected_leaf_with_normalized(command, command, redirects, matched)
+}
+
+fn expected_leaf_with_normalized(
+    command: &str,
+    normalized: &str,
+    redirects: Vec<Value>,
+    matched: Option<(&str, &str, &str)>,
+) -> Value {
+    let mut leaf = json!({"original": command, "normalized": normalized});
+    if !redirects.is_empty() {
+        leaf["redirects"] = Value::Array(redirects);
     }
     if let Some((rule_name, expanded_pattern, action_summary)) = matched {
         leaf["matched"] = expected_match(rule_name, expanded_pattern, action_summary);
@@ -29,6 +38,7 @@ fn expected_leaf(
 
 fn expected_allowed_redirect(
     original_target: &str,
+    direction: &str,
     kind: &str,
     match_text: &str,
     is_local: bool,
@@ -36,10 +46,12 @@ fn expected_allowed_redirect(
 ) -> Value {
     json!({
         "original_target": original_target,
+        "direction": direction,
         "kind": kind,
         "match_text": match_text,
         "is_local": is_local,
         "matched": expected_match(matched.0, matched.1, matched.2),
+        "decision": "allowed",
     })
 }
 
@@ -74,8 +86,11 @@ fn actual_trace(engine: &BashRuleEngine, command: &str, cwd: &str) -> Value {
 fn redirect_compatibility_engine() -> BashRuleEngine {
     make_engine(vec![
         allow_rule("allow-echo", r"^echo($|\s)"),
+        allow_rule("allow-cat", r"^cat$"),
         redirect_rule("allow-local", ".*", true),
+        directional_redirect_rule("allow-local-input", ".*", true, RedirectDirection::Input),
         redirect_rule("allow-stdout", r"^&1$", false),
+        directional_redirect_rule("allow-stdin", r"^&1$", false, RedirectDirection::Input),
     ])
 }
 
@@ -89,11 +104,13 @@ fn explain_json_preserves_authorized_redirect_shape() {
         actual_trace(&engine, "echo hi > report.txt 2>&1", cwd),
         expected_trace(
             "echo hi > report.txt 2>&1",
-            vec![expected_leaf(
+            vec![expected_leaf_with_normalized(
                 "echo hi > report.txt 2>&1",
+                "echo hi",
                 vec![
                     expected_allowed_redirect(
                         "report.txt",
+                        "output",
                         "filesystem",
                         "report.txt",
                         true,
@@ -101,6 +118,7 @@ fn explain_json_preserves_authorized_redirect_shape() {
                     ),
                     expected_allowed_redirect(
                         "1",
+                        "output",
                         "descriptor",
                         "&1",
                         false,
@@ -118,6 +136,99 @@ fn explain_json_preserves_authorized_redirect_shape() {
 }
 
 #[test]
+fn explain_json_preserves_authorized_input_redirect_shape() {
+    let cwd = tempfile::tempdir().unwrap();
+    let cwd = cwd.path().to_str().unwrap();
+    let engine = redirect_compatibility_engine();
+
+    assert_eq!(
+        actual_trace(&engine, "cat < input.txt 0<&1", cwd),
+        expected_trace(
+            "cat < input.txt 0<&1",
+            vec![expected_leaf_with_normalized(
+                "cat < input.txt 0<&1",
+                "cat",
+                vec![
+                    expected_allowed_redirect(
+                        "input.txt",
+                        "input",
+                        "filesystem",
+                        "input.txt",
+                        true,
+                        (
+                            "allow-local-input",
+                            ".*",
+                            "AllowRedirect (input, local only)",
+                        ),
+                    ),
+                    expected_allowed_redirect(
+                        "1",
+                        "input",
+                        "descriptor",
+                        "&1",
+                        false,
+                        ("allow-stdin", "^&1$", "AllowRedirect (input)"),
+                    ),
+                ],
+                Some(("allow-cat", r"^cat$", "Allow")),
+            )],
+            Vec::new(),
+            None,
+            json!({"Allowed": {"rule_name": "allow-cat"}}),
+            &["allow-cat", "allow-local-input", "allow-stdin"],
+        )
+    );
+}
+
+#[test]
+fn explain_json_distinguishes_denied_redirects() {
+    let cwd = tempfile::tempdir().unwrap();
+    let cwd = cwd.path().to_str().unwrap();
+    let engine = make_engine(vec![
+        allow_rule("allow-echo", r"^echo$"),
+        deny_redirect_rule(
+            "deny-protected",
+            r"^protected\.txt$",
+            "protected output",
+            RedirectDirection::Both,
+        ),
+        redirect_rule("allow-local", ".*", true),
+    ]);
+
+    assert_eq!(
+        actual_trace(&engine, "echo <> protected.txt", cwd),
+        expected_trace(
+            "echo <> protected.txt",
+            vec![expected_leaf_with_normalized(
+                "echo <> protected.txt",
+                "echo",
+                vec![json!({
+                    "original_target": "protected.txt",
+                    "direction": "both",
+                    "kind": "filesystem",
+                    "match_text": "protected.txt",
+                    "is_local": true,
+                    "matched": expected_match(
+                        "deny-protected",
+                        r"^protected\.txt$",
+                        "DenyRedirect: protected output",
+                    ),
+                    "decision": "denied",
+                })],
+                Some(("allow-echo", r"^echo$", "Allow")),
+            )],
+            Vec::new(),
+            None,
+            json!({"Denied": {
+                "rule_name": "deny-protected",
+                "reason": "protected output",
+            }}),
+            &["allow-echo", "deny-protected"],
+        )
+    );
+}
+
+#[test]
 fn explain_json_preserves_unresolvable_redirect_shape() {
     let cwd = tempfile::tempdir().unwrap();
     let cwd = cwd.path().to_str().unwrap();
@@ -127,10 +238,12 @@ fn explain_json_preserves_unresolvable_redirect_shape() {
         actual_trace(&engine, "echo hi > $OUT", cwd),
         expected_trace(
             "echo hi > $OUT",
-            vec![expected_leaf(
+            vec![expected_leaf_with_normalized(
                 "echo hi > $OUT",
+                "echo hi",
                 vec![json!({
                     "original_target": "$OUT",
+                    "direction": "output",
                     "kind": "filesystem",
                     "failure": "redirect target is not a static path",
                 })],
@@ -227,10 +340,8 @@ fn diagnostic_redirect_matches_do_not_pollute_provenance() {
     let denied_trace = explain(&engine, "rm > denied.txt", cwd, None);
     assert_eq!(denied_trace.contributors, ["deny-rm"]);
     assert_eq!(
-        denied_trace.sub_commands[0].output_redirects[0]
-            .matched
-            .as_ref()
-            .unwrap()
+        matched_redirect(&denied_trace.sub_commands[0].redirects[0])
+            .0
             .rule_name,
         "allow-local"
     );
@@ -239,10 +350,8 @@ fn diagnostic_redirect_matches_do_not_pollute_provenance() {
     assert_eq!(rechecked.final_result, denied("deny-safe", "blocked"));
     assert_eq!(rechecked.contributors, ["filter-drop", "deny-safe"]);
     assert_eq!(
-        rechecked.rewritten_sub_commands[0].output_redirects[0]
-            .matched
-            .as_ref()
-            .unwrap()
+        matched_redirect(&rechecked.rewritten_sub_commands[0].redirects[0])
+            .0
             .rule_name,
         "allow-local"
     );
@@ -259,23 +368,20 @@ fn explain_distinguishes_descriptors_from_quoted_filesystem_targets() {
     ]);
 
     let descriptor = explain(&engine, "echo hi 2>&1", cwd, None);
-    let descriptor = &descriptor.sub_commands[0].output_redirects[0];
+    let descriptor = &descriptor.sub_commands[0].redirects[0];
     assert_eq!(descriptor.original_target, "1");
     assert_eq!(descriptor.kind, "descriptor");
     assert_eq!(descriptor.match_text.as_deref(), Some("&1"));
     assert_eq!(descriptor.is_local, Some(false));
-    assert_eq!(
-        descriptor.matched.as_ref().unwrap().rule_name,
-        "allow-stdout"
-    );
+    assert_eq!(matched_redirect(descriptor).0.rule_name, "allow-stdout");
 
     let quoted = explain(&engine, "echo hi > '&1'", cwd, None);
-    let quoted = &quoted.sub_commands[0].output_redirects[0];
+    let quoted = &quoted.sub_commands[0].redirects[0];
     assert_eq!(quoted.original_target, "'&1'");
     assert_eq!(quoted.kind, "filesystem");
     assert_eq!(quoted.match_text.as_deref(), Some("./&1"));
     assert_eq!(quoted.is_local, Some(true));
-    assert_eq!(quoted.matched.as_ref().unwrap().rule_name, "allow-local");
+    assert_eq!(matched_redirect(quoted).0.rule_name, "allow-local");
 }
 
 #[test]
@@ -447,11 +553,10 @@ fn explain_revalidates_argument_filtered_redirects() {
         trace.final_result,
         evaluation_result(&engine, command, cwd, None)
     );
-    assert!(
-        trace.rewritten_sub_commands[0].output_redirects[0]
-            .failure
-            .is_some()
-    );
+    assert!(matches!(
+        &trace.rewritten_sub_commands[0].redirects[0].state,
+        RedirectTraceState::Failed { .. }
+    ));
 }
 
 #[test]
@@ -470,9 +575,41 @@ fn explain_reports_an_unanalyzable_modify_rewrite() {
         Some(RewrittenBailTrace {
             command: "echo $(date)".to_string(),
             reason: BailReason::CommandSubstitution,
+            redirect: None,
         })
     );
     assert!(trace.rewritten_sub_commands.is_empty());
+}
+
+#[test]
+fn explain_reports_denied_endpoint_on_modify_bail() {
+    let engine = make_engine(vec![
+        modify_rule(
+            "dynamic-rewrite",
+            r"^safe$",
+            r#"echo "$(date)" > protected"#,
+        ),
+        deny_redirect_rule(
+            "deny-protected",
+            r"^protected$",
+            "protected output",
+            RedirectDirection::Output,
+        ),
+    ]);
+    let cwd = tempfile::tempdir().unwrap();
+    let trace = explain(&engine, "safe", cwd.path().to_str().unwrap(), None);
+
+    assert_eq!(
+        trace.final_result,
+        denied("deny-protected", "protected output")
+    );
+    let redirect = trace.rewritten_bail.unwrap().redirect.unwrap();
+    assert_eq!(redirect.original_target, "protected");
+    assert_eq!(redirect.direction, RedirectDirection::Output);
+    assert_eq!(redirect.match_text.as_deref(), Some("protected"));
+    let (matched, decision) = matched_redirect(&redirect);
+    assert_eq!(decision, RedirectTraceDecision::Denied);
+    assert_eq!(matched.rule_name, "deny-protected");
 }
 
 #[test]
@@ -499,6 +636,7 @@ fn explain_retains_rewrite_bail_from_argument_filter_recheck() {
         Some(RewrittenBailTrace {
             command: "echo $(date)".to_string(),
             reason: BailReason::CommandSubstitution,
+            redirect: None,
         })
     );
 }

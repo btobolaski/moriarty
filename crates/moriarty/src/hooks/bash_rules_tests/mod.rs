@@ -1,4 +1,14 @@
 use super::*;
+use crate::test_helpers::{deny_redirect_rule, directional_redirect_rule, redirect_rule};
+
+fn matched_redirect(
+    trace: &RedirectEndpointTrace,
+) -> (&RuleMatchExplanation, RedirectTraceDecision) {
+    let RedirectTraceState::Matched { matched, decision } = &trace.state else {
+        panic!("expected matched redirect trace");
+    };
+    (matched, *decision)
+}
 
 fn filter_command_for_test(command: &str) -> Option<FilterCommand> {
     let SplitOutcome::Commands(mut leaves) = split_command(command, "", &BTreeSet::new()) else {
@@ -15,8 +25,9 @@ fn filter_for_test(
     add: &Option<Vec<String>>,
     replace: &Option<HashMap<String, String>>,
 ) -> miette::Result<String> {
-    let filter_command = filter_command_for_test(command);
-    filter_arguments(command, filter_command.as_ref(), remove, add, replace)
+    let filter_command = filter_command_for_test(command)
+        .ok_or_else(|| miette!("ArgumentFilter requires one brush-parsed simple command"))?;
+    filter_arguments(&filter_command, remove, add, replace)
 }
 
 fn filter_remove(cmd: &str, remove: &[&str]) -> String {
@@ -43,15 +54,6 @@ fn allow_rule(name: &str, pattern: &str) -> BashRule {
         pattern: pattern.to_string(),
         modes: None,
         action: BashRuleAction::Allow,
-    }
-}
-
-fn redirect_rule(name: &str, pattern: &str, allow_local: bool) -> BashRule {
-    BashRule {
-        name: name.to_string(),
-        pattern: pattern.to_string(),
-        modes: None,
-        action: BashRuleAction::AllowRedirect { allow_local },
     }
 }
 
@@ -193,7 +195,7 @@ fn command_result(
     mode: Option<PermissionMode>,
 ) -> RuleResult {
     engine
-        .match_command_decision(command, None, mode)
+        .match_command_decision(command, None, RedirectRewrite::NONE, mode)
         .outcome()
         .into()
 }
@@ -211,7 +213,12 @@ fn leaf_command_result(
         return RuleResult::NoMatch;
     };
     engine
-        .match_command_decision(&leaf.match_text, leaf.filter_command.as_ref(), mode)
+        .match_command_decision(
+            &leaf.match_text,
+            leaf.filter_command.as_ref(),
+            RedirectRewrite::from_leaf(leaf),
+            mode,
+        )
         .outcome()
         .into()
 }

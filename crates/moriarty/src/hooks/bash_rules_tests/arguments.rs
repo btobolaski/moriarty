@@ -63,6 +63,37 @@ fn filter_arguments_preserves_quoted_argument_boundaries() {
 }
 
 #[test]
+fn filter_arguments_preserves_quoted_normalized_paths() {
+    for (command, expected) in [
+        (
+            "cat --number '/tmp/p/report file'",
+            "cat '/tmp/p/report file'",
+        ),
+        ("cat --number '/tmp/p/*.pem'", "cat '/tmp/p/*.pem'"),
+        (
+            r"cat --number /tmp/p/report\ file",
+            r"cat /tmp/p/report\ file",
+        ),
+    ] {
+        let filter_command = match split_command(command, "/tmp/p", &BTreeSet::new()) {
+            SplitOutcome::Commands(mut leaves) => leaves.pop().unwrap().filter_command.unwrap(),
+            SplitOutcome::Bail { reason, .. } => panic!("unexpected bail: {reason:?}"),
+        };
+        assert_eq!(
+            filter_arguments(
+                &filter_command,
+                &Some(vec!["--number".to_string()]),
+                &None,
+                &None,
+            )
+            .unwrap(),
+            expected,
+            "case {command:?}"
+        );
+    }
+}
+
+#[test]
 fn filter_arguments_preserves_unchanged_shell_syntax() {
     for (command, expected) in [
         (
@@ -74,6 +105,8 @@ fn filter_arguments_preserves_unchanged_shell_syntax() {
             r#"cargo doc >"report.txt""#,
         ),
         (">report.txt cargo doc --open", ">report.txt cargo doc"),
+        (">report cargo doc --open 2>err", ">report cargo doc 2>err"),
+        ("cargo >report doc --open 2>err", "cargo >report doc 2>err"),
     ] {
         assert_eq!(filter_remove(command, &["--open"]), expected);
     }
@@ -152,11 +185,11 @@ fn test_filter_arguments_combined() {
 
 #[test]
 fn filter_arguments_handles_trailing_whitespace_and_invalid_spans() {
-    let filter_command = filter_command_for_test("cargo doc --open").unwrap();
+    let mut filter_command = filter_command_for_test("cargo doc --open").unwrap();
+    filter_command.source.push(' ');
     assert_eq!(
         filter_arguments(
-            "cargo doc --open ",
-            Some(&filter_command),
+            &filter_command,
             &Some(vec!["--open".to_string()]),
             &Some(vec!["--no-browser".to_string()]),
             &None,
@@ -166,6 +199,7 @@ fn filter_arguments_handles_trailing_whitespace_and_invalid_spans() {
     );
 
     let invalid = FilterCommand {
+        source: "cargo".to_string(),
         program: filter_command.program,
         arguments: vec![FilterArgument {
             value: "bad".to_string(),
@@ -176,14 +210,34 @@ fn filter_arguments_handles_trailing_whitespace_and_invalid_spans() {
     };
     assert!(
         filter_arguments(
-            "cargo",
-            Some(&invalid),
+            &invalid,
             &None,
             &None,
             &Some(HashMap::from([("bad".to_string(), "safe".to_string())])),
         )
         .is_err()
     );
+}
+
+#[test]
+fn argument_filter_matches_without_redirects_but_rewrites_the_full_source() {
+    let cwd = tempfile::tempdir().unwrap();
+    let engine = make_engine(vec![
+        filter_rule("filter-open", r"^cargo doc --open$", "--open", None),
+        allow_rule("allow-cargo-doc", r"^cargo doc$"),
+        redirect_rule("allow-local", ".*", true),
+    ]);
+
+    assert!(matches!(
+        evaluation_result(
+            &engine,
+            ">report cargo doc --open 2>err",
+            cwd.path().to_str().unwrap(),
+            None,
+        ),
+        RuleResult::ArgumentFiltered { new_command, .. }
+            if new_command == ">report cargo doc 2>err"
+    ));
 }
 
 #[test]
@@ -358,6 +412,65 @@ fn argument_filter_revalidation_keeps_the_original_rewrite_when_allowed() {
             && new_command == "cargo doc"
             && reason == "Removed --open"
     ));
+}
+
+#[test]
+fn argument_filter_revalidation_preserves_quoted_path_semantics() {
+    let engine = make_engine(vec![
+        BashRule {
+            name: "filter-number".to_string(),
+            pattern: r"^cat --number report file$".to_string(),
+            modes: None,
+            action: BashRuleAction::ArgumentFilter {
+                remove: Some(vec!["--number".to_string()]),
+                add: None,
+                replace: None,
+                reason: None,
+            },
+        },
+        allow_rule("allow-cat-path", r"^cat report file$"),
+    ]);
+
+    assert!(matches!(
+        evaluation_result(
+            &engine,
+            "cat --number '/tmp/p/report file'",
+            "/tmp/p",
+            None,
+        ),
+        RuleResult::ArgumentFiltered { new_command, .. }
+            if new_command == "cat '/tmp/p/report file'"
+    ));
+}
+
+#[test]
+fn filtered_modify_recheck_propagates_redirect_denial() {
+    let engine = make_engine(vec![
+        filter_rule("filter-drop", r"^rewrite --drop$", "--drop", None),
+        modify_rule("rewrite", r"^rewrite$", "echo > protected"),
+        deny_redirect_rule(
+            "deny-protected",
+            r"^protected$",
+            "protected output",
+            RedirectDirection::Output,
+        ),
+    ]);
+    let cwd = tempfile::tempdir().unwrap();
+    let evaluation = evaluate(
+        &engine,
+        "rewrite --drop",
+        cwd.path().to_str().unwrap(),
+        None,
+    );
+
+    assert_eq!(
+        evaluation.rule_result(),
+        denied("deny-protected", "protected output")
+    );
+    assert_eq!(
+        evaluation.contributors(),
+        ["filter-drop", "rewrite", "deny-protected"]
+    );
 }
 
 #[test]

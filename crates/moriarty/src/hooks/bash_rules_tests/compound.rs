@@ -100,19 +100,33 @@ fn test_compound_dangerous_tail_denied() {
 }
 
 #[test]
-fn test_compound_output_redirects_require_matching_endpoint_rules() {
+fn every_redirect_requires_matching_endpoint_policy() {
     let cwd = tempfile::tempdir().unwrap();
     let cwd = cwd.path().to_str().unwrap();
-    let engine = review_redirect_engine();
-    for (command, endpoint_rule) in [
-        ("echo hi >/dev/null", "allow-dev-null"),
-        ("echo hi 2>&1", "allow-stdout"),
-        ("echo hi > one 2> two", "allow-local"),
+    let engine = make_engine(vec![
+        allow_rule("allow-echo", r"^echo($|\s)"),
+        allow_rule("allow-cat", r"^cat$"),
+        directional_redirect_rule("allow-local", ".*", true, RedirectDirection::Both),
+        redirect_rule("allow-dev-null", r"^/dev/null$", false),
+        directional_redirect_rule(
+            "allow-descriptors",
+            r"^&(0|1)$",
+            false,
+            RedirectDirection::Both,
+        ),
+    ]);
+    for (command, command_rule, endpoint_rule) in [
+        ("echo hi >/dev/null", "allow-echo", "allow-dev-null"),
+        ("echo hi 2>&1", "allow-echo", "allow-descriptors"),
+        ("cat < input", "allow-cat", "allow-local"),
+        ("cat 0<&1", "allow-cat", "allow-descriptors"),
+        ("echo hi > one 2> two", "allow-echo", "allow-local"),
     ] {
         let evaluation = evaluate(&engine, command, cwd, None);
-        assert_eq!(evaluation.rule_result(), allowed("allow-echo"));
-        assert_eq!(evaluation.contributors(), ["allow-echo", endpoint_rule]);
+        assert_eq!(evaluation.rule_result(), allowed(command_rule));
+        assert_eq!(evaluation.contributors(), [command_rule, endpoint_rule]);
     }
+
     let descriptor_only = echo_redirect_engine(vec![redirect_rule("allow-stdout", r"^&1$", false)]);
     assert_compound_cases(
         &descriptor_only,
@@ -126,17 +140,218 @@ fn test_compound_output_redirects_require_matching_endpoint_rules() {
 }
 
 #[test]
-fn redirect_only_commands_need_command_policy() {
+fn redirect_contributors_follow_source_order() {
     let cwd = tempfile::tempdir().unwrap();
     let engine = make_engine(vec![
-        allow_rule("allow-out-command", r"^out$"),
-        redirect_rule("allow-local", r"^out$", true),
+        allow_rule("allow-cat", r"^cat$"),
+        directional_redirect_rule("allow-input", r"^input$", false, RedirectDirection::Input),
+        redirect_rule("allow-output", r"^output$", false),
+        redirect_rule("allow-stdout", r"^&1$", false),
     ]);
+    let evaluation = evaluate(
+        &engine,
+        "cat < input > output 2>&1",
+        cwd.path().to_str().unwrap(),
+        None,
+    );
+
+    assert_eq!(evaluation.rule_result(), allowed("allow-cat"));
+    assert_eq!(
+        evaluation.contributors(),
+        ["allow-cat", "allow-input", "allow-output", "allow-stdout"]
+    );
+}
+
+#[test]
+fn exact_command_rules_match_without_redirects_but_cannot_authorize_endpoints() {
+    let with_descriptor = make_engine(vec![
+        allow_rule("allow-hakari", r"^cargo hakari verify$"),
+        redirect_rule("standard-descriptors", r"^&(1|2|-)$", false),
+    ]);
+    let evaluation = evaluate(&with_descriptor, "cargo hakari verify 2>&1", "", None);
+    assert_eq!(evaluation.rule_result(), allowed("allow-hakari"));
+    assert_eq!(
+        evaluation.contributors(),
+        ["allow-hakari", "standard-descriptors"]
+    );
+
+    let command_only = make_engine(vec![allow_rule("allow-hakari", r"^cargo hakari verify$")]);
+    assert_eq!(
+        evaluation_result(&command_only, "cargo hakari verify 2>&1", "", None),
+        asked("allow-hakari")
+    );
+
+    let cat_only = make_engine(vec![allow_rule("allow-cat", r"^cat$")]);
+    let cwd = tempfile::tempdir().unwrap();
+    assert_eq!(
+        evaluation_result(
+            &cat_only,
+            "cat < local-input",
+            cwd.path().to_str().unwrap(),
+            None,
+        ),
+        asked("allow-cat")
+    );
+}
+
+fn redirect_direction_engine(direction: RedirectDirection) -> BashRuleEngine {
+    make_engine(vec![
+        allow_rule("allow-echo", r"^echo($|\s)"),
+        allow_rule("allow-cat", r"^cat$"),
+        directional_redirect_rule("allow-local", ".*", true, direction),
+    ])
+}
+
+#[test]
+fn existing_redirect_rules_remain_output_only() {
+    let cwd = tempfile::tempdir().unwrap();
+    let cwd = cwd.path().to_str().unwrap();
+    for (direction, command, expected) in [
+        (RedirectDirection::Output, "echo value > report", true),
+        (RedirectDirection::Output, "cat < .env", false),
+        (RedirectDirection::Output, "cat <> state", false),
+        (RedirectDirection::Input, "cat < .env", true),
+        (RedirectDirection::Input, "echo value > report", false),
+        (RedirectDirection::Input, "cat <> state", false),
+        (RedirectDirection::Both, "cat <> state", true),
+    ] {
+        let result = evaluation_result(&redirect_direction_engine(direction), command, cwd, None);
+        let actual = match result {
+            RuleResult::Allowed { .. } => true,
+            RuleResult::Asked { .. } => false,
+            other => panic!("unexpected result for {command:?}: {other:?}"),
+        };
+        assert_eq!(actual, expected, "case {direction:?} {command:?}");
+    }
+}
+
+#[test]
+fn redirect_domain_deny_blocks_a_broad_allow() {
+    let cwd = tempfile::tempdir().unwrap();
+    let engine = make_engine(vec![
+        allow_rule("allow-echo", r"^echo($|\s)"),
+        deny_redirect_rule(
+            "deny-protected",
+            r"^protected\.txt$",
+            "protected output",
+            RedirectDirection::Output,
+        ),
+        redirect_rule("allow-local-output", ".*", true),
+    ]);
+    let evaluation = evaluate(
+        &engine,
+        "echo replacement > protected.txt",
+        cwd.path().to_str().unwrap(),
+        None,
+    );
 
     assert_eq!(
-        evaluation_result(&engine, "> out", cwd.path().to_str().unwrap(), None),
-        RuleResult::NoMatch
+        evaluation.rule_result(),
+        denied("deny-protected", "protected output")
     );
+    assert_eq!(evaluation.contributors(), ["allow-echo", "deny-protected"]);
+
+    let no_command_rule = evaluate(
+        &engine,
+        "unknown > protected.txt",
+        cwd.path().to_str().unwrap(),
+        None,
+    );
+    assert_eq!(
+        no_command_rule.rule_result(),
+        denied("deny-protected", "protected output")
+    );
+    assert_eq!(no_command_rule.contributors(), ["deny-protected"]);
+}
+
+#[test]
+fn redirect_denies_overlap_only_matching_endpoint_directions() {
+    let cwd = tempfile::tempdir().unwrap();
+    let cwd = cwd.path().to_str().unwrap();
+    for (label, deny_direction, allow_direction, command, should_deny) in [
+        (
+            "input deny skips output",
+            RedirectDirection::Input,
+            RedirectDirection::Output,
+            "echo x > file",
+            false,
+        ),
+        (
+            "both deny blocks input",
+            RedirectDirection::Both,
+            RedirectDirection::Input,
+            "cat < file",
+            true,
+        ),
+        (
+            "output deny skips input",
+            RedirectDirection::Output,
+            RedirectDirection::Input,
+            "cat < file",
+            false,
+        ),
+        (
+            "input deny blocks read-write",
+            RedirectDirection::Input,
+            RedirectDirection::Both,
+            "cat <> file",
+            true,
+        ),
+    ] {
+        let engine = make_engine(vec![
+            allow_rule("allow-echo", r"^echo($|\s)"),
+            allow_rule("allow-cat", r"^cat$"),
+            deny_redirect_rule("deny-file", r"^file$", "blocked", deny_direction),
+            directional_redirect_rule("allow-file", r"^file$", true, allow_direction),
+        ]);
+        let result = evaluation_result(&engine, command, cwd, None);
+        if should_deny {
+            assert_eq!(result, denied("deny-file", "blocked"), "case {label}");
+        } else {
+            assert!(
+                matches!(result, RuleResult::Allowed { .. }),
+                "case {label}: {result:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn exact_rules_preserve_final_escaped_whitespace() {
+    let engine = make_engine(vec![allow_rule("allow-printf", r"^printf foo\\ $")]);
+    assert_eq!(
+        evaluation_result(&engine, r"printf foo\ ", "", None),
+        allowed("allow-printf")
+    );
+}
+
+#[test]
+fn redirect_only_commands_need_explicit_command_policy() {
+    let cwd = tempfile::tempdir().unwrap();
+    let cwd = cwd.path().to_str().unwrap();
+    let target_only = make_engine(vec![
+        allow_rule("allow-target", r"^out$"),
+        redirect_rule("allow-local", r"^out$", true),
+    ]);
+    for command in ["> out", "< out"] {
+        assert_eq!(
+            evaluation_result(&target_only, command, cwd, None),
+            RuleResult::NoMatch,
+            "case {command:?}"
+        );
+    }
+
+    let explicit = make_engine(vec![
+        allow_rule("allow-redirect-only", r"^[<>] out$"),
+        directional_redirect_rule("allow-local", r"^out$", true, RedirectDirection::Both),
+    ]);
+    for command in ["> out", "< out"] {
+        assert_eq!(
+            evaluation_result(&explicit, command, cwd, None),
+            allowed("allow-redirect-only"),
+            "case {command:?}"
+        );
+    }
 }
 
 async fn assert_evaluation_surfaces(
@@ -181,7 +396,14 @@ async fn synchronous_live_and_explain_paths_preserve_results_and_provenance() {
         deny_rule("deny-rm", r"^rm", "blocked"),
         ask_rule("ask-docker", r"^docker"),
         allow_rule("allow-echo", r"^echo($|\s)"),
-        redirect_rule("allow-local", ".*", true),
+        allow_rule("allow-cat", r"^cat$"),
+        deny_redirect_rule(
+            "deny-protected",
+            r"^protected$",
+            "protected output",
+            RedirectDirection::Output,
+        ),
+        directional_redirect_rule("allow-local", ".*", true, RedirectDirection::Both),
     ]));
     let cases = [
         ("echo hi", allowed("allow-echo"), vec!["allow-echo"]),
@@ -198,7 +420,18 @@ async fn synchronous_live_and_explain_paths_preserve_results_and_provenance() {
             allowed("allow-echo"),
             vec!["allow-echo", "allow-local"],
         ),
+        (
+            "echo hi > protected",
+            denied("deny-protected", "protected output"),
+            vec!["allow-echo", "deny-protected"],
+        ),
+        (
+            "cat < input.txt",
+            allowed("allow-cat"),
+            vec!["allow-cat", "allow-local"],
+        ),
         ("echo hi > $OUT", asked("allow-echo"), vec!["allow-echo"]),
+        ("cat <&input", asked("allow-cat"), vec!["allow-cat"]),
     ];
 
     for (command, expected_result, expected_contributors) in cases {
@@ -210,6 +443,230 @@ async fn synchronous_live_and_explain_paths_preserve_results_and_provenance() {
             &expected_contributors,
         )
         .await;
+    }
+}
+
+#[test]
+fn modify_preserves_authorized_original_redirects() {
+    let cwd = tempfile::tempdir().unwrap();
+    let engine = make_engine(vec![
+        modify_rule("rewrite-echo", r"^echo unsafe$", "echo safe"),
+        redirect_rule("allow-output", r"^original-output$", true),
+    ]);
+    let evaluation = evaluate(
+        &engine,
+        "echo unsafe > original-output",
+        cwd.path().to_str().unwrap(),
+        None,
+    );
+
+    assert_eq!(
+        evaluation.rule_result(),
+        modified("rewrite-echo", "echo safe >original-output")
+    );
+    assert_eq!(evaluation.contributors(), ["rewrite-echo", "allow-output"]);
+}
+
+#[test]
+fn modify_preserves_multiple_original_redirects() {
+    let cwd = tempfile::tempdir().unwrap();
+    let engine = make_engine(vec![
+        modify_rule("rewrite-echo", r"^echo unsafe$", "echo safe"),
+        redirect_rule("allow-output", r"^(one|two)$", true),
+    ]);
+
+    assert_eq!(
+        evaluation_result(
+            &engine,
+            "echo unsafe > one 2> two",
+            cwd.path().to_str().unwrap(),
+            None,
+        ),
+        modified("rewrite-echo", "echo safe >one 2>two")
+    );
+}
+
+#[test]
+fn modify_with_original_redirect_defers_unanalyzable_rewrite() {
+    let cwd = tempfile::tempdir().unwrap();
+    let engine = make_engine(vec![
+        modify_rule("rewrite-echo", r"^echo unsafe$", "echo $(date)"),
+        redirect_rule("allow-output", r"^output$", true),
+    ]);
+
+    assert_eq!(
+        evaluation_result(
+            &engine,
+            "echo unsafe > output",
+            cwd.path().to_str().unwrap(),
+            None,
+        ),
+        asked("rewrite-echo")
+    );
+}
+
+#[test]
+fn modify_rechecks_denied_original_redirects() {
+    let cwd = tempfile::tempdir().unwrap();
+    let engine = make_engine(vec![
+        modify_rule("rewrite-echo", r"^echo unsafe$", "echo safe"),
+        deny_redirect_rule(
+            "deny-output",
+            r"^original-output$",
+            "protected output",
+            RedirectDirection::Output,
+        ),
+    ]);
+    assert_eq!(
+        evaluation_result(
+            &engine,
+            "echo unsafe > original-output",
+            cwd.path().to_str().unwrap(),
+            None,
+        ),
+        denied("deny-output", "protected output")
+    );
+}
+
+#[test]
+fn modify_carries_redirect_alias_bindings_into_recheck() {
+    let cwd = tempfile::tempdir().unwrap();
+    let cwd = cwd.path().to_str().unwrap();
+    let engine = make_engine_with_aliases(
+        vec![
+            modify_rule("rewrite-echo", r"^echo unsafe$", "echo safe"),
+            deny_redirect_rule(
+                "deny-protected",
+                r"^protected$",
+                "protected output",
+                RedirectDirection::Output,
+            ),
+        ],
+        &["P"],
+    );
+    let command = format!("P={cwd}; echo unsafe > $P/protected");
+    let evaluation = evaluate(&engine, &command, cwd, None);
+
+    assert_eq!(
+        evaluation.rule_result(),
+        denied("deny-protected", "protected output")
+    );
+    assert_eq!(
+        evaluation.contributors(),
+        ["rewrite-echo", "deny-protected"]
+    );
+}
+
+#[test]
+fn modify_retains_redirect_alias_binding_in_output() {
+    let cwd = tempfile::tempdir().unwrap();
+    let cwd = cwd.path().to_str().unwrap();
+    let engine = make_engine_with_aliases(
+        vec![
+            modify_rule("rewrite-echo", r"^echo unsafe$", "echo safe"),
+            redirect_rule("allow-output", r"^protected$", true),
+        ],
+        &["P"],
+    );
+    let command = format!("P={cwd}; echo unsafe > $P/protected");
+
+    assert_eq!(
+        evaluation_result(&engine, &command, cwd, None),
+        modified("rewrite-echo", &format!("P={cwd}; echo safe >$P/protected"),)
+    );
+}
+
+#[test]
+fn modify_does_not_retain_bindings_unused_by_redirects() {
+    let cwd = tempfile::tempdir().unwrap();
+    let cwd = cwd.path().to_str().unwrap();
+    let engine = make_engine_with_aliases(
+        vec![
+            modify_rule("rewrite-echo", r"^echo file$", "echo safe"),
+            redirect_rule("allow-output", r"^output$", true),
+        ],
+        &["P"],
+    );
+    let command = format!("P={cwd}; echo $P/file > output");
+
+    assert_eq!(
+        evaluation_result(&engine, &command, cwd, None),
+        modified("rewrite-echo", "echo safe >output")
+    );
+}
+
+#[test]
+fn modify_rejects_detached_or_swallowed_redirects() {
+    let cwd = tempfile::tempdir().unwrap();
+    for replacement in ["echo safe;", "echo safe # keep this comment", "echo safe |"] {
+        let engine = make_engine(vec![
+            modify_rule("rewrite-echo", r"^echo unsafe$", replacement),
+            redirect_rule("allow-output", r"^output$", true),
+        ]);
+        assert_eq!(
+            evaluation_result(
+                &engine,
+                "echo unsafe > output",
+                cwd.path().to_str().unwrap(),
+                None,
+            ),
+            asked("rewrite-echo"),
+            "{replacement}"
+        );
+    }
+}
+
+#[test]
+fn bailout_static_redirect_denies_are_enforced() {
+    let cwd = tempfile::tempdir().unwrap();
+    let cwd = cwd.path().to_str().unwrap();
+    let deny_output = deny_redirect_rule(
+        "deny-protected",
+        r"^protected$",
+        "protected output",
+        RedirectDirection::Output,
+    );
+    let direct = make_engine(vec![deny_output.clone()]);
+    let command = r#"echo "$(date)" > protected"#;
+    let evaluation = evaluate(&direct, command, cwd, None);
+    assert_eq!(
+        evaluation.rule_result(),
+        denied("deny-protected", "protected output")
+    );
+    assert_eq!(evaluation.contributors(), ["deny-protected"]);
+
+    for command in [r#"echo "$(date)" > other"#, r#"echo "$(date)" < protected"#] {
+        let evaluation = evaluate(&direct, command, cwd, None);
+        assert_eq!(evaluation.rule_result(), RuleResult::NoMatch, "{command}");
+        assert!(evaluation.contributors().is_empty(), "{command}");
+    }
+
+    let rewritten = make_engine(vec![
+        modify_rule("rewrite", r"^rewrite$", command),
+        deny_output,
+    ]);
+    assert_eq!(
+        evaluation_result(&rewritten, "rewrite", cwd, None),
+        denied("deny-protected", "protected output")
+    );
+}
+
+#[test]
+fn compound_bailout_static_redirect_denies_are_enforced() {
+    let cwd = tempfile::tempdir().unwrap();
+    let engine = make_engine(vec![deny_redirect_rule(
+        "deny-protected",
+        r"^protected$",
+        "protected output",
+        RedirectDirection::Output,
+    )]);
+
+    for command in ["(echo hi) > protected", "[[ -n x ]] > protected"] {
+        assert_eq!(
+            evaluation_result(&engine, command, cwd.path().to_str().unwrap(), None),
+            denied("deny-protected", "protected output"),
+            "{command}"
+        );
     }
 }
 
@@ -239,11 +696,25 @@ fn rewritten_commands_use_the_same_redirect_policy_in_sync_and_explain_paths() {
     ] {
         assert_eq!(result, asked("redirecting-echo"));
     }
-    let rewritten = &explained.rewritten_sub_commands[0].output_redirects[0];
+    let rewritten = &explained.rewritten_sub_commands[0].redirects[0];
     assert_eq!(rewritten.match_text.as_deref(), Some("report.txt"));
+    let RedirectTraceState::Failed { failure } = &rewritten.state else {
+        panic!("expected failed redirect trace");
+    };
+    assert_eq!(failure, "no eligible output AllowRedirect rule matched");
+
+    let denied_rewrite = make_engine(vec![
+        modify_rule("redirecting-echo", r"^rewrite-echo$", "echo > protected"),
+        deny_redirect_rule(
+            "deny-protected",
+            r"^protected$",
+            "protected output",
+            RedirectDirection::Output,
+        ),
+    ]);
     assert_eq!(
-        rewritten.failure.as_deref(),
-        Some("no eligible AllowRedirect rule matched")
+        evaluation_result(&denied_rewrite, "rewrite-echo", cwd, None),
+        denied("deny-protected", "protected output")
     );
 
     let allowed = evaluate(&review_redirect_engine(), "rewrite-echo", cwd, None);

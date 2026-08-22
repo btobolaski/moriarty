@@ -45,14 +45,69 @@ fn command_and_redirect_first_match_domains_are_independent() {
 }
 
 #[test]
+fn endpoint_denial_analysis_uses_mode_eligible_rules() {
+    let cwd = tempfile::tempdir().unwrap();
+    let mut plan_deny =
+        deny_redirect_rule("plan-deny", r"^out$", "blocked", RedirectDirection::Output);
+    plan_deny.modes = Some(BTreeSet::from([PermissionMode::Plan]));
+    let engine = make_engine(vec![plan_deny]);
+
+    for (mode, expected_analysis) in [
+        (Some(PermissionMode::Plan), true),
+        (Some(PermissionMode::Default), false),
+        (None, false),
+    ] {
+        let context = EvaluationContext::new(cwd.path().to_str().unwrap(), mode);
+        let analysis =
+            engine.evaluate_original("unknown > out", &context, EvaluationPurpose::Decision);
+        assert_eq!(
+            analysis.leaves().unwrap()[0]
+                .endpoints()
+                .analyzed()
+                .is_some(),
+            expected_analysis,
+            "case {mode:?}"
+        );
+    }
+}
+
+#[test]
+fn endpoint_denial_analysis_skips_disjoint_directions() {
+    let cwd = tempfile::tempdir().unwrap();
+    let engine = make_engine(vec![deny_redirect_rule(
+        "deny-input",
+        r".*",
+        "blocked",
+        RedirectDirection::Input,
+    )]);
+
+    for (command, expected_analysis) in [
+        ("unknown > out", false),
+        ("unknown < input", true),
+        ("unknown <> state", true),
+    ] {
+        let context = EvaluationContext::new(cwd.path().to_str().unwrap(), None);
+        let analysis = engine.evaluate_original(command, &context, EvaluationPurpose::Decision);
+        assert_eq!(
+            analysis.leaves().unwrap()[0]
+                .endpoints()
+                .analyzed()
+                .is_some(),
+            expected_analysis,
+            "case {command:?}"
+        );
+    }
+}
+
+#[test]
 fn matched_rule_metadata_is_shared_across_evaluations() {
     let engine = make_engine(vec![
         allow_rule("allow-ls", r"^ls($|\s)"),
         redirect_rule("allow-out", r"^out$", false),
     ]);
     let command_matches = [
-        engine.match_command_decision("ls", None, None),
-        engine.match_command_decision("ls -la", None, None),
+        engine.match_command_decision("ls", None, RedirectRewrite::NONE, None),
+        engine.match_command_decision("ls -la", None, RedirectRewrite::NONE, None),
     ];
     let [Some(first), Some(second)] = command_matches.map(|decision| {
         decision
@@ -64,8 +119,20 @@ fn matched_rule_metadata_is_shared_across_evaluations() {
     assert!(Arc::ptr_eq(&first, &second));
 
     let redirect_matches = [
-        engine.match_redirect_rule("out", None, RedirectEndpointKind::Filesystem, false),
-        engine.match_redirect_rule("out", None, RedirectEndpointKind::Filesystem, false),
+        engine.match_redirect_rule(
+            "out",
+            None,
+            RedirectDirection::Output,
+            RedirectEndpointKind::Filesystem,
+            false,
+        ),
+        engine.match_redirect_rule(
+            "out",
+            None,
+            RedirectDirection::Output,
+            RedirectEndpointKind::Filesystem,
+            false,
+        ),
     ];
     let [Some(first), Some(second)] =
         redirect_matches.map(|matched| matched.map(|rule| rule.metadata))

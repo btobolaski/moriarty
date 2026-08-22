@@ -25,7 +25,7 @@ use brush_parser::{
     ast::{
         AndOr, Assignment, AssignmentName, AssignmentValue, Command, CommandPrefixOrSuffixItem,
         CompoundCommand, CompoundListItem, IoFileRedirectKind, IoFileRedirectTarget, IoRedirect,
-        Pipeline, PipelineTimed, SeparatorOperator, SimpleCommand, Word,
+        Pipeline, PipelineTimed, RedirectList, SeparatorOperator, SimpleCommand, Word,
     },
     word::{Parameter, ParameterExpr, TildeExpr, WordPiece, WordPieceWithSource},
 };
@@ -33,7 +33,7 @@ use serde::Serialize;
 
 // local / workspace deps
 use super::tool_rules::strip_cwd_prefix;
-use crate::user_config::BashPathAlias;
+use crate::user_config::{BashPathAlias, RedirectDirection};
 
 const NON_STATIC_REDIRECT_REASON: &str = "redirect target is not a static path";
 const INVALID_DESCRIPTOR_REASON: &str = "redirect target is not a valid file descriptor";
@@ -44,7 +44,32 @@ pub(crate) enum SplitOutcome {
     /// The command parsed into N independently-evaluable simple commands, in execution order.
     Commands(Vec<LeafCommand>),
     /// The command contains a construct we cannot fully analyze; the caller must fail safe.
-    Bail(BailReason),
+    Bail {
+        reason: BailReason,
+        redirects: Vec<RedirectEndpoint>,
+    },
+}
+
+struct SplitBail {
+    reason: BailReason,
+    redirects: Vec<RedirectEndpoint>,
+}
+
+impl SplitBail {
+    fn without_redirects(reason: BailReason) -> Self {
+        Self {
+            reason,
+            redirects: Vec::new(),
+        }
+    }
+}
+
+fn retain_split_bail(retained: &mut Option<SplitBail>, mut next: SplitBail) {
+    if let Some(retained) = retained {
+        retained.redirects.append(&mut next.redirects);
+    } else {
+        *retained = Some(next);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -68,13 +93,19 @@ pub(crate) enum ParsedRedirectTarget {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct OutputRedirectEndpoint {
+pub(crate) struct RedirectEndpoint {
     pub(crate) original_target: String,
+    #[serde(skip)]
+    order: usize,
     pub(crate) target: ParsedRedirectTarget,
+    pub(crate) direction: RedirectDirection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FilterCommand {
+    /// Alias expansion is necessary after declaration leaves are removed, while retaining source
+    /// quoting and escapes prevents filtering from activating literal shell syntax.
+    pub(crate) source: String,
     pub(crate) program: FilterArgument,
     pub(crate) arguments: Vec<FilterArgument>,
     pub(crate) rewrite_prefix: String,
@@ -96,8 +127,12 @@ pub(crate) struct LeafCommand {
     pub bindings: Vec<AliasBinding>,
     /// Kept separate from rule matching so uncertainty can cap Allow without hiding Deny.
     pub requires_confirmation: Option<String>,
-    /// Every output-side endpoint in source order. Command rules do not authorize these targets.
-    pub output_redirects: Vec<OutputRedirectEndpoint>,
+    /// Every redirect endpoint in source order. Command rules do not authorize these targets.
+    pub redirects: Vec<RedirectEndpoint>,
+    /// Unlike all-word `bindings`, this subset lets Modify retain only declarations needed by
+    /// redirect spellings, avoiding unused declarations that would make the recheck prompt.
+    pub(crate) redirect_bindings: Vec<AliasBinding>,
+    pub(crate) redirect_suffix: String,
     pub(crate) filter_command: Option<FilterCommand>,
     declaration_id: Option<usize>,
 }
@@ -137,11 +172,21 @@ pub(crate) fn split_command(
 
     let tokens = match brush_parser::tokenize_str(command) {
         Ok(tokens) => tokens,
-        Err(_) => return SplitOutcome::Bail(BailReason::ParseError),
+        Err(_) => {
+            return SplitOutcome::Bail {
+                reason: BailReason::ParseError,
+                redirects: Vec::new(),
+            };
+        }
     };
     let program = match brush_parser::parse_tokens(&tokens, &options) {
         Ok(program) => program,
-        Err(_) => return SplitOutcome::Bail(BailReason::ParseError),
+        Err(_) => {
+            return SplitOutcome::Bail {
+                reason: BailReason::ParseError,
+                redirects: Vec::new(),
+            };
+        }
     };
 
     // `SourcePosition.index` is a character offset, so collect chars once and slice/normalize by
@@ -149,6 +194,7 @@ pub(crate) fn split_command(
     let chars: Vec<char> = command.chars().collect();
     let mut state = AliasState::new(configured_aliases);
     let mut leaves = Vec::new();
+    let mut bailout = None;
 
     for complete_command in &program.complete_commands {
         for item in &complete_command.0 {
@@ -161,9 +207,22 @@ pub(crate) fn split_command(
                 &mut state,
                 &mut leaves,
             ) {
-                return SplitOutcome::Bail(bail);
+                retain_split_bail(&mut bailout, bail);
             }
         }
+    }
+
+    if let Some(mut bailout) = bailout {
+        let mut redirects = leaves
+            .into_iter()
+            .flat_map(|leaf| leaf.redirects)
+            .collect::<Vec<_>>();
+        redirects.append(&mut bailout.redirects);
+        redirects.sort_by_key(|redirect| redirect.order);
+        return SplitOutcome::Bail {
+            reason: bailout.reason,
+            redirects,
+        };
     }
 
     leaves.retain(|leaf| {
@@ -184,6 +243,7 @@ struct AliasState<'a> {
     active: BTreeMap<String, ActiveBinding>,
     used_declarations: BTreeSet<usize>,
     next_declaration_id: usize,
+    next_redirect_order: usize,
     declarations_allowed: bool,
     redirect_path_context_changed: bool,
 }
@@ -195,6 +255,7 @@ impl<'a> AliasState<'a> {
             active: BTreeMap::new(),
             used_declarations: BTreeSet::new(),
             next_declaration_id: 0,
+            next_redirect_order: 0,
             declarations_allowed: true,
             redirect_path_context_changed: false,
         }
@@ -202,6 +263,12 @@ impl<'a> AliasState<'a> {
 
     fn is_configured(&self, name: &str) -> bool {
         self.configured.contains(name)
+    }
+
+    fn next_redirect_order(&mut self) -> usize {
+        let order = self.next_redirect_order;
+        self.next_redirect_order += 1;
+        order
     }
 }
 
@@ -213,7 +280,7 @@ fn collect_list_item(
     options: &ParserOptions,
     state: &mut AliasState,
     leaves: &mut Vec<LeafCommand>,
-) -> Result<(), BailReason> {
+) -> Result<(), SplitBail> {
     let and_or_list = &item.0;
     if let Some((simple, name, value)) = supported_declaration(item, chars, state) {
         let declaration_id = state.next_declaration_id;
@@ -238,7 +305,8 @@ fn collect_list_item(
 
     state.declarations_allowed = false;
     let first_leaf = leaves.len();
-    collect_pipeline(
+    let mut bailout = None;
+    if let Err(bail) = collect_pipeline(
         &and_or_list.first,
         tokens,
         chars,
@@ -246,12 +314,16 @@ fn collect_list_item(
         options,
         state,
         leaves,
-    )?;
+    ) {
+        retain_split_bail(&mut bailout, bail);
+    }
     for and_or in &and_or_list.additional {
         let pipeline = match and_or {
             AndOr::And(pipeline) | AndOr::Or(pipeline) => pipeline,
         };
-        collect_pipeline(pipeline, tokens, chars, cwd, options, state, leaves)?;
+        if let Err(bail) = collect_pipeline(pipeline, tokens, chars, cwd, options, state, leaves) {
+            retain_split_bail(&mut bailout, bail);
+        }
     }
     if matches!(item.1, SeparatorOperator::Async)
         && leaves.len() > first_leaf
@@ -261,7 +333,7 @@ fn collect_list_item(
     {
         filter.rewrite_suffix.push_str(" &");
     }
-    Ok(())
+    bailout.map_or(Ok(()), Err)
 }
 
 fn supported_declaration<'a>(
@@ -345,22 +417,71 @@ fn collect_pipeline(
     options: &ParserOptions,
     state: &mut AliasState,
     leaves: &mut Vec<LeafCommand>,
-) -> Result<(), BailReason> {
+) -> Result<(), SplitBail> {
     let first_leaf = leaves.len();
+    let mut bailout = None;
     for command in &pipeline.seq {
         match command {
             Command::Simple(simple) => {
-                let mut leaf = leaf_from_simple(simple, tokens, chars, cwd, options, state)?;
-                apply_mutation_barriers(simple, state, &mut leaf.requires_confirmation);
-                leaves.push(leaf);
+                match leaf_from_simple(simple, tokens, chars, cwd, options, state) {
+                    Ok(mut leaf) => {
+                        apply_mutation_barriers(simple, state, &mut leaf.requires_confirmation);
+                        leaves.push(leaf);
+                    }
+                    Err(bail) => {
+                        // Later endpoints still need fail-closed shell-state barriers after this leaf.
+                        let mut ignored_confirmation = None;
+                        apply_mutation_barriers(simple, state, &mut ignored_confirmation);
+                        retain_split_bail(&mut bailout, bail);
+                    }
+                }
             }
             // A subshell gets its own reason so diagnostics can distinguish it; every other
             // compound construct (brace group, if/for/while/case, `[[ ]]`, `((…))`, function) is
             // out of scope for v1 and bails conservatively.
-            Command::Compound(CompoundCommand::Subshell(_), _) => return Err(BailReason::Subshell),
-            Command::Compound(_, _) | Command::Function(_) | Command::ExtendedTest(_, _) => {
-                return Err(BailReason::CompoundCommand);
+            Command::Compound(compound, redirect_list) => {
+                let reason = if matches!(compound, CompoundCommand::Subshell(_)) {
+                    BailReason::Subshell
+                } else {
+                    BailReason::CompoundCommand
+                };
+                retain_split_bail(
+                    &mut bailout,
+                    SplitBail {
+                        reason,
+                        redirects: collect_bail_redirects(
+                            redirect_list.as_ref(),
+                            chars,
+                            cwd,
+                            options,
+                            state,
+                        ),
+                    },
+                );
+                if !matches!(
+                    compound,
+                    CompoundCommand::Subshell(_) | CompoundCommand::Coprocess(_)
+                ) {
+                    state.redirect_path_context_changed = true;
+                }
             }
+            Command::ExtendedTest(_, redirect_list) => retain_split_bail(
+                &mut bailout,
+                SplitBail {
+                    reason: BailReason::CompoundCommand,
+                    redirects: collect_bail_redirects(
+                        redirect_list.as_ref(),
+                        chars,
+                        cwd,
+                        options,
+                        state,
+                    ),
+                },
+            ),
+            Command::Function(_) => retain_split_bail(
+                &mut bailout,
+                SplitBail::without_redirects(BailReason::CompoundCommand),
+            ),
         }
     }
     if leaves.len() > first_leaf
@@ -370,7 +491,7 @@ fn collect_pipeline(
     {
         filter.rewrite_prefix = pipeline_rewrite_prefix(pipeline);
     }
-    Ok(())
+    bailout.map_or(Ok(()), Err)
 }
 
 fn pipeline_rewrite_prefix(pipeline: &Pipeline) -> String {
@@ -385,6 +506,54 @@ fn pipeline_rewrite_prefix(pipeline: &Pipeline) -> String {
     prefix
 }
 
+fn collect_bail_redirects(
+    redirect_list: Option<&RedirectList>,
+    chars: &[char],
+    cwd: &str,
+    options: &ParserOptions,
+    state: &mut AliasState,
+) -> Vec<RedirectEndpoint> {
+    let Some(redirect_list) = redirect_list else {
+        return Vec::new();
+    };
+    let mut leaf = LeafAccumulator::default();
+    for redirect in &redirect_list.0 {
+        // Unsupported redirect forms have no static endpoint to enforce; the command already
+        // prompts, so continue collecting any later endpoints that can still match a deny.
+        let _ = process_redirect(redirect, chars, cwd, options, state, &mut leaf);
+    }
+    if state.redirect_path_context_changed {
+        invalidate_context_dependent_redirects(&mut leaf.redirects, EARLIER_PATH_CONTEXT_REASON);
+    }
+    leaf.redirects
+}
+
+const EARLIER_PATH_CONTEXT_REASON: &str = "an earlier command may have changed cwd or HOME; filesystem redirect resolution is not trustworthy";
+const CURRENT_PATH_CONTEXT_REASON: &str =
+    "the command may change cwd or HOME; filesystem redirect resolution is not trustworthy";
+
+fn invalidate_context_dependent_redirects(
+    redirects: &mut [RedirectEndpoint],
+    reason: &str,
+) -> bool {
+    let mut changed = false;
+    for endpoint in redirects {
+        if matches!(
+            &endpoint.target,
+            ParsedRedirectTarget::Filesystem {
+                path,
+                expand_home_tilde,
+            } if *expand_home_tilde || !Path::new(path).is_absolute()
+        ) {
+            endpoint.target = ParsedRedirectTarget::Unresolvable {
+                reason: reason.to_string(),
+            };
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// A word collected from a leaf, carrying enough information to reconstruct original,
 /// alias-expanded, and cwd-normalized forms without reparsing the command.
 struct LeafWord {
@@ -394,6 +563,16 @@ struct LeafWord {
     filter_value: String,
     role: WordRole,
     span: Option<(usize, usize)>,
+}
+
+#[derive(Default)]
+struct LeafAccumulator {
+    words: Vec<LeafWord>,
+    bindings: Vec<AliasBinding>,
+    redirect_bindings: Vec<AliasBinding>,
+    requires_confirmation: Option<String>,
+    redirects: Vec<RedirectEndpoint>,
+    redirect_suffix: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -411,109 +590,118 @@ fn leaf_from_simple(
     cwd: &str,
     options: &ParserOptions,
     state: &mut AliasState,
-) -> Result<LeafCommand, BailReason> {
-    let mut words = Vec::new();
-    let mut bindings = Vec::new();
-    let mut requires_confirmation = None;
-    let mut output_redirects = Vec::new();
+) -> Result<LeafCommand, SplitBail> {
+    let mut leaf = LeafAccumulator::default();
+    // A later static endpoint can still match a hard deny even though the leaf remains unexecutable.
+    let mut bail_reason = None;
 
     if let Some(prefix) = &simple.prefix {
         for item in &prefix.0 {
-            process_item(
-                item,
-                chars,
-                cwd,
-                options,
-                state,
-                &mut words,
-                &mut bindings,
-                &mut requires_confirmation,
-                &mut output_redirects,
-                WordRole::Other,
-            )?;
+            if let Err(reason) =
+                process_item(item, chars, cwd, options, state, &mut leaf, WordRole::Other)
+            {
+                bail_reason.get_or_insert(reason);
+            }
         }
     }
-    if let Some(name) = &simple.word_or_name {
-        push_word(
+    if let Some(name) = &simple.word_or_name
+        && let Err(reason) = push_word(
             name,
             WordRole::CommandName,
             chars,
             cwd,
             options,
             state,
-            &mut words,
-            &mut bindings,
-            &mut requires_confirmation,
+            &mut leaf.words,
+            &mut leaf.bindings,
+            &mut leaf.requires_confirmation,
             |_| (),
-        )?;
+        )
+    {
+        bail_reason.get_or_insert(reason);
     }
     if let Some(suffix) = &simple.suffix {
         for item in &suffix.0 {
-            process_item(
+            if let Err(reason) = process_item(
                 item,
                 chars,
                 cwd,
                 options,
                 state,
-                &mut words,
-                &mut bindings,
-                &mut requires_confirmation,
-                &mut output_redirects,
+                &mut leaf,
                 WordRole::Argument,
-            )?;
+            ) {
+                bail_reason.get_or_insert(reason);
+            }
         }
     }
 
     let context_failure = if state.redirect_path_context_changed {
-        Some(
-            "an earlier command may have changed cwd or HOME; filesystem redirect resolution is not trustworthy",
-        )
+        Some(EARLIER_PATH_CONTEXT_REASON)
     } else if changes_redirect_path_context(simple) {
-        Some(
-            "the command may change cwd or HOME; filesystem redirect resolution is not trustworthy",
-        )
+        Some(CURRENT_PATH_CONTEXT_REASON)
     } else {
         None
     };
-    if let Some(reason) = context_failure {
-        let mut path_context_matters = false;
-        for endpoint in &mut output_redirects {
-            let context_dependent = matches!(
-                &endpoint.target,
-                ParsedRedirectTarget::Filesystem {
-                    path,
-                    expand_home_tilde,
-                } if *expand_home_tilde || !Path::new(path).is_absolute()
-            );
-            if context_dependent {
-                path_context_matters = true;
-                endpoint.target = ParsedRedirectTarget::Unresolvable {
-                    reason: reason.to_string(),
-                };
-            }
-        }
-        if path_context_matters {
-            add_confirmation(&mut requires_confirmation, reason.to_string());
-        }
+    if let Some(reason) = context_failure
+        && invalidate_context_dependent_redirects(&mut leaf.redirects, reason)
+    {
+        add_confirmation(&mut leaf.requires_confirmation, reason.to_string());
     }
 
-    let leaf_start = leaf_source_start(&words, tokens);
-    let original = build_leaf_text(&words, chars, LeafTextStage::Original, leaf_start).text;
-    let expanded = build_leaf_text(&words, chars, LeafTextStage::Expanded, leaf_start).text;
-    let normalized = build_leaf_text(&words, chars, LeafTextStage::Normalized, leaf_start);
-    let filter_command = normalized.program.map(|program| FilterCommand {
-        program,
-        arguments: normalized.arguments,
-        rewrite_prefix: String::new(),
-        rewrite_suffix: String::new(),
-    });
+    if let Some(reason) = bail_reason {
+        return Err(SplitBail {
+            reason,
+            redirects: leaf.redirects,
+        });
+    }
+
+    let leaf_start = leaf_source_start(&leaf.words, tokens);
+    let original = build_leaf_text(
+        &leaf.words,
+        chars,
+        LeafTextStage::Original,
+        leaf_start,
+        false,
+    )
+    .text;
+    let expanded = build_leaf_text(
+        &leaf.words,
+        chars,
+        LeafTextStage::Expanded,
+        leaf_start,
+        false,
+    );
+    let match_text =
+        build_match_text(&leaf.words, chars, leaf_start).map_err(|reason| SplitBail {
+            reason,
+            redirects: leaf.redirects.clone(),
+        })?;
+    let alias_expanded = leaf
+        .words
+        .iter()
+        .any(LeafWord::was_expanded)
+        .then(|| expanded.text.clone());
+    let filter_command = if leaf.words.iter().all(|word| word.span.is_some()) {
+        expanded.program.map(|program| FilterCommand {
+            source: expanded.text,
+            program,
+            arguments: expanded.arguments,
+            rewrite_prefix: String::new(),
+            rewrite_suffix: String::new(),
+        })
+    } else {
+        None
+    };
     Ok(LeafCommand {
         original,
-        match_text: normalized.text,
-        alias_expanded: words.iter().any(LeafWord::was_expanded).then_some(expanded),
-        bindings,
-        requires_confirmation,
-        output_redirects,
+        match_text,
+        alias_expanded,
+        bindings: leaf.bindings,
+        requires_confirmation: leaf.requires_confirmation,
+        redirects: leaf.redirects,
+        redirect_bindings: leaf.redirect_bindings,
+        redirect_suffix: leaf.redirect_suffix,
         filter_command,
         declaration_id: None,
     })
@@ -525,17 +713,13 @@ impl LeafWord {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn process_item(
     item: &CommandPrefixOrSuffixItem,
     chars: &[char],
     cwd: &str,
     options: &ParserOptions,
     state: &mut AliasState,
-    words: &mut Vec<LeafWord>,
-    bindings: &mut Vec<AliasBinding>,
-    requires_confirmation: &mut Option<String>,
-    output_redirects: &mut Vec<OutputRedirectEndpoint>,
+    leaf: &mut LeafAccumulator,
     word_role: WordRole,
 ) -> Result<(), BailReason> {
     match item {
@@ -546,25 +730,22 @@ fn process_item(
             cwd,
             options,
             state,
-            words,
-            bindings,
-            requires_confirmation,
+            &mut leaf.words,
+            &mut leaf.bindings,
+            &mut leaf.requires_confirmation,
             |_| (),
         ),
-        CommandPrefixOrSuffixItem::AssignmentWord(_, word) => {
-            push_assignment_word(word, chars, options, state, words, requires_confirmation)
-        }
-        CommandPrefixOrSuffixItem::IoRedirect(redirect) => process_redirect(
-            redirect,
+        CommandPrefixOrSuffixItem::AssignmentWord(_, word) => push_assignment_word(
+            word,
             chars,
-            cwd,
             options,
             state,
-            words,
-            bindings,
-            requires_confirmation,
-            output_redirects,
+            &mut leaf.words,
+            &mut leaf.requires_confirmation,
         ),
+        CommandPrefixOrSuffixItem::IoRedirect(redirect) => {
+            process_redirect(redirect, chars, cwd, options, state, leaf)
+        }
         // `<(...)` / `>(...)` runs a command in a subshell; cannot reason about it.
         CommandPrefixOrSuffixItem::ProcessSubstitution(_, _) => {
             Err(BailReason::ProcessSubstitution)
@@ -572,103 +753,121 @@ fn process_item(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+fn append_redirect_suffix(suffix: &mut String, source: &str) {
+    suffix.push(' ');
+    suffix.push_str(source);
+}
+
 fn process_redirect(
     redirect: &IoRedirect,
     chars: &[char],
     cwd: &str,
     options: &ParserOptions,
     state: &mut AliasState,
-    words: &mut Vec<LeafWord>,
-    bindings: &mut Vec<AliasBinding>,
-    requires_confirmation: &mut Option<String>,
-    output_redirects: &mut Vec<OutputRedirectEndpoint>,
+    leaf: &mut LeafAccumulator,
 ) -> Result<(), BailReason> {
     match redirect {
-        IoRedirect::File(source_fd, kind, target) => match target {
-            IoFileRedirectTarget::Filename(word) => {
-                let pushed = push_redirect_target(
-                    word,
-                    chars,
-                    cwd,
-                    options,
-                    state,
-                    words,
-                    bindings,
-                    requires_confirmation,
-                )?;
-                if is_output_redirect(kind) {
-                    output_redirects.push(pushed.file_endpoint());
+        IoRedirect::File(source_fd, kind, target) => {
+            let direction = redirect_direction(kind.clone());
+            let operator = redirect_operator(kind);
+            match target {
+                IoFileRedirectTarget::Filename(word) => {
+                    let pushed = push_redirect_target(word, chars, cwd, options, state, leaf)?;
+                    let source = pushed.redirect_source(*source_fd, operator);
+                    append_redirect_suffix(&mut leaf.redirect_suffix, &source);
+                    let order = state.next_redirect_order();
+                    leaf.redirects.push(pushed.file_endpoint(order, direction));
+                    Ok(())
                 }
-                Ok(())
-            }
-            IoFileRedirectTarget::Duplicate(word) => {
-                let pushed = push_redirect_target(
-                    word,
-                    chars,
-                    cwd,
-                    options,
-                    state,
-                    words,
-                    bindings,
-                    requires_confirmation,
-                )?;
-                if is_output_redirect(kind) {
-                    output_redirects.push(match descriptor_match_text(&pushed.classified_value) {
-                        Some(match_text) => OutputRedirectEndpoint {
-                            original_target: pushed.original_target,
-                            target: ParsedRedirectTarget::Descriptor { match_text },
-                        },
-                        None if source_fd.is_none() => pushed.file_endpoint(),
-                        None => OutputRedirectEndpoint {
-                            original_target: pushed.original_target,
-                            target: ParsedRedirectTarget::Unresolvable {
-                                reason: INVALID_DESCRIPTOR_REASON.to_string(),
+                IoFileRedirectTarget::Duplicate(word) => {
+                    let pushed = push_redirect_target(word, chars, cwd, options, state, leaf)?;
+                    let source = pushed.redirect_source(*source_fd, operator);
+                    append_redirect_suffix(&mut leaf.redirect_suffix, &source);
+                    let order = state.next_redirect_order();
+                    leaf.redirects
+                        .push(match descriptor_match_text(&pushed.classified_value) {
+                            Some(match_text) => RedirectEndpoint {
+                                original_target: pushed.original_target,
+                                order,
+                                target: ParsedRedirectTarget::Descriptor { match_text },
+                                direction,
                             },
-                        },
-                    });
+                            None if source_fd.is_none()
+                                && matches!(kind, IoFileRedirectKind::DuplicateOutput) =>
+                            {
+                                pushed.file_endpoint(order, direction)
+                            }
+                            None => RedirectEndpoint {
+                                original_target: pushed.original_target,
+                                order,
+                                target: ParsedRedirectTarget::Unresolvable {
+                                    reason: INVALID_DESCRIPTOR_REASON.to_string(),
+                                },
+                                direction,
+                            },
+                        });
+                    Ok(())
                 }
-                Ok(())
-            }
-            IoFileRedirectTarget::Fd(fd) => {
-                if is_output_redirect(kind) {
-                    output_redirects.push(OutputRedirectEndpoint {
-                        original_target: fd.to_string(),
+                IoFileRedirectTarget::Fd(fd) => {
+                    let target = fd.to_string();
+                    let source = redirect_source(*source_fd, operator, &target);
+                    append_redirect_suffix(&mut leaf.redirect_suffix, &source);
+                    leaf.redirects.push(RedirectEndpoint {
+                        original_target: target.clone(),
+                        order: state.next_redirect_order(),
                         target: ParsedRedirectTarget::Descriptor {
                             match_text: format!("&{fd}"),
                         },
+                        direction,
                     });
+                    Ok(())
                 }
-                Ok(())
+                IoFileRedirectTarget::ProcessSubstitution(_, _) => {
+                    Err(BailReason::ProcessSubstitution)
+                }
             }
-            IoFileRedirectTarget::ProcessSubstitution(_, _) => Err(BailReason::ProcessSubstitution),
-        },
-        IoRedirect::OutputAndError(word, _append) => {
-            let pushed = push_redirect_target(
-                word,
-                chars,
-                cwd,
-                options,
-                state,
-                words,
-                bindings,
-                requires_confirmation,
-            )?;
-            output_redirects.push(pushed.file_endpoint());
+        }
+        IoRedirect::OutputAndError(word, append) => {
+            let pushed = push_redirect_target(word, chars, cwd, options, state, leaf)?;
+            let operator = if *append { "&>>" } else { "&>" };
+            let source = pushed.redirect_source(None, operator);
+            append_redirect_suffix(&mut leaf.redirect_suffix, &source);
+            let order = state.next_redirect_order();
+            leaf.redirects
+                .push(pushed.file_endpoint(order, RedirectDirection::Output));
             Ok(())
         }
         IoRedirect::HereDocument(_, _) | IoRedirect::HereString(_, _) => Err(BailReason::HereDoc),
     }
 }
 
-fn is_output_redirect(kind: &IoFileRedirectKind) -> bool {
-    matches!(
-        kind,
+fn redirect_direction(kind: IoFileRedirectKind) -> RedirectDirection {
+    match kind {
+        IoFileRedirectKind::Read | IoFileRedirectKind::DuplicateInput => RedirectDirection::Input,
         IoFileRedirectKind::Write
-            | IoFileRedirectKind::Append
-            | IoFileRedirectKind::Clobber
-            | IoFileRedirectKind::ReadAndWrite
-            | IoFileRedirectKind::DuplicateOutput
+        | IoFileRedirectKind::Append
+        | IoFileRedirectKind::Clobber
+        | IoFileRedirectKind::DuplicateOutput => RedirectDirection::Output,
+        IoFileRedirectKind::ReadAndWrite => RedirectDirection::Both,
+    }
+}
+
+fn redirect_operator(kind: &IoFileRedirectKind) -> &'static str {
+    match kind {
+        IoFileRedirectKind::Read => "<",
+        IoFileRedirectKind::Write => ">",
+        IoFileRedirectKind::Append => ">>",
+        IoFileRedirectKind::ReadAndWrite => "<>",
+        IoFileRedirectKind::Clobber => ">|",
+        IoFileRedirectKind::DuplicateInput => "<&",
+        IoFileRedirectKind::DuplicateOutput => ">&",
+    }
+}
+
+fn redirect_source(source_fd: Option<i32>, operator: &str, target: &str) -> String {
+    format!(
+        "{}{operator}{target}",
+        source_fd.map_or_else(String::new, |fd| fd.to_string())
     )
 }
 
@@ -727,37 +926,50 @@ impl WordPushMetadata<'_> {
 }
 
 impl PushedWord {
-    fn file_endpoint(self) -> OutputRedirectEndpoint {
-        OutputRedirectEndpoint {
+    fn redirect_source(&self, source_fd: Option<i32>, operator: &str) -> String {
+        redirect_source(source_fd, operator, &self.original_target)
+    }
+
+    fn file_endpoint(self, order: usize, direction: RedirectDirection) -> RedirectEndpoint {
+        RedirectEndpoint {
             original_target: self.original_target,
+            order,
             target: self.target,
+            direction,
         }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_redirect_target(
     word: &Word,
     chars: &[char],
     cwd: &str,
     options: &ParserOptions,
     state: &mut AliasState,
-    words: &mut Vec<LeafWord>,
-    bindings: &mut Vec<AliasBinding>,
-    requires_confirmation: &mut Option<String>,
+    leaf: &mut LeafAccumulator,
 ) -> Result<PushedWord, BailReason> {
-    push_word(
+    let mut target_bindings = Vec::new();
+    let pushed = push_word(
         word,
         WordRole::RedirectTarget,
         chars,
         cwd,
         options,
         state,
-        words,
-        bindings,
-        requires_confirmation,
+        &mut leaf.words,
+        &mut target_bindings,
+        &mut leaf.requires_confirmation,
         |metadata| metadata.into_redirect(),
-    )
+    )?;
+    for binding in target_bindings {
+        if !leaf.bindings.contains(&binding) {
+            leaf.bindings.push(binding.clone());
+        }
+        if !leaf.redirect_bindings.contains(&binding) {
+            leaf.redirect_bindings.push(binding);
+        }
+    }
+    Ok(pushed)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1462,6 +1674,7 @@ fn build_leaf_text(
     chars: &[char],
     stage: LeafTextStage,
     leaf_start: Option<usize>,
+    omit_redirects: bool,
 ) -> BuiltLeafText {
     let mut text = String::new();
     let mut program = None;
@@ -1476,6 +1689,9 @@ fn build_leaf_text(
 
     if words.iter().any(|word| word.span.is_none()) {
         for word in words {
+            if omit_redirects && word.role == WordRole::RedirectTarget {
+                continue;
+            }
             if !text.is_empty() {
                 text.push(' ');
             }
@@ -1497,7 +1713,11 @@ fn build_leaf_text(
     let mut pos = leaf_start.unwrap_or(first_word_start);
     for word in ordered {
         let (start, end) = word.span.expect("span checked present above");
-        if start > pos {
+        if omit_redirects && word.role == WordRole::RedirectTarget {
+            pos = end.max(pos);
+            continue;
+        }
+        if start > pos && (!omit_redirects || !text.is_empty()) {
             text.extend(&chars[pos..start]);
         }
         let output_start = text.len();
@@ -1527,6 +1747,26 @@ fn build_leaf_text(
     }
 }
 
+fn build_match_text(
+    words: &[LeafWord],
+    chars: &[char],
+    leaf_start: Option<usize>,
+) -> Result<String, BailReason> {
+    if words
+        .iter()
+        .all(|word| word.role == WordRole::RedirectTarget)
+    {
+        if leaf_start.is_none() || words.iter().any(|word| word.span.is_none()) {
+            return Err(BailReason::ParseError);
+        }
+        return Ok(
+            build_leaf_text(words, chars, LeafTextStage::Normalized, leaf_start, false).text,
+        );
+    }
+
+    Ok(build_leaf_text(words, chars, LeafTextStage::Normalized, leaf_start, true).text)
+}
+
 fn record_filter_word(
     word: &LeafWord,
     stage: LeafTextStage,
@@ -1534,7 +1774,7 @@ fn record_filter_word(
     program: &mut Option<FilterArgument>,
     arguments: &mut Vec<FilterArgument>,
 ) {
-    if !matches!(stage, LeafTextStage::Normalized) {
+    if !matches!(stage, LeafTextStage::Expanded) {
         return;
     }
     let filter_word = FilterArgument {
@@ -1581,19 +1821,28 @@ mod tests {
     fn leaves_with_aliases(command: &str, cwd: &str, names: &[&str]) -> Vec<LeafCommand> {
         match split_command(command, cwd, &aliases(names)) {
             SplitOutcome::Commands(leaves) => leaves,
-            SplitOutcome::Bail(reason) => {
+            SplitOutcome::Bail { reason, .. } => {
                 panic!("expected Commands for {command:?}, got Bail({reason:?})")
             }
         }
     }
 
     fn leaf_word(original: &str, normalized: &str, span: Option<(usize, usize)>) -> LeafWord {
+        leaf_word_with_role(original, normalized, WordRole::Other, span)
+    }
+
+    fn leaf_word_with_role(
+        original: &str,
+        normalized: &str,
+        role: WordRole,
+        span: Option<(usize, usize)>,
+    ) -> LeafWord {
         LeafWord {
             original_value: original.to_string(),
             expanded_value: original.to_string(),
             value: normalized.to_string(),
             filter_value: normalized.to_string(),
-            role: WordRole::Other,
+            role,
             span,
         }
     }
@@ -1633,7 +1882,7 @@ mod tests {
 
     fn bail_with_aliases(command: &str, names: &[&str]) -> BailReason {
         match split_command(command, "", &aliases(names)) {
-            SplitOutcome::Bail(reason) => reason,
+            SplitOutcome::Bail { reason, .. } => reason,
             SplitOutcome::Commands(leaves) => {
                 panic!("expected Bail for {command:?}, got {leaves:?}")
             }
@@ -1646,14 +1895,14 @@ mod tests {
             texts(NORTH_STAR, ""),
             vec![
                 r#"echo "===== Is there a lib.rs? =====""#,
-                "ls crates/moriarty/src/lib.rs 2>/dev/null",
+                "ls crates/moriarty/src/lib.rs",
                 r#"echo "FOUND lib.rs""#,
                 r#"echo "NO lib.rs (binary only via main.rs)""#,
                 "echo",
                 r#"echo "===== Cargo.toml deps =====""#,
                 "cat crates/moriarty/Cargo.toml",
                 "echo",
-                "cat Cargo.toml 2>/dev/null",
+                "cat Cargo.toml",
                 "head -60",
             ]
         );
@@ -1663,7 +1912,7 @@ mod tests {
     fn north_star_retains_discard_redirects() {
         let endpoints: Vec<_> = leaves(NORTH_STAR, "")
             .into_iter()
-            .flat_map(|leaf| leaf.output_redirects)
+            .flat_map(|leaf| leaf.redirects)
             .collect();
         assert_eq!(endpoints.len(), 2);
         assert!(endpoints.iter().all(|endpoint| matches!(
@@ -1709,6 +1958,112 @@ mod tests {
         assert_eq!(bail("((1))"), BailReason::CompoundCommand);
         assert_eq!(bail("if true; then ls; fi"), BailReason::CompoundCommand);
         assert_eq!(bail(r#"echo "unbalanced"#), BailReason::ParseError);
+    }
+
+    #[test]
+    fn bailout_retains_static_redirect_after_unanalyzable_word() {
+        let SplitOutcome::Bail { reason, redirects } =
+            split_command(r#"echo "$(date)" > protected"#, "", &BTreeSet::new())
+        else {
+            panic!("expected bailout");
+        };
+        assert_eq!(reason, BailReason::CommandSubstitution);
+        assert!(matches!(
+            redirects.as_slice(),
+            [RedirectEndpoint {
+                target: ParsedRedirectTarget::Filesystem { path, .. },
+                direction: RedirectDirection::Output,
+                ..
+            }] if path == "protected"
+        ));
+    }
+
+    #[test]
+    fn bailout_redirects_follow_source_order_across_leaves() {
+        let SplitOutcome::Bail { redirects, .. } = split_command(
+            r#"echo "$(date)" > first; echo ok > second"#,
+            "",
+            &BTreeSet::new(),
+        ) else {
+            panic!("expected bailout");
+        };
+        assert_eq!(
+            redirects
+                .into_iter()
+                .map(|redirect| redirect.original_target)
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+    }
+
+    #[test]
+    fn bailout_later_redirect_respects_mutation_barrier() {
+        let SplitOutcome::Bail { redirects, .. } =
+            split_command(r#"cd "$(date)"; echo ok > protected"#, "", &BTreeSet::new())
+        else {
+            panic!("expected bailout");
+        };
+        assert!(matches!(
+            redirects.as_slice(),
+            [RedirectEndpoint {
+                target: ParsedRedirectTarget::Unresolvable { reason },
+                ..
+            }] if reason.contains("changed cwd or HOME")
+        ));
+    }
+
+    #[test]
+    fn bailout_retains_compound_and_extended_test_redirects() {
+        for command in ["(echo hi) > protected", "[[ -n x ]] > protected"] {
+            let SplitOutcome::Bail { redirects, .. } = split_command(command, "", &BTreeSet::new())
+            else {
+                panic!("expected bailout for {command}");
+            };
+            assert!(matches!(
+                redirects.as_slice(),
+                [RedirectEndpoint {
+                    target: ParsedRedirectTarget::Filesystem { path, .. },
+                    direction: RedirectDirection::Output,
+                    ..
+                }] if path == "protected"
+            ));
+        }
+    }
+
+    #[test]
+    fn compound_bailout_invalidates_later_redirect_path_context() {
+        let SplitOutcome::Bail { redirects, .. } = split_command(
+            "{ cd /tmp; }; echo hi > secret",
+            "/work/project",
+            &BTreeSet::new(),
+        ) else {
+            panic!("expected bailout");
+        };
+        assert!(matches!(
+            redirects.as_slice(),
+            [RedirectEndpoint {
+                target: ParsedRedirectTarget::Unresolvable { reason },
+                ..
+            }] if reason.contains("changed cwd or HOME")
+        ));
+    }
+
+    #[test]
+    fn subshell_bailout_keeps_parent_redirect_context() {
+        let SplitOutcome::Bail { redirects, .. } = split_command(
+            "(cd /tmp); echo hi > secret",
+            "/work/project",
+            &BTreeSet::new(),
+        ) else {
+            panic!("expected bailout");
+        };
+        assert!(matches!(
+            redirects.as_slice(),
+            [RedirectEndpoint {
+                target: ParsedRedirectTarget::Filesystem { path, .. },
+                ..
+            }] if path == "secret"
+        ));
     }
 
     #[test]
@@ -1921,8 +2276,8 @@ mod tests {
         let leaves = leaves(command, "/work/project");
         let leaf = leaves.last().unwrap();
         let endpoint_requires_confirmation = matches!(
-            leaf.output_redirects.as_slice(),
-            [OutputRedirectEndpoint {
+            leaf.redirects.as_slice(),
+            [RedirectEndpoint {
                 target: ParsedRedirectTarget::Unresolvable { .. },
                 ..
             }]
@@ -1954,6 +2309,10 @@ mod tests {
                 "case {command}"
             );
         }
+        assert_eq!(
+            redirect_confirmation_state("cd /tmp; cat < ~/input"),
+            (true, true)
+        );
         for command in [
             "cd /tmp; echo hi 2>&1",
             "echo HOME > out",
@@ -1972,8 +2331,51 @@ mod tests {
     }
 
     #[test]
-    fn retains_every_output_redirect_and_excludes_input_only_forms() {
+    fn command_match_text_omits_redirect_syntax_in_every_position() {
+        for (command, expected) in [
+            ("echo x", "echo x"),
+            ("echo x>out", "echo x"),
+            ("echo x > out", "echo x"),
+            (">report cargo build", "cargo build"),
+            ("cargo >report build", "cargo build"),
+            ("cargo build 2>&1", "cargo build"),
+            ("cargo  build  2>err", "cargo  build"),
+            ("cargo < input > output build", "cargo build"),
+            ("RUSTFLAGS=x cargo check <input", "RUSTFLAGS=x cargo check"),
+            ("echo 世界 > 出力", "echo 世界"),
+            ("cat <> state", "cat"),
+        ] {
+            assert_eq!(texts(command, ""), [expected], "case {command:?}");
+        }
+        assert_eq!(texts("echo hi > out | cat < out", ""), ["echo hi", "cat"]);
+        assert_eq!(
+            leaves_with_aliases("P=/work/project; cat < $P/input", "/work/project", &["P"],)[0]
+                .match_text,
+            "cat"
+        );
+    }
+
+    #[test]
+    fn normalized_filter_source_retains_redirect_syntax_and_spans() {
+        let leaf = &leaves(">report cargo doc --open 2>err", "")[0];
+        let filter = leaf.filter_command.as_ref().unwrap();
+        assert_eq!(leaf.match_text, "cargo doc --open");
+        assert_eq!(filter.source, ">report cargo doc --open 2>err");
+        assert_eq!(&filter.source[filter.program.range.clone()], "cargo");
+        assert_eq!(
+            filter
+                .arguments
+                .iter()
+                .map(|argument| &filter.source[argument.range.clone()])
+                .collect::<Vec<_>>(),
+            ["doc", "--open"]
+        );
+    }
+
+    #[test]
+    fn retains_every_supported_redirect_endpoint() {
         for (command, analyzable, expand_home_tilde) in [
+            ("cat < input.txt", Some("input.txt"), false),
             ("echo x > out.txt", Some("out.txt"), false),
             ("echo x >> out.txt", Some("out.txt"), false),
             ("echo x >| out.txt", Some("out.txt"), false),
@@ -1989,14 +2391,14 @@ mod tests {
             (r#"echo x > "~/report.txt""#, Some("~/report.txt"), false),
             (r"echo x > \~/report.txt", Some("~/report.txt"), false),
             ("echo x > $OUT", None, false),
-            ("echo x > *.txt", None, false),
+            ("cat < *.txt", None, false),
             ("echo x > @(one|two)", None, false),
             ("echo x > +(one|two)", None, false),
             ("echo x > !(one|two)", None, false),
             ("echo x > {one,two}", None, false),
         ] {
             let leaves = leaves(command, "");
-            let [endpoint] = leaves[0].output_redirects.as_slice() else {
+            let [endpoint] = leaves[0].redirects.as_slice() else {
                 panic!("expected one file endpoint for {command:?}");
             };
             let (actual_target, actual_expansion) = match &endpoint.target {
@@ -2012,8 +2414,13 @@ mod tests {
             assert_eq!(actual_target, analyzable, "case {command:?}");
             assert_eq!(actual_expansion, expand_home_tilde, "case {command:?}");
         }
+    }
 
+    #[test]
+    fn classifies_input_and_output_descriptor_endpoints() {
         for (command, expected) in [
+            ("cat 0<&1", "&1"),
+            ("cat <&-", "&-"),
             ("ls 2>&1", "&1"),
             (r#"ls 2>&"1""#, "&1"),
             ("ls >&-", "&-"),
@@ -2021,53 +2428,86 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    leaves(command, "")[0].output_redirects.as_slice(),
-                    [OutputRedirectEndpoint {
+                    leaves(command, "")[0].redirects.as_slice(),
+                    [RedirectEndpoint {
                         target: ParsedRedirectTarget::Descriptor { match_text },
                         ..
                     }] if match_text == expected
                 ),
                 "expected descriptor {expected:?} for {command:?}"
             );
-            assert_eq!(texts(command, ""), vec![command]);
         }
-
         assert!(matches!(
-            leaves("echo 2>&foo", "")[0].output_redirects.as_slice(),
-            [OutputRedirectEndpoint {
-                target: ParsedRedirectTarget::Unresolvable { reason },
+            leaves("echo >&out", "")[0].redirects.as_slice(),
+            [RedirectEndpoint {
+                target: ParsedRedirectTarget::Filesystem { path, .. },
                 ..
-            }] if reason == INVALID_DESCRIPTOR_REASON
+            }] if path == "out"
         ));
+        for command in ["cat <&input", "echo 2>&out"] {
+            assert!(matches!(
+                leaves(command, "")[0].redirects.as_slice(),
+                [RedirectEndpoint {
+                    target: ParsedRedirectTarget::Unresolvable { reason },
+                    ..
+                }] if reason == INVALID_DESCRIPTOR_REASON
+            ));
+        }
+    }
 
-        for command in ["echo hi", "cat < input.txt", "cat 0<&1"] {
-            assert!(
-                leaves(command, "")[0].output_redirects.is_empty(),
-                "expected no output endpoint for {command:?}"
+    #[test]
+    fn redirect_suffix_preserves_source_order_and_spelling() {
+        for (command, expected) in [
+            (
+                "echo hi 2>>\"err log\" >| out 2>&1",
+                " 2>>\"err log\" >|out 2>&1",
+            ),
+            ("cat 3<> state 0<&1", " 3<>state 0<&1"),
+            ("&> out echo hi", " &>out"),
+        ] {
+            assert_eq!(leaves(command, "")[0].redirect_suffix, expected);
+        }
+    }
+
+    #[test]
+    fn redirect_bindings_track_only_aliases_consumed_by_targets() {
+        for reference in ["$P/protected", "${P}/protected"] {
+            let command = format!("P=/work/project; echo hi > {reference}");
+            let leaves = leaves_with_aliases(&command, "/work/project", &["P"]);
+            assert_eq!(
+                leaves[0].redirect_bindings,
+                [AliasBinding {
+                    name: "P".to_string(),
+                    value: "/work/project".to_string(),
+                }],
+                "{reference}"
             );
         }
-        assert_eq!(texts("cat 0<&1", ""), ["cat 0<&1"]);
+        let leaves = leaves_with_aliases(
+            "P=/work/project; echo hi > $P_SUFFIX/protected",
+            "/work/project",
+            &["P"],
+        );
+        assert!(leaves.last().unwrap().redirect_bindings.is_empty());
     }
 
     #[test]
     fn redirect_only_leaves_retain_their_operators() {
-        assert_eq!(texts("> out", ""), ["> out"]);
-        assert_eq!(texts("2> out", ""), ["2> out"]);
-        assert_eq!(texts("&> out", ""), ["&> out"]);
-        assert_eq!(
-            texts("> out; echo hi > other", ""),
-            ["> out", "echo hi > other"]
-        );
+        for command in ["> out", "2> out", "&> out", "< input", "0<&1"] {
+            assert_eq!(texts(command, ""), [command], "case {command:?}");
+            assert_eq!(leaves(command, "")[0].redirects.len(), 1);
+        }
+        assert_eq!(texts("> out; echo hi > other", ""), ["> out", "echo hi"]);
     }
 
     #[test]
     fn descriptor_source_never_uses_text_from_a_comment() {
         let leaves = leaves("# &1\nrm -rf / >&1", "");
         assert_eq!(leaves.len(), 1);
-        assert_eq!(leaves[0].match_text, "rm -rf / >&1");
+        assert_eq!(leaves[0].match_text, "rm -rf /");
         assert!(matches!(
-            leaves[0].output_redirects.as_slice(),
-            [OutputRedirectEndpoint {
+            leaves[0].redirects.as_slice(),
+            [RedirectEndpoint {
                 target: ParsedRedirectTarget::Descriptor { match_text },
                 ..
             }] if match_text == "&1"
@@ -2075,27 +2515,22 @@ mod tests {
     }
 
     #[test]
-    fn output_redirects_preserve_source_order_and_static_analysis() {
-        let leaves = leaves("echo x > one 2> two", "");
-        let redirects = &leaves[0].output_redirects;
+    fn redirect_endpoints_preserve_source_order_and_static_analysis() {
+        let leaves = leaves("cat < one > two 3<&0 4>&1", "");
         assert_eq!(
-            redirects
+            leaves[0]
+                .redirects
                 .iter()
                 .map(|endpoint| match &endpoint.target {
-                    ParsedRedirectTarget::Filesystem { .. } => endpoint.original_target.as_str(),
-                    ParsedRedirectTarget::Descriptor { .. }
-                    | ParsedRedirectTarget::Unresolvable { .. } => {
-                        panic!("expected file endpoint")
+                    ParsedRedirectTarget::Filesystem { path, .. } => path.clone(),
+                    ParsedRedirectTarget::Descriptor { match_text } => match_text.clone(),
+                    ParsedRedirectTarget::Unresolvable { .. } => {
+                        panic!("expected analyzable endpoint")
                     }
                 })
                 .collect::<Vec<_>>(),
-            ["one", "two"]
+            ["one", "two", "&0", "&1"]
         );
-    }
-
-    #[test]
-    fn redirect_to_real_file_keeps_operator_in_leaf_text() {
-        assert_eq!(texts("echo x > out.txt", ""), vec!["echo x > out.txt"]);
     }
 
     #[test]
@@ -2150,8 +2585,14 @@ mod tests {
     #[test]
     fn normalizes_redirect_target_paths() {
         let leaf = &leaves("cat < /abs/cwd/input.txt", "/abs/cwd")[0];
-        assert_eq!(leaf.match_text, "cat < input.txt");
-        assert!(leaf.output_redirects.is_empty());
+        assert_eq!(leaf.match_text, "cat");
+        assert!(matches!(
+            leaf.redirects.as_slice(),
+            [RedirectEndpoint {
+                target: ParsedRedirectTarget::Filesystem { path, .. },
+                ..
+            }] if path == "/abs/cwd/input.txt"
+        ));
     }
 
     #[test]
@@ -2161,18 +2602,40 @@ mod tests {
     }
 
     #[test]
-    fn build_leaf_text_falls_back_when_a_span_is_missing() {
+    fn leaf_text_builders_fail_safe_when_a_span_is_missing() {
         // Directly exercise the missing-span fallback, which is otherwise hard to trigger because
         // the parser populates spans for ordinary words.
         let words = vec![
             leaf_word("cat", "cat", Some((0, 3))),
             leaf_word("/abs/cwd/foo.rs", "src/foo.rs", None),
+            leaf_word_with_role("out", "out", WordRole::RedirectTarget, None),
         ];
-        let chars: Vec<char> = "cat /abs/cwd/foo.rs".chars().collect();
+        let chars: Vec<char> = "cat /abs/cwd/foo.rs > out".chars().collect();
         assert_eq!(
-            build_leaf_text(&words, &chars, LeafTextStage::Normalized, None).text,
+            build_leaf_text(&words, &chars, LeafTextStage::Normalized, None, false).text,
+            "cat src/foo.rs out"
+        );
+        assert_eq!(
+            build_match_text(&words, &chars, None).unwrap(),
             "cat src/foo.rs"
         );
+
+        let redirect_only = [leaf_word_with_role(
+            "out",
+            "out",
+            WordRole::RedirectTarget,
+            None,
+        )];
+        assert_eq!(
+            build_match_text(&redirect_only, &chars, None),
+            Err(BailReason::ParseError)
+        );
+    }
+
+    #[test]
+    fn match_text_preserves_shell_significant_whitespace() {
+        assert_eq!(leaves(r"printf foo\ ", "")[0].match_text, r"printf foo\ ");
+        assert_eq!(leaves("\u{a0}echo hi", "")[0].match_text, "\u{a0}echo hi");
     }
 
     #[test]

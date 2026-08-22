@@ -12,6 +12,8 @@ use tempfile::TempDir;
 #[cfg(unix)]
 use which::which;
 
+use crate::user_config::{BashRule, BashRuleAction, RedirectDirection};
+
 pub(crate) const PATH_ALIAS_COMMAND: &str =
     "P=/work/project/node_modules/pkg; rg needle $P/output.d.ts | head -5";
 
@@ -26,6 +28,44 @@ name = "allow-head"
 pattern = "^head($|\\s)"
 action = { type = "Allow" }
 "#;
+
+pub(crate) fn redirect_rule(name: &str, pattern: &str, allow_local: bool) -> BashRule {
+    directional_redirect_rule(name, pattern, allow_local, RedirectDirection::Output)
+}
+
+pub(crate) fn directional_redirect_rule(
+    name: &str,
+    pattern: &str,
+    allow_local: bool,
+    direction: RedirectDirection,
+) -> BashRule {
+    BashRule {
+        name: name.to_string(),
+        pattern: pattern.to_string(),
+        modes: None,
+        action: BashRuleAction::AllowRedirect {
+            allow_local,
+            direction,
+        },
+    }
+}
+
+pub(crate) fn deny_redirect_rule(
+    name: &str,
+    pattern: &str,
+    reason: &str,
+    direction: RedirectDirection,
+) -> BashRule {
+    BashRule {
+        name: name.to_string(),
+        pattern: pattern.to_string(),
+        modes: None,
+        action: BashRuleAction::DenyRedirect {
+            value: reason.to_string(),
+            direction,
+        },
+    }
+}
 
 pub(crate) const SUBAGENT_EXECUTION_RULES: &str = r#"
 [[tool_rules]]

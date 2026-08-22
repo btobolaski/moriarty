@@ -34,14 +34,15 @@ use crate::{
             BashRuleEngine, CommandTrace, EndpointAnalysis, Evaluation, EvaluationContext,
             EvaluationPurpose, FilesystemAnalysis, FilterContinuation, LeafIdentity,
             MatchedCommandRule, MatchedRedirectRule, OriginalContinuation, PolicyAnalysis,
-            RedirectCheckAnalysis, RedirectEndpointKind, RedirectEndpointTrace, RewrittenBailTrace,
-            RuleMatchExplanation, RuleResult, SubCommandTrace,
+            RedirectCheckAnalysis, RedirectEndpointKind, RedirectEndpointTrace,
+            RedirectTraceDecision, RedirectTraceState, RewrittenBailTrace, RuleMatchExplanation,
+            RuleResult, SubCommandTrace,
         },
         command_split::{AliasBinding, BailReason},
     },
     permission_mode::PermissionMode,
     project_config::runner::{CommandOutput, VerifiedProject, verify_and_load_project},
-    user_config::load_user_config_from,
+    user_config::{RedirectDirection, load_user_config_from},
 };
 
 pub async fn exec_test(cmd: crate::TestCommand) -> miette::Result<()> {
@@ -386,11 +387,18 @@ fn redirect_trace_parts(
     analysis: &RedirectCheckAnalysis,
 ) -> (Vec<SubCommandTrace>, Option<RewrittenBailTrace>) {
     match analysis {
-        RedirectCheckAnalysis::Bail { command, reason } => (
+        RedirectCheckAnalysis::Bail {
+            command,
+            reason,
+            denied_endpoint,
+        } => (
             Vec::new(),
             Some(RewrittenBailTrace {
                 command: command.clone(),
                 reason: *reason,
+                redirect: denied_endpoint
+                    .as_ref()
+                    .map(|denied| endpoint_trace(denied.endpoint())),
             }),
         ),
         RedirectCheckAnalysis::Leaves(leaves) => (
@@ -414,15 +422,31 @@ fn sub_command_trace(
         normalized: identity.normalized().to_string(),
         bindings: identity.bindings().to_vec(),
         requires_confirmation: identity.requires_confirmation().map(str::to_string),
-        output_redirects: endpoints.iter().map(endpoint_trace).collect(),
+        redirects: endpoints.iter().map(endpoint_trace).collect(),
         matched,
     }
 }
 
-fn unmatched_redirect_failure(matched_rule: Option<&MatchedRedirectRule>) -> Option<String> {
-    matched_rule
-        .is_none()
-        .then(|| "no eligible AllowRedirect rule matched".to_string())
+fn redirect_trace_state(
+    matched_rule: Option<&MatchedRedirectRule>,
+    direction: RedirectDirection,
+) -> RedirectTraceState {
+    match matched_rule {
+        Some(rule) => RedirectTraceState::Matched {
+            matched: redirect_rule_explanation(rule),
+            decision: if rule.is_deny() {
+                RedirectTraceDecision::Denied
+            } else {
+                RedirectTraceDecision::Allowed
+            },
+        },
+        None => RedirectTraceState::Failed {
+            failure: format!(
+                "no eligible {} AllowRedirect rule matched",
+                direction.as_str()
+            ),
+        },
+    }
 }
 
 fn endpoint_trace(endpoint: &EndpointAnalysis) -> RedirectEndpointTrace {
@@ -431,13 +455,14 @@ fn endpoint_trace(endpoint: &EndpointAnalysis) -> RedirectEndpointTrace {
             original_target,
             match_text,
             matched_rule,
+            ..
         } => RedirectEndpointTrace {
             original_target: original_target.clone(),
+            direction: endpoint.direction(),
             kind: RedirectEndpointKind::Descriptor.label(),
             match_text: Some(match_text.clone()),
             is_local: Some(false),
-            matched: matched_rule.as_ref().map(redirect_rule_explanation),
-            failure: unmatched_redirect_failure(matched_rule.as_ref()),
+            state: redirect_trace_state(matched_rule.as_ref(), endpoint.direction()),
         },
         EndpointAnalysis::Filesystem {
             original_target,
@@ -446,24 +471,28 @@ fn endpoint_trace(endpoint: &EndpointAnalysis) -> RedirectEndpointTrace {
                     target,
                     matched_rule,
                 },
+            ..
         } => RedirectEndpointTrace {
             original_target: original_target.clone(),
+            direction: endpoint.direction(),
             kind: target.kind().label(),
             match_text: Some(target.match_text().to_string()),
             is_local: Some(target.is_local()),
-            matched: matched_rule.as_ref().map(redirect_rule_explanation),
-            failure: unmatched_redirect_failure(matched_rule.as_ref()),
+            state: redirect_trace_state(matched_rule.as_ref(), endpoint.direction()),
         },
         EndpointAnalysis::Filesystem {
             original_target,
             resolution: FilesystemAnalysis::Failed { reason, .. },
+            ..
         } => RedirectEndpointTrace {
             original_target: original_target.clone(),
+            direction: endpoint.direction(),
             kind: RedirectEndpointKind::Filesystem.label(),
             match_text: None,
             is_local: None,
-            matched: None,
-            failure: Some(reason.clone()),
+            state: RedirectTraceState::Failed {
+                failure: reason.clone(),
+            },
         },
     }
 }
@@ -497,8 +526,10 @@ fn write_redirect_explanation(
 ) -> io::Result<()> {
     writeln!(
         writer,
-        "    {} redirect target: {}",
-        endpoint.kind, endpoint.original_target
+        "    {} {} redirect target: {}",
+        endpoint.direction.as_str(),
+        endpoint.kind,
+        endpoint.original_target
     )?;
     if let Some(match_text) = &endpoint.match_text {
         writeln!(writer, "      resolved for matching: {match_text}")?;
@@ -506,16 +537,22 @@ fn write_redirect_explanation(
     if let Some(is_local) = endpoint.is_local {
         writeln!(writer, "      project-local: {is_local}")?;
     }
-    if let Some(matched) = &endpoint.matched {
-        writeln!(
-            writer,
-            "      allowed by redirect rule '{}'  [{}]",
-            matched.rule_name, matched.action_summary
-        )?;
-        writeln!(writer, "        pattern: {}", matched.expanded_pattern)?;
-    }
-    if let Some(failure) = &endpoint.failure {
-        writeln!(writer, "      not authorized: {failure}")?;
+    match &endpoint.state {
+        RedirectTraceState::Matched { matched, decision } => {
+            let decision = match decision {
+                RedirectTraceDecision::Allowed => "allowed",
+                RedirectTraceDecision::Denied => "denied",
+            };
+            writeln!(
+                writer,
+                "      {decision} by redirect rule '{}'  [{}]",
+                matched.rule_name, matched.action_summary
+            )?;
+            writeln!(writer, "        pattern: {}", matched.expanded_pattern)?;
+        }
+        RedirectTraceState::Failed { failure } => {
+            writeln!(writer, "      not authorized: {failure}")?;
+        }
     }
     Ok(())
 }
@@ -540,7 +577,7 @@ fn write_sub_command_explanation(
             binding.name, binding.value
         )?;
     }
-    for endpoint in &sub.output_redirects {
+    for endpoint in &sub.redirects {
         write_redirect_explanation(writer, endpoint)?;
     }
     if let Some(reason) = &sub.requires_confirmation {
@@ -573,7 +610,7 @@ fn write_explanation(writer: &mut impl Write, trace: &CommandTrace) -> io::Resul
     if let Some(reason) = &trace.bail {
         writeln!(
             writer,
-            "  Could not analyze ({reason:?}); only an explicit Deny on the whole command is honored."
+            "  Could not analyze ({reason:?}); only a whole-command or retained-endpoint Deny is honored."
         )?;
     }
     for (index, sub) in trace.sub_commands.iter().enumerate() {
@@ -586,6 +623,9 @@ fn write_explanation(writer: &mut impl Write, trace: &CommandTrace) -> io::Resul
             "    could not analyze rewrite ({:?})",
             rewritten.reason
         )?;
+        if let Some(endpoint) = &rewritten.redirect {
+            write_redirect_explanation(writer, endpoint)?;
+        }
     }
     for (index, sub) in trace.rewritten_sub_commands.iter().enumerate() {
         write_sub_command_explanation(writer, "Rewritten leaf", index, sub)?;
@@ -728,7 +768,7 @@ mod tests {
     use crate::test_helpers::{
         PATH_ALIAS_COMMAND, PATH_ALIAS_READ_RULES, setup_isolated_xdg_config,
     };
-    use crate::user_config::{BashRule, BashRuleAction, UserConfig};
+    use crate::user_config::{BashRule, BashRuleAction, RedirectDirection, UserConfig};
 
     async fn create_test_config(dir: &TempDir, rules: Vec<BashRule>) -> PathBuf {
         write_user_config(
@@ -1135,7 +1175,7 @@ mod tests {
                     value: "/work/project".to_string(),
                 }],
                 requires_confirmation: None,
-                output_redirects: Vec::new(),
+                redirects: Vec::new(),
                 matched: Some(RuleMatchExplanation {
                     rule_name: "allow-cat".to_string(),
                     expanded_pattern: "^cat ".to_string(),
@@ -1174,41 +1214,61 @@ mod tests {
             bash_path_aliases: BTreeSet::new(),
             bash_rules: Some(vec![
                 modify("redirecting-echo", r"^rewrite$", "echo > report.txt"),
+                modify(
+                    "bailing-echo",
+                    r"^rewrite-bail$",
+                    r#"echo "$(date)" > reports/protected.txt"#,
+                ),
                 allow("allow-echo", r"^echo($|\s)"),
                 deny("deny-rm", r"^rm", "no removal"),
+                BashRule {
+                    name: "deny-protected".to_string(),
+                    pattern: r"^reports/protected\.txt$".to_string(),
+                    modes: None,
+                    action: BashRuleAction::DenyRedirect {
+                        value: "protected output".to_string(),
+                        direction: RedirectDirection::Output,
+                    },
+                },
                 BashRule {
                     name: "allow-local".to_string(),
                     pattern: r"^reports/".to_string(),
                     modes: None,
-                    action: BashRuleAction::AllowRedirect { allow_local: true },
+                    action: BashRuleAction::AllowRedirect {
+                        allow_local: true,
+                        direction: RedirectDirection::Output,
+                    },
                 },
             ]),
             tool_rules: None,
         })
         .unwrap();
         let allowed = explain(&engine, "echo hi > reports/status.txt", cwd, None);
+        let redirect_denied = explain(&engine, "echo hi > reports/protected.txt", cwd, None);
         let unresolved = explain(&engine, "echo hi > $OUT", cwd, None);
         let denied = explain(&engine, "rm > reports/denied.txt", cwd, None);
         let rewritten = explain(&engine, "rewrite", cwd, None);
-        assert_eq!(
-            denied.sub_commands[0].output_redirects[0]
-                .matched
-                .as_ref()
-                .unwrap()
-                .rule_name,
-            "allow-local"
-        );
+        let rewrite_bail = explain(&engine, "rewrite-bail", cwd, None);
+        let RedirectTraceState::Matched { matched, .. } =
+            &denied.sub_commands[0].redirects[0].state
+        else {
+            panic!("expected matched redirect trace");
+        };
+        assert_eq!(matched.rule_name, "allow-local");
 
         let mut output = Vec::new();
         write_explanation(&mut output, &allowed).unwrap();
+        write_explanation(&mut output, &redirect_denied).unwrap();
         write_explanation(&mut output, &unresolved).unwrap();
         write_explanation(&mut output, &denied).unwrap();
         write_explanation(&mut output, &rewritten).unwrap();
         let output = String::from_utf8(output).unwrap();
         for expected in [
+            "output filesystem redirect target: reports/status.txt",
             "resolved for matching: reports/status.txt",
             "project-local: true",
             "allowed by redirect rule 'allow-local'",
+            "denied by redirect rule 'deny-protected'",
             "Contributing rules: allow-echo, allow-local",
             "DENIED by rule: deny-rm",
             "Rewritten leaf 1: echo > report.txt",
@@ -1220,17 +1280,46 @@ mod tests {
         }
 
         assert_eq!(output.matches("not authorized:").count(), 2);
-        let unresolved_endpoint = &unresolved.sub_commands[0].output_redirects[0];
-        assert!(unresolved_endpoint.failure.is_some());
-        assert!(unresolved_endpoint.matched.is_none());
-        let rewritten_endpoint = &rewritten.rewritten_sub_commands[0].output_redirects[0];
-        assert!(rewritten_endpoint.failure.is_some());
-        assert!(rewritten_endpoint.matched.is_none());
+
+        let mut bail_output = Vec::new();
+        write_explanation(&mut bail_output, &rewrite_bail).unwrap();
+        let bail_output = String::from_utf8(bail_output).unwrap();
+        for expected in [
+            r#"Rewritten command: echo "$(date)" > reports/protected.txt"#,
+            "output filesystem redirect target: reports/protected.txt",
+            "denied by redirect rule 'deny-protected'",
+        ] {
+            assert!(
+                bail_output.contains(expected),
+                "missing {expected:?} in {bail_output:?}"
+            );
+        }
+
+        let denied_endpoint = &redirect_denied.sub_commands[0].redirects[0];
+        assert!(matches!(
+            &denied_endpoint.state,
+            RedirectTraceState::Matched {
+                decision: RedirectTraceDecision::Denied,
+                ..
+            }
+        ));
+        let unresolved_endpoint = &unresolved.sub_commands[0].redirects[0];
+        assert!(matches!(
+            &unresolved_endpoint.state,
+            RedirectTraceState::Failed { .. }
+        ));
+        let rewritten_endpoint = &rewritten.rewritten_sub_commands[0].redirects[0];
+        assert!(matches!(
+            &rewritten_endpoint.state,
+            RedirectTraceState::Failed { .. }
+        ));
 
         let json = serde_json::to_value(&allowed).unwrap();
-        let endpoint = &json["sub_commands"][0]["output_redirects"][0];
+        let endpoint = &json["sub_commands"][0]["redirects"][0];
+        assert_eq!(endpoint["direction"], "output");
         assert_eq!(endpoint["match_text"], "reports/status.txt");
         assert_eq!(endpoint["is_local"], true);
+        assert_eq!(endpoint["decision"], "allowed");
         assert_eq!(endpoint["matched"]["rule_name"], "allow-local");
         assert_eq!(json["contributors"], json!(["allow-echo", "allow-local"]));
     }

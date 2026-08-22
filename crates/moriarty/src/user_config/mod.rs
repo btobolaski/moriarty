@@ -153,16 +153,16 @@ impl UserConfig {
     }
 }
 
-/// Command actions and `AllowRedirect` actions use separate declaration-ordered domains, so a
-/// match in one cannot shadow or authorize the other.
+/// Command actions and directional redirect actions use separate declaration-ordered domains, so
+/// a match in one cannot shadow or authorize the other.
 ///
 /// # Compound commands
 ///
 /// The hook splits each Bash command into leaf simple-commands and matches `pattern` against each
 /// leaf independently (see `hooks::command_split`), so a pattern only needs to describe one command
-/// — not a whole `a && b | c` pipeline. Operators are split off, command substitution/subshells bail
-/// to a prompt, and output endpoints require separate redirect rules, so allow-rules can be simple
-/// prefixes (`^ls`) without spelling out pipes or shell-metacharacter exclusions. A pattern still
+/// — not a whole `a && b | c` pipeline. Operators and redirects are omitted from non-redirect-only
+/// command match text, command substitution/subshells bail unless a command or endpoint deny applies,
+/// and every redirect endpoint requires direction-matching policy. A pattern still
 /// guards a program's *own* dangerous flags (e.g. `find -exec`, `sed -i`), which are invisible to
 /// the splitter.
 ///
@@ -182,6 +182,44 @@ pub struct BashRule {
     pub action: BashRuleAction,
 }
 
+/// Keeping input explicit prevents legacy output rules from silently gaining read authority.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RedirectDirection {
+    Input,
+    #[default]
+    Output,
+    Both,
+}
+
+impl RedirectDirection {
+    pub(crate) const ALL: [Self; 3] = [Self::Input, Self::Output, Self::Both];
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Input => "input",
+            Self::Output => "output",
+            Self::Both => "both",
+        }
+    }
+
+    pub(crate) fn covers(self, endpoint: Self) -> bool {
+        self == Self::Both || self == endpoint
+    }
+
+    pub(crate) fn overlaps(self, other: Self) -> bool {
+        self == Self::Both || other == Self::Both || self == other
+    }
+
+    fn is_output(&self) -> bool {
+        matches!(self, Self::Output)
+    }
+
+    fn is_both(&self) -> bool {
+        matches!(self, Self::Both)
+    }
+}
+
 /// Action to take when a Bash rule matches its command or redirect-endpoint domain.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "type")]
@@ -192,15 +230,28 @@ pub enum BashRuleAction {
     Modify { value: String },
     /// Explicitly allow the command to execute.
     Allow,
-    /// Authorize a matched output-redirect endpoint without granting command execution.
+    /// Authorize a matched redirect endpoint without granting command execution.
     ///
-    /// When `allow_local` is true, the resolved ordinary path must remain within the canonical hook
-    /// cwd; devices, special files, and descriptors require an unrestricted target rule.
-    /// Redirect rules form a separate rule domain and never participate in command first-match
-    /// selection.
+    /// Existing rules remain output-only; input and read-write endpoints require an explicit
+    /// direction. When `allow_local` is true, the resolved ordinary path must remain within the
+    /// canonical hook cwd; devices, special files, and descriptors require an unrestricted target
+    /// rule. Redirect rules form a separate rule domain and never participate in command
+    /// first-match selection.
     AllowRedirect {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         allow_local: bool,
+        #[serde(default, skip_serializing_if = "RedirectDirection::is_output")]
+        direction: RedirectDirection,
+    },
+    /// Redirect syntax is absent from command match text, so endpoint-specific hard blocks need
+    /// their own action domain.
+    DenyRedirect {
+        value: String,
+        #[serde(
+            default = "RedirectDirection::both",
+            skip_serializing_if = "RedirectDirection::is_both"
+        )]
+        direction: RedirectDirection,
     },
     /// Defer to the user when a command requires explicit authorization but shouldn't be auto-approved.
     /// Use this for potentially dangerous operations that need case-by-case evaluation.
@@ -238,31 +289,133 @@ pub enum BashRuleAction {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RedirectRuleAction {
+    Allow {
+        allow_local: bool,
+        direction: RedirectDirection,
+    },
+    Deny {
+        value: String,
+        direction: RedirectDirection,
+    },
+}
+
+impl RedirectRuleAction {
+    pub(crate) fn from_config(action: &BashRuleAction) -> Option<Self> {
+        match action {
+            BashRuleAction::AllowRedirect {
+                allow_local,
+                direction,
+            } => Some(Self::Allow {
+                allow_local: *allow_local,
+                direction: *direction,
+            }),
+            BashRuleAction::DenyRedirect { value, direction } => Some(Self::Deny {
+                value: value.clone(),
+                direction: *direction,
+            }),
+            BashRuleAction::Deny { .. }
+            | BashRuleAction::Modify { .. }
+            | BashRuleAction::Allow
+            | BashRuleAction::Ask
+            | BashRuleAction::ArgumentFilter { .. } => None,
+        }
+    }
+
+    pub(crate) fn matches(
+        &self,
+        endpoint_direction: RedirectDirection,
+        is_filesystem: bool,
+        is_local: bool,
+    ) -> bool {
+        match self {
+            Self::Allow {
+                allow_local,
+                direction,
+            } => {
+                direction.covers(endpoint_direction) && (!*allow_local || is_filesystem && is_local)
+            }
+            Self::Deny { direction, .. } => direction.overlaps(endpoint_direction),
+        }
+    }
+
+    pub(crate) fn is_deny(&self) -> bool {
+        matches!(self, Self::Deny { .. })
+    }
+
+    pub(crate) fn deny_direction(&self) -> Option<RedirectDirection> {
+        match self {
+            Self::Allow { .. } => None,
+            Self::Deny { direction, .. } => Some(*direction),
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AllowRedirectFields {
     #[serde(default)]
     allow_local: bool,
+    #[serde(default)]
+    direction: RedirectDirection,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DenyRedirectFields {
+    value: String,
+    #[serde(default = "RedirectDirection::both")]
+    direction: RedirectDirection,
+}
+
+impl RedirectDirection {
+    fn both() -> Self {
+        Self::Both
+    }
 }
 
 /// Action tables historically tolerated extra metadata, so existing variants retain that config
-/// compatibility. AllowRedirect stays strict because misspelling `allow_local` widens path scope.
+/// compatibility. Redirect actions stay strict because misspelled scope fields can widen authority.
 fn deserialize_bash_rule_action<'de, D>(deserializer: D) -> Result<BashRuleAction, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let mut value = Value::deserialize(deserializer)?;
-    if let Value::Object(fields) = &mut value
-        && fields.get("type").and_then(Value::as_str) == Some("AllowRedirect")
-    {
-        fields.remove("type");
-        let fields =
-            serde_json::from_value::<AllowRedirectFields>(value).map_err(de::Error::custom)?;
-        return Ok(BashRuleAction::AllowRedirect {
-            allow_local: fields.allow_local,
-        });
+    enum RedirectActionKind {
+        Allow,
+        Deny,
     }
-    serde_json::from_value(value).map_err(de::Error::custom)
+
+    let value = Value::deserialize(deserializer)?;
+    let Value::Object(mut fields) = value else {
+        return serde_json::from_value(value).map_err(de::Error::custom);
+    };
+    let kind = match fields.get("type").and_then(Value::as_str) {
+        Some("AllowRedirect") => Some(RedirectActionKind::Allow),
+        Some("DenyRedirect") => Some(RedirectActionKind::Deny),
+        _ => None,
+    };
+    match kind {
+        Some(RedirectActionKind::Allow) => {
+            fields.remove("type");
+            let fields = serde_json::from_value::<AllowRedirectFields>(Value::Object(fields))
+                .map_err(de::Error::custom)?;
+            Ok(BashRuleAction::AllowRedirect {
+                allow_local: fields.allow_local,
+                direction: fields.direction,
+            })
+        }
+        Some(RedirectActionKind::Deny) => {
+            fields.remove("type");
+            let fields = serde_json::from_value::<DenyRedirectFields>(Value::Object(fields))
+                .map_err(de::Error::custom)?;
+            Ok(BashRuleAction::DenyRedirect {
+                value: fields.value,
+                direction: fields.direction,
+            })
+        }
+        None => serde_json::from_value(Value::Object(fields)).map_err(de::Error::custom),
+    }
 }
 
 /// Conditions target literal top-level input keys and are conjoined; ordered rules remain the
@@ -441,7 +594,7 @@ mod tests {
     }
 
     #[test]
-    fn allow_redirect_rejects_invalid_shapes() {
+    fn redirect_actions_reject_invalid_shapes() {
         let config = r#"
             [[bash_rules]]
             name = "typo"
@@ -459,6 +612,74 @@ mod tests {
             "\"AllowRedirect\"",
         );
         assert!(toml::from_str::<UserConfig>(&scalar).is_err());
+
+        for action in [
+            r#"{ type = "AllowRedirect", direction = "sideways" }"#,
+            r#"{ type = "DenyRedirect", value = "blocked", directon = "input" }"#,
+        ] {
+            let invalid = config.replace("{ type = \"AllowRedirect\", allow_locl = true }", action);
+            assert!(toml::from_str::<UserConfig>(&invalid).is_err());
+        }
+
+        let non_string = config.replace(
+            "{ type = \"AllowRedirect\", allow_locl = true }",
+            "{ type = 5 }",
+        );
+        let error = toml::from_str::<UserConfig>(&non_string)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("invalid type"), "error: {error}");
+        assert!(!error.contains("missing field `type`"), "error: {error}");
+    }
+
+    #[test]
+    fn redirect_rule_actions_match_direction_and_locality() {
+        let allow = BashRuleAction::AllowRedirect {
+            allow_local: true,
+            direction: RedirectDirection::Input,
+        };
+        let deny = BashRuleAction::DenyRedirect {
+            value: "blocked".to_string(),
+            direction: RedirectDirection::Both,
+        };
+        let allow = RedirectRuleAction::from_config(&allow).unwrap();
+        let deny = RedirectRuleAction::from_config(&deny).unwrap();
+
+        assert_eq!(
+            allow,
+            RedirectRuleAction::Allow {
+                allow_local: true,
+                direction: RedirectDirection::Input,
+            }
+        );
+        assert_eq!(
+            deny,
+            RedirectRuleAction::Deny {
+                value: "blocked".to_string(),
+                direction: RedirectDirection::Both,
+            }
+        );
+
+        let input = RedirectDirection::Input;
+        let output = RedirectDirection::Output;
+        for (label, action, direction, is_filesystem, is_local, expected) in [
+            ("local input", &allow, input, true, true, true),
+            ("nonlocal input", &allow, input, true, false, false),
+            ("local output", &allow, output, true, true, false),
+            ("deny output", &deny, output, false, false, true),
+        ] {
+            assert_eq!(
+                action.matches(direction, is_filesystem, is_local),
+                expected,
+                "case: {label}"
+            );
+        }
+
+        assert!(!allow.is_deny());
+        assert_eq!(allow.deny_direction(), None);
+        assert!(deny.is_deny());
+        assert_eq!(deny.deny_direction(), Some(RedirectDirection::Both));
+        assert!(RedirectRuleAction::from_config(&BashRuleAction::Allow).is_none());
     }
 
     #[test]
@@ -580,13 +801,21 @@ action = { type = "Allow" }
         let legacy = sample_config(Some(vec![allow("ls", "^ls")]), None);
         let redirect = |allow_local| {
             let mut config = legacy.clone();
-            config.bash_rules.as_mut().unwrap()[0].action =
-                BashRuleAction::AllowRedirect { allow_local };
+            config.bash_rules.as_mut().unwrap()[0].action = BashRuleAction::AllowRedirect {
+                allow_local,
+                direction: RedirectDirection::Output,
+            };
             config
         };
         let unrestricted = redirect(false);
         let local = redirect(true);
 
+        assert!(
+            serde_json::to_value(&unrestricted).unwrap()["bash_rules"][0]["action"]
+                .get("direction")
+                .is_none(),
+            "the output default must preserve existing config hashes"
+        );
         assert_ne!(unrestricted.effective_hash(), legacy.effective_hash());
         assert_ne!(local.effective_hash(), legacy.effective_hash());
         assert_ne!(unrestricted.effective_hash(), local.effective_hash());
@@ -651,8 +880,18 @@ action = { type = "Allow" }
                 value: "$1 --flag".to_string(),
             },
             BashRuleAction::Allow,
-            BashRuleAction::AllowRedirect { allow_local: false },
-            BashRuleAction::AllowRedirect { allow_local: true },
+            BashRuleAction::AllowRedirect {
+                allow_local: false,
+                direction: RedirectDirection::Output,
+            },
+            BashRuleAction::AllowRedirect {
+                allow_local: true,
+                direction: RedirectDirection::Input,
+            },
+            BashRuleAction::DenyRedirect {
+                value: "protected".to_string(),
+                direction: RedirectDirection::Both,
+            },
             BashRuleAction::Ask,
         ];
 
@@ -745,10 +984,29 @@ value = "$1 --flag""#;
         let action: BashRuleAction = toml::from_str(toml_allow).unwrap();
         assert_eq!(action, BashRuleAction::Allow);
 
-        let redirect = BashRuleAction::AllowRedirect { allow_local: false };
+        let redirect = BashRuleAction::AllowRedirect {
+            allow_local: false,
+            direction: RedirectDirection::Output,
+        };
         assert_eq!(
             toml::to_string(&redirect).unwrap(),
             "type = \"AllowRedirect\"\n"
+        );
+        assert_eq!(
+            toml::from_str::<BashRuleAction>("type = \"AllowRedirect\"\ndirection = \"input\"\n")
+                .unwrap(),
+            BashRuleAction::AllowRedirect {
+                allow_local: false,
+                direction: RedirectDirection::Input,
+            }
+        );
+        assert_eq!(
+            toml::from_str::<BashRuleAction>("type = \"DenyRedirect\"\nvalue = \"protected\"\n")
+                .unwrap(),
+            BashRuleAction::DenyRedirect {
+                value: "protected".to_string(),
+                direction: RedirectDirection::Both,
+            }
         );
 
         // Test Ask action

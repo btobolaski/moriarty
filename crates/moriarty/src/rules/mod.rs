@@ -36,7 +36,8 @@ use crate::{
     },
     permission_mode::{PermissionMode, mode_restrictions_overlap},
     user_config::{
-        BashRule, BashRuleAction, ToolRule, UserConfig, load_user_config, load_user_config_from,
+        BashRule, BashRuleAction, RedirectDirection, RedirectRuleAction, ToolRule, UserConfig,
+        load_user_config, load_user_config_from,
     },
 };
 
@@ -254,15 +255,27 @@ fn strict_bash_warnings(
         let (kind, message) = match rule.action {
             BashRuleAction::Allow => (
                 "over-broad-allow",
-                "Allow rule matches effectively every command",
+                "Allow rule matches effectively every command".to_string(),
             ),
-            BashRuleAction::AllowRedirect { allow_local: false } => (
+            BashRuleAction::AllowRedirect {
+                allow_local: false,
+                direction,
+            } => (
                 "over-broad-redirect",
-                "Non-local AllowRedirect rule authorizes every resolved filesystem or descriptor endpoint",
+                format!(
+                    "Non-local AllowRedirect rule authorizes every resolved filesystem or descriptor endpoint for direction '{}'",
+                    direction.as_str()
+                ),
             ),
-            BashRuleAction::AllowRedirect { allow_local: true } => (
+            BashRuleAction::AllowRedirect {
+                allow_local: true,
+                direction,
+            } => (
                 "broad-local-redirect",
-                "Local AllowRedirect rule authorizes every resolved path within the project cwd",
+                format!(
+                    "Local AllowRedirect rule authorizes every path within the project cwd for direction '{}'",
+                    direction.as_str()
+                ),
             ),
             _ => continue,
         };
@@ -271,7 +284,7 @@ fn strict_bash_warnings(
             rule_name: rule.name.clone(),
             pattern: rule.pattern.clone(),
             kind: kind.to_string(),
-            message: message.to_string(),
+            message,
         });
     }
 
@@ -288,7 +301,7 @@ fn strict_bash_warnings(
             rule_name: rule.name.clone(),
             pattern: rule.pattern.clone(),
             kind: "missing-redirect-policy".to_string(),
-            message: "Command Allow rule has no mode-overlapping redirect policy; its output redirects will prompt"
+            message: "Command Allow rule has no mode-overlapping redirect allow policy; redirects without a matching direction will prompt"
                 .to_string(),
         });
     }
@@ -380,19 +393,21 @@ fn shadow_warnings(
 }
 
 fn bash_rule_can_shadow(earlier: &BashRule, later: &BashRule) -> bool {
-    match (&earlier.action, &later.action) {
-        (
-            BashRuleAction::AllowRedirect {
-                allow_local: earlier_local,
-            },
-            BashRuleAction::AllowRedirect {
-                allow_local: later_local,
-            },
-        ) => !earlier_local || *later_local,
-        (BashRuleAction::AllowRedirect { .. }, _) | (_, BashRuleAction::AllowRedirect { .. }) => {
-            false
-        }
-        _ => true,
+    match (
+        RedirectRuleAction::from_config(&earlier.action),
+        RedirectRuleAction::from_config(&later.action),
+    ) {
+        (Some(earlier), Some(later)) => RedirectDirection::ALL.into_iter().all(|direction| {
+            // Non-filesystem endpoints cannot be local, so `(false, true)` is not a distinct class.
+            [(true, true), (true, false), (false, false)]
+                .into_iter()
+                .all(|(is_filesystem, is_local)| {
+                    !later.matches(direction, is_filesystem, is_local)
+                        || earlier.matches(direction, is_filesystem, is_local)
+                })
+        }),
+        (Some(_), None) | (None, Some(_)) => false,
+        (None, None) => true,
     }
 }
 
@@ -527,7 +542,7 @@ pattern = "^ls\\b"
 modes = ["default", "plan"]
 action = { type = "Allow" }
 
-# AllowRedirect rules authorize only output endpoints; they never authorize commands.
+# Redirect rules govern endpoints only; existing AllowRedirect rules default to output.
 [[bash_rules]]
 name = "allow-project-build-redirects"
 pattern = "^build/"
@@ -537,6 +552,16 @@ action = { type = "AllowRedirect", allow_local = true }
 name = "allow-tool-cache-redirects"
 pattern = "^~/.cache/tool/"
 action = { type = "AllowRedirect" }
+
+[[bash_rules]]
+name = "deny-secret-input"
+pattern = "^secrets/"
+action = { type = "DenyRedirect", value = "Secrets cannot be redirect inputs", direction = "input" }
+
+[[bash_rules]]
+name = "allow-fixture-input"
+pattern = "^fixtures/"
+action = { type = "AllowRedirect", allow_local = true, direction = "input" }
 
 [[bash_rules]]
 name = "allow-dev-null-redirect"
@@ -608,7 +633,7 @@ fn schema(json: bool) -> miette::Result<()> {
 // ===== rules starter =====
 
 /// Common read-only commands that are safe to auto-allow once compound splitting has separated
-/// them from any operators. Output endpoints still require their own redirect-domain rule.
+/// them from any operators. Redirect endpoints still require their own redirect-domain rule.
 const STARTER_COMMANDS: &[&str] = &[
     "echo", "ls", "cat", "head", "tail", "wc", "sort", "uniq", "grep", "rg", "pwd", "which",
     "file", "stat", "basename", "dirname", "true", "date", "env",
@@ -630,13 +655,28 @@ fn starter_rules() -> Vec<BashRule> {
         name: "allow-dev-null-redirect".to_string(),
         pattern: r"^/dev/null$".to_string(),
         modes: None,
-        action: BashRuleAction::AllowRedirect { allow_local: false },
+        action: BashRuleAction::AllowRedirect {
+            allow_local: false,
+            direction: RedirectDirection::Output,
+        },
     });
     rules.push(BashRule {
         name: "allow-standard-descriptor-redirects".to_string(),
         pattern: r"^&(1|2|-)$".to_string(),
         modes: None,
-        action: BashRuleAction::AllowRedirect { allow_local: false },
+        action: BashRuleAction::AllowRedirect {
+            allow_local: false,
+            direction: RedirectDirection::Output,
+        },
+    });
+    rules.push(BashRule {
+        name: "allow-stdin-descriptor-redirect".to_string(),
+        pattern: r"^&0$".to_string(),
+        modes: None,
+        action: BashRuleAction::AllowRedirect {
+            allow_local: false,
+            direction: RedirectDirection::Input,
+        },
     });
     rules
 }
@@ -666,7 +706,7 @@ fn starter(json: bool) -> miette::Result<()> {
     println!("# The compound splitter evaluates each leaf of a command independently, so these");
     println!("# simple prefix patterns stay safe inside `&&` / `||` / `|` / `;` chains.");
     println!(
-        "# Output endpoints require separate AllowRedirect rules; this pack includes /dev/null and standard descriptors."
+        "# Redirect endpoints require separate rules; this pack includes output descriptors and stdin input duplication."
     );
     println!();
     print!("{toml}");
@@ -934,6 +974,13 @@ struct ObservedLeaf {
     filter_command: Option<FilterCommand>,
 }
 
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct RedirectTargetKey {
+    match_text: String,
+    is_local: bool,
+    direction: RedirectDirection,
+}
+
 /// Pure core of `suggest`: turns aggregated Bash rows into anchored rule suggestions.
 ///
 /// Each observed command is first split into the leaf simple-commands the hook actually evaluates
@@ -1063,7 +1110,7 @@ fn build_redirect_suggestions(
     limit: usize,
     engine: &BashRuleEngine,
 ) -> Vec<Suggestion> {
-    let mut targets: BTreeMap<(String, bool), ObservedGroup> = BTreeMap::new();
+    let mut targets: BTreeMap<RedirectTargetKey, ObservedGroup> = BTreeMap::new();
     let mut contexts = BTreeMap::new();
     for row in rows {
         if row.cwd.is_empty() {
@@ -1093,13 +1140,18 @@ fn build_redirect_suggestions(
                 continue;
             }
             for endpoint in endpoints {
+                let direction = endpoint.direction();
                 match endpoint {
                     EndpointAnalysis::Descriptor {
                         match_text,
                         matched_rule: None,
                         ..
                     } => {
-                        observed_targets.insert((match_text.clone(), false));
+                        observed_targets.insert(RedirectTargetKey {
+                            match_text: match_text.clone(),
+                            is_local: false,
+                            direction,
+                        });
                     }
                     EndpointAnalysis::Filesystem {
                         resolution:
@@ -1109,35 +1161,43 @@ fn build_redirect_suggestions(
                             },
                         ..
                     } => {
-                        observed_targets.insert((
-                            target.match_text().to_string(),
-                            target.kind().is_filesystem() && target.is_local(),
-                        ));
+                        observed_targets.insert(RedirectTargetKey {
+                            match_text: target.match_text().to_string(),
+                            is_local: target.kind().is_filesystem() && target.is_local(),
+                            direction,
+                        });
                     }
                     EndpointAnalysis::Descriptor { .. } | EndpointAnalysis::Filesystem { .. } => {}
                 }
             }
         }
-        for (match_text, is_local) in observed_targets {
-            targets.entry((match_text, is_local)).or_default().absorb(
-                row.count,
-                command,
-                row.permission_mode,
-            );
+        for target in observed_targets {
+            targets
+                .entry(target)
+                .or_default()
+                .absorb(row.count, command, row.permission_mode);
         }
     }
 
     let mut suggestions: Vec<_> = targets
         .into_iter()
         .filter(|(_, group)| group.count >= min_count)
-        .map(|((match_text, allow_local), group)| {
+        .map(|(target, group)| {
+            let RedirectTargetKey {
+                match_text,
+                is_local,
+                direction,
+            } = target;
             let pattern = format!("^{}$", regex::escape(&match_text));
             Suggestion {
                 rule: BashRule {
-                    name: redirect_suggestion_name(&pattern, allow_local),
+                    name: redirect_suggestion_name(&pattern, is_local, direction),
                     pattern,
                     modes: group.rule_modes(),
-                    action: BashRuleAction::AllowRedirect { allow_local },
+                    action: BashRuleAction::AllowRedirect {
+                        allow_local: is_local,
+                        direction,
+                    },
                 },
                 count: group.count,
                 observed_commands: group.observed.into_iter().collect(),
@@ -1169,8 +1229,8 @@ fn cluster_by_program(leaves: &BTreeMap<String, ObservedLeaf>) -> BTreeMap<Strin
     let mut clusters: BTreeMap<String, ProgramCluster> = BTreeMap::new();
     for (text, leaf) in leaves {
         let Some(command) = leaf.filter_command.as_ref().filter(|command| {
-            command.program.range.start == 0
-                && text.get(command.program.range.clone()) == Some(command.program.value.as_str())
+            text.strip_prefix(&command.program.value)
+                .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with(char::is_whitespace))
         }) else {
             continue;
         };
@@ -1238,8 +1298,15 @@ fn short_hash(command: &str) -> String {
         .collect()
 }
 
-fn redirect_suggestion_name(pattern: &str, allow_local: bool) -> String {
-    let identity = format!("{pattern}\nallow_local={allow_local}");
+fn redirect_suggestion_name(
+    pattern: &str,
+    allow_local: bool,
+    direction: RedirectDirection,
+) -> String {
+    let identity = format!(
+        "{pattern}\nallow_local={allow_local}\ndirection={}",
+        direction.as_str()
+    );
     format!("suggested-redirect-{}", short_hash(&identity))
 }
 
@@ -1511,7 +1578,11 @@ mod tests {
 
     use super::*;
     use crate::{
-        test_helpers::{PATH_ALIAS_COMMAND, SUBAGENT_EXECUTION_RULES, setup_isolated_xdg_config},
+        test_helpers::{
+            PATH_ALIAS_COMMAND, SUBAGENT_EXECUTION_RULES, deny_redirect_rule,
+            directional_redirect_rule as directional_redirect, redirect_rule as redirect,
+            setup_isolated_xdg_config,
+        },
         user_config::{BashRule, BashRuleAction, ToolRule, ToolRuleAction, ToolRuleCondition},
     };
 
@@ -1522,6 +1593,16 @@ mod tests {
             bash_rules: Some(rules),
             tool_rules: None,
         }
+    }
+
+    fn shadowed_rule_names(config: &UserConfig) -> Vec<String> {
+        build_lint_report(config, true)
+            .unwrap()
+            .warnings
+            .into_iter()
+            .filter(|warning| warning.kind == "shadowed")
+            .map(|warning| warning.rule_name)
+            .collect()
     }
 
     fn engine_with_bash(rules: Vec<BashRule>) -> BashRuleEngine {
@@ -1595,15 +1676,6 @@ mod tests {
             pattern: pattern.to_string(),
             modes: None,
             action: BashRuleAction::Ask,
-        }
-    }
-
-    fn redirect(name: &str, pattern: &str, allow_local: bool) -> BashRule {
-        BashRule {
-            name: name.to_string(),
-            pattern: pattern.to_string(),
-            modes: None,
-            action: BashRuleAction::AllowRedirect { allow_local },
         }
     }
 
@@ -1838,30 +1910,74 @@ mod tests {
 
     #[test]
     fn strict_shadow_warnings_respect_rule_domains_and_locality() {
-        let config = config_with_bash(vec![
-            allow("allow-command", r"^echo"),
-            redirect("allow-local-redirect", r"^echo", true),
-            redirect("allow-external-redirect", r"^echo-out$", false),
-        ]);
-        assert!(
-            build_lint_report(&config, true)
-                .unwrap()
-                .warnings
-                .iter()
-                .all(|warning| warning.kind != "shadowed")
-        );
+        let deny_file =
+            |name, direction| deny_redirect_rule(name, r"^out/file$", "blocked", direction);
+        for (label, config) in [
+            (
+                "separate domains",
+                config_with_bash(vec![
+                    allow("allow-command", r"^echo"),
+                    redirect("allow-local-redirect", r"^echo", true),
+                    redirect("allow-external-redirect", r"^echo-out$", false),
+                ]),
+            ),
+            (
+                "disjoint directions",
+                config_with_bash(vec![
+                    directional_redirect("allow-input", r"^out", false, RedirectDirection::Input),
+                    redirect("allow-output", r"^out/file$", false),
+                ]),
+            ),
+            (
+                "partial locality",
+                config_with_bash(vec![
+                    redirect("allow-local", r"^out", true),
+                    deny_file("deny-output", RedirectDirection::Output),
+                ]),
+            ),
+            (
+                "partial direction",
+                config_with_bash(vec![
+                    directional_redirect("allow-input", r"^out", false, RedirectDirection::Input),
+                    deny_file("deny-both", RedirectDirection::Both),
+                ]),
+            ),
+        ] {
+            assert_eq!(
+                shadowed_rule_names(&config),
+                Vec::<String>::new(),
+                "{label}"
+            );
+        }
 
-        let shadowed = config_with_bash(vec![
-            redirect("all-outputs", r"^out", false),
-            redirect("local-output", r"^out/file$", true),
-        ]);
-        assert!(
-            build_lint_report(&shadowed, true)
-                .unwrap()
-                .warnings
-                .iter()
-                .any(|warning| warning.kind == "shadowed" && warning.rule_name == "local-output")
-        );
+        for (label, config, expected) in [
+            (
+                "unrestricted before local",
+                config_with_bash(vec![
+                    redirect("all-outputs", r"^out", false),
+                    redirect("local-output", r"^out/file$", true),
+                ]),
+                "local-output",
+            ),
+            (
+                "deny both before allow output",
+                config_with_bash(vec![
+                    deny_redirect_rule("deny-all", r"^out", "blocked", RedirectDirection::Both),
+                    redirect("allow-output", r"^out/file$", false),
+                ]),
+                "allow-output",
+            ),
+            (
+                "allow both before deny input",
+                config_with_bash(vec![
+                    directional_redirect("allow-all", r"^out", false, RedirectDirection::Both),
+                    deny_file("deny-input", RedirectDirection::Input),
+                ]),
+                "deny-input",
+            ),
+        ] {
+            assert_eq!(shadowed_rule_names(&config), [expected], "{label}");
+        }
     }
 
     #[test]
@@ -1984,8 +2100,18 @@ mod tests {
         );
         assert!(rules[STARTER_COMMANDS.len()..].iter().all(|rule| matches!(
             rule.action,
-            BashRuleAction::AllowRedirect { allow_local: false }
+            BashRuleAction::AllowRedirect {
+                allow_local: false,
+                ..
+            }
         )));
+        assert!(matches!(
+            rules.last().unwrap().action,
+            BashRuleAction::AllowRedirect {
+                direction: RedirectDirection::Input,
+                ..
+            }
+        ));
         let engine = engine_with_bash(rules);
         assert!(
             matches!(
@@ -2003,7 +2129,7 @@ mod tests {
                 "starter /dev/null rule should be independent of cwd {cwd:?}"
             );
         }
-        for command in ["ls 2>&1", "echo >&2", "echo >&-"] {
+        for command in ["ls 2>&1", "echo >&2", "echo >&-", "cat <&0"] {
             assert!(matches!(
                 evaluation_result(&engine, command, cwd.path().to_str().unwrap(), None),
                 RuleResult::Allowed { .. }
@@ -2103,7 +2229,7 @@ mod tests {
     }
 
     #[test]
-    fn suggestions_use_brush_program_metadata() {
+    fn suggestions_use_redirect_free_text_and_brush_program_metadata() {
         let rows = vec![bash_row(">report cargo build", 3, PreToolResult::Ask)];
         let exact = build_suggestions(
             &rows,
@@ -2113,19 +2239,28 @@ mod tests {
             10,
             &empty_engine(),
         );
+        assert_eq!(exact[0].rule.pattern, r"^cargo build$");
         assert!(exact[0].rule.name.starts_with("suggested-cargo-"));
-        assert!(
-            build_suggestions(
-                &rows,
-                MatchMode::Prefix,
-                SuggestAction::Ask,
-                2,
-                10,
-                &empty_engine(),
-            )
-            .is_empty(),
-            "a program prefix cannot match a leaf whose redirect comes first"
+
+        let prefix = build_suggestions(
+            &rows,
+            MatchMode::Prefix,
+            SuggestAction::Ask,
+            2,
+            10,
+            &empty_engine(),
         );
+        assert_eq!(prefix[0].rule.pattern, r"^cargo(\s|$)");
+
+        let fuzzy = build_suggestions(
+            &rows,
+            MatchMode::Fuzzy,
+            SuggestAction::Ask,
+            2,
+            10,
+            &empty_engine(),
+        );
+        assert_eq!(fuzzy[0].rule.pattern, r"^cargo (build)(\s|$)");
     }
 
     #[test]
@@ -2302,6 +2437,7 @@ mod tests {
             redirect_row("echo hi >/dev/null", 4, cwd, None),
             redirect_row("echo hi >/dev/null", 6, "/dev", None),
             redirect_row("echo hi 2>&1", 5, cwd, None),
+            redirect_row("echo < input.txt", 4, cwd, None),
             redirect_row("echo hi > $OUT", 9, cwd, None),
             redirect_row("echo hi > safe.txt 2> $OUT", 7, cwd, None),
             redirect_row("cat x > safe.txt", 1, cwd, None),
@@ -2324,18 +2460,22 @@ mod tests {
 
         assert_eq!(
             by_pattern.len(),
-            3,
+            4,
             "leaves with unresolved or context-dependent endpoints and allowed targets are omitted"
         );
-        for (pattern, allow_local) in [
-            (r"^mode\.txt$", true),
-            (r"^/dev/null$", false),
-            (r"^\&1$", false),
+        for (pattern, allow_local, direction) in [
+            (r"^mode\.txt$", true, RedirectDirection::Output),
+            (r"^input\.txt$", true, RedirectDirection::Input),
+            (r"^/dev/null$", false, RedirectDirection::Output),
+            (r"^\&1$", false, RedirectDirection::Output),
         ] {
             let suggestion = by_pattern.get(pattern).unwrap();
             assert!(matches!(
                 suggestion.rule.action,
-                BashRuleAction::AllowRedirect { allow_local: actual } if actual == allow_local
+                BashRuleAction::AllowRedirect {
+                    allow_local: actual,
+                    direction: actual_direction,
+                } if actual == allow_local && actual_direction == direction
             ));
         }
         assert!(!by_pattern.contains_key(r"^safe\.txt$"));
@@ -2347,6 +2487,34 @@ mod tests {
                 PermissionMode::Default,
                 PermissionMode::Plan,
             ]))
+        );
+    }
+
+    #[test]
+    fn redirect_suggestions_keep_input_and_output_authority_separate() {
+        let cwd = tempfile::tempdir().unwrap();
+        let cwd = cwd.path().to_str().unwrap();
+        let rows = vec![
+            redirect_row("echo hi > shared", 2, cwd, None),
+            redirect_row("cat < shared", 3, cwd, None),
+        ];
+        let engine = engine_with_bash(vec![
+            allow("allow-echo", r"^echo($|\s)"),
+            allow("allow-cat", r"^cat$"),
+        ]);
+
+        let suggestions = build_redirect_suggestions(&rows, 1, 10, &engine);
+        assert_eq!(suggestions.len(), 2);
+        assert_ne!(suggestions[0].rule.name, suggestions[1].rule.name);
+        assert_eq!(
+            suggestions
+                .iter()
+                .map(|suggestion| match &suggestion.rule.action {
+                    BashRuleAction::AllowRedirect { direction, .. } => *direction,
+                    other => panic!("expected redirect suggestion, got {other:?}"),
+                })
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([RedirectDirection::Input, RedirectDirection::Output])
         );
     }
 
@@ -2374,7 +2542,10 @@ mod tests {
         );
         assert!(matches!(
             suggestions[0].rule.action,
-            BashRuleAction::AllowRedirect { allow_local: true }
+            BashRuleAction::AllowRedirect {
+                allow_local: true,
+                ..
+            }
         ));
     }
 
@@ -2968,10 +3139,22 @@ mod tests {
     }
 
     #[test]
-    fn redirect_suggestion_names_include_locality() {
+    fn redirect_suggestion_names_include_scope() {
         assert_ne!(
-            redirect_suggestion_name(r"^target$", false),
-            redirect_suggestion_name(r"^target$", true)
+            redirect_suggestion_name(r"^target$", false, RedirectDirection::Output),
+            redirect_suggestion_name(r"^target$", true, RedirectDirection::Output)
+        );
+        assert_ne!(
+            redirect_suggestion_name(r"^target$", false, RedirectDirection::Output),
+            redirect_suggestion_name(r"^target$", false, RedirectDirection::Input)
+        );
+        // Names are persisted in suggested config, so pin the semantic lowercase identity input.
+        assert_eq!(
+            redirect_suggestion_name(r"^target$", false, RedirectDirection::Input),
+            format!(
+                "suggested-redirect-{}",
+                short_hash("^target$\nallow_local=false\ndirection=input")
+            )
         );
     }
 

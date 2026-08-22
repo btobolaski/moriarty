@@ -22,14 +22,16 @@ use tracing::debug;
 use super::{
     FILESYSTEM_EVALUATION_TIMEOUT,
     command_split::{
-        AliasBinding, BailReason, FilterCommand, LeafCommand, OutputRedirectEndpoint,
-        ParsedRedirectTarget, SplitOutcome, split_command,
+        AliasBinding, BailReason, FilterCommand, LeafCommand, ParsedRedirectTarget,
+        RedirectEndpoint, SplitOutcome, split_command,
     },
     path_resolution::{RedirectResolutionContext, RedirectTargetResolution},
 };
 use crate::{
     permission_mode::{PermissionMode, is_mode_eligible},
-    user_config::{BashPathAlias, BashRule, BashRuleAction, UserConfig},
+    user_config::{
+        BashPathAlias, BashRule, BashRuleAction, RedirectDirection, RedirectRuleAction, UserConfig,
+    },
 };
 
 #[derive(Debug)]
@@ -71,7 +73,30 @@ struct CompiledRedirectRule {
     metadata: Arc<MatchedRuleMetadata>,
     regex: Regex,
     modes: Option<BTreeSet<PermissionMode>>,
-    allow_local: bool,
+    action: Arc<RedirectRuleAction>,
+}
+
+#[derive(Clone, Copy)]
+struct RedirectRewrite<'a> {
+    bindings: &'a [AliasBinding],
+    suffix: &'a str,
+    count: usize,
+}
+
+impl<'a> RedirectRewrite<'a> {
+    const NONE: Self = Self {
+        bindings: &[],
+        suffix: "",
+        count: 0,
+    };
+
+    fn from_leaf(leaf: &'a LeafCommand) -> Self {
+        Self {
+            bindings: &leaf.redirect_bindings,
+            suffix: &leaf.redirect_suffix,
+            count: leaf.redirects.len(),
+        }
+    }
 }
 
 /// Includes `rule_name` in all match variants to support logging and debugging.
@@ -346,18 +371,36 @@ pub(crate) struct RuleMatchExplanation {
     pub action_summary: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum RedirectTraceDecision {
+    Allowed,
+    Denied,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub(crate) enum RedirectTraceState {
+    Matched {
+        matched: RuleMatchExplanation,
+        decision: RedirectTraceDecision,
+    },
+    Failed {
+        failure: String,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct RedirectEndpointTrace {
     pub original_target: String,
+    pub direction: RedirectDirection,
     pub kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub match_text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_local: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub matched: Option<RuleMatchExplanation>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub failure: Option<String>,
+    #[serde(flatten)]
+    pub state: RedirectTraceState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -371,7 +414,7 @@ pub(crate) struct SubCommandTrace {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requires_confirmation: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub output_redirects: Vec<RedirectEndpointTrace>,
+    pub redirects: Vec<RedirectEndpointTrace>,
     pub matched: Option<RuleMatchExplanation>,
 }
 
@@ -380,6 +423,8 @@ pub(crate) struct SubCommandTrace {
 pub(crate) struct RewrittenBailTrace {
     pub command: String,
     pub reason: BailReason,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redirect: Option<RedirectEndpointTrace>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -418,6 +463,7 @@ pub(crate) struct MatchedCommandRule {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MatchedRedirectRule {
     metadata: Arc<MatchedRuleMetadata>,
+    action: Arc<RedirectRuleAction>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -473,11 +519,13 @@ pub(crate) enum FilesystemAnalysis {
 pub(crate) enum EndpointAnalysis {
     Descriptor {
         original_target: String,
+        direction: RedirectDirection,
         match_text: String,
         matched_rule: Option<MatchedRedirectRule>,
     },
     Filesystem {
         original_target: String,
+        direction: RedirectDirection,
         resolution: FilesystemAnalysis,
     },
 }
@@ -485,8 +533,37 @@ pub(crate) enum EndpointAnalysis {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RedirectAuthorizationView<'a> {
     Authorized(&'a MatchedRedirectRule),
+    Denied(&'a MatchedRedirectRule, &'a str),
     Unmatched,
     Unresolvable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeniedRedirectEndpoint {
+    endpoint: EndpointAnalysis,
+    rule: MatchedRedirectRule,
+    reason: String,
+}
+
+impl DeniedRedirectEndpoint {
+    fn from_denied(endpoint: EndpointAnalysis) -> Option<Self> {
+        let (rule, reason) = endpoint.denial()?;
+        let rule = rule.clone();
+        let reason = reason.to_string();
+        Some(Self {
+            endpoint,
+            rule,
+            reason,
+        })
+    }
+
+    pub(crate) fn endpoint(&self) -> &EndpointAnalysis {
+        &self.endpoint
+    }
+
+    fn denial(&self) -> (&MatchedRedirectRule, &str) {
+        (&self.rule, &self.reason)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -524,6 +601,10 @@ pub(crate) enum BailDecision {
         rule: MatchedCommandRule,
         reason: String,
     },
+    RedirectDeny {
+        rule: MatchedRedirectRule,
+        reason: String,
+    },
     NoMatch,
 }
 
@@ -539,7 +620,11 @@ pub(crate) enum PolicyAnalysis {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RedirectCheckAnalysis {
-    Bail { command: String, reason: BailReason },
+    Bail {
+        command: String,
+        reason: BailReason,
+        denied_endpoint: Option<DeniedRedirectEndpoint>,
+    },
     Leaves(Vec<RedirectLeafAnalysis>),
 }
 
@@ -609,6 +694,10 @@ pub(crate) enum PolicyOutcome<'a> {
         rule: &'a MatchedCommandRule,
         reason: &'a str,
     },
+    RedirectDeny {
+        rule: &'a MatchedRedirectRule,
+        reason: &'a str,
+    },
     Modify {
         rule: &'a MatchedCommandRule,
         new_command: &'a str,
@@ -639,11 +728,31 @@ impl CommandAction {
     }
 }
 
-fn redirect_action_summary(allow_local: bool) -> String {
-    if allow_local {
-        "AllowRedirect (local only)".to_string()
-    } else {
-        "AllowRedirect".to_string()
+fn redirect_action_summary(action: &RedirectRuleAction) -> String {
+    match action {
+        RedirectRuleAction::Allow {
+            allow_local,
+            direction,
+        } => {
+            let mut qualifiers = Vec::new();
+            if *direction != RedirectDirection::Output {
+                qualifiers.push(direction.as_str());
+            }
+            if *allow_local {
+                qualifiers.push("local only");
+            }
+            if qualifiers.is_empty() {
+                "AllowRedirect".to_string()
+            } else {
+                format!("AllowRedirect ({})", qualifiers.join(", "))
+            }
+        }
+        RedirectRuleAction::Deny { value, direction } if *direction == RedirectDirection::Both => {
+            format!("DenyRedirect: {value}")
+        }
+        RedirectRuleAction::Deny { value, direction } => {
+            format!("DenyRedirect ({}): {value}", direction.as_str())
+        }
     }
 }
 
@@ -683,10 +792,27 @@ impl CompiledCommandRules {
 }
 
 impl CompiledRedirectRules {
+    fn deny_coverage(&self, mode: Option<PermissionMode>) -> BTreeSet<RedirectDirection> {
+        let mut coverage = BTreeSet::new();
+        for rule in &self.rules {
+            if is_mode_eligible(rule.modes.as_ref(), mode)
+                && let Some(direction) = rule.action.deny_direction()
+            {
+                coverage.extend(
+                    RedirectDirection::ALL
+                        .into_iter()
+                        .filter(|endpoint| direction.overlaps(*endpoint)),
+                );
+            }
+        }
+        coverage
+    }
+
     fn first_match(
         &self,
         text: &str,
         mode: Option<PermissionMode>,
+        endpoint_direction: RedirectDirection,
         is_filesystem: bool,
         is_local: bool,
     ) -> Option<&CompiledRedirectRule> {
@@ -694,8 +820,10 @@ impl CompiledRedirectRules {
             let rule = &self.rules[index];
             debug_assert!(rule.regex.is_match(text));
             (is_mode_eligible(rule.modes.as_ref(), mode)
-                && (!rule.allow_local || is_filesystem && is_local))
-                .then_some(rule)
+                && rule
+                    .action
+                    .matches(endpoint_direction, is_filesystem, is_local))
+            .then_some(rule)
         })
     }
 }
@@ -766,6 +894,21 @@ impl BashRuleEngine {
                 }
             };
 
+            if let Some(action) = RedirectRuleAction::from_config(&rule.action) {
+                redirect_patterns.push(expanded_pattern.clone());
+                redirect_rules.push(CompiledRedirectRule {
+                    metadata: Arc::new(MatchedRuleMetadata {
+                        rule_name: rule.name,
+                        expanded_pattern,
+                        action_summary: redirect_action_summary(&action),
+                    }),
+                    regex,
+                    modes: rule.modes,
+                    action: Arc::new(action),
+                });
+                continue;
+            }
+
             let action = match rule.action {
                 BashRuleAction::Allow => CommandAction::Allow,
                 BashRuleAction::Deny { value } => CommandAction::Deny(value),
@@ -782,18 +925,7 @@ impl BashRuleEngine {
                     replace,
                     reason,
                 },
-                BashRuleAction::AllowRedirect { allow_local } => {
-                    redirect_patterns.push(expanded_pattern.clone());
-                    redirect_rules.push(CompiledRedirectRule {
-                        metadata: Arc::new(MatchedRuleMetadata {
-                            rule_name: rule.name,
-                            expanded_pattern,
-                            action_summary: redirect_action_summary(allow_local),
-                        }),
-                        regex,
-                        modes: rule.modes,
-                        allow_local,
-                    });
+                BashRuleAction::AllowRedirect { .. } | BashRuleAction::DenyRedirect { .. } => {
                     continue;
                 }
             };
@@ -840,6 +972,7 @@ impl BashRuleEngine {
         &self,
         command: &str,
         command_shape: Option<&FilterCommand>,
+        redirect_rewrite: RedirectRewrite<'_>,
         mode: Option<PermissionMode>,
     ) -> CommandDecision {
         let Some(rule) = self.command_rules.first_match(command, mode) else {
@@ -858,9 +991,23 @@ impl BashRuleEngine {
                     .regex
                     .captures(command)
                     .expect("Invariant violation: RegexSet and Regex desynchronized");
+                let replacement = expand_captures(&captures, value);
+                let mut rewritten = replacement.clone();
+                rewritten.push_str(redirect_rewrite.suffix);
+                if !self.redirects_remain_attached(&replacement, &rewritten, redirect_rewrite.count)
+                {
+                    return CommandDecision::Ask { rule: matched };
+                }
+
+                let prefix = redirect_rewrite
+                    .bindings
+                    .iter()
+                    .map(|binding| format!("{}={}; ", binding.name, binding.value))
+                    .collect::<String>();
+                let new_command = format!("{prefix}{rewritten}");
                 CommandDecision::Modify {
                     rule: matched,
-                    new_command: expand_captures(&captures, value),
+                    new_command,
                 }
             }
             CommandAction::Ask => CommandDecision::Ask { rule: matched },
@@ -869,23 +1016,63 @@ impl BashRuleEngine {
                 add,
                 replace,
                 reason,
-            } => match filter_arguments(command, command_shape, remove, add, replace) {
-                Ok(new_command) => CommandDecision::ArgumentFilter {
-                    rule: matched,
-                    new_command,
-                    reason: reason.clone(),
-                },
-                Err(error) => {
-                    debug!(
-                        rule_name = %rule.metadata.rule_name,
-                        command,
-                        error = %error,
-                        "Failed to filter command arguments, asking user"
-                    );
-                    CommandDecision::Ask { rule: matched }
+            } => {
+                let Some(command_shape) = command_shape else {
+                    return CommandDecision::Ask { rule: matched };
+                };
+                match filter_arguments(command_shape, remove, add, replace) {
+                    Ok(new_command) => CommandDecision::ArgumentFilter {
+                        rule: matched,
+                        new_command,
+                        reason: reason.clone(),
+                    },
+                    Err(error) => {
+                        debug!(
+                            rule_name = %rule.metadata.rule_name,
+                            command,
+                            error = %error,
+                            "Failed to filter command arguments, asking user"
+                        );
+                        CommandDecision::Ask { rule: matched }
+                    }
                 }
-            },
+            }
         }
+    }
+
+    fn redirects_remain_attached(
+        &self,
+        replacement: &str,
+        rewritten: &str,
+        redirect_count: usize,
+    ) -> bool {
+        if redirect_count == 0 {
+            return true;
+        }
+        // Attachment depends on parse shape and redirect counts, not cwd normalization, so the
+        // structural comparison deliberately reparses without a cwd.
+        let (before, after) = match (
+            split_command(replacement, "", &self.path_aliases),
+            split_command(rewritten, "", &self.path_aliases),
+        ) {
+            (SplitOutcome::Commands(before), SplitOutcome::Commands(after)) => (before, after),
+            // The continuation reparses the same rewritten command and prompts on this bailout.
+            (_, SplitOutcome::Bail { .. }) => return true,
+            (SplitOutcome::Bail { .. }, SplitOutcome::Commands(_)) => return false,
+        };
+        if before.len() != after.len() || before.is_empty() {
+            return false;
+        }
+        let last = before.len() - 1;
+        before
+            .iter()
+            .zip(&after)
+            .enumerate()
+            .all(|(index, (before_leaf, after_leaf))| {
+                before_leaf.match_text == after_leaf.match_text
+                    && after_leaf.redirects.len()
+                        == before_leaf.redirects.len() + usize::from(index == last) * redirect_count
+            })
     }
 
     pub(crate) fn evaluate_sync(
@@ -929,10 +1116,24 @@ impl BashRuleEngine {
         purpose: EvaluationPurpose,
     ) -> PolicyAnalysis {
         match split_command(command, &context.cwd, &self.path_aliases) {
-            SplitOutcome::Bail(reason) => {
-                let decision = match self.match_command_decision(command, None, context.mode) {
+            SplitOutcome::Bail { reason, redirects } => {
+                let decision = match self.match_command_decision(
+                    command,
+                    None,
+                    RedirectRewrite::NONE,
+                    context.mode,
+                ) {
                     CommandDecision::Deny { rule, reason } => BailDecision::Deny { rule, reason },
-                    _ => BailDecision::NoMatch,
+                    _ => self.redirect_denied_endpoint(redirects, context).map_or(
+                        BailDecision::NoMatch,
+                        |endpoint| {
+                            let (rule, reason) = endpoint.denial();
+                            BailDecision::RedirectDeny {
+                                rule: rule.clone(),
+                                reason: reason.to_string(),
+                            }
+                        },
+                    ),
                 };
                 PolicyAnalysis::Bail {
                     command: command.to_string(),
@@ -940,12 +1141,21 @@ impl BashRuleEngine {
                     decision,
                 }
             }
-            SplitOutcome::Commands(leaves) => PolicyAnalysis::Leaves(
-                leaves
-                    .into_iter()
-                    .map(|leaf| self.analyze_policy_leaf(leaf, context, purpose))
-                    .collect(),
-            ),
+            SplitOutcome::Commands(leaves) => {
+                let redirect_denies = if leaves.iter().any(|leaf| !leaf.redirects.is_empty()) {
+                    self.redirect_rules.deny_coverage(context.mode)
+                } else {
+                    BTreeSet::new()
+                };
+                PolicyAnalysis::Leaves(
+                    leaves
+                        .into_iter()
+                        .map(|leaf| {
+                            self.analyze_policy_leaf(leaf, context, purpose, &redirect_denies)
+                        })
+                        .collect(),
+                )
+            }
         }
     }
 
@@ -954,18 +1164,27 @@ impl BashRuleEngine {
         leaf: LeafCommand,
         context: &EvaluationContext,
         purpose: EvaluationPurpose,
+        redirect_denies: &BTreeSet<RedirectDirection>,
     ) -> PolicyLeafAnalysis {
         let command = self.match_command_decision(
             &leaf.match_text,
             leaf.filter_command.as_ref(),
+            RedirectRewrite::from_leaf(&leaf),
             context.mode,
         );
-        let (identity, output_redirects) = leaf_identity_and_redirects(leaf);
+        let (identity, redirects) = leaf_identity_and_redirects(leaf);
         let analyze_endpoints = matches!(purpose, EvaluationPurpose::Diagnostics)
-            || matches!(command, CommandDecision::Allow { .. });
+            || matches!(command, CommandDecision::Allow { .. })
+            || (redirects
+                .iter()
+                .any(|endpoint| redirect_denies.contains(&endpoint.direction))
+                && matches!(
+                    command,
+                    CommandDecision::NoMatch | CommandDecision::Ask { .. }
+                ));
         let endpoints = if analyze_endpoints {
             EndpointCoverage::Analyzed(
-                output_redirects
+                redirects
                     .into_iter()
                     .map(|endpoint| self.analyze_endpoint(endpoint, context))
                     .collect(),
@@ -980,23 +1199,37 @@ impl BashRuleEngine {
         }
     }
 
+    fn redirect_denied_endpoint(
+        &self,
+        redirects: Vec<RedirectEndpoint>,
+        context: &EvaluationContext,
+    ) -> Option<DeniedRedirectEndpoint> {
+        let coverage = self.redirect_rules.deny_coverage(context.mode);
+        redirects
+            .into_iter()
+            .filter(|endpoint| coverage.contains(&endpoint.direction))
+            .map(|endpoint| self.analyze_endpoint(endpoint, context))
+            .find_map(DeniedRedirectEndpoint::from_denied)
+    }
+
     fn analyze_redirect_check(
         &self,
         command: &str,
         context: &EvaluationContext,
     ) -> RedirectCheckAnalysis {
         match split_command(command, &context.cwd, &self.path_aliases) {
-            SplitOutcome::Bail(reason) => RedirectCheckAnalysis::Bail {
+            SplitOutcome::Bail { reason, redirects } => RedirectCheckAnalysis::Bail {
                 command: command.to_string(),
                 reason,
+                denied_endpoint: self.redirect_denied_endpoint(redirects, context),
             },
             SplitOutcome::Commands(leaves) => RedirectCheckAnalysis::Leaves(
                 leaves
                     .into_iter()
                     .map(|leaf| {
-                        let (identity, output_redirects) = leaf_identity_and_redirects(leaf);
+                        let (identity, redirects) = leaf_identity_and_redirects(leaf);
                         RedirectLeafAnalysis {
-                            endpoints: output_redirects
+                            endpoints: redirects
                                 .into_iter()
                                 .map(|endpoint| self.analyze_endpoint(endpoint, context))
                                 .collect(),
@@ -1010,25 +1243,29 @@ impl BashRuleEngine {
 
     fn analyze_endpoint(
         &self,
-        endpoint: OutputRedirectEndpoint,
+        endpoint: RedirectEndpoint,
         context: &EvaluationContext,
     ) -> EndpointAnalysis {
+        let direction = endpoint.direction;
         match endpoint.target {
             ParsedRedirectTarget::Descriptor { match_text } => {
                 let matched_rule = self.match_redirect_rule(
                     &match_text,
                     context.mode,
+                    direction,
                     RedirectEndpointKind::Descriptor,
                     false,
                 );
                 EndpointAnalysis::Descriptor {
                     original_target: endpoint.original_target,
+                    direction,
                     match_text,
                     matched_rule,
                 }
             }
             ParsedRedirectTarget::Unresolvable { reason } => EndpointAnalysis::Filesystem {
                 original_target: endpoint.original_target,
+                direction,
                 resolution: FilesystemAnalysis::Failed {
                     stage: EndpointFailureStage::StaticAnalysis,
                     reason,
@@ -1049,10 +1286,16 @@ impl BashRuleEngine {
                     } else {
                         RedirectEndpointKind::Filesystem
                     };
-                    let matched_rule =
-                        self.match_redirect_rule(&match_text, context.mode, kind, is_local);
+                    let matched_rule = self.match_redirect_rule(
+                        &match_text,
+                        context.mode,
+                        direction,
+                        kind,
+                        is_local,
+                    );
                     EndpointAnalysis::Filesystem {
                         original_target: endpoint.original_target,
+                        direction,
                         resolution: FilesystemAnalysis::Resolved {
                             target: ResolvedRedirectTarget {
                                 match_text,
@@ -1065,6 +1308,7 @@ impl BashRuleEngine {
                 }
                 Err(error) => EndpointAnalysis::Filesystem {
                     original_target: endpoint.original_target,
+                    direction,
                     resolution: FilesystemAnalysis::Failed {
                         stage: EndpointFailureStage::RuntimeResolution,
                         reason: format!("failed to resolve redirect target: {error}"),
@@ -1078,13 +1322,15 @@ impl BashRuleEngine {
         &self,
         match_text: &str,
         mode: Option<PermissionMode>,
+        direction: RedirectDirection,
         kind: RedirectEndpointKind,
         is_local: bool,
     ) -> Option<MatchedRedirectRule> {
         self.redirect_rules
-            .first_match(match_text, mode, kind.is_filesystem(), is_local)
+            .first_match(match_text, mode, direction, kind.is_filesystem(), is_local)
             .map(|rule| MatchedRedirectRule {
                 metadata: Arc::clone(&rule.metadata),
+                action: Arc::clone(&rule.action),
             })
     }
 
@@ -1148,9 +1394,21 @@ impl CommandDecision {
 impl EndpointAnalysis {
     fn authorization(&self) -> RedirectAuthorizationView<'_> {
         match self.matched_rule() {
-            Some(rule) => RedirectAuthorizationView::Authorized(rule),
+            Some(rule) => match rule.action.as_ref() {
+                RedirectRuleAction::Allow { .. } => RedirectAuthorizationView::Authorized(rule),
+                RedirectRuleAction::Deny { value, .. } => {
+                    RedirectAuthorizationView::Denied(rule, value)
+                }
+            },
             None if self.failure_stage().is_some() => RedirectAuthorizationView::Unresolvable,
             None => RedirectAuthorizationView::Unmatched,
+        }
+    }
+
+    fn denial(&self) -> Option<(&MatchedRedirectRule, &str)> {
+        match self.authorization() {
+            RedirectAuthorizationView::Denied(rule, reason) => Some((rule, reason)),
+            _ => None,
         }
     }
 
@@ -1165,6 +1423,12 @@ impl EndpointAnalysis {
                 resolution: FilesystemAnalysis::Failed { .. },
                 ..
             } => None,
+        }
+    }
+
+    pub(crate) fn direction(&self) -> RedirectDirection {
+        match self {
+            Self::Descriptor { direction, .. } | Self::Filesystem { direction, .. } => *direction,
         }
     }
 
@@ -1209,6 +1473,10 @@ impl MatchedRedirectRule {
     pub(crate) fn action_summary(&self) -> &str {
         &self.metadata.action_summary
     }
+
+    pub(crate) fn is_deny(&self) -> bool {
+        self.action.is_deny()
+    }
 }
 
 impl ResolvedRedirectTarget {
@@ -1225,7 +1493,7 @@ impl ResolvedRedirectTarget {
     }
 }
 
-fn leaf_identity_and_redirects(leaf: LeafCommand) -> (LeafIdentity, Vec<OutputRedirectEndpoint>) {
+fn leaf_identity_and_redirects(leaf: LeafCommand) -> (LeafIdentity, Vec<RedirectEndpoint>) {
     let identity = LeafIdentity {
         original: leaf.original,
         alias_expanded: leaf.alias_expanded,
@@ -1234,7 +1502,7 @@ fn leaf_identity_and_redirects(leaf: LeafCommand) -> (LeafIdentity, Vec<OutputRe
         requires_confirmation: leaf.requires_confirmation,
         command_shape: leaf.filter_command,
     };
-    (identity, leaf.output_redirects)
+    (identity, leaf.redirects)
 }
 
 impl LeafIdentity {
@@ -1291,19 +1559,34 @@ impl PolicyLeafAnalysis {
 
     pub(crate) fn outcome(&self) -> PolicyOutcome<'_> {
         let outcome = self.command.outcome();
+        if matches!(
+            outcome,
+            PolicyOutcome::Deny { .. }
+                | PolicyOutcome::Modify { .. }
+                | PolicyOutcome::ArgumentFilter { .. }
+        ) {
+            return outcome;
+        }
+        let endpoints = match &self.endpoints {
+            EndpointCoverage::Analyzed(endpoints) => endpoints.as_slice(),
+            EndpointCoverage::Skipped => &[],
+        };
+        if let Some((rule, reason)) = endpoints.iter().find_map(EndpointAnalysis::denial) {
+            return PolicyOutcome::RedirectDeny { rule, reason };
+        }
         let PolicyOutcome::Allow { rule } = outcome else {
             return outcome;
         };
-        let endpoints_allowed = match &self.endpoints {
-            EndpointCoverage::Analyzed(endpoints) => endpoints.iter().all(|endpoint| {
-                matches!(
-                    endpoint.authorization(),
-                    RedirectAuthorizationView::Authorized(_)
-                )
-            }),
-            EndpointCoverage::Skipped => false,
-        };
-        if endpoints_allowed && self.identity.requires_confirmation.is_none() {
+        if matches!(self.endpoints, EndpointCoverage::Skipped) {
+            return PolicyOutcome::Ask { rule };
+        }
+        if endpoints.iter().all(|endpoint| {
+            matches!(
+                endpoint.authorization(),
+                RedirectAuthorizationView::Authorized(_)
+            )
+        }) && self.identity.requires_confirmation.is_none()
+        {
             outcome
         } else {
             PolicyOutcome::Ask { rule }
@@ -1323,6 +1606,9 @@ impl PolicyAnalysis {
         match self {
             Self::Bail { decision, .. } => match decision {
                 BailDecision::Deny { rule, reason } => PolicyOutcome::Deny { rule, reason },
+                BailDecision::RedirectDeny { rule, reason } => {
+                    PolicyOutcome::RedirectDeny { rule, reason }
+                }
                 BailDecision::NoMatch => PolicyOutcome::NoMatch,
             },
             Self::Leaves(leaves) if leaves.len() == 1 => leaves[0].outcome(),
@@ -1338,6 +1624,7 @@ impl PolicyAnalysis {
                     Some(
                         outcome @ (PolicyOutcome::Allow { .. }
                         | PolicyOutcome::Deny { .. }
+                        | PolicyOutcome::RedirectDeny { .. }
                         | PolicyOutcome::Ask { .. }),
                     ) => outcome,
                     _ => PolicyOutcome::NoMatch,
@@ -1358,6 +1645,22 @@ impl RedirectLeafAnalysis {
 }
 
 impl RedirectCheckAnalysis {
+    fn denial(&self) -> Option<(&MatchedRedirectRule, &str)> {
+        match self {
+            Self::Bail {
+                denied_endpoint: Some(endpoint),
+                ..
+            } => Some(endpoint.denial()),
+            Self::Bail {
+                denied_endpoint: None,
+                ..
+            } => None,
+            Self::Leaves(leaves) => leaves
+                .iter()
+                .find_map(|leaf| leaf.endpoints.iter().find_map(EndpointAnalysis::denial)),
+        }
+    }
+
     fn allows_rewrite(&self) -> bool {
         match self {
             Self::Bail { .. } => false,
@@ -1395,7 +1698,9 @@ impl Evaluation {
                 OriginalContinuation::ModifyRedirectCheck(check),
                 PolicyOutcome::Modify { rule, new_command },
             ) => {
-                if check.allows_rewrite() {
+                if let Some((rule, reason)) = check.denial() {
+                    PolicyOutcome::RedirectDeny { rule, reason }
+                } else if check.allows_rewrite() {
                     PolicyOutcome::Modify { rule, new_command }
                 } else {
                     PolicyOutcome::Ask { rule }
@@ -1414,7 +1719,9 @@ impl Evaluation {
                     PolicyOutcome::Modify { rule, new_command },
                     FilterContinuation::ModifyRedirectCheck(check),
                 ) => {
-                    if check.allows_rewrite() {
+                    if let Some((rule, reason)) = check.denial() {
+                        PolicyOutcome::RedirectDeny { rule, reason }
+                    } else if check.allows_rewrite() {
                         PolicyOutcome::Modify { rule, new_command }
                     } else {
                         PolicyOutcome::Ask { rule }
@@ -1465,6 +1772,10 @@ impl From<PolicyOutcome<'_>> for RuleResult {
                 rule_name: rule.rule_name().to_string(),
                 reason: reason.to_string(),
             },
+            PolicyOutcome::RedirectDeny { rule, reason } => Self::Denied {
+                rule_name: rule.rule_name().to_string(),
+                reason: reason.to_string(),
+            },
             PolicyOutcome::Modify { rule, new_command } => Self::Modified {
                 rule_name: rule.rule_name().to_string(),
                 new_command: new_command.to_string(),
@@ -1488,7 +1799,7 @@ impl From<PolicyOutcome<'_>> for RuleResult {
 
 fn policy_rank(outcome: PolicyOutcome<'_>) -> u8 {
     match outcome {
-        PolicyOutcome::Deny { .. } => 4,
+        PolicyOutcome::Deny { .. } | PolicyOutcome::RedirectDeny { .. } => 4,
         PolicyOutcome::Ask { .. } => 3,
         PolicyOutcome::NoMatch
         | PolicyOutcome::Modify { .. }
@@ -1531,6 +1842,10 @@ fn collect_policy_contributors<'a>(
             ..
         } => push_matched_contributor(contributors, MatchedContributor::Command(rule)),
         PolicyAnalysis::Bail {
+            decision: BailDecision::RedirectDeny { rule, .. },
+            ..
+        } => push_matched_contributor(contributors, MatchedContributor::Redirect(rule)),
+        PolicyAnalysis::Bail {
             decision: BailDecision::NoMatch,
             ..
         } => {}
@@ -1539,11 +1854,12 @@ fn collect_policy_contributors<'a>(
                 if let Some(rule) = leaf.command.matched_rule() {
                     push_matched_contributor(contributors, MatchedContributor::Command(rule));
                 }
-                if matches!(leaf.command, CommandDecision::Allow { .. })
-                    && let EndpointCoverage::Analyzed(endpoints) = &leaf.endpoints
-                {
+                if let EndpointCoverage::Analyzed(endpoints) = &leaf.endpoints {
                     for endpoint in endpoints {
-                        if let Some(rule) = endpoint.matched_rule() {
+                        if let Some(rule) = endpoint.matched_rule()
+                            && (matches!(leaf.command, CommandDecision::Allow { .. })
+                                || rule.is_deny())
+                        {
                             push_matched_contributor(
                                 contributors,
                                 MatchedContributor::Redirect(rule),
@@ -1560,11 +1876,24 @@ fn collect_redirect_contributors<'a>(
     check: &'a RedirectCheckAnalysis,
     contributors: &mut Vec<MatchedContributor<'a>>,
 ) {
-    if let RedirectCheckAnalysis::Leaves(leaves) = check {
-        for leaf in leaves {
-            for endpoint in &leaf.endpoints {
-                if let Some(rule) = endpoint.matched_rule() {
-                    push_matched_contributor(contributors, MatchedContributor::Redirect(rule));
+    match check {
+        RedirectCheckAnalysis::Bail {
+            denied_endpoint: Some(endpoint),
+            ..
+        } => {
+            let (rule, _) = endpoint.denial();
+            push_matched_contributor(contributors, MatchedContributor::Redirect(rule));
+        }
+        RedirectCheckAnalysis::Bail {
+            denied_endpoint: None,
+            ..
+        } => {}
+        RedirectCheckAnalysis::Leaves(leaves) => {
+            for leaf in leaves {
+                for endpoint in &leaf.endpoints {
+                    if let Some(rule) = endpoint.matched_rule() {
+                        push_matched_contributor(contributors, MatchedContributor::Redirect(rule));
+                    }
                 }
             }
         }
@@ -1603,14 +1932,12 @@ fn quote_command_word(word: &str) -> String {
 }
 
 fn filter_arguments(
-    command: &str,
-    filter_command: Option<&FilterCommand>,
+    filter_command: &FilterCommand,
     remove: &Option<Vec<String>>,
     add: &Option<Vec<String>>,
     replace: &Option<HashMap<String, String>>,
 ) -> miette::Result<String> {
-    let filter_command = filter_command
-        .ok_or_else(|| miette!("ArgumentFilter requires one brush-parsed simple command"))?;
+    let command = &filter_command.source;
     let mut edits = Vec::new();
     for argument in &filter_command.arguments {
         let removed = remove.as_ref().is_some_and(|patterns| {

