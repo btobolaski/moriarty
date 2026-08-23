@@ -96,7 +96,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
-use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
 use uuid::Uuid;
 
@@ -395,6 +395,10 @@ pub enum CustomMessagePayload {
     /// in the outer `content` field.
     #[serde(rename = "plannotator-framing")]
     PlannotatorFraming(PlannotatorFramingDetails),
+    /// Emitted when a `subagent_wait` subscription wakes, carrying the
+    /// subscription token, run id, and wake outcome.
+    #[serde(rename = "subagent-wait-subscription")]
+    SubagentWaitSubscription(SubagentWaitSubscriptionDetails),
 }
 
 // ---------------------------------------------------------------------------
@@ -1857,7 +1861,11 @@ fn parse_tool_result_details(
         }
         "instinct_write" => serde_json::from_value(details).map(ToolResultDetails::InstinctWrite),
         "intercom" => serde_json::from_value(details).map(ToolResultDetails::Intercom),
+        "lens_diagnostics" => {
+            serde_json::from_value(details).map(ToolResultDetails::LensDiagnostics)
+        }
         "ls" => serde_json::from_value(details).map(ToolResultDetails::Ls),
+        "lsp_diagnostics" => serde_json::from_value(details).map(ToolResultDetails::LspDiagnostics),
         "memory" => {
             if is_empty_details_object(&details) {
                 Ok(ToolResultDetails::Empty(EmptyDetails {}))
@@ -1869,12 +1877,16 @@ fn parse_tool_result_details(
             serde_json::from_value(details).map(ToolResultDetails::SearchResult)
         }
         "mcp" => serde_json::from_value(details).map(ToolResultDetails::Mcp),
+        "module_report" => serde_json::from_value(details).map(ToolResultDetails::ModuleReport),
         "project_tools_run_build"
         | "project_tools_run_formatter"
         | "project_tools_run_lint"
         | "project_tools_run_tests"
         | "jj_read_only_run" => {
             serde_json::from_value(details).map(ToolResultDetails::McpToolResult)
+        }
+        "pi_lens_activate_tools" => {
+            serde_json::from_value(details).map(ToolResultDetails::PiLensActivateTools)
         }
         "plannotator_submit_plan" => {
             serde_json::from_value(details).map(ToolResultDetails::PlannotatorSubmitPlan)
@@ -2032,6 +2044,12 @@ pub enum ToolResultDetails {
     Empty(EmptyDetails),
     Memory(MemoryDetails),
     Skill(SkillDetails),
+    // pi-lens tool results; each tool has its own typed detail struct
+    // routed explicitly by `parse_tool_result_details`.
+    LensDiagnostics(LensDiagnosticsDetails),
+    LspDiagnostics(LspDiagnosticsDetails),
+    ModuleReport(ModuleReportDetails),
+    PiLensActivateTools(PiLensActivateToolsDetails),
 }
 
 /// Compression breadcrumb appended to tool results that flowed through the
@@ -2066,6 +2084,8 @@ pub struct ContactSupervisorResultDetails {
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivered: Option<bool>,
 }
 
 /// `ls` tool results are either a plain listing (no `details`), a lean-ctx
@@ -3747,6 +3767,138 @@ pub struct SearchResultDetails {
 #[serde(deny_unknown_fields)]
 pub struct EmptyDetails {}
 
+/// Newtype over `serde_json::Value` that supplies the `Ord`, `PartialOrd`,
+/// and `Hash` trait impls needed by detail struct derives. Two
+/// `JsonValue`s are compared/hashed by their canonical string
+/// representation, so structural equality is preserved.
+#[derive(Debug, Clone)]
+pub struct JsonValue(pub Value);
+
+impl PartialEq for JsonValue {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for JsonValue {}
+
+impl PartialOrd for JsonValue {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for JsonValue {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let a = serde_json::to_string(&self.0).unwrap_or_default();
+        let b = serde_json::to_string(&other.0).unwrap_or_default();
+        a.cmp(&b)
+    }
+}
+
+impl std::hash::Hash for JsonValue {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let s = serde_json::to_string(&self.0).unwrap_or_default();
+        s.hash(state);
+    }
+}
+
+impl Serialize for JsonValue {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for JsonValue {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Value::deserialize(deserializer).map(JsonValue)
+    }
+}
+
+/// Results from `lens_diagnostics` carry the diagnostic mode, count of
+/// files checked, and how many stale cached entries were dropped.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LensDiagnosticsDetails {
+    pub mode: String,
+    pub files_checked: u32,
+    pub stale_dropped: u32,
+}
+
+/// Results from `lsp_diagnostics` come in two shapes discriminated by
+/// `mode`: single-file (`"file"`) and batch (`"batch"`).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "camelCase", deny_unknown_fields)]
+pub enum LspDiagnosticsDetails {
+    #[serde(rename = "file")]
+    File(LspDiagnosticsFile),
+    #[serde(rename = "batch")]
+    Batch(LspDiagnosticsBatch),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LspDiagnosticsFile {
+    pub file_path: PathBuf,
+    pub severity: String,
+    pub server_scope: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_server_id: Option<String>,
+    pub primary_diagnostics_count: u32,
+    pub auxiliary_diagnostics_count: u32,
+    pub diagnostics: Vec<JsonValue>,
+    pub total_diagnostics: u32,
+    pub truncated: bool,
+    pub unconfirmed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lsp_health: Option<JsonValue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LspDiagnosticsBatch {
+    pub files_checked: u32,
+    pub concurrency: u32,
+    pub severity: String,
+    pub server_scope: String,
+    pub diagnostics: Vec<JsonValue>,
+    pub primary_diagnostics_count: u32,
+    pub auxiliary_diagnostics_count: u32,
+    pub total_diagnostics: u32,
+    pub truncated: bool,
+    pub clean_files: u32,
+    pub unconfirmed_files: u32,
+    pub outcomes: Vec<JsonValue>,
+    pub outcome_counts: JsonValue,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lsp_health_warnings: Option<Vec<String>>,
+}
+
+/// Results from `module_report` carry graph availability, staleness, and
+/// symbol/callback/export counts.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModuleReportDetails {
+    pub available: bool,
+    pub staleness: String,
+    pub symbols: u32,
+    pub exports: u32,
+    pub callbacks: u32,
+    pub callback_support: String,
+    pub view: String,
+}
+
+/// Results from `pi_lens_activate_tools` carry which tools matched the
+/// request and which were newly activated.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PiLensActivateToolsDetails {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub matches: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub added: Vec<String>,
+}
+
 /// Hermes memory writes emit a small snake_case result envelope whose exact
 /// optional fields depend on the action (`add`, `replace`, `remove`). The log
 /// parser only needs the shared shape so cost analysis can keep scanning.
@@ -3950,6 +4102,17 @@ pub struct PlannotatorData {
     /// framing delivery.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub framing_delivered: bool,
+}
+
+/// Payload of a `subagent-wait-subscription` custom message. Emitted when a
+/// registered `subagent_wait` subscription wakes, carrying the subscription
+/// token, the run id that triggered it, and the wake outcome.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SubagentWaitSubscriptionDetails {
+    pub token: String,
+    pub run_id: String,
+    pub outcome: String,
 }
 
 /// Structured payload of a `plannotator-framing` custom message. Carries
