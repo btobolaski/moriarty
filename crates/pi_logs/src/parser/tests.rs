@@ -6002,6 +6002,164 @@ fn all_routed_mcp_tool_names_parse_client_errors() {
 }
 
 #[test]
+fn project_report_tool_result_accepts_available_details() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "project_report",
+        vec![json!({"type": "text", "text": "..."})],
+        false,
+        Some(json!({
+            "available": true,
+            "hubs": 6,
+            "entryPoints": 5,
+            "view": "default"
+        })),
+    ));
+    let Some(ToolResultDetails::ProjectReport(details)) = tool_result.details else {
+        panic!("expected ProjectReport details")
+    };
+    assert!(details.available);
+    assert_eq!(details.hubs, Some(6));
+    assert_eq!(details.entry_points, Some(5));
+    assert_eq!(details.view.as_deref(), Some("default"));
+}
+
+#[test]
+fn project_report_tool_result_accepts_unavailable_with_hint() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "project_report",
+        vec![json!({"type": "text", "text": "No review graph cached"})],
+        true,
+        Some(json!({
+            "available": false,
+            "hint": "No review graph cached for this workspace yet — a build was kicked off in the background; retry this call shortly."
+        })),
+    ));
+    let Some(ToolResultDetails::ProjectReport(details)) = tool_result.details else {
+        panic!("expected ProjectReport details")
+    };
+    assert!(!details.available);
+    assert!(details.hint.is_some());
+}
+
+#[test]
+fn read_symbol_tool_result_accepts_found_details() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "read_symbol",
+        vec![json!({"type": "text", "text": "function foo ..."})],
+        false,
+        Some(json!({
+            "found": true,
+            "name": "run_configured_checks",
+            "kind": "function",
+            "startLine": 109,
+            "endLine": 254,
+            "readRecorded": true
+        })),
+    ));
+    let Some(ToolResultDetails::ReadSymbol(details)) = tool_result.details else {
+        panic!("expected ReadSymbol details")
+    };
+    assert!(details.found);
+    assert_eq!(details.name.as_deref(), Some("run_configured_checks"));
+    assert_eq!(details.kind.as_deref(), Some("function"));
+    assert_eq!(details.start_line, Some(109));
+    assert_eq!(details.end_line, Some(254));
+    assert_eq!(details.read_recorded, Some(true));
+}
+
+#[test]
+fn read_symbol_tool_result_accepts_not_found_with_suggestions() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "read_symbol",
+        vec![json!({"type": "text", "text": "Symbol not found"})],
+        true,
+        Some(json!({
+            "found": false,
+            "suggestions": ["run_items_parallel"]
+        })),
+    ));
+    let Some(ToolResultDetails::ReadSymbol(details)) = tool_result.details else {
+        panic!("expected ReadSymbol details")
+    };
+    assert!(!details.found);
+    assert_eq!(
+        details.suggestions,
+        Some(vec!["run_items_parallel".to_string()])
+    );
+}
+
+#[test]
+fn read_enclosing_tool_result_accepts_found_details() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "read_enclosing",
+        vec![json!({"type": "text", "text": "function foo ..."})],
+        false,
+        Some(json!({
+            "found": true,
+            "name": "handle_stop_hook",
+            "kind": "function",
+            "line": 663,
+            "startLine": 651,
+            "endLine": 676,
+            "enclosingStartLine": 651,
+            "enclosingEndLine": 676,
+            "selection": {"strategy": "range-containment", "source": "tree-sitter", "confidence": "high"},
+            "readRecorded": true
+        })),
+    ));
+    let Some(ToolResultDetails::ReadEnclosing(details)) = tool_result.details else {
+        panic!("expected ReadEnclosing details")
+    };
+    assert!(details.found);
+    assert_eq!(details.name.as_deref(), Some("handle_stop_hook"));
+    assert_eq!(details.kind.as_deref(), Some("function"));
+    assert_eq!(details.line, Some(663));
+    assert_eq!(details.start_line, Some(651));
+    assert_eq!(details.end_line, Some(676));
+}
+
+#[test]
+fn symbol_search_tool_result_accepts_available_details() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "symbol_search",
+        vec![json!({"type": "text", "text": "Top 2 file(s)..."})],
+        false,
+        Some(json!({
+            "available": true,
+            "query": "rmcp mcp server",
+            "count": 2,
+            "coverage": {"files": 119, "truncated": false}
+        })),
+    ));
+    let Some(ToolResultDetails::SymbolSearch(details)) = tool_result.details else {
+        panic!("expected SymbolSearch details")
+    };
+    assert!(details.available);
+    assert_eq!(details.query.as_deref(), Some("rmcp mcp server"));
+    assert_eq!(details.count, Some(2));
+}
+
+#[test]
+fn symbol_search_tool_result_accepts_unavailable_with_hint() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "symbol_search",
+        vec![json!({"type": "text", "text": "No word index"})],
+        true,
+        Some(json!({
+            "available": false,
+            "query": "mcp server",
+            "hint": "No word index for this workspace yet — retry shortly."
+        })),
+    ));
+    let Some(ToolResultDetails::SymbolSearch(details)) = tool_result.details else {
+        panic!("expected SymbolSearch details")
+    };
+    assert!(!details.available);
+    assert_eq!(details.query.as_deref(), Some("mcp server"));
+    assert!(details.hint.is_some());
+}
+
+#[test]
 fn mcp_call_result_accepts_omitted_content_shape() {
     let call_json = json!({
         "isError": false,

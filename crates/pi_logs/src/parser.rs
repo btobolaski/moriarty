@@ -1891,7 +1891,10 @@ fn parse_tool_result_details(
         "plannotator_submit_plan" => {
             serde_json::from_value(details).map(ToolResultDetails::PlannotatorSubmitPlan)
         }
+        "project_report" => serde_json::from_value(details).map(ToolResultDetails::ProjectReport),
         "read" => serde_json::from_value(details).map(ToolResultDetails::Read),
+        "read_enclosing" => serde_json::from_value(details).map(ToolResultDetails::ReadEnclosing),
+        "read_symbol" => serde_json::from_value(details).map(ToolResultDetails::ReadSymbol),
         "skill" => {
             if is_empty_details_object(&details) {
                 Ok(ToolResultDetails::Empty(EmptyDetails {}))
@@ -1905,6 +1908,7 @@ fn parse_tool_result_details(
         "subagent_supervisor" => {
             serde_json::from_value(details).map(ToolResultDetails::SubagentSupervisor)
         }
+        "symbol_search" => serde_json::from_value(details).map(ToolResultDetails::SymbolSearch),
         "todo" => serde_json::from_value(details).map(ToolResultDetails::Todo),
         "web_search" => parse_web_search_details(details),
         _ => serde_json::from_value(details),
@@ -2044,12 +2048,23 @@ pub enum ToolResultDetails {
     Empty(EmptyDetails),
     Memory(MemoryDetails),
     Skill(SkillDetails),
-    // pi-lens tool results; each tool has its own typed detail struct
+    // pi-lens/pi-lsp tool results; each tool has its own typed detail struct
     // routed explicitly by `parse_tool_result_details`.
     LensDiagnostics(LensDiagnosticsDetails),
     LspDiagnostics(LspDiagnosticsDetails),
     ModuleReport(ModuleReportDetails),
     PiLensActivateTools(PiLensActivateToolsDetails),
+    ProjectReport(ProjectReportDetails),
+    // ReadEnclosing precedes ReadSymbol because both share {found, name,
+    // kind, startLine, endLine, readRecorded, warnings, error} and a
+    // minimal shared-field payload in the untagged fallback would otherwise
+    // resolve as the wrong variant. Tool-name routing in
+    // `parse_tool_result_details` disambiguates cleanly for normal parsing;
+    // this ordering is a belt-and-suspenders safety net for the unknown-tool
+    // fallback path.
+    ReadEnclosing(ReadEnclosingDetails),
+    ReadSymbol(ReadSymbolDetails),
+    SymbolSearch(SymbolSearchDetails),
 }
 
 /// Compression breadcrumb appended to tool results that flowed through the
@@ -3897,6 +3912,107 @@ pub struct PiLensActivateToolsDetails {
     pub matches: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub added: Vec<String>,
+}
+
+/// Results from `project_report` carry graph availability and a retry
+/// hint on cold cache.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProjectReportDetails {
+    #[serde(default)]
+    pub available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hubs: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_points: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<String>,
+}
+
+/// Results from `read_enclosing` carry the matched symbol plus partial/
+/// enclosing range metadata.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReadEnclosingDetails {
+    #[serde(default)]
+    pub found: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_line: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enclosing_start_line: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enclosing_end_line: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_chain: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<JsonValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_recorded: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warnings: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outline: Option<Vec<JsonValue>>,
+}
+
+/// Results from `read_symbol` carry the matched symbol name/kind/range plus
+/// read-guard recording status. Not-found results carry `found: false` and
+/// an optional suggestions list.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReadSymbolDetails {
+    #[serde(default)]
+    pub found: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_line: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_recorded: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggestions: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warnings: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ambiguous: Option<JsonValue>,
+}
+
+/// Results from `symbol_search` carry availability, query, count, and
+/// coverage stats plus a retry hint on cold index.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SymbolSearchDetails {
+    #[serde(default)]
+    pub available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<JsonValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
 }
 
 /// Hermes memory writes emit a small snake_case result envelope whose exact
