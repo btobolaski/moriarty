@@ -47,14 +47,11 @@
         };
         muslTarget = muslTargets.${system} or null;
 
-        craneLib =
-          if muslTarget != null
-          then
-            (crane.mkLib pkgs).overrideToolchain (p:
-              p.rust-bin.stable.latest.default.override {
-                targets = [muslTarget];
-              })
-          else crane.mkLib pkgs;
+        craneLib = (crane.mkLib pkgs).overrideToolchain (p:
+          p.rust-bin.stable.latest.default.override {
+            extensions = ["rust-analyzer" "rust-src"];
+            targets = lib.optional (muslTarget != null) muslTarget;
+          });
         src = craneLib.cleanCargoSource ./.;
 
         # Common arguments can be set here to avoid repeating them later
