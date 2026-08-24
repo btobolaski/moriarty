@@ -185,7 +185,21 @@ test in a separate process, making this safe and preventing tests from clobberin
   became an untagged enum over the two mutually exclusive shapes — `AutoModeReminder` and `AutoModeBehaviorFlags`, each
   still `deny_unknown_fields` — so neither an all-absent nor a both-present payload is representable. Untagged is the
   cost of a wire shape with no discriminator beyond which keys are present: a new third shape still fails to parse, but
-  as an untagged mismatch rather than the more precise unknown-field error; added in Claude Code 2.1.226+)
+  as an untagged mismatch rather than the more precise unknown-field error; added in Claude Code 2.1.226+), and an
+  `atis-latch` line type (`AtisLatch`, a session-scoped record whose undocumented `atis` payload has only ever been
+  observed empty, so it stays an opaque `String`), an `output_tokens_details` object on `AssistantUsage`
+  (`OutputTokensDetails`, a breakdown of `output_tokens` — currently just `thinking_tokens`, required because every
+  observed payload carries it — not an addition to the billable total), a `bypass` field on the `auto_mode` behavior
+  flags, `bashFirst`/`steerOnly` fields on the previously empty `auto_mode_exit` attachment (`AutoModeExit`, echoing the
+  flags in effect when auto mode ended; like `AutoMode` it became an untagged enum over its two mutually exclusive
+  shapes — `AutoModeExitBare` and `AutoModeExitBehaviorFlags` — rather than sibling `Option` fields, so a half-present
+  payload the wire format never produces is not representable), a `source_uuid`
+  field on `queued_command` attachments (`QueuedCommand`, the message a queued command originated from; emitted
+  snake_case unlike its camelCase siblings, so the rename is spelled out on the field), a `turnCompanion` field on user
+  turns (`UserLogLine`, marking a meta turn that accompanies the turn it was injected alongside — e.g. an invoked
+  skill's instructions — rather than standing on its own), and an `away_summary` system subtype (`AwaySummary`, the
+  recap Claude Code writes while the user is away from the session; shaped like `SystemLogInformational` minus its
+  `level`) (all added in Claude Code 2.1.238+)
 - Also owns the structured view of the raw `model` string via `model::Model { family, version }` plus `ModelFamily` and
   `ModelVersion`. Both `cost_analyzer` (for pricing) and `moriarty::api_pricing` (for grouping/display) consume this one
   parser so family/version classification is not duplicated across crates. The parser preserves capability-decorated raw

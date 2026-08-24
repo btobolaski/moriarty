@@ -96,7 +96,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
-use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use serde_json::{Map, Value};
 use uuid::Uuid;
 

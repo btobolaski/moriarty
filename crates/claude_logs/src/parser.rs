@@ -205,7 +205,7 @@ pub struct SearchResultsReceivedData {
 #[serde(tag = "type")]
 pub enum LogLine {
     #[serde(rename = "user")]
-    User(UserLogLine),
+    User(Box<UserLogLine>),
     #[serde(rename = "assistant")]
     Assistant(Box<AssistantLogLine>),
     #[serde(rename = "file-history-snapshot")]
@@ -238,6 +238,8 @@ pub enum LogLine {
     PrLink(PrLink),
     #[serde(rename = "fork-context-ref")]
     ForkContextRef(ForkContextRef),
+    #[serde(rename = "atis-latch")]
+    AtisLatch(AtisLatch),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -245,6 +247,17 @@ pub enum LogLine {
 #[serde(deny_unknown_fields)]
 pub struct CustomTitle {
     pub custom_title: String,
+    pub session_id: Uuid,
+}
+
+/// Session-scoped record added in Claude Code 2.1.238+. `atis` is kept as an opaque `String`
+/// because the field is undocumented and has only ever been observed empty, so there is no
+/// vocabulary to model and nothing downstream reads it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct AtisLatch {
+    pub atis: String,
     pub session_id: Uuid,
 }
 
@@ -436,11 +449,33 @@ pub struct AutoModeBehaviorFlags {
     pub auto_mode_consent_flow: bool,
     pub bash_first: bool,
     pub steer_only: bool,
+    /// Added in Claude Code 2.1.238+; nullable so 2.1.226-era payloads without it still match this
+    /// variant rather than falling through to an untagged mismatch.
+    pub bypass: Option<bool>,
+}
+
+/// Claude Code 2.1.238+ echoes the behavior flags that were in effect when auto mode ended; every
+/// earlier version emitted an empty object. Modeled as untagged variants for the same reason as
+/// [`AutoMode`]: sibling `Option` fields could represent a half-present payload the wire format
+/// never produces, and a genuinely new shape should fail to parse rather than be absorbed.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum AutoModeExit {
+    Bare(AutoModeExitBare),
+    BehaviorFlags(AutoModeExitBehaviorFlags),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct AutoModeExit {}
+pub struct AutoModeExitBare {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct AutoModeExitBehaviorFlags {
+    pub bash_first: bool,
+    pub steer_only: bool,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -771,6 +806,10 @@ pub struct PlanModeReentryAttachment {
 #[serde(deny_unknown_fields)]
 pub struct QueuedCommand {
     pub prompt: String,
+    /// The message this queued command originated from. Added in Claude Code 2.1.238+, and emitted
+    /// as snake_case unlike its camelCase siblings, so the rename is spelled out here.
+    #[serde(rename = "source_uuid")]
+    pub source_uuid: Option<Uuid>,
     pub command_mode: String,
     /// Who queued the command (e.g. `{"kind":"human"}`); absent in logs before Claude Code
     /// 2.1.197. Reuses [`MessageOrigin`] since both carry the same `kind` discriminator.
@@ -866,6 +905,29 @@ pub enum SystemLogLine {
     TurnDuration(TurnDuration),
     ModelRefusalFallback(ModelRefusalFallback),
     ModelConsentFallback(ModelConsentFallback),
+    AwaySummary(AwaySummary),
+}
+
+/// The recap Claude Code writes while the user is away from the session (suppressible via
+/// `/config`). Shaped like [`SystemLogInformational`] minus its `level`. Added in Claude Code
+/// 2.1.238+.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct AwaySummary {
+    pub parent_uuid: Uuid,
+    pub is_sidechain: bool,
+    pub git_branch: Option<String>,
+    pub slug: Option<String>,
+    pub user_type: String,
+    pub cwd: String,
+    pub session_id: Uuid,
+    pub version: String,
+    pub content: String,
+    pub is_meta: bool,
+    pub timestamp: DateTime<Utc>,
+    pub uuid: Uuid,
+    pub entrypoint: Option<String>,
 }
 
 /// Records Claude Code's session-level fallback when the selected model requires usage-credit
@@ -1503,6 +1565,10 @@ pub struct UserLogLine {
     /// Scheduling priority for a queued prompt (e.g. `later`); present only on turns that were
     /// queued rather than sent immediately, hence `Option`. Added in Claude Code 2.1.201+.
     pub queue_priority: Option<QueuePriority>,
+    /// Marks a meta turn that accompanies the turn it was injected alongside (e.g. a skill's
+    /// instructions carried with the prompt that invoked it) rather than standing on its own.
+    /// Added in Claude Code 2.1.238+.
+    pub turn_companion: Option<bool>,
     /// Claude Code 2.1.206+ repeats the session id under the snake_case key `session_id` alongside
     /// the camelCase `sessionId` (`session_id` above); the two always carry the same value. Modeled
     /// as its own field rather than a `#[serde(alias)]` on `session_id` because both keys appear at
@@ -1865,6 +1931,8 @@ pub struct AssistantUsage {
     pub cache_read_input_tokens: usize,
     pub cache_creation: AssistantCacheCreation,
     pub output_tokens: usize,
+    /// Breakdown of `output_tokens`, not an addition to it. Added in Claude Code 2.1.238+.
+    pub output_tokens_details: Option<OutputTokensDetails>,
     pub service_tier: Option<String>,
     pub server_tool_use: Option<ServerToolUse>,
     /// Geographic region where inference was performed. Added in Claude Code 2.1.12+.
@@ -1873,6 +1941,15 @@ pub struct AssistantUsage {
     pub iterations: Option<Vec<Iteration>>,
     /// Speed setting for the response. Added in Claude Code 2.1.77+.
     pub speed: Option<Speed>,
+}
+
+/// Added in Claude Code 2.1.238+. `thinking_tokens` is required because every observed payload
+/// carries it, so a future breakdown that omits it surfaces as a parse error rather than a
+/// silently-empty struct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutputTokensDetails {
+    pub thinking_tokens: usize,
 }
 
 /// Iteration data from Claude Code's response. Added in Claude Code 2.1.77+ as empty objects,

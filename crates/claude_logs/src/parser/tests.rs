@@ -159,6 +159,42 @@ fn test_parse_pr_link_rejects_unknown_fields() {
     );
 }
 
+fn atis_latch_json() -> serde_json::Value {
+    serde_json::json!({
+        "type": "atis-latch",
+        "atis": "",
+        "sessionId": "027ad547-7c91-4ffa-9b42-03d81d73828c"
+    })
+}
+
+#[test]
+fn test_parse_atis_latch_log_line() {
+    let LogLine::AtisLatch(latch) = serde_json::from_value(atis_latch_json()).unwrap() else {
+        panic!("expected an atis-latch log line");
+    };
+    assert_eq!(latch.atis, "");
+    assert_eq!(
+        latch.session_id,
+        "027ad547-7c91-4ffa-9b42-03d81d73828c"
+            .parse::<Uuid>()
+            .unwrap()
+    );
+}
+
+#[test]
+fn test_parse_atis_latch_rejects_unknown_fields() {
+    let mut json = atis_latch_json();
+    json.as_object_mut()
+        .expect("fixture is a JSON object")
+        .insert("extraField".to_string(), serde_json::json!("should fail"));
+    let err = serde_json::from_value::<LogLine>(json).expect_err("Should reject unknown fields");
+    assert!(
+        err.to_string().contains("unknown field"),
+        "Error should mention unknown field, got: {}",
+        err
+    );
+}
+
 #[test]
 fn test_parse_fork_context_ref_log_line() {
     let json = serde_json::json!({
@@ -3062,6 +3098,58 @@ fn test_parse_system_log_informational_without_git_branch() {
         }
         _ => panic!("Expected System(Informational) variant"),
     }
+}
+
+fn away_summary_json() -> serde_json::Value {
+    serde_json::json!({
+        "type": "system",
+        "subtype": "away_summary",
+        "parentUuid": "6616d413-727a-45a6-ab51-348f0b16979b",
+        "isSidechain": false,
+        "content": "Gathering inputs for pnpm render:root-auth. (disable recaps in /config)",
+        "timestamp": "2026-08-24T17:20:55.288Z",
+        "uuid": "e08a8aed-a9ce-4146-b783-cf77d1734141",
+        "isMeta": false,
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "767a91b4-9f7a-449d-b97d-01a42f5b6fc5",
+        "version": "2.1.238",
+        "gitBranch": "HEAD"
+    })
+}
+
+#[test]
+fn test_parse_system_log_away_summary() {
+    let line: LogLine =
+        serde_json::from_value(away_summary_json()).expect("Failed to parse away summary");
+
+    match line {
+        LogLine::System(SystemLogLine::AwaySummary(summary)) => {
+            assert_eq!(
+                summary.content,
+                "Gathering inputs for pnpm render:root-auth. (disable recaps in /config)"
+            );
+            assert_eq!(summary.git_branch.as_deref(), Some("HEAD"));
+            assert!(!summary.is_meta);
+        }
+        _ => panic!("Expected System(AwaySummary) variant"),
+    }
+}
+
+#[test]
+fn test_parse_system_log_away_summary_rejects_unknown_fields() {
+    let mut json = away_summary_json();
+    json.as_object_mut()
+        .expect("fixture is a JSON object")
+        .insert("unknownField".to_string(), serde_json::json!("should fail"));
+
+    let err = serde_json::from_value::<LogLine>(json).expect_err("Should reject unknown fields");
+    assert!(
+        err.to_string().contains("unknown field"),
+        "Error should mention unknown field, got: {}",
+        err
+    );
 }
 
 #[test]
@@ -6001,6 +6089,31 @@ fn test_parse_user_log_line_with_queue_priority() {
     });
     let line: UserLogLine = serde_json::from_value(json).unwrap();
     assert_eq!(line.queue_priority, Some(QueuePriority::Later));
+    assert_eq!(line.turn_companion, None);
+}
+
+#[test]
+fn test_parse_user_log_line_with_turn_companion() {
+    // Claude Code 2.1.238 marks the meta turn carrying an invoked skill's instructions as a
+    // companion to the prompt that invoked it.
+    let json = serde_json::json!({
+        "parentUuid": "c0225c2f-5d39-4a3b-ae03-963bfcd23228",
+        "isSidechain": false,
+        "promptId": "0cde8170-4ecd-41da-99fd-c1efab7ff6fd",
+        "message": {"role": "user", "content": "Base directory for this skill: /skills/real-code-review"},
+        "isMeta": true,
+        "turnCompanion": true,
+        "uuid": "b4e57ed0-4304-413a-9a88-0ee66cd4d783",
+        "timestamp": "2026-08-24T17:31:48.949Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "57d72248-a8c6-4b51-81c5-7778851c2a3e",
+        "version": "2.1.238",
+        "gitBranch": "HEAD"
+    });
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(line.turn_companion, Some(true));
 }
 
 #[test]
@@ -6260,6 +6373,50 @@ fn test_parse_assistant_usage_with_iterations_and_speed() {
     let line: AssistantLogLine = serde_json::from_value(json).unwrap();
     assert_eq!(line.message.usage.iterations, Some(vec![]));
     assert_eq!(line.message.usage.speed, Some(Speed::Standard));
+    assert_eq!(line.message.usage.output_tokens_details, None);
+}
+
+#[test]
+fn test_parse_assistant_usage_with_output_tokens_details() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "test-session",
+        "version": "2.1.238",
+        "gitBranch": "main",
+        "message": {
+            "id": "msg-1",
+            "type": "message",
+            "role": "assistant",
+            "content": "response",
+            "model": "claude-sonnet-5",
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 100,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": 0,
+                    "ephemeral_1h_input_tokens": 0
+                },
+                "output_tokens": 223,
+                "output_tokens_details": {
+                    "thinking_tokens": 18
+                }
+            }
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2026-08-24T19:00:13.354Z"
+    });
+    let line: AssistantLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(
+        line.message.usage.output_tokens_details,
+        Some(OutputTokensDetails {
+            thinking_tokens: 18
+        })
+    );
 }
 
 #[test]
@@ -9603,6 +9760,48 @@ fn test_parse_attachment_queued_command_with_origin() {
 }
 
 #[test]
+fn test_parse_attachment_queued_command_with_source_uuid() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": null,
+        "isSidechain": false,
+        "attachment": {
+            "type": "queued_command",
+            "prompt": "queued while busy",
+            "source_uuid": "1f438c56-2f6c-4cf8-a2a5-d0c13f1e5ff2",
+            "commandMode": "prompt",
+            "origin": {"kind": "human"},
+            "timestamp": "2026-08-24T18:50:38.260Z"
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440000",
+        "timestamp": "2026-08-24T18:50:38.260Z",
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.238",
+        "gitBranch": "HEAD"
+    });
+    let log_line: LogLine = serde_json::from_value(json).unwrap();
+    match log_line {
+        LogLine::Attachment(att) => {
+            if let AttachmentData::QueuedCommand(cmd) = &att.attachment {
+                assert_eq!(
+                    cmd.source_uuid,
+                    Some(
+                        "1f438c56-2f6c-4cf8-a2a5-d0c13f1e5ff2"
+                            .parse::<Uuid>()
+                            .unwrap()
+                    )
+                );
+            } else {
+                panic!("Expected QueuedCommand, got {:?}", att.attachment);
+            }
+        }
+        other => panic!("Expected Attachment, got {:?}", other),
+    }
+}
+
+#[test]
 fn test_parse_attachment_queued_command_with_null_origin() {
     let json = serde_json::json!({
         "type": "attachment",
@@ -9732,6 +9931,42 @@ fn test_parse_attachment_auto_mode_behavior_flags() {
                 assert!(!flags.auto_mode_consent_flow);
                 assert!(flags.bash_first);
                 assert!(flags.steer_only);
+                assert_eq!(flags.bypass, None);
+            } else {
+                panic!("Expected AutoMode, got {:?}", att.attachment);
+            }
+        }
+        other => panic!("Expected Attachment, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_attachment_auto_mode_behavior_flags_with_bypass() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": null,
+        "isSidechain": false,
+        "attachment": {
+            "type": "auto_mode",
+            "autoModeConsentFlow": false,
+            "bashFirst": true,
+            "steerOnly": true,
+            "bypass": false
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2026-08-24T18:31:00.945Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.238",
+        "gitBranch": "HEAD"
+    });
+    let log_line: LogLine = serde_json::from_value(json).unwrap();
+    match log_line {
+        LogLine::Attachment(att) => {
+            if let AttachmentData::AutoMode(AutoMode::BehaviorFlags(flags)) = &att.attachment {
+                assert_eq!(flags.bypass, Some(false));
             } else {
                 panic!("Expected AutoMode, got {:?}", att.attachment);
             }
@@ -9762,7 +9997,49 @@ fn test_parse_attachment_auto_mode_exit() {
     let log_line: LogLine = serde_json::from_value(json).unwrap();
     match log_line {
         LogLine::Attachment(att) => {
-            assert!(matches!(att.attachment, AttachmentData::AutoModeExit(_)));
+            assert!(matches!(
+                att.attachment,
+                AttachmentData::AutoModeExit(AutoModeExit::Bare(_))
+            ));
+        }
+        other => panic!("Expected Attachment, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_attachment_auto_mode_exit_with_behavior_flags() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": null,
+        "isSidechain": false,
+        "attachment": {
+            "type": "auto_mode_exit",
+            "bashFirst": true,
+            "steerOnly": true
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440002",
+        "timestamp": "2026-08-24T22:56:36.647Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.238",
+        "gitBranch": "HEAD"
+    });
+    let log_line: LogLine = serde_json::from_value(json).unwrap();
+    match log_line {
+        LogLine::Attachment(att) => {
+            if let AttachmentData::AutoModeExit(AutoModeExit::BehaviorFlags(flags)) =
+                &att.attachment
+            {
+                assert!(flags.bash_first);
+                assert!(flags.steer_only);
+            } else {
+                panic!(
+                    "Expected AutoModeExit behavior flags, got {:?}",
+                    att.attachment
+                );
+            }
         }
         other => panic!("Expected Attachment, got {:?}", other),
     }

@@ -383,6 +383,10 @@ fn claude_system_fields(system: &ClaudeSystemLogLine) -> ClaudeSystemFields {
             timestamp: line.timestamp,
             uuid: line.uuid,
         },
+        ClaudeSystemLogLine::AwaySummary(line) => ClaudeSystemFields {
+            timestamp: line.timestamp,
+            uuid: line.uuid,
+        },
     }
 }
 
@@ -433,6 +437,7 @@ impl AnalyzableLog for ClaudeLogLine {
             // Unlike the other session-metadata records, `pr-link` carries a real timestamp.
             ClaudeLogLine::PrLink(line) => line.timestamp,
             ClaudeLogLine::ForkContextRef(_) => claude_timestamp_sentinel(),
+            ClaudeLogLine::AtisLatch(_) => claude_timestamp_sentinel(),
         }
     }
 
@@ -476,6 +481,7 @@ impl AnalyzableLog for ClaudeLogLine {
             ClaudeLogLine::ForkContextRef(line) => {
                 format!("fork-context-ref:{}", line.agent_id)
             }
+            ClaudeLogLine::AtisLatch(line) => format!("atis-latch:{}", line.session_id),
         }
     }
 
@@ -655,6 +661,7 @@ mod tests {
     const CLAUDE_SYSTEM_STOP_HOOK_SUMMARY_UUID: &str = "13131313-1313-4313-8313-131313131313";
     const CLAUDE_SYSTEM_TURN_DURATION_UUID: &str = "14141414-1414-4414-8414-141414141414";
     const CLAUDE_SYSTEM_CONSENT_FALLBACK_UUID: &str = "17171717-1717-4717-8717-171717171717";
+    const CLAUDE_SYSTEM_AWAY_SUMMARY_UUID: &str = "18181818-1818-4818-8818-181818181818";
     const CLAUDE_SYSTEM_LOGICAL_PARENT_UUID: &str = "15151515-1515-4515-8515-151515151515";
     const CLAUDE_SYSTEM_CLEARED_ATTACHMENT_UUID: &str = "16161616-1616-4616-8616-161616161616";
 
@@ -973,6 +980,14 @@ mod tests {
         })
     }
 
+    fn claude_atis_latch_json() -> serde_json::Value {
+        json!({
+            "type": "atis-latch",
+            "atis": "",
+            "sessionId": CLAUDE_SESSION_ID,
+        })
+    }
+
     fn claude_system_json(
         subtype: &str,
         parent_uuid: Option<&str>,
@@ -997,6 +1012,17 @@ mod tests {
         metadata.insert("content".to_string(), json!("informational message"));
         metadata.insert("isMeta".to_string(), json!(false));
         metadata.insert("level".to_string(), json!("info"));
+        serde_json::Value::Object(metadata)
+    }
+
+    fn claude_system_away_summary_json() -> serde_json::Value {
+        let mut metadata = claude_system_json(
+            "away_summary",
+            Some(CLAUDE_PARENT_UUID),
+            CLAUDE_SYSTEM_AWAY_SUMMARY_UUID,
+        );
+        metadata.insert("content".to_string(), json!("away recap"));
+        metadata.insert("isMeta".to_string(), json!(false));
         serde_json::Value::Object(metadata)
     }
 
@@ -1970,6 +1996,18 @@ mod tests {
                 value: claude_fork_context_ref_json,
                 expected_timestamp: ExpectedClaudeTimestamp::Sentinel,
                 expected_id: "fork-context-ref:awhere-does-this-c5f743e50c0b4c81".to_string(),
+            },
+            ClaudeNonBillableCase {
+                name: "atis latch",
+                value: claude_atis_latch_json,
+                expected_timestamp: ExpectedClaudeTimestamp::Sentinel,
+                expected_id: claude_metadata_identifier("atis-latch"),
+            },
+            ClaudeNonBillableCase {
+                name: "system away summary",
+                value: claude_system_away_summary_json,
+                expected_timestamp: ExpectedClaudeTimestamp::Real,
+                expected_id: CLAUDE_SYSTEM_AWAY_SUMMARY_UUID.to_string(),
             },
         ];
 
