@@ -269,6 +269,10 @@ with warnings, while explicit missing paths and having no available source are e
   accepts their observed action-agnostic fields plus the real `{}` validation-error payload used by the extension
 - Strict by default with `#[serde(deny_unknown_fields)]`, path-aware parse errors, and narrowly documented exceptions
   for shapes that require custom deserialization or specific corrupt-stream tolerance
+- Pi-lens result details use tool-name-routed, derived Serde schemas: `lens_diagnostics` distinguishes delta/all/full
+  (including unavailable) responses, `lsp_diagnostics` distinguishes file/batch/directory responses,
+  `lens_diagnostic_mark` keeps typed dispositions and nonzero lines, and `module_report` accepts optional callback
+  support. `fetch_content` also accepts its optional timestamp metadata.
 - `CompactionLine` and `BranchSummaryLine` carry an optional `usage: Option<AssistantUsage>` recording the cost/tokens
   of the summarization call pi made to produce them (pi added this field after the initial compaction schema, so it is
   `#[serde(default)]` for backward compatibility); the lines record no provider/model of their own, so attribution is
@@ -647,7 +651,7 @@ and body already say what the code does; comments should add information that is
 - Restate the function name (e.g. `/// Format duration in a readable way` on `fn format_duration`).
 - Narrate the body line-by-line (e.g. `/// Appends one row per non-zero-cost model in display order` on a function that
   does exactly that and nothing else).
-- Re-describe parameter names (e.g. `/// `grand_total` is the footer total.` on a parameter named `grand_total`).
+- Re-describe parameter names (e.g. `///`grand_total`is the footer total.` on a parameter named `grand_total`).
 
 **Keep or write** doc comments that:
 

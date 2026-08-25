@@ -91,12 +91,13 @@ use std::{
     fs::File,
     hash::{Hash, Hasher},
     io::{BufRead, BufReader},
+    num::{NonZeroU32, NonZeroUsize},
     path::{Path, PathBuf},
 };
 
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
-use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
 use uuid::Uuid;
 
@@ -1861,6 +1862,9 @@ fn parse_tool_result_details(
         }
         "instinct_write" => serde_json::from_value(details).map(ToolResultDetails::InstinctWrite),
         "intercom" => serde_json::from_value(details).map(ToolResultDetails::Intercom),
+        "lens_diagnostic_mark" => {
+            serde_json::from_value(details).map(ToolResultDetails::LensDiagnosticMark)
+        }
         "lens_diagnostics" => {
             serde_json::from_value(details).map(ToolResultDetails::LensDiagnostics)
         }
@@ -2050,6 +2054,7 @@ pub enum ToolResultDetails {
     Skill(SkillDetails),
     // pi-lens/pi-lsp tool results; each tool has its own typed detail struct
     // routed explicitly by `parse_tool_result_details`.
+    LensDiagnosticMark(LensDiagnosticMarkDetails),
     LensDiagnostics(LensDiagnosticsDetails),
     LspDiagnostics(LspDiagnosticsDetails),
     ModuleReport(ModuleReportDetails),
@@ -3286,6 +3291,8 @@ pub struct FetchContentDetails {
     pub prompt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<String>,
 }
 
 /// Replaying a single previously-fetched URL via `get_search_content`
@@ -3830,18 +3837,178 @@ impl<'de> Deserialize<'de> for JsonValue {
     }
 }
 
-/// Results from `lens_diagnostics` carry the diagnostic mode, count of
-/// files checked, and how many stale cached entries were dropped.
+/// The producer's `mode` selects an incompatible detail shape, so the parser
+/// keeps cached and full-scan state from being combined accidentally.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "camelCase", deny_unknown_fields)]
+pub enum LensDiagnosticsDetails {
+    #[serde(rename = "delta")]
+    Delta(LensDiagnosticsDelta),
+    #[serde(rename = "all")]
+    All(LensDiagnosticsSummary),
+    #[serde(rename = "full")]
+    Full(LensDiagnosticsFull),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum LensDiagnosticsDelta {
+    Clean(LensDiagnosticsDeltaClean),
+    Findings(LensDiagnosticsDeltaFindings),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct LensDiagnosticsDetails {
-    pub mode: String,
+pub struct LensDiagnosticsDeltaClean {
+    pub warnings: u32,
+    pub carried_over_files: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LensDiagnosticsDeltaFindings {
+    pub actionable_warnings: u32,
+    pub quality_issues: u32,
+    pub project_diagnostics: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum LensDiagnosticsSummary {
+    Clean(LensDiagnosticsClean),
+    Findings(LensDiagnosticsFindings),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LensDiagnosticsClean {
     pub files_checked: u32,
     pub stale_dropped: u32,
 }
 
-/// Results from `lsp_diagnostics` come in two shapes discriminated by
-/// `mode`: single-file (`"file"`) and batch (`"batch"`).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LensDiagnosticsFindings {
+    pub files_with_issues: NonZeroUsize,
+    pub total_blocking: u32,
+    pub total_errors: u32,
+    pub total_warnings: u32,
+    pub stale_dropped: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum LensDiagnosticsFull {
+    Unavailable(LensDiagnosticsFullUnavailable),
+    Clean(LensDiagnosticsFullDetails<LensDiagnosticsClean>),
+    Findings(LensDiagnosticsFullDetails<LensDiagnosticsFindings>),
+}
+
+/// Pi-lens emits this minimal full-mode response when its language-server scan
+/// cannot run, instead of fabricating a clean result.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LensDiagnosticsFullUnavailable {
+    pub files_checked: u32,
+    pub lsp_unavailable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LensDiagnosticsFullDetails<S> {
+    pub lsp_files_checked: u32,
+    pub partial: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_diagnostics: Option<LensProjectDiagnostics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_diagnostics_delta: Option<LensProjectDiagnosticsDelta>,
+    pub cold_runners: Vec<String>,
+    pub cold_reasons: BTreeMap<String, String>,
+    pub failed_analyzers: Vec<LensAnalyzerFailure>,
+    pub analyzer_timings_ms: BTreeMap<String, u64>,
+    pub disposition_suppressed: u32,
+    pub disposition_suppressed_by_lane: BTreeMap<String, u32>,
+    pub analyzers_cached_age_ms: BTreeMap<String, u64>,
+    pub analyzers_aborted: bool,
+    pub analyzers_aborted_ids: Vec<String>,
+    pub analyzers_unsafe_root: bool,
+    pub project_walk_unsafe_root: bool,
+    pub lsp_files_confirmed: u32,
+    pub lsp_files_unconfirmed: u32,
+    pub lsp_files_partially_covered: u32,
+    pub unconfirmed_lsp_server_ids: Vec<String>,
+    pub unconfirmed_lsp_files: Vec<String>,
+    pub lsp_server_breakdown: BTreeMap<String, LensLspServerSummary>,
+    pub lsp_primary_diagnostics_count: u32,
+    pub lsp_auxiliary_diagnostics_count: u32,
+    pub project_scan_truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_generated_file_skips: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_generated_name_only_skips: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_generated_dir_skips: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timed_out: Option<bool>,
+    #[serde(flatten)]
+    pub summary: S,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LensDiagnosticsTier {
+    All,
+    Cheap,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LensProjectDiagnostics {
+    pub tier: LensDiagnosticsTier,
+    pub files_scanned: u32,
+    pub diagnostics: u32,
+    pub runners: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LensProjectDiagnosticsDelta {
+    pub diagnostics: u32,
+    pub sources: Vec<String>,
+    pub turn_index: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LensAnalyzerFailure {
+    pub id: String,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LensLspServerSummary {
+    pub confirmed: usize,
+    pub total: NonZeroUsize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LensDiagnosticDisposition {
+    FalsePositive,
+    Suppress,
+    Defer,
+    Flagged,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LensDiagnosticMarkDetails {
+    pub anchor: String,
+    pub disposition: LensDiagnosticDisposition,
+    pub line: NonZeroU32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "camelCase", deny_unknown_fields)]
 pub enum LspDiagnosticsDetails {
@@ -3849,6 +4016,8 @@ pub enum LspDiagnosticsDetails {
     File(LspDiagnosticsFile),
     #[serde(rename = "batch")]
     Batch(LspDiagnosticsBatch),
+    #[serde(rename = "directory")]
+    Directory(LspDiagnosticsDirectory),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -3867,13 +4036,19 @@ pub struct LspDiagnosticsFile {
     pub unconfirmed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lsp_health: Option<JsonValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timed_out: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unconfirmed_server_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LspDiagnosticsBatch {
     pub files_checked: u32,
-    pub concurrency: u32,
+    pub concurrency: NonZeroUsize,
     pub severity: String,
     pub server_scope: String,
     pub diagnostics: Vec<JsonValue>,
@@ -3887,10 +4062,49 @@ pub struct LspDiagnosticsBatch {
     pub outcome_counts: JsonValue,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lsp_health_warnings: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timed_out_files: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incomplete_files: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_errors: Option<Vec<String>>,
 }
 
-/// Results from `module_report` carry graph availability, staleness, and
-/// symbol/callback/export counts.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LspDiagnosticsDirectory {
+    pub file_path: PathBuf,
+    pub severity: String,
+    pub server_scope: String,
+    pub files_scanned: u32,
+    pub capped: bool,
+    pub diagnostics: Vec<JsonValue>,
+    pub primary_diagnostics_count: u32,
+    pub auxiliary_diagnostics_count: u32,
+    pub total_diagnostics: u32,
+    pub truncated: bool,
+    pub clean_files: u32,
+    pub unconfirmed_files: u32,
+    pub concurrency: NonZeroUsize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timed_out_files: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_errors: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lsp_health_warnings: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CallbackSupport {
+    Tuned,
+    Generic,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ModuleReportDetails {
@@ -3899,7 +4113,8 @@ pub struct ModuleReportDetails {
     pub symbols: u32,
     pub exports: u32,
     pub callbacks: u32,
-    pub callback_support: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub callback_support: Option<CallbackSupport>,
     pub view: String,
 }
 
