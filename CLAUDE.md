@@ -197,7 +197,10 @@ test in a separate process, making this safe and preventing tests from clobberin
   field on `queued_command` attachments (`QueuedCommand`, the message a queued command originated from; emitted
   snake_case unlike its camelCase siblings, so the rename is spelled out on the field), a `turnCompanion` field on user
   turns (`UserLogLine`, marking a meta turn that accompanies the turn it was injected alongside — e.g. an invoked
-  skill's instructions — rather than standing on its own), and an `away_summary` system subtype (`AwaySummary`, the
+  skill's instructions — rather than standing on its own), a `classifierMetaLines` field on user turns (`UserLogLine`,
+  the context Claude Code hands its auto-mode safety classifier; logged as an embedded newline-terminated JSON *string*
+  rather than a nested object and kept an opaque `String` because the payload is the classifier's own undocumented,
+  volatile schema and nothing downstream reads it), and an `away_summary` system subtype (`AwaySummary`, the
   recap Claude Code writes while the user is away from the session; shaped like `SystemLogInformational` minus its
   `level`) (all added in Claude Code 2.1.238+)
 - Also owns the structured view of the raw `model` string via `model::Model { family, version }` plus `ModelFamily` and

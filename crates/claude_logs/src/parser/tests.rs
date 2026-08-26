@@ -6117,6 +6117,33 @@ fn test_parse_user_log_line_with_turn_companion() {
 }
 
 #[test]
+fn test_parse_user_log_line_with_classifier_meta_lines() {
+    // Claude Code 2.1.238 attaches auto mode's classifier context as an embedded JSON string, so
+    // the field must stay a String rather than a nested object.
+    let json = serde_json::json!({
+        "parentUuid": "f78059a8-6bd0-4c00-a7ad-33369bdbe9d8",
+        "isSidechain": true,
+        "promptId": "9c024b6d-f9e4-4c8f-8b7a-c72255323d93",
+        "agentId": "aa5dc93d927674738",
+        "message": {"role": "user", "content": "test"},
+        "uuid": "f7c10d66-4699-489b-8f4c-df52f5e0fd34",
+        "timestamp": "2026-08-26T15:51:51.767Z",
+        "classifierMetaLines": "{\"meta\":{\"gitStatus\":{\"staged\":0,\"modified\":4,\"untracked\":0}}}\n",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "c42a9553-cddb-44db-9b25-2a9e5958f84b",
+        "version": "2.1.238",
+        "gitBranch": "HEAD"
+    });
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(
+        line.classifier_meta_lines.as_deref(),
+        Some("{\"meta\":{\"gitStatus\":{\"staged\":0,\"modified\":4,\"untracked\":0}}}\n")
+    );
+}
+
+#[test]
 fn test_parse_user_log_line_without_queue_priority() {
     // The field is absent on turns sent immediately, so it must default to None.
     let json = serde_json::json!({

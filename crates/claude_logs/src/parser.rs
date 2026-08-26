@@ -1569,6 +1569,12 @@ pub struct UserLogLine {
     /// instructions carried with the prompt that invoked it) rather than standing on its own.
     /// Added in Claude Code 2.1.238+.
     pub turn_companion: Option<bool>,
+    /// Context Claude Code hands its auto-mode safety classifier, logged as an embedded JSON
+    /// *string* (newline-terminated) rather than a nested object. Kept opaque because the payload is
+    /// the classifier's own undocumented, volatile schema and nothing downstream reads it; parsing it
+    /// into typed fields would make every classifier-side addition a parse failure here.
+    /// Added in Claude Code 2.1.238+.
+    pub classifier_meta_lines: Option<String>,
     /// Claude Code 2.1.206+ repeats the session id under the snake_case key `session_id` alongside
     /// the camelCase `sessionId` (`session_id` above); the two always carry the same value. Modeled
     /// as its own field rather than a `#[serde(alias)]` on `session_id` because both keys appear at
