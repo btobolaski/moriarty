@@ -52,16 +52,12 @@
 //!   than a fully open `String` but wider than a strict enum, because faux
 //!   session IDs are dynamic and cannot be enumerated ahead of time.
 //!
-//! * **Shape-branching custom deserializer** — [`McpDetails`] uses a
-//!   custom `Deserialize` impl that accepts two structurally incompatible
-//!   wire formats: a sessions-only action shape (`{ sessions: N }` with no
-//!   `mode`, emitted by pi's `action: "ui-messages"` MCP server status
-//!   call) and the normal mode-based shape (all standard fields with
-//!   `mode` required). Both branches enforce strict unknown-field
-//!   rejection — the sessions-only path via
-//!   `reject_unknown_object_fields` and the mode-based path via an
-//!   internally-derived `StrictMcpDetails` struct with
-//!   `#[serde(deny_unknown_fields)]`.
+//! * **Shape-branching protocol schema** — [`McpDetails`] is an untagged
+//!   enum over two strict wire shapes: a sessions-only action (`{ sessions:
+//!   N }` with no `mode`, emitted by pi's `action: "ui-messages"` MCP
+//!   server status call) and the normal mode-based shape (with `mode`
+//!   required). Keeping their fields in separate derived structs preserves
+//!   strict unknown-field rejection without mirroring the common shape.
 //!
 //! * **Forward-compatible protocol schemas** — structs representing
 //!   server-defined or runtime-defined protocol envelopes whose field
@@ -97,7 +93,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
-use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de, ser::SerializeMap};
 use serde_json::{Map, Value};
 use uuid::Uuid;
 
@@ -1880,7 +1876,7 @@ fn parse_tool_result_details(
         "memory_search" | "session_search" => {
             serde_json::from_value(details).map(ToolResultDetails::SearchResult)
         }
-        "mcp" => serde_json::from_value(details).map(ToolResultDetails::Mcp),
+        "mcp" => parse_mcp_tool_result_details(details),
         "module_report" => serde_json::from_value(details).map(ToolResultDetails::ModuleReport),
         "project_tools_run_build"
         | "project_tools_run_formatter"
@@ -1916,6 +1912,14 @@ fn parse_tool_result_details(
         "todo" => serde_json::from_value(details).map(ToolResultDetails::Todo),
         "web_search" => parse_web_search_details(details),
         _ => serde_json::from_value(details),
+    }
+}
+
+fn parse_mcp_tool_result_details(details: Value) -> Result<ToolResultDetails, serde_json::Error> {
+    if details.get("mode").is_none() && details.get("error").is_some() {
+        serde_json::from_value(details).map(ToolResultDetails::McpInitializationError)
+    } else {
+        serde_json::from_value(details).map(ToolResultDetails::Mcp)
     }
 }
 
@@ -2045,6 +2049,7 @@ pub enum ToolResultDetails {
     // be absorbed by any of them and safely falls through here.
     FetchContent(FetchContentDetails),
     GetSearchContent(GetSearchContentDetails),
+    McpInitializationError(McpInitializationError),
     // Hermes `memory` and `skill` are intentionally parsed by `tool_name`
     // first because their error shapes can collapse to `{}` or a bare
     // `{error}` and would otherwise be ambiguous in direct untagged
@@ -3356,21 +3361,6 @@ pub struct GrepDetails {
     pub compression: Option<CompressionInfo>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum McpMode {
-    Call,
-    Describe,
-    Instructions,
-    List,
-    Search,
-    Status,
-    #[serde(rename = "auth-start")]
-    AuthStart,
-    #[serde(rename = "auth-complete")]
-    AuthComplete,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum McpTool {
@@ -3404,186 +3394,299 @@ pub struct McpDescribedTool {
     pub input_schema: JsonBlob,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct McpDetails {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mode: Option<McpMode>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sessions: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mcp_result: Option<McpCallResult>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub server: Option<String>,
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum McpDetails {
+    Mode(McpModeDetails),
+    SessionsOnly(McpSessionsDetails),
+}
+
+/// Every result mode has distinct success and error payloads, so retain that
+/// discriminator rather than forcing unrelated fields into one option bag.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(tag = "mode")]
+pub enum McpModeDetails {
+    #[serde(rename = "call")]
+    Call(McpCallDetails),
+    #[serde(rename = "connect")]
+    Connect(McpModeError),
+    #[serde(rename = "describe")]
+    Describe(McpDescribeDetails),
+    #[serde(rename = "instructions")]
+    Instructions(McpInstructionsDetails),
+    #[serde(rename = "list")]
+    List(McpListDetails),
+    #[serde(rename = "search")]
+    Search(McpSearchDetails),
+    #[serde(rename = "status")]
+    Status(McpStatusDetails),
+    #[serde(rename = "auth-start")]
+    AuthStart(McpAuthStartDetails),
+    #[serde(rename = "auth-complete")]
+    AuthComplete(McpAuthCompleteDetails),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum McpCallDetails {
+    Success(Box<McpCallSuccess>),
+    Error(Box<McpModeError>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct McpCallSuccess {
+    pub server: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool: Option<McpTool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
+    pub resource_uri: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
-    /// Set on `mode: "call"` errors of kind `tool_not_found`; names the
-    /// missing MCP tool the caller asked for.
+    pub mcp_result: Option<McpCallResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub requested_tool: Option<String>,
-    /// Newer tool-not-found errors also identify the server that exposed the
-    /// suggestion list when the requested tool name was ambiguous or wrong.
+    pub ui_open: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hint_server: Option<String>,
-    /// `mode: "status"` snapshot of every configured MCP server.
+    pub ui_viewer: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub servers: Option<Vec<McpServerStatus>>,
-    /// Total tools available across connected servers (status mode).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub total_tools: Option<u32>,
-    /// How many of `servers` are currently connected (status mode).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub connected_count: Option<u32>,
-    /// How many of `servers` the user has disabled (status mode); reported
-    /// separately from `connected_count` because a disabled server is neither
-    /// connected nor failed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub disabled_count: Option<u32>,
-    /// `mode: "list"` of tools exposed by a single server.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tools: Option<Vec<String>>,
-    /// Number of tools in `tools` (list mode).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub count: Option<u32>,
-    /// Optional because older MCP list results omit this metadata.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub has_instructions: Option<bool>,
-    /// `mode: "search"` search results; kept as raw `JsonBlob` because
-    /// MCP tool search schemas are server-defined (same reasoning as
-    /// `McpCallResult.content`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub matches: Option<Vec<JsonBlob>>,
-    /// `mode: "search"` query that produced `matches`; absent for
-    /// local-state-only searches that don't issue a remote query.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub query: Option<String>,
-    /// Overflow/truncation metadata added in newer pi versions when an
-    /// MCP response exceeds pi's in-message byte cap. Stored as raw JSON.
+    pub ui_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_guard: Option<JsonBlob>,
-    /// Length of the server instructions text (`mode: "instructions"`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub length: Option<u32>,
 }
 
-impl<'de> Deserialize<'de> for McpDetails {
+/// Errors share a small client-owned envelope even when their surrounding MCP
+/// mode differs; keeping it separate preserves each mode's success contract.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct McpModeError {
+    pub error: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_tool: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint_server: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<Box<McpTool>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggestions: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has_instructions: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<Box<JsonBlob>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_result: Option<Box<McpCallResult>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_guard: Option<Box<JsonBlob>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum McpDescribeDetails {
+    Success(McpDescribeSuccess),
+    Error(McpModeError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct McpDescribeSuccess {
+    pub server: String,
+    pub tool: McpTool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum McpInstructionsDetails {
+    Success(McpInstructionsSuccess),
+    Error(McpModeError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct McpInstructionsSuccess {
+    pub server: String,
+    pub length: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum McpListDetails {
+    Success(McpListSuccess),
+    Error(McpModeError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct McpListSuccess {
+    pub server: String,
+    pub tools: Vec<String>,
+    pub count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has_instructions: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum McpSearchDetails {
+    Success(McpSearchSuccess),
+    Error(McpModeError),
+}
+
+// `deny_unknown_fields` conflicts with `flatten`; McpPagination rejects the
+// flattened remainder instead, so unexpected successful-search keys still fail.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpSearchSuccess {
+    /// Keep server-defined matches raw because their schema is independent of
+    /// this parser's release cycle.
+    pub matches: Vec<JsonBlob>,
+    pub count: u32,
+    pub query: String,
+    #[serde(flatten)]
+    pub pagination: McpPagination,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connecting_servers: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct McpStatusDetails {
+    pub servers: Vec<McpServerStatus>,
+    pub total_tools: u32,
+    pub connected_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_count: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum McpAuthStartDetails {
+    Success(McpAuthStartSuccess),
+    Error(McpModeError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct McpAuthStartSuccess {
+    pub server: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authenticated: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum McpAuthCompleteDetails {
+    Success(McpAuthCompleteSuccess),
+    Error(McpModeError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct McpAuthCompleteSuccess {
+    pub server: String,
+    pub authenticated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct McpInitializationError {
+    pub error: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
+/// The sessions-only MCP action has no mode, so keeping it separate prevents
+/// a missing mode from weakening validation of ordinary MCP responses.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct McpSessionsDetails {
+    pub sessions: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_guard: Option<JsonBlob>,
+}
+
+/// A single state prevents an MCP search response from claiming both that it
+/// is complete and that the caller must continue at a later offset.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum McpPagination {
+    None,
+    Complete,
+    More { next_offset: u32 },
+}
+
+impl Serialize for McpPagination {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(match self {
+            Self::None => 0,
+            Self::Complete | Self::More { .. } => 2,
+        }))?;
+        match self {
+            Self::None => {}
+            Self::Complete => {
+                map.serialize_entry("hasMore", &false)?;
+                map.serialize_entry("nextOffset", &Option::<u32>::None)?;
+            }
+            Self::More { next_offset } => {
+                map.serialize_entry("hasMore", &true)?;
+                map.serialize_entry("nextOffset", next_offset)?;
+            }
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for McpPagination {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        let value = Value::deserialize(deserializer)?;
-        let object = value
-            .as_object()
-            .ok_or_else(|| de::Error::custom("McpDetails payload must be an object"))?;
+        let object = Map::<String, Value>::deserialize(deserializer)?;
+        reject_unknown_object_fields(&object, &["hasMore", "nextOffset"])
+            .map_err(de::Error::custom)?;
 
-        // `action: "ui-messages"` shape: { sessions: N } with no mode field.
-        if !object.contains_key("mode") && object.contains_key("sessions") {
-            let sessions = object_field::<u32>(object, "sessions").map_err(de::Error::custom)?;
-            let output_guard = object
-                .get("outputGuard")
-                .map(|v| serde_json::from_value(v.clone()).map_err(de::Error::custom))
-                .transpose()?;
-            reject_unknown_object_fields(object, &["sessions", "outputGuard"])
-                .map_err(de::Error::custom)?;
-            return Ok(McpDetails {
-                mode: None,
-                sessions: Some(sessions),
-                mcp_result: None,
-                server: None,
-                tool: None,
-                error: None,
-                message: None,
-                requested_tool: None,
-                hint_server: None,
-                servers: None,
-                total_tools: None,
-                connected_count: None,
-                disabled_count: None,
-                tools: None,
-                count: None,
-                has_instructions: None,
-                matches: None,
-                query: None,
-                output_guard,
-                length: None,
-            });
+        let has_more = object
+            .get("hasMore")
+            .map(|value| serde_json::from_value::<bool>(value.clone()).map_err(de::Error::custom))
+            .transpose()?;
+        let next_offset = object
+            .get("nextOffset")
+            .map(|value| {
+                serde_json::from_value::<Option<u32>>(value.clone()).map_err(de::Error::custom)
+            })
+            .transpose()?
+            .flatten();
+
+        match (has_more, next_offset) {
+            (None, None) if !object.contains_key("nextOffset") => Ok(Self::None),
+            (Some(false), None) if object.contains_key("nextOffset") => Ok(Self::Complete),
+            (Some(true), Some(next_offset)) => Ok(Self::More { next_offset }),
+            (Some(false), Some(_)) => Err(de::Error::custom(
+                "nextOffset must be null when hasMore is false",
+            )),
+            (Some(false), None) => Err(de::Error::custom(
+                "nextOffset is required when hasMore is false",
+            )),
+            (Some(true), None) => Err(de::Error::custom(
+                "nextOffset is required when hasMore is true",
+            )),
+            (None, _) => Err(de::Error::custom(
+                "hasMore is required when nextOffset is present",
+            )),
         }
-
-        // Fall through: validate through a strict intermediate struct.
-        // The intermediate struct enforces deny_unknown_fields so the
-        // usual mode-based McpDetails wire shape is still strict; only
-        // the sessions-only action shape bypasses it above.
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase", deny_unknown_fields)]
-        struct StrictMcpDetails {
-            mode: McpMode,
-            #[serde(default)]
-            sessions: Option<u32>,
-            #[serde(default)]
-            mcp_result: Option<McpCallResult>,
-            #[serde(default)]
-            server: Option<String>,
-            #[serde(default)]
-            tool: Option<McpTool>,
-            #[serde(default)]
-            error: Option<String>,
-            #[serde(default)]
-            message: Option<String>,
-            #[serde(default)]
-            requested_tool: Option<String>,
-            #[serde(default)]
-            hint_server: Option<String>,
-            #[serde(default)]
-            servers: Option<Vec<McpServerStatus>>,
-            #[serde(default)]
-            total_tools: Option<u32>,
-            #[serde(default)]
-            connected_count: Option<u32>,
-            #[serde(default)]
-            disabled_count: Option<u32>,
-            #[serde(default)]
-            tools: Option<Vec<String>>,
-            #[serde(default)]
-            count: Option<u32>,
-            #[serde(default)]
-            has_instructions: Option<bool>,
-            #[serde(default)]
-            matches: Option<Vec<JsonBlob>>,
-            #[serde(default)]
-            query: Option<String>,
-            #[serde(default)]
-            output_guard: Option<JsonBlob>,
-            #[serde(default)]
-            length: Option<u32>,
-        }
-
-        let strict = StrictMcpDetails::deserialize(value).map_err(de::Error::custom)?;
-        Ok(McpDetails {
-            mode: Some(strict.mode),
-            sessions: strict.sessions,
-            mcp_result: strict.mcp_result,
-            server: strict.server,
-            tool: strict.tool,
-            error: strict.error,
-            message: strict.message,
-            requested_tool: strict.requested_tool,
-            hint_server: strict.hint_server,
-            servers: strict.servers,
-            total_tools: strict.total_tools,
-            connected_count: strict.connected_count,
-            disabled_count: strict.disabled_count,
-            tools: strict.tools,
-            count: strict.count,
-            has_instructions: strict.has_instructions,
-            matches: strict.matches,
-            query: strict.query,
-            output_guard: strict.output_guard,
-            length: strict.length,
-        })
     }
 }
 
@@ -3597,6 +3700,8 @@ pub struct McpServerStatus {
     /// server has not failed since startup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failed_ago: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled: Option<bool>,
 }
 
 /// Generic MCP call payloads are server-defined, so preserve them as raw

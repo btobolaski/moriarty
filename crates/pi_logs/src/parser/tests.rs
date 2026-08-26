@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::*;
 
@@ -442,7 +442,7 @@ fn parse_tool_call(tool_name: &str, arguments: Value) -> ToolCallContent {
     *tool_call
 }
 
-fn parse_mcp_details(content: Vec<Value>, details: Value) -> McpDetails {
+fn parse_mcp_details(content: Vec<Value>, details: Value) -> McpModeDetails {
     let tool_result = parse_tool_result_message(tool_result_message_json(
         "mcp",
         content,
@@ -450,11 +450,33 @@ fn parse_mcp_details(content: Vec<Value>, details: Value) -> McpDetails {
         Some(details),
     ));
 
-    let Some(ToolResultDetails::Mcp(details)) = tool_result.details else {
-        panic!("expected Mcp details")
+    let Some(ToolResultDetails::Mcp(McpDetails::Mode(details))) = tool_result.details else {
+        panic!("expected mode-based Mcp details")
     };
 
     details
+}
+
+fn parse_mcp_call_success(content: Vec<Value>, details: Value) -> McpCallSuccess {
+    let McpModeDetails::Call(details) = parse_mcp_details(content, details) else {
+        panic!("expected call-mode Mcp details")
+    };
+    let McpCallDetails::Success(details) = details else {
+        panic!("expected successful call details")
+    };
+
+    *details
+}
+
+fn parse_mcp_call_error(content: Vec<Value>, details: Value) -> McpModeError {
+    let McpModeDetails::Call(details) = parse_mcp_details(content, details) else {
+        panic!("expected call-mode Mcp details")
+    };
+    let McpCallDetails::Error(details) = details else {
+        panic!("expected failed call details")
+    };
+
+    *details
 }
 
 fn parse_tool_result_message(value: Value) -> ToolResultMessage {
@@ -2248,7 +2270,7 @@ fn contact_supervisor_tool_result_accepts_error_flag() {
 
 #[test]
 fn mcp_tool_result_accepts_call_result() {
-    let details = parse_mcp_details(
+    let details = parse_mcp_call_success(
         vec![json!({
             "type": "text",
             "text": "{\"exit_code\":0,\"stderr\":\"\",\"stdout\":\"working tree clean\\n\"}"
@@ -2272,8 +2294,7 @@ fn mcp_tool_result_accepts_call_result() {
         }),
     );
 
-    assert_eq!(details.mode, Some(McpMode::Call));
-    assert_eq!(details.server.as_deref(), Some("git-read-only"));
+    assert_eq!(details.server, "git-read-only");
     assert_eq!(details.tool.as_ref().map(McpTool::name), Some("status"));
 
     let mcp_result = details.mcp_result.expect("expected mcp result");
@@ -2290,7 +2311,7 @@ fn mcp_tool_result_accepts_call_result() {
 
 #[test]
 fn mcp_tool_result_accepts_arbitrary_structured_content() {
-    let details = parse_mcp_details(
+    let details = parse_mcp_call_success(
         vec![json!({
             "type": "text",
             "text": "resource payload available"
@@ -2332,7 +2353,7 @@ fn mcp_tool_result_accepts_arbitrary_structured_content() {
 
 #[test]
 fn mcp_tool_result_accepts_missing_structured_content() {
-    let details = parse_mcp_details(
+    let details = parse_mcp_call_success(
         vec![
             json!({"type": "text", "text": "stdout: \n\n "}),
             json!({
@@ -2357,11 +2378,10 @@ fn mcp_tool_result_accepts_missing_structured_content() {
         }),
     );
 
-    assert_eq!(details.mode, Some(McpMode::Call));
     let mcp_result = details.mcp_result.expect("expected mcp result");
     assert!(!mcp_result.is_error);
     assert!(mcp_result.structured_content.is_none());
-    assert_eq!(details.server.as_deref(), Some("project-tools"));
+    assert_eq!(details.server, "project-tools");
     assert_eq!(details.tool.as_ref().map(McpTool::name), Some("run_tests"));
 }
 
@@ -2390,13 +2410,11 @@ fn mcp_tool_result_accepts_describe_mode() {
         }),
     );
 
-    assert_eq!(details.mode, Some(McpMode::Describe));
-    assert_eq!(details.server.as_deref(), Some("jj-read-only"));
-    let described = details
-        .tool
-        .as_ref()
-        .and_then(McpTool::described)
-        .expect("expected described tool");
+    let McpModeDetails::Describe(McpDescribeDetails::Success(details)) = details else {
+        panic!("expected successful describe-mode Mcp details")
+    };
+    assert_eq!(details.server, "jj-read-only");
+    let described = details.tool.described().expect("expected described tool");
     assert_eq!(described.name, "jj_read_only_run");
     assert_eq!(described.original_name.as_deref(), Some("run"));
     assert_eq!(described.description, "Runs a jj command");
@@ -2414,7 +2432,7 @@ fn mcp_tool_result_accepts_describe_mode() {
 
 #[test]
 fn mcp_tool_result_accepts_call_failure() {
-    let details = parse_mcp_details(
+    let details = parse_mcp_call_error(
         vec![json!({
             "type": "text",
             "text": "Failed to call tool: MCP error -32600: Project tools not approved"
@@ -2422,17 +2440,19 @@ fn mcp_tool_result_accepts_call_failure() {
         json!({
             "mode": "call",
             "error": "call_failed",
-            "message": "MCP error -32600: Project tools not approved"
+            "message": "MCP error -32600: Project tools not approved",
+            "mcpResult": {"isError": true, "omitted": true},
+            "outputGuard": {"truncated": true}
         }),
     );
 
-    assert_eq!(details.mode, Some(McpMode::Call));
-    assert_eq!(details.error.as_deref(), Some("call_failed"));
+    assert_eq!(details.error, "call_failed");
     assert_eq!(
         details.message.as_deref(),
         Some("MCP error -32600: Project tools not approved")
     );
-    assert!(details.mcp_result.is_none());
+    assert!(details.mcp_result.is_some());
+    assert!(details.output_guard.is_some());
 }
 
 #[test]
@@ -5893,17 +5913,14 @@ fn find_truncation_payload_lands_in_find_during_direct_details_deserialization()
     assert!(matches!(details, ToolResultDetails::Find(_)));
 }
 
-/// McpDetails carries strict `deny_unknown_fields`, so a silent rename
-/// of `servers` / `connectedCount` / `disabledCount` / `totalTools` would leave
-/// callers parsing status responses with empty data. This pins all four plus the
-/// McpServerStatus shape.
+/// MCP mode variants reject unrelated wire fields, so a silent rename of
+/// `servers` / `connectedCount` / `disabledCount` / `totalTools` would fail
+/// rather than silently leave status data empty. This pins that shape.
 #[test]
 fn mcp_tool_result_accepts_status_mode() {
-    let tool_result = parse_tool_result_message(tool_result_message_json(
-        "mcp",
-        vec![json!({"type": "text", "text": "status"})],
-        false,
-        Some(json!({
+    let details = parse_mcp_details(
+        vec![],
+        json!({
             "mode": "status",
             "servers": [
                 {"name": "git-read-only", "status": "connected", "toolCount": 4},
@@ -5912,16 +5929,15 @@ fn mcp_tool_result_accepts_status_mode() {
             "totalTools": 4,
             "connectedCount": 1,
             "disabledCount": 2
-        })),
-    ));
-    let Some(ToolResultDetails::Mcp(details)) = tool_result.details else {
-        panic!("expected Mcp details")
+        }),
+    );
+    let McpModeDetails::Status(details) = details else {
+        panic!("expected status-mode Mcp details")
     };
-    assert_eq!(details.mode, Some(McpMode::Status));
-    assert_eq!(details.total_tools, Some(4));
-    assert_eq!(details.connected_count, Some(1));
+    assert_eq!(details.total_tools, 4);
+    assert_eq!(details.connected_count, 1);
     assert_eq!(details.disabled_count, Some(2));
-    let servers = details.servers.expect("expected servers");
+    let servers = details.servers;
     assert_eq!(servers.len(), 2);
     assert_eq!(servers[0].name, "git-read-only");
     assert_eq!(servers[0].status, "connected");
@@ -5931,6 +5947,19 @@ fn mcp_tool_result_accepts_status_mode() {
     assert_eq!(servers[1].status, "failed");
     assert_eq!(servers[1].tool_count, 0);
     assert_eq!(servers[1].failed_ago, Some(12));
+
+    let McpModeDetails::Status(older_details) = parse_mcp_details(
+        vec![],
+        json!({
+            "mode": "status",
+            "servers": [],
+            "totalTools": 0,
+            "connectedCount": 0
+        }),
+    ) else {
+        panic!("expected legacy status details")
+    };
+    assert_eq!(older_details.disabled_count, None);
 }
 
 /// `mode: "list"` populates `tools` and `count` instead
@@ -5939,35 +5968,31 @@ fn mcp_tool_result_accepts_status_mode() {
 /// the data was on the wire.
 #[test]
 fn mcp_tool_result_accepts_list_mode() {
-    let tool_result = parse_tool_result_message(tool_result_message_json(
-        "mcp",
-        vec![json!({"type": "text", "text": "list"})],
-        false,
-        Some(json!({
+    let details = parse_mcp_details(
+        vec![],
+        json!({
             "mode": "list",
             "server": "git-read-only",
             "tools": ["status", "diff", "log", "show"],
             "count": 4,
             "hasInstructions": true
-        })),
-    ));
-    let Some(ToolResultDetails::Mcp(details)) = tool_result.details else {
-        panic!("expected Mcp details")
+        }),
+    );
+    let McpModeDetails::List(McpListDetails::Success(details)) = details else {
+        panic!("expected successful list-mode Mcp details")
     };
-    assert_eq!(details.mode, Some(McpMode::List));
-    assert_eq!(details.server.as_deref(), Some("git-read-only"));
+    assert_eq!(details.server, "git-read-only");
     assert_eq!(details.has_instructions, Some(true));
     assert_eq!(
         details.tools,
-        Some(vec![
+        vec![
             "status".to_string(),
             "diff".to_string(),
             "log".to_string(),
             "show".to_string()
-        ])
+        ]
     );
-    assert_eq!(details.count, Some(4));
-    assert!(details.servers.is_none());
+    assert_eq!(details.count, 4);
 }
 
 /// `mode: "call"` errors of kind `tool_not_found`
@@ -5975,56 +6000,89 @@ fn mcp_tool_result_accepts_list_mode() {
 /// attach `hintServer` to point the caller at the right server namespace.
 #[test]
 fn mcp_tool_result_accepts_tool_not_found_error() {
-    let tool_result = parse_tool_result_message(tool_result_message_json(
-        "mcp",
-        vec![json!({"type": "text", "text": "tool not found"})],
-        true,
-        Some(json!({
+    let details = parse_mcp_call_error(
+        vec![],
+        json!({
             "mode": "call",
             "server": "git-read-only",
             "tool": "rebase",
             "error": "tool_not_found",
             "message": "Server 'git-read-only' does not expose tool 'rebase'",
             "requestedTool": "rebase",
-            "hintServer": "git-read-only"
-        })),
-    ));
-    let Some(ToolResultDetails::Mcp(details)) = tool_result.details else {
-        panic!("expected Mcp details")
-    };
-    assert_eq!(details.mode, Some(McpMode::Call));
+            "hintServer": "git-read-only",
+            "suggestions": ["git_read_only_rebase"]
+        }),
+    );
     assert_eq!(details.server.as_deref(), Some("git-read-only"));
-    assert_eq!(details.tool.as_ref().map(McpTool::name), Some("rebase"));
-    assert_eq!(details.error.as_deref(), Some("tool_not_found"));
+    assert_eq!(details.tool.as_deref().map(McpTool::name), Some("rebase"));
+    assert_eq!(details.error, "tool_not_found");
     assert_eq!(details.requested_tool.as_deref(), Some("rebase"));
     assert_eq!(details.hint_server.as_deref(), Some("git-read-only"));
-    // This fixture models the tool-not-found shape, which should not carry a
-    // nested call result payload.
-    assert!(details.mcp_result.is_none());
+    assert_eq!(
+        details.suggestions,
+        Some(vec!["git_read_only_rebase".to_string()])
+    );
 }
 
-/// `mode: "search"` populates `matches` and `query` in addition to
-/// `count`, departing from the list/status fields.
+/// `mode: "search"` owns its result and pagination fields, so a field
+/// rename cannot silently move those values into a different MCP mode.
 #[test]
 fn mcp_tool_result_accepts_search_mode() {
-    let tool_result = parse_tool_result_message(tool_result_message_json(
-        "mcp",
-        vec![json!({"type": "text", "text": "search"})],
-        false,
-        Some(json!({
+    let McpModeDetails::Search(McpSearchDetails::Success(details)) = parse_mcp_details(
+        vec![],
+        json!({
             "mode": "search",
             "matches": [],
             "count": 0,
-            "query": "write"
-        })),
-    ));
-    let Some(ToolResultDetails::Mcp(details)) = tool_result.details else {
-        panic!("expected Mcp details")
+            "query": "write",
+            "hasMore": true,
+            "nextOffset": 10
+        }),
+    ) else {
+        panic!("expected successful search-mode Mcp details")
     };
-    assert_eq!(details.mode, Some(McpMode::Search));
-    assert_eq!(details.query.as_deref(), Some("write"));
-    assert_eq!(details.matches.as_deref(), Some(&[][..]));
-    assert_eq!(details.count, Some(0));
+    assert_eq!(details.query, "write");
+    assert!(details.matches.is_empty());
+    assert_eq!(details.count, 0);
+    assert_eq!(details.pagination, McpPagination::More { next_offset: 10 });
+}
+
+#[test]
+fn mcp_pagination_round_trips_valid_states() {
+    for (label, wire, expected) in [
+        ("none", json!({}), McpPagination::None),
+        (
+            "complete",
+            json!({"hasMore": false, "nextOffset": null}),
+            McpPagination::Complete,
+        ),
+        (
+            "more",
+            json!({"hasMore": true, "nextOffset": 10}),
+            McpPagination::More { next_offset: 10 },
+        ),
+    ] {
+        let parsed = serde_json::from_value::<McpPagination>(wire.clone())
+            .expect("valid pagination should parse");
+        assert_eq!(parsed, expected, "{label}");
+        assert_eq!(
+            serde_json::to_value(expected).expect("pagination should serialize"),
+            wire,
+            "{label}"
+        );
+    }
+}
+
+#[test]
+fn mcp_pagination_rejects_inconsistent_states() {
+    for wire in [
+        json!({"hasMore": false, "nextOffset": 10}),
+        json!({"hasMore": true, "nextOffset": null}),
+        json!({"hasMore": false}),
+        json!({"nextOffset": null}),
+    ] {
+        assert!(serde_json::from_value::<McpPagination>(wire).is_err());
+    }
 }
 
 /// `mode: "instructions"` carries `length` (the length of the server
@@ -6032,45 +6090,85 @@ fn mcp_tool_result_accepts_search_mode() {
 /// silent rename cannot quietly drop production data during parsing.
 #[test]
 fn mcp_tool_result_accepts_instructions_mode() {
-    let tool_result = parse_tool_result_message(tool_result_message_json(
-        "mcp",
-        vec![json!({"type": "text", "text": "instructions"})],
-        false,
-        Some(json!({
+    let details = parse_mcp_details(
+        vec![],
+        json!({
             "mode": "instructions",
             "server": "jj-read-only",
             "length": 152
-        })),
-    ));
-    let Some(ToolResultDetails::Mcp(details)) = tool_result.details else {
-        panic!("expected Mcp details")
+        }),
+    );
+    let McpModeDetails::Instructions(McpInstructionsDetails::Success(details)) = details else {
+        panic!("expected successful instructions-mode Mcp details")
     };
-    assert_eq!(details.mode, Some(McpMode::Instructions));
-    assert_eq!(details.server.as_deref(), Some("jj-read-only"));
-    assert_eq!(details.length, Some(152));
+    assert_eq!(details.server, "jj-read-only");
+    assert_eq!(details.length, 152);
 }
 
-/// `mode: "auth-start"` and `"auth-complete"` use explicit
-/// `#[serde(rename)]` overrides because the enum's `rename_all =
-/// "lowercase"` would otherwise produce `authstart`/`authcomplete`.
-/// Pin both wire names so a dropped attribute cannot silently change
-/// the accepted variant and reject real pi MCP auth-flow log lines.
+/// `mode: "auth-start"` and `"auth-complete"` use explicit wire tags because
+/// their hyphens cannot be derived from the Rust variant names. Pin both so a
+/// dropped tag cannot reject real MCP auth-flow log lines.
 #[test]
 fn mcp_tool_result_accepts_auth_modes() {
-    for (wire, expected) in [
-        ("auth-start", McpMode::AuthStart),
-        ("auth-complete", McpMode::AuthComplete),
+    for (wire, payload) in [
+        (
+            "auth-start",
+            json!({"mode": "auth-start", "server": "github", "authenticated": true}),
+        ),
+        (
+            "auth-complete",
+            json!({"mode": "auth-complete", "server": "github", "authenticated": true}),
+        ),
     ] {
-        let tool_result = parse_tool_result_message(tool_result_message_json(
-            "mcp",
-            vec![json!({"type": "text", "text": wire})],
-            false,
-            Some(json!({"mode": wire, "server": "github"})),
-        ));
-        let Some(ToolResultDetails::Mcp(details)) = tool_result.details else {
-            panic!("expected Mcp details")
-        };
-        assert_eq!(details.mode, Some(expected));
+        match (wire, parse_mcp_details(vec![], payload)) {
+            ("auth-start", McpModeDetails::AuthStart(McpAuthStartDetails::Success(_)))
+            | ("auth-complete", McpModeDetails::AuthComplete(McpAuthCompleteDetails::Success(_))) =>
+                {}
+            (_, details) => panic!("unexpected authentication details: {details:?}"),
+        }
+    }
+}
+
+#[test]
+fn mcp_tool_result_accepts_mode_errors() {
+    for (mode, payload) in [
+        (
+            "connect",
+            json!({"mode": "connect", "error": "connect_failed"}),
+        ),
+        (
+            "describe",
+            json!({"mode": "describe", "error": "tool_not_found", "requestedTool": "missing", "suggestions": ["known"]}),
+        ),
+        (
+            "instructions",
+            json!({"mode": "instructions", "error": "no_instructions"}),
+        ),
+        (
+            "list",
+            json!({"mode": "list", "error": "not_found", "tools": [], "count": 0, "hasInstructions": false}),
+        ),
+        ("search", json!({"mode": "search", "error": "empty_query"})),
+        (
+            "auth-start",
+            json!({"mode": "auth-start", "error": "oauth_not_supported"}),
+        ),
+        (
+            "auth-complete",
+            json!({"mode": "auth-complete", "error": "not_authenticated"}),
+        ),
+    ] {
+        match (mode, parse_mcp_details(vec![], payload)) {
+            ("connect", McpModeDetails::Connect(_))
+            | ("describe", McpModeDetails::Describe(McpDescribeDetails::Error(_)))
+            | ("instructions", McpModeDetails::Instructions(McpInstructionsDetails::Error(_)))
+            | ("list", McpModeDetails::List(McpListDetails::Error(_)))
+            | ("search", McpModeDetails::Search(McpSearchDetails::Error(_)))
+            | ("auth-start", McpModeDetails::AuthStart(McpAuthStartDetails::Error(_)))
+            | ("auth-complete", McpModeDetails::AuthComplete(McpAuthCompleteDetails::Error(_))) => {
+            }
+            (_, details) => panic!("unexpected MCP error details: {details:?}"),
+        }
     }
 }
 
@@ -6315,9 +6413,11 @@ fn mcp_details_sessions_only_accepts_output_guard() {
         "outputGuard": {"truncated": true, "originalBytes": 100000}
     }))
     .expect("sessions-only shape with outputGuard should parse");
-    assert_eq!(details.sessions, Some(1));
+    let McpDetails::SessionsOnly(details) = details else {
+        panic!("expected sessions-only Mcp details")
+    };
+    assert_eq!(details.sessions, 1);
     assert!(details.output_guard.is_some());
-    assert!(details.mode.is_none());
 }
 
 #[test]
@@ -6461,28 +6561,23 @@ fn mcp_tool_result_breadcrumb_vs_error_dispatch() {
 
 #[test]
 fn mcp_details_serialize_hint_server_as_camel_case() {
-    let value = serde_json::to_value(McpDetails {
-        mode: Some(McpMode::Call),
-        sessions: None,
-        mcp_result: None,
-        server: Some("git-read-only".to_string()),
-        tool: Some(McpTool::Name("rebase".to_string())),
-        error: Some("tool_not_found".to_string()),
-        message: Some("missing tool".to_string()),
-        requested_tool: Some("rebase".to_string()),
-        hint_server: Some("project-tools".to_string()),
-        servers: None,
-        total_tools: None,
-        connected_count: None,
-        disabled_count: None,
-        tools: None,
-        count: None,
-        has_instructions: None,
-        matches: None,
-        query: None,
-        output_guard: None,
-        length: None,
-    })
+    let value = serde_json::to_value(McpDetails::Mode(McpModeDetails::Call(
+        McpCallDetails::Error(Box::new(McpModeError {
+            error: "tool_not_found".to_string(),
+            server: None,
+            message: Some("missing tool".to_string()),
+            requested_tool: Some("rebase".to_string()),
+            hint_server: Some("project-tools".to_string()),
+            tool: None,
+            suggestions: None,
+            tools: None,
+            count: None,
+            has_instructions: None,
+            status: None,
+            mcp_result: None,
+            output_guard: None,
+        })),
+    )))
     .expect("serialize mcp details");
 
     assert_eq!(value.get("hintServer"), Some(&Value::from("project-tools")));
@@ -6497,63 +6592,95 @@ fn mcp_details_accepts_sessions_only_ui_messages_shape() {
     }))
     .expect("sessions-only shape should parse");
 
-    assert_eq!(details.mode, None);
-    assert_eq!(details.sessions, Some(3));
-    assert!(details.mcp_result.is_none());
-    assert!(details.server.is_none());
+    let McpDetails::SessionsOnly(details) = details else {
+        panic!("expected sessions-only Mcp details")
+    };
+    assert_eq!(details.sessions, 3);
+    assert!(details.output_guard.is_none());
+}
+
+#[test]
+fn mcp_tool_result_accepts_initialization_error() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "mcp",
+        vec![],
+        false,
+        Some(json!({"error": "init_timeout", "timeoutMs": 1_000})),
+    ));
+    let Some(ToolResultDetails::McpInitializationError(details)) = tool_result.details else {
+        panic!("expected MCP initialization error")
+    };
+    assert_eq!(details.error, "init_timeout");
+    assert_eq!(details.timeout_ms, Some(1_000));
 }
 
 #[test]
 fn mcp_details_sessions_only_shape_rejects_unknown_fields() {
-    let err = serde_json::from_value::<McpDetails>(json!({
+    serde_json::from_value::<McpDetails>(json!({
         "sessions": 3,
         "unexpected": true
     }))
     .expect_err("sessions-only shape should reject unknown fields");
-
-    assert!(
-        err.to_string().contains("unknown field"),
-        "unexpected error: {err}"
-    );
 }
 
 #[test]
-fn mcp_details_normal_mode_accepts_sessions_field() {
+fn mcp_details_accepts_call_success_shape() {
     let details: McpDetails = serde_json::from_value(json!({
         "mode": "call",
-        "sessions": 2
+        "server": "project-tools",
+        "tool": "run_tests"
     }))
-    .expect("mode-based shape with sessions should parse");
+    .expect("call success shape should parse");
 
-    assert_eq!(details.mode, Some(McpMode::Call));
-    assert_eq!(details.sessions, Some(2));
+    assert!(matches!(
+        details,
+        McpDetails::Mode(McpModeDetails::Call(call))
+            if matches!(call, McpCallDetails::Success(_))
+    ));
+}
+
+#[test]
+fn mcp_details_rejects_fields_from_other_modes() {
+    for details in [
+        json!({"mode": "call", "hasMore": true, "nextOffset": 10}),
+        json!({
+            "mode": "status",
+            "servers": [],
+            "totalTools": 0,
+            "connectedCount": 0,
+            "disabledCount": 0,
+            "suggestions": []
+        }),
+        json!({
+            "mode": "search",
+            "matches": [],
+            "count": 0,
+            "query": "query",
+            "hasMore": false,
+            "nextOffset": null,
+            "unexpected": true
+        }),
+    ] {
+        serde_json::from_value::<McpDetails>(details)
+            .expect_err("mode-specific fields should be rejected");
+    }
 }
 
 #[test]
 fn mcp_details_normal_mode_rejects_unknown_fields() {
-    let err = serde_json::from_value::<McpDetails>(json!({
+    serde_json::from_value::<McpDetails>(json!({
         "mode": "call",
         "garbage": true
     }))
     .expect_err("mode-based shape should reject unknown fields");
-
-    assert!(
-        err.to_string().contains("unknown field"),
-        "unexpected error: {err}"
-    );
 }
 
 #[test]
 fn mcp_details_missing_mode_without_sessions_is_rejected() {
-    let err = serde_json::from_value::<McpDetails>(json!({
+    serde_json::from_value::<McpDetails>(json!({
         "server": "git"
     }))
     .expect_err("no-mode no-sessions shape should be rejected");
-
-    assert!(
-        err.to_string().contains("missing field"),
-        "unexpected error: {err}"
-    );
 }
 
 /// Pins the routed async-only fields on subagent results.

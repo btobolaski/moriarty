@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
 use pi_logs::{
-    CustomMessagePayload, CustomPayload, PiLogLine, RoleMessage, ToolResultDetails,
-    WebSearchResultsPayload, parse_file,
+    CustomMessagePayload, CustomPayload, McpCallDetails, McpDetails, McpModeDetails, PiLogLine,
+    RoleMessage, ToolResultDetails, WebSearchResultsPayload, parse_file,
 };
 
 fn fixture_path(relative: &str) -> PathBuf {
@@ -44,6 +44,12 @@ fn parse_recent_fixture_file() {
     };
     let Some(ToolResultDetails::Mcp(details)) = &details_message.details else {
         panic!("expected mcp tool result details")
+    };
+    let McpDetails::Mode(McpModeDetails::Call(details)) = details else {
+        panic!("expected call-mode mcp tool result details")
+    };
+    let McpCallDetails::Error(details) = details else {
+        panic!("expected failed mcp tool result details")
     };
     assert_eq!(details.hint_server.as_deref(), Some("project-tools"));
 

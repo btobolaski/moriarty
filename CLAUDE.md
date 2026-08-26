@@ -790,13 +790,14 @@ dedicated strict payloads so misspelled locality or direction fields cannot sile
 Also, do not force `rename_all = "camelCase"` onto parser structs whose upstream wire schema is not camelCase. Preserve
 the on-disk protocol exactly, even when that means snake_case fields like `GitReadOnlyArgs.project_dir`.
 
-1. **`serde(flatten)` of an internally-tagged enum**: when a struct flattens an enum that uses `#[serde(tag = "...")]`
-   without a `content` field, the inner tag appears at the same JSON level as the outer struct's fields and serde's
-   flatten codegen does not register it as claimed; a strict outer struct then rejects it as unknown at runtime.
-   `WebSearchResultsData` is the only struct in this category. It keeps the flattened internally tagged wire shape, but
-   restores strict outer-key validation with a manual deserializer. _Adjacently_ tagged flatten targets (those with both
-   `tag` and `content`) do not hit this collision, so structs like `CustomLine` and `CustomMessageLine` keep derived
-   `deny_unknown_fields` handling. Each exception must carry an inline comment naming the limitation.
+1. **`serde(flatten)` limitations**: `deny_unknown_fields` cannot be combined with a flattened internally-tagged enum
+   because the inner tag appears at the outer level and serde does not register it as claimed; a strict outer struct then
+   rejects it at runtime. `WebSearchResultsData` keeps that wire shape but restores strict outer-key validation with a
+   manual deserializer. The same limitation applies to `McpSearchDetails`' flattened `McpPagination`: its custom
+   deserializer rejects every flattened key except `hasMore` and `nextOffset`. _Adjacently_ tagged flatten targets
+   (those with both `tag` and `content`) do not hit this collision, so structs like `CustomLine` and
+   `CustomMessageLine` keep derived `deny_unknown_fields` handling. Each exception must carry an inline comment naming
+   the limitation.
 2. **Corrupt-stream tolerance**: tool-argument structs (e.g. `EditArgs`, `EditReplacement`, `GrepArgs`) deliberately
    omit it to tolerate completed-but-corrupted or hallucinated assistant streams that emit malformed sibling keys. The
    same goal is also met at finer granularity by field-level aliases (for example `FindArgs.limit` accepting malformed
