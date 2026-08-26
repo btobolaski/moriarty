@@ -24,6 +24,15 @@ security hooks for command validation.
   - **Bash rules**: Fine-grained command validation with pattern matching, modification, and argument filtering
   - See [BASH_RULES.md](./BASH_RULES.md) for complete configuration guide
 
+## Security
+
+While tool call permissioning is labeled as a security control, it should be treated as a very porous control. As long
+as you don't add a rule that allows, it will prevent an agent from doing something like `rm -rf /` or executing a binary
+that it downloads from somewhere. It will not protect you from actively hostile agent. An example of this is that you're
+very likely to have a rule allow the agent to write tests without manual approval. All the agent needs to do is right a
+test to do the thing that it wants to do and then the rules do not provide protection. It is better to think of the
+rules as guidance on what the agent is allowed to do.
+
 ## Requirements
 
 ### Testing
