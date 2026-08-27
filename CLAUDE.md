@@ -193,16 +193,15 @@ test in a separate process, making this safe and preventing tests from clobberin
   flags, `bashFirst`/`steerOnly` fields on the previously empty `auto_mode_exit` attachment (`AutoModeExit`, echoing the
   flags in effect when auto mode ended; like `AutoMode` it became an untagged enum over its two mutually exclusive
   shapes — `AutoModeExitBare` and `AutoModeExitBehaviorFlags` — rather than sibling `Option` fields, so a half-present
-  payload the wire format never produces is not representable), a `source_uuid`
-  field on `queued_command` attachments (`QueuedCommand`, the message a queued command originated from; emitted
-  snake_case unlike its camelCase siblings, so the rename is spelled out on the field), a `turnCompanion` field on user
-  turns (`UserLogLine`, marking a meta turn that accompanies the turn it was injected alongside — e.g. an invoked
-  skill's instructions — rather than standing on its own), a `classifierMetaLines` field on user turns (`UserLogLine`,
-  the context Claude Code hands its auto-mode safety classifier; logged as an embedded newline-terminated JSON *string*
-  rather than a nested object and kept an opaque `String` because the payload is the classifier's own undocumented,
-  volatile schema and nothing downstream reads it), and an `away_summary` system subtype (`AwaySummary`, the
-  recap Claude Code writes while the user is away from the session; shaped like `SystemLogInformational` minus its
-  `level`) (all added in Claude Code 2.1.238+)
+  payload the wire format never produces is not representable), a `source_uuid` field on `queued_command` attachments
+  (`QueuedCommand`, the message a queued command originated from; emitted snake_case unlike its camelCase siblings, so
+  the rename is spelled out on the field), a `turnCompanion` field on user turns (`UserLogLine`, marking a meta turn
+  that accompanies the turn it was injected alongside — e.g. an invoked skill's instructions — rather than standing on
+  its own), a `classifierMetaLines` field on user turns (`UserLogLine`, the context Claude Code hands its auto-mode
+  safety classifier; logged as an embedded newline-terminated JSON _string_ rather than a nested object and kept an
+  opaque `String` because the payload is the classifier's own undocumented, volatile schema and nothing downstream reads
+  it), and an `away_summary` system subtype (`AwaySummary`, the recap Claude Code writes while the user is away from the
+  session; shaped like `SystemLogInformational` minus its `level`) (all added in Claude Code 2.1.238+)
 - Also owns the structured view of the raw `model` string via `model::Model { family, version }` plus `ModelFamily` and
   `ModelVersion`. Both `cost_analyzer` (for pricing) and `moriarty::api_pricing` (for grouping/display) consume this one
   parser so family/version classification is not duplicated across crates. The parser preserves capability-decorated raw
@@ -389,20 +388,22 @@ with warnings, while explicit missing paths and having no available source are e
     direction plus whether its matched redirect rule allowed or denied it into the compatibility trace. Compiled rules
     own shared match metadata so repeated evaluations do not rebuild explanation strings.
   - **Configured path-alias preprocessing**: the optional top-level `bash_path_aliases` ordered set names trusted shell
-    variables that may be bound by an exact leading `NAME=/literal/path;` declaration or newline-terminated equivalent.
-    `command_split` expands parser-identified plain `$NAME`/`${NAME}` references in either unquoted or ordinary
-    double-quoted words, including `"$P/runtime/mocks.js"` and `"$P"/runtime/mocks.js`, then applies quote-aware cwd
-    stripping. Single-quoted `'$P'` remains literal; localized `$"…"`, indirect, dynamic, and other quoted or escaped
-    compositions stay unsupported and cap Allow at Ask. The declaration is analysis metadata only after a later
-    supported reference consumes it. Unsupported declarations/references and command-position expansion remain leaves
-    with an independent Allow-to-Ask confirmation cap, so later Denies still win. Rather than model per-builtin mutation
-    targets, an assignment invalidates all aliases only when a binding is active or it targets a configured alias;
-    unrelated standalone environment assignments remain eligible for normal rules. Dynamic command names, wrappers,
-    `exec`, and recognized shell-state builtins (including `shopt`, `alias`, and `unalias`) invalidate all active
-    aliases and become redirect path-context barriers. This trades extra prompts for a small fail-closed implementation
-    without retaining stale bindings. Config deserialization validates shell identifiers and rejects the fixed
-    shell-control names before any tool rule can short-circuit Bash analysis. No aliases is the omitted/hash-compatible
-    default; configured aliases are trusted policy and must not be application/tool behavior variables.
+    variables that may be bound by an exact leading absolute or cwd-relative `NAME=literal/path;` declaration or
+    newline-terminated equivalent. Relative values must be non-empty, require a recorded cwd, and cannot contain a
+    complete `..` component; `command_split` joins accepted values lexically to cwd without filesystem inspection, then
+    expands parser-identified plain `$NAME`/`${NAME}` references in either unquoted or ordinary double-quoted words,
+    including `"$P/runtime/mocks.js"` and `"$P"/runtime/mocks.js`, then applies quote-aware cwd stripping. Single-quoted
+    `'$P'` remains literal; localized `$"…"`, indirect, dynamic, and other quoted or escaped compositions stay
+    unsupported and cap Allow at Ask. The declaration is analysis metadata only after a later supported reference
+    consumes it. Unsupported declarations/references and command-position expansion remain leaves with an independent
+    Allow-to-Ask confirmation cap, so later Denies still win. Rather than model per-builtin mutation targets, an
+    assignment invalidates all aliases only when a binding is active or it targets a configured alias; unrelated
+    standalone environment assignments remain eligible for normal rules. Dynamic command names, wrappers, `exec`, and
+    recognized shell-state builtins (including `shopt`, `alias`, and `unalias`) invalidate all active aliases and become
+    redirect path-context barriers. This trades extra prompts for a small fail-closed implementation without retaining
+    stale bindings. Config deserialization validates shell identifiers and rejects the fixed shell-control names before
+    any tool rule can short-circuit Bash analysis. No aliases is the omitted/hash-compatible default; configured aliases
+    are trusted policy and must not be application/tool behavior variables.
   - **Component-scoped redirect policy**: command rules match a cwd-normalized view with every parsed input and output
     redirect removed, with first-match-wins among ordinary actions. Redirect-only leaves retain their full syntax so
     endpoint policy alone cannot authorize shell execution. Every endpoint (`<`, `<&`, `>`, `>>`, `>|`, `&>`, `&>>`,
@@ -794,13 +795,12 @@ Also, do not force `rename_all = "camelCase"` onto parser structs whose upstream
 the on-disk protocol exactly, even when that means snake_case fields like `GitReadOnlyArgs.project_dir`.
 
 1. **`serde(flatten)` limitations**: `deny_unknown_fields` cannot be combined with a flattened internally-tagged enum
-   because the inner tag appears at the outer level and serde does not register it as claimed; a strict outer struct then
-   rejects it at runtime. `WebSearchResultsData` keeps that wire shape but restores strict outer-key validation with a
-   manual deserializer. The same limitation applies to `McpSearchDetails`' flattened `McpPagination`: its custom
+   because the inner tag appears at the outer level and serde does not register it as claimed; a strict outer struct
+   then rejects it at runtime. `WebSearchResultsData` keeps that wire shape but restores strict outer-key validation
+   with a manual deserializer. The same limitation applies to `McpSearchDetails`' flattened `McpPagination`: its custom
    deserializer rejects every flattened key except `hasMore` and `nextOffset`. _Adjacently_ tagged flatten targets
-   (those with both `tag` and `content`) do not hit this collision, so structs like `CustomLine` and
-   `CustomMessageLine` keep derived `deny_unknown_fields` handling. Each exception must carry an inline comment naming
-   the limitation.
+   (those with both `tag` and `content`) do not hit this collision, so structs like `CustomLine` and `CustomMessageLine`
+   keep derived `deny_unknown_fields` handling. Each exception must carry an inline comment naming the limitation.
 2. **Corrupt-stream tolerance**: tool-argument structs (e.g. `EditArgs`, `EditReplacement`, `GrepArgs`) deliberately
    omit it to tolerate completed-but-corrupted or hallucinated assistant streams that emit malformed sibling keys. The
    same goal is also met at finer granularity by field-level aliases (for example `FindArgs.limit` accepting malformed

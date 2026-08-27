@@ -821,6 +821,14 @@ fn redirect_resolution_enforces_locality_for_aliases_and_symlinks() {
         ],
     );
 
+    let relative_alias_command = "P=.; echo hi > $P/reports/out";
+    let command_only_engine =
+        make_engine_with_aliases(vec![allow_rule("allow-echo", r"^echo($|\s)")], &["P"]);
+    assert_eq!(
+        evaluation_result(&command_only_engine, relative_alias_command, cwd, None),
+        asked("allow-echo")
+    );
+
     let alias_engine = make_engine_with_aliases(
         vec![
             allow_rule("allow-echo", r"^echo($|\s)"),
@@ -828,14 +836,14 @@ fn redirect_resolution_enforces_locality_for_aliases_and_symlinks() {
         ],
         &["P"],
     );
-    let alias = evaluate(
-        &alias_engine,
-        &format!("P={cwd}; echo hi > $P/reports/out"),
-        cwd,
-        None,
-    );
-    assert_eq!(alias.rule_result(), allowed("allow-echo"));
-    assert_eq!(alias.contributors(), ["allow-echo", "allow-local"]);
+    for command in [
+        format!("P={cwd}; echo hi > $P/reports/out"),
+        relative_alias_command.to_string(),
+    ] {
+        let alias = evaluate(&alias_engine, &command, cwd, None);
+        assert_eq!(alias.rule_result(), allowed("allow-echo"));
+        assert_eq!(alias.contributors(), ["allow-echo", "allow-local"]);
+    }
 
     #[cfg(unix)]
     {
@@ -854,6 +862,10 @@ fn redirect_resolution_enforces_locality_for_aliases_and_symlinks() {
         assert_eq!(
             evaluation_result(&engine, "echo hi > link/out", cwd, None),
             allowed("allow-echo")
+        );
+        assert_eq!(
+            evaluation_result(&alias_engine, "P=.; echo hi > $P/link/out", cwd, None),
+            asked("allow-echo")
         );
     }
 }
@@ -981,6 +993,10 @@ fn configured_alias_paths_match_exact_relative_rules() {
         "/work/project",
         [
             (
+                "P=node_modules/pkg; rg needle $P/output.d.ts",
+                allowed("allow-rg-project-file"),
+            ),
+            (
                 "P=/work/project/node_modules/pkg; rg needle $P/output.d.ts",
                 allowed("allow-rg-project-file"),
             ),
@@ -1028,6 +1044,7 @@ fn configured_aliases_preserve_policy_boundaries() {
         &engine,
         "/work/project",
         [
+            ("P=../secret; echo $P/file", asked("allow-echo")),
             (
                 r#"P=/work/project; cat "$P"/src/."."/."."/."."/etc/passwd"#,
                 asked("ask-cat-absolute"),

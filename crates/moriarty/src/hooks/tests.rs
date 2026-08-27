@@ -2740,6 +2740,10 @@ async fn configured_path_alias_supports_ordinary_but_not_localized_quotes() {
     let config = format!("bash_path_aliases = [\"P\"]\n{PATH_ALIAS_READ_RULES}");
     for (command, allowed) in [
         (
+            "P=node_modules/.pnpm/@scope+pkg@1.0.0/node_modules/pkg; rg needle $P/output.d.ts | head -5; rg other \"${P}/runtime.d.ts\" | head -5",
+            true,
+        ),
+        (
             "P=/work/project/node_modules/.pnpm/@scope+pkg@1.0.0/node_modules/pkg; rg needle $P/output.d.ts | head -5; rg other \"${P}/runtime.d.ts\" | head -5",
             true,
         ),

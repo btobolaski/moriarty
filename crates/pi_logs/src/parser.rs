@@ -3944,6 +3944,8 @@ impl<'de> Deserialize<'de> for JsonValue {
 
 /// The producer's `mode` selects an incompatible detail shape, so the parser
 /// keeps cached and full-scan state from being combined accidentally.
+// Boxing the public wire-model variant would be a breaking API change for a cold parser path.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "camelCase", deny_unknown_fields)]
 pub enum LensDiagnosticsDetails {

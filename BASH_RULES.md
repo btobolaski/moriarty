@@ -313,9 +313,10 @@ P=/work/project/node_modules/.pnpm/@pulumi+pulumi@3.247.0/node_modules/@pulumi/p
 ```
 
 With `cwd = /work/project`, the `rg` leaf above is matched as `rg -n "isUnknown" node_modules/.pnpm/.../output.d.ts`,
-exactly like the equivalent command containing the literal absolute path. The binding itself grants no permission: every
-expanded leaf still has to match the existing ordered rules, out-of-cwd paths remain absolute, and a path containing
-`..` is not presented as a safe relative path.
+exactly like the equivalent command containing the literal absolute path. A relative declaration such as
+`P=node_modules/.pnpm/...` is first rooted lexically at the recorded cwd, then follows the same expansion and
+normalization path. The binding itself grants no permission: every expanded leaf still has to match the existing ordered
+rules, out-of-cwd paths remain absolute, and a path containing `..` is not presented as a safe relative path.
 
 ### Trusted Policy
 
@@ -335,7 +336,12 @@ A binding is recognized only when all of these conditions hold:
 - it contains exactly one scalar, non-append assignment and no command, redirect, pipeline peer, `!`, `time`, `&&`,
   `||`, or background `&` separator;
 - its name appears in `bash_path_aliases`;
-- its unquoted value is an absolute literal matching `^/[A-Za-z0-9/._@+,:=%-]*$`.
+- its unquoted value is either an absolute literal matching `^/[A-Za-z0-9/._@+,:=%-]*$`, or a non-empty relative literal
+  matching `^[A-Za-z0-9/._@+,:=%-]+$` with no slash-delimited `..` component.
+
+A relative value requires a non-empty recorded cwd and is joined to it lexically before expansion. Moriarty does not
+canonicalize the declaration, inspect the filesystem, or resolve symlinks at this stage; redirect endpoint policy still
+performs its existing filesystem-safe resolution later. With no cwd, a relative declaration remains unsupported.
 
 Later words may use one plain `$NAME` or `${NAME}` expansion with literal text around it, either unquoted or inside
 ordinary double quotes. Supported forms include `$P/output.d.ts`, `--file=$P/input`, `"$P/runtime/mocks.js"`, and

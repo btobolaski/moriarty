@@ -282,7 +282,7 @@ fn collect_list_item(
     leaves: &mut Vec<LeafCommand>,
 ) -> Result<(), SplitBail> {
     let and_or_list = &item.0;
-    if let Some((simple, name, value)) = supported_declaration(item, chars, state) {
+    if let Some((simple, name, value)) = supported_declaration(item, chars, cwd, state) {
         let declaration_id = state.next_declaration_id;
         state.next_declaration_id += 1;
 
@@ -339,6 +339,7 @@ fn collect_list_item(
 fn supported_declaration<'a>(
     item: &'a CompoundListItem,
     chars: &[char],
+    cwd: &str,
     state: &AliasState,
 ) -> Option<(&'a SimpleCommand, String, String)> {
     if !state.declarations_allowed
@@ -370,13 +371,13 @@ fn supported_declaration<'a>(
         .iter()
         .collect();
     if source != format!("{name}={}", value.value)
-        || !is_literal_absolute_path(&value.value)
         || !has_explicit_sequence_terminator(assignment, chars)
     {
         return None;
     }
+    let value = resolve_literal_alias_value(&value.value, cwd)?;
 
-    Some((simple, name.clone(), value.value.clone()))
+    Some((simple, name.clone(), value))
 }
 
 fn sole_assignment(simple: &SimpleCommand) -> Option<&Assignment> {
@@ -393,11 +394,21 @@ fn sole_assignment(simple: &SimpleCommand) -> Option<&Assignment> {
     }
 }
 
-fn is_literal_absolute_path(value: &str) -> bool {
-    value.starts_with('/')
-        && value.bytes().all(|byte| {
-            byte == b'/' || byte.is_ascii_alphanumeric() || b"._@+,:=%-".contains(&byte)
-        })
+fn resolve_literal_alias_value(value: &str, cwd: &str) -> Option<String> {
+    if !value
+        .bytes()
+        .all(|byte| byte == b'/' || byte.is_ascii_alphanumeric() || b"._@+,:=%-".contains(&byte))
+    {
+        return None;
+    }
+    if value.starts_with('/') {
+        return Some(value.to_string());
+    }
+    if value.is_empty() || cwd.is_empty() || has_parent_component(value) {
+        return None;
+    }
+
+    Path::new(cwd).join(value).to_str().map(ToOwned::to_owned)
 }
 
 fn has_explicit_sequence_terminator(assignment: &Assignment, chars: &[char]) -> bool {
@@ -2151,11 +2162,74 @@ mod tests {
     }
 
     #[test]
+    fn relative_declarations_are_cwd_rooted_lexically() {
+        let leaves = leaves_with_aliases(
+            "R=users/brendan/graphical/moriarty/tool_rules.toml; wc -l $R",
+            "/Users/brendan/.flk",
+            &["R"],
+        );
+        assert_eq!(leaves.len(), 1);
+        assert_eq!(leaves[0].original, "wc -l $R");
+        assert_eq!(
+            leaves[0].alias_expanded.as_deref(),
+            Some("wc -l /Users/brendan/.flk/users/brendan/graphical/moriarty/tool_rules.toml")
+        );
+        assert_eq!(
+            leaves[0].match_text,
+            "wc -l users/brendan/graphical/moriarty/tool_rules.toml"
+        );
+        assert_eq!(
+            leaves[0].bindings,
+            [AliasBinding {
+                name: "R".to_string(),
+                value: "/Users/brendan/.flk/users/brendan/graphical/moriarty/tool_rules.toml"
+                    .to_string(),
+            }]
+        );
+        assert!(leaves[0].requires_confirmation.is_none());
+
+        for (command, cwd, expected_binding, expected_match) in [
+            ("R=.; pwd $R", "/work/project", "/work/project/.", "pwd ."),
+            (
+                "R=relative/path\ncat $R/file",
+                "/work/project/",
+                "/work/project/relative/path",
+                "cat relative/path/file",
+            ),
+            ("R=tmp; cat $R/file", "/", "/tmp", "cat /tmp/file"),
+            (
+                "R=a_b-c.d,@+x:y=z%20; cat $R/file",
+                "/work",
+                "/work/a_b-c.d,@+x:y=z%20",
+                "cat a_b-c.d,@+x:y=z%20/file",
+            ),
+            (
+                "R=/work/project/../secret; cat $R/file",
+                "/work/project",
+                "/work/project/../secret",
+                "cat /work/project/../secret/file",
+            ),
+        ] {
+            let leaves = leaves_with_aliases(command, cwd, &["R"]);
+            assert_eq!(leaves.len(), 1, "case {command:?}");
+            assert_eq!(
+                leaves[0].bindings[0].value, expected_binding,
+                "case {command:?}"
+            );
+            assert_eq!(leaves[0].match_text, expected_match, "case {command:?}");
+            assert!(
+                leaves[0].requires_confirmation.is_none(),
+                "case {command:?}"
+            );
+        }
+    }
+
+    #[test]
     fn unsupported_alias_declarations_force_confirmation_without_hiding_later_leaves() {
         let groups = [
             (
                 "value",
-                "P='/work/project' ~ P=relative/path ~ P+=/work/project ~ P=(/work/project) ~ P[0]=/work/project",
+                "P=.. ~ P=../secret ~ P=dir/../secret ~ P= ~ P='relative/path' ~ P=relative\\/path ~ P=a*b ~ P+=/work/project ~ P=(/work/project) ~ P[0]=/work/project",
             ),
             (
                 "shape",
@@ -2181,8 +2255,30 @@ mod tests {
                 declaration.requires_confirmation.is_some(),
                 "{label} case {command:?}"
             );
+            assert!(
+                leaves
+                    .iter()
+                    .find(|leaf| leaf.original == "echo $P")
+                    .and_then(|leaf| leaf.requires_confirmation.as_deref())
+                    .is_some_and(|reason| reason.contains("no supported active binding")),
+                "{label} case {command:?}"
+            );
             assert_eq!(leaves.last().unwrap().original, "rm -rf /");
         }
+    }
+
+    #[test]
+    fn relative_declaration_without_cwd_is_unsupported() {
+        let command = "P=relative/path; echo $P; rm -rf /";
+        let leaves = leaves_with_aliases(command, "", &["P"]);
+        assert!(leaves[0].requires_confirmation.is_some());
+        assert!(
+            leaves[1]
+                .requires_confirmation
+                .as_deref()
+                .is_some_and(|reason| reason.contains("no supported active binding"))
+        );
+        assert_eq!(leaves.last().unwrap().original, "rm -rf /");
     }
 
     #[test]
