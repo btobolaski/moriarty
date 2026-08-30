@@ -113,7 +113,7 @@ test in a separate process, making this safe and preventing tests from clobberin
   (associating a session with the GitHub PR Claude Code opened or updated; added in Claude Code 2.1.158+),
   model-refusal-fallback records (when Claude Code retries a refused request on another model, e.g. Fable 5 → Opus 4.8),
   `fallback` content blocks recording the from/to model pair inside an assistant message (both added in Claude Code
-  2.1.170+), `image` content blocks inside tool_result content (observed in Claude Code 2.1.170 logs when a tool returns
+  2.1.170+), `image` content blocks inside tool*result content (observed in Claude Code 2.1.170 logs when a tool returns
   a screenshot), `image` file-attachment content (a user `@`-referencing an image file; uses Claude Code's own base64
   `file` envelope with size/dimensions rather than the API's `source` envelope), and a `pendingBackgroundAgentCount`
   field on `turn_duration` system records (the count of background agents still running when the turn completed; added
@@ -198,7 +198,7 @@ test in a separate process, making this safe and preventing tests from clobberin
   the rename is spelled out on the field), a `turnCompanion` field on user turns (`UserLogLine`, marking a meta turn
   that accompanies the turn it was injected alongside — e.g. an invoked skill's instructions — rather than standing on
   its own), a `classifierMetaLines` field on user turns (`UserLogLine`, the context Claude Code hands its auto-mode
-  safety classifier; logged as an embedded newline-terminated JSON _string_ rather than a nested object and kept an
+  safety classifier; logged as an embedded newline-terminated JSON \_string* rather than a nested object and kept an
   opaque `String` because the payload is the classifier's own undocumented, volatile schema and nothing downstream reads
   it), and an `away_summary` system subtype (`AwaySummary`, the recap Claude Code writes while the user is away from the
   session; shaped like `SystemLogInformational` minus its `level`) (all added in Claude Code 2.1.238+)
@@ -274,7 +274,12 @@ with warnings, while explicit missing paths and having no available source are e
 - Pi-lens result details use tool-name-routed, derived Serde schemas: `lens_diagnostics` distinguishes delta/all/full
   (including unavailable) responses, `lsp_diagnostics` distinguishes file/batch/directory responses,
   `lens_diagnostic_mark` keeps typed dispositions and nonzero lines, and `module_report` accepts optional callback
-  support. `fetch_content` also accepts its optional timestamp metadata.
+  support. `fetch_content` also accepts its optional timestamp metadata. `ast_grep_replace`/`ast_grep_search` are routed
+  to all-optional detail structs because each tool emits several partially-overlapping shapes (structural-rule vs
+  pattern success, validation, stale-preview) with no shared required field; their empty error sentinels drop to `None`
+  before routing (the tools are not in `preserves_empty_error_details`, unlike `memory`/`skill`) and only a non-error
+  `{}` payload would route to `ToolResultDetails::Empty`. `mcpScript` routes to `McpScriptDetails` with required
+  closed-enum `mode` (`"script"` today) and opaque `calls` entries.
 - `CompactionLine` and `BranchSummaryLine` carry an optional `usage: Option<AssistantUsage>` recording the cost/tokens
   of the summarization call pi made to produce them (pi added this field after the initial compaction schema, so it is
   `#[serde(default)]` for backward compatibility); the lines record no provider/model of their own, so attribution is

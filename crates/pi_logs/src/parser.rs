@@ -93,7 +93,11 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
-use serde::{Deserialize, Deserializer, Serialize, Serializer, de, ser::SerializeMap};
+use serde::{
+    Deserialize, Deserializer, Serialize, Serializer,
+    de::{self, DeserializeOwned},
+    ser::SerializeMap,
+};
 use serde_json::{Map, Value};
 use uuid::Uuid;
 
@@ -1828,12 +1832,33 @@ fn preserves_empty_error_details(tool_name: &str) -> bool {
     matches!(tool_name, "memory" | "skill")
 }
 
+/// Routes tools whose `{}` details carry no typed data. For tools not in
+/// `preserves_empty_error_details`, `resolve_tool_result_details` drops the
+/// empty error sentinel before routing, so an empty object reaching here is
+/// a success payload with no structured result. For `memory`/`skill` the
+/// preserved empty error body also reaches here and routes to `Empty` by
+/// design (their `{}` validation-error payload). Either way, collapse to
+/// `Empty` instead of failing strict deserialization on `{}`; non-empty
+/// details deserialize through the supplied per-tool constructor.
+fn empty_or<T: DeserializeOwned>(
+    details: Value,
+    wrap: fn(T) -> ToolResultDetails,
+) -> Result<ToolResultDetails, serde_json::Error> {
+    if is_empty_details_object(&details) {
+        Ok(ToolResultDetails::Empty(EmptyDetails {}))
+    } else {
+        serde_json::from_value(details).map(wrap)
+    }
+}
+
 fn parse_tool_result_details(
     tool_name: &str,
     details: Value,
 ) -> Result<ToolResultDetails, serde_json::Error> {
     match tool_name {
         "ask_user" => serde_json::from_value(details).map(ToolResultDetails::AskUser),
+        "ast_grep_replace" => empty_or(details, ToolResultDetails::AstGrepReplace),
+        "ast_grep_search" => empty_or(details, ToolResultDetails::AstGrepSearch),
         "bash" => serde_json::from_value(details).map(ToolResultDetails::Bash),
         "code_search" => serde_json::from_value(details).map(ToolResultDetails::CodeSearch),
         "compress" => serde_json::from_value(details).map(ToolResultDetails::Compress),
@@ -1866,17 +1891,12 @@ fn parse_tool_result_details(
         }
         "ls" => serde_json::from_value(details).map(ToolResultDetails::Ls),
         "lsp_diagnostics" => serde_json::from_value(details).map(ToolResultDetails::LspDiagnostics),
-        "memory" => {
-            if is_empty_details_object(&details) {
-                Ok(ToolResultDetails::Empty(EmptyDetails {}))
-            } else {
-                serde_json::from_value(details).map(ToolResultDetails::Memory)
-            }
-        }
+        "memory" => empty_or(details, ToolResultDetails::Memory),
         "memory_search" | "session_search" => {
             serde_json::from_value(details).map(ToolResultDetails::SearchResult)
         }
         "mcp" => parse_mcp_tool_result_details(details),
+        "mcpScript" => serde_json::from_value(details).map(ToolResultDetails::McpScript),
         "module_report" => serde_json::from_value(details).map(ToolResultDetails::ModuleReport),
         "project_tools_run_build"
         | "project_tools_run_formatter"
@@ -1895,13 +1915,7 @@ fn parse_tool_result_details(
         "read" => serde_json::from_value(details).map(ToolResultDetails::Read),
         "read_enclosing" => serde_json::from_value(details).map(ToolResultDetails::ReadEnclosing),
         "read_symbol" => serde_json::from_value(details).map(ToolResultDetails::ReadSymbol),
-        "skill" => {
-            if is_empty_details_object(&details) {
-                Ok(ToolResultDetails::Empty(EmptyDetails {}))
-            } else {
-                serde_json::from_value(details).map(ToolResultDetails::Skill)
-            }
-        }
+        "skill" => empty_or(details, ToolResultDetails::Skill),
         "subagent" | "subagent_wait" => {
             serde_json::from_value(details).map(ToolResultDetails::Subagent)
         }
@@ -2014,6 +2028,7 @@ pub enum ToolResultDetails {
     SearchResult(SearchResultDetails),
     Intercom(IntercomResultDetails),
     Mcp(McpDetails),
+    McpScript(McpScriptDetails),
     McpToolResult(McpToolResult),
     Bash(BashDetails),
     PlannotatorSubmitPlan(PlannotatorSubmitPlanDetails),
@@ -2059,6 +2074,12 @@ pub enum ToolResultDetails {
     Skill(SkillDetails),
     // pi-lens/pi-lsp tool results; each tool has its own typed detail struct
     // routed explicitly by `parse_tool_result_details`.
+    // ast_grep_replace precedes ast_grep_search because their untagged shapes
+    // overlap on {matchCount, totalMatches, truncated}: tool-name routing
+    // does the real disambiguation and this only keeps direct enum
+    // deserialization deterministic.
+    AstGrepReplace(AstGrepReplaceDetails),
+    AstGrepSearch(AstGrepSearchDetails),
     LensDiagnosticMark(LensDiagnosticMarkDetails),
     LensDiagnostics(LensDiagnosticsDetails),
     LspDiagnostics(LspDiagnosticsDetails),
@@ -3616,6 +3637,38 @@ pub struct McpSessionsDetails {
     pub output_guard: Option<JsonBlob>,
 }
 
+/// Results from the adapter's `mcpScript` batch tool carry `mode: "script"`
+/// plus optional init/error fields, the call trace, and output-guard fields.
+/// The `calls` entries are kept opaque (typed `ScriptOperation` in the
+/// adapter today, but nothing downstream reads them; type them if per-call
+/// cost stats ever need grouping).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct McpScriptDetails {
+    pub mode: McpScriptMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calls: Option<Vec<JsonValue>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_result: Option<JsonValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_guard: Option<JsonBlob>,
+}
+
+/// Closed enum so any new mcpScript mode value introduced upstream surfaces
+/// as a loud parse error rather than silently being dropped; the adapter
+/// currently only emits `"script"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum McpScriptMode {
+    Script,
+}
+
 /// A single state prevents an MCP search response from claiming both that it
 /// is complete and that the caller must continue at a later offset.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -4234,6 +4287,70 @@ pub struct PiLensActivateToolsDetails {
     pub matches: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub added: Vec<String>,
+}
+
+/// Results from `ast_grep_replace` come in two success shapes (the
+/// structural-intent path reports only `{matchCount, applied}` while the
+/// pattern path adds `totalMatches`/`truncated`), plus `{stalePreview: true}`
+/// when a dry-run preview went stale. Error paths emit an empty `details`
+/// object; that empty error sentinel is dropped to `None` by
+/// [`resolve_tool_result_details`] because the tool is not in
+/// [`preserves_empty_error_details`], while a (never-observed) empty
+/// success payload would route to `ToolResultDetails::Empty`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AstGrepReplaceDetails {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub match_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_matches: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_preview: Option<bool>,
+}
+
+/// Results from `ast_grep_search` mix validation outputs (`valid`,
+/// `validateOnly`, `mode`, `warning`) with paginated match outputs, and no
+/// field is shared by every shape, so all fields are optional. Error paths
+/// emit an empty `details` object; that empty error sentinel is dropped to
+/// `None` by [`resolve_tool_result_details`] because the tool is not in
+/// [`preserves_empty_error_details`], while a (never-observed) empty
+/// success payload would route to `ToolResultDetails::Empty`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AstGrepSearchDetails {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub match_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_matches: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has_more: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_by_file: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_reads: Option<Vec<JsonValue>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub match_locations: Option<Vec<JsonValue>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggested_dump: Option<JsonValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validate_only: Option<bool>,
+    /// Validate-strategy label emitted by the extension (`"rule"` or
+    /// `"pattern"` today). Left open-ended because new validate modes must
+    /// not fail whole-file parsing, mirroring the web-search mode precedent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 /// Results from `project_report` carry graph availability and a retry

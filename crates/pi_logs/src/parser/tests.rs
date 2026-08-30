@@ -4579,6 +4579,30 @@ fn pi_lens_tool_result_details_route_current_shapes() {
         Some(ToolResultDetails::LensDiagnostics(LensDiagnosticsDetails::Full(
             LensDiagnosticsFull::Unavailable(_),
         ))) => "lens-unavailable",
+        Some(ToolResultDetails::AstGrepReplace(details)) => {
+            if details.stale_preview == Some(true) {
+                "ast-replace-stale"
+            } else if details.total_matches.is_some() {
+                "ast-replace"
+            } else {
+                "ast-replace-rule"
+            }
+        }
+        Some(ToolResultDetails::AstGrepSearch(details)) => {
+            if details.validate_only == Some(true) {
+                "ast-search-validate"
+            } else {
+                "ast-search"
+            }
+        }
+        Some(ToolResultDetails::McpScript(details)) => {
+            if details.error.is_some() {
+                "mcp-script-error"
+            } else {
+                "mcp-script"
+            }
+        }
+        Some(ToolResultDetails::Empty(_)) => "empty",
         other => panic!("unexpected tool details: {other:?}"),
     };
     let module = |support| json!({"available":false,"staleness":"unavailable","symbols":0,"exports":0,"callbacks":0,"callbackSupport":support,"view":"default"});
@@ -4635,9 +4659,88 @@ fn pi_lens_tool_result_details_route_current_shapes() {
             json!({"mode":"full","filesChecked":0,"lspUnavailable":true}),
             "lens-unavailable",
         ),
+        (
+            "ast_grep_replace",
+            json!({"matchCount":8,"totalMatches":8,"truncated":false,"applied":true}),
+            "ast-replace",
+        ),
+        (
+            "ast_grep_replace",
+            json!({"matchCount":2,"applied":true}),
+            "ast-replace-rule",
+        ),
+        (
+            "ast_grep_replace",
+            json!({"stalePreview":true}),
+            "ast-replace-stale",
+        ),
+        ("ast_grep_replace", json!({}), "empty"),
+        (
+            "ast_grep_search",
+            json!({"matchCount":0,"totalMatches":0,"truncated":false,"hasMore":false,"skip":0,"groupByFile":false,"searchReads":[],"matchLocations":[],"suggestedDump":{"tool":"ast_grep_dump"}}),
+            "ast-search",
+        ),
+        (
+            "ast_grep_search",
+            json!({"valid":false,"validateOnly":true}),
+            "ast-search-validate",
+        ),
+        ("ast_grep_search", json!({}), "empty"),
+        (
+            "mcpScript",
+            json!({"mode":"script","timeoutMs":3600000,"calls":[{"operation":"call","path":"project-tools_run_tests","ok":true,"durationMs":20022},{"operation":"call","path":"project-tools_run_lint","ok":false,"error":"tool_error","durationMs":12289}]}),
+            "mcp-script",
+        ),
+        (
+            "mcpScript",
+            json!({"mode":"script","error":"not_initialized"}),
+            "mcp-script-error",
+        ),
     ] {
         assert_eq!(kind(tool_name, details), expected);
     }
+}
+
+/// Pins the closed-enum claim on `McpScriptMode`: an unknown mode value must
+/// fail loudly rather than be silently absorbed by a relaxed `String`, and
+/// the required `mode` must keep an empty `{}` success payload from parsing.
+#[test]
+fn mcp_script_tool_result_rejects_unknown_and_missing_mode() {
+    assert_parse_error_contains_any(
+        "rejects unknown mcpScript mode",
+        tool_result_message_json(
+            "mcpScript",
+            vec![json!({"type": "text", "text": "batched"})],
+            false,
+            Some(json!({"mode": "replay", "calls": []})),
+        ),
+        &["unknown variant", "did not match any variant"],
+    );
+    assert_parse_error_contains_any(
+        "rejects mcpScript payload missing mode",
+        tool_result_message_json(
+            "mcpScript",
+            vec![json!({"type": "text", "text": "batched"})],
+            false,
+            Some(json!({})),
+        ),
+        &["missing field"],
+    );
+}
+
+/// Pins the untagged ordering invariant: with no tool-name routing available
+/// (direct enum deserialization and the unknown-tool fallback), the shared
+/// `{matchCount, totalMatches, truncated}` shape resolves as the earlier
+/// `AstGrepReplace` variant.
+#[test]
+fn ast_grep_shared_shape_resolves_as_replace() {
+    let details: ToolResultDetails = serde_json::from_value(json!({
+        "matchCount": 1,
+        "totalMatches": 1,
+        "truncated": false
+    }))
+    .expect("shared ast_grep shape should deserialize");
+    assert!(matches!(details, ToolResultDetails::AstGrepReplace(_)));
 }
 
 #[test]
