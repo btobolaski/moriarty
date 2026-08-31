@@ -1883,14 +1883,13 @@ fn parse_tool_result_details(
         }
         "instinct_write" => serde_json::from_value(details).map(ToolResultDetails::InstinctWrite),
         "intercom" => serde_json::from_value(details).map(ToolResultDetails::Intercom),
-        "lens_diagnostic_mark" => {
-            serde_json::from_value(details).map(ToolResultDetails::LensDiagnosticMark)
-        }
+        "lens_diagnostic_mark" => empty_or(details, ToolResultDetails::LensDiagnosticMark),
         "lens_diagnostics" => {
             serde_json::from_value(details).map(ToolResultDetails::LensDiagnostics)
         }
         "ls" => serde_json::from_value(details).map(ToolResultDetails::Ls),
         "lsp_diagnostics" => serde_json::from_value(details).map(ToolResultDetails::LspDiagnostics),
+        "lsp_navigation" => serde_json::from_value(details).map(ToolResultDetails::LspNavigation),
         "memory" => empty_or(details, ToolResultDetails::Memory),
         "memory_search" | "session_search" => {
             serde_json::from_value(details).map(ToolResultDetails::SearchResult)
@@ -2083,6 +2082,11 @@ pub enum ToolResultDetails {
     LensDiagnosticMark(LensDiagnosticMarkDetails),
     LensDiagnostics(LensDiagnosticsDetails),
     LspDiagnostics(LspDiagnosticsDetails),
+    // Pi-lens owns this evolving envelope and no caller reads its fields;
+    // tool-name routing retains it without making unrelated untagged shapes
+    // deserialize as navigation details.
+    #[serde(skip_deserializing)]
+    LspNavigation(JsonBlob),
     ModuleReport(ModuleReportDetails),
     PiLensActivateTools(PiLensActivateToolsDetails),
     ProjectReport(ProjectReportDetails),

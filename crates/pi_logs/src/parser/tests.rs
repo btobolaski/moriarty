@@ -4643,6 +4643,7 @@ fn pi_lens_tool_result_details_route_current_shapes() {
         ("lens_diagnostic_mark", mark("suppress"), "mark-suppress"),
         ("lens_diagnostic_mark", mark("defer"), "mark-defer"),
         ("lens_diagnostic_mark", mark("flagged"), "mark-flagged"),
+        ("lens_diagnostic_mark", json!({}), "empty"),
         (
             "lens_diagnostics",
             json!({"mode":"delta","warnings":0,"carriedOverFiles":1}),
@@ -4699,6 +4700,35 @@ fn pi_lens_tool_result_details_route_current_shapes() {
     ] {
         assert_eq!(kind(tool_name, details), expected);
     }
+}
+
+#[test]
+fn lsp_navigation_tool_result_accepts_success_and_future_metadata() {
+    let tool_result = tool_result_with_details(
+        "lsp_navigation",
+        json!({"operation":"references","supported":true,"resultCount":1,"futureMetadata":true}),
+    );
+    let Some(ToolResultDetails::LspNavigation(JsonBlob(details))) = tool_result.details else {
+        panic!("expected lsp_navigation details")
+    };
+    assert_eq!(
+        details,
+        json!({"operation":"references","supported":true,"resultCount":1,"futureMetadata":true}),
+    );
+}
+
+#[test]
+fn lsp_navigation_does_not_absorb_untagged_details() {
+    let details: ToolResultDetails = serde_json::from_value(json!({
+        "available": false,
+        "staleness": "unavailable",
+        "symbols": 0,
+        "exports": 0,
+        "callbacks": 0,
+        "view": "default"
+    }))
+    .expect("expected module_report details");
+    assert!(matches!(details, ToolResultDetails::ModuleReport(_)));
 }
 
 /// Pins the closed-enum claim on `McpScriptMode`: an unknown mode value must
