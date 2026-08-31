@@ -1,5 +1,24 @@
 use super::*;
 
+/// `target` selects the object the extra field is inserted into, so a caller can exercise a nested
+/// payload's strictness (an artifact entry) as well as the line's own.
+fn assert_log_line_rejects_extra_field(
+    mut json: serde_json::Value,
+    target: fn(&mut serde_json::Value) -> &mut serde_json::Value,
+) {
+    target(&mut json)
+        .as_object_mut()
+        .expect("mutation target is a JSON object")
+        .insert("extraField".to_string(), serde_json::json!("should fail"));
+
+    let err = serde_json::from_value::<LogLine>(json).expect_err("Should reject unknown fields");
+    assert!(
+        err.to_string().contains("unknown field"),
+        "Error should mention unknown field, got: {}",
+        err
+    );
+}
+
 #[test]
 fn test_parse_user_log_line_with_agent_id() {
     let json = serde_json::json!({
@@ -193,6 +212,161 @@ fn test_parse_atis_latch_rejects_unknown_fields() {
         "Error should mention unknown field, got: {}",
         err
     );
+}
+
+fn frame_link_json() -> serde_json::Value {
+    serde_json::json!({
+        "type": "frame-link",
+        "sessionId": "c0d69030-a005-4543-8798-38425c069dc7",
+        "path": "/tmp/scratchpad/h2-service-dependency-graph.md",
+        "frameUrl": "https://claude.ai/code/artifact/453110f4-9db6-4428-ad3c-9df991340402",
+        "title": "h2-service-dependency-graph.md",
+        "artifactCount": 1,
+        "timestamp": "2026-08-31T15:27:02.823Z"
+    })
+}
+
+#[test]
+fn test_parse_frame_link_log_line() {
+    let LogLine::FrameLink(FrameLink::Published(link)) =
+        serde_json::from_value(frame_link_json()).unwrap()
+    else {
+        panic!("expected a published frame-link log line");
+    };
+    assert_eq!(link.path, "/tmp/scratchpad/h2-service-dependency-graph.md");
+    assert_eq!(
+        link.frame_url,
+        "https://claude.ai/code/artifact/453110f4-9db6-4428-ad3c-9df991340402"
+    );
+    assert_eq!(link.title, "h2-service-dependency-graph.md");
+    assert_eq!(link.artifact_count, 1);
+}
+
+#[test]
+fn test_parse_frame_link_log_line_without_artifact_details() {
+    let json = serde_json::json!({
+        "type": "frame-link",
+        "sessionId": "c0d69030-a005-4543-8798-38425c069dc7",
+        "artifactCount": 1,
+        "timestamp": "2026-08-31T16:03:24.519Z"
+    });
+    let LogLine::FrameLink(FrameLink::Bare(link)) = serde_json::from_value(json).unwrap() else {
+        panic!("expected a bare frame-link log line");
+    };
+    assert_eq!(link.artifact_count, 1);
+}
+
+#[test]
+fn test_parse_frame_link_rejects_partial_artifact_details() {
+    let mut json = frame_link_json();
+    json.as_object_mut()
+        .expect("fixture is a JSON object")
+        .remove("title");
+    let err = serde_json::from_value::<LogLine>(json)
+        .expect_err("Should reject a half-present artifact triple");
+    assert!(
+        err.to_string().contains("did not match any variant"),
+        "Error should report that no frame-link shape matched, got: {}",
+        err
+    );
+}
+
+fn artifact_comment_monitor_json() -> serde_json::Value {
+    serde_json::json!({
+        "type": "artifact-comment-monitor",
+        "v": 1,
+        "sessionId": "c0d69030-a005-4543-8798-38425c069dc7",
+        "artifacts": {
+            "453110f4-9db6-4428-ad3c-9df991340402": {
+                "state": "armed",
+                "writtenAtMs": 1788190023083u64,
+                "title": "h2-service-dependency-graph.md"
+            }
+        }
+    })
+}
+
+#[test]
+fn test_parse_artifact_comment_monitor_log_line() {
+    let LogLine::ArtifactCommentMonitor(monitor) =
+        serde_json::from_value(artifact_comment_monitor_json()).unwrap()
+    else {
+        panic!("expected an artifact-comment-monitor log line");
+    };
+    assert_eq!(monitor.v, 1);
+    let artifact = monitor
+        .artifacts
+        .get(
+            &"453110f4-9db6-4428-ad3c-9df991340402"
+                .parse::<Uuid>()
+                .unwrap(),
+        )
+        .expect("fixture has one monitored artifact");
+    assert_eq!(artifact.state, "armed");
+    assert_eq!(artifact.written_at_ms, 1788190023083);
+    assert_eq!(artifact.title, "h2-service-dependency-graph.md");
+}
+
+#[test]
+fn test_parse_artifact_comment_monitor_rejects_unknown_artifact_fields() {
+    assert_log_line_rejects_extra_field(artifact_comment_monitor_json(), |json| {
+        &mut json["artifacts"]["453110f4-9db6-4428-ad3c-9df991340402"]
+    });
+}
+
+fn artifact_autoreact_ledger_json() -> serde_json::Value {
+    serde_json::json!({
+        "type": "artifact-autoreact-ledger",
+        "v": 1,
+        "sessionId": "c0d69030-a005-4543-8798-38425c069dc7",
+        "accountUuid": "ef6692be-04e0-43f8-a5a2-3212d362e10b",
+        "artifacts": {
+            "453110f4-9db6-4428-ad3c-9df991340402": {
+                "savedAt": 1788190028700u64,
+                "stampHighWater": null,
+                "everBaselined": true,
+                "everHadThreads": false,
+                "turnTimestamps": [],
+                "threads": []
+            }
+        }
+    })
+}
+
+#[test]
+fn test_parse_artifact_autoreact_ledger_log_line() {
+    let LogLine::ArtifactAutoreactLedger(ledger) =
+        serde_json::from_value(artifact_autoreact_ledger_json()).unwrap()
+    else {
+        panic!("expected an artifact-autoreact-ledger log line");
+    };
+    assert_eq!(
+        ledger.account_uuid,
+        "ef6692be-04e0-43f8-a5a2-3212d362e10b"
+            .parse::<Uuid>()
+            .unwrap()
+    );
+    let artifact = ledger
+        .artifacts
+        .get(
+            &"453110f4-9db6-4428-ad3c-9df991340402"
+                .parse::<Uuid>()
+                .unwrap(),
+        )
+        .expect("fixture has one ledger artifact");
+    assert_eq!(artifact.saved_at, 1788190028700);
+    assert_eq!(artifact.stamp_high_water, None);
+    assert!(artifact.ever_baselined);
+    assert!(!artifact.ever_had_threads);
+    assert!(artifact.turn_timestamps.is_empty());
+    assert!(artifact.threads.is_empty());
+}
+
+#[test]
+fn test_parse_artifact_autoreact_ledger_rejects_unknown_artifact_fields() {
+    assert_log_line_rejects_extra_field(artifact_autoreact_ledger_json(), |json| {
+        &mut json["artifacts"]["453110f4-9db6-4428-ad3c-9df991340402"]
+    });
 }
 
 #[test]
@@ -3150,6 +3324,48 @@ fn test_parse_system_log_away_summary_rejects_unknown_fields() {
         "Error should mention unknown field, got: {}",
         err
     );
+}
+
+fn agents_killed_json() -> serde_json::Value {
+    serde_json::json!({
+        "type": "system",
+        "subtype": "agents_killed",
+        "parentUuid": "d9314b52-2937-4d5c-a858-49188f4e851e",
+        "isSidechain": false,
+        "timestamp": "2026-08-31T16:16:05.906Z",
+        "uuid": "932c728c-0711-44be-871e-170444fc29ed",
+        "isMeta": false,
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "6d9c57de-81b9-45f1-b047-ec3c10a1583c",
+        "version": "2.1.238",
+        "gitBranch": "HEAD",
+        "slug": "plan-out-deploying-the-wiggly-pnueli"
+    })
+}
+
+#[test]
+fn test_parse_system_log_agents_killed() {
+    let line: LogLine =
+        serde_json::from_value(agents_killed_json()).expect("Failed to parse agents killed");
+
+    match line {
+        LogLine::System(SystemLogLine::AgentsKilled(killed)) => {
+            assert_eq!(killed.git_branch.as_deref(), Some("HEAD"));
+            assert_eq!(
+                killed.slug.as_deref(),
+                Some("plan-out-deploying-the-wiggly-pnueli")
+            );
+            assert_eq!(killed.cwd, "/test");
+        }
+        _ => panic!("Expected System(AgentsKilled) variant"),
+    }
+}
+
+#[test]
+fn test_parse_system_log_agents_killed_rejects_unknown_fields() {
+    assert_log_line_rejects_extra_field(agents_killed_json(), |json| json);
 }
 
 #[test]

@@ -200,8 +200,19 @@ test in a separate process, making this safe and preventing tests from clobberin
   its own), a `classifierMetaLines` field on user turns (`UserLogLine`, the context Claude Code hands its auto-mode
   safety classifier; logged as an embedded newline-terminated JSON \_string* rather than a nested object and kept an
   opaque `String` because the payload is the classifier's own undocumented, volatile schema and nothing downstream reads
-  it), and an `away_summary` system subtype (`AwaySummary`, the recap Claude Code writes while the user is away from the
-  session; shaped like `SystemLogInformational` minus its `level`) (all added in Claude Code 2.1.238+)
+  it), an `away_summary` system subtype (`AwaySummary`, the recap Claude Code writes while the user is away from the
+  session; shaped like `SystemLogInformational` minus its `level`), an `agents_killed` system subtype (`AgentsKilled`,
+  recording that Claude Code terminated the session's still-running background agents; shaped like `AwaySummary` minus
+  its `content` because the event carries no message of its own), and three artifact line types — `frame-link`
+  (`FrameLink`, associating a session with the artifact frame Claude Code opened for it; its `path`/`frameUrl`/`title`
+  describe the published artifact and are emitted together while records that only restate the session's frame carry
+  none of them, so — like `AutoModeExit` — it is an untagged enum over `PublishedFrameLink` and `BareFrameLink` rather
+  than sibling `Option` fields, and a half-present payload is not representable), `artifact-comment-monitor` (`ArtifactCommentMonitor`, a session-scoped snapshot
+  of which published artifacts are watched for new comments, keyed by artifact id; each entry's `state` stays a `String`
+  for the same reason as `TaskStatus.status`), and `artifact-autoreact-ledger` (`ArtifactAutoreactLedger`, the
+  bookkeeping for comment threads already reacted to, also keyed by artifact id; its per-artifact `threads` has only
+  ever been observed empty, so its element type is an empty `deny_unknown_fields` struct that surfaces the real shape as
+  a parse error rather than silently discarding it) (all added in Claude Code 2.1.238+)
 - Also owns the structured view of the raw `model` string via `model::Model { family, version }` plus `ModelFamily` and
   `ModelVersion`. Both `cost_analyzer` (for pricing) and `moriarty::api_pricing` (for grouping/display) consume this one
   parser so family/version classification is not duplicated across crates. The parser preserves capability-decorated raw

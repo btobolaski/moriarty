@@ -387,6 +387,10 @@ fn claude_system_fields(system: &ClaudeSystemLogLine) -> ClaudeSystemFields {
             timestamp: line.timestamp,
             uuid: line.uuid,
         },
+        ClaudeSystemLogLine::AgentsKilled(line) => ClaudeSystemFields {
+            timestamp: line.timestamp,
+            uuid: line.uuid,
+        },
     }
 }
 
@@ -438,6 +442,9 @@ impl AnalyzableLog for ClaudeLogLine {
             ClaudeLogLine::PrLink(line) => line.timestamp,
             ClaudeLogLine::ForkContextRef(_) => claude_timestamp_sentinel(),
             ClaudeLogLine::AtisLatch(_) => claude_timestamp_sentinel(),
+            ClaudeLogLine::FrameLink(line) => line.timestamp(),
+            ClaudeLogLine::ArtifactCommentMonitor(_) => claude_timestamp_sentinel(),
+            ClaudeLogLine::ArtifactAutoreactLedger(_) => claude_timestamp_sentinel(),
         }
     }
 
@@ -482,6 +489,19 @@ impl AnalyzableLog for ClaudeLogLine {
                 format!("fork-context-ref:{}", line.agent_id)
             }
             ClaudeLogLine::AtisLatch(line) => format!("atis-latch:{}", line.session_id),
+            // A session can link its frame more than once, so key on the timestamp too rather than
+            // session alone.
+            ClaudeLogLine::FrameLink(line) => {
+                format!("frame-link:{}:{}", line.session_id(), line.timestamp())
+            }
+            // The record is a whole-session snapshot rewritten in place, so the session alone
+            // identifies it and repeated snapshots collapse onto one entry.
+            ClaudeLogLine::ArtifactCommentMonitor(line) => {
+                format!("artifact-comment-monitor:{}", line.session_id)
+            }
+            ClaudeLogLine::ArtifactAutoreactLedger(line) => {
+                format!("artifact-autoreact-ledger:{}", line.session_id)
+            }
         }
     }
 
@@ -662,6 +682,7 @@ mod tests {
     const CLAUDE_SYSTEM_TURN_DURATION_UUID: &str = "14141414-1414-4414-8414-141414141414";
     const CLAUDE_SYSTEM_CONSENT_FALLBACK_UUID: &str = "17171717-1717-4717-8717-171717171717";
     const CLAUDE_SYSTEM_AWAY_SUMMARY_UUID: &str = "18181818-1818-4818-8818-181818181818";
+    const CLAUDE_SYSTEM_AGENTS_KILLED_UUID: &str = "19191919-1919-4919-8919-191919191919";
     const CLAUDE_SYSTEM_LOGICAL_PARENT_UUID: &str = "15151515-1515-4515-8515-151515151515";
     const CLAUDE_SYSTEM_CLEARED_ATTACHMENT_UUID: &str = "16161616-1616-4616-8616-161616161616";
 
@@ -988,6 +1009,52 @@ mod tests {
         })
     }
 
+    fn claude_frame_link_json() -> serde_json::Value {
+        json!({
+            "type": "frame-link",
+            "sessionId": CLAUDE_SESSION_ID,
+            "path": "/tmp/scratchpad/report.md",
+            "frameUrl": "https://claude.ai/code/artifact/453110f4-9db6-4428-ad3c-9df991340402",
+            "title": "report.md",
+            "artifactCount": 1,
+            "timestamp": CLAUDE_TIMESTAMP,
+        })
+    }
+
+    fn claude_artifact_comment_monitor_json() -> serde_json::Value {
+        json!({
+            "type": "artifact-comment-monitor",
+            "v": 1,
+            "sessionId": CLAUDE_SESSION_ID,
+            "artifacts": {
+                "453110f4-9db6-4428-ad3c-9df991340402": {
+                    "state": "armed",
+                    "writtenAtMs": 1_788_190_023_083u64,
+                    "title": "report.md",
+                },
+            },
+        })
+    }
+
+    fn claude_artifact_autoreact_ledger_json() -> serde_json::Value {
+        json!({
+            "type": "artifact-autoreact-ledger",
+            "v": 1,
+            "sessionId": CLAUDE_SESSION_ID,
+            "accountUuid": "ef6692be-04e0-43f8-a5a2-3212d362e10b",
+            "artifacts": {
+                "453110f4-9db6-4428-ad3c-9df991340402": {
+                    "savedAt": 1_788_190_028_700u64,
+                    "stampHighWater": serde_json::Value::Null,
+                    "everBaselined": true,
+                    "everHadThreads": false,
+                    "turnTimestamps": [],
+                    "threads": [],
+                },
+            },
+        })
+    }
+
     fn claude_system_json(
         subtype: &str,
         parent_uuid: Option<&str>,
@@ -1022,6 +1089,16 @@ mod tests {
             CLAUDE_SYSTEM_AWAY_SUMMARY_UUID,
         );
         metadata.insert("content".to_string(), json!("away recap"));
+        metadata.insert("isMeta".to_string(), json!(false));
+        serde_json::Value::Object(metadata)
+    }
+
+    fn claude_system_agents_killed_json() -> serde_json::Value {
+        let mut metadata = claude_system_json(
+            "agents_killed",
+            Some(CLAUDE_PARENT_UUID),
+            CLAUDE_SYSTEM_AGENTS_KILLED_UUID,
+        );
         metadata.insert("isMeta".to_string(), json!(false));
         serde_json::Value::Object(metadata)
     }
@@ -2008,6 +2085,32 @@ mod tests {
                 value: claude_system_away_summary_json,
                 expected_timestamp: ExpectedClaudeTimestamp::Real,
                 expected_id: CLAUDE_SYSTEM_AWAY_SUMMARY_UUID.to_string(),
+            },
+            ClaudeNonBillableCase {
+                name: "system agents killed",
+                value: claude_system_agents_killed_json,
+                expected_timestamp: ExpectedClaudeTimestamp::Real,
+                expected_id: CLAUDE_SYSTEM_AGENTS_KILLED_UUID.to_string(),
+            },
+            ClaudeNonBillableCase {
+                name: "frame link",
+                value: claude_frame_link_json,
+                // Unlike the other artifact records, frame-link carries a real timestamp and keys
+                // on it as well as the session, so a session-only identifier would fail this case.
+                expected_timestamp: ExpectedClaudeTimestamp::Real,
+                expected_id: format!("frame-link:{CLAUDE_SESSION_ID}:{}", timestamp()),
+            },
+            ClaudeNonBillableCase {
+                name: "artifact comment monitor",
+                value: claude_artifact_comment_monitor_json,
+                expected_timestamp: ExpectedClaudeTimestamp::Sentinel,
+                expected_id: claude_metadata_identifier("artifact-comment-monitor"),
+            },
+            ClaudeNonBillableCase {
+                name: "artifact autoreact ledger",
+                value: claude_artifact_autoreact_ledger_json,
+                expected_timestamp: ExpectedClaudeTimestamp::Sentinel,
+                expected_id: claude_metadata_identifier("artifact-autoreact-ledger"),
             },
         ];
 

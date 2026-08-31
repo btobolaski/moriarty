@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 #[cfg(test)]
 use std::path::Path;
 
@@ -240,6 +240,117 @@ pub enum LogLine {
     ForkContextRef(ForkContextRef),
     #[serde(rename = "atis-latch")]
     AtisLatch(AtisLatch),
+    #[serde(rename = "frame-link")]
+    FrameLink(FrameLink),
+    #[serde(rename = "artifact-comment-monitor")]
+    ArtifactCommentMonitor(ArtifactCommentMonitor),
+    #[serde(rename = "artifact-autoreact-ledger")]
+    ArtifactAutoreactLedger(ArtifactAutoreactLedger),
+}
+
+/// Session-scoped bookkeeping for the comment threads Claude Code has already reacted to on each
+/// published artifact, keyed by artifact id. Added in Claude Code 2.1.238+.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactAutoreactLedger {
+    /// Schema version of the `artifacts` payload; only `1` has been observed.
+    pub v: u32,
+    pub session_id: Uuid,
+    pub account_uuid: Uuid,
+    pub artifacts: BTreeMap<Uuid, AutoreactedArtifact>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct AutoreactedArtifact {
+    pub saved_at: u64,
+    /// Null until the session has stamped a thread; typed as a millisecond timestamp to match its
+    /// `saved_at` sibling.
+    pub stamp_high_water: Option<u64>,
+    pub ever_baselined: bool,
+    pub ever_had_threads: bool,
+    pub turn_timestamps: Vec<u64>,
+    /// Only empty arrays have been observed, so the element shape is unknown; an empty strict
+    /// struct surfaces the real shape as a parse error rather than silently discarding it.
+    pub threads: Vec<AutoreactedThread>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutoreactedThread {}
+
+/// Session-scoped snapshot of which published artifacts Claude Code is watching for new comments,
+/// keyed by artifact id. Added in Claude Code 2.1.238+.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactCommentMonitor {
+    /// Schema version of the `artifacts` payload; only `1` has been observed.
+    pub v: u32,
+    pub session_id: Uuid,
+    pub artifacts: BTreeMap<Uuid, MonitoredArtifact>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct MonitoredArtifact {
+    /// Kept as a `String` because the monitor's lifecycle vocabulary is undocumented and volatile
+    /// (only `armed` has been observed) and nothing downstream reads it.
+    pub state: String,
+    pub written_at_ms: u64,
+    pub title: String,
+}
+
+/// Associates a session with the artifact frame Claude Code opened for it. Added in Claude Code
+/// 2.1.238+. `path`, `frameUrl`, and `title` describe the published artifact and are emitted
+/// together, while records that only restate the session's frame carry none of them; the two
+/// shapes are separate variants — like [`AutoModeExit`] — so a half-present payload the wire format
+/// never produces is not representable.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum FrameLink {
+    Published(PublishedFrameLink),
+    Bare(BareFrameLink),
+}
+
+impl FrameLink {
+    pub fn session_id(&self) -> Uuid {
+        match self {
+            Self::Published(link) => link.session_id,
+            Self::Bare(link) => link.session_id,
+        }
+    }
+
+    pub fn timestamp(&self) -> DateTime<Utc> {
+        match self {
+            Self::Published(link) => link.timestamp,
+            Self::Bare(link) => link.timestamp,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct PublishedFrameLink {
+    pub session_id: Uuid,
+    pub artifact_count: u32,
+    pub path: String,
+    pub frame_url: String,
+    pub title: String,
+    pub timestamp: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct BareFrameLink {
+    pub session_id: Uuid,
+    pub artifact_count: u32,
+    pub timestamp: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -906,6 +1017,28 @@ pub enum SystemLogLine {
     ModelRefusalFallback(ModelRefusalFallback),
     ModelConsentFallback(ModelConsentFallback),
     AwaySummary(AwaySummary),
+    AgentsKilled(AgentsKilled),
+}
+
+/// Records that Claude Code terminated the session's still-running background agents. Shaped like
+/// [`AwaySummary`] minus its `content` because the event carries no message of its own. Added in
+/// Claude Code 2.1.238+.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct AgentsKilled {
+    pub parent_uuid: Uuid,
+    pub is_sidechain: bool,
+    pub git_branch: Option<String>,
+    pub slug: Option<String>,
+    pub user_type: String,
+    pub cwd: String,
+    pub session_id: Uuid,
+    pub version: String,
+    pub is_meta: bool,
+    pub timestamp: DateTime<Utc>,
+    pub uuid: Uuid,
+    pub entrypoint: Option<String>,
 }
 
 /// The recap Claude Code writes while the user is away from the session (suppressible via
