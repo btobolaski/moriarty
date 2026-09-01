@@ -4750,6 +4750,44 @@ fn test_parse_compact_boundary_with_partial_preserved_metadata() {
 }
 
 #[test]
+fn test_parse_compact_boundary_with_session_kind() {
+    // A backgrounded session's system records carry sessionKind too, so the shared boundary macro
+    // must accept it alongside the conversation records.
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "logicalParentUuid": "1d6ea6ce-23d1-47d4-bf8a-65a9b884dc89",
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "538faf26-5f15-48a0-be20-20876e5f4f29",
+        "version": "2.1.238",
+        "gitBranch": "HEAD",
+        "type": "system",
+        "subtype": "compact_boundary",
+        "content": "Conversation compacted",
+        "sessionKind": "bg",
+        "timestamp": "2026-08-31T15:48:03.553Z",
+        "uuid": "c7486d00-8c13-4665-acb0-0c3e5e812cd2",
+        "level": "info",
+        "compactMetadata": {
+            "trigger": "manual",
+            "preTokens": 468607,
+            "postTokens": 7737
+        }
+    });
+
+    let line: LogLine =
+        serde_json::from_value(json).expect("Failed to parse compact_boundary with sessionKind");
+
+    match line {
+        LogLine::System(SystemLogLine::CompactBoundary(boundary)) => {
+            assert_eq!(boundary.session_kind, Some(SessionKind::Bg));
+        }
+        other => panic!("Expected compact_boundary, got {other:?}"),
+    }
+}
+
+#[test]
 fn test_parse_compact_boundary_with_cumulative_dropped_tokens() {
     // Claude Code 2.1.197 added cumulativeDroppedTokens to compactMetadata.
     let json = serde_json::json!({
@@ -6330,6 +6368,52 @@ fn test_parse_user_log_line_with_turn_companion() {
     });
     let line: UserLogLine = serde_json::from_value(json).unwrap();
     assert_eq!(line.turn_companion, Some(true));
+}
+
+#[test]
+fn test_parse_user_log_line_with_session_kind() {
+    // Claude Code 2.1.238 tags every record of a backgrounded session with sessionKind.
+    let json = serde_json::json!({
+        "parentUuid": "c0225c2f-5d39-4a3b-ae03-963bfcd23228",
+        "isSidechain": false,
+        "message": {"role": "user", "content": "Continue"},
+        "sessionKind": "bg",
+        "uuid": "b4e57ed0-4304-413a-9a88-0ee66cd4d783",
+        "timestamp": "2026-08-31T17:31:48.949Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "57d72248-a8c6-4b51-81c5-7778851c2a3e",
+        "version": "2.1.238",
+        "gitBranch": "HEAD"
+    });
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(line.session_kind, Some(SessionKind::Bg));
+}
+
+#[test]
+fn test_parse_user_log_line_rejects_unknown_session_kind() {
+    // SessionKind is strict so a new kind surfaces as a parse error instead of being ignored.
+    let json = serde_json::json!({
+        "parentUuid": "c0225c2f-5d39-4a3b-ae03-963bfcd23228",
+        "isSidechain": false,
+        "message": {"role": "user", "content": "Continue"},
+        "sessionKind": "fg",
+        "uuid": "b4e57ed0-4304-413a-9a88-0ee66cd4d783",
+        "timestamp": "2026-08-31T17:31:48.949Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "57d72248-a8c6-4b51-81c5-7778851c2a3e",
+        "version": "2.1.238",
+        "gitBranch": "HEAD"
+    });
+    let err = serde_json::from_value::<UserLogLine>(json)
+        .expect_err("unknown sessionKind must not parse");
+    assert!(
+        err.to_string().contains("unknown variant `fg`"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]

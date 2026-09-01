@@ -482,6 +482,7 @@ pub struct AttachmentLogLine {
     /// once, which serde would reject as a duplicate. `Option` so pre-2.1.206 lines still parse.
     #[serde(rename = "session_id")]
     pub session_id_snake: Option<Uuid>,
+    pub session_kind: Option<SessionKind>,
 }
 
 /// Attachment payload types. Added in Claude Code 2.1.104+.
@@ -1061,6 +1062,7 @@ pub struct AwaySummary {
     pub timestamp: DateTime<Utc>,
     pub uuid: Uuid,
     pub entrypoint: Option<String>,
+    pub session_kind: Option<SessionKind>,
 }
 
 /// Records Claude Code's session-level fallback when the selected model requires usage-credit
@@ -1201,6 +1203,7 @@ pub struct StopHookSummary {
     /// envelope; `model_consent_fallback` models its own duplicate the same way.
     #[serde(rename = "session_id")]
     pub session_id_snake: Option<Uuid>,
+    pub session_kind: Option<SessionKind>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1397,6 +1400,7 @@ macro_rules! define_boundary_log {
             pub $metadata_field: $metadata_ty,
             /// Entry point that started the session (e.g., "cli"). Added in Claude Code 2.1.104+.
             pub entrypoint: Option<String>,
+            pub session_kind: Option<SessionKind>,
         }
     };
 }
@@ -1543,6 +1547,7 @@ pub struct TurnDuration {
     /// Optional because only workflow-enabled turns emit this count. Observed in Claude Code
     /// 2.1.206+.
     pub pending_workflow_count: Option<u32>,
+    pub session_kind: Option<SessionKind>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1714,6 +1719,7 @@ pub struct UserLogLine {
     /// once, which serde would reject as a duplicate. `Option` so pre-2.1.206 lines still parse.
     #[serde(rename = "session_id")]
     pub session_id_snake: Option<Uuid>,
+    pub session_kind: Option<SessionKind>,
 }
 
 /// Summarization metadata on a compact-summary user turn. Added in Claude Code 2.1.214+.
@@ -1775,6 +1781,16 @@ pub enum ToolDenialKind {
 #[serde(rename_all = "camelCase")]
 pub enum QueuePriority {
     Later,
+}
+
+/// Kind of session a record belongs to. Only backgrounded sessions carry the field; ordinary
+/// foreground sessions omit it entirely, so every site holds it as an `Option`. Modeled as a strict
+/// enum (not a free `String`) so a new kind surfaces as a parse error to be handled, matching the
+/// parser's fail-on-unknown stance. Added in Claude Code 2.1.238+.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SessionKind {
+    Bg,
 }
 
 /// Reasoning-effort level the assistant turn was generated at. Modeled as a strict enum (not a free
@@ -1988,6 +2004,7 @@ pub struct AssistantLogLine {
     /// Reasoning-effort level the turn was generated at (e.g. "xhigh"). `Option` so pre-2.1.214
     /// lines still parse. Added in Claude Code 2.1.214+.
     pub effort: Option<ReasoningEffort>,
+    pub session_kind: Option<SessionKind>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -212,7 +212,12 @@ test in a separate process, making this safe and preventing tests from clobberin
   for the same reason as `TaskStatus.status`), and `artifact-autoreact-ledger` (`ArtifactAutoreactLedger`, the
   bookkeeping for comment threads already reacted to, also keyed by artifact id; its per-artifact `threads` has only
   ever been observed empty, so its element type is an empty `deny_unknown_fields` struct that surfaces the real shape as
-  a parse error rather than silently discarding it) (all added in Claude Code 2.1.238+)
+  a parse error rather than silently discarding it), and a `sessionKind` field (`SessionKind`, a strict enum —
+  currently only `bg` — marking a record as belonging to a backgrounded session; ordinary foreground sessions omit the
+  field entirely, so every site holds it as an `Option`. Carried by the conversation records — user, assistant, and
+  attachment — plus the `away_summary`, `stop_hook_summary`, `turn_duration`, and `compact_boundary` system records
+  (`MicrocompactBoundary` gets it as a byproduct of sharing `define_boundary_log!`); other line types are left alone
+  until one is observed carrying it) (all added in Claude Code 2.1.238+)
 - Also owns the structured view of the raw `model` string via `model::Model { family, version }` plus `ModelFamily` and
   `ModelVersion`. Both `cost_analyzer` (for pricing) and `moriarty::api_pricing` (for grouping/display) consume this one
   parser so family/version classification is not duplicated across crates. The parser preserves capability-decorated raw
