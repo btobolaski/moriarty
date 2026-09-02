@@ -9,7 +9,7 @@ use uuid::Uuid;
 use claude_logs::{
     AssistantLogLine as ClaudeAssistantLogLine, AssistantUsage as ClaudeAssistantUsage,
     LogLine as ClaudeLogLine, Model as ClaudeModel, ModelFamily as ClaudeModelFamily,
-    SystemLogLine as ClaudeSystemLogLine,
+    ModelVersion as ClaudeModelVersion, SystemLogLine as ClaudeSystemLogLine,
 };
 use pi_logs::{
     AssistantMessage, AssistantUsage as PiAssistantUsage, PiLogLine, Provider, RoleMessage,
@@ -162,7 +162,7 @@ const fn decimal_rate(mantissa: u32, scale: u32) -> Decimal {
     Decimal::from_parts(mantissa, 0, 0, false, scale)
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClaudeModelPricing {
     /// Price per million input tokens.
     pub input: Decimal,
@@ -211,15 +211,35 @@ impl ClaudeModelPricing {
         cache_read: decimal_rate(50, 2),
     };
 
-    /// Pricing for Fable models (effective as of 2026-05-26).
-    /// Applies to `claude-fable-*` model strings. Anthropic publishes only the
-    /// input/output rates for Fable; the cache rates derive from the standard
-    /// 1.25x-input write / 0.1x-input read multipliers.
+    /// Pricing for Fable 5 (effective as of 2026-05-26).
+    /// Applies to `claude-fable-*` model strings below version 5.1. Anthropic
+    /// publishes only the input/output rates for Fable 5; the cache rates
+    /// derive from the standard 1.25x-input write / 0.1x-input read
+    /// multipliers.
     pub const FABLE: Self = Self {
         input: decimal_rate(10, 0),
         output: decimal_rate(50, 0),
         cache_write: decimal_rate(125, 1),
         cache_read: decimal_rate(1, 0),
+    };
+
+    /// Pricing for Fable 5.1 and later (effective as of 2026-08-31).
+    /// Identical to `FABLE` except for cache reads, which Anthropic cut from
+    /// the standard 0.1x-input multiplier to a published $0.25/MTok — so this
+    /// tier is not derivable from `FABLE` and must be spelled out.
+    pub const FABLE_5_1: Self = Self {
+        input: decimal_rate(10, 0),
+        output: decimal_rate(50, 0),
+        cache_write: decimal_rate(125, 1),
+        cache_read: decimal_rate(25, 2),
+    };
+
+    /// First Fable version priced at the `FABLE_5_1` tier. `ModelVersion`'s
+    /// derived `Ord` places a `None` minor below `Some(0)`, so a bare
+    /// `claude-fable-5` compares below this and stays on the `FABLE` tier.
+    const FABLE_5_1_FIRST_VERSION: ClaudeModelVersion = ClaudeModelVersion {
+        major: 5,
+        minor: Some(1),
     };
 
     pub fn calculate_cost(&self, usage: &ClaudeTokenCounts) -> LlmCost {
@@ -239,11 +259,17 @@ impl ClaudeModelPricing {
     /// `"OPUS"` inputs, default to the Opus 3 rate (`$15/$75`) because that
     /// is the only historical Opus pricing tier without explicit version
     /// digits in the wire id.
+    ///
+    /// Fable is version-tiered too: `5.1` and later use the reduced
+    /// cache-read rate; `5` and versionless ids stay on the launch tier.
     pub fn for_model(model: &ClaudeModel) -> Option<Self> {
         match model.family {
             ClaudeModelFamily::Sonnet => Some(Self::SONNET),
             ClaudeModelFamily::Haiku => Some(Self::HAIKU),
-            ClaudeModelFamily::Fable => Some(Self::FABLE),
+            ClaudeModelFamily::Fable => Some(match model.version {
+                Some(version) if version >= Self::FABLE_5_1_FIRST_VERSION => Self::FABLE_5_1,
+                _ => Self::FABLE,
+            }),
             ClaudeModelFamily::Opus => Some(match model.version.map(|v| v.major) {
                 Some(major) if major >= 4 => Self::OPUS_4,
                 _ => Self::OPUS,
@@ -1645,28 +1671,34 @@ mod tests {
         // parsed `claude_logs::Model` into a pricing constant; keeping each
         // family wired here prevents a new family variant from silently
         // dropping out of cost analysis.
+        // Whole tiers are compared (not just `input`) because the two Fable
+        // tiers differ only in `cache_read`.
         let cases = [
-            ("claude-sonnet-4-5", ClaudeModelPricing::SONNET.input),
-            (
-                "claude-3-5-sonnet-20241022",
-                ClaudeModelPricing::SONNET.input,
-            ),
-            ("claude-haiku-4-5", ClaudeModelPricing::HAIKU.input),
-            ("claude-3-opus-20240229", ClaudeModelPricing::OPUS.input),
+            ("claude-sonnet-4-5", ClaudeModelPricing::SONNET),
+            ("claude-3-5-sonnet-20241022", ClaudeModelPricing::SONNET),
+            ("claude-haiku-4-5", ClaudeModelPricing::HAIKU),
+            ("claude-3-opus-20240229", ClaudeModelPricing::OPUS),
             // Opus 3 with an explicit minor exercises the
             // `Some(major) where major < 4` arm of the version dispatch —
             // structurally distinct from both the `major >= 4` arm and the
             // bare/versionless `None` arm covered below.
-            ("claude-opus-3-5-20241022", ClaudeModelPricing::OPUS.input),
-            ("claude-opus-4-20250514", ClaudeModelPricing::OPUS_4.input),
-            ("claude-opus-4-7", ClaudeModelPricing::OPUS_4.input),
-            ("claude-fable-5", ClaudeModelPricing::FABLE.input),
+            ("claude-opus-3-5-20241022", ClaudeModelPricing::OPUS),
+            ("claude-opus-4-20250514", ClaudeModelPricing::OPUS_4),
+            ("claude-opus-4-7", ClaudeModelPricing::OPUS_4),
+            ("claude-fable-5", ClaudeModelPricing::FABLE),
+            ("claude-fable-5-1", ClaudeModelPricing::FABLE_5_1),
+            // The `[1m]` context-window suffix is stripped before version
+            // parsing, so it must not knock a 5.1 id back to the launch tier.
+            ("claude-fable-5-1[1m]", ClaudeModelPricing::FABLE_5_1),
+            // Later Fable releases inherit the newest tier, mirroring how
+            // Opus `major >= 4` resolves to OPUS_4.
+            ("claude-fable-6", ClaudeModelPricing::FABLE_5_1),
         ];
-        for (id, expected_input) in cases {
+        for (id, expected) in cases {
             let model = ClaudeModel::from_model_string(id).expect("fixture parses");
             assert_eq!(
-                ClaudeModelPricing::for_model(&model).map(|p| p.input),
-                Some(expected_input),
+                ClaudeModelPricing::for_model(&model),
+                Some(expected),
                 "id {id:?}",
             );
         }
@@ -1675,16 +1707,17 @@ mod tests {
         // historical Opus pricing without explicit version digits.
         let versionless_opus = ClaudeModel::family(ClaudeModelFamily::Opus);
         assert_eq!(
-            ClaudeModelPricing::for_model(&versionless_opus).map(|p| p.input),
-            Some(ClaudeModelPricing::OPUS.input),
+            ClaudeModelPricing::for_model(&versionless_opus),
+            Some(ClaudeModelPricing::OPUS),
         );
 
-        // Fable has a single flat tier, so even a versionless entry resolves
-        // to FABLE (no version dispatch like Opus).
+        // Versionless Fable defaults to the launch (Fable 5) tier rather than
+        // the newer 5.1 tier, matching the versionless-Opus convention of
+        // falling back to the oldest tier.
         let versionless_fable = ClaudeModel::family(ClaudeModelFamily::Fable);
         assert_eq!(
-            ClaudeModelPricing::for_model(&versionless_fable).map(|p| p.input),
-            Some(ClaudeModelPricing::FABLE.input),
+            ClaudeModelPricing::for_model(&versionless_fable),
+            Some(ClaudeModelPricing::FABLE),
         );
 
         // Synthetic is the only family for which pricing is `None` —
@@ -1914,6 +1947,21 @@ mod tests {
                     input: Decimal::new(10, 0),
                     cache_write: Decimal::new(125, 1),
                     cache_read: Decimal::new(1, 0),
+                    output: Decimal::new(50, 0),
+                },
+            },
+            ClaudePricedAssistantCase {
+                name: "fable 5.1 reduced cache-read pricing",
+                request_id: Some("req-fable-5-1"),
+                message_id: "msg_fable_5_1",
+                uuid: CLAUDE_ASSISTANT_UUID,
+                model: "claude-fable-5-1",
+                usage: (1_000_000, 1_000_000, 1_000_000, 1_000_000),
+                expected_id: "req-fable-5-1",
+                expected_cost: LlmCost {
+                    input: Decimal::new(10, 0),
+                    cache_write: Decimal::new(125, 1),
+                    cache_read: Decimal::new(25, 2),
                     output: Decimal::new(50, 0),
                 },
             },

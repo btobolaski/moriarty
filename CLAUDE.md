@@ -315,8 +315,9 @@ with warnings, while explicit missing paths and having no available source are e
   calculated in `cost_analyzer` with local Decimal-based Claude pricing helpers (`ClaudeModelPricing::for_model`) that
   consume `&claude_logs::Model`; the family enum itself lives in `claude_logs` so the parser and pricing layer agree on
   classification without depending on `moriarty::api_pricing` internals. Opus 3 vs Opus 4.x share `ModelFamily::Opus`
-  and the pricing dispatch reads the parsed `version.major` to pick the OPUS or OPUS_4 tier; `ModelFamily::Fable` maps
-  directly to the flat FABLE tier without version dispatch.
+  and the pricing dispatch reads the parsed `version.major` to pick the OPUS or OPUS_4 tier; `ModelFamily::Fable`
+  compares the full parsed `ModelVersion` against 5.1 to pick FABLE (Fable 5 and versionless ids) or FABLE_5_1 (5.1 and
+  later, which differs only in its reduced cache-read rate).
 - `moriarty::api_pricing` and `moriarty::pi_cost` both delegate all log loading, deduplication, pricing, and raw token
   extraction to this crate; the backends only bucket the returned billable lines into cost or token report rows
 - `LineWithCost.session_id` is normalized during parsing so backends can group by conversation without re-reading log
