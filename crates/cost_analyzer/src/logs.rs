@@ -471,6 +471,7 @@ impl AnalyzableLog for ClaudeLogLine {
             ClaudeLogLine::FrameLink(line) => line.timestamp(),
             ClaudeLogLine::ArtifactCommentMonitor(_) => claude_timestamp_sentinel(),
             ClaudeLogLine::ArtifactAutoreactLedger(_) => claude_timestamp_sentinel(),
+            ClaudeLogLine::CostState(_) => claude_timestamp_sentinel(),
         }
     }
 
@@ -528,6 +529,8 @@ impl AnalyzableLog for ClaudeLogLine {
             ClaudeLogLine::ArtifactAutoreactLedger(line) => {
                 format!("artifact-autoreact-ledger:{}", line.session_id)
             }
+            // Also a whole-session snapshot rewritten in place, so the session alone identifies it.
+            ClaudeLogLine::CostState(line) => format!("cost-state:{}", line.session_id),
         }
     }
 
@@ -1078,6 +1081,33 @@ mod tests {
                     "threads": [],
                 },
             },
+        })
+    }
+
+    fn claude_cost_state_json() -> serde_json::Value {
+        json!({
+            "type": "cost-state",
+            "sessionId": CLAUDE_SESSION_ID,
+            "totalCostUSD": 6.7649372,
+            "totalAPIDuration": 821_011u64,
+            "totalAPIDurationWithoutRetries": 820_358u64,
+            "totalToolDuration": 1_590_250u64,
+            "totalLinesAdded": 44u64,
+            "totalLinesRemoved": 27u64,
+            "totalDuration": 2_794_405u64,
+            "startTime": 1_788_370_535_815u64,
+            "modelUsage": {
+                "claude-opus-5": {
+                    "inputTokens": 22u64,
+                    "outputTokens": 10_338u64,
+                    "thinkingTokens": 6_719u64,
+                    "cacheReadInputTokens": 407_057u64,
+                    "cacheCreationInputTokens": 112_011u64,
+                    "webSearchRequests": 0u64,
+                    "costUSD": 1.16215725,
+                },
+            },
+            "hasUnknownModelCost": false,
         })
     }
 
@@ -2159,6 +2189,12 @@ mod tests {
                 value: claude_artifact_autoreact_ledger_json,
                 expected_timestamp: ExpectedClaudeTimestamp::Sentinel,
                 expected_id: claude_metadata_identifier("artifact-autoreact-ledger"),
+            },
+            ClaudeNonBillableCase {
+                name: "cost state",
+                value: claude_cost_state_json,
+                expected_timestamp: ExpectedClaudeTimestamp::Sentinel,
+                expected_id: claude_metadata_identifier("cost-state"),
             },
         ];
 

@@ -24,6 +24,10 @@ pub struct QueueOperation {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<serde_json::Value>,
     pub session_id: String,
+    /// Why the operation happened (only `absorbed_mid_turn` on a `remove` has been observed);
+    /// kept a raw `String` for the same reason as `operation` above. Added in Claude Code 2.1.257+.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// Progress events from Claude Code 2.1+.
@@ -246,6 +250,8 @@ pub enum LogLine {
     ArtifactCommentMonitor(ArtifactCommentMonitor),
     #[serde(rename = "artifact-autoreact-ledger")]
     ArtifactAutoreactLedger(ArtifactAutoreactLedger),
+    #[serde(rename = "cost-state")]
+    CostState(CostState),
 }
 
 /// Session-scoped bookkeeping for the comment threads Claude Code has already reacted to on each
@@ -372,6 +378,53 @@ pub struct AtisLatch {
     pub session_id: Uuid,
 }
 
+/// Claude Code's own running tally of what the session has cost and how long it has spent, written
+/// as a session-scoped snapshot rather than a per-turn record. Added in Claude Code 2.1.257+. This
+/// is Claude Code's accounting, not an input to `cost_analyzer`'s: the analyzer prices assistant
+/// turns itself, so these totals are parsed for completeness and deliberately not folded into any
+/// report, where they would double-count.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct CostState {
+    pub session_id: Uuid,
+    #[serde(rename = "totalCostUSD")]
+    pub total_cost_usd: f64,
+    /// Durations are milliseconds; `startTime` is a Unix epoch timestamp in milliseconds.
+    #[serde(rename = "totalAPIDuration")]
+    pub total_api_duration: u64,
+    #[serde(rename = "totalAPIDurationWithoutRetries")]
+    pub total_api_duration_without_retries: u64,
+    pub total_tool_duration: u64,
+    pub total_duration: u64,
+    pub start_time: u64,
+    pub total_lines_added: u64,
+    pub total_lines_removed: u64,
+    /// Keyed by the raw wire id rather than a parsed [`Model`], whose equality skips `raw` and
+    /// whose version parsing drops the `[1m]` suffix: `claude-opus-5` and `claude-opus-5[1m]` are
+    /// one `Model` key, so keying on it would silently drop one of the two entries Claude Code
+    /// records separately.
+    pub model_usage: BTreeMap<String, CostStateModelUsage>,
+    /// Set when Claude Code priced a model it has no rate for, so `total_cost_usd` understates the
+    /// session.
+    pub has_unknown_model_cost: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct CostStateModelUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    /// Reasoning tokens, already counted inside `output_tokens` rather than added to it.
+    pub thinking_tokens: u64,
+    pub cache_read_input_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub web_search_requests: u64,
+    #[serde(rename = "costUSD")]
+    pub cost_usd: f64,
+}
+
 /// AI-generated conversation title. Added in Claude Code 2.1.141+ alongside the existing
 /// `custom-title` records to capture titles Claude Code derives automatically from the
 /// conversation rather than ones the user provides.
@@ -494,11 +547,14 @@ pub enum AttachmentData {
     AgentListingDelta(AgentListingDelta),
     AutoMode(AutoMode),
     AutoModeExit(AutoModeExit),
+    BashOutputAudienceNote(BashOutputAudienceNote),
+    BatchingReminderSent(BatchingReminderSent),
     CommandPermissions(CommandPermissions),
     CompactFileReference(CompactFileReference),
     ContextTip(ContextTip),
     DateChange(DateChange),
     DeferredToolsDelta(DeferredToolsDelta),
+    Diagnostics(DiagnosticsAttachment),
     Directory(DirectoryAttachment),
     EditedTextFile(EditedTextFile),
     File(FileAttachment),
@@ -517,6 +573,7 @@ pub enum AttachmentData {
     PlanModeReentry(PlanModeReentryAttachment),
     QueuedCommand(QueuedCommand),
     ReadTruncationNotice(ReadTruncationNotice),
+    SilentTurnReminder(SilentTurnReminder),
     SkillListing(SkillListing),
     TaskReminder(TaskReminder),
     TaskStatus(TaskStatus),
@@ -589,6 +646,26 @@ pub struct AutoModeExitBehaviorFlags {
     pub steer_only: bool,
 }
 
+/// Note Claude Code injects after a `Bash` call to remind the model that the command's output was
+/// shown to it and not to the user. Added in Claude Code 2.1.257+.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct BashOutputAudienceNote {
+    #[serde(rename = "toolUseID")]
+    pub tool_use_id: String,
+}
+
+/// Reminder Claude Code injects telling the model to batch independent tool calls into one
+/// response; `model` records which model the reminder was aimed at. Added in Claude Code 2.1.257+.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct BatchingReminderSent {
+    pub text: String,
+    pub model: Model,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
@@ -644,6 +721,79 @@ pub struct DeferredToolsDelta {
     pub readded_names: Vec<String>,
     #[serde(default)]
     pub pending_mcp_servers: Vec<String>,
+    #[serde(default)]
+    pub failed_mcp_servers: Vec<String>,
+    /// Tools withheld from the wire schema; only ever observed empty, so the element type is
+    /// assumed to match its `*_names` siblings.
+    #[serde(default)]
+    pub wire_hidden_names: Vec<String>,
+}
+
+/// Editor diagnostics Claude Code attaches after a file changed, so the model sees the errors its
+/// edit introduced or fixed. `isNew` distinguishes freshly reported diagnostics from a restatement
+/// of ones already surfaced. Added in Claude Code 2.1.257+.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct DiagnosticsAttachment {
+    pub files: Vec<DiagnosticsFile>,
+    pub is_new: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct DiagnosticsFile {
+    pub uri: String,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct Diagnostic {
+    pub message: String,
+    pub severity: DiagnosticSeverity,
+    pub range: DiagnosticRange,
+    /// The reporting tool (e.g. `rustc`).
+    pub source: String,
+    /// The tool's own diagnostic code (e.g. `E0425`). LSP also permits a numeric code, but Claude
+    /// Code has only ever been observed emitting it as a string.
+    pub code: String,
+}
+
+/// LSP's documented closed severity set, so a value outside it surfaces as a parse error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum DiagnosticSeverity {
+    Error,
+    Warning,
+    Information,
+    Hint,
+}
+
+/// Zero-based line/character span, matching LSP rather than the one-based numbering Claude Code
+/// shows the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiagnosticRange {
+    pub start: DiagnosticPosition,
+    pub end: DiagnosticPosition,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiagnosticPosition {
+    pub line: u32,
+    pub character: u32,
+}
+
+/// Nudge Claude Code injects when a turn has run long without the model saying anything to the
+/// user. Added in Claude Code 2.1.257+.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct SilentTurnReminder {
+    pub text: String,
 }
 
 /// Directory contents attached to a turn (e.g. via an `@dir` reference); `content` is a
@@ -1703,6 +1853,10 @@ pub struct UserLogLine {
     /// Scheduling priority for a queued prompt (e.g. `later`); present only on turns that were
     /// queued rather than sent immediately, hence `Option`. Added in Claude Code 2.1.201+.
     pub queue_priority: Option<QueuePriority>,
+    /// Marks a turn that was queued without the attachments Claude Code would normally inject
+    /// alongside it (observed on injected task notifications). Only `true` has been observed, so
+    /// `Option` doubles as the absent/false case. Added in Claude Code 2.1.257+.
+    pub queue_skip_attachments: Option<bool>,
     /// Marks a meta turn that accompanies the turn it was injected alongside (e.g. a skill's
     /// instructions carried with the prompt that invoked it) rather than standing on its own.
     /// Added in Claude Code 2.1.238+.
@@ -2005,6 +2159,11 @@ pub struct AssistantLogLine {
     /// lines still parse. Added in Claude Code 2.1.214+.
     pub effort: Option<ReasoningEffort>,
     pub session_kind: Option<SessionKind>,
+    /// 0-based position of this line's content block within the API response it came from: Claude
+    /// Code logs one assistant line per content block, so the lines sharing a `request_id` are
+    /// distinguished by this index and it restarts at 0 for each response. `Option` so pre-2.1.257
+    /// lines still parse. Added in Claude Code 2.1.257+.
+    pub api_block_index: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

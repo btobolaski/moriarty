@@ -1603,6 +1603,55 @@ fn test_parse_assistant_with_effort() {
 }
 
 #[test]
+fn test_parse_assistant_with_api_block_index() {
+    let json = serde_json::json!({
+        "parentUuid": "eede2871-e78d-4c6e-864a-76cac855f446",
+        "isSidechain": false,
+        "type": "assistant",
+        "uuid": "97d081ac-aa71-436d-bda0-0a53b196e6fe",
+        "timestamp": "2026-09-02T18:23:37.664Z",
+        "message": {
+            "id": "msg_011Cef5aGTMePVioUn5Gqs1w",
+            "container": null,
+            "model": "claude-opus-5",
+            "role": "assistant",
+            "stop_details": null,
+            "stop_reason": "tool_use",
+            "stop_sequence": null,
+            "type": "message",
+            "usage": {
+                "input_tokens": 2,
+                "output_tokens": 296,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "server_tool_use": {"web_search_requests": 0, "web_fetch_requests": 0},
+                "service_tier": "standard",
+                "cache_creation": {"ephemeral_1h_input_tokens": 0, "ephemeral_5m_input_tokens": 0}
+            },
+            "content": [{"type": "text", "text": "ok"}],
+            "context_management": null
+        },
+        "apiBlockIndex": 2,
+        "requestId": "req_011Cef5aFmC2FNPZybBeEqNr",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "22222222-2222-2222-2222-222222222222",
+        "version": "2.1.257",
+        "gitBranch": "HEAD"
+    });
+
+    let line: LogLine =
+        serde_json::from_value(json).expect("Failed to parse assistant with apiBlockIndex");
+    match line {
+        LogLine::Assistant(assistant) => {
+            assert_eq!(assistant.api_block_index, Some(2));
+        }
+        _ => panic!("Expected Assistant variant"),
+    }
+}
+
+#[test]
 fn test_parse_assistant_with_is_aborted_mid_stream() {
     let json = serde_json::json!({
         "parentUuid": "eede2871-e78d-4c6e-864a-76cac855f446",
@@ -7855,7 +7904,9 @@ fn test_parse_attachment_deferred_tools_delta_with_readded_and_pending() {
             "addedLines": ["WebFetch"],
             "removedNames": ["OldTool"],
             "readdedNames": ["PreviouslyRemoved"],
-            "pendingMcpServers": ["server-a", "server-b"]
+            "pendingMcpServers": ["server-a", "server-b"],
+            "failedMcpServers": ["server-c"],
+            "wireHiddenNames": ["HiddenTool"]
         },
         "uuid": "550e8400-e29b-41d4-a716-446655440000",
         "timestamp": "2026-05-28T00:00:00Z",
@@ -7874,6 +7925,8 @@ fn test_parse_attachment_deferred_tools_delta_with_readded_and_pending() {
                 assert_eq!(delta.removed_names, vec!["OldTool"]);
                 assert_eq!(delta.readded_names, vec!["PreviouslyRemoved"]);
                 assert_eq!(delta.pending_mcp_servers, vec!["server-a", "server-b"]);
+                assert_eq!(delta.failed_mcp_servers, vec!["server-c"]);
+                assert_eq!(delta.wire_hidden_names, vec!["HiddenTool"]);
             }
             other => panic!("Expected DeferredToolsDelta, got {:?}", other),
         },
@@ -11385,4 +11438,228 @@ fn test_parse_assistant_log_line_with_null_entrypoint() {
     });
     let line: AssistantLogLine = serde_json::from_value(json).unwrap();
     assert_eq!(line.entrypoint, None);
+}
+
+// `reason` on a `queue-operation` (Claude Code 2.1.257+) records why the entry left the queue.
+#[test]
+fn test_parse_queue_operation_with_reason() {
+    let json = serde_json::json!({
+        "type": "queue-operation",
+        "operation": "remove",
+        "timestamp": "2026-09-02T18:27:29.921Z",
+        "content": "Likely it is missing a rule to egress to traefik.",
+        "sessionId": "fa4fd201-5dac-417e-b2d2-bae37c14f350",
+        "reason": "absorbed_mid_turn"
+    });
+
+    let line: LogLine =
+        serde_json::from_value(json).expect("Failed to parse queue-operation with reason");
+    match line {
+        LogLine::QueueOperation(op) => {
+            assert_eq!(op.reason.as_deref(), Some("absorbed_mid_turn"));
+        }
+        _ => panic!("Expected QueueOperation variant"),
+    }
+}
+
+// `queueSkipAttachments` (Claude Code 2.1.257+) marks a queued turn injected without attachments.
+#[test]
+fn test_parse_user_with_queue_skip_attachments() {
+    let json = serde_json::json!({
+        "parentUuid": "ff9f560a-f665-4117-9f13-324af54a8527",
+        "isSidechain": false,
+        "type": "user",
+        "uuid": "5e5b1a4c-6c1e-4a2e-9d64-9f1d5cdb0c7a",
+        "timestamp": "2026-09-02T18:27:29.921Z",
+        "message": {"role": "user", "content": "<task-notification>done</task-notification>"},
+        "queueSkipAttachments": true,
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "801f616c-13c9-45cb-8c71-b4b13badc6ef",
+        "version": "2.1.257",
+        "gitBranch": "HEAD"
+    });
+
+    let line: LogLine =
+        serde_json::from_value(json).expect("Failed to parse user with queueSkipAttachments");
+    match line {
+        LogLine::User(user) => assert_eq!(user.queue_skip_attachments, Some(true)),
+        _ => panic!("Expected User variant"),
+    }
+}
+
+// `cost-state` (Claude Code 2.1.257+) is Claude Code's own session cost/duration tally.
+#[test]
+fn test_parse_cost_state() {
+    let json = serde_json::json!({
+        "type": "cost-state",
+        "sessionId": "801f616c-13c9-45cb-8c71-b4b13badc6ef",
+        "totalCostUSD": 6.764937200000001,
+        "totalAPIDuration": 821011,
+        "totalAPIDurationWithoutRetries": 820358,
+        "totalToolDuration": 1590250,
+        "totalLinesAdded": 44,
+        "totalLinesRemoved": 27,
+        "totalDuration": 2794405,
+        "startTime": 1788370535815_u64,
+        "modelUsage": {
+            "claude-opus-5[1m]": {
+                "inputTokens": 22,
+                "outputTokens": 10338,
+                "thinkingTokens": 6719,
+                "cacheReadInputTokens": 407057,
+                "cacheCreationInputTokens": 112011,
+                "webSearchRequests": 0,
+                "costUSD": 1.1621572500000004
+            },
+            "claude-opus-5": {
+                "inputTokens": 7,
+                "outputTokens": 11,
+                "thinkingTokens": 0,
+                "cacheReadInputTokens": 13,
+                "cacheCreationInputTokens": 17,
+                "webSearchRequests": 0,
+                "costUSD": 0.5
+            }
+        },
+        "hasUnknownModelCost": false
+    });
+
+    let line: LogLine = serde_json::from_value(json).expect("Failed to parse cost-state");
+    match line {
+        LogLine::CostState(state) => {
+            assert_eq!(state.total_cost_usd, 6.764937200000001);
+            assert_eq!(state.total_api_duration_without_retries, 820358);
+            assert!(!state.has_unknown_model_cost);
+            // Keying on the raw id is what keeps these two entries apart: they are one key under
+            // `Model`, whose equality skips the raw string and whose version parsing drops `[1m]`.
+            let usage = state
+                .model_usage
+                .get("claude-opus-5[1m]")
+                .expect("per-model usage is keyed by the raw model id");
+            assert_eq!(usage.thinking_tokens, 6719);
+            assert_eq!(usage.cost_usd, 1.1621572500000004);
+            assert_eq!(
+                state
+                    .model_usage
+                    .get("claude-opus-5")
+                    .expect("the undecorated id is a separate entry")
+                    .cost_usd,
+                0.5
+            );
+        }
+        _ => panic!("Expected CostState variant"),
+    }
+}
+
+// `diagnostics` attachment (Claude Code 2.1.257+) carries editor diagnostics for changed files.
+#[test]
+fn test_parse_attachment_diagnostics() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": "8876f5e5-fabd-4c7d-b617-d07ac9e6fdaf",
+        "isSidechain": false,
+        "attachment": {
+            "type": "diagnostics",
+            "files": [{
+                "uri": "/test/parser.rs",
+                "diagnostics": [{
+                    "message": "cannot find type `Missing` in this scope",
+                    "severity": "Error",
+                    "range": {
+                        "start": {"line": 496, "character": 27},
+                        "end": {"line": 496, "character": 49}
+                    },
+                    "source": "rustc",
+                    "code": "E0425"
+                }]
+            }],
+            "isNew": true
+        },
+        "uuid": "3d19f293-ac4e-47a7-97fc-35a80eaa1157",
+        "timestamp": "2026-09-02T18:30:33.680Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "723b9031-3708-4082-97e4-4eb76aa117bc",
+        "version": "2.1.257",
+        "gitBranch": "HEAD"
+    });
+    let log_line: LogLine = serde_json::from_value(json).unwrap();
+    match log_line {
+        LogLine::Attachment(att) => {
+            if let AttachmentData::Diagnostics(diagnostics) = &att.attachment {
+                assert!(diagnostics.is_new);
+                let file = &diagnostics.files[0];
+                assert_eq!(file.uri, "/test/parser.rs");
+                let diagnostic = &file.diagnostics[0];
+                assert_eq!(diagnostic.severity, DiagnosticSeverity::Error);
+                assert_eq!(diagnostic.source, "rustc");
+                assert_eq!(diagnostic.code, "E0425");
+                assert_eq!(diagnostic.range.start.line, 496);
+                assert_eq!(diagnostic.range.end.character, 49);
+            } else {
+                panic!("Expected Diagnostics, got {:?}", att.attachment);
+            }
+        }
+        other => panic!("Expected Attachment, got {:?}", other),
+    }
+}
+
+// `silent_turn_reminder`, `bash_output_audience_note`, and `batching_reminder_sent` attachments
+// (all Claude Code 2.1.257+) are the turn-shaping notes Claude Code injects mid-turn.
+#[test]
+fn test_parse_attachment_turn_reminders() {
+    let attachment_of = |attachment: serde_json::Value| {
+        let line = serde_json::json!({
+            "type": "attachment",
+            "parentUuid": "2c4682ed-4546-40b8-9297-d71c95f0a96f",
+            "isSidechain": false,
+            "attachment": attachment,
+            "uuid": "ebf71565-d7b5-4e98-aac6-ca04ad88f471",
+            "timestamp": "2026-09-02T18:29:46.664Z",
+            "userType": "external",
+            "entrypoint": "cli",
+            "cwd": "/test",
+            "sessionId": "fa4fd201-5dac-417e-b2d2-bae37c14f350",
+            "version": "2.1.257",
+            "gitBranch": "HEAD"
+        });
+        match serde_json::from_value::<LogLine>(line).expect("Failed to parse reminder attachment")
+        {
+            LogLine::Attachment(att) => att.attachment,
+            other => panic!("Expected Attachment, got {:?}", other),
+        }
+    };
+
+    assert_eq!(
+        attachment_of(serde_json::json!({
+            "type": "silent_turn_reminder",
+            "text": "The user hasn't heard from you in a while."
+        })),
+        AttachmentData::SilentTurnReminder(SilentTurnReminder {
+            text: "The user hasn't heard from you in a while.".to_string(),
+        })
+    );
+    assert_eq!(
+        attachment_of(serde_json::json!({
+            "type": "bash_output_audience_note",
+            "toolUseID": "toolu_01QwQuhp6qaXMGsQYRCNsgim"
+        })),
+        AttachmentData::BashOutputAudienceNote(BashOutputAudienceNote {
+            tool_use_id: "toolu_01QwQuhp6qaXMGsQYRCNsgim".to_string(),
+        })
+    );
+    assert_eq!(
+        attachment_of(serde_json::json!({
+            "type": "batching_reminder_sent",
+            "text": "Request every independent item in this one response.",
+            "model": "claude-fable-5-1"
+        })),
+        AttachmentData::BatchingReminderSent(BatchingReminderSent {
+            text: "Request every independent item in this one response.".to_string(),
+            model: Model::from_model_string("claude-fable-5-1".to_string()).unwrap(),
+        })
+    );
 }
