@@ -1874,6 +1874,10 @@ pub struct UserLogLine {
     #[serde(rename = "session_id")]
     pub session_id_snake: Option<Uuid>,
     pub session_kind: Option<SessionKind>,
+    /// Ids of the images pasted into this turn, matching the `[Image #N]` placeholders in its text
+    /// and the `image` content blocks carrying the data. Logged as `null` on turns with no paste, so
+    /// `Option` covers both the null and the absent case. Added in Claude Code 2.1.257+.
+    pub image_paste_ids: Option<Vec<u32>>,
 }
 
 /// Summarization metadata on a compact-summary user turn. Added in Claude Code 2.1.214+.
@@ -2164,6 +2168,10 @@ pub struct AssistantLogLine {
     /// distinguished by this index and it restarts at 0 for each response. `Option` so pre-2.1.257
     /// lines still parse. Added in Claude Code 2.1.257+.
     pub api_block_index: Option<u32>,
+    /// Mirrors [`UserLogLine::image_paste_ids`]; only ever observed `null` on assistant turns, but
+    /// Claude Code emits the key on both roles so the field is required for strict parsing to
+    /// succeed. Added in Claude Code 2.1.257+.
+    pub image_paste_ids: Option<Vec<u32>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

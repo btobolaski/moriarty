@@ -6493,6 +6493,29 @@ fn test_parse_user_log_line_with_classifier_meta_lines() {
 }
 
 #[test]
+fn test_parse_user_log_line_with_image_paste_ids() {
+    let json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "version": "2.1.257",
+        "gitBranch": "HEAD",
+        "message": {"role": "user", "content": [
+            {"type": "text", "text": "[Image #1] what is this"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGk="}}
+        ]},
+        "uuid": "f7c10d66-4699-489b-8f4c-df52f5e0fd34",
+        "timestamp": "2026-09-03T15:51:51.767Z",
+        "imagePasteIds": [1]
+    });
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(line.image_paste_ids, Some(vec![1]));
+}
+
+#[test]
 fn test_parse_user_log_line_without_queue_priority() {
     // The field is absent on turns sent immediately, so it must default to None.
     let json = serde_json::json!({
