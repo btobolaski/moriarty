@@ -4068,6 +4068,18 @@ fn custom_message_plannotator_complete_without_details() {
 }
 
 #[test]
+fn custom_message_rpiv_todo_continuation_without_details() {
+    assert!(matches!(
+        parse_custom_message_payload(
+            "[Automated rpiv-todo reminder] Unfinished todos remain.",
+            "rpiv-todo-continuation",
+            None
+        ),
+        CustomMessagePayload::RpivTodoContinuation
+    ));
+}
+
+#[test]
 fn custom_message_plannotator_complete_rejects_details() {
     assert_parse_error_contains_any(
         "plannotator-complete rejects details",

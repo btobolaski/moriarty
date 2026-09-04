@@ -346,7 +346,7 @@ pub struct CustomMessageLine {
 
 /// Adjacently tagged enum selected by `customType` with the typed body living
 /// under `details`. `details` is optional because some variants
-/// (`plannotator-complete`) omit it entirely.
+/// (`plannotator-complete`, `rpiv-todo-continuation`) omit it entirely.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "customType", content = "details")]
 pub enum CustomMessagePayload {
@@ -400,6 +400,11 @@ pub enum CustomMessagePayload {
     /// subscription token, run id, and wake outcome.
     #[serde(rename = "subagent-wait-subscription")]
     SubagentWaitSubscription(SubagentWaitSubscriptionDetails),
+    /// Automated todo reminder injected by the rpiv extension when unfinished
+    /// todos remain, explicitly marked in `content` as not user-sent. Carries
+    /// no `details` payload, so it must be a unit variant to parse.
+    #[serde(rename = "rpiv-todo-continuation")]
+    RpivTodoContinuation,
 }
 
 // ---------------------------------------------------------------------------
