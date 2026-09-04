@@ -29,7 +29,7 @@ impl PiModelMetricsMap {
             }
             std::collections::btree_map::Entry::Occupied(mut entry) => entry
                 .get_mut()
-                .checked_add_assign(metrics)
+                .try_add_assign(metrics)
                 .wrap_err_with(|| format!("failed to aggregate metrics for {}", model.model)),
         }
     }
@@ -42,20 +42,15 @@ impl PiModelMetricsMap {
             })
     }
 
-    pub(crate) fn model_metrics(&self) -> impl Iterator<Item = (&PiModel, &MetricComponents)> {
-        self.metrics.iter()
+    pub(crate) fn agent_turns(&self) -> u64 {
+        self.metrics
+            .values()
+            .map(MetricComponents::agent_turns)
+            .sum()
     }
 
-    #[cfg(test)]
-    pub(crate) fn model_costs(
-        &self,
-    ) -> impl Iterator<Item = (&PiModel, &crate::cost_report::CostComponents)> {
-        self.metrics.iter().map(|(model, metrics)| {
-            let MetricComponents::Cost(costs) = metrics else {
-                unreachable!("cost tests requested token metrics")
-            };
-            (model, costs)
-        })
+    pub(crate) fn model_metrics(&self) -> impl Iterator<Item = (&PiModel, &MetricComponents)> {
+        self.metrics.iter()
     }
 
     #[cfg(test)]
@@ -71,9 +66,20 @@ pub(crate) type PiModelCostsMap = PiModelMetricsMap;
 mod tests {
     use pi_logs::Provider;
 
-    use crate::cost_report::{CostComponents, TokenCounts};
+    use crate::cost_report::{CostComponents, MetricPayload, TokenCounts};
 
     use super::*;
+
+    impl PiModelMetricsMap {
+        pub(crate) fn model_costs(&self) -> impl Iterator<Item = (&PiModel, &CostComponents)> {
+            self.metrics.iter().map(|(model, metrics)| {
+                let MetricPayload::Cost(costs) = &metrics.payload else {
+                    unreachable!("cost tests requested token metrics")
+                };
+                (model, costs)
+            })
+        }
+    }
 
     fn model(provider: Provider, model: &str) -> PiModel {
         PiModel {
@@ -89,22 +95,24 @@ mod tests {
         metrics
             .add(
                 key.clone(),
-                MetricComponents::Cost(CostComponents::new(1.0, 2.0, 0.0, 0.0)),
+                MetricComponents::from(CostComponents::new(1.0, 2.0, 0.0, 0.0)).with_agent_turns(2),
             )
             .unwrap();
         metrics
             .add(
                 key,
-                MetricComponents::Cost(CostComponents::new(0.5, 0.5, 0.25, 0.0)),
+                MetricComponents::from(CostComponents::new(0.5, 0.5, 0.25, 0.0))
+                    .with_agent_turns(3),
             )
             .unwrap();
 
         let entries: Vec<_> = metrics.model_metrics().collect();
         assert_eq!(entries.len(), 1);
         assert_eq!(
-            *entries[0].1,
-            MetricComponents::Cost(CostComponents::new(1.5, 2.5, 0.25, 0.0))
+            entries[0].1.payload,
+            MetricPayload::Cost(CostComponents::new(1.5, 2.5, 0.25, 0.0))
         );
+        assert_eq!(metrics.agent_turns(), 5);
     }
 
     #[test]
@@ -114,19 +122,23 @@ mod tests {
         metrics
             .add(
                 key.clone(),
-                MetricComponents::Tokens(TokenCounts::new(1, 2, 3, 4)),
+                MetricComponents::from(TokenCounts::new(1, 2, 3, 4)).with_agent_turns(4),
             )
             .unwrap();
         metrics
-            .add(key, MetricComponents::Tokens(TokenCounts::new(5, 6, 7, 8)))
+            .add(
+                key,
+                MetricComponents::from(TokenCounts::new(5, 6, 7, 8)).with_agent_turns(5),
+            )
             .unwrap();
 
         let entries: Vec<_> = metrics.model_metrics().collect();
         assert_eq!(entries.len(), 1);
         assert_eq!(
-            *entries[0].1,
-            MetricComponents::Tokens(TokenCounts::new(6, 8, 10, 12))
+            entries[0].1.payload,
+            MetricPayload::Tokens(TokenCounts::new(6, 8, 10, 12))
         );
+        assert_eq!(metrics.agent_turns(), 9);
     }
 
     #[test]
@@ -136,12 +148,12 @@ mod tests {
         metrics
             .add(
                 key.clone(),
-                MetricComponents::Cost(CostComponents::new(1.0, 0.0, 0.0, 0.0)),
+                MetricComponents::from(CostComponents::new(1.0, 0.0, 0.0, 0.0)),
             )
             .unwrap();
 
         let error = metrics
-            .add(key, MetricComponents::Tokens(TokenCounts::new(1, 0, 0, 0)))
+            .add(key, MetricComponents::from(TokenCounts::new(1, 0, 0, 0)))
             .unwrap_err();
 
         assert!(
@@ -157,19 +169,19 @@ mod tests {
         metrics
             .add(
                 model(Provider::OpenAi, "gpt-5"),
-                MetricComponents::Tokens(TokenCounts::new(1, 0, 0, 0)),
+                MetricComponents::from(TokenCounts::new(1, 0, 0, 0)),
             )
             .unwrap();
         metrics
             .add(
                 model(Provider::Anthropic, "claude-sonnet-4-5"),
-                MetricComponents::Tokens(TokenCounts::new(1, 0, 0, 0)),
+                MetricComponents::from(TokenCounts::new(1, 0, 0, 0)),
             )
             .unwrap();
         metrics
             .add(
                 model(Provider::Anthropic, "claude-haiku-3-5"),
-                MetricComponents::Tokens(TokenCounts::new(1, 0, 0, 0)),
+                MetricComponents::from(TokenCounts::new(1, 0, 0, 0)),
             )
             .unwrap();
 
@@ -194,13 +206,13 @@ mod tests {
         metrics
             .add(
                 model(Provider::Anthropic, "claude-sonnet-4-5"),
-                MetricComponents::Tokens(TokenCounts::new(1, 2, 3, 4)),
+                MetricComponents::from(TokenCounts::new(1, 2, 3, 4)),
             )
             .unwrap();
         metrics
             .add(
                 model(Provider::OpenAi, "gpt-5"),
-                MetricComponents::Tokens(TokenCounts::new(5, 6, 7, 8)),
+                MetricComponents::from(TokenCounts::new(5, 6, 7, 8)),
             )
             .unwrap();
 
@@ -217,12 +229,12 @@ mod tests {
         metrics
             .add(
                 key.clone(),
-                MetricComponents::Tokens(TokenCounts::new(u64::MAX, 0, 0, 0)),
+                MetricComponents::from(TokenCounts::new(u64::MAX, 0, 0, 0)),
             )
             .unwrap();
 
         let error = metrics
-            .add(key, MetricComponents::Tokens(TokenCounts::new(1, 0, 0, 0)))
+            .add(key, MetricComponents::from(TokenCounts::new(1, 0, 0, 0)))
             .unwrap_err();
 
         assert!(

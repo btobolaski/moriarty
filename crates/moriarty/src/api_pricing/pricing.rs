@@ -72,7 +72,7 @@ impl ModelMetricsMap {
             }
             std::collections::hash_map::Entry::Occupied(mut entry) => entry
                 .get_mut()
-                .checked_add_assign(metrics)
+                .try_add_assign(metrics)
                 .map_err(|error| error.wrap_err(format!("failed to aggregate {label} metrics"))),
         }
     }
@@ -91,6 +91,13 @@ impl ModelMetricsMap {
             .try_fold(MetricTotal::zero(report_mode), |acc, metrics| {
                 acc.checked_add(metrics.total())
             })
+    }
+
+    pub fn agent_turns(&self) -> u64 {
+        self.metrics
+            .values()
+            .map(MetricComponents::agent_turns)
+            .sum()
     }
 
     /// Ordered view of every populated bucket, keyed by the parsed `Model`
@@ -119,46 +126,45 @@ impl ModelMetricsMap {
 }
 
 #[cfg(test)]
-impl ModelMetricsMap {
-    pub fn get(&self, model: Model) -> crate::cost_report::CostComponents {
-        match self.get_metric(model, ReportMode::Cost) {
-            MetricComponents::Cost(costs) => costs,
-            MetricComponents::Tokens(_) => {
-                unreachable!("map contains token metrics but cost access was requested")
-            }
-        }
-    }
-
-    pub fn get_tokens(&self, model: Model) -> crate::cost_report::TokenCounts {
-        match self.get_metric(model, ReportMode::Tokens) {
-            MetricComponents::Cost(_) => {
-                unreachable!("map contains cost metrics but token access was requested")
-            }
-            MetricComponents::Tokens(tokens) => tokens,
-        }
-    }
-
-    pub fn model_costs(&self) -> Vec<(String, crate::cost_report::CostComponents)> {
-        self.model_metrics()
-            .into_iter()
-            .map(|(name, metrics)| match metrics {
-                MetricComponents::Cost(costs) => (name, costs),
-                MetricComponents::Tokens(_) => {
-                    unreachable!("map contains token metrics but cost access was requested")
-                }
-            })
-            .collect()
-    }
-}
-
-#[cfg(test)]
 pub type ModelCostsMap = ModelMetricsMap;
 
 #[cfg(test)]
 mod tests {
-    use crate::cost_report::{CostComponents, TokenCounts};
+    use crate::cost_report::{CostComponents, MetricPayload, TokenCounts};
 
     use super::*;
+
+    impl ModelMetricsMap {
+        pub fn get(&self, model: Model) -> CostComponents {
+            match self.get_metric(model, ReportMode::Cost).payload {
+                MetricPayload::Cost(costs) => costs,
+                MetricPayload::Tokens(_) => {
+                    unreachable!("map contains token metrics but cost access was requested")
+                }
+            }
+        }
+
+        pub fn get_tokens(&self, model: Model) -> TokenCounts {
+            match self.get_metric(model, ReportMode::Tokens).payload {
+                MetricPayload::Cost(_) => {
+                    unreachable!("map contains cost metrics but token access was requested")
+                }
+                MetricPayload::Tokens(tokens) => tokens,
+            }
+        }
+
+        pub fn model_costs(&self) -> Vec<(String, CostComponents)> {
+            self.model_metrics()
+                .into_iter()
+                .map(|(name, metrics)| match metrics.payload {
+                    MetricPayload::Cost(costs) => (name, costs),
+                    MetricPayload::Tokens(_) => {
+                        unreachable!("map contains token metrics but cost access was requested")
+                    }
+                })
+                .collect()
+        }
+    }
 
     fn sonnet() -> Model {
         Model::family(ModelFamily::Sonnet)
@@ -172,17 +178,18 @@ mod tests {
         let mut map = ModelMetricsMap::default();
         map.add(
             sonnet(),
-            MetricComponents::Cost(CostComponents::new(1.0, 2.0, 0.0, 0.0)),
+            MetricComponents::from(CostComponents::new(1.0, 2.0, 0.0, 0.0)).with_agent_turns(2),
         )
         .unwrap();
         map.add(
             sonnet(),
-            MetricComponents::Cost(CostComponents::new(0.5, 0.5, 0.25, 0.0)),
+            MetricComponents::from(CostComponents::new(0.5, 0.5, 0.25, 0.0)).with_agent_turns(3),
         )
         .unwrap();
 
         let sonnet_costs = map.get(sonnet());
         assert_eq!(sonnet_costs, CostComponents::new(1.5, 2.5, 0.25, 0.0));
+        assert_eq!(map.agent_turns(), 5);
     }
 
     #[test]
@@ -190,17 +197,18 @@ mod tests {
         let mut map = ModelMetricsMap::default();
         map.add(
             sonnet(),
-            MetricComponents::Tokens(TokenCounts::new(1, 2, 0, 0)),
+            MetricComponents::from(TokenCounts::new(1, 2, 0, 0)).with_agent_turns(4),
         )
         .unwrap();
         map.add(
             sonnet(),
-            MetricComponents::Tokens(TokenCounts::new(3, 4, 5, 6)),
+            MetricComponents::from(TokenCounts::new(3, 4, 5, 6)).with_agent_turns(5),
         )
         .unwrap();
 
         let sonnet_tokens = map.get_tokens(sonnet());
         assert_eq!(sonnet_tokens, TokenCounts::new(4, 6, 5, 6));
+        assert_eq!(map.agent_turns(), 9);
     }
 
     #[test]
@@ -208,14 +216,14 @@ mod tests {
         let mut map = ModelMetricsMap::default();
         map.add(
             sonnet(),
-            MetricComponents::Cost(CostComponents::new(1.0, 0.0, 0.0, 0.0)),
+            MetricComponents::from(CostComponents::new(1.0, 0.0, 0.0, 0.0)),
         )
         .unwrap();
 
         let error = map
             .add(
                 sonnet(),
-                MetricComponents::Tokens(TokenCounts::new(1, 0, 0, 0)),
+                MetricComponents::from(TokenCounts::new(1, 0, 0, 0)),
             )
             .unwrap_err();
 
@@ -239,13 +247,13 @@ mod tests {
         metrics
             .add(
                 sonnet(),
-                MetricComponents::Cost(CostComponents::new(1.0, 2.0, 0.0, 0.0)),
+                MetricComponents::from(CostComponents::new(1.0, 2.0, 0.0, 0.0)),
             )
             .unwrap();
         metrics
             .add(
                 haiku(),
-                MetricComponents::Cost(CostComponents::new(0.5, 1.0, 0.0, 0.0)),
+                MetricComponents::from(CostComponents::new(0.5, 1.0, 0.0, 0.0)),
             )
             .unwrap();
 
@@ -261,13 +269,13 @@ mod tests {
         metrics
             .add(
                 sonnet(),
-                MetricComponents::Tokens(TokenCounts::new(1, 2, 3, 4)),
+                MetricComponents::from(TokenCounts::new(1, 2, 3, 4)),
             )
             .unwrap();
         metrics
             .add(
                 haiku(),
-                MetricComponents::Tokens(TokenCounts::new(5, 6, 7, 8)),
+                MetricComponents::from(TokenCounts::new(5, 6, 7, 8)),
             )
             .unwrap();
 
@@ -283,13 +291,13 @@ mod tests {
         metrics
             .add(
                 sonnet(),
-                MetricComponents::Tokens(TokenCounts::new(9_007_199_254_740_993, 1, 0, 0)),
+                MetricComponents::from(TokenCounts::new(9_007_199_254_740_993, 1, 0, 0)),
             )
             .unwrap();
         metrics
             .add(
                 haiku(),
-                MetricComponents::Tokens(TokenCounts::new(2, 0, 0, 0)),
+                MetricComponents::from(TokenCounts::new(2, 0, 0, 0)),
             )
             .unwrap();
 
@@ -305,14 +313,14 @@ mod tests {
         metrics
             .add(
                 sonnet(),
-                MetricComponents::Tokens(TokenCounts::new(u64::MAX, 0, 0, 0)),
+                MetricComponents::from(TokenCounts::new(u64::MAX, 0, 0, 0)),
             )
             .unwrap();
 
         let error = metrics
             .add(
                 sonnet(),
-                MetricComponents::Tokens(TokenCounts::new(1, 0, 0, 0)),
+                MetricComponents::from(TokenCounts::new(1, 0, 0, 0)),
             )
             .unwrap_err();
 
@@ -333,7 +341,7 @@ mod tests {
         metrics
             .add(
                 Model::family(ModelFamily::Synthetic),
-                MetricComponents::Cost(CostComponents::new(9.0, 8.0, 7.0, 6.0)),
+                MetricComponents::from(CostComponents::new(9.0, 8.0, 7.0, 6.0)),
             )
             .unwrap();
 
@@ -373,7 +381,7 @@ mod tests {
             metrics
                 .add(
                     Model::from_model_string(id).expect("fixture model id parses"),
-                    MetricComponents::Cost(CostComponents::new(1.0, 0.0, 0.0, 0.0)),
+                    MetricComponents::from(CostComponents::new(1.0, 0.0, 0.0, 0.0)),
                 )
                 .unwrap();
         }
@@ -417,7 +425,7 @@ mod tests {
             metrics
                 .add(
                     Model::from_model_string(id).expect("fixture model id parses"),
-                    MetricComponents::Cost(CostComponents::new(1.0, 0.0, 0.0, 0.0)),
+                    MetricComponents::from(CostComponents::new(1.0, 0.0, 0.0, 0.0)),
                 )
                 .unwrap();
         }

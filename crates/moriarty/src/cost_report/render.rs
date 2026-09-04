@@ -83,20 +83,33 @@ impl TokenCounts {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) enum MetricComponents {
+pub(crate) enum MetricPayload {
     Cost(CostComponents),
     Tokens(TokenCounts),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct MetricComponents {
+    pub(crate) payload: MetricPayload,
+    // Payload conversions stay neutral because Pi compactions are billable but not agent turns.
+    agent_turns: u64,
+}
+
 impl From<CostComponents> for MetricComponents {
     fn from(value: CostComponents) -> Self {
-        Self::Cost(value)
+        Self {
+            payload: MetricPayload::Cost(value),
+            agent_turns: 0,
+        }
     }
 }
 
 impl From<TokenCounts> for MetricComponents {
     fn from(value: TokenCounts) -> Self {
-        Self::Tokens(value)
+        Self {
+            payload: MetricPayload::Tokens(value),
+            agent_turns: 0,
+        }
     }
 }
 
@@ -104,42 +117,60 @@ impl MetricComponents {
     #[cfg(test)]
     pub(crate) fn zero(report_mode: ReportMode) -> Self {
         match report_mode {
-            ReportMode::Cost => Self::Cost(CostComponents::default()),
-            ReportMode::Tokens => Self::Tokens(TokenCounts::default()),
+            ReportMode::Cost => CostComponents::default().into(),
+            ReportMode::Tokens => TokenCounts::default().into(),
         }
+    }
+
+    pub(crate) fn with_agent_turns(mut self, agent_turns: u64) -> Self {
+        self.agent_turns = agent_turns;
+        self
+    }
+
+    pub(crate) fn agent_turns(&self) -> u64 {
+        self.agent_turns
     }
 
     pub(crate) fn is_zero(&self) -> bool {
-        match self {
-            Self::Cost(costs) => costs.total() == 0.0,
-            Self::Tokens(counts) => counts.total() == 0,
-        }
+        self.agent_turns == 0
+            && match self.payload {
+                MetricPayload::Cost(costs) => costs.total() == 0.0,
+                MetricPayload::Tokens(counts) => counts.total() == 0,
+            }
     }
 
     pub(crate) fn total(&self) -> MetricTotal {
-        match self {
-            Self::Cost(costs) => MetricTotal::Cost(costs.total()),
-            Self::Tokens(counts) => MetricTotal::Tokens(counts.total()),
+        match self.payload {
+            MetricPayload::Cost(costs) => MetricTotal::Cost(costs.total()),
+            MetricPayload::Tokens(counts) => MetricTotal::Tokens(counts.total()),
         }
     }
 
-    pub(crate) fn checked_add_assign(&mut self, other: Self) -> miette::Result<()> {
-        match (self, other) {
-            (Self::Cost(current), Self::Cost(other)) => {
+    pub(crate) fn try_add_assign(&mut self, other: Self) -> miette::Result<()> {
+        match (&mut self.payload, other.payload) {
+            (MetricPayload::Cost(current), MetricPayload::Cost(other)) => {
                 current.input += other.input;
                 current.output += other.output;
                 current.cache_write += other.cache_write;
                 current.cache_read += other.cache_read;
-                Ok(())
             }
-            (Self::Tokens(current), Self::Tokens(other)) => current.checked_add_assign(other),
-            (Self::Cost(_), Self::Tokens(_)) => Err(miette!(
-                "attempted to add token metrics into a cost accumulator"
-            )),
-            (Self::Tokens(_), Self::Cost(_)) => Err(miette!(
-                "attempted to add cost metrics into a token accumulator"
-            )),
+            (MetricPayload::Tokens(current), MetricPayload::Tokens(other)) => {
+                current.checked_add_assign(other)?;
+            }
+            (MetricPayload::Cost(_), MetricPayload::Tokens(_)) => {
+                return Err(miette!(
+                    "attempted to add token metrics into a cost accumulator"
+                ));
+            }
+            (MetricPayload::Tokens(_), MetricPayload::Cost(_)) => {
+                return Err(miette!(
+                    "attempted to add cost metrics into a token accumulator"
+                ));
+            }
         }
+
+        self.agent_turns += other.agent_turns;
+        Ok(())
     }
 }
 
@@ -182,6 +213,41 @@ impl MetricTotal {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ReportTotals {
+    pub(crate) total: MetricTotal,
+    pub(crate) agent_turns: u64,
+}
+
+impl ReportTotals {
+    pub(crate) fn new(total: MetricTotal, agent_turns: u64) -> Self {
+        Self { total, agent_turns }
+    }
+
+    pub(crate) fn zero(report_mode: ReportMode) -> Self {
+        Self::new(MetricTotal::zero(report_mode), 0)
+    }
+
+    pub(crate) fn try_add(self, other: Self) -> miette::Result<Self> {
+        Ok(Self {
+            total: self.total.checked_add(other.total)?,
+            agent_turns: self.agent_turns + other.agent_turns,
+        })
+    }
+}
+
+pub(crate) fn sum_report_totals<'a, Item: 'a>(
+    report_mode: ReportMode,
+    items: impl IntoIterator<Item = &'a Item>,
+    item_totals: impl Fn(&Item) -> miette::Result<ReportTotals>,
+) -> miette::Result<ReportTotals> {
+    items
+        .into_iter()
+        .try_fold(ReportTotals::zero(report_mode), |totals, item| {
+            totals.try_add(item_totals(item)?)
+        })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReportMode {
     Cost,
@@ -219,6 +285,8 @@ const MIN_WIDTH_FOR_WRAPPING: usize = 100;
 
 #[derive(Tabled)]
 pub(crate) struct FormattedMetricColumns {
+    #[tabled(rename = "Agent Turns")]
+    pub(crate) agent_turns: String,
     #[tabled(rename = "Input")]
     pub(crate) input: String,
     #[tabled(rename = "Output")]
@@ -233,15 +301,18 @@ pub(crate) struct FormattedMetricColumns {
 
 impl FormattedMetricColumns {
     pub(crate) fn from_metrics(metrics: MetricComponents) -> Self {
-        match metrics {
-            MetricComponents::Cost(costs) => Self {
+        let agent_turns = fmt_tokens(metrics.agent_turns() as u128);
+        match metrics.payload {
+            MetricPayload::Cost(costs) => Self {
+                agent_turns,
                 input: fmt_money(costs.input),
                 output: fmt_money(costs.output),
                 cache_write: fmt_money(costs.cache_write),
                 cache_read: fmt_money(costs.cache_read),
                 subtotal: fmt_money(costs.total()),
             },
-            MetricComponents::Tokens(counts) => Self {
+            MetricPayload::Tokens(counts) => Self {
+                agent_turns,
                 input: fmt_tokens(counts.input as u128),
                 output: fmt_tokens(counts.output as u128),
                 cache_write: fmt_tokens(counts.cache_write as u128),
@@ -253,67 +324,31 @@ impl FormattedMetricColumns {
 
     /// Leaving the per-component cells blank prevents the footer from looking
     /// like another model row whose subtotal should be added again.
-    pub(crate) fn from_total(total: MetricTotal) -> Self {
+    pub(crate) fn from_total(totals: ReportTotals) -> Self {
         Self {
+            agent_turns: fmt_tokens(totals.agent_turns as u128),
             input: String::new(),
             output: String::new(),
             cache_write: String::new(),
             cache_read: String::new(),
-            subtotal: total.format(),
-        }
-    }
-}
-
-pub(crate) trait IntoMetricTotalForMode {
-    fn into_metric_total(self, report_mode: ReportMode) -> MetricTotal;
-}
-
-impl IntoMetricTotalForMode for MetricTotal {
-    fn into_metric_total(self, _report_mode: ReportMode) -> MetricTotal {
-        self
-    }
-}
-
-#[cfg(test)]
-impl IntoMetricTotalForMode for f64 {
-    fn into_metric_total(self, report_mode: ReportMode) -> MetricTotal {
-        match report_mode {
-            ReportMode::Cost => MetricTotal::Cost(self),
-            ReportMode::Tokens => MetricTotal::Tokens(self.round() as u128),
-        }
-    }
-}
-
-#[cfg(test)]
-impl IntoMetricTotalForMode for u64 {
-    fn into_metric_total(self, report_mode: ReportMode) -> MetricTotal {
-        match report_mode {
-            ReportMode::Cost => MetricTotal::Cost(self as f64),
-            ReportMode::Tokens => MetricTotal::Tokens(self as u128),
-        }
-    }
-}
-
-#[cfg(test)]
-impl IntoMetricTotalForMode for u128 {
-    fn into_metric_total(self, report_mode: ReportMode) -> MetricTotal {
-        match report_mode {
-            ReportMode::Cost => MetricTotal::Cost(self as f64),
-            ReportMode::Tokens => MetricTotal::Tokens(self),
+            subtotal: totals.total.format(),
         }
     }
 }
 
 #[derive(Tabled)]
 pub(crate) struct GrandTotalRow {
+    #[tabled(rename = "Agent Turns")]
+    pub(crate) agent_turns: String,
     #[tabled(rename = "Grand Total")]
     pub(crate) grand_total: String,
 }
 
 impl GrandTotalRow {
-    pub(crate) fn new(report_mode: ReportMode, grand_total: impl IntoMetricTotalForMode) -> Self {
+    pub(crate) fn new(totals: ReportTotals) -> Self {
         Self {
-            grand_total: grand_total.into_metric_total(report_mode).format(),
+            agent_turns: fmt_tokens(totals.agent_turns as u128),
+            grand_total: totals.total.format(),
         }
     }
 }
@@ -519,7 +554,7 @@ pub(crate) fn display_summary(
     report_mode: ReportMode,
     providers: Option<&[(String, MetricComponents)]>,
     models: &[(String, MetricComponents)],
-    grand_total: MetricTotal,
+    grand_totals: ReportTotals,
 ) {
     let term_width = get_terminal_width();
     println!("{}", divider(term_width));
@@ -535,9 +570,9 @@ pub(crate) fn display_summary(
                 provider,
                 metrics: FormattedMetricColumns::from_metrics(metrics),
             },
-            |total| ProviderSummaryRow {
+            |totals| ProviderSummaryRow {
                 provider: "Total".to_string(),
-                metrics: FormattedMetricColumns::from_total(total),
+                metrics: FormattedMetricColumns::from_total(totals),
             },
             term_width,
         );
@@ -551,15 +586,15 @@ pub(crate) fn display_summary(
             model,
             metrics: FormattedMetricColumns::from_metrics(metrics),
         },
-        |total| ModelSummaryRow {
+        |totals| ModelSummaryRow {
             model: "Total".to_string(),
-            metrics: FormattedMetricColumns::from_total(total),
+            metrics: FormattedMetricColumns::from_total(totals),
         },
         term_width,
     );
     println!();
 
-    let row = GrandTotalRow::new(report_mode, grand_total);
+    let row = GrandTotalRow::new(grand_totals);
     let mut table = Table::new(vec![row]);
     table.with(Style::rounded());
     table.with(Modify::new(Rows::first()).with(Alignment::center()));
@@ -572,22 +607,22 @@ fn render_summary_table<Row: Tabled>(
     report_mode: ReportMode,
     items: &[(String, MetricComponents)],
     into_row: impl Fn(String, MetricComponents) -> Row,
-    into_total_row: impl Fn(MetricTotal) -> Row,
+    into_total_row: impl Fn(ReportTotals) -> Row,
     term_width: usize,
 ) {
     let mut rows: Vec<Row> = Vec::new();
-    let mut total = MetricTotal::zero(report_mode);
+    let mut totals = ReportTotals::zero(report_mode);
 
     for (key, metrics) in items.iter() {
         if !metrics.is_zero() {
-            total = total
-                .checked_add(metrics.total())
-                .expect("summary table subtotal overflow");
+            totals = totals
+                .try_add(ReportTotals::new(metrics.total(), metrics.agent_turns()))
+                .expect("summary table totals overflow");
             rows.push(into_row(key.clone(), *metrics));
         }
     }
 
-    rows.push(into_total_row(total));
+    rows.push(into_total_row(totals));
 
     let mut table = Table::new(rows);
     table.with(Style::rounded());
@@ -597,17 +632,14 @@ fn render_summary_table<Row: Tabled>(
 }
 
 #[cfg(test)]
-pub(crate) fn display_grand_total(
-    report_mode: ReportMode,
-    grand_total: impl IntoMetricTotalForMode,
-) {
+pub(crate) fn display_grand_total(grand_totals: ReportTotals) {
     let term_width = get_terminal_width();
     println!("{}", divider(term_width));
     println!("Summary");
     println!("{}", divider(term_width));
     println!();
 
-    let row = GrandTotalRow::new(report_mode, grand_total);
+    let row = GrandTotalRow::new(grand_totals);
     let mut table = Table::new(vec![row]);
 
     table.with(Style::rounded());
@@ -628,7 +660,7 @@ mod tests {
         cache_write: f64,
         cache_read: f64,
     ) -> MetricComponents {
-        MetricComponents::Cost(CostComponents::new(input, output, cache_write, cache_read))
+        CostComponents::new(input, output, cache_write, cache_read).into()
     }
 
     fn token_metrics(
@@ -637,7 +669,75 @@ mod tests {
         cache_write: u64,
         cache_read: u64,
     ) -> MetricComponents {
-        MetricComponents::Tokens(TokenCounts::new(input, output, cache_write, cache_read))
+        TokenCounts::new(input, output, cache_write, cache_read).into()
+    }
+
+    #[test]
+    fn formatted_columns_include_agent_turns() {
+        let detail = FormattedMetricColumns::from_metrics(
+            cost_metrics(1.0, 2.0, 3.0, 4.0).with_agent_turns(12_345),
+        );
+        assert_eq!(detail.agent_turns, "12,345");
+
+        let total =
+            FormattedMetricColumns::from_total(ReportTotals::new(MetricTotal::Cost(10.0), 12_345));
+        assert_eq!(total.agent_turns, "12,345");
+        assert_eq!(total.input, "");
+        assert_eq!(total.output, "");
+        assert_eq!(total.cache_write, "");
+        assert_eq!(total.cache_read, "");
+        assert_eq!(total.subtotal, "$10.0000");
+    }
+
+    #[test]
+    fn metric_components_add_turns_for_both_payload_modes() {
+        let mut costs = cost_metrics(1.0, 0.0, 0.0, 0.0).with_agent_turns(2);
+        costs
+            .try_add_assign(cost_metrics(2.0, 0.0, 0.0, 0.0).with_agent_turns(3))
+            .unwrap();
+        assert_eq!(costs.agent_turns(), 5);
+
+        let mut tokens = token_metrics(1, 0, 0, 0).with_agent_turns(4);
+        tokens
+            .try_add_assign(token_metrics(2, 0, 0, 0).with_agent_turns(5))
+            .unwrap();
+        assert_eq!(tokens.agent_turns(), 9);
+    }
+
+    #[test]
+    fn sum_report_totals_handles_empty_sum_and_mode_mismatch() {
+        let empty: [ReportTotals; 0] = [];
+        assert_eq!(
+            sum_report_totals(ReportMode::Cost, &empty, |totals| Ok(*totals)).unwrap(),
+            ReportTotals::zero(ReportMode::Cost)
+        );
+
+        let items = [
+            ReportTotals::new(MetricTotal::Cost(1.5), 2),
+            ReportTotals::new(MetricTotal::Cost(2.5), 3),
+        ];
+        assert_eq!(
+            sum_report_totals(ReportMode::Cost, &items, |totals| Ok(*totals)).unwrap(),
+            ReportTotals::new(MetricTotal::Cost(4.0), 5)
+        );
+
+        let error =
+            sum_report_totals(ReportMode::Tokens, &items[..1], |totals| Ok(*totals)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("attempted to add cost totals into a token grand total")
+        );
+    }
+
+    #[test]
+    fn metric_components_with_turn_is_not_zero_when_payload_is_zero() {
+        assert!(
+            !cost_metrics(0.0, 0.0, 0.0, 0.0)
+                .with_agent_turns(1)
+                .is_zero()
+        );
+        assert!(!token_metrics(0, 0, 0, 0).with_agent_turns(1).is_zero());
     }
 
     #[test]
@@ -658,7 +758,7 @@ mod tests {
             ReportMode::Cost,
             Some(&providers),
             &models,
-            MetricTotal::Cost(4.5),
+            ReportTotals::new(MetricTotal::Cost(4.5), 0),
         );
     }
 
@@ -674,7 +774,7 @@ mod tests {
             ReportMode::Tokens,
             Some(&providers),
             &models,
-            MetricTotal::Tokens(1_650),
+            ReportTotals::new(MetricTotal::Tokens(1_650), 0),
         );
     }
 
@@ -682,17 +782,38 @@ mod tests {
     fn display_summary_no_providers_does_not_panic() {
         let models = vec![("Sonnet".to_string(), cost_metrics(1.0, 2.0, 0.0, 0.0))];
 
-        display_summary(ReportMode::Cost, None, &models, MetricTotal::Cost(3.0));
+        display_summary(
+            ReportMode::Cost,
+            None,
+            &models,
+            ReportTotals::new(MetricTotal::Cost(3.0), 0),
+        );
     }
 
     #[test]
     fn display_summary_empty_models_does_not_panic() {
-        display_summary(ReportMode::Cost, None, &[], MetricTotal::Cost(0.0));
+        display_summary(
+            ReportMode::Cost,
+            None,
+            &[],
+            ReportTotals::new(MetricTotal::Cost(0.0), 0),
+        );
     }
 
     #[test]
-    fn display_summary_zero_metrics_skips_detail_rows() {
-        let models = vec![("Zero".to_string(), cost_metrics(0.0, 0.0, 0.0, 0.0))];
-        display_summary(ReportMode::Cost, None, &models, MetricTotal::Cost(0.0));
+    fn display_summary_handles_zero_payload_rows() {
+        let models = vec![
+            ("Zero".to_string(), cost_metrics(0.0, 0.0, 0.0, 0.0)),
+            (
+                "Turn only".to_string(),
+                cost_metrics(0.0, 0.0, 0.0, 0.0).with_agent_turns(1),
+            ),
+        ];
+        display_summary(
+            ReportMode::Cost,
+            None,
+            &models,
+            ReportTotals::new(MetricTotal::Cost(0.0), 1),
+        );
     }
 }

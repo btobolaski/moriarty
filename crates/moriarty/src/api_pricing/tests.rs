@@ -201,11 +201,12 @@ fn cost_row_formats_currency_columns() {
     let row = CostRow::new(
         "2025-10-23",
         "Sonnet",
-        ComponentTotals::new(1.2345, 2.3456, 0.5, 0.25),
+        MetricComponents::from(ComponentTotals::new(1.2345, 2.3456, 0.5, 0.25)).with_agent_turns(2),
     );
 
     assert_eq!(row.date, "2025-10-23");
     assert_eq!(row.model, "Sonnet");
+    assert_eq!(row.metrics.agent_turns, "2");
     assert_money_columns(&row.metrics, (1.2345, 2.3456, 0.5, 0.25));
 }
 
@@ -214,9 +215,10 @@ fn cost_row_formats_token_columns() {
     let row = CostRow::new(
         "2025-10-23",
         "Sonnet",
-        MetricComponents::Tokens(TokenCounts::new(1_234, 5_678, 90, 12)),
+        MetricComponents::from(TokenCounts::new(1_234, 5_678, 90, 12)).with_agent_turns(3),
     );
 
+    assert_eq!(row.metrics.agent_turns, "3");
     assert_eq!(row.metrics.input, "1,234");
     assert_eq!(row.metrics.output, "5,678");
     assert_eq!(row.metrics.cache_write, "90");
@@ -229,7 +231,7 @@ fn cost_row_formats_large_token_columns_exactly() {
     let row = CostRow::new(
         "2025-10-23",
         "Sonnet",
-        MetricComponents::Tokens(TokenCounts::new(9_007_199_254_740_993, 8, 90, 12)),
+        MetricComponents::from(TokenCounts::new(9_007_199_254_740_993, 8, 90, 12)),
     );
 
     assert_eq!(row.metrics.input, "9,007,199,254,740,993");
@@ -249,11 +251,12 @@ fn cost_row_zero_values_format_as_zero_currency() {
 
 #[test]
 fn cost_row_total_row_uses_blank_component_columns() {
-    let row = CostRow::new_total_row(MetricTotal::Cost(56.789));
+    let row = CostRow::new_total_row(ReportTotals::new(MetricTotal::Cost(56.789), 4));
 
     assert_eq!(row.date, "");
     assert_eq!(row.model, "Total");
     assert_blank_money_component_columns(&row.metrics);
+    assert_eq!(row.metrics.agent_turns, "4");
     assert_eq!(row.metrics.subtotal, "$56.7890");
 }
 
@@ -265,7 +268,7 @@ fn cost_row_total_row_variants() {
     ];
 
     for (label, total, expected_subtotal) in cases {
-        let row = CostRow::new_total_row(MetricTotal::Cost(total));
+        let row = CostRow::new_total_row(ReportTotals::new(MetricTotal::Cost(total), 0));
         assert_eq!(row.model, "Total", "case {label}");
         assert_eq!(row.metrics.subtotal, expected_subtotal, "case {label}");
     }
@@ -286,24 +289,26 @@ fn fmt_money_normalizes_negative_zero() {
 
 #[test]
 fn grand_total_row_formats_currency() {
-    let row = GrandTotalRow::new(ReportMode::Cost, 143.7082);
+    let row = GrandTotalRow::new(ReportTotals::new(MetricTotal::Cost(143.7082), 12_345));
 
+    assert_eq!(row.agent_turns, "12,345");
     assert_eq!(row.grand_total, "$143.7082");
 }
 
 #[test]
 fn grand_total_row_formats_tokens() {
-    let row = GrandTotalRow::new(ReportMode::Tokens, MetricTotal::Tokens(1_437_082));
+    let row = GrandTotalRow::new(ReportTotals::new(MetricTotal::Tokens(1_437_082), 7));
 
+    assert_eq!(row.agent_turns, "7");
     assert_eq!(row.grand_total, "1,437,082");
 }
 
 #[test]
 fn grand_total_row_formats_large_tokens_exactly() {
-    let row = GrandTotalRow::new(
-        ReportMode::Tokens,
+    let row = GrandTotalRow::new(ReportTotals::new(
         MetricTotal::Tokens(9_007_199_254_741_103),
-    );
+        0,
+    ));
 
     assert_eq!(row.grand_total, "9,007,199,254,741,103");
 }
@@ -316,7 +321,7 @@ fn grand_total_row_variants() {
     ];
 
     for (label, grand_total, expected) in cases {
-        let row = GrandTotalRow::new(ReportMode::Cost, grand_total);
+        let row = GrandTotalRow::new(ReportTotals::new(MetricTotal::Cost(grand_total), 0));
         assert_eq!(row.grand_total, expected, "case {label}");
     }
 }
@@ -326,7 +331,7 @@ fn grand_total_row_variants() {
 #[test]
 fn display_grand_total_smoke_variants() {
     for grand_total in [0.0, 143.7082, 12_345.678_9, 0.0001] {
-        display_grand_total(ReportMode::Cost, grand_total);
+        display_grand_total(ReportTotals::new(MetricTotal::Cost(grand_total), 0));
     }
 }
 
@@ -433,7 +438,7 @@ fn create_grouped_table_variants() {
                     "Sonnet",
                     ComponentTotals::new(1.0, 1.0, 0.0, 0.0),
                 ),
-                CostRow::new_total_row(MetricTotal::Cost(2.0)),
+                CostRow::new_total_row(ReportTotals::new(MetricTotal::Cost(2.0), 0)),
             ],
             total_row_indices: vec![1],
             expected_substrings: vec!["Sonnet", "Total"],
@@ -447,13 +452,13 @@ fn create_grouped_table_variants() {
                     "Sonnet",
                     ComponentTotals::new(1.0, 1.0, 0.0, 0.0),
                 ),
-                CostRow::new_total_row(MetricTotal::Cost(2.0)),
+                CostRow::new_total_row(ReportTotals::new(MetricTotal::Cost(2.0), 0)),
                 CostRow::new(
                     "2025-10-24",
                     "Haiku",
                     ComponentTotals::new(0.5, 0.5, 0.0, 0.0),
                 ),
-                CostRow::new_total_row(MetricTotal::Cost(1.0)),
+                CostRow::new_total_row(ReportTotals::new(MetricTotal::Cost(1.0), 0)),
             ],
             total_row_indices: vec![1, 3],
             expected_substrings: vec!["2025-10-23", "2025-10-24", "Sonnet", "Haiku"],
@@ -605,13 +610,14 @@ fn session_cost_row_formats_currency_columns() {
 
 #[test]
 fn session_cost_row_total_uses_blank_component_columns() {
-    let row = SessionCostRow::new_total_row(MetricTotal::Cost(7.5));
+    let row = SessionCostRow::new_total_row(ReportTotals::new(MetricTotal::Cost(7.5), 2));
 
     assert_eq!(row.session, "");
     assert_eq!(row.time_range, "");
     assert_eq!(row.duration, "");
     assert_eq!(row.model, "Total");
     assert_blank_money_component_columns(&row.metrics);
+    assert_eq!(row.metrics.agent_turns, "2");
     assert_eq!(row.metrics.subtotal, "$7.5000");
 }
 
@@ -622,7 +628,7 @@ fn session_costs_fixture(session_id: &str) -> SessionCosts {
     per_model
         .add(
             Model::family(ModelFamily::Sonnet),
-            ComponentTotals::new(1.0, 2.0, 0.0, 0.0),
+            MetricComponents::from(ComponentTotals::new(1.0, 2.0, 0.0, 0.0)).with_agent_turns(2),
         )
         .unwrap();
     SessionCosts {
@@ -658,11 +664,13 @@ fn build_session_cost_rows_emits_per_model_row_then_total() {
     assert_eq!(rows[0].session, "019dc252");
     assert_eq!(rows[0].duration, "1 hr 30 min");
     assert_eq!(rows[0].model, "Sonnet");
+    assert_eq!(rows[0].metrics.agent_turns, "2");
 
     assert_eq!(rows[1].session, "");
     assert_eq!(rows[1].time_range, "");
     assert_eq!(rows[1].duration, "");
     assert_eq!(rows[1].model, "Total");
+    assert_eq!(rows[1].metrics.agent_turns, "2");
     assert_eq!(rows[1].metrics.subtotal, "$3.0000");
 }
 
@@ -760,13 +768,13 @@ fn collect_session_model_aggregates_total_equals_grand_total() {
     per_model_a
         .add(
             Model::family(ModelFamily::Sonnet),
-            MetricComponents::Cost(ComponentTotals::new(1.0, 2.0, 0.0, 0.0)),
+            MetricComponents::from(ComponentTotals::new(1.0, 2.0, 0.0, 0.0)).with_agent_turns(2),
         )
         .unwrap();
     per_model_a
         .add(
             Model::family(ModelFamily::Haiku),
-            MetricComponents::Cost(ComponentTotals::new(0.5, 1.0, 0.0, 0.0)),
+            MetricComponents::from(ComponentTotals::new(0.5, 1.0, 0.0, 0.0)).with_agent_turns(3),
         )
         .unwrap();
 
@@ -774,7 +782,7 @@ fn collect_session_model_aggregates_total_equals_grand_total() {
     per_model_b
         .add(
             Model::family(ModelFamily::Opus),
-            MetricComponents::Cost(ComponentTotals::new(15.0, 75.0, 0.0, 0.0)),
+            MetricComponents::from(ComponentTotals::new(15.0, 75.0, 0.0, 0.0)).with_agent_turns(4),
         )
         .unwrap();
 
@@ -806,6 +814,7 @@ fn collect_session_model_aggregates_total_equals_grand_total() {
 
     assert_eq!(grand_total, model_grand);
     assert_eq!(grand_total, MetricTotal::Cost(94.5));
+    assert_eq!(models.iter().map(|(_, m)| m.agent_turns()).sum::<u64>(), 9);
 }
 
 #[test]
@@ -860,7 +869,7 @@ fn display_costs_with_summary_token_mode_smoke() {
     let opus4 = Model::from_model_string("claude-opus-4-20250514").unwrap();
     map.add(
         opus4,
-        MetricComponents::Tokens(TokenCounts::new(1_000, 500, 100, 50)),
+        MetricComponents::from(TokenCounts::new(1_000, 500, 100, 50)),
     )
     .unwrap();
     let token_daily = vec![DailyCosts {

@@ -134,9 +134,12 @@ test in a separate process, making this safe and preventing tests from clobberin
 **`cost_report/`** - Shared cost report rendering and filtering:
 
 - Holds shared time filtering, grouped-table rendering, stacked-chart rendering, `ReportMode`, `CostComponents`,
-  `TokenCounts`, `MetricComponents`, and report warning helpers used by both cost-report backends
-- `FormattedMetricColumns` and `GrandTotalRow` are mode-aware: cost mode formats dollars, token mode formats integer
-  token counts with thousands separators, while preserving the same table shape for both backends
+  `TokenCounts`, `MetricComponents`, and report warning helpers used by both cost-report backends. `MetricComponents`
+  carries agent-turn counts for detail rows alongside a cost/token payload; `ReportTotals` pairs the two only while
+  rendering subtotal/summary rows, and `sum_report_totals` keeps backend grand-total aggregation aligned. Chart-facing
+  `MetricTotal` remains cost/token-only
+- `FormattedMetricColumns` and `GrandTotalRow` render agent turns with integer separators; cost mode formats dollars and
+  token mode formats integer token counts while preserving the same table shape for both backends
 - `display_summary` renders a consolidated "Summary" section (optional provider table for `pi cost`, model table for
   both backends, and grand total) called by each backend after its inline grouped-table rendering
 - `charts.rs` renders deterministic horizontal stacked bars for both time-series and share views, including top-N plus
@@ -153,6 +156,8 @@ test in a separate process, making this safe and preventing tests from clobberin
   and chart legend distinguish e.g. "Sonnet 4" from "Sonnet 4.5"; row/legend ordering is family-first (Fable → Opus →
   Sonnet → Haiku) then version-desc via the local `model_sort_key` helper, so within-family Opus 4.x rows sit above Opus
   3 rows automatically. Token mode stays integer-exact end-to-end instead of passing through floating-point helpers
+- Agent turns count deduplicated billable assistant responses, so copied records and multi-line content blocks sharing
+  the same preferred response identifier contribute once
 - Unknown Claude models surface as stderr tracing errors via `cost_analyzer`; they are not rendered in the report
 - Also prepares `ChartBucket` data for `graphs claude`, reusing the same analyzer output while keeping the existing
   detailed table report unchanged
@@ -166,6 +171,8 @@ test in a separate process, making this safe and preventing tests from clobberin
   `BTreeMap<PiModel, MetricComponents>` accumulator inside `PiModelMetricsMap`
 - Conversation mode depends on `cost_analyzer::LineWithCost.session_id`, which is attached during the single-pass parse
   from either Claude assistant lines or pi `SessionLine` headers
+- Agent turns count assistant messages only; billable compaction and branch-summary summarization calls contribute cost
+  and tokens under the active model but zero turns
 - Also prepares provider/model `ChartBucket` data for `graphs pi`, reusing the same analyzer output while keeping the
   existing detailed table report unchanged
 - Entry points: `pi cost` and `graphs pi` subcommands in `main.rs`

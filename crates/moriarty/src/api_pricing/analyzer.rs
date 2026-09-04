@@ -5,8 +5,8 @@ use rust_decimal::prelude::ToPrimitive;
 
 use super::pricing::ModelMetricsMap;
 use crate::cost_report::{
-    CostComponents, DateTimezone, MetricComponents, MetricTotal, ReportMode, TimeRangeFilter,
-    TokenCounts,
+    CostComponents, DateTimezone, MetricComponents, MetricTotal, ReportMode, ReportTotals,
+    TimeRangeFilter, TokenCounts,
 };
 use claude_logs::{LogLine, Model};
 use cost_analyzer::{
@@ -40,6 +40,17 @@ impl DailyMetrics {
     pub fn total(&self, report_mode: ReportMode) -> miette::Result<MetricTotal> {
         self.per_model.total(report_mode)
     }
+
+    pub fn agent_turns(&self) -> u64 {
+        self.per_model.agent_turns()
+    }
+
+    pub fn report_totals(&self, report_mode: ReportMode) -> miette::Result<ReportTotals> {
+        Ok(ReportTotals::new(
+            self.total(report_mode)?,
+            self.agent_turns(),
+        ))
+    }
 }
 
 /// `start_time` and `end_time` bracket only the kept billable lines, so the
@@ -55,6 +66,17 @@ pub struct SessionMetrics {
 impl SessionMetrics {
     pub fn total(&self, report_mode: ReportMode) -> miette::Result<MetricTotal> {
         self.per_model.total(report_mode)
+    }
+
+    pub fn agent_turns(&self) -> u64 {
+        self.per_model.agent_turns()
+    }
+
+    pub fn report_totals(&self, report_mode: ReportMode) -> miette::Result<ReportTotals> {
+        Ok(ReportTotals::new(
+            self.total(report_mode)?,
+            self.agent_turns(),
+        ))
     }
 
     pub fn duration_minutes(&self) -> i64 {
@@ -106,12 +128,11 @@ fn metric_components(
     line: &LineWithCost<LogLine>,
     report_mode: ReportMode,
 ) -> miette::Result<MetricComponents> {
-    match report_mode {
-        ReportMode::Cost => Ok(MetricComponents::Cost(cost_components_from_llm_cost(
-            &line.cost,
-        )?)),
-        ReportMode::Tokens => Ok(MetricComponents::Tokens(token_counts_from_line(line)?)),
+    Ok(match report_mode {
+        ReportMode::Cost => MetricComponents::from(cost_components_from_llm_cost(&line.cost)?),
+        ReportMode::Tokens => MetricComponents::from(token_counts_from_line(line)?),
     }
+    .with_agent_turns(1))
 }
 
 /// Loads all dedup-resolved, time-filtered billable entries from `dir`.
@@ -512,11 +533,8 @@ mod tests {
         let costs = component_totals_from_llm_cost(&line.cost);
         line.session_id = None;
 
-        let error = session_analysis_from_entries(
-            vec![(line, model_type, MetricComponents::Cost(costs))],
-            false,
-        )
-        .unwrap_err();
+        let error = session_analysis_from_entries(vec![(line, model_type, costs.into())], false)
+            .unwrap_err();
 
         assert!(
             error.to_string().contains("missing a session id"),
@@ -545,8 +563,8 @@ mod tests {
     async fn analyze_directory_buckets_lines_by_utc_date_and_sums_costs_per_model() {
         let dir = TempDir::new().unwrap();
         let session = "019dc252-e50e-766c-8182-d654b46881af";
-        // Two Sonnet calls on 2026-04-16 (one in each file, no duplicate IDs)
-        // and one Haiku call on 2026-04-17.
+        // Two distinct Sonnet calls on 2026-04-16, with one copied into both
+        // files, and one Haiku call on 2026-04-17.
         write_log(
             dir.path(),
             "a.jsonl",
@@ -562,6 +580,13 @@ mod tests {
             dir.path(),
             "b.jsonl",
             &[
+                assistant_line(
+                    session,
+                    timestamp(2026, 4, 16, 1, 0),
+                    "claude-sonnet-4-20250514",
+                    "req-sonnet-1",
+                    usage_json(1_000_000, 0, 0, 0),
+                ),
                 assistant_line(
                     session,
                     timestamp(2026, 4, 16, 2, 0),
@@ -597,12 +622,14 @@ mod tests {
         assert!((sonnet_day_1.input - SONNET_INPUT_PER_MILLION).abs() < 1e-9);
         assert!((sonnet_day_1.output - SONNET_OUTPUT_PER_MILLION).abs() < 1e-9);
         assert_eq!(day_1.per_model.get(haiku_3_bucket()).total(), 0.0);
+        assert_eq!(day_1.agent_turns(), 2);
 
         let day_2 = &result.daily_metrics[1];
         assert_eq!(day_2.date, NaiveDate::from_ymd_opt(2026, 4, 17).unwrap());
         let haiku_day_2 = day_2.per_model.get(haiku_3_bucket());
         assert!((haiku_day_2.input - HAIKU_INPUT_PER_MILLION).abs() < 1e-9);
         assert!((haiku_day_2.output - HAIKU_OUTPUT_PER_MILLION).abs() < 1e-9);
+        assert_eq!(day_2.agent_turns(), 1);
     }
 
     #[tokio::test]
@@ -647,6 +674,7 @@ mod tests {
         assert_eq!(costs.cache_write, 120);
         assert_eq!(costs.cache_read, 52);
         assert_eq!(costs.total(), 7_114);
+        assert_eq!(result.daily_metrics[0].agent_turns(), 2);
     }
 
     #[tokio::test]

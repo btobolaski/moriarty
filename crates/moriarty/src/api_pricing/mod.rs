@@ -9,10 +9,10 @@ use claude_logs::Model;
 
 use crate::cost_report::{
     ChartBucket, ChartSegment, DateTimezone, DatedSegments, FormattedMetricColumns,
-    MetricComponents, MetricTotal, ReportMode, SessionSegments, TimeRangeFilter,
+    MetricComponents, ReportMode, ReportTotals, SessionSegments, TimeRangeFilter,
     build_grouped_rows, display_summary, format_duration, format_session_id, format_time_range,
     grouped_label, print_grouped_report, push_nonzero_metric_rows, render_or_empty,
-    render_stacked_charts,
+    render_stacked_charts, sum_report_totals,
 };
 use analyzer::{DailyMetrics, SessionMetrics};
 use pricing::{ModelMetricsMap, model_sort_key};
@@ -36,15 +36,15 @@ impl ApiMetricRow {
         }
     }
 
-    fn new_total_row(total: MetricTotal) -> Self {
-        Self::new_labeled_total_row("", total)
+    fn new_total_row(totals: ReportTotals) -> Self {
+        Self::new_labeled_total_row("", totals)
     }
 
-    fn new_labeled_total_row(date: &str, total: MetricTotal) -> Self {
+    fn new_labeled_total_row(date: &str, totals: ReportTotals) -> Self {
         Self {
             date: date.to_string(),
             model: "Total".to_string(),
-            metrics: FormattedMetricColumns::from_total(total),
+            metrics: FormattedMetricColumns::from_total(totals),
         }
     }
 }
@@ -80,22 +80,22 @@ impl ApiSessionMetricRow {
         }
     }
 
-    fn new_total_row(total: MetricTotal) -> Self {
-        Self::new_labeled_total_row("", "", "", total)
+    fn new_total_row(totals: ReportTotals) -> Self {
+        Self::new_labeled_total_row("", "", "", totals)
     }
 
     fn new_labeled_total_row(
         session: &str,
         time_range: &str,
         duration: &str,
-        total: MetricTotal,
+        totals: ReportTotals,
     ) -> Self {
         Self {
             session: session.to_string(),
             time_range: time_range.to_string(),
             duration: duration.to_string(),
             model: "Total".to_string(),
-            metrics: FormattedMetricColumns::from_total(total),
+            metrics: FormattedMetricColumns::from_total(totals),
         }
     }
 }
@@ -192,13 +192,11 @@ fn build_daily_rows(
             Ok(())
         },
         |rows, metrics, has_detail_rows| {
+            let totals = metrics.report_totals(report_mode)?;
             rows.push(if has_detail_rows {
-                ApiMetricRow::new_total_row(metrics.total(report_mode)?)
+                ApiMetricRow::new_total_row(totals)
             } else {
-                ApiMetricRow::new_labeled_total_row(
-                    &metrics.date.to_string(),
-                    metrics.total(report_mode)?,
-                )
+                ApiMetricRow::new_labeled_total_row(&metrics.date.to_string(), totals)
             });
             Ok(())
         },
@@ -232,14 +230,15 @@ fn build_session_rows(
             Ok(())
         },
         |rows, metrics, has_detail_rows| {
+            let totals = metrics.report_totals(report_mode)?;
             rows.push(if has_detail_rows {
-                ApiSessionMetricRow::new_total_row(metrics.total(report_mode)?)
+                ApiSessionMetricRow::new_total_row(totals)
             } else {
                 ApiSessionMetricRow::new_labeled_total_row(
                     &format_session_id(&metrics.session_id),
                     &format_time_range(timezone, metrics.start_time, metrics.end_time),
                     &format_duration(metrics.duration_minutes()),
-                    metrics.total(report_mode)?,
+                    totals,
                 )
             });
             Ok(())
@@ -266,7 +265,7 @@ fn collect_model_aggregates_from_maps<'a>(
             map.entry(model)
                 .and_modify(|existing| {
                     existing
-                        .checked_add_assign(metrics)
+                        .try_add_assign(metrics)
                         .expect("model aggregate overflow")
                 })
                 .or_insert(metrics);
@@ -285,15 +284,13 @@ fn display_daily_metrics(
     report_mode: ReportMode,
 ) -> miette::Result<()> {
     let (rows, total_row_indices) = build_daily_rows(daily_metrics, report_mode)?;
-    let grand_total = daily_metrics
-        .iter()
-        .try_fold(MetricTotal::zero(report_mode), |acc, item| {
-            acc.checked_add(item.total(report_mode)?)
-        })?;
+    let grand_totals = sum_report_totals(report_mode, daily_metrics, |item| {
+        item.report_totals(report_mode)
+    })?;
     let models = collect_model_aggregates(daily_metrics);
 
     print_grouped_report(daily_title(report_mode), &rows, &total_row_indices);
-    display_summary(report_mode, None, &models, grand_total);
+    display_summary(report_mode, None, &models, grand_totals);
     Ok(())
 }
 
@@ -303,15 +300,13 @@ fn display_session_metrics(
     report_mode: ReportMode,
 ) -> miette::Result<()> {
     let (rows, total_row_indices) = build_session_rows(session_metrics, timezone, report_mode)?;
-    let grand_total = session_metrics
-        .iter()
-        .try_fold(MetricTotal::zero(report_mode), |acc, item| {
-            acc.checked_add(item.total(report_mode)?)
-        })?;
+    let grand_totals = sum_report_totals(report_mode, session_metrics, |item| {
+        item.report_totals(report_mode)
+    })?;
     let models = collect_session_model_aggregates(session_metrics);
 
     print_grouped_report(session_title(report_mode), &rows, &total_row_indices);
-    display_summary(report_mode, None, &models, grand_total);
+    display_summary(report_mode, None, &models, grand_totals);
     Ok(())
 }
 

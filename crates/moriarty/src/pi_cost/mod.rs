@@ -7,10 +7,10 @@ use tabled::Tabled;
 
 use crate::cost_report::{
     ChartBucket, ChartSegment, DateTimezone, DatedSegments, FormattedMetricColumns,
-    MetricComponents, MetricTotal, ReportMode, SessionSegments, TimeRangeFilter,
+    MetricComponents, ReportMode, ReportTotals, SessionSegments, TimeRangeFilter,
     build_grouped_rows, display_summary, format_duration, format_session_id, format_time_range,
     grouped_label, print_grouped_report, push_nonzero_metric_rows, render_or_empty,
-    render_stacked_charts,
+    render_stacked_charts, sum_report_totals,
 };
 use analyzer::{DailyMetrics, SessionMetrics};
 use pi_logs::Provider;
@@ -43,16 +43,16 @@ impl PiMetricRow {
         }
     }
 
-    fn new_total_row(total: MetricTotal) -> Self {
-        Self::new_labeled_total_row("", total)
+    fn new_total_row(totals: ReportTotals) -> Self {
+        Self::new_labeled_total_row("", totals)
     }
 
-    fn new_labeled_total_row(date: &str, total: MetricTotal) -> Self {
+    fn new_labeled_total_row(date: &str, totals: ReportTotals) -> Self {
         Self {
             date: date.to_string(),
             provider: String::new(),
             model: "Total".to_string(),
-            metrics: FormattedMetricColumns::from_total(total),
+            metrics: FormattedMetricColumns::from_total(totals),
         }
     }
 }
@@ -92,15 +92,15 @@ impl PiSessionMetricRow {
         }
     }
 
-    fn new_total_row(total: MetricTotal) -> Self {
-        Self::new_labeled_total_row("", "", "", total)
+    fn new_total_row(totals: ReportTotals) -> Self {
+        Self::new_labeled_total_row("", "", "", totals)
     }
 
     fn new_labeled_total_row(
         session: &str,
         time_range: &str,
         duration: &str,
-        total: MetricTotal,
+        totals: ReportTotals,
     ) -> Self {
         Self {
             session: session.to_string(),
@@ -108,7 +108,7 @@ impl PiSessionMetricRow {
             duration: duration.to_string(),
             provider: String::new(),
             model: "Total".to_string(),
-            metrics: FormattedMetricColumns::from_total(total),
+            metrics: FormattedMetricColumns::from_total(totals),
         }
     }
 }
@@ -227,13 +227,11 @@ fn build_daily_rows(
             Ok(())
         },
         |rows, metrics, has_detail_rows| {
+            let totals = metrics.report_totals(report_mode)?;
             rows.push(if has_detail_rows {
-                PiMetricRow::new_total_row(metrics.total(report_mode)?)
+                PiMetricRow::new_total_row(totals)
             } else {
-                PiMetricRow::new_labeled_total_row(
-                    &metrics.date.to_string(),
-                    metrics.total(report_mode)?,
-                )
+                PiMetricRow::new_labeled_total_row(&metrics.date.to_string(), totals)
             });
             Ok(())
         },
@@ -276,14 +274,15 @@ fn build_session_rows(
             Ok(())
         },
         |rows, metrics, has_detail_rows| {
+            let totals = metrics.report_totals(report_mode)?;
             rows.push(if has_detail_rows {
-                PiSessionMetricRow::new_total_row(metrics.total(report_mode)?)
+                PiSessionMetricRow::new_total_row(totals)
             } else {
                 PiSessionMetricRow::new_labeled_total_row(
                     &format_session_id(&metrics.session_id),
                     &format_time_range(timezone, metrics.start_time, metrics.end_time),
                     &format_duration(metrics.duration_minutes()),
-                    metrics.total(report_mode)?,
+                    totals,
                 )
             });
             Ok(())
@@ -314,7 +313,7 @@ fn collect_provider_and_model_aggregates_from_maps<'a>(
                 .entry(label)
                 .and_modify(|existing| {
                     existing
-                        .checked_add_assign(*metrics)
+                        .try_add_assign(*metrics)
                         .expect("provider aggregate overflow")
                 })
                 .or_insert(*metrics);
@@ -323,7 +322,7 @@ fn collect_provider_and_model_aggregates_from_maps<'a>(
                 .entry(pi_model.model.clone())
                 .and_modify(|existing| {
                     existing
-                        .checked_add_assign(*metrics)
+                        .try_add_assign(*metrics)
                         .expect("model aggregate overflow")
                 })
                 .or_insert(*metrics);
@@ -341,15 +340,13 @@ fn display_daily_metrics(
     report_mode: ReportMode,
 ) -> miette::Result<()> {
     let (rows, total_row_indices) = build_daily_rows(daily_metrics, report_mode)?;
-    let grand_total = daily_metrics
-        .iter()
-        .try_fold(MetricTotal::zero(report_mode), |acc, item| {
-            acc.checked_add(item.total(report_mode)?)
-        })?;
+    let grand_totals = sum_report_totals(report_mode, daily_metrics, |item| {
+        item.report_totals(report_mode)
+    })?;
     let (providers, models) = collect_provider_and_model_aggregates(daily_metrics);
 
     print_grouped_report(daily_title(report_mode), &rows, &total_row_indices);
-    display_summary(report_mode, Some(&providers), &models, grand_total);
+    display_summary(report_mode, Some(&providers), &models, grand_totals);
     Ok(())
 }
 
@@ -359,15 +356,13 @@ fn display_session_metrics(
     report_mode: ReportMode,
 ) -> miette::Result<()> {
     let (rows, total_row_indices) = build_session_rows(session_metrics, timezone, report_mode)?;
-    let grand_total = session_metrics
-        .iter()
-        .try_fold(MetricTotal::zero(report_mode), |acc, item| {
-            acc.checked_add(item.total(report_mode)?)
-        })?;
+    let grand_totals = sum_report_totals(report_mode, session_metrics, |item| {
+        item.report_totals(report_mode)
+    })?;
     let (providers, models) = collect_session_provider_and_model_aggregates(session_metrics);
 
     print_grouped_report(session_title(report_mode), &rows, &total_row_indices);
-    display_summary(report_mode, Some(&providers), &models, grand_total);
+    display_summary(report_mode, Some(&providers), &models, grand_totals);
     Ok(())
 }
 
@@ -519,8 +514,8 @@ mod tests {
     use super::*;
     use crate::{
         cost_report::{
-            ComponentTotals, FormattedCostColumns, MetricComponents, ReportMode, TokenCounts,
-            fmt_money,
+            ComponentTotals, FormattedCostColumns, MetricComponents, MetricPayload, MetricTotal,
+            ReportMode, TokenCounts, fmt_money,
         },
         pi_cost::{
             analyzer::{DailyCosts, SessionCosts},
@@ -568,7 +563,13 @@ mod tests {
                         provider,
                         model: model.to_string(),
                     },
-                    ComponentTotals::new(input, output, cache_write, cache_read),
+                    MetricComponents::from(ComponentTotals::new(
+                        input,
+                        output,
+                        cache_write,
+                        cache_read,
+                    ))
+                    .with_agent_turns(1),
                 )
                 .unwrap();
             self
@@ -585,7 +586,8 @@ mod tests {
                     provider: Provider::Anthropic,
                     model: "claude-sonnet-4-5".to_string(),
                 },
-                ComponentTotals::new(1.0, 2.0, 0.0, 0.0),
+                MetricComponents::from(ComponentTotals::new(1.0, 2.0, 0.0, 0.0))
+                    .with_agent_turns(1),
             )
             .unwrap();
         SessionCosts {
@@ -621,23 +623,25 @@ mod tests {
             "2025-10-23",
             "Anthropic",
             "claude-sonnet-4-5",
-            ComponentTotals::new(1.25, 2.5, 0.5, 0.25),
+            MetricComponents::from(ComponentTotals::new(1.25, 2.5, 0.5, 0.25)).with_agent_turns(2),
         );
 
         assert_eq!(row.date, "2025-10-23");
         assert_eq!(row.provider, "Anthropic");
         assert_eq!(row.model, "claude-sonnet-4-5");
+        assert_eq!(row.metrics.agent_turns, "2");
         assert_money_columns(&row.metrics, (1.25, 2.5, 0.5, 0.25));
     }
 
     #[test]
     fn pi_cost_row_total_uses_blank_component_columns() {
-        let row = PiCostRow::new_total_row(MetricTotal::Cost(7.5));
+        let row = PiCostRow::new_total_row(ReportTotals::new(MetricTotal::Cost(7.5), 3));
 
         assert_eq!(row.date, "");
         assert_eq!(row.provider, "");
         assert_eq!(row.model, "Total");
         assert_blank_money_component_columns(&row.metrics);
+        assert_eq!(row.metrics.agent_turns, "3");
         assert_eq!(row.metrics.subtotal, "$7.5000");
     }
 
@@ -647,9 +651,10 @@ mod tests {
             "2025-10-23",
             "Anthropic",
             "claude-sonnet-4-5",
-            MetricComponents::Tokens(TokenCounts::new(1_234, 5_678, 90, 12)),
+            MetricComponents::from(TokenCounts::new(1_234, 5_678, 90, 12)).with_agent_turns(4),
         );
 
+        assert_eq!(row.metrics.agent_turns, "4");
         assert_eq!(row.metrics.input, "1,234");
         assert_eq!(row.metrics.output, "5,678");
         assert_eq!(row.metrics.cache_write, "90");
@@ -676,6 +681,7 @@ mod tests {
         assert_eq!(rows[2].provider, "OpenAI");
         assert_eq!(rows[2].model, "gpt-5");
         assert_eq!(rows[3].model, "Total");
+        assert_eq!(rows[3].metrics.agent_turns, "3");
     }
 
     #[test]
@@ -692,8 +698,28 @@ mod tests {
     }
 
     #[test]
+    fn build_cost_rows_keeps_turn_only_detail_row() {
+        let daily = costs_on(2025, 10, 23).with_model(
+            Provider::Anthropic,
+            "claude-sonnet-4-5",
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        );
+
+        let (rows, total_row_indices) = build_cost_rows(&[daily], ReportMode::Cost);
+
+        assert_eq!(total_row_indices, vec![1]);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].metrics.agent_turns, "1");
+        assert_eq!(rows[0].metrics.subtotal, "$0.0000");
+        assert_eq!(rows[1].metrics.agent_turns, "1");
+    }
+
+    #[test]
     fn pi_session_cost_row_total_uses_blank_component_columns() {
-        let row = PiSessionCostRow::new_total_row(MetricTotal::Cost(4.0));
+        let row = PiSessionCostRow::new_total_row(ReportTotals::new(MetricTotal::Cost(4.0), 2));
 
         assert_eq!(row.session, "");
         assert_eq!(row.time_range, "");
@@ -701,6 +727,7 @@ mod tests {
         assert_eq!(row.provider, "");
         assert_eq!(row.model, "Total");
         assert_blank_money_component_columns(&row.metrics);
+        assert_eq!(row.metrics.agent_turns, "2");
         assert_eq!(row.metrics.subtotal, "$4.0000");
     }
 
@@ -735,7 +762,8 @@ mod tests {
                     provider: Provider::OpenAi,
                     model: "gpt-5".to_string(),
                 },
-                ComponentTotals::new(0.5, 0.5, 0.0, 0.0),
+                MetricComponents::from(ComponentTotals::new(0.5, 0.5, 0.0, 0.0))
+                    .with_agent_turns(2),
             )
             .unwrap();
 
@@ -753,6 +781,7 @@ mod tests {
         assert_eq!(rows[1].time_range, "");
         assert_eq!(rows[1].duration, "");
         assert_eq!(rows[2].model, "Total");
+        assert_eq!(rows[2].metrics.agent_turns, "3");
     }
 
     #[test]
@@ -795,6 +824,17 @@ mod tests {
             .fold(MetricTotal::Cost(0.0), |acc, t| acc.checked_add(t).unwrap());
         assert_eq!(model_total, grand_total);
         assert_eq!(grand_total, MetricTotal::Cost(11.5));
+        assert_eq!(
+            (
+                daily_costs
+                    .iter()
+                    .map(DailyMetrics::agent_turns)
+                    .sum::<u64>(),
+                providers.iter().map(|(_, m)| m.agent_turns()).sum::<u64>(),
+                models.iter().map(|(_, m)| m.agent_turns()).sum::<u64>(),
+            ),
+            (3, 3, 3)
+        );
     }
 
     #[test]
@@ -806,7 +846,8 @@ mod tests {
                     provider: Provider::Anthropic,
                     model: "claude-sonnet-4-5".to_string(),
                 },
-                ComponentTotals::new(1.0, 2.0, 0.0, 0.0),
+                MetricComponents::from(ComponentTotals::new(1.0, 2.0, 0.0, 0.0))
+                    .with_agent_turns(2),
             )
             .unwrap();
         per_model
@@ -815,7 +856,8 @@ mod tests {
                     provider: Provider::OpenAi,
                     model: "gpt-5".to_string(),
                 },
-                ComponentTotals::new(0.5, 1.0, 0.0, 0.0),
+                MetricComponents::from(ComponentTotals::new(0.5, 1.0, 0.0, 0.0))
+                    .with_agent_turns(3),
             )
             .unwrap();
 
@@ -867,9 +909,10 @@ mod tests {
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].0, "claude-sonnet-4-5");
         assert_eq!(
-            models[0].1,
-            MetricComponents::Cost(ComponentTotals::new(4.0, 6.0, 0.0, 0.0))
+            models[0].1.payload,
+            MetricPayload::Cost(ComponentTotals::new(4.0, 6.0, 0.0, 0.0))
         );
+        assert_eq!(models[0].1.agent_turns(), 2);
     }
 
     #[test]
@@ -897,7 +940,7 @@ mod tests {
                     provider: Provider::Anthropic,
                     model: "claude-sonnet-4-5".to_string(),
                 },
-                MetricComponents::Tokens(TokenCounts::new(1_000, 500, 100, 50)),
+                MetricComponents::from(TokenCounts::new(1_000, 500, 100, 50)).with_agent_turns(1),
             )
             .unwrap();
 

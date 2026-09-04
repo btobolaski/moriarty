@@ -5,13 +5,13 @@ use rust_decimal::prelude::ToPrimitive;
 
 use super::pricing::PiModelMetricsMap;
 use crate::cost_report::{
-    CostComponents, DateTimezone, MetricComponents, MetricTotal, ReportMode, TimeRangeFilter,
-    TokenCounts,
+    CostComponents, DateTimezone, MetricComponents, MetricTotal, ReportMode, ReportTotals,
+    TimeRangeFilter, TokenCounts,
 };
 use cost_analyzer::{
     AnalyzableLog, LineWithCost, LlmCost, TokenType, analyze_directory as cost_analyze_directory,
 };
-use pi_logs::PiLogLine;
+use pi_logs::{PiLogLine, RoleMessage};
 
 #[derive(Debug, Default)]
 pub struct AnalysisResult {
@@ -35,6 +35,17 @@ impl DailyMetrics {
     pub fn total(&self, report_mode: ReportMode) -> miette::Result<MetricTotal> {
         self.per_model.total(report_mode)
     }
+
+    pub fn agent_turns(&self) -> u64 {
+        self.per_model.agent_turns()
+    }
+
+    pub fn report_totals(&self, report_mode: ReportMode) -> miette::Result<ReportTotals> {
+        Ok(ReportTotals::new(
+            self.total(report_mode)?,
+            self.agent_turns(),
+        ))
+    }
 }
 
 #[derive(Debug)]
@@ -48,6 +59,17 @@ pub struct SessionMetrics {
 impl SessionMetrics {
     pub fn total(&self, report_mode: ReportMode) -> miette::Result<MetricTotal> {
         self.per_model.total(report_mode)
+    }
+
+    pub fn agent_turns(&self) -> u64 {
+        self.per_model.agent_turns()
+    }
+
+    pub fn report_totals(&self, report_mode: ReportMode) -> miette::Result<ReportTotals> {
+        Ok(ReportTotals::new(
+            self.total(report_mode)?,
+            self.agent_turns(),
+        ))
     }
 
     pub fn duration_minutes(&self) -> i64 {
@@ -101,12 +123,15 @@ fn metric_components(
     line: &LineWithCost<PiLogLine>,
     report_mode: ReportMode,
 ) -> miette::Result<MetricComponents> {
-    match report_mode {
-        ReportMode::Cost => Ok(MetricComponents::Cost(cost_components_from_llm_cost(
-            &line.cost,
-        )?)),
-        ReportMode::Tokens => Ok(MetricComponents::Tokens(token_counts_from_line(line)?)),
+    let agent_turns = u64::from(matches!(
+        line.log.as_ref(),
+        PiLogLine::Message(message) if matches!(&message.message, RoleMessage::Assistant(_))
+    ));
+    Ok(match report_mode {
+        ReportMode::Cost => MetricComponents::from(cost_components_from_llm_cost(&line.cost)?),
+        ReportMode::Tokens => MetricComponents::from(token_counts_from_line(line)?),
     }
+    .with_agent_turns(agent_turns))
 }
 
 async fn load_billable_lines(
@@ -242,6 +267,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::cost_report::MetricPayload;
     use pi_logs::Provider;
 
     fn write_log(dir: &Path, name: &str, lines: &[Value]) {
@@ -280,6 +306,35 @@ mod tests {
             "id": session_id,
             "timestamp": timestamp.to_rfc3339(),
             "cwd": "/tmp/moriarty-test"
+        })
+    }
+
+    fn compaction_line(id: &str, timestamp: DateTime<Utc>) -> Value {
+        json!({
+            "type": "compaction",
+            "id": id,
+            "parentId": "p1",
+            "timestamp": timestamp.to_rfc3339(),
+            "summary": "Compacted earlier work",
+            "firstKeptEntryId": "e1",
+            "tokensBefore": 12345,
+            "details": {"readFiles": [], "modifiedFiles": []},
+            "usage": {
+                "input": 4,
+                "output": 3,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "totalTokens": 7,
+                "cost": {
+                    "input": "4",
+                    "output": "3",
+                    "cacheRead": "0",
+                    "cacheWrite": "0",
+                    "total": "7",
+                    "source": "pi"
+                }
+            },
+            "fromHook": false
         })
     }
 
@@ -730,7 +785,7 @@ mod tests {
                     .then_some(metrics)
             })
             .expect("model bucket present");
-        let MetricComponents::Tokens(costs) = costs else {
+        let MetricPayload::Tokens(costs) = costs.payload else {
             panic!("expected token metrics")
         };
         assert_eq!(costs.input, 1_234);
@@ -738,6 +793,7 @@ mod tests {
         assert_eq!(costs.cache_write, 90);
         assert_eq!(costs.cache_read, 12);
         assert_eq!(costs.total(), 7_014);
+        assert_eq!(result.daily_metrics[0].agent_turns(), 1);
     }
 
     #[tokio::test]
@@ -801,7 +857,7 @@ mod tests {
                     .then_some(metrics)
             })
             .expect("model bucket present");
-        let MetricComponents::Tokens(costs) = costs else {
+        let MetricPayload::Tokens(costs) = costs.payload else {
             panic!("expected token metrics")
         };
         assert_eq!(costs.input, 1_244);
@@ -809,6 +865,7 @@ mod tests {
         assert_eq!(costs.cache_write, 120);
         assert_eq!(costs.cache_read, 52);
         assert_eq!(costs.total(), 7_114);
+        assert_eq!(session_metrics.agent_turns(), 2);
     }
 
     #[tokio::test]
@@ -1031,6 +1088,47 @@ mod tests {
 
         assert_eq!(result.session_metrics.len(), 1);
         assert!(result.had_errors);
+    }
+
+    #[tokio::test]
+    async fn analyze_directory_counts_assistant_but_not_compaction_as_agent_turn() {
+        // Compaction stands in for the shared non-Message guard arm; branch
+        // summaries take the same fallthrough path.
+        let dir = TempDir::new().unwrap();
+        let session = "019dc252-e50e-766c-8182-d654b46881b0";
+        write_log(
+            dir.path(),
+            "turns.jsonl",
+            &[
+                session_line(session, timestamp(2026, 4, 16, 0, 0)),
+                anthropic_line(
+                    "assistant",
+                    timestamp(2026, 4, 16, 9, 0),
+                    "claude-sonnet-4-5",
+                    "1",
+                    "2",
+                    "0",
+                    "0",
+                ),
+                compaction_line("compaction", timestamp(2026, 4, 16, 10, 0)),
+            ],
+        );
+
+        let result = analyze_directory(
+            dir.path(),
+            DateTimezone::Utc,
+            &unrestricted_filter(),
+            ReportMode::Cost,
+        )
+        .await
+        .unwrap();
+
+        let day = &result.daily_metrics[0];
+        assert_eq!(day.agent_turns(), 1);
+        assert_eq!(
+            day.total(ReportMode::Cost).unwrap(),
+            MetricTotal::Cost(10.0)
+        );
     }
 
     #[tokio::test]
