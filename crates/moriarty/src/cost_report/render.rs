@@ -369,10 +369,19 @@ pub(crate) struct ModelSummaryRow {
     metrics: FormattedMetricColumns,
 }
 
+/// Terminal width assumed when stdout/stderr/stdin are not a TTY (piped
+/// output). Chosen wider than the widest report table (~105 columns for the
+/// grouped daily table) because squeezing to the conventional 80 truncates
+/// the table (width < MIN_WIDTH_FOR_WRAPPING takes the `Width::truncate`
+/// branch), cutting totals like `$4.0000` down in piped output. Real narrow
+/// terminals still use their actual size, and the wrap-vs-truncate
+/// threshold is unaffected.
+pub(crate) const PIPED_TERMINAL_WIDTH: usize = 120;
+
 pub(crate) fn get_terminal_width() -> usize {
     terminal::size()
         .map(|(cols, _)| cols as usize)
-        .unwrap_or(80)
+        .unwrap_or(PIPED_TERMINAL_WIDTH)
 }
 
 pub(crate) fn divider(width: usize) -> String {

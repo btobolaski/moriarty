@@ -210,6 +210,11 @@ with warnings, while explicit missing paths and having no available source are e
   before routing (the tools are not in `preserves_empty_error_details`, unlike `memory`/`skill`) and only a non-error
   `{}` payload would route to `ToolResultDetails::Empty`. `mcpScript` routes to `McpScriptDetails` with required
   closed-enum `mode` (`"script"` today) and opaque `calls` entries.
+- The `intercom` tool result's `details` (`IntercomResultDetails`) is an untagged enum over the supervisor-status
+  payload (`{active, pending: count, root}`; carried verbatim from the native supervisor channel when the
+  pi-intercom extension delegates to it, reusing `SubagentSupervisorStatusDetails`) and the extension's loose
+  accreted-optional-fields shape (`IntercomLooseDetails`), mirroring `claude_logs`' `AutoModeExit`/`FrameLink`
+  pattern so the supervisor triple's co-occurrence is required and half-present states fail loudly.
 - `CompactionLine` and `BranchSummaryLine` carry an optional `usage: Option<AssistantUsage>` recording the cost/tokens
   of the summarization call pi made to produce them (pi added this field after the initial compaction schema, so it is
   `#[serde(default)]` for backward compatibility); the lines record no provider/model of their own, so attribution is
@@ -734,7 +739,7 @@ the on-disk protocol exactly, even when that means snake_case fields like `GitRe
    because the inner tag appears at the outer level and serde does not register it as claimed; a strict outer struct
    then rejects it at runtime. `WebSearchResultsData` keeps that wire shape but restores strict outer-key validation
    with a manual deserializer. The same limitation applies to `McpSearchDetails`' flattened `McpPagination`: its custom
-   deserializer rejects every flattened key except `hasMore` and `nextOffset`. _Adjacently_ tagged flatten targets
+   deserializer rejects every flattened key except `hasMore` and `nextOffset`. *Adjacently* tagged flatten targets
    (those with both `tag` and `content`) do not hit this collision, so structs like `CustomLine` and `CustomMessageLine`
    keep derived `deny_unknown_fields` handling. Each exception must carry an inline comment naming the limitation.
 2. **Corrupt-stream tolerance**: tool-argument structs (e.g. `EditArgs`, `EditReplacement`, `GrepArgs`) deliberately

@@ -5,13 +5,10 @@ use std::{
     io::{self, IsTerminal},
 };
 
-use crossterm::{
-    style::{Color, Stylize},
-    terminal,
-};
+use crossterm::style::{Color, Stylize};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::render::{MetricTotal, ReportMode, divider, fmt_money, fmt_tokens};
+use super::render::{MetricTotal, ReportMode, divider, fmt_money, fmt_tokens, get_terminal_width};
 
 const DEFAULT_TOP_N: usize = 5;
 const DEFAULT_TIME_BAR_WIDTH: usize = 48;
@@ -734,12 +731,6 @@ fn format_metric_total(total: MetricTotal) -> String {
         MetricTotal::Cost(amount) => fmt_money(amount),
         MetricTotal::Tokens(amount) => fmt_tokens(amount),
     }
-}
-
-fn get_terminal_width() -> usize {
-    terminal::size()
-        .map(|(cols, _)| cols as usize)
-        .unwrap_or(80)
 }
 
 fn use_ansi_color(color_mode: ChartColorMode) -> bool {

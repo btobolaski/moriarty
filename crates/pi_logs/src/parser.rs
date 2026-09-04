@@ -4562,9 +4562,29 @@ pub struct SkillDetails {
     pub updated: Option<String>,
 }
 
+/// The `intercom` tool result's `details` carries either the pi-intercom
+/// extension's own shape (delivery status, error, bare active flag,
+/// requestId, sessions, pending items; fields accreted as optional across
+/// versions) or the native supervisor status payload
+/// (`{"active":true,"pending":0,"root":...}`, observed when the extension
+/// delegates to the supervisor channel). Untagged over both, mirroring
+/// [`SubagentSupervisorResultDetails`]: the strict status variant keeps the
+/// supervisor triple (`active`/`pending` count/`root`) required, so
+/// half-present states the wire never produces fail loudly, while the loose
+/// variant keeps the accreted fields optional for older logs.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum IntercomResultDetails {
+    SupervisorStatus(SubagentSupervisorStatusDetails),
+    Loose(IntercomLooseDetails),
+}
+
+/// The pi-intercom extension's own `details` shape, kept permissive because
+/// the extension added fields across versions and older logs may carry any
+/// subset.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct IntercomResultDetails {
+pub struct IntercomLooseDetails {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4573,8 +4593,11 @@ pub struct IntercomResultDetails {
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<bool>,
-    /// Whether the intercom message is currently active (pending a response).
-    /// Added in newer pi versions; optional for backward compatibility.
+    /// The extension's bare "message is active (pending a response)" flag,
+    /// observed alone in `intercom` delivery shapes. This key also carries
+    /// the supervisor-channel-active flag in the supervisor status payload,
+    /// which parses as [`IntercomResultDetails::SupervisorStatus`] first, so
+    /// it never reaches this field with `pending`/`root`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active: Option<bool>,
     /// Request identifier for the intercom message. Added in newer pi
@@ -4588,14 +4611,17 @@ pub struct IntercomResultDetails {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sessions: Vec<JsonBlob>,
     /// Subagent runs awaiting a decision from the parent (e.g. `need_decision`).
-    /// Added in newer pi versions; optional for backward compatibility.
+    /// Added in newer pi versions; optional for backward compatibility. A
+    /// count-shaped `pending` belongs to the supervisor status payload and
+    /// fails here (loudly) rather than being silently accepted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending: Option<Vec<IntercomPendingItem>>,
 }
 
 /// A subagent run that is waiting for a parent decision via intercom.
-/// Pi populates this on the `intercom` tool result's `details.pending`
-/// when child subagents reach a `need_decision` state.
+/// Pi populates this on the intercom tool result's loose-shape `details.pending`
+/// ([`IntercomLooseDetails::pending`]) when child subagents reach a
+/// `need_decision` state.
 ///
 /// This mirrors [`PendingSupervisorRequest`] used by the
 /// `subagent_supervisor` tool, but keeps `child_index` and

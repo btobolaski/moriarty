@@ -2095,6 +2095,17 @@ fn fact_list_tool_result_accepts_count() {
     assert_eq!(details.count, 0);
 }
 
+/// Deserializes intercom tool-result details and unwraps the loose
+/// extension-shape variant the intercom detail tests pin.
+fn parse_loose_intercom_details(value: Value) -> IntercomLooseDetails {
+    match serde_json::from_value::<IntercomResultDetails>(value)
+        .expect("intercom result details should parse")
+    {
+        IntercomResultDetails::Loose(details) => details,
+        other => panic!("expected loose intercom details, got {other:?}"),
+    }
+}
+
 #[test]
 fn intercom_tool_result_accepts_delivery_status() {
     let tool_result = parse_tool_result_message(tool_result_message_json(
@@ -2111,8 +2122,10 @@ fn intercom_tool_result_accepts_delivery_status() {
         })),
     ));
 
-    let Some(ToolResultDetails::Intercom(details)) = tool_result.details else {
-        panic!("expected Intercom details")
+    let Some(ToolResultDetails::Intercom(IntercomResultDetails::Loose(details))) =
+        tool_result.details
+    else {
+        panic!("expected loose Intercom details")
     };
     assert_eq!(
         details.message_id.as_deref(),
@@ -2135,8 +2148,10 @@ fn intercom_tool_result_accepts_error_flag() {
         Some(json!({"error": true})),
     ));
 
-    let Some(ToolResultDetails::Intercom(details)) = tool_result.details else {
-        panic!("expected Intercom details")
+    let Some(ToolResultDetails::Intercom(IntercomResultDetails::Loose(details))) =
+        tool_result.details
+    else {
+        panic!("expected loose Intercom details")
     };
     assert_eq!(details.error, Some(true));
     assert_eq!(details.message_id, None);
@@ -6608,12 +6623,11 @@ fn acceptance_config_accepts_explicit_reason() {
 
 #[test]
 fn intercom_result_accepts_active_field() {
-    let details: IntercomResultDetails = serde_json::from_value(json!({
+    let details = parse_loose_intercom_details(json!({
         "messageId": "msg-1",
         "delivered": true,
         "active": true
-    }))
-    .expect("intercom result with active should parse");
+    }));
     assert_eq!(details.message_id.as_deref(), Some("msg-1"));
     assert_eq!(details.delivered, Some(true));
     assert_eq!(details.active, Some(true));
@@ -9230,12 +9244,11 @@ fn subagent_supervisor_pending_result_parses() {
 
 #[test]
 fn intercom_result_accepts_request_id() {
-    let details: IntercomResultDetails = serde_json::from_value(json!({
+    let details = parse_loose_intercom_details(json!({
         "messageId": "msg-1",
         "delivered": true,
         "requestId": "req-42"
-    }))
-    .expect("intercom result with requestId should parse");
+    }));
     assert_eq!(details.message_id.as_deref(), Some("msg-1"));
     assert_eq!(details.delivered, Some(true));
     assert_eq!(details.request_id.as_deref(), Some("req-42"));
@@ -9244,13 +9257,12 @@ fn intercom_result_accepts_request_id() {
 #[test]
 fn intercom_result_accepts_sessions_field() {
     let session_entry = json!({"id": "session-1", "metadata": {"active": true}});
-    let details: IntercomResultDetails = serde_json::from_value(json!({
+    let details = parse_loose_intercom_details(json!({
         "sessions": [session_entry.clone()]
-    }))
-    .expect("intercom result with non-empty sessions should parse");
+    }));
     assert_eq!(details.sessions, vec![JsonBlob::from(session_entry)]);
 
-    let empty: IntercomResultDetails = serde_json::from_value(json!({"sessions": []})).unwrap();
+    let empty = parse_loose_intercom_details(json!({"sessions": []}));
     assert!(empty.sessions.is_empty());
 }
 
@@ -9261,7 +9273,7 @@ fn intercom_result_accepts_sessions_field() {
 /// intercom tool results.
 #[test]
 fn intercom_result_accepts_pending_items() {
-    let details: IntercomResultDetails = serde_json::from_value(json!({
+    let details = parse_loose_intercom_details(json!({
         "pending": [
             {
                 "id": "req-1",
@@ -9278,8 +9290,7 @@ fn intercom_result_accepts_pending_items() {
                 "reason": "ask"
             }
         ]
-    }))
-    .expect("intercom result with pending items should parse");
+    }));
     let pending = details.pending.expect("pending should be present");
     assert_eq!(pending[0].id, "req-1");
     assert_eq!(pending[0].run_id, "run-42");
@@ -9294,6 +9305,49 @@ fn intercom_result_accepts_pending_items() {
     assert_eq!(pending[1].reason, "ask");
     assert_eq!(pending[1].child_index, None);
     assert_eq!(pending[1].expects_reply, None);
+}
+
+/// The `intercom` tool result also carries the native supervisor status
+/// payload (`{"active":true,"pending":0,"root":...}`) when the
+/// pi-intercom extension delegates to the supervisor channel: `pending` is
+/// an integer count rather than an items list, and `root` names the channel
+/// directory. Pinned from a real production line (the parse failure this
+/// struct originally tripped on).
+#[test]
+fn intercom_result_accepts_supervisor_status_payload() {
+    const CHANNEL_ROOT: &str = "/tmp/nix-shell.hEIGDt/pi-subagents-uid-1000/supervisor-channels";
+    let details = serde_json::from_value::<IntercomResultDetails>(json!({
+        "active": true,
+        "pending": 0,
+        "root": CHANNEL_ROOT
+    }))
+    .expect("intercom result with supervisor status payload should parse");
+    let IntercomResultDetails::SupervisorStatus(status) = details else {
+        panic!("expected supervisor status variant");
+    };
+    assert!(status.active);
+    assert_eq!(status.pending, 0);
+    assert_eq!(status.root, PathBuf::from(CHANNEL_ROOT));
+}
+
+/// Half-present supervisor status payloads (the count without the channel
+/// root) must fail loudly rather than parse into partially-populated loose
+/// details.
+#[test]
+fn intercom_result_rejects_half_present_status() {
+    serde_json::from_value::<IntercomResultDetails>(json!({
+        "active": true,
+        "pending": 0
+    }))
+    .expect_err("half-present supervisor status payload must be rejected");
+}
+
+/// A `pending` value matching neither shape (not an items list, not a
+/// count) must fail loudly instead of silently defaulting.
+#[test]
+fn intercom_result_rejects_unknown_pending_shape() {
+    serde_json::from_value::<IntercomResultDetails>(json!({"pending": "many"}))
+        .expect_err("pending matching neither shape must be rejected");
 }
 
 #[test]

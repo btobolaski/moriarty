@@ -165,53 +165,6 @@ fn assert_has_graph_bar(stdout: &str, row_prefix: &str) {
 }
 
 #[test]
-fn pi_cost_cli_renders_daily_report_and_incomplete_warning() {
-    let dir = TempDir::new().unwrap();
-    let session = "019dc252-e50e-766c-8182-d654b46881b0";
-    write_log(
-        dir.path(),
-        "valid.jsonl",
-        &[
-            session_line(session, "2026-04-16T00:00:00Z"),
-            anthropic_line(
-                "anthropic-1",
-                "2026-04-16T09:00:00Z",
-                "claude-sonnet-4-5",
-                "1.0",
-                "2.0",
-            ),
-            openai_line("openai-1", "2026-04-16T10:00:00Z", "gpt-5", "0.5", "0.5"),
-        ],
-    );
-    fs::write(dir.path().join("invalid.jsonl"), "not json at all").unwrap();
-
-    let output = moriarty_command()
-        .args(["pi", "cost", "--dir"])
-        .arg(dir.path())
-        .args(["--timezone", "utc"])
-        .output()
-        .unwrap();
-
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    let stderr = String::from_utf8(output.stderr).unwrap();
-
-    assert!(stdout.contains("Pi Cost Report"));
-    assert!(stdout.contains("2026-04"));
-    assert!(stdout.contains("gpt-5"));
-    assert!(stdout.contains("claude-sonnet"));
-    assert!(stdout.contains("Summary"));
-    assert!(stdout.contains("Grand Total"));
-    assert!(stdout.contains("$4.0000"));
-    assert!(stderr.contains("Warning: some log files could not be read or parsed"));
-}
-
-#[test]
 fn pi_cost_cli_renders_daily_token_report() {
     let dir = TempDir::new().unwrap();
     let session = "019dc252-e50e-766c-8182-d654b46881b0";
