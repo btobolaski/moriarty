@@ -28,9 +28,10 @@
 //!   permissive structs, targeted field aliases, or untagged fallback enums
 //!   so a single corrupted record cannot abort an entire log file:
 //!     1. Permissive argument/payload structs ([`EditArgs`], nested edit
-//!        payloads like [`EditReplacement`], and [`GrepArgs`]) that omit
-//!        `deny_unknown_fields` to ignore hallucinated sibling keys (e.g.
-//!        `:path` on grep).
+//!        payloads like [`EditReplacement`], [`GrepArgs`], and [`TodoArgs`])
+//!        that omit `deny_unknown_fields` to ignore hallucinated sibling
+//!        keys (e.g. `:path` on grep, `actionactionadeveloper` on todo
+//!        params echoes).
 //!     2. Field-level aliases (for example on [`FindArgs`]) that map an
 //!        observed punctuated key corruption like `.limit` back onto the
 //!        intended schema field without relaxing the whole struct.
@@ -977,8 +978,12 @@ pub struct SubagentStatusArgs {
     pub dir: Option<PathBuf>,
 }
 
+// No `deny_unknown_fields`: `params` echoes the model-emitted tool-call arguments,
+// and corrupted assistant streams have been observed hallucinating extra keys
+// there (e.g. `"actionactionadeveloper": "functions.todo"` alongside the real
+// `"action"`), so strict rejection would fail the whole log line.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct TodoArgs {
     pub action: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

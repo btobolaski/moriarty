@@ -2050,6 +2050,36 @@ fn todo_tool_result_accepts_error_field() {
     );
 }
 
+/// Corrupted model streams have been observed hallucinating extra keys in the
+/// echoed `params` (e.g. `actionactionadeveloper`); those must not fail the line.
+#[test]
+fn todo_tool_result_accepts_hallucinated_params_keys() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "todo",
+        vec![json!({"type": "text", "text": "Created #14"})],
+        false,
+        Some(json!({
+            "action": "create",
+            "params": {
+                "actionactionadeveloper": "functions.todo",
+                "action": "create",
+                "subject": "Remove unreachable child deadline branch"
+            },
+            "tasks": [],
+            "nextId": 15
+        })),
+    ));
+
+    let Some(ToolResultDetails::Todo(details)) = tool_result.details else {
+        panic!("expected Todo details")
+    };
+    assert_eq!(details.params.action, "create");
+    assert_eq!(
+        details.params.subject.as_deref(),
+        Some("Remove unreachable child deadline branch")
+    );
+}
+
 /// Accepts a `subjects` array for bulk task creation.
 #[test]
 fn todo_tool_result_accepts_subjects_param() {

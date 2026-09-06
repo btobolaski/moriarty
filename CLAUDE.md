@@ -742,7 +742,8 @@ the on-disk protocol exactly, even when that means snake_case fields like `GitRe
    deserializer rejects every flattened key except `hasMore` and `nextOffset`. *Adjacently* tagged flatten targets
    (those with both `tag` and `content`) do not hit this collision, so structs like `CustomLine` and `CustomMessageLine`
    keep derived `deny_unknown_fields` handling. Each exception must carry an inline comment naming the limitation.
-2. **Corrupt-stream tolerance**: tool-argument structs (e.g. `EditArgs`, `EditReplacement`, `GrepArgs`) deliberately
+2. **Corrupt-stream tolerance**: tool-argument structs (e.g. `EditArgs`, `EditReplacement`, `GrepArgs`, and now
+   `TodoArgs`) deliberately
    omit it to tolerate completed-but-corrupted or hallucinated assistant streams that emit malformed sibling keys. The
    same goal is also met at finer granularity by field-level aliases (for example `FindArgs.limit` accepting malformed
    `.limit` while keeping the rest of the struct strict) and untagged fallback enums (`EditEntry::Fragment` absorbs raw
