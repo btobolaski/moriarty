@@ -211,14 +211,18 @@ with warnings, while explicit missing paths and having no available source are e
   `{}` payload would route to `ToolResultDetails::Empty`. `mcpScript` routes to `McpScriptDetails` with required
   closed-enum `mode` (`"script"` today) and opaque `calls` entries.
 - The `intercom` tool result's `details` (`IntercomResultDetails`) is an untagged enum over the supervisor-status
-  payload (`{active, pending: count, root}`; carried verbatim from the native supervisor channel when the
-  pi-intercom extension delegates to it, reusing `SubagentSupervisorStatusDetails`) and the extension's loose
-  accreted-optional-fields shape (`IntercomLooseDetails`), mirroring `claude_logs`' `AutoModeExit`/`FrameLink`
-  pattern so the supervisor triple's co-occurrence is required and half-present states fail loudly.
+  payload (`{active, pending: count, root}`; carried verbatim from the native supervisor channel when the pi-intercom
+  extension delegates to it, reusing `SubagentSupervisorStatusDetails`) and the extension's loose
+  accreted-optional-fields shape (`IntercomLooseDetails`), mirroring `claude_logs`' `AutoModeExit`/`FrameLink` pattern
+  so the supervisor triple's co-occurrence is required and half-present states fail loudly.
 - `CompactionLine` and `BranchSummaryLine` carry an optional `usage: Option<AssistantUsage>` recording the cost/tokens
   of the summarization call pi made to produce them (pi added this field after the initial compaction schema, so it is
   `#[serde(default)]` for backward compatibility); the lines record no provider/model of their own, so attribution is
   left to `cost_analyzer`'s active-model fallback
+- `CompactionDetailsV2` also carries an optional `retained_tool_output_projection` (`RetainedToolOutputProjection`, pi's
+  per-compaction record of how much large-tool-output content was kept in the folded context); `omissions` stays an
+  opaque `Vec<JsonBlob>` because its element shape is intentionally unmodeled until a populated example exists (the only
+  observed payload had an empty list)
 - Includes a `parse_pi_sessions` binary that recursively smoke-tests a sessions tree by parsing every `*.jsonl` file
 
 **`cost_analyzer/`** - Generic cost-analysis library:
@@ -739,16 +743,16 @@ the on-disk protocol exactly, even when that means snake_case fields like `GitRe
    because the inner tag appears at the outer level and serde does not register it as claimed; a strict outer struct
    then rejects it at runtime. `WebSearchResultsData` keeps that wire shape but restores strict outer-key validation
    with a manual deserializer. The same limitation applies to `McpSearchDetails`' flattened `McpPagination`: its custom
-   deserializer rejects every flattened key except `hasMore` and `nextOffset`. *Adjacently* tagged flatten targets
+   deserializer rejects every flattened key except `hasMore` and `nextOffset`. _Adjacently_ tagged flatten targets
    (those with both `tag` and `content`) do not hit this collision, so structs like `CustomLine` and `CustomMessageLine`
    keep derived `deny_unknown_fields` handling. Each exception must carry an inline comment naming the limitation.
 2. **Corrupt-stream tolerance**: tool-argument structs (e.g. `EditArgs`, `EditReplacement`, `GrepArgs`, and now
-   `TodoArgs`) deliberately
-   omit it to tolerate completed-but-corrupted or hallucinated assistant streams that emit malformed sibling keys. The
-   same goal is also met at finer granularity by field-level aliases (for example `FindArgs.limit` accepting malformed
-   `.limit` while keeping the rest of the struct strict) and untagged fallback enums (`EditEntry::Fragment` absorbs raw
-   JSON tokens in an `edits` array; `MaybeU32::Garbage` absorbs string-typed corruption of numeric tool-call arguments).
-   Each such exception must carry an inline comment naming the observed failure mode.
+   `TodoArgs`) deliberately omit it to tolerate completed-but-corrupted or hallucinated assistant streams that emit
+   malformed sibling keys. The same goal is also met at finer granularity by field-level aliases (for example
+   `FindArgs.limit` accepting malformed `.limit` while keeping the rest of the struct strict) and untagged fallback
+   enums (`EditEntry::Fragment` absorbs raw JSON tokens in an `edits` array; `MaybeU32::Garbage` absorbs string-typed
+   corruption of numeric tool-call arguments). Each such exception must carry an inline comment naming the observed
+   failure mode.
 3. **Forward-compatible protocol schemas**: structs representing server-defined or runtime-defined protocol envelopes
    whose field sets evolve independently of the parser (e.g. `McpCallResult` for MCP tool-call results, which pi's
    runtime regularly extends with new metadata fields like `contentBlocks`, `outputGuard`, and `omitted`). Every such

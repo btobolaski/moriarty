@@ -1087,6 +1087,25 @@ fn rejects_unknown_compaction_field() {
 }
 
 #[test]
+fn rejects_unknown_retained_tool_output_projection_field() {
+    let mut bad_compaction = compaction_json(false);
+    bad_compaction["details"]["retainedToolOutputProjection"] = json!({
+        "version": 1,
+        "retainedTokens": 0,
+        "omittedTokens": 0,
+        "pendingCount": 0,
+        "omissions": [],
+        "bogus": true,
+    });
+
+    assert_parse_error_contains_any(
+        "rejects unknown retainedToolOutputProjection field",
+        bad_compaction,
+        &["bogus"],
+    );
+}
+
+#[test]
 fn compaction_line_v2() {
     let mut value = json!({
         "type": "compaction",
@@ -1140,6 +1159,7 @@ fn compaction_line_v2() {
             assert!(!details.om_folded.full_fold);
             assert!(details.om_folded.observations.is_empty());
             assert!(details.om_folded.reflections.is_empty());
+            assert!(details.retained_tool_output_projection.is_none());
 
             let usage = compaction.usage.expect("usage present");
             assert_eq!(usage.input, 90351);
@@ -1188,6 +1208,62 @@ fn compaction_line_v2_minimal() {
             assert!(!details.previous_summary_used);
             assert_eq!(details.om_folded.observations.len(), 1);
             assert_eq!(details.om_folded.reflections.len(), 2);
+        }
+        other => panic!("expected Compaction, got {other:?}"),
+    }
+}
+
+/// Mirrors the only observed real-world payload carrying the retained-tool
+/// output projection so a future key or shape drift fails here first.
+#[test]
+fn compaction_line_v2_with_retained_tool_output() {
+    let line = parse(json!({
+        "type": "compaction",
+        "id": "c1",
+        "parentId": "p1",
+        "timestamp": FIXED_TIMESTAMP,
+        "summary": "Compacted with retained tool output",
+        "firstKeptEntryId": "e1",
+        "tokensBefore": 12345,
+        "details": {
+            "compactor": "blackhole",
+            "version": 1,
+            "sections": ["Session Goal"],
+            "sourceMessageCount": 211,
+            "previousSummaryUsed": true,
+            "om.folded": {
+                "type": "om.folded",
+                "version": 1,
+                "fullFold": true,
+                "observations": [],
+                "reflections": []
+            },
+            "retainedToolOutputProjection": {
+                "version": 1,
+                "retainedTokens": 6645,
+                "omittedTokens": 0,
+                "pendingCount": 0,
+                "omissions": []
+            }
+        },
+        "fromHook": true,
+    }));
+
+    match line {
+        PiLogLine::Compaction(compaction) => {
+            assert!(compaction.from_hook);
+            let CompactionDetails::V2(details) = &compaction.details else {
+                panic!("expected V2");
+            };
+            let projection = details
+                .retained_tool_output_projection
+                .as_ref()
+                .expect("retained tool output projection present");
+            assert_eq!(projection.version, 1);
+            assert_eq!(projection.retained_tokens, 6645);
+            assert_eq!(projection.omitted_tokens, 0);
+            assert_eq!(projection.pending_count, 0);
+            assert!(projection.omissions.is_empty());
         }
         other => panic!("expected Compaction, got {other:?}"),
     }

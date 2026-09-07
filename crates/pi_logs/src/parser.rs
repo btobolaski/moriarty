@@ -273,6 +273,25 @@ pub struct CompactionDetailsV2 {
     pub previous_summary_used: bool,
     #[serde(rename = "om.folded")]
     pub om_folded: OmFolded,
+    /// Retained-tool-output bookkeeping pi added to compactions that preserve
+    /// parts of large tool results. Optional for backward compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retained_tool_output_projection: Option<RetainedToolOutputProjection>,
+}
+
+/// pi's per-compaction record of how much large-tool-output content was kept
+/// in the folded context. Only one payload has been observed (empty
+/// `omissions`), so the omission element shape stays unmodeled.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RetainedToolOutputProjection {
+    pub version: u32,
+    pub retained_tokens: u64,
+    pub omitted_tokens: u64,
+    pub pending_count: u64,
+    /// Element shape never observed (the only seen payload had an empty
+    /// list), so entries stay opaque until a populated example exists.
+    pub omissions: Vec<JsonBlob>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
