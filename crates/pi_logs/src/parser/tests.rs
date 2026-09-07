@@ -5517,6 +5517,92 @@ fn custom_message_web_search_content_ready_rejects_details() {
 }
 
 #[test]
+fn custom_message_firstpick_session_summary_rpc() {
+    match parse_custom_message_payload(
+        "",
+        "firstpick:session-summary-rpc",
+        Some(json!({
+            "version": 1,
+            "kind": "state",
+            "sessionId": "01a07a0e-b676-715a-90cb-17b0a5b3d6d5",
+            "configured": false,
+            "enabled": false,
+            "durable": true,
+        })),
+    ) {
+        CustomMessagePayload::FirstPickSessionSummaryRpc(details) => {
+            assert_eq!(details.version, 1);
+            assert_eq!(details.kind, "state");
+            assert_eq!(details.session_id, "01a07a0e-b676-715a-90cb-17b0a5b3d6d5");
+            assert!(!details.configured);
+            assert!(!details.enabled);
+            assert!(details.durable);
+        }
+        other => panic!("expected FirstPickSessionSummaryRpc, got {other:?}"),
+    }
+}
+
+#[test]
+fn custom_firstpick_session_summary_name_provenance() {
+    match parse_custom_payload(
+        "firstpick:session-summary-name-provenance",
+        json!({"version": 1, "explicit": true}),
+    ) {
+        CustomPayload::FirstPickSessionSummaryNameProvenance(data) => {
+            assert_eq!(data.version, 1);
+            assert!(data.explicit);
+        }
+        other => panic!("expected FirstPickSessionSummaryNameProvenance, got {other:?}"),
+    }
+}
+
+#[test]
+fn custom_webui_subagent_retained_runs_v1() {
+    match parse_custom_payload(
+        "webui-subagent-retained-runs-v1",
+        json!({
+            "version": 1,
+            "runs": [{
+                "id": "421d8070-5e9f-46c7-8797-d4c0de6ad629",
+                "source": "async",
+                "mode": "single",
+                "status": "done",
+                "startedAt": 1788753616488u64,
+                "endedAt": 1788753643609u64,
+                "agents": [],
+            }, {
+                "id": "0d2a7f60-0000-4000-8000-000000000001",
+                "source": "async",
+                "mode": "single",
+                "status": "running",
+                "startedAt": 1788753616489u64,
+                "endedAt": 1788753643610u64,
+                "agents": [{"agentId": "a1", "label": "worker"}],
+            }],
+        }),
+    ) {
+        CustomPayload::WebuiSubagentRetainedRuns(data) => {
+            assert_eq!(data.version, 1);
+            assert_eq!(data.runs.len(), 2);
+            assert!(data.runs[0].agents.is_empty());
+            assert_eq!(
+                data.runs[1].agents,
+                vec![JsonBlob(json!({"agentId": "a1", "label": "worker"}))]
+            );
+            let run = &data.runs[0];
+            assert_eq!(run.id, "421d8070-5e9f-46c7-8797-d4c0de6ad629");
+            assert_eq!(run.source, "async");
+            assert_eq!(run.mode, "single");
+            assert_eq!(run.status, "done");
+            assert_eq!(run.started_at, 1788753616488);
+            assert_eq!(run.ended_at, 1788753643609);
+            assert!(run.agents.is_empty());
+        }
+        other => panic!("expected WebuiSubagentRetainedRuns, got {other:?}"),
+    }
+}
+
+#[test]
 fn custom_message_subagent_compaction_resume_has_no_details() {
     assert!(matches!(
         parse_custom_message_payload(

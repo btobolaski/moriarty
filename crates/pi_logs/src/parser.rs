@@ -350,6 +350,15 @@ pub enum CustomPayload {
     OmObservationsDropped(OmObservationsDroppedData),
     #[serde(rename = "om.reflections.dropped")]
     OmReflectionsDropped(OmReflectionsDroppedData),
+    /// Name-provenance record emitted by the firstpick session-summary
+    /// extension: whether the session's summary name was set explicitly by
+    /// the user or derived.
+    #[serde(rename = "firstpick:session-summary-name-provenance")]
+    FirstPickSessionSummaryNameProvenance(FirstPickNameProvenanceData),
+    /// Snapshot of the web UI's retained subagent runs, emitted by pi's
+    /// built-in webui integration.
+    #[serde(rename = "webui-subagent-retained-runs-v1")]
+    WebuiSubagentRetainedRuns(WebuiSubagentRetainedRunsData),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -425,6 +434,12 @@ pub enum CustomMessagePayload {
     /// no `details` payload, so it must be a unit variant to parse.
     #[serde(rename = "rpiv-todo-continuation")]
     RpivTodoContinuation,
+    /// State announcement broadcast by the firstpick session-summary
+    /// extension over its RPC channel (summary generation configured/enabled,
+    /// durable or not). The human-readable text lives in the outer `content`
+    /// field, which is observed empty for these state records.
+    #[serde(rename = "firstpick:session-summary-rpc")]
+    FirstPickSessionSummaryRpc(FirstPickSessionSummaryRpcDetails),
 }
 
 // ---------------------------------------------------------------------------
@@ -4736,6 +4751,54 @@ pub struct SubagentWaitSubscriptionDetails {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PlannotatorFramingDetails {
     pub phase: PlannotatorPhase,
+}
+
+/// Details of a `firstpick:session-summary-rpc` custom message.
+/// `kind` stays a `String` because the extension's RPC vocabulary is
+/// undocumented and only the `state` broadcast has been observed.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FirstPickSessionSummaryRpcDetails {
+    pub version: u32,
+    pub kind: String,
+    pub session_id: String,
+    pub configured: bool,
+    pub enabled: bool,
+    pub durable: bool,
+}
+
+/// Payload of the `firstpick:session-summary-name-provenance` custom line:
+/// whether the session's summary name was set explicitly or derived.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FirstPickNameProvenanceData {
+    pub version: u32,
+    pub explicit: bool,
+}
+
+/// Payload of the `webui-subagent-retained-runs-v1` custom line: the web
+/// UI's snapshot of retained subagent runs. Per-run `source`/`mode`/`status`
+/// stay `String` because their runtime vocabularies are undocumented, and
+/// `agents` stays opaque until a populated example exists (only ever
+/// observed empty).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WebuiSubagentRetainedRunsData {
+    pub version: u32,
+    pub runs: Vec<WebuiRetainedRun>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WebuiRetainedRun {
+    pub id: String,
+    pub source: String,
+    pub mode: String,
+    pub status: String,
+    /// Observed values are whole-millisecond epoch timestamps.
+    pub started_at: i64,
+    pub ended_at: i64,
+    pub agents: Vec<JsonBlob>,
 }
 
 /// Plannotator originally serialised `savedState` as an opaque marker
