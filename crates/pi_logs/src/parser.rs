@@ -1968,6 +1968,9 @@ fn parse_tool_result_details(
         "symbol_search" => serde_json::from_value(details).map(ToolResultDetails::SymbolSearch),
         "todo" => serde_json::from_value(details).map(ToolResultDetails::Todo),
         "web_search" => parse_web_search_details(details),
+        "workspace_session_summaries" => {
+            serde_json::from_value(details).map(ToolResultDetails::WorkspaceSessionSummaries)
+        }
         _ => serde_json::from_value(details),
     }
 }
@@ -2065,6 +2068,7 @@ pub enum ToolResultDetails {
     Grep(GrepDetails),
     Read(ReadDetails),
     Count(CountDetails),
+    WorkspaceSessionSummaries(WorkspaceSessionSummariesDetails),
     // `memory_search` and `session_search` share the same compact
     // success/count/message envelope, so one typed variant avoids duplicating
     // their parser surface.
@@ -3977,6 +3981,15 @@ pub enum InstinctWriteAction {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CountDetails {
     pub count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkspaceSessionSummariesDetails {
+    pub current: u32,
+    pub live: u32,
+    pub persisted: u32,
+    pub peers: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

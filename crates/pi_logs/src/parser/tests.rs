@@ -2266,6 +2266,22 @@ fn intercom_tool_result_accepts_error_flag() {
 }
 
 #[test]
+fn workspace_session_summaries_tool_result_accepts_counts() {
+    let tool_result = tool_result_with_details(
+        "workspace_session_summaries",
+        json!({"current": 0, "live": 1, "persisted": 2, "peers": 3}),
+    );
+
+    let Some(ToolResultDetails::WorkspaceSessionSummaries(details)) = tool_result.details else {
+        panic!("expected workspace session summaries details")
+    };
+    assert_eq!(details.current, 0);
+    assert_eq!(details.live, 1);
+    assert_eq!(details.persisted, 2);
+    assert_eq!(details.peers, 3);
+}
+
+#[test]
 fn instinct_list_tool_result_accepts_count() {
     let tool_result = parse_tool_result_message(tool_result_message_json(
         "instinct_list",
