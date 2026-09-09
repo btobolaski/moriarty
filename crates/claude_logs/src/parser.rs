@@ -552,11 +552,13 @@ pub enum AttachmentData {
     CommandPermissions(CommandPermissions),
     CompactFileReference(CompactFileReference),
     ContextTip(ContextTip),
+    Date(DateAttachment),
     DateChange(DateChange),
     DeferredToolsDelta(DeferredToolsDelta),
     Diagnostics(DiagnosticsAttachment),
     Directory(DirectoryAttachment),
     EditedTextFile(EditedTextFile),
+    Environment(EnvironmentAttachment),
     File(FileAttachment),
     HookBlockingError(HookBlockingError),
     HookCancelled(HookCancelled),
@@ -564,15 +566,19 @@ pub enum AttachmentData {
     HookPermissionDecision(HookPermissionDecision),
     HookSuccess(HookSuccess),
     HookSystemMessage(HookSystemMessage),
+    Instructions(InstructionsAttachment),
     InvokedSkills(InvokedSkills),
     McpInstructionsDelta(McpInstructionsDelta),
+    Model(ModelAttachment),
     NestedMemory(NestedMemory),
     PlanFileReference(PlanFileReference),
     PlanMode(PlanModeAttachment),
     PlanModeExit(PlanModeExitAttachment),
     PlanModeReentry(PlanModeReentryAttachment),
+    PromptSnapshot(PromptSnapshot),
     QueuedCommand(QueuedCommand),
     ReadTruncationNotice(ReadTruncationNotice),
+    SessionContext(SessionContext),
     SilentTurnReminder(SilentTurnReminder),
     SkillListing(SkillListing),
     TaskReminder(TaskReminder),
@@ -710,6 +716,19 @@ pub struct DateChange {
     pub new_date: NaiveDate,
 }
 
+/// The current date Claude Code states at the start of a turn's context. Distinct from
+/// `date_change`, which marks the date rolling over mid-session. Added in Claude Code 2.1.257+.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct DateAttachment {
+    pub date: NaiveDate,
+    /// Whether the date changed since the last turn's context. Nullable because the earliest
+    /// 2.1.257 records state the date without tracking rollover.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changed: Option<bool>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
@@ -796,6 +815,62 @@ pub struct SilentTurnReminder {
     pub text: String,
 }
 
+/// A record of the system prompt (as its constituent blocks) and tool roster a turn was sent with.
+/// `tools` is absent on turns whose snapshot predates the tool roster being captured, hence
+/// `Option`. Added in Claude Code 2.1.257+.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct PromptSnapshot {
+    pub system_prompt: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<PromptSnapshotTool>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct PromptSnapshotTool {
+    pub name: String,
+    pub description: String,
+}
+
+/// The model-identity blurb Claude Code injects into a turn, alongside the structured identity it
+/// was rendered from. Added in Claude Code 2.1.257+.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct ModelAttachment {
+    pub identity: ModelIdentity,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct ModelIdentity {
+    pub model_id: Model,
+    pub marketing_name: String,
+    pub knowledge_cutoff: String,
+}
+
+/// The session-level context Claude Code injects into a turn, each entry already rendered as the
+/// prose the model sees rather than as structured data. Added in Claude Code 2.1.257+.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct SessionContext {
+    pub context: SessionContextEntries,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct SessionContextEntries {
+    pub user_email: String,
+    pub git_status: String,
+}
+
 /// Directory contents attached to a turn (e.g. via an `@dir` reference); `content` is a
 /// newline-separated listing of the directory's immediate entries. Added in Claude Code 2.1.158+.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -815,6 +890,29 @@ pub struct EditedTextFile {
     pub snippet: String,
     /// Added in Claude Code 2.1.201+, hence `Option` so older records still parse.
     pub display_path: Option<String>,
+}
+
+/// The environment description Claude Code injects into a turn (working directory, platform, shell,
+/// scratchpad). Added in Claude Code 2.1.257+.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct EnvironmentAttachment {
+    pub snapshot: EnvironmentSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct EnvironmentSnapshot {
+    pub working_directory: String,
+    pub is_worktree: bool,
+    pub is_git_repo: bool,
+    pub additional_working_directories: Vec<String>,
+    pub platform: String,
+    pub shell: String,
+    pub os_version: String,
+    pub scratchpad_directory: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -972,6 +1070,34 @@ pub struct HookSystemMessage {
     #[serde(rename = "toolUseID")]
     pub tool_use_id: String,
     pub hook_event: String,
+}
+
+/// The instruction files Claude Code loaded into a turn's context (CLAUDE.md files and the auto
+/// memory index). Added in Claude Code 2.1.257+.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct InstructionsAttachment {
+    pub files: Vec<InstructionsFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct InstructionsFile {
+    pub path: String,
+    #[serde(rename = "type")]
+    pub kind: InstructionsFileKind,
+    pub content: String,
+}
+
+/// Where an instruction file was loaded from. A strict enum — like [`ReasoningEffort`] — so a scope
+/// Claude Code adds later surfaces as a parse error rather than being silently misclassified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum InstructionsFileKind {
+    User,
+    Project,
+    AutoMem,
 }
 
 /// Skills invoked during a turn (e.g. a `/code-review` slash command), each carrying the loaded

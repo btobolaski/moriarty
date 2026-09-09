@@ -19,6 +19,19 @@ fn assert_log_line_rejects_extra_field(
     );
 }
 
+/// Kept separate from [`parse_attachment`] for the tests that assert on envelope fields
+/// (`entrypoint`, `agentId`, `sessionKind`) alongside the payload.
+fn parse_attachment_line(json: serde_json::Value) -> AttachmentLogLine {
+    match serde_json::from_value::<LogLine>(json).expect("Failed to parse attachment log line") {
+        LogLine::Attachment(att) => *att,
+        other => panic!("Expected Attachment, got {other:?}"),
+    }
+}
+
+fn parse_attachment(json: serde_json::Value) -> AttachmentData {
+    parse_attachment_line(json).attachment
+}
+
 #[test]
 fn test_parse_user_log_line_with_agent_id() {
     let json = serde_json::json!({
@@ -1834,26 +1847,21 @@ fn test_parse_attachment_with_snake_case_session_id() {
         "gitBranch": "main",
         "slug": null
     });
-    let line: LogLine = serde_json::from_value(json).unwrap();
-    match line {
-        LogLine::Attachment(att) => {
-            assert_eq!(
-                att.session_id_snake,
-                Some(
-                    "55555555-5555-5555-5555-555555555555"
-                        .parse::<Uuid>()
-                        .unwrap()
-                )
-            );
-            assert_eq!(
-                att.session_id,
-                "66666666-6666-6666-6666-666666666666"
-                    .parse::<Uuid>()
-                    .unwrap()
-            );
-        }
-        other => panic!("Expected Attachment, got {:?}", other),
-    }
+    let att = parse_attachment_line(json);
+    assert_eq!(
+        att.session_id_snake,
+        Some(
+            "55555555-5555-5555-5555-555555555555"
+                .parse::<Uuid>()
+                .unwrap()
+        )
+    );
+    assert_eq!(
+        att.session_id,
+        "66666666-6666-6666-6666-666666666666"
+            .parse::<Uuid>()
+            .unwrap()
+    );
 }
 
 #[test]
@@ -7726,19 +7734,14 @@ fn test_parse_attachment_deferred_tools_delta() {
         "gitBranch": "main",
         "slug": "test-slug"
     });
-    let log_line: LogLine = serde_json::from_value(json).unwrap();
-    match log_line {
-        LogLine::Attachment(att) => match att.attachment {
-            AttachmentData::DeferredToolsDelta(delta) => {
-                assert_eq!(delta.added_names, vec!["WebFetch", "WebSearch"]);
-                assert!(delta.readded_names.is_empty());
-                assert!(delta.pending_mcp_servers.is_empty());
-                assert_eq!(att.entrypoint, Some("cli".to_string()));
-            }
-            other => panic!("Expected DeferredToolsDelta, got {:?}", other),
-        },
-        other => panic!("Expected Attachment, got {:?}", other),
-    }
+    let att = parse_attachment_line(json);
+    assert_eq!(att.entrypoint, Some("cli".to_string()));
+    let AttachmentData::DeferredToolsDelta(delta) = att.attachment else {
+        panic!("Expected DeferredToolsDelta");
+    };
+    assert_eq!(delta.added_names, vec!["WebFetch", "WebSearch"]);
+    assert!(delta.readded_names.is_empty());
+    assert!(delta.pending_mcp_servers.is_empty());
 }
 
 #[test]
@@ -7764,21 +7767,15 @@ fn test_parse_attachment_read_truncation_notice() {
         "gitBranch": "HEAD"
     });
 
-    let line: LogLine = serde_json::from_value(json).expect("Should parse read_truncation_notice");
-    match line {
-        LogLine::Attachment(attachment) => match attachment.attachment {
-            AttachmentData::ReadTruncationNotice(notice) => {
-                assert_eq!(notice.banner, expected_banner);
-                assert_eq!(notice.tool_use_id, "toolu_01At3K4pi5v6Ejx6tDDzghPy");
+    let AttachmentData::ReadTruncationNotice(notice) = parse_attachment(json) else {
+        panic!("Expected ReadTruncationNotice");
+    };
+    assert_eq!(notice.banner, expected_banner);
+    assert_eq!(notice.tool_use_id, "toolu_01At3K4pi5v6Ejx6tDDzghPy");
 
-                let serialized = serde_json::to_value(notice).expect("Should serialize notice");
-                assert_eq!(serialized["toolUseID"], "toolu_01At3K4pi5v6Ejx6tDDzghPy");
-                assert!(serialized.get("toolUseId").is_none());
-            }
-            other => panic!("Expected ReadTruncationNotice, got {other:?}"),
-        },
-        other => panic!("Expected Attachment, got {other:?}"),
-    }
+    let serialized = serde_json::to_value(notice).expect("Should serialize notice");
+    assert_eq!(serialized["toolUseID"], "toolu_01At3K4pi5v6Ejx6tDDzghPy");
+    assert!(serialized.get("toolUseId").is_none());
 }
 
 #[test]
@@ -7823,23 +7820,17 @@ fn test_parse_attachment_agent_listing_delta() {
         "gitBranch": "main",
         "slug": null
     });
-    let log_line: LogLine = serde_json::from_value(json).unwrap();
-    match log_line {
-        LogLine::Attachment(att) => match att.attachment {
-            AttachmentData::AgentListingDelta(delta) => {
-                assert_eq!(delta.added_types, vec!["claude", "Explore"]);
-                assert_eq!(
-                    delta.added_lines,
-                    vec!["- claude: catch-all", "- Explore: read-only search"]
-                );
-                assert!(delta.removed_types.is_empty());
-                assert!(delta.is_initial);
-                assert!(delta.show_concurrency_note);
-            }
-            other => panic!("Expected AgentListingDelta, got {:?}", other),
-        },
-        other => panic!("Expected Attachment, got {:?}", other),
-    }
+    let AttachmentData::AgentListingDelta(delta) = parse_attachment(json) else {
+        panic!("Expected AgentListingDelta");
+    };
+    assert_eq!(delta.added_types, vec!["claude", "Explore"]);
+    assert_eq!(
+        delta.added_lines,
+        vec!["- claude: catch-all", "- Explore: read-only search"]
+    );
+    assert!(delta.removed_types.is_empty());
+    assert!(delta.is_initial);
+    assert!(delta.show_concurrency_note);
 }
 
 #[test]
@@ -7866,20 +7857,14 @@ fn test_parse_attachment_agent_listing_delta_non_initial() {
         "gitBranch": "main",
         "slug": null
     });
-    let log_line: LogLine = serde_json::from_value(json).unwrap();
-    match log_line {
-        LogLine::Attachment(att) => match att.attachment {
-            AttachmentData::AgentListingDelta(delta) => {
-                assert_eq!(delta.added_types, vec!["new-agent"]);
-                assert_eq!(delta.added_lines, vec!["- new-agent: added mid-session"]);
-                assert_eq!(delta.removed_types, vec!["old-agent"]);
-                assert!(!delta.is_initial);
-                assert!(!delta.show_concurrency_note);
-            }
-            other => panic!("Expected AgentListingDelta, got {:?}", other),
-        },
-        other => panic!("Expected Attachment, got {:?}", other),
-    }
+    let AttachmentData::AgentListingDelta(delta) = parse_attachment(json) else {
+        panic!("Expected AgentListingDelta");
+    };
+    assert_eq!(delta.added_types, vec!["new-agent"]);
+    assert_eq!(delta.added_lines, vec!["- new-agent: added mid-session"]);
+    assert_eq!(delta.removed_types, vec!["old-agent"]);
+    assert!(!delta.is_initial);
+    assert!(!delta.show_concurrency_note);
 }
 
 #[test]
@@ -7941,20 +7926,14 @@ fn test_parse_attachment_deferred_tools_delta_with_readded_and_pending() {
         "gitBranch": "main",
         "slug": null
     });
-    let log_line: LogLine = serde_json::from_value(json).unwrap();
-    match log_line {
-        LogLine::Attachment(att) => match att.attachment {
-            AttachmentData::DeferredToolsDelta(delta) => {
-                assert_eq!(delta.removed_names, vec!["OldTool"]);
-                assert_eq!(delta.readded_names, vec!["PreviouslyRemoved"]);
-                assert_eq!(delta.pending_mcp_servers, vec!["server-a", "server-b"]);
-                assert_eq!(delta.failed_mcp_servers, vec!["server-c"]);
-                assert_eq!(delta.wire_hidden_names, vec!["HiddenTool"]);
-            }
-            other => panic!("Expected DeferredToolsDelta, got {:?}", other),
-        },
-        other => panic!("Expected Attachment, got {:?}", other),
-    }
+    let AttachmentData::DeferredToolsDelta(delta) = parse_attachment(json) else {
+        panic!("Expected DeferredToolsDelta");
+    };
+    assert_eq!(delta.removed_names, vec!["OldTool"]);
+    assert_eq!(delta.readded_names, vec!["PreviouslyRemoved"]);
+    assert_eq!(delta.pending_mcp_servers, vec!["server-a", "server-b"]);
+    assert_eq!(delta.failed_mcp_servers, vec!["server-c"]);
+    assert_eq!(delta.wire_hidden_names, vec!["HiddenTool"]);
 }
 
 #[test]
@@ -7989,28 +7968,21 @@ fn test_parse_attachment_file() {
         "gitBranch": "main",
         "slug": null
     });
-    let log_line: LogLine = serde_json::from_value(json).unwrap();
-    match log_line {
-        LogLine::Attachment(att) => {
-            assert_eq!(att.agent_id, Some("agent-1".to_string()));
-            match att.attachment {
-                AttachmentData::File(file) => {
-                    assert_eq!(file.filename, "/abs/path/to/file.md");
-                    assert_eq!(file.display_path, "to/file.md");
-                    let FileAttachmentContent::Text { file: body } = file.content else {
-                        panic!("Expected Text content");
-                    };
-                    assert_eq!(body.file_path, "/abs/path/to/file.md");
-                    assert_eq!(body.content, "hello");
-                    assert_eq!(body.num_lines, 1);
-                    assert_eq!(body.start_line, 1);
-                    assert_eq!(body.total_lines, 1);
-                }
-                other => panic!("Expected File attachment, got {:?}", other),
-            }
-        }
-        other => panic!("Expected Attachment, got {:?}", other),
-    }
+    let att = parse_attachment_line(json);
+    assert_eq!(att.agent_id, Some("agent-1".to_string()));
+    let AttachmentData::File(file) = att.attachment else {
+        panic!("Expected File attachment");
+    };
+    assert_eq!(file.filename, "/abs/path/to/file.md");
+    assert_eq!(file.display_path, "to/file.md");
+    let FileAttachmentContent::Text { file: body } = file.content else {
+        panic!("Expected Text content");
+    };
+    assert_eq!(body.file_path, "/abs/path/to/file.md");
+    assert_eq!(body.content, "hello");
+    assert_eq!(body.num_lines, 1);
+    assert_eq!(body.start_line, 1);
+    assert_eq!(body.total_lines, 1);
 }
 
 #[test]
@@ -8048,27 +8020,21 @@ fn test_parse_attachment_image_file() {
         "gitBranch": "HEAD",
         "slug": "happy-doodling-moonbeam"
     });
-    let log_line: LogLine = serde_json::from_value(json).unwrap();
-    match log_line {
-        LogLine::Attachment(att) => match att.attachment {
-            AttachmentData::File(file) => {
-                assert_eq!(file.filename, "/abs/path/call_starts.png");
-                assert_eq!(file.display_path, "call_starts.png");
-                let FileAttachmentContent::Image { file: body } = file.content else {
-                    panic!("Expected Image content");
-                };
-                assert_eq!(body.base64, "iVBORw0KGgo=");
-                assert_eq!(body.r#type, "image/png");
-                assert_eq!(body.original_size, 95245);
-                assert_eq!(body.dimensions.original_width, 1606);
-                assert_eq!(body.dimensions.original_height, 588);
-                assert_eq!(body.dimensions.display_width, 803);
-                assert_eq!(body.dimensions.display_height, 294);
-            }
-            other => panic!("Expected File attachment, got {:?}", other),
-        },
-        other => panic!("Expected Attachment, got {:?}", other),
-    }
+    let AttachmentData::File(file) = parse_attachment(json) else {
+        panic!("Expected File attachment");
+    };
+    assert_eq!(file.filename, "/abs/path/call_starts.png");
+    assert_eq!(file.display_path, "call_starts.png");
+    let FileAttachmentContent::Image { file: body } = file.content else {
+        panic!("Expected Image content");
+    };
+    assert_eq!(body.base64, "iVBORw0KGgo=");
+    assert_eq!(body.r#type, "image/png");
+    assert_eq!(body.original_size, 95245);
+    assert_eq!(body.dimensions.original_width, 1606);
+    assert_eq!(body.dimensions.original_height, 588);
+    assert_eq!(body.dimensions.display_width, 803);
+    assert_eq!(body.dimensions.display_height, 294);
 }
 
 #[test]
@@ -8154,24 +8120,17 @@ fn test_parse_attachment_nested_memory() {
         "gitBranch": "main",
         "slug": null
     });
-    let log_line: LogLine = serde_json::from_value(json).unwrap();
-    match log_line {
-        LogLine::Attachment(att) => {
-            assert_eq!(att.agent_id, None);
-            match att.attachment {
-                AttachmentData::NestedMemory(memory) => {
-                    assert_eq!(memory.path, "/abs/CLAUDE.md");
-                    assert_eq!(memory.display_path, "CLAUDE.md");
-                    assert_eq!(memory.content.r#type, "Project");
-                    assert_eq!(memory.content.content, "# Hello");
-                    assert!(!memory.content.content_differs_from_disk);
-                    assert_eq!(memory.content.raw_content, None);
-                }
-                other => panic!("Expected NestedMemory attachment, got {:?}", other),
-            }
-        }
-        other => panic!("Expected Attachment, got {:?}", other),
-    }
+    let att = parse_attachment_line(json);
+    assert_eq!(att.agent_id, None);
+    let AttachmentData::NestedMemory(memory) = att.attachment else {
+        panic!("Expected NestedMemory attachment");
+    };
+    assert_eq!(memory.path, "/abs/CLAUDE.md");
+    assert_eq!(memory.display_path, "CLAUDE.md");
+    assert_eq!(memory.content.r#type, "Project");
+    assert_eq!(memory.content.content, "# Hello");
+    assert!(!memory.content.content_differs_from_disk);
+    assert_eq!(memory.content.raw_content, None);
 }
 
 #[test]
@@ -8196,18 +8155,12 @@ fn test_parse_attachment_directory() {
         "gitBranch": "main",
         "slug": null
     });
-    let log_line: LogLine = serde_json::from_value(json).unwrap();
-    match log_line {
-        LogLine::Attachment(att) => match att.attachment {
-            AttachmentData::Directory(dir) => {
-                assert_eq!(dir.path, "/Users/brendan/src/project");
-                assert_eq!(dir.content, "src\nCargo.toml\nREADME.md");
-                assert_eq!(dir.display_path, "project");
-            }
-            other => panic!("Expected Directory attachment, got {:?}", other),
-        },
-        other => panic!("Expected Attachment, got {:?}", other),
-    }
+    let AttachmentData::Directory(dir) = parse_attachment(json) else {
+        panic!("Expected Directory attachment");
+    };
+    assert_eq!(dir.path, "/Users/brendan/src/project");
+    assert_eq!(dir.content, "src\nCargo.toml\nREADME.md");
+    assert_eq!(dir.display_path, "project");
 }
 
 #[test]
@@ -8231,20 +8184,14 @@ fn test_parse_attachment_compact_file_reference() {
         "gitBranch": "HEAD",
         "slug": "synchronous-sparking-scone"
     });
-    let log_line: LogLine = serde_json::from_value(json).unwrap();
-    match log_line {
-        LogLine::Attachment(att) => match att.attachment {
-            AttachmentData::CompactFileReference(file_ref) => {
-                assert_eq!(
-                    file_ref.filename,
-                    "/Users/brendan/src/moriarty/crates/moriarty/src/hooks/tests.rs"
-                );
-                assert_eq!(file_ref.display_path, "crates/moriarty/src/hooks/tests.rs");
-            }
-            other => panic!("Expected CompactFileReference attachment, got {:?}", other),
-        },
-        other => panic!("Expected Attachment, got {:?}", other),
-    }
+    let AttachmentData::CompactFileReference(file_ref) = parse_attachment(json) else {
+        panic!("Expected CompactFileReference attachment");
+    };
+    assert_eq!(
+        file_ref.filename,
+        "/Users/brendan/src/moriarty/crates/moriarty/src/hooks/tests.rs"
+    );
+    assert_eq!(file_ref.display_path, "crates/moriarty/src/hooks/tests.rs");
 }
 
 #[test]
@@ -8288,24 +8235,18 @@ fn test_parse_attachment_context_tip() {
         "version": "2.1.197",
         "gitBranch": "main"
     });
-    let log_line: LogLine = serde_json::from_value(json).unwrap();
-    match log_line {
-        LogLine::Attachment(att) => match att.attachment {
-            AttachmentData::ContextTip(tip) => {
-                assert_eq!(
-                    tip.tip.tip,
-                    "You're searching across multiple directories outside your working directory. You can grant Claude access to those paths with /add-dir so you don't have to manually search — just read the file directly"
-                );
-                assert_eq!(tip.tip.feature_id, "outside-working-dir");
-                assert_eq!(
-                    tip.tip.action.as_deref(),
-                    Some("/add-dir /Users/brendan/src/h2/h2-root-auth")
-                );
-            }
-            other => panic!("Expected ContextTip attachment, got {:?}", other),
-        },
-        other => panic!("Expected Attachment, got {:?}", other),
-    }
+    let AttachmentData::ContextTip(tip) = parse_attachment(json) else {
+        panic!("Expected ContextTip attachment");
+    };
+    assert_eq!(
+        tip.tip.tip,
+        "You're searching across multiple directories outside your working directory. You can grant Claude access to those paths with /add-dir so you don't have to manually search — just read the file directly"
+    );
+    assert_eq!(tip.tip.feature_id, "outside-working-dir");
+    assert_eq!(
+        tip.tip.action.as_deref(),
+        Some("/add-dir /Users/brendan/src/h2/h2-root-auth")
+    );
 }
 
 #[test]
@@ -8369,23 +8310,17 @@ fn test_parse_attachment_plan_file_reference() {
         "gitBranch": "HEAD",
         "slug": "example-plan"
     });
-    let log_line: LogLine = serde_json::from_value(json).unwrap();
-    match log_line {
-        LogLine::Attachment(att) => match att.attachment {
-            AttachmentData::PlanFileReference(plan_ref) => {
-                assert_eq!(
-                    plan_ref.plan_file_path,
-                    "/Users/test/.claude/plans/example-plan.md"
-                );
-                assert_eq!(
-                    plan_ref.plan_content,
-                    "# Plan: Example feature\n\n## Context\n\nDo the thing.\n"
-                );
-            }
-            other => panic!("Expected PlanFileReference attachment, got {:?}", other),
-        },
-        other => panic!("Expected Attachment, got {:?}", other),
-    }
+    let AttachmentData::PlanFileReference(plan_ref) = parse_attachment(json) else {
+        panic!("Expected PlanFileReference attachment");
+    };
+    assert_eq!(
+        plan_ref.plan_file_path,
+        "/Users/test/.claude/plans/example-plan.md"
+    );
+    assert_eq!(
+        plan_ref.plan_content,
+        "# Plan: Example feature\n\n## Context\n\nDo the thing.\n"
+    );
 }
 
 #[test]
@@ -8460,18 +8395,12 @@ fn test_parse_attachment_skill_listing_with_names() {
         "gitBranch": "main",
         "slug": null
     });
-    let log_line: LogLine = serde_json::from_value(json).unwrap();
-    match log_line {
-        LogLine::Attachment(att) => match att.attachment {
-            AttachmentData::SkillListing(listing) => {
-                assert_eq!(listing.skill_count, 2);
-                assert!(listing.is_initial);
-                assert_eq!(listing.names, Some(vec!["a".to_string(), "b".to_string()]));
-            }
-            other => panic!("Expected SkillListing attachment, got {:?}", other),
-        },
-        other => panic!("Expected Attachment, got {:?}", other),
-    }
+    let AttachmentData::SkillListing(listing) = parse_attachment(json) else {
+        panic!("Expected SkillListing attachment");
+    };
+    assert_eq!(listing.skill_count, 2);
+    assert!(listing.is_initial);
+    assert_eq!(listing.names, Some(vec!["a".to_string(), "b".to_string()]));
 }
 
 // Older Claude Code logs emit `skill_listing` without `names`; the field must stay optional so those
@@ -8498,17 +8427,11 @@ fn test_parse_attachment_skill_listing_without_names() {
         "gitBranch": "main",
         "slug": null
     });
-    let log_line: LogLine = serde_json::from_value(json).unwrap();
-    match log_line {
-        LogLine::Attachment(att) => match att.attachment {
-            AttachmentData::SkillListing(listing) => {
-                assert_eq!(listing.skill_count, 1);
-                assert_eq!(listing.names, None);
-            }
-            other => panic!("Expected SkillListing attachment, got {:?}", other),
-        },
-        other => panic!("Expected Attachment, got {:?}", other),
-    }
+    let AttachmentData::SkillListing(listing) = parse_attachment(json) else {
+        panic!("Expected SkillListing attachment");
+    };
+    assert_eq!(listing.skill_count, 1);
+    assert_eq!(listing.names, None);
 }
 
 #[test]
@@ -8535,22 +8458,17 @@ fn test_parse_attachment_invoked_skills() {
         "gitBranch": "HEAD",
         "slug": "elegant-yawning-steele"
     });
-    let log_line: LogLine = serde_json::from_value(json).unwrap();
-    match log_line {
-        LogLine::Attachment(att) => match att.attachment {
-            AttachmentData::InvokedSkills(invoked) => {
-                assert_eq!(invoked.skills.len(), 1);
-                assert_eq!(invoked.skills[0].name, "code-review");
-                assert_eq!(invoked.skills[0].path, "userSettings:code-review");
-                assert_eq!(
-                    invoked.skills[0].content,
-                    "The following is feedback from a code review"
-                );
-            }
-            other => panic!("Expected InvokedSkills attachment, got {:?}", other),
-        },
-        other => panic!("Expected Attachment, got {:?}", other),
-    }
+    let AttachmentData::InvokedSkills(invoked) = parse_attachment(json) else {
+        panic!("Expected InvokedSkills attachment");
+    };
+    assert_eq!(
+        invoked.skills,
+        vec![InvokedSkill {
+            name: "code-review".to_string(),
+            path: "userSettings:code-review".to_string(),
+            content: "The following is feedback from a code review".to_string(),
+        }]
+    );
 }
 
 // A turn can record zero invoked skills, so an empty `skills` array must parse cleanly.
@@ -8574,14 +8492,10 @@ fn test_parse_attachment_invoked_skills_empty() {
         "gitBranch": "HEAD",
         "slug": null
     });
-    let log_line: LogLine = serde_json::from_value(json).unwrap();
-    match log_line {
-        LogLine::Attachment(att) => match att.attachment {
-            AttachmentData::InvokedSkills(invoked) => assert!(invoked.skills.is_empty()),
-            other => panic!("Expected InvokedSkills attachment, got {:?}", other),
-        },
-        other => panic!("Expected Attachment, got {:?}", other),
-    }
+    let AttachmentData::InvokedSkills(invoked) = parse_attachment(json) else {
+        panic!("Expected InvokedSkills attachment");
+    };
+    assert!(invoked.skills.is_empty());
 }
 
 // `deny_unknown_fields` on the outer `InvokedSkills` envelope is a separate code path from the
@@ -8760,20 +8674,14 @@ fn test_parse_attachment_nested_memory_with_raw_content() {
         "gitBranch": "main",
         "slug": null
     });
-    let log_line: LogLine = serde_json::from_value(json).unwrap();
-    match log_line {
-        LogLine::Attachment(att) => match att.attachment {
-            AttachmentData::NestedMemory(memory) => {
-                assert!(memory.content.content_differs_from_disk);
-                assert_eq!(
-                    memory.content.raw_content.as_deref(),
-                    Some("<!-- template -->\n# Processed")
-                );
-            }
-            other => panic!("Expected NestedMemory attachment, got {:?}", other),
-        },
-        other => panic!("Expected Attachment, got {:?}", other),
-    }
+    let AttachmentData::NestedMemory(memory) = parse_attachment(json) else {
+        panic!("Expected NestedMemory attachment");
+    };
+    assert!(memory.content.content_differs_from_disk);
+    assert_eq!(
+        memory.content.raw_content.as_deref(),
+        Some("<!-- template -->\n# Processed")
+    );
 }
 
 #[test]
@@ -8805,17 +8713,11 @@ fn test_parse_attachment_nested_memory_content_differs_without_raw_content() {
         "gitBranch": "main",
         "slug": null
     });
-    let log_line: LogLine = serde_json::from_value(json).unwrap();
-    match log_line {
-        LogLine::Attachment(att) => match att.attachment {
-            AttachmentData::NestedMemory(memory) => {
-                assert!(memory.content.content_differs_from_disk);
-                assert_eq!(memory.content.raw_content, None);
-            }
-            other => panic!("Expected NestedMemory attachment, got {:?}", other),
-        },
-        other => panic!("Expected Attachment, got {:?}", other),
-    }
+    let AttachmentData::NestedMemory(memory) = parse_attachment(json) else {
+        panic!("Expected NestedMemory attachment");
+    };
+    assert!(memory.content.content_differs_from_disk);
+    assert_eq!(memory.content.raw_content, None);
 }
 
 #[test]
@@ -9521,19 +9423,12 @@ fn test_parse_attachment_hook_success() {
         "version": "2.1.104",
         "gitBranch": "main"
     });
-    let log_line: LogLine = serde_json::from_value(json).unwrap();
-    match log_line {
-        LogLine::Attachment(att) => {
-            if let AttachmentData::HookSuccess(hook) = &att.attachment {
-                assert_eq!(hook.hook_name, "PreToolUse:Bash");
-                assert_eq!(hook.exit_code, 0);
-                assert_eq!(hook.duration_ms, 30);
-            } else {
-                panic!("Expected HookSuccess, got {:?}", att.attachment);
-            }
-        }
-        other => panic!("Expected Attachment, got {:?}", other),
-    }
+    let AttachmentData::HookSuccess(hook) = parse_attachment(json) else {
+        panic!("Expected HookSuccess");
+    };
+    assert_eq!(hook.hook_name, "PreToolUse:Bash");
+    assert_eq!(hook.exit_code, 0);
+    assert_eq!(hook.duration_ms, 30);
 }
 
 #[test]
@@ -9556,19 +9451,12 @@ fn test_parse_attachment_hook_permission_decision() {
         "version": "2.1.141",
         "gitBranch": "HEAD"
     });
-    let log_line: LogLine = serde_json::from_value(json).unwrap();
-    match log_line {
-        LogLine::Attachment(att) => {
-            if let AttachmentData::HookPermissionDecision(hook) = &att.attachment {
-                assert_eq!(hook.decision, PermissionDecisionKind::Allow);
-                assert_eq!(hook.tool_use_id, "toolu_01CF2aDiUqw4Q9vvgSncRUz6");
-                assert_eq!(hook.hook_event, "PermissionRequest");
-            } else {
-                panic!("Expected HookPermissionDecision, got {:?}", att.attachment);
-            }
-        }
-        other => panic!("Expected Attachment, got {:?}", other),
-    }
+    let AttachmentData::HookPermissionDecision(hook) = parse_attachment(json) else {
+        panic!("Expected HookPermissionDecision");
+    };
+    assert_eq!(hook.decision, PermissionDecisionKind::Allow);
+    assert_eq!(hook.tool_use_id, "toolu_01CF2aDiUqw4Q9vvgSncRUz6");
+    assert_eq!(hook.hook_event, "PermissionRequest");
 }
 
 fn hook_permission_decision_envelope(attachment: serde_json::Value) -> serde_json::Value {
@@ -9595,16 +9483,10 @@ fn test_parse_attachment_hook_permission_decision_deny() {
         "toolUseID": "toolu_deny",
         "hookEvent": "PermissionRequest"
     }));
-    let log_line: LogLine = serde_json::from_value(json).unwrap();
-    match log_line {
-        LogLine::Attachment(att) => match &att.attachment {
-            AttachmentData::HookPermissionDecision(hook) => {
-                assert_eq!(hook.decision, PermissionDecisionKind::Deny);
-            }
-            other => panic!("Expected HookPermissionDecision, got {:?}", other),
-        },
-        other => panic!("Expected Attachment, got {:?}", other),
-    }
+    let AttachmentData::HookPermissionDecision(hook) = parse_attachment(json) else {
+        panic!("Expected HookPermissionDecision");
+    };
+    assert_eq!(hook.decision, PermissionDecisionKind::Deny);
 }
 
 #[test]
@@ -9615,16 +9497,10 @@ fn test_parse_attachment_hook_permission_decision_ask() {
         "toolUseID": "toolu_ask",
         "hookEvent": "PermissionRequest"
     }));
-    let log_line: LogLine = serde_json::from_value(json).unwrap();
-    match log_line {
-        LogLine::Attachment(att) => match &att.attachment {
-            AttachmentData::HookPermissionDecision(hook) => {
-                assert_eq!(hook.decision, PermissionDecisionKind::Ask);
-            }
-            other => panic!("Expected HookPermissionDecision, got {:?}", other),
-        },
-        other => panic!("Expected Attachment, got {:?}", other),
-    }
+    let AttachmentData::HookPermissionDecision(hook) = parse_attachment(json) else {
+        panic!("Expected HookPermissionDecision");
+    };
+    assert_eq!(hook.decision, PermissionDecisionKind::Ask);
 }
 
 #[test]
@@ -9683,13 +9559,10 @@ fn test_parse_attachment_plan_mode() {
         "version": "2.1.104",
         "gitBranch": "main"
     });
-    let log_line: LogLine = serde_json::from_value(json).unwrap();
-    match log_line {
-        LogLine::Attachment(att) => {
-            assert!(matches!(att.attachment, AttachmentData::PlanMode(_)));
-        }
-        other => panic!("Expected Attachment, got {:?}", other),
-    }
+    assert!(matches!(
+        parse_attachment(json),
+        AttachmentData::PlanMode(_)
+    ));
 }
 
 #[test]
@@ -9719,18 +9592,11 @@ fn test_parse_attachment_task_reminder() {
         "version": "2.1.104",
         "gitBranch": "main"
     });
-    let log_line: LogLine = serde_json::from_value(json).unwrap();
-    match log_line {
-        LogLine::Attachment(att) => {
-            if let AttachmentData::TaskReminder(reminder) = &att.attachment {
-                assert_eq!(reminder.item_count, 1);
-                assert_eq!(reminder.content[0].subject, "Fix bug");
-            } else {
-                panic!("Expected TaskReminder, got {:?}", att.attachment);
-            }
-        }
-        other => panic!("Expected Attachment, got {:?}", other),
-    }
+    let AttachmentData::TaskReminder(reminder) = parse_attachment(json) else {
+        panic!("Expected TaskReminder");
+    };
+    assert_eq!(reminder.item_count, 1);
+    assert_eq!(reminder.content[0].subject, "Fix bug");
 }
 
 #[test]
@@ -9759,17 +9625,10 @@ fn test_parse_attachment_task_reminder_without_active_form() {
         "version": "2.1.104",
         "gitBranch": "main"
     });
-    let log_line: LogLine = serde_json::from_value(json).unwrap();
-    match log_line {
-        LogLine::Attachment(att) => {
-            if let AttachmentData::TaskReminder(reminder) = &att.attachment {
-                assert_eq!(reminder.content[0].active_form, None);
-            } else {
-                panic!("Expected TaskReminder, got {:?}", att.attachment);
-            }
-        }
-        other => panic!("Expected Attachment, got {:?}", other),
-    }
+    let AttachmentData::TaskReminder(reminder) = parse_attachment(json) else {
+        panic!("Expected TaskReminder");
+    };
+    assert_eq!(reminder.content[0].active_form, None);
 }
 
 // `task_status` attachment (Claude Code 2.1.214+) tracks a spawned background agent's progress.
@@ -9796,19 +9655,12 @@ fn test_parse_attachment_task_status() {
         "version": "2.1.214",
         "gitBranch": "HEAD"
     });
-    let log_line: LogLine = serde_json::from_value(json).unwrap();
-    match log_line {
-        LogLine::Attachment(att) => {
-            if let AttachmentData::TaskStatus(task) = &att.attachment {
-                assert_eq!(task.task_id, "a1155314b8a6f5c42");
-                assert_eq!(task.task_type, "local_agent");
-                assert_eq!(task.status, "running");
-            } else {
-                panic!("Expected TaskStatus, got {:?}", att.attachment);
-            }
-        }
-        other => panic!("Expected Attachment, got {:?}", other),
-    }
+    let AttachmentData::TaskStatus(task) = parse_attachment(json) else {
+        panic!("Expected TaskStatus");
+    };
+    assert_eq!(task.task_id, "a1155314b8a6f5c42");
+    assert_eq!(task.task_type, "local_agent");
+    assert_eq!(task.status, "running");
 }
 
 #[test]
@@ -9866,20 +9718,321 @@ fn test_parse_attachment_total_tokens_reminder() {
         "version": "2.1.226",
         "gitBranch": "HEAD"
     });
-    let log_line: LogLine = serde_json::from_value(json).unwrap();
-    match log_line {
-        LogLine::Attachment(att) => {
-            if let AttachmentData::TotalTokensReminder(reminder) = &att.attachment {
-                assert_eq!(
-                    reminder.text,
-                    "<total_tokens>15000000 tokens left</total_tokens>"
-                );
-            } else {
-                panic!("Expected TotalTokensReminder, got {:?}", att.attachment);
-            }
-        }
-        other => panic!("Expected Attachment, got {:?}", other),
+    let AttachmentData::TotalTokensReminder(reminder) = parse_attachment(json) else {
+        panic!("Expected TotalTokensReminder");
+    };
+    assert_eq!(
+        reminder.text,
+        "<total_tokens>15000000 tokens left</total_tokens>"
+    );
+}
+
+// `prompt_snapshot` attachment (Claude Code 2.1.257+) records the system prompt blocks and tool
+// roster a turn was sent with.
+#[test]
+fn test_parse_attachment_prompt_snapshot() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": null,
+        "isSidechain": false,
+        "attachment": {
+            "type": "prompt_snapshot",
+            "systemPrompt": ["You are Claude Code.", "# Harness"],
+            "tools": [{"name": "Read", "description": "Reads a file."}]
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440000",
+        "timestamp": "2026-09-08T23:10:33.580Z",
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.257",
+        "gitBranch": "HEAD"
+    });
+    let AttachmentData::PromptSnapshot(snapshot) = parse_attachment(json) else {
+        panic!("Expected PromptSnapshot");
+    };
+    assert_eq!(
+        snapshot.system_prompt,
+        vec!["You are Claude Code.".to_string(), "# Harness".to_string()]
+    );
+    assert_eq!(
+        snapshot.tools,
+        Some(vec![PromptSnapshotTool {
+            name: "Read".to_string(),
+            description: "Reads a file.".to_string(),
+        }])
+    );
+}
+
+// Snapshots that omit the tool roster entirely still parse.
+#[test]
+fn test_parse_attachment_prompt_snapshot_without_tools() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": null,
+        "isSidechain": false,
+        "attachment": {
+            "type": "prompt_snapshot",
+            "systemPrompt": ["You are Claude Code."]
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440000",
+        "timestamp": "2026-09-08T23:10:33.580Z",
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.257",
+        "gitBranch": "HEAD"
+    });
+    let AttachmentData::PromptSnapshot(snapshot) = parse_attachment(json) else {
+        panic!("Expected PromptSnapshot");
+    };
+    assert_eq!(snapshot.tools, None);
+}
+
+fn date_attachment_line(changed: Option<bool>) -> serde_json::Value {
+    let mut attachment = serde_json::json!({
+        "type": "date",
+        "date": "2026-09-08"
+    });
+    if let Some(changed) = changed {
+        attachment["changed"] = changed.into();
     }
+    serde_json::json!({
+        "type": "attachment",
+        "parentUuid": null,
+        "isSidechain": false,
+        "attachment": attachment,
+        "uuid": "550e8400-e29b-41d4-a716-446655440000",
+        "timestamp": "2026-09-08T23:10:33.580Z",
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.257",
+        "gitBranch": "HEAD"
+    })
+}
+
+// `date` attachment (Claude Code 2.1.257+) states the current date in a turn's context; unlike
+// `date_change` it is not a rollover marker.
+#[test]
+fn test_parse_attachment_date() {
+    assert_eq!(
+        parse_attachment(date_attachment_line(Some(true))),
+        AttachmentData::Date(DateAttachment {
+            date: NaiveDate::from_ymd_opt(2026, 9, 8).unwrap(),
+            changed: Some(true),
+        })
+    );
+}
+
+// Records predating the `changed` field still parse.
+#[test]
+fn test_parse_attachment_date_without_changed() {
+    assert_eq!(
+        parse_attachment(date_attachment_line(None)),
+        AttachmentData::Date(DateAttachment {
+            date: NaiveDate::from_ymd_opt(2026, 9, 8).unwrap(),
+            changed: None,
+        })
+    );
+}
+
+// `model` attachment (Claude Code 2.1.257+) records the model-identity blurb injected into a turn.
+#[test]
+fn test_parse_attachment_model() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": "db33bae6-dbb2-479a-a46f-716416615aa2",
+        "isSidechain": false,
+        "attachment": {
+            "type": "model",
+            "identity": {
+                "modelId": "claude-opus-5",
+                "marketingName": "Opus 5",
+                "knowledgeCutoff": "May 2026"
+            },
+            "text": "You are powered by the model named Opus 5."
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440000",
+        "timestamp": "2026-09-08T23:10:33.580Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.257",
+        "gitBranch": "HEAD"
+    });
+    let AttachmentData::Model(model) = parse_attachment(json) else {
+        panic!("Expected Model");
+    };
+    assert_eq!(model.identity.model_id.family, crate::ModelFamily::Opus);
+    assert_eq!(model.identity.model_id.version.expect("version").major, 5);
+    assert_eq!(model.identity.marketing_name, "Opus 5");
+    assert_eq!(model.identity.knowledge_cutoff, "May 2026");
+    assert_eq!(model.text, "You are powered by the model named Opus 5.");
+}
+
+// `session_context` attachment (Claude Code 2.1.257+) carries the pre-rendered session context.
+#[test]
+fn test_parse_attachment_session_context() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": "db33bae6-dbb2-479a-a46f-716416615aa2",
+        "isSidechain": true,
+        "agentId": "a57e74c94d7a65863",
+        "attachment": {
+            "type": "session_context",
+            "context": {
+                "userEmail": "The user's email address is brendan@syllable.ai.",
+                "gitStatus": "Current branch: HEAD"
+            }
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440000",
+        "timestamp": "2026-09-08T23:10:33.580Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.257",
+        "gitBranch": "HEAD"
+    });
+    assert_eq!(
+        parse_attachment(json),
+        AttachmentData::SessionContext(SessionContext {
+            context: SessionContextEntries {
+                user_email: "The user's email address is brendan@syllable.ai.".to_string(),
+                git_status: "Current branch: HEAD".to_string(),
+            }
+        })
+    );
+}
+
+// `environment` attachment (Claude Code 2.1.257+) records the environment description injected
+// into a turn.
+#[test]
+fn test_parse_attachment_environment() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": "a949cf72-3568-4846-babc-5dd05ac6da84",
+        "isSidechain": false,
+        "attachment": {
+            "type": "environment",
+            "snapshot": {
+                "workingDirectory": "/Users/brendan/src/h2/h2-iac",
+                "isWorktree": false,
+                "isGitRepo": true,
+                "additionalWorkingDirectories": ["/Users/brendan/src/h2/other"],
+                "platform": "darwin",
+                "shell": "bash",
+                "osVersion": "Darwin 25.5.0",
+                "scratchpadDirectory": "/private/tmp/claude-501/scratchpad"
+            }
+        },
+        "uuid": "9afab302-0832-40df-9764-be357ce3659e",
+        "timestamp": "2026-09-08T23:10:33.580Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/Users/brendan/src/h2/h2-iac",
+        "sessionId": "44286351-68c4-4453-befa-bde800b6e9b1",
+        "version": "2.1.257",
+        "gitBranch": "HEAD"
+    });
+    assert_eq!(
+        parse_attachment(json),
+        AttachmentData::Environment(EnvironmentAttachment {
+            snapshot: EnvironmentSnapshot {
+                working_directory: "/Users/brendan/src/h2/h2-iac".to_string(),
+                is_worktree: false,
+                is_git_repo: true,
+                additional_working_directories: vec!["/Users/brendan/src/h2/other".to_string()],
+                platform: "darwin".to_string(),
+                shell: "bash".to_string(),
+                os_version: "Darwin 25.5.0".to_string(),
+                scratchpad_directory: "/private/tmp/claude-501/scratchpad".to_string(),
+            }
+        })
+    );
+}
+
+// `instructions` attachment (Claude Code 2.1.257+) carries the CLAUDE.md files and auto-memory
+// index loaded into a turn's context.
+#[test]
+fn test_parse_attachment_instructions() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": "a949cf72-3568-4846-babc-5dd05ac6da84",
+        "isSidechain": true,
+        "agentId": "a36576a57ce2095a2",
+        "attachment": {
+            "type": "instructions",
+            "files": [
+                {"path": "/Users/brendan/.claude/CLAUDE.md", "type": "User", "content": "# AGENTS.md"},
+                {"path": "/Users/brendan/src/h2/h2-iac/CLAUDE.md", "type": "Project", "content": "# CLAUDE.md"},
+                {"path": "/Users/brendan/.claude/projects/x/memory/MEMORY.md", "type": "AutoMem", "content": "# Memory index"}
+            ]
+        },
+        "uuid": "062604ef-63ba-4653-99c4-51b0c33106d4",
+        "timestamp": "2026-09-08T23:12:20.404Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/Users/brendan/src/h2/h2-iac",
+        "sessionId": "44286351-68c4-4453-befa-bde800b6e9b1",
+        "version": "2.1.257",
+        "gitBranch": "HEAD"
+    });
+    let AttachmentData::Instructions(instructions) = parse_attachment(json) else {
+        panic!("Expected Instructions");
+    };
+    assert_eq!(
+        instructions.files,
+        vec![
+            InstructionsFile {
+                path: "/Users/brendan/.claude/CLAUDE.md".to_string(),
+                kind: InstructionsFileKind::User,
+                content: "# AGENTS.md".to_string(),
+            },
+            InstructionsFile {
+                path: "/Users/brendan/src/h2/h2-iac/CLAUDE.md".to_string(),
+                kind: InstructionsFileKind::Project,
+                content: "# CLAUDE.md".to_string(),
+            },
+            InstructionsFile {
+                path: "/Users/brendan/.claude/projects/x/memory/MEMORY.md".to_string(),
+                kind: InstructionsFileKind::AutoMem,
+                content: "# Memory index".to_string(),
+            },
+        ]
+    );
+}
+
+// An unrecognized instruction-file scope must fail loudly rather than being misclassified.
+#[test]
+fn test_parse_attachment_instructions_rejects_unknown_kind() {
+    let json = serde_json::json!({
+        "type": "attachment",
+        "parentUuid": null,
+        "isSidechain": false,
+        "attachment": {
+            "type": "instructions",
+            "files": [
+                {"path": "/x/CLAUDE.md", "type": "Enterprise", "content": "# x"}
+            ]
+        },
+        "uuid": "550e8400-e29b-41d4-a716-446655440000",
+        "timestamp": "2026-09-08T23:12:20.404Z",
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
+        "version": "2.1.257",
+        "gitBranch": "main"
+    });
+    let err = serde_json::from_value::<LogLine>(json)
+        .expect_err("Should reject an unknown instruction-file scope");
+    assert!(
+        err.to_string().contains("unknown variant `Enterprise`"),
+        "Error should name the unknown scope, got: {}",
+        err
+    );
 }
 
 #[test]
@@ -10033,18 +10186,11 @@ fn test_parse_attachment_mcp_instructions_delta() {
         "version": "2.1.104",
         "gitBranch": "main"
     });
-    let log_line: LogLine = serde_json::from_value(json).unwrap();
-    match log_line {
-        LogLine::Attachment(att) => {
-            if let AttachmentData::McpInstructionsDelta(delta) = &att.attachment {
-                assert_eq!(delta.added_names, vec!["git-read-only"]);
-                assert_eq!(delta.removed_names.len(), 0);
-            } else {
-                panic!("Expected McpInstructionsDelta, got {:?}", att.attachment);
-            }
-        }
-        other => panic!("Expected Attachment, got {:?}", other),
-    }
+    let AttachmentData::McpInstructionsDelta(delta) = parse_attachment(json) else {
+        panic!("Expected McpInstructionsDelta");
+    };
+    assert_eq!(delta.added_names, vec!["git-read-only"]);
+    assert!(delta.removed_names.is_empty());
 }
 
 #[test]
@@ -10066,18 +10212,11 @@ fn test_parse_attachment_plan_mode_exit() {
         "version": "2.1.104",
         "gitBranch": "main"
     });
-    let log_line: LogLine = serde_json::from_value(json).unwrap();
-    match log_line {
-        LogLine::Attachment(att) => {
-            if let AttachmentData::PlanModeExit(exit) = &att.attachment {
-                assert_eq!(exit.plan_file_path, "/tmp/plan.md");
-                assert!(exit.plan_exists);
-            } else {
-                panic!("Expected PlanModeExit, got {:?}", att.attachment);
-            }
-        }
-        other => panic!("Expected Attachment, got {:?}", other),
-    }
+    let AttachmentData::PlanModeExit(exit) = parse_attachment(json) else {
+        panic!("Expected PlanModeExit");
+    };
+    assert_eq!(exit.plan_file_path, "/tmp/plan.md");
+    assert!(exit.plan_exists);
 }
 
 #[test]
@@ -10099,19 +10238,12 @@ fn test_parse_attachment_queued_command() {
         "version": "2.1.104",
         "gitBranch": "main"
     });
-    let log_line: LogLine = serde_json::from_value(json).unwrap();
-    match log_line {
-        LogLine::Attachment(att) => {
-            if let AttachmentData::QueuedCommand(cmd) = &att.attachment {
-                assert_eq!(cmd.prompt, "Run the tests");
-                assert_eq!(cmd.command_mode, "prompt");
-                assert_eq!(cmd.origin, None);
-            } else {
-                panic!("Expected QueuedCommand, got {:?}", att.attachment);
-            }
-        }
-        other => panic!("Expected Attachment, got {:?}", other),
-    }
+    let AttachmentData::QueuedCommand(cmd) = parse_attachment(json) else {
+        panic!("Expected QueuedCommand");
+    };
+    assert_eq!(cmd.prompt, "Run the tests");
+    assert_eq!(cmd.command_mode, "prompt");
+    assert_eq!(cmd.origin, None);
 }
 
 #[test]
@@ -10135,31 +10267,24 @@ fn test_parse_attachment_queued_command_with_origin() {
         "version": "2.1.197",
         "gitBranch": "HEAD"
     });
-    let log_line: LogLine = serde_json::from_value(json).unwrap();
-    match log_line {
-        LogLine::Attachment(att) => {
-            if let AttachmentData::QueuedCommand(cmd) = &att.attachment {
-                assert_eq!(
-                    cmd.prompt,
-                    "be sure to use the gitattributes to mark the crds as generated."
-                );
-                assert_eq!(cmd.command_mode, "prompt");
-                assert_eq!(
-                    cmd.origin,
-                    Some(MessageOrigin {
-                        kind: "human".to_string()
-                    })
-                );
-                assert_eq!(
-                    cmd.timestamp,
-                    Some("2026-07-01T18:50:39.389Z".parse::<DateTime<Utc>>().unwrap())
-                );
-            } else {
-                panic!("Expected QueuedCommand, got {:?}", att.attachment);
-            }
-        }
-        other => panic!("Expected Attachment, got {:?}", other),
-    }
+    let AttachmentData::QueuedCommand(cmd) = parse_attachment(json) else {
+        panic!("Expected QueuedCommand");
+    };
+    assert_eq!(
+        cmd.prompt,
+        "be sure to use the gitattributes to mark the crds as generated."
+    );
+    assert_eq!(cmd.command_mode, "prompt");
+    assert_eq!(
+        cmd.origin,
+        Some(MessageOrigin {
+            kind: "human".to_string()
+        })
+    );
+    assert_eq!(
+        cmd.timestamp,
+        Some("2026-07-01T18:50:39.389Z".parse::<DateTime<Utc>>().unwrap())
+    );
 }
 
 #[test]
@@ -10184,24 +10309,17 @@ fn test_parse_attachment_queued_command_with_source_uuid() {
         "version": "2.1.238",
         "gitBranch": "HEAD"
     });
-    let log_line: LogLine = serde_json::from_value(json).unwrap();
-    match log_line {
-        LogLine::Attachment(att) => {
-            if let AttachmentData::QueuedCommand(cmd) = &att.attachment {
-                assert_eq!(
-                    cmd.source_uuid,
-                    Some(
-                        "1f438c56-2f6c-4cf8-a2a5-d0c13f1e5ff2"
-                            .parse::<Uuid>()
-                            .unwrap()
-                    )
-                );
-            } else {
-                panic!("Expected QueuedCommand, got {:?}", att.attachment);
-            }
-        }
-        other => panic!("Expected Attachment, got {:?}", other),
-    }
+    let AttachmentData::QueuedCommand(cmd) = parse_attachment(json) else {
+        panic!("Expected QueuedCommand");
+    };
+    assert_eq!(
+        cmd.source_uuid,
+        Some(
+            "1f438c56-2f6c-4cf8-a2a5-d0c13f1e5ff2"
+                .parse::<Uuid>()
+                .unwrap()
+        )
+    );
 }
 
 #[test]
@@ -10225,18 +10343,11 @@ fn test_parse_attachment_queued_command_with_null_origin() {
         "version": "2.1.197",
         "gitBranch": "main"
     });
-    let log_line: LogLine = serde_json::from_value(json).unwrap();
-    match log_line {
-        LogLine::Attachment(att) => {
-            if let AttachmentData::QueuedCommand(cmd) = &att.attachment {
-                assert_eq!(cmd.origin, None);
-                assert_eq!(cmd.timestamp, None);
-            } else {
-                panic!("Expected QueuedCommand, got {:?}", att.attachment);
-            }
-        }
-        other => panic!("Expected Attachment, got {:?}", other),
-    }
+    let AttachmentData::QueuedCommand(cmd) = parse_attachment(json) else {
+        panic!("Expected QueuedCommand");
+    };
+    assert_eq!(cmd.origin, None);
+    assert_eq!(cmd.timestamp, None);
 }
 
 #[test]
@@ -10259,18 +10370,11 @@ fn test_parse_attachment_skill_listing() {
         "version": "2.1.104",
         "gitBranch": "main"
     });
-    let log_line: LogLine = serde_json::from_value(json).unwrap();
-    match log_line {
-        LogLine::Attachment(att) => {
-            if let AttachmentData::SkillListing(listing) = &att.attachment {
-                assert_eq!(listing.skill_count, 2);
-                assert!(listing.is_initial);
-            } else {
-                panic!("Expected SkillListing, got {:?}", att.attachment);
-            }
-        }
-        other => panic!("Expected Attachment, got {:?}", other),
-    }
+    let AttachmentData::SkillListing(listing) = parse_attachment(json) else {
+        panic!("Expected SkillListing");
+    };
+    assert_eq!(listing.skill_count, 2);
+    assert!(listing.is_initial);
 }
 
 #[test]
@@ -10293,17 +10397,10 @@ fn test_parse_attachment_auto_mode() {
         "gitBranch": "main",
         "slug": "test-slug"
     });
-    let log_line: LogLine = serde_json::from_value(json).unwrap();
-    match log_line {
-        LogLine::Attachment(att) => {
-            if let AttachmentData::AutoMode(AutoMode::Reminder(reminder)) = &att.attachment {
-                assert_eq!(reminder.reminder_type, "full");
-            } else {
-                panic!("Expected AutoMode, got {:?}", att.attachment);
-            }
-        }
-        other => panic!("Expected Attachment, got {:?}", other),
-    }
+    let AttachmentData::AutoMode(AutoMode::Reminder(reminder)) = parse_attachment(json) else {
+        panic!("Expected AutoMode reminder");
+    };
+    assert_eq!(reminder.reminder_type, "full");
 }
 
 #[test]
@@ -10327,20 +10424,13 @@ fn test_parse_attachment_auto_mode_behavior_flags() {
         "version": "2.1.226",
         "gitBranch": "HEAD"
     });
-    let log_line: LogLine = serde_json::from_value(json).unwrap();
-    match log_line {
-        LogLine::Attachment(att) => {
-            if let AttachmentData::AutoMode(AutoMode::BehaviorFlags(flags)) = &att.attachment {
-                assert!(!flags.auto_mode_consent_flow);
-                assert!(flags.bash_first);
-                assert!(flags.steer_only);
-                assert_eq!(flags.bypass, None);
-            } else {
-                panic!("Expected AutoMode, got {:?}", att.attachment);
-            }
-        }
-        other => panic!("Expected Attachment, got {:?}", other),
-    }
+    let AttachmentData::AutoMode(AutoMode::BehaviorFlags(flags)) = parse_attachment(json) else {
+        panic!("Expected AutoMode behavior flags");
+    };
+    assert!(!flags.auto_mode_consent_flow);
+    assert!(flags.bash_first);
+    assert!(flags.steer_only);
+    assert_eq!(flags.bypass, None);
 }
 
 #[test]
@@ -10365,17 +10455,10 @@ fn test_parse_attachment_auto_mode_behavior_flags_with_bypass() {
         "version": "2.1.238",
         "gitBranch": "HEAD"
     });
-    let log_line: LogLine = serde_json::from_value(json).unwrap();
-    match log_line {
-        LogLine::Attachment(att) => {
-            if let AttachmentData::AutoMode(AutoMode::BehaviorFlags(flags)) = &att.attachment {
-                assert_eq!(flags.bypass, Some(false));
-            } else {
-                panic!("Expected AutoMode, got {:?}", att.attachment);
-            }
-        }
-        other => panic!("Expected Attachment, got {:?}", other),
-    }
+    let AttachmentData::AutoMode(AutoMode::BehaviorFlags(flags)) = parse_attachment(json) else {
+        panic!("Expected AutoMode behavior flags");
+    };
+    assert_eq!(flags.bypass, Some(false));
 }
 
 #[test]
@@ -10397,16 +10480,10 @@ fn test_parse_attachment_auto_mode_exit() {
         "gitBranch": "main",
         "slug": "test-slug"
     });
-    let log_line: LogLine = serde_json::from_value(json).unwrap();
-    match log_line {
-        LogLine::Attachment(att) => {
-            assert!(matches!(
-                att.attachment,
-                AttachmentData::AutoModeExit(AutoModeExit::Bare(_))
-            ));
-        }
-        other => panic!("Expected Attachment, got {:?}", other),
-    }
+    assert!(matches!(
+        parse_attachment(json),
+        AttachmentData::AutoModeExit(AutoModeExit::Bare(_))
+    ));
 }
 
 #[test]
@@ -10429,23 +10506,12 @@ fn test_parse_attachment_auto_mode_exit_with_behavior_flags() {
         "version": "2.1.238",
         "gitBranch": "HEAD"
     });
-    let log_line: LogLine = serde_json::from_value(json).unwrap();
-    match log_line {
-        LogLine::Attachment(att) => {
-            if let AttachmentData::AutoModeExit(AutoModeExit::BehaviorFlags(flags)) =
-                &att.attachment
-            {
-                assert!(flags.bash_first);
-                assert!(flags.steer_only);
-            } else {
-                panic!(
-                    "Expected AutoModeExit behavior flags, got {:?}",
-                    att.attachment
-                );
-            }
-        }
-        other => panic!("Expected Attachment, got {:?}", other),
-    }
+    let AttachmentData::AutoModeExit(AutoModeExit::BehaviorFlags(flags)) = parse_attachment(json)
+    else {
+        panic!("Expected AutoModeExit behavior flags");
+    };
+    assert!(flags.bash_first);
+    assert!(flags.steer_only);
 }
 
 #[test]
@@ -10468,17 +10534,10 @@ fn test_parse_attachment_command_permissions() {
         "gitBranch": "main",
         "slug": "test-slug"
     });
-    let log_line: LogLine = serde_json::from_value(json).unwrap();
-    match log_line {
-        LogLine::Attachment(att) => {
-            if let AttachmentData::CommandPermissions(perms) = &att.attachment {
-                assert_eq!(perms.allowed_tools, vec!["Bash", "Read"]);
-            } else {
-                panic!("Expected CommandPermissions, got {:?}", att.attachment);
-            }
-        }
-        other => panic!("Expected Attachment, got {:?}", other),
-    }
+    let AttachmentData::CommandPermissions(perms) = parse_attachment(json) else {
+        panic!("Expected CommandPermissions");
+    };
+    assert_eq!(perms.allowed_tools, vec!["Bash", "Read"]);
 }
 
 #[test]
@@ -10501,20 +10560,12 @@ fn test_parse_attachment_date_change() {
         "gitBranch": "main",
         "slug": "test-slug"
     });
-    let log_line: LogLine = serde_json::from_value(json).unwrap();
-    match log_line {
-        LogLine::Attachment(att) => {
-            if let AttachmentData::DateChange(change) = &att.attachment {
-                assert_eq!(
-                    change.new_date,
-                    chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap()
-                );
-            } else {
-                panic!("Expected DateChange, got {:?}", att.attachment);
-            }
-        }
-        other => panic!("Expected Attachment, got {:?}", other),
-    }
+    assert_eq!(
+        parse_attachment(json),
+        AttachmentData::DateChange(DateChange {
+            new_date: NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
+        })
+    );
 }
 
 #[test]
@@ -10568,19 +10619,12 @@ fn test_parse_attachment_edited_text_file() {
         "gitBranch": "main",
         "slug": "test-slug"
     });
-    let log_line: LogLine = serde_json::from_value(json).unwrap();
-    match log_line {
-        LogLine::Attachment(att) => {
-            if let AttachmentData::EditedTextFile(edited) = &att.attachment {
-                assert_eq!(edited.filename, "/src/main.rs");
-                assert_eq!(edited.snippet, "fn main() {\n    println!(\"hello\");\n}");
-                assert_eq!(edited.display_path, None);
-            } else {
-                panic!("Expected EditedTextFile, got {:?}", att.attachment);
-            }
-        }
-        other => panic!("Expected Attachment, got {:?}", other),
-    }
+    let AttachmentData::EditedTextFile(edited) = parse_attachment(json) else {
+        panic!("Expected EditedTextFile");
+    };
+    assert_eq!(edited.filename, "/src/main.rs");
+    assert_eq!(edited.snippet, "fn main() {\n    println!(\"hello\");\n}");
+    assert_eq!(edited.display_path, None);
 }
 
 #[test]
@@ -10604,22 +10648,15 @@ fn test_parse_attachment_edited_text_file_with_display_path() {
         "version": "2.1.201",
         "gitBranch": "HEAD"
     });
-    let log_line: LogLine = serde_json::from_value(json).unwrap();
-    match log_line {
-        LogLine::Attachment(att) => {
-            if let AttachmentData::EditedTextFile(edited) = &att.attachment {
-                assert_eq!(
-                    edited.filename,
-                    "/Users/brendan/src/h2/h2-iac/.specs/foundation.md"
-                );
-                assert_eq!(edited.snippet, "1\t# foundation");
-                assert_eq!(edited.display_path.as_deref(), Some(".specs/foundation.md"));
-            } else {
-                panic!("Expected EditedTextFile, got {:?}", att.attachment);
-            }
-        }
-        other => panic!("Expected Attachment, got {:?}", other),
-    }
+    let AttachmentData::EditedTextFile(edited) = parse_attachment(json) else {
+        panic!("Expected EditedTextFile");
+    };
+    assert_eq!(
+        edited.filename,
+        "/Users/brendan/src/h2/h2-iac/.specs/foundation.md"
+    );
+    assert_eq!(edited.snippet, "1\t# foundation");
+    assert_eq!(edited.display_path.as_deref(), Some(".specs/foundation.md"));
 }
 
 // `rename_all = "camelCase"` and `deny_unknown_fields` interact: a serialize-side rename bug would
@@ -10656,20 +10693,13 @@ fn test_parse_attachment_plan_mode_reentry() {
         "gitBranch": "main",
         "slug": "test-slug"
     });
-    let log_line: LogLine = serde_json::from_value(json).unwrap();
-    match log_line {
-        LogLine::Attachment(att) => {
-            if let AttachmentData::PlanModeReentry(reentry) = &att.attachment {
-                assert_eq!(
-                    reentry.plan_file_path,
-                    "/Users/test/.claude/plans/my-plan.md"
-                );
-            } else {
-                panic!("Expected PlanModeReentry, got {:?}", att.attachment);
-            }
-        }
-        other => panic!("Expected Attachment, got {:?}", other),
-    }
+    let AttachmentData::PlanModeReentry(reentry) = parse_attachment(json) else {
+        panic!("Expected PlanModeReentry");
+    };
+    assert_eq!(
+        reentry.plan_file_path,
+        "/Users/test/.claude/plans/my-plan.md"
+    );
 }
 
 #[test]
@@ -10699,20 +10729,13 @@ fn test_parse_attachment_hook_non_blocking_error() {
         "gitBranch": "main",
         "slug": "test-slug"
     });
-    let log_line: LogLine = serde_json::from_value(json).unwrap();
-    match log_line {
-        LogLine::Attachment(att) => {
-            if let AttachmentData::HookNonBlockingError(err) = &att.attachment {
-                assert_eq!(err.hook_name, "PostToolUse:ExitPlanMode");
-                assert_eq!(err.tool_use_id, "toolu_01MpjtQCRgkG3zhy3rWBNGfx");
-                assert_eq!(err.exit_code, 1);
-                assert_eq!(err.duration_ms, 107);
-            } else {
-                panic!("Expected HookNonBlockingError, got {:?}", att.attachment);
-            }
-        }
-        other => panic!("Expected Attachment, got {:?}", other),
-    }
+    let AttachmentData::HookNonBlockingError(err) = parse_attachment(json) else {
+        panic!("Expected HookNonBlockingError");
+    };
+    assert_eq!(err.hook_name, "PostToolUse:ExitPlanMode");
+    assert_eq!(err.tool_use_id, "toolu_01MpjtQCRgkG3zhy3rWBNGfx");
+    assert_eq!(err.exit_code, 1);
+    assert_eq!(err.duration_ms, 107);
 }
 
 #[test]
@@ -10741,24 +10764,17 @@ fn test_parse_attachment_hook_blocking_error() {
         "gitBranch": "main",
         "slug": "test-slug"
     });
-    let log_line: LogLine = serde_json::from_value(json).unwrap();
-    match log_line {
-        LogLine::Attachment(att) => {
-            if let AttachmentData::HookBlockingError(err) = &att.attachment {
-                assert_eq!(err.hook_name, "Stop");
-                assert_eq!(err.tool_use_id, "25ac3468-1b14-498d-b231-f6a80674f20d");
-                assert_eq!(err.hook_event, "Stop");
-                assert_eq!(err.blocking_error.command, "moriarty hooks exec");
-                assert_eq!(
-                    err.blocking_error.blocking_error,
-                    "Checks failed:\n\nCheck 'semgrep' failed with exit code 2"
-                );
-            } else {
-                panic!("Expected HookBlockingError, got {:?}", att.attachment);
-            }
-        }
-        other => panic!("Expected Attachment, got {:?}", other),
-    }
+    let AttachmentData::HookBlockingError(err) = parse_attachment(json) else {
+        panic!("Expected HookBlockingError");
+    };
+    assert_eq!(err.hook_name, "Stop");
+    assert_eq!(err.tool_use_id, "25ac3468-1b14-498d-b231-f6a80674f20d");
+    assert_eq!(err.hook_event, "Stop");
+    assert_eq!(err.blocking_error.command, "moriarty hooks exec");
+    assert_eq!(
+        err.blocking_error.blocking_error,
+        "Checks failed:\n\nCheck 'semgrep' failed with exit code 2"
+    );
 }
 
 #[test]
@@ -10815,26 +10831,19 @@ fn test_parse_attachment_hook_cancelled() {
         "gitBranch": "main",
         "slug": "test-slug"
     });
-    let log_line: LogLine = serde_json::from_value(json).unwrap();
-    match log_line {
-        LogLine::Attachment(att) => {
-            if let AttachmentData::HookCancelled(cancelled) = &att.attachment {
-                assert_eq!(cancelled.hook_name, "Stop");
-                assert_eq!(
-                    cancelled.tool_use_id,
-                    "21ef6391-1417-40ab-b9ba-e55f5684c31a"
-                );
-                assert_eq!(cancelled.hook_event, "Stop");
-                assert_eq!(cancelled.command, "moriarty hooks exec");
-                assert_eq!(cancelled.duration_ms, 3184);
-                assert_eq!(cancelled.timed_out, None);
-                assert_eq!(cancelled.timeout_ms, None);
-            } else {
-                panic!("Expected HookCancelled, got {:?}", att.attachment);
-            }
-        }
-        other => panic!("Expected Attachment, got {:?}", other),
-    }
+    let AttachmentData::HookCancelled(cancelled) = parse_attachment(json) else {
+        panic!("Expected HookCancelled");
+    };
+    assert_eq!(cancelled.hook_name, "Stop");
+    assert_eq!(
+        cancelled.tool_use_id,
+        "21ef6391-1417-40ab-b9ba-e55f5684c31a"
+    );
+    assert_eq!(cancelled.hook_event, "Stop");
+    assert_eq!(cancelled.command, "moriarty hooks exec");
+    assert_eq!(cancelled.duration_ms, 3184);
+    assert_eq!(cancelled.timed_out, None);
+    assert_eq!(cancelled.timeout_ms, None);
 }
 
 #[test]
@@ -10864,19 +10873,12 @@ fn test_parse_attachment_hook_cancelled_with_timeout_fields() {
         "gitBranch": "HEAD",
         "slug": "spicy-snuggling-ocean"
     });
-    let log_line: LogLine = serde_json::from_value(json).unwrap();
-    match log_line {
-        LogLine::Attachment(att) => {
-            if let AttachmentData::HookCancelled(cancelled) = &att.attachment {
-                assert_eq!(cancelled.duration_ms, 11734);
-                assert_eq!(cancelled.timed_out, Some(false));
-                assert_eq!(cancelled.timeout_ms, Some(300000));
-            } else {
-                panic!("Expected HookCancelled, got {:?}", att.attachment);
-            }
-        }
-        other => panic!("Expected Attachment, got {:?}", other),
-    }
+    let AttachmentData::HookCancelled(cancelled) = parse_attachment(json) else {
+        panic!("Expected HookCancelled");
+    };
+    assert_eq!(cancelled.duration_ms, 11734);
+    assert_eq!(cancelled.timed_out, Some(false));
+    assert_eq!(cancelled.timeout_ms, Some(300000));
 }
 
 #[test]
@@ -10906,18 +10908,11 @@ fn test_parse_attachment_hook_cancelled_timed_out_true() {
         "gitBranch": "HEAD",
         "slug": "spicy-snuggling-ocean"
     });
-    let log_line: LogLine = serde_json::from_value(json).unwrap();
-    match log_line {
-        LogLine::Attachment(att) => {
-            if let AttachmentData::HookCancelled(cancelled) = &att.attachment {
-                assert_eq!(cancelled.timed_out, Some(true));
-                assert_eq!(cancelled.timeout_ms, Some(300000));
-            } else {
-                panic!("Expected HookCancelled, got {:?}", att.attachment);
-            }
-        }
-        other => panic!("Expected Attachment, got {:?}", other),
-    }
+    let AttachmentData::HookCancelled(cancelled) = parse_attachment(json) else {
+        panic!("Expected HookCancelled");
+    };
+    assert_eq!(cancelled.timed_out, Some(true));
+    assert_eq!(cancelled.timeout_ms, Some(300000));
 }
 
 #[test]
@@ -10943,23 +10938,16 @@ fn test_parse_attachment_hook_system_message() {
         "gitBranch": "main",
         "slug": "test-slug"
     });
-    let log_line: LogLine = serde_json::from_value(json).unwrap();
-    match log_line {
-        LogLine::Attachment(att) => {
-            if let AttachmentData::HookSystemMessage(msg) = &att.attachment {
-                assert_eq!(msg.hook_name, "Stop");
-                assert_eq!(msg.tool_use_id, "25ac3468-1b14-498d-b231-f6a80674f20d");
-                assert_eq!(msg.hook_event, "Stop");
-                assert_eq!(
-                    msg.content,
-                    "Checks failed:\n\nCheck 'semgrep' failed with exit code 2"
-                );
-            } else {
-                panic!("Expected HookSystemMessage, got {:?}", att.attachment);
-            }
-        }
-        other => panic!("Expected Attachment, got {:?}", other),
-    }
+    let AttachmentData::HookSystemMessage(msg) = parse_attachment(json) else {
+        panic!("Expected HookSystemMessage");
+    };
+    assert_eq!(msg.hook_name, "Stop");
+    assert_eq!(msg.tool_use_id, "25ac3468-1b14-498d-b231-f6a80674f20d");
+    assert_eq!(msg.hook_event, "Stop");
+    assert_eq!(
+        msg.content,
+        "Checks failed:\n\nCheck 'semgrep' failed with exit code 2"
+    );
 }
 
 #[test]
@@ -11609,25 +11597,18 @@ fn test_parse_attachment_diagnostics() {
         "version": "2.1.257",
         "gitBranch": "HEAD"
     });
-    let log_line: LogLine = serde_json::from_value(json).unwrap();
-    match log_line {
-        LogLine::Attachment(att) => {
-            if let AttachmentData::Diagnostics(diagnostics) = &att.attachment {
-                assert!(diagnostics.is_new);
-                let file = &diagnostics.files[0];
-                assert_eq!(file.uri, "/test/parser.rs");
-                let diagnostic = &file.diagnostics[0];
-                assert_eq!(diagnostic.severity, DiagnosticSeverity::Error);
-                assert_eq!(diagnostic.source, "rustc");
-                assert_eq!(diagnostic.code, "E0425");
-                assert_eq!(diagnostic.range.start.line, 496);
-                assert_eq!(diagnostic.range.end.character, 49);
-            } else {
-                panic!("Expected Diagnostics, got {:?}", att.attachment);
-            }
-        }
-        other => panic!("Expected Attachment, got {:?}", other),
-    }
+    let AttachmentData::Diagnostics(diagnostics) = parse_attachment(json) else {
+        panic!("Expected Diagnostics");
+    };
+    assert!(diagnostics.is_new);
+    let file = &diagnostics.files[0];
+    assert_eq!(file.uri, "/test/parser.rs");
+    let diagnostic = &file.diagnostics[0];
+    assert_eq!(diagnostic.severity, DiagnosticSeverity::Error);
+    assert_eq!(diagnostic.source, "rustc");
+    assert_eq!(diagnostic.code, "E0425");
+    assert_eq!(diagnostic.range.start.line, 496);
+    assert_eq!(diagnostic.range.end.character, 49);
 }
 
 // `silent_turn_reminder`, `bash_output_audience_note`, and `batching_reminder_sent` attachments
@@ -11635,7 +11616,7 @@ fn test_parse_attachment_diagnostics() {
 #[test]
 fn test_parse_attachment_turn_reminders() {
     let attachment_of = |attachment: serde_json::Value| {
-        let line = serde_json::json!({
+        parse_attachment(serde_json::json!({
             "type": "attachment",
             "parentUuid": "2c4682ed-4546-40b8-9297-d71c95f0a96f",
             "isSidechain": false,
@@ -11648,12 +11629,7 @@ fn test_parse_attachment_turn_reminders() {
             "sessionId": "fa4fd201-5dac-417e-b2d2-bae37c14f350",
             "version": "2.1.257",
             "gitBranch": "HEAD"
-        });
-        match serde_json::from_value::<LogLine>(line).expect("Failed to parse reminder attachment")
-        {
-            LogLine::Attachment(att) => att.attachment,
-            other => panic!("Expected Attachment, got {:?}", other),
-        }
+        }))
     };
 
     assert_eq!(
