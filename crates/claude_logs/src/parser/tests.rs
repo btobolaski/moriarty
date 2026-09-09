@@ -9872,20 +9872,24 @@ fn test_parse_attachment_model() {
     assert_eq!(model.text, "You are powered by the model named Opus 5.");
 }
 
-// `session_context` attachment (Claude Code 2.1.257+) carries the pre-rendered session context.
-#[test]
-fn test_parse_attachment_session_context() {
-    let json = serde_json::json!({
+fn session_context_json(git_status: Option<&str>) -> serde_json::Value {
+    let mut context = serde_json::json!({
+        "userEmail": "The user's email address is brendan@syllable.ai."
+    });
+    if let Some(git_status) = git_status {
+        context
+            .as_object_mut()
+            .expect("fixture is a JSON object")
+            .insert("gitStatus".to_string(), serde_json::json!(git_status));
+    }
+    serde_json::json!({
         "type": "attachment",
         "parentUuid": "db33bae6-dbb2-479a-a46f-716416615aa2",
         "isSidechain": true,
         "agentId": "a57e74c94d7a65863",
         "attachment": {
             "type": "session_context",
-            "context": {
-                "userEmail": "The user's email address is brendan@syllable.ai.",
-                "gitStatus": "Current branch: HEAD"
-            }
+            "context": context
         },
         "uuid": "550e8400-e29b-41d4-a716-446655440000",
         "timestamp": "2026-09-08T23:10:33.580Z",
@@ -9895,39 +9899,62 @@ fn test_parse_attachment_session_context() {
         "sessionId": "550e8400-e29b-41d4-a716-446655440001",
         "version": "2.1.257",
         "gitBranch": "HEAD"
-    });
+    })
+}
+
+// `session_context` attachment (Claude Code 2.1.257+) carries the pre-rendered session context.
+#[test]
+fn test_parse_attachment_session_context() {
     assert_eq!(
-        parse_attachment(json),
+        parse_attachment(session_context_json(Some("Current branch: HEAD"))),
         AttachmentData::SessionContext(SessionContext {
             context: SessionContextEntries {
                 user_email: "The user's email address is brendan@syllable.ai.".to_string(),
-                git_status: "Current branch: HEAD".to_string(),
+                git_status: Some("Current branch: HEAD".to_string()),
             }
         })
     );
 }
 
-// `environment` attachment (Claude Code 2.1.257+) records the environment description injected
-// into a turn.
+// Claude Code omits `gitStatus` from the session context even inside a git working copy.
 #[test]
-fn test_parse_attachment_environment() {
-    let json = serde_json::json!({
+fn test_parse_attachment_session_context_without_git_status() {
+    assert_eq!(
+        parse_attachment(session_context_json(None)),
+        AttachmentData::SessionContext(SessionContext {
+            context: SessionContextEntries {
+                user_email: "The user's email address is brendan@syllable.ai.".to_string(),
+                git_status: None,
+            }
+        })
+    );
+}
+
+fn environment_json(changes: Option<serde_json::Value>) -> serde_json::Value {
+    let mut attachment = serde_json::json!({
+        "type": "environment",
+        "snapshot": {
+            "workingDirectory": "/Users/brendan/src/h2/h2-iac",
+            "isWorktree": false,
+            "isGitRepo": true,
+            "additionalWorkingDirectories": ["/Users/brendan/src/h2/other"],
+            "platform": "darwin",
+            "shell": "bash",
+            "osVersion": "Darwin 25.5.0",
+            "scratchpadDirectory": "/private/tmp/claude-501/scratchpad"
+        }
+    });
+    if let Some(changes) = changes {
+        attachment
+            .as_object_mut()
+            .expect("fixture is a JSON object")
+            .insert("changes".to_string(), changes);
+    }
+    serde_json::json!({
         "type": "attachment",
         "parentUuid": "a949cf72-3568-4846-babc-5dd05ac6da84",
         "isSidechain": false,
-        "attachment": {
-            "type": "environment",
-            "snapshot": {
-                "workingDirectory": "/Users/brendan/src/h2/h2-iac",
-                "isWorktree": false,
-                "isGitRepo": true,
-                "additionalWorkingDirectories": ["/Users/brendan/src/h2/other"],
-                "platform": "darwin",
-                "shell": "bash",
-                "osVersion": "Darwin 25.5.0",
-                "scratchpadDirectory": "/private/tmp/claude-501/scratchpad"
-            }
-        },
+        "attachment": attachment,
         "uuid": "9afab302-0832-40df-9764-be357ce3659e",
         "timestamp": "2026-09-08T23:10:33.580Z",
         "userType": "external",
@@ -9936,20 +9963,47 @@ fn test_parse_attachment_environment() {
         "sessionId": "44286351-68c4-4453-befa-bde800b6e9b1",
         "version": "2.1.257",
         "gitBranch": "HEAD"
-    });
+    })
+}
+
+fn expected_environment_snapshot() -> EnvironmentSnapshot {
+    EnvironmentSnapshot {
+        working_directory: "/Users/brendan/src/h2/h2-iac".to_string(),
+        is_worktree: false,
+        is_git_repo: true,
+        additional_working_directories: vec!["/Users/brendan/src/h2/other".to_string()],
+        platform: "darwin".to_string(),
+        shell: "bash".to_string(),
+        os_version: "Darwin 25.5.0".to_string(),
+        scratchpad_directory: "/private/tmp/claude-501/scratchpad".to_string(),
+    }
+}
+
+// `environment` attachment (Claude Code 2.1.257+) records the environment description injected
+// into a turn.
+#[test]
+fn test_parse_attachment_environment() {
     assert_eq!(
-        parse_attachment(json),
+        parse_attachment(environment_json(None)),
         AttachmentData::Environment(EnvironmentAttachment {
-            snapshot: EnvironmentSnapshot {
-                working_directory: "/Users/brendan/src/h2/h2-iac".to_string(),
-                is_worktree: false,
-                is_git_repo: true,
-                additional_working_directories: vec!["/Users/brendan/src/h2/other".to_string()],
-                platform: "darwin".to_string(),
-                shell: "bash".to_string(),
-                os_version: "Darwin 25.5.0".to_string(),
-                scratchpad_directory: "/private/tmp/claude-501/scratchpad".to_string(),
-            }
+            snapshot: expected_environment_snapshot(),
+            changes: None,
+        })
+    );
+}
+
+// A re-injected `environment` attachment names the snapshot fields that moved since the last one.
+#[test]
+fn test_parse_attachment_environment_with_changes() {
+    assert_eq!(
+        parse_attachment(environment_json(Some(
+            serde_json::json!([{"field": "scratchpadDirectory"}])
+        ))),
+        AttachmentData::Environment(EnvironmentAttachment {
+            snapshot: expected_environment_snapshot(),
+            changes: Some(vec![EnvironmentChange {
+                field: "scratchpadDirectory".to_string(),
+            }]),
         })
     );
 }

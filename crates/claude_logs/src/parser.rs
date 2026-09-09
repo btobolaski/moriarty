@@ -868,7 +868,10 @@ pub struct SessionContext {
 #[serde(deny_unknown_fields)]
 pub struct SessionContextEntries {
     pub user_email: String,
-    pub git_status: String,
+    /// Absent when Claude Code injects the session context without a git blurb, which it does even
+    /// inside a git working copy, so its presence cannot be inferred from the record's `gitBranch`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_status: Option<String>,
 }
 
 /// Directory contents attached to a turn (e.g. via an `@dir` reference); `content` is a
@@ -899,6 +902,19 @@ pub struct EditedTextFile {
 #[serde(deny_unknown_fields)]
 pub struct EnvironmentAttachment {
     pub snapshot: EnvironmentSnapshot,
+    /// Which snapshot fields moved since the previous injection; absent on the first snapshot of a
+    /// session, which establishes the environment rather than reporting a change to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changes: Option<Vec<EnvironmentChange>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct EnvironmentChange {
+    /// Names a key of `EnvironmentSnapshot`, but kept a `String` because a field added upstream
+    /// would already surface as an unknown-field error on the snapshot itself.
+    pub field: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]

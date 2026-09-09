@@ -128,9 +128,13 @@ test in a separate process, making this safe and preventing tests from clobberin
   Claude Code emits at the head of a turn — `instructions` (`InstructionsAttachment`, the CLAUDE.md files and auto-memory
   index loaded into context; each file's scope is the strict `InstructionsFileKind` enum — `User`/`Project`/`AutoMem` —
   so a scope added later surfaces as a parse error rather than being silently misclassified), `environment`
-  (`EnvironmentAttachment`, the working directory, worktree/git flags, platform, shell, OS version, and scratchpad path),
-  `session_context` (`SessionContext`, the `userEmail`/`gitStatus` blurbs, already rendered as the prose the model sees
-  rather than as structured data), `model` (`ModelAttachment`, the model-identity blurb plus the `ModelIdentity` it was
+  (`EnvironmentAttachment`, the working directory, worktree/git flags, platform, shell, OS version, and scratchpad path,
+  plus an optional `changes` list — `EnvironmentChange` entries naming the snapshot fields that moved since the previous
+  injection, absent on the first snapshot of a session; each `field` stays a `String` rather than an enum over
+  `EnvironmentSnapshot`'s keys because a field added upstream already surfaces as an unknown-field error on the snapshot
+  itself), `session_context` (`SessionContext`, the `userEmail`/`gitStatus` blurbs, already rendered as the prose the
+  model sees rather than as structured data; `gitStatus` is optional because Claude Code omits it even inside a git
+  working copy, so its presence cannot be inferred from the record's `gitBranch`), `model` (`ModelAttachment`, the model-identity blurb plus the `ModelIdentity` it was
   rendered from, whose `modelId` parses into `Model` like every other wire model id), `date` (`DateAttachment`, the
   current date stated in the turn's context, plus a nullable `changed` flag saying whether it moved since the previous
   turn; distinct from `date_change`, which marks the date rolling over mid-session), and `prompt_snapshot` (`PromptSnapshot`, the system prompt as its constituent blocks plus the tool
