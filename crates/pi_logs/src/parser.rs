@@ -3823,7 +3823,10 @@ pub struct McpCallResult {
     pub content: Option<Vec<JsonBlob>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub structured_content: Option<JsonBlob>,
-    pub is_error: bool,
+    /// Wrapped calls can omit this field, so preserve absence rather than
+    /// claiming a successful result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_error: Option<bool>,
     /// Opaque content-block representation added in newer pi versions
     /// alongside the flat `content` array; currently observed as null when
     /// absent and present when pi records per-block tool-result metadata.
@@ -3890,12 +3893,50 @@ pub struct McpBreadcrumb {
 /// successful call either passes through the MCP `CallToolResult` or records
 /// a compact `{server, tool}` breadcrumb; a client-side transport failure
 /// records only the server name and a compact error string.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+///
+/// Direct result shapes use their present discriminator fields so a missing
+/// `isError` in a wrapped call remains distinguishable from a breadcrumb.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(untagged)]
 pub enum McpToolResult {
     Call(McpCallResult),
     Breadcrumb(McpBreadcrumb),
     Error(McpClientError),
+}
+
+impl<'de> Deserialize<'de> for McpToolResult {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        let (has_is_error, has_server, has_tool, has_error) = {
+            let object = value
+                .as_object()
+                .ok_or_else(|| de::Error::custom("MCP tool result must be an object"))?;
+            (
+                object.contains_key("isError"),
+                object.contains_key("server"),
+                object.contains_key("tool"),
+                object.contains_key("error"),
+            )
+        };
+
+        match (has_is_error, has_server, has_tool, has_error) {
+            (true, _, _, _) => serde_json::from_value(value)
+                .map(Self::Call)
+                .map_err(de::Error::custom),
+            (false, true, true, false) => serde_json::from_value(value)
+                .map(Self::Breadcrumb)
+                .map_err(de::Error::custom),
+            (false, true, false, true) => serde_json::from_value(value)
+                .map(Self::Error)
+                .map_err(de::Error::custom),
+            _ => Err(de::Error::custom(
+                "MCP tool result did not match a direct call, breadcrumb, or client error",
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

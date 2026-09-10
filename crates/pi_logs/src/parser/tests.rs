@@ -2435,7 +2435,7 @@ fn mcp_tool_result_accepts_call_result() {
     assert_eq!(details.tool.as_ref().map(McpTool::name), Some("status"));
 
     let mcp_result = details.mcp_result.expect("expected mcp result");
-    assert!(!mcp_result.is_error);
+    assert_eq!(mcp_result.is_error, Some(false));
     assert_eq!(
         mcp_result.structured_content,
         Some(JsonBlob::from(json!({
@@ -2516,10 +2516,23 @@ fn mcp_tool_result_accepts_missing_structured_content() {
     );
 
     let mcp_result = details.mcp_result.expect("expected mcp result");
-    assert!(!mcp_result.is_error);
+    assert_eq!(mcp_result.is_error, Some(false));
     assert!(mcp_result.structured_content.is_none());
     assert_eq!(details.server, "project-tools");
     assert_eq!(details.tool.as_ref().map(McpTool::name), Some("run_tests"));
+}
+
+#[test]
+fn mcp_tool_result_preserves_missing_is_error() {
+    let details = parse_mcp_call_success(
+        vec![],
+        json!({"mode": "call", "mcpResult": {}, "server": "grafana"}),
+    );
+
+    assert_eq!(
+        details.mcp_result.expect("expected mcp result").is_error,
+        None
+    );
 }
 
 #[test]
@@ -6747,7 +6760,7 @@ fn mcp_call_result_accepts_omitted_content_shape() {
     });
     let result: McpCallResult =
         serde_json::from_value(call_json).expect("omitted content shape should parse");
-    assert!(!result.is_error);
+    assert_eq!(result.is_error, Some(false));
     assert_eq!(result.omitted, Some(true));
     assert!(result.content.is_none());
     assert!(result.content_blocks.is_some());
@@ -6770,7 +6783,7 @@ fn mcp_call_result_tolerates_unknown_future_fields() {
     });
     let result: McpCallResult =
         serde_json::from_value(call_json).expect("future fields should be tolerated");
-    assert!(!result.is_error);
+    assert_eq!(result.is_error, Some(false));
     assert!(result.content.is_some());
 }
 
