@@ -545,6 +545,9 @@ pub struct AttachmentLogLine {
 #[serde(rename_all = "snake_case")]
 pub enum AttachmentData {
     AgentListingDelta(AgentListingDelta),
+    /// A file the turn already had in context, re-stated rather than re-read. Shares
+    /// `FileAttachment`'s wire shape exactly, so it reuses that struct.
+    AlreadyReadFile(FileAttachment),
     AutoMode(AutoMode),
     AutoModeExit(AutoModeExit),
     BashOutputAudienceNote(BashOutputAudienceNote),

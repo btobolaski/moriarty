@@ -138,7 +138,10 @@ test in a separate process, making this safe and preventing tests from clobberin
   rendered from, whose `modelId` parses into `Model` like every other wire model id), `date` (`DateAttachment`, the
   current date stated in the turn's context, plus a nullable `changed` flag saying whether it moved since the previous
   turn; distinct from `date_change`, which marks the date rolling over mid-session), and `prompt_snapshot` (`PromptSnapshot`, the system prompt as its constituent blocks plus the tool
-  roster; `tools` is `Option` because some snapshots omit it entirely) (all added in Claude Code 2.1.257+)
+  roster; `tools` is `Option` because some snapshots omit it entirely) (all added in Claude Code 2.1.257+), and an
+  `already_read_file` attachment (a file the turn already had in context, re-stated rather than re-read; its payload is
+  byte-identical to `file`'s, so the variant reuses `FileAttachment` rather than declaring a duplicate struct; also
+  added in Claude Code 2.1.257+)
 - Also owns the structured view of the raw `model` string via `model::Model { family, version }` plus `ModelFamily` and
   `ModelVersion`. Both `cost_analyzer` (for pricing) and `moriarty::api_pricing` (for grouping/display) consume this one
   parser so family/version classification is not duplicated across crates. The parser preserves capability-decorated raw

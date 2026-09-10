@@ -7744,6 +7744,31 @@ fn test_parse_attachment_deferred_tools_delta() {
     assert!(delta.pending_mcp_servers.is_empty());
 }
 
+/// `already_read_file` reuses `FileAttachment`, whose field contract is asserted by
+/// `test_parse_attachment_file`; the only behavior unique to this variant is tag routing.
+#[test]
+fn test_parse_attachment_already_read_file_routes_to_file_payload() {
+    let json = serde_json::json!({
+        "type": "already_read_file",
+        "filename": "/Users/brendan/.flk/config.json",
+        "displayPath": "config.json",
+        "content": {
+            "type": "text",
+            "file": {
+                "filePath": "/Users/brendan/.flk/config.json",
+                "content": "{}\n",
+                "numLines": 1,
+                "startLine": 1,
+                "totalLines": 1
+            }
+        }
+    });
+
+    let attachment: AttachmentData =
+        serde_json::from_value(json).expect("Should parse already_read_file attachment");
+    assert!(matches!(attachment, AttachmentData::AlreadyReadFile(_)));
+}
+
 #[test]
 fn test_parse_attachment_read_truncation_notice() {
     let expected_banner = "[Truncated: PARTIAL view — /tmp/task.output: showing lines 1-395 of 1282 total (68943 tokens, cap 25000).]";
