@@ -3609,7 +3609,43 @@ pub struct McpListSuccess {
 #[serde(untagged)]
 pub enum McpSearchDetails {
     Success(McpSearchSuccess),
-    Error(McpModeError),
+    UnsafePattern(McpUnsafePatternError),
+    Error(McpSearchError),
+}
+
+/// Safety rejections must include the metadata that explains why a query was
+/// rejected. Other client error codes retain the shared error envelope.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct McpSearchError(McpModeError);
+
+impl<'de> Deserialize<'de> for McpSearchError {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let error = McpModeError::deserialize(deserializer)?;
+        if error.error == "unsafe_pattern" {
+            return Err(de::Error::custom(
+                "unsafe_pattern search errors require query and safetyStatus",
+            ));
+        }
+        Ok(Self(error))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct McpUnsafePatternError {
+    pub error: McpUnsafePatternErrorKind,
+    pub query: String,
+    pub safety_status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum McpUnsafePatternErrorKind {
+    #[serde(rename = "unsafe_pattern")]
+    UnsafePattern,
 }
 
 // `deny_unknown_fields` conflicts with `flatten`; McpPagination rejects the

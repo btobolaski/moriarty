@@ -6512,34 +6512,19 @@ fn mcp_tool_result_accepts_auth_modes() {
 
 #[test]
 fn mcp_tool_result_accepts_mode_errors() {
-    for (mode, payload) in [
-        (
-            "connect",
-            json!({"mode": "connect", "error": "connect_failed"}),
-        ),
-        (
-            "describe",
-            json!({"mode": "describe", "error": "tool_not_found", "requestedTool": "missing", "suggestions": ["known"]}),
-        ),
-        (
-            "instructions",
-            json!({"mode": "instructions", "error": "no_instructions"}),
-        ),
-        (
-            "list",
-            json!({"mode": "list", "error": "not_found", "tools": [], "count": 0, "hasInstructions": false}),
-        ),
-        ("search", json!({"mode": "search", "error": "empty_query"})),
-        (
-            "auth-start",
-            json!({"mode": "auth-start", "error": "oauth_not_supported"}),
-        ),
-        (
-            "auth-complete",
-            json!({"mode": "auth-complete", "error": "not_authenticated"}),
-        ),
+    for (mode, error) in [
+        ("connect", "connect_failed"),
+        ("describe", "tool_not_found"),
+        ("instructions", "no_instructions"),
+        ("list", "not_found"),
+        ("search", "empty_query"),
+        ("auth-start", "oauth_not_supported"),
+        ("auth-complete", "not_authenticated"),
     ] {
-        match (mode, parse_mcp_details(vec![], payload)) {
+        match (
+            mode,
+            parse_mcp_details(vec![], json!({"mode": mode, "error": error})),
+        ) {
             ("connect", McpModeDetails::Connect(_))
             | ("describe", McpModeDetails::Describe(McpDescribeDetails::Error(_)))
             | ("instructions", McpModeDetails::Instructions(McpInstructionsDetails::Error(_)))
@@ -6548,9 +6533,30 @@ fn mcp_tool_result_accepts_mode_errors() {
             | ("auth-start", McpModeDetails::AuthStart(McpAuthStartDetails::Error(_)))
             | ("auth-complete", McpModeDetails::AuthComplete(McpAuthCompleteDetails::Error(_))) => {
             }
-            (_, details) => panic!("unexpected MCP error details: {details:?}"),
+            (_, details) => panic!("unexpected {mode} MCP error details: {details:?}"),
         }
     }
+}
+
+#[test]
+fn mcp_tool_result_accepts_unsafe_search_error() {
+    let McpModeDetails::Search(McpSearchDetails::UnsafePattern(details)) = parse_mcp_details(
+        vec![],
+        json!({
+            "mode": "search",
+            "error": "unsafe_pattern",
+            "query": "grafana.*(prometheus|alert_rules|datasource|rule_group)",
+            "safetyStatus": "unknown"
+        }),
+    ) else {
+        panic!("expected unsafe search error details")
+    };
+    assert_eq!(details.error, McpUnsafePatternErrorKind::UnsafePattern);
+    assert_eq!(
+        details.query,
+        "grafana.*(prometheus|alert_rules|datasource|rule_group)"
+    );
+    assert_eq!(details.safety_status, "unknown");
 }
 
 /// Verify that every tool name routed through `McpToolResult` in
@@ -7040,6 +7046,13 @@ fn mcp_details_rejects_fields_from_other_modes() {
             "nextOffset": null,
             "unexpected": true
         }),
+        json!({
+            "mode": "connect",
+            "error": "connect_failed",
+            "query": "query",
+            "safetyStatus": "unknown"
+        }),
+        json!({"mode": "search", "error": "unsafe_pattern"}),
     ] {
         serde_json::from_value::<McpDetails>(details)
             .expect_err("mode-specific fields should be rejected");

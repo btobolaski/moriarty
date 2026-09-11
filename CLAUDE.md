@@ -229,8 +229,10 @@ with warnings, while explicit missing paths and having no available source are e
   to all-optional detail structs because each tool emits several partially-overlapping shapes (structural-rule vs
   pattern success, validation, stale-preview) with no shared required field; their empty error sentinels drop to `None`
   before routing (the tools are not in `preserves_empty_error_details`, unlike `memory`/`skill`) and only a non-error
-  `{}` payload would route to `ToolResultDetails::Empty`. `mcpScript` routes to `McpScriptDetails` with required
-  closed-enum `mode` (`"script"` today) and opaque `calls` entries.
+  `{}` payload would route to `ToolResultDetails::Empty`. MCP search errors keep the shared envelope except
+  `unsafe_pattern`, whose strict `McpSearchDetails::UnsafePattern` shape requires `query` and `safetyStatus`.
+  `mcpScript` routes to `McpScriptDetails` with required closed-enum `mode` (`"script"` today) and opaque `calls`
+  entries.
 - The `intercom` tool result's `details` (`IntercomResultDetails`) is an untagged enum over the supervisor-status
   payload (`{active, pending: count, root}`; carried verbatim from the native supervisor channel when the pi-intercom
   extension delegates to it, reusing `SubagentSupervisorStatusDetails`) and the extension's loose
