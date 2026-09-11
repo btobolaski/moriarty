@@ -857,13 +857,69 @@ pub struct ModelIdentity {
     pub knowledge_cutoff: String,
 }
 
-/// The session-level context Claude Code injects into a turn, each entry already rendered as the
-/// prose the model sees rather than as structured data. Added in Claude Code 2.1.257+.
+/// Whether an attachment's content was (re)loaded and why (e.g. `session_start`); a later Claude
+/// Code build added this pair of fields to both `session_context` and `instructions`. `changed` and
+/// `reason` are always emitted together on the wire, so this pairs them into one type rather than
+/// sibling `Option` fields, which would make a half-present payload representable. `reason` stays a
+/// `String` rather than a strict enum because its vocabulary is undocumented and only one value
+/// (`session_start`) has been observed.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
+pub struct ContextReload {
+    pub changed: bool,
+    pub reason: String,
+}
+
+/// The session-level context Claude Code injects into a turn, each entry already rendered as the
+/// prose the model sees rather than as structured data. Added in Claude Code 2.1.257+. `reload` is
+/// `None` on logs from before a later build added the `changed`/`reason` pair. Deserializes via
+/// `SessionContextWire` because `changed`/`reason` are wire-level siblings of `context` rather than
+/// a nested object: `#[serde(flatten)]` cannot be combined with `#[serde(deny_unknown_fields)]` on
+/// this struct directly, so the strict field set is checked on the intermediate wire struct instead
+/// — see [`ContextReload`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(try_from = "SessionContextWire")]
 pub struct SessionContext {
     pub context: SessionContextEntries,
+    #[serde(flatten)]
+    pub reload: Option<ContextReload>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+struct SessionContextWire {
+    context: SessionContextEntries,
+    #[serde(default)]
+    changed: Option<bool>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+impl TryFrom<SessionContextWire> for SessionContext {
+    type Error = String;
+
+    fn try_from(wire: SessionContextWire) -> Result<Self, Self::Error> {
+        Ok(Self {
+            context: wire.context,
+            reload: context_reload_from_wire(wire.changed, wire.reason)?,
+        })
+    }
+}
+
+/// Shared by [`SessionContext`] and [`InstructionsAttachment`]'s `TryFrom` conversions: requires
+/// `changed`/`reason` to both be present or both be absent.
+fn context_reload_from_wire(
+    changed: Option<bool>,
+    reason: Option<String>,
+) -> Result<Option<ContextReload>, String> {
+    match (changed, reason) {
+        (Some(changed), Some(reason)) => Ok(Some(ContextReload { changed, reason })),
+        (None, None) => Ok(None),
+        _ => Err("`changed` and `reason` must both be present or both be absent".to_string()),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1092,12 +1148,40 @@ pub struct HookSystemMessage {
 }
 
 /// The instruction files Claude Code loaded into a turn's context (CLAUDE.md files and the auto
-/// memory index). Added in Claude Code 2.1.257+.
+/// memory index). Added in Claude Code 2.1.257+. `reload` is `None` on logs from before a later
+/// build added the `changed`/`reason` pair. Deserializes via `InstructionsAttachmentWire` for the
+/// same reason as [`SessionContext`]: `changed`/`reason` are wire-level siblings of `files` rather
+/// than a nested object, so the strict field set is checked on the intermediate wire struct — see
+/// [`ContextReload`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "InstructionsAttachmentWire")]
 pub struct InstructionsAttachment {
     pub files: Vec<InstructionsFile>,
+    #[serde(flatten)]
+    pub reload: Option<ContextReload>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+struct InstructionsAttachmentWire {
+    files: Vec<InstructionsFile>,
+    #[serde(default)]
+    changed: Option<bool>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+impl TryFrom<InstructionsAttachmentWire> for InstructionsAttachment {
+    type Error = String;
+
+    fn try_from(wire: InstructionsAttachmentWire) -> Result<Self, Self::Error> {
+        Ok(Self {
+            files: wire.files,
+            reload: context_reload_from_wire(wire.changed, wire.reason)?,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]

@@ -9572,7 +9572,10 @@ fn test_parse_attachment_model() {
     assert_eq!(model.text, "You are powered by the model named Opus 5.");
 }
 
-fn session_context_json(git_status: Option<&str>) -> serde_json::Value {
+fn session_context_json(
+    git_status: Option<&str>,
+    reload: Option<(bool, &str)>,
+) -> serde_json::Value {
     let mut context = serde_json::json!({
         "userEmail": "The user's email address is brendan@syllable.ai."
     });
@@ -9582,15 +9585,23 @@ fn session_context_json(git_status: Option<&str>) -> serde_json::Value {
             .expect("fixture is a JSON object")
             .insert("gitStatus".to_string(), serde_json::json!(git_status));
     }
+    let mut attachment = serde_json::json!({
+        "type": "session_context",
+        "context": context
+    });
+    if let Some((changed, reason)) = reload {
+        let attachment = attachment
+            .as_object_mut()
+            .expect("fixture is a JSON object");
+        attachment.insert("changed".to_string(), serde_json::json!(changed));
+        attachment.insert("reason".to_string(), serde_json::json!(reason));
+    }
     serde_json::json!({
         "type": "attachment",
         "parentUuid": "db33bae6-dbb2-479a-a46f-716416615aa2",
         "isSidechain": true,
         "agentId": "a57e74c94d7a65863",
-        "attachment": {
-            "type": "session_context",
-            "context": context
-        },
+        "attachment": attachment,
         "uuid": "550e8400-e29b-41d4-a716-446655440000",
         "timestamp": "2026-09-08T23:10:33.580Z",
         "userType": "external",
@@ -9606,12 +9617,13 @@ fn session_context_json(git_status: Option<&str>) -> serde_json::Value {
 #[test]
 fn test_parse_attachment_session_context() {
     assert_eq!(
-        parse_attachment(session_context_json(Some("Current branch: HEAD"))),
+        parse_attachment(session_context_json(Some("Current branch: HEAD"), None)),
         AttachmentData::SessionContext(SessionContext {
             context: SessionContextEntries {
                 user_email: "The user's email address is brendan@syllable.ai.".to_string(),
                 git_status: Some("Current branch: HEAD".to_string()),
-            }
+            },
+            reload: None,
         })
     );
 }
@@ -9620,13 +9632,47 @@ fn test_parse_attachment_session_context() {
 #[test]
 fn test_parse_attachment_session_context_without_git_status() {
     assert_eq!(
-        parse_attachment(session_context_json(None)),
+        parse_attachment(session_context_json(None, None)),
         AttachmentData::SessionContext(SessionContext {
             context: SessionContextEntries {
                 user_email: "The user's email address is brendan@syllable.ai.".to_string(),
                 git_status: None,
-            }
+            },
+            reload: None,
         })
+    );
+}
+
+// A later build adds a `changed`/`reason` pair to `session_context`, mirroring `instructions`.
+#[test]
+fn test_parse_attachment_session_context_with_reload() {
+    assert_eq!(
+        parse_attachment(session_context_json(None, Some((true, "session_start")))),
+        AttachmentData::SessionContext(SessionContext {
+            context: SessionContextEntries {
+                user_email: "The user's email address is brendan@syllable.ai.".to_string(),
+                git_status: None,
+            },
+            reload: Some(ContextReload {
+                changed: true,
+                reason: "session_start".to_string(),
+            }),
+        })
+    );
+}
+
+// `changed`/`reason` are always emitted together; a half-present pair must fail to parse rather
+// than silently dropping the value that was present.
+#[test]
+fn test_parse_attachment_session_context_rejects_half_present_reload() {
+    let mut json = session_context_json(None, None);
+    json["attachment"]["changed"] = serde_json::json!(true);
+    let error = serde_json::from_value::<LogLine>(json).expect_err("half-present reload must fail");
+    assert!(
+        error
+            .to_string()
+            .contains("`changed` and `reason` must both be present or both be absent"),
+        "unexpected error: {error}"
     );
 }
 
@@ -9708,23 +9754,31 @@ fn test_parse_attachment_environment_with_changes() {
     );
 }
 
-// `instructions` attachment (Claude Code 2.1.257+) carries the CLAUDE.md files and auto-memory
-// index loaded into a turn's context.
-#[test]
-fn test_parse_attachment_instructions() {
-    let json = serde_json::json!({
+fn instructions_json(
+    files: &[(&str, &str, &str)],
+    reload: Option<(bool, &str)>,
+) -> serde_json::Value {
+    let files: Vec<_> = files
+        .iter()
+        .map(|(path, kind, content)| serde_json::json!({"path": path, "type": kind, "content": content}))
+        .collect();
+    let mut attachment = serde_json::json!({
+        "type": "instructions",
+        "files": files
+    });
+    if let Some((changed, reason)) = reload {
+        let attachment = attachment
+            .as_object_mut()
+            .expect("fixture is a JSON object");
+        attachment.insert("changed".to_string(), serde_json::json!(changed));
+        attachment.insert("reason".to_string(), serde_json::json!(reason));
+    }
+    serde_json::json!({
         "type": "attachment",
         "parentUuid": "a949cf72-3568-4846-babc-5dd05ac6da84",
         "isSidechain": true,
         "agentId": "a36576a57ce2095a2",
-        "attachment": {
-            "type": "instructions",
-            "files": [
-                {"path": "/Users/brendan/.claude/CLAUDE.md", "type": "User", "content": "# AGENTS.md"},
-                {"path": "/Users/brendan/src/h2/h2-iac/CLAUDE.md", "type": "Project", "content": "# CLAUDE.md"},
-                {"path": "/Users/brendan/.claude/projects/x/memory/MEMORY.md", "type": "AutoMem", "content": "# Memory index"}
-            ]
-        },
+        "attachment": attachment,
         "uuid": "062604ef-63ba-4653-99c4-51b0c33106d4",
         "timestamp": "2026-09-08T23:12:20.404Z",
         "userType": "external",
@@ -9733,7 +9787,29 @@ fn test_parse_attachment_instructions() {
         "sessionId": "44286351-68c4-4453-befa-bde800b6e9b1",
         "version": "2.1.257",
         "gitBranch": "HEAD"
-    });
+    })
+}
+
+// `instructions` attachment (Claude Code 2.1.257+) carries the CLAUDE.md files and auto-memory
+// index loaded into a turn's context.
+#[test]
+fn test_parse_attachment_instructions() {
+    let json = instructions_json(
+        &[
+            ("/Users/brendan/.claude/CLAUDE.md", "User", "# AGENTS.md"),
+            (
+                "/Users/brendan/src/h2/h2-iac/CLAUDE.md",
+                "Project",
+                "# CLAUDE.md",
+            ),
+            (
+                "/Users/brendan/.claude/projects/x/memory/MEMORY.md",
+                "AutoMem",
+                "# Memory index",
+            ),
+        ],
+        None,
+    );
     let AttachmentData::Instructions(instructions) = parse_attachment(json) else {
         panic!("Expected Instructions");
     };
@@ -9757,29 +9833,50 @@ fn test_parse_attachment_instructions() {
             },
         ]
     );
+    assert_eq!(instructions.reload, None);
+}
+
+// A later build adds a `changed`/`reason` pair, stating why the files were (re)loaded.
+#[test]
+fn test_parse_attachment_instructions_with_reload() {
+    let json = instructions_json(
+        &[("/Users/brendan/.claude/CLAUDE.md", "User", "# AGENTS.md")],
+        Some((true, "session_start")),
+    );
+    let AttachmentData::Instructions(instructions) = parse_attachment(json) else {
+        panic!("Expected Instructions");
+    };
+    assert_eq!(
+        instructions.reload,
+        Some(ContextReload {
+            changed: true,
+            reason: "session_start".to_string(),
+        })
+    );
+}
+
+// A payload key outside `files`/`changed`/`reason` must still fail loudly; this guards the
+// intermediate `InstructionsAttachmentWire` struct, which is where `deny_unknown_fields` now lives
+// since `InstructionsAttachment` itself deserializes via `TryFrom`.
+#[test]
+fn test_parse_attachment_instructions_rejects_unknown_field_in_payload() {
+    let mut json = instructions_json(
+        &[("/Users/brendan/.claude/CLAUDE.md", "User", "# AGENTS.md")],
+        None,
+    );
+    json["attachment"]["bogus"] = serde_json::json!(1);
+    let error =
+        serde_json::from_value::<LogLine>(json).expect_err("unknown field must be rejected");
+    assert!(
+        error.to_string().contains("unknown field `bogus`"),
+        "unexpected error: {error}"
+    );
 }
 
 // An unrecognized instruction-file scope must fail loudly rather than being misclassified.
 #[test]
 fn test_parse_attachment_instructions_rejects_unknown_kind() {
-    let json = serde_json::json!({
-        "type": "attachment",
-        "parentUuid": null,
-        "isSidechain": false,
-        "attachment": {
-            "type": "instructions",
-            "files": [
-                {"path": "/x/CLAUDE.md", "type": "Enterprise", "content": "# x"}
-            ]
-        },
-        "uuid": "550e8400-e29b-41d4-a716-446655440000",
-        "timestamp": "2026-09-08T23:12:20.404Z",
-        "userType": "external",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
-        "version": "2.1.257",
-        "gitBranch": "main"
-    });
+    let json = instructions_json(&[("/x/CLAUDE.md", "Enterprise", "# x")], None);
     let err = serde_json::from_value::<LogLine>(json)
         .expect_err("Should reject an unknown instruction-file scope");
     assert!(
@@ -9787,6 +9884,22 @@ fn test_parse_attachment_instructions_rejects_unknown_kind() {
         "Error should name the unknown scope, got: {}",
         err
     );
+}
+
+// The flattened `reload` field must round-trip back to sibling `changed`/`reason` keys, not a
+// nested object, since that is the wire shape Claude Code actually emits.
+#[test]
+fn test_instructions_attachment_with_reload_round_trips() {
+    let attachment = serde_json::json!({
+        "type": "instructions",
+        "files": [
+            {"path": "/x/CLAUDE.md", "type": "User", "content": "# x"}
+        ],
+        "changed": true,
+        "reason": "session_start"
+    });
+    let parsed: AttachmentData = serde_json::from_value(attachment.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&parsed).unwrap(), attachment);
 }
 
 #[test]

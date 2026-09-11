@@ -127,14 +127,22 @@ test in a separate process, making this safe and preventing tests from clobberin
   on assistant turns, but emitted on both roles so both structs need the field), and six context-injection attachments
   Claude Code emits at the head of a turn — `instructions` (`InstructionsAttachment`, the CLAUDE.md files and auto-memory
   index loaded into context; each file's scope is the strict `InstructionsFileKind` enum — `User`/`Project`/`AutoMem` —
-  so a scope added later surfaces as a parse error rather than being silently misclassified), `environment`
+  so a scope added later surfaces as a parse error rather than being silently misclassified; a later build adds a
+  sibling `changed`/`reason` pair recording whether the files were reloaded and why (e.g. `session_start`), modeled as
+  a shared `Option<ContextReload>` field rather than sibling `Option`s because the wire always emits both together.
+  `changed`/`reason` are top-level siblings of `files` rather than a nested object, and `#[serde(flatten)]` cannot be
+  combined with `#[serde(deny_unknown_fields)]` on the same struct, so `InstructionsAttachment` deserializes via
+  `#[serde(try_from = "InstructionsAttachmentWire")]`: the intermediate wire struct keeps `deny_unknown_fields` and its
+  `TryFrom` conversion (sharing `context_reload_from_wire` with `SessionContext`) rejects a half-present pair instead
+  of silently dropping it; `reason` stays a `String` because only `session_start` has been observed), `environment`
   (`EnvironmentAttachment`, the working directory, worktree/git flags, platform, shell, OS version, and scratchpad path,
   plus an optional `changes` list — `EnvironmentChange` entries naming the snapshot fields that moved since the previous
   injection, absent on the first snapshot of a session; each `field` stays a `String` rather than an enum over
   `EnvironmentSnapshot`'s keys because a field added upstream already surfaces as an unknown-field error on the snapshot
   itself), `session_context` (`SessionContext`, the `userEmail`/`gitStatus` blurbs, already rendered as the prose the
   model sees rather than as structured data; `gitStatus` is optional because Claude Code omits it even inside a git
-  working copy, so its presence cannot be inferred from the record's `gitBranch`), `model` (`ModelAttachment`, the model-identity blurb plus the `ModelIdentity` it was
+  working copy, so its presence cannot be inferred from the record's `gitBranch`; also gained the same
+  `Option<ContextReload>` field and manual-deserialize treatment as `instructions`), `model` (`ModelAttachment`, the model-identity blurb plus the `ModelIdentity` it was
   rendered from, whose `modelId` parses into `Model` like every other wire model id), `date` (`DateAttachment`, the
   current date stated in the turn's context, plus a nullable `changed` flag saying whether it moved since the previous
   turn; distinct from `date_change`, which marks the date rolling over mid-session), and `prompt_snapshot` (`PromptSnapshot`, the system prompt as its constituent blocks plus the tool
