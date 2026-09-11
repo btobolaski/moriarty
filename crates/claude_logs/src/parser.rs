@@ -2395,6 +2395,10 @@ pub struct AssistantLogLine {
     /// Kept separate from the message stop reason because interrupted responses can still have
     /// billable usage and must remain analyzable. Added in Claude Code 2.1.219+.
     pub is_aborted_mid_stream: Option<bool>,
+    /// Marks a synthetic error turn that Claude Code recorded after the upstream response was cut
+    /// off partway through streaming output, distinct from [`Self::is_aborted_mid_stream`], which
+    /// records a response the client stopped. Added in Claude Code 2.1.257+.
+    pub truncated_after_output: Option<bool>,
     /// Reasoning-effort level the turn was generated at (e.g. "xhigh"). `Option` so pre-2.1.214
     /// lines still parse. Added in Claude Code 2.1.214+.
     pub effort: Option<ReasoningEffort>,

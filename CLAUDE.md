@@ -146,7 +146,10 @@ test in a separate process, making this safe and preventing tests from clobberin
   rendered from, whose `modelId` parses into `Model` like every other wire model id), `date` (`DateAttachment`, the
   current date stated in the turn's context, plus a nullable `changed` flag saying whether it moved since the previous
   turn; distinct from `date_change`, which marks the date rolling over mid-session), and `prompt_snapshot` (`PromptSnapshot`, the system prompt as its constituent blocks plus the tool
-  roster; `tools` is `Option` because some snapshots omit it entirely) (all added in Claude Code 2.1.257+), and an
+  roster; `tools` is `Option` because some snapshots omit it entirely) (all added in Claude Code 2.1.257+), and a
+  `truncatedAfterOutput` field on assistant turns (`AssistantLogLine`, marking a synthetic error turn Claude Code
+  recorded after the upstream response was cut off partway through streaming output; distinct from
+  `isAbortedMidStream`, which records a response the client stopped), and an
   `already_read_file` attachment (a file the turn already had in context, re-stated rather than re-read; its payload is
   byte-identical to `file`'s, so the variant reuses `FileAttachment` rather than declaring a duplicate struct; also
   added in Claude Code 2.1.257+), and a `_meta` member on the `mcpMeta` envelope (`McpMeta.meta`, MCP's reserved

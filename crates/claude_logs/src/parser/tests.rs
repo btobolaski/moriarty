@@ -26,6 +26,68 @@ fn user_log_line_json(extra: serde_json::Value) -> serde_json::Value {
     json
 }
 
+/// Overlays `extra` onto a minimal `AssistantLogLine` envelope so a case can state only the keys it
+/// is about. Unlike [`user_log_line_json`] the overlay merges nested objects rather than replacing
+/// them, because the assistant envelope's `message`/`usage` payloads are large and most cases change
+/// one key inside them; a non-object value (including `null`) always replaces.
+fn assistant_log_line_json(extra: serde_json::Value) -> serde_json::Value {
+    let mut json = serde_json::json!({
+        "parentUuid": "eede2871-e78d-4c6e-864a-76cac855f446",
+        "isSidechain": false,
+        "type": "assistant",
+        "uuid": "97d081ac-aa71-436d-bda0-0a53b196e6fe",
+        "timestamp": "2026-07-09T22:47:12.395Z",
+        "message": {
+            "id": "msg_011Cctf6yyjGaNhwgqmUY6KP",
+            "container": null,
+            "model": "claude-opus-4-8",
+            "role": "assistant",
+            "stop_details": null,
+            "stop_reason": "end_turn",
+            "stop_sequence": null,
+            "type": "message",
+            "usage": {
+                "input_tokens": 4,
+                "output_tokens": 8,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "server_tool_use": {"web_search_requests": 0, "web_fetch_requests": 0},
+                "service_tier": null,
+                "cache_creation": {"ephemeral_1h_input_tokens": 0, "ephemeral_5m_input_tokens": 0}
+            },
+            "content": [{"type": "text", "text": "ok"}],
+            "context_management": null
+        },
+        "requestId": "req_011Cctf6yyjGaNhwgqmUY6KP",
+        "userType": "external",
+        "cwd": "/test",
+        "sessionId": "22222222-2222-2222-2222-222222222222",
+        "version": "2.1.104",
+        "gitBranch": "HEAD"
+    });
+    merge_json(&mut json, extra);
+    json
+}
+
+fn merge_json(target: &mut serde_json::Value, overlay: serde_json::Value) {
+    match (target, overlay) {
+        (serde_json::Value::Object(target), serde_json::Value::Object(overlay)) => {
+            for (key, value) in overlay {
+                merge_json(target.entry(key).or_insert(serde_json::Value::Null), value);
+            }
+        }
+        (target, overlay) => *target = overlay,
+    }
+}
+
+fn parse_assistant_log_line(json: serde_json::Value) -> AssistantLogLine {
+    let line: LogLine = serde_json::from_value(json).expect("Failed to parse assistant log line");
+    let LogLine::Assistant(assistant) = line else {
+        panic!("Expected Assistant variant, got {line:?}");
+    };
+    *assistant
+}
+
 /// `target` selects the object the extra field is inserted into, so a caller can exercise a nested
 /// payload's strictness (an artifact entry) as well as the line's own.
 fn assert_log_line_rejects_extra_field(
@@ -1305,120 +1367,42 @@ fn test_parse_assistant_with_web_fetch_and_context_management() {
 // Synthetic API-error assistant turn (Claude Code 2.1.158) carrying error type + HTTP status.
 #[test]
 fn test_parse_assistant_api_error_message_with_status() {
-    let json = serde_json::json!({
-        "parentUuid": "92511969-25ff-4e15-8b0e-705cb1a6df59",
-        "isSidechain": false,
-        "type": "assistant",
-        "uuid": "2201f52c-7e6a-4415-8a94-1bbafcbd3747",
-        "timestamp": "2026-06-05T15:39:29.956Z",
-        "message": {
-            "id": "b33613b3-4af5-4202-b471-0f290ba1a955",
-            "container": null,
-            "model": "<synthetic>",
-            "role": "assistant",
-            "stop_reason": "stop_sequence",
-            "stop_sequence": "",
-            "type": "message",
-            "usage": {
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "cache_creation_input_tokens": 0,
-                "cache_read_input_tokens": 0,
-                "server_tool_use": {"web_search_requests": 0, "web_fetch_requests": 0},
-                "service_tier": null,
-                "cache_creation": {"ephemeral_1h_input_tokens": 0, "ephemeral_5m_input_tokens": 0}
-            },
-            "content": [{"type": "text", "text": "API Error: 529 Overloaded."}],
-            "context_management": null
-        },
-        "requestId": "req_011CbkMobZe6EibUaraVrDUU",
+    let assistant = parse_assistant_log_line(assistant_log_line_json(serde_json::json!({
+        "message": {"model": "<synthetic>"},
         "error": "server_error",
         "isApiErrorMessage": true,
         "apiErrorStatus": 529,
-        "userType": "external",
-        "entrypoint": "cli",
-        "cwd": "/test",
-        "sessionId": "897f641d-35f9-4a70-8b47-f3c8f3d9e308",
-        "version": "2.1.158",
-        "gitBranch": "HEAD",
-        "slug": "synchronous-sparking-scone"
-    });
+        "version": "2.1.158"
+    })));
 
-    let line: LogLine =
-        serde_json::from_value(json).expect("Failed to parse api-error assistant message");
-
-    match line {
-        LogLine::Assistant(assistant) => {
-            assert_eq!(assistant.is_api_error_message, Some(true));
-            assert_eq!(assistant.error.as_deref(), Some("server_error"));
-            assert_eq!(assistant.api_error_status, Some(529));
-            assert_eq!(assistant.error_details, None);
-        }
-        _ => panic!("Expected Assistant variant"),
-    }
+    assert_eq!(assistant.is_api_error_message, Some(true));
+    assert_eq!(assistant.error.as_deref(), Some("server_error"));
+    assert_eq!(assistant.api_error_status, Some(529));
+    assert_eq!(assistant.error_details, None);
 }
 
 // Synthetic API-error assistant turn (Claude Code 2.1.201) carrying the raw upstream error body in
 // `errorDetails` alongside `error`/`apiErrorStatus`.
 #[test]
 fn test_parse_assistant_api_error_message_with_error_details() {
-    let json = serde_json::json!({
-        "parentUuid": "eede2871-e78d-4c6e-864a-76cac855f446",
-        "isSidechain": false,
-        "type": "assistant",
-        "uuid": "97d081ac-aa71-436d-bda0-0a53b196e6fe",
-        "timestamp": "2026-07-07T22:47:12.395Z",
-        "message": {
-            "id": "5754569c-0201-4018-a884-9d76cbf94c47",
-            "container": null,
-            "model": "<synthetic>",
-            "role": "assistant",
-            "stop_details": null,
-            "stop_reason": "stop_sequence",
-            "stop_sequence": "",
-            "type": "message",
-            "usage": {
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "cache_creation_input_tokens": 0,
-                "cache_read_input_tokens": 0,
-                "server_tool_use": {"web_search_requests": 0, "web_fetch_requests": 0},
-                "service_tier": null,
-                "cache_creation": {"ephemeral_1h_input_tokens": 0, "ephemeral_5m_input_tokens": 0}
-            },
-            "content": [{"type": "text", "text": "You've hit your monthly spend limit. /model to switch models."}],
-            "context_management": null
-        },
-        "requestId": "req_011CcoWaJyfmubPDDPN2iUDU",
+    let assistant = parse_assistant_log_line(assistant_log_line_json(serde_json::json!({
+        "message": {"model": "<synthetic>"},
         "error": "rate_limit",
         "errorDetails": "429 {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"This request would exceed your account's monthly spend limit. Please try again later.\"},\"request_id\":\"req_011CcoWaJyfmubPDDPN2iUDU\"}",
         "isApiErrorMessage": true,
         "apiErrorStatus": 429,
-        "userType": "external",
-        "entrypoint": "cli",
-        "cwd": "/test",
-        "sessionId": "e51c5fa7-4122-484e-8183-8c531ff7b98c",
-        "version": "2.1.201",
-        "gitBranch": "HEAD"
-    });
+        "version": "2.1.201"
+    })));
 
-    let line: LogLine =
-        serde_json::from_value(json).expect("Failed to parse api-error assistant message");
-
-    match line {
-        LogLine::Assistant(assistant) => {
-            assert_eq!(assistant.is_api_error_message, Some(true));
-            assert_eq!(assistant.error.as_deref(), Some("rate_limit"));
-            assert_eq!(assistant.api_error_status, Some(429));
-            assert_eq!(
-                assistant.error_details.as_deref(),
-                Some(
-                    "429 {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"This request would exceed your account's monthly spend limit. Please try again later.\"},\"request_id\":\"req_011CcoWaJyfmubPDDPN2iUDU\"}"
-                )
-            );
-        }
-        _ => panic!("Expected Assistant variant"),
-    }
+    assert_eq!(assistant.is_api_error_message, Some(true));
+    assert_eq!(assistant.error.as_deref(), Some("rate_limit"));
+    assert_eq!(assistant.api_error_status, Some(429));
+    assert_eq!(
+        assistant.error_details.as_deref(),
+        Some(
+            "429 {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"This request would exceed your account's monthly spend limit. Please try again later.\"},\"request_id\":\"req_011CcoWaJyfmubPDDPN2iUDU\"}"
+        )
+    );
 }
 
 // Claude Code 2.1.206 began repeating the session id under the snake_case key `session_id`
@@ -1427,249 +1411,77 @@ fn test_parse_assistant_api_error_message_with_error_details() {
 // rather than reject the line; it lands in `session_id_snake` and always matches `sessionId`.
 #[test]
 fn test_parse_assistant_with_snake_case_session_id() {
-    let json = serde_json::json!({
-        "parentUuid": "eede2871-e78d-4c6e-864a-76cac855f446",
-        "isSidechain": false,
-        "type": "assistant",
-        "uuid": "97d081ac-aa71-436d-bda0-0a53b196e6fe",
-        "timestamp": "2026-07-09T22:47:12.395Z",
-        "message": {
-            "id": "msg_011Cctf6yyjGaNhwgqmUY6KP",
-            "container": null,
-            "model": "claude-opus-4-8",
-            "role": "assistant",
-            "stop_details": null,
-            "stop_reason": "end_turn",
-            "stop_sequence": null,
-            "type": "message",
-            "usage": {
-                "input_tokens": 4,
-                "output_tokens": 8,
-                "cache_creation_input_tokens": 0,
-                "cache_read_input_tokens": 0,
-                "server_tool_use": {"web_search_requests": 0, "web_fetch_requests": 0},
-                "service_tier": null,
-                "cache_creation": {"ephemeral_1h_input_tokens": 0, "ephemeral_5m_input_tokens": 0}
-            },
-            "content": [{"type": "text", "text": "ok"}],
-            "context_management": null
-        },
-        "requestId": "req_011Cctf6yyjGaNhwgqmUY6KP",
-        // Distinct from `sessionId` below so the assertions prove the snake_case key maps to
-        // `session_id_snake` specifically; real logs always carry the same value in both.
+    let assistant = parse_assistant_log_line(assistant_log_line_json(serde_json::json!({
+        // Distinct from the envelope's `sessionId` so the assertions prove the snake_case key maps
+        // to `session_id_snake` specifically; real logs always carry the same value in both.
         "session_id": "11111111-1111-1111-1111-111111111111",
-        "userType": "external",
-        "entrypoint": "cli",
-        "cwd": "/test",
-        "sessionId": "22222222-2222-2222-2222-222222222222",
-        "version": "2.1.206",
-        "gitBranch": "HEAD"
-    });
+        "version": "2.1.206"
+    })));
 
-    let line: LogLine =
-        serde_json::from_value(json).expect("Failed to parse assistant with snake_case session_id");
-    match line {
-        LogLine::Assistant(assistant) => {
-            assert_eq!(
-                assistant.session_id_snake.as_deref(),
-                Some("11111111-1111-1111-1111-111111111111")
-            );
-            assert_eq!(assistant.session_id, "22222222-2222-2222-2222-222222222222");
-        }
-        _ => panic!("Expected Assistant variant"),
-    }
+    assert_eq!(
+        assistant.session_id_snake.as_deref(),
+        Some("11111111-1111-1111-1111-111111111111")
+    );
+    assert_eq!(assistant.session_id, "22222222-2222-2222-2222-222222222222");
 }
 
 // The `effort` field on assistant turns (Claude Code 2.1.214+) records the reasoning-effort level.
 #[test]
 fn test_parse_assistant_with_effort() {
-    let json = serde_json::json!({
-        "parentUuid": "eede2871-e78d-4c6e-864a-76cac855f446",
-        "isSidechain": false,
-        "type": "assistant",
-        "uuid": "97d081ac-aa71-436d-bda0-0a53b196e6fe",
-        "timestamp": "2026-07-21T00:14:47.742Z",
-        "message": {
-            "id": "msg_011Cctf6yyjGaNhwgqmUY6KP",
-            "container": null,
-            "model": "claude-fable-5",
-            "role": "assistant",
-            "stop_details": null,
-            "stop_reason": "end_turn",
-            "stop_sequence": null,
-            "type": "message",
-            "usage": {
-                "input_tokens": 4,
-                "output_tokens": 8,
-                "cache_creation_input_tokens": 0,
-                "cache_read_input_tokens": 0,
-                "server_tool_use": {"web_search_requests": 0, "web_fetch_requests": 0},
-                "service_tier": null,
-                "cache_creation": {"ephemeral_1h_input_tokens": 0, "ephemeral_5m_input_tokens": 0}
-            },
-            "content": [{"type": "text", "text": "ok"}],
-            "context_management": null
-        },
-        "requestId": "req_011Cctf6yyjGaNhwgqmUY6KP",
-        "userType": "external",
-        "entrypoint": "cli",
-        "cwd": "/test",
-        "sessionId": "22222222-2222-2222-2222-222222222222",
+    let assistant = parse_assistant_log_line(assistant_log_line_json(serde_json::json!({
         "version": "2.1.214",
-        "gitBranch": "HEAD",
         "effort": "xhigh"
-    });
+    })));
 
-    let line: LogLine =
-        serde_json::from_value(json).expect("Failed to parse assistant with effort");
-    match line {
-        LogLine::Assistant(assistant) => {
-            assert_eq!(assistant.effort, Some(ReasoningEffort::Xhigh));
-        }
-        _ => panic!("Expected Assistant variant"),
-    }
+    assert_eq!(assistant.effort, Some(ReasoningEffort::Xhigh));
 }
 
 #[test]
 fn test_parse_assistant_with_api_block_index() {
-    let json = serde_json::json!({
-        "parentUuid": "eede2871-e78d-4c6e-864a-76cac855f446",
-        "isSidechain": false,
-        "type": "assistant",
-        "uuid": "97d081ac-aa71-436d-bda0-0a53b196e6fe",
-        "timestamp": "2026-09-02T18:23:37.664Z",
-        "message": {
-            "id": "msg_011Cef5aGTMePVioUn5Gqs1w",
-            "container": null,
-            "model": "claude-opus-5",
-            "role": "assistant",
-            "stop_details": null,
-            "stop_reason": "tool_use",
-            "stop_sequence": null,
-            "type": "message",
-            "usage": {
-                "input_tokens": 2,
-                "output_tokens": 296,
-                "cache_creation_input_tokens": 0,
-                "cache_read_input_tokens": 0,
-                "server_tool_use": {"web_search_requests": 0, "web_fetch_requests": 0},
-                "service_tier": "standard",
-                "cache_creation": {"ephemeral_1h_input_tokens": 0, "ephemeral_5m_input_tokens": 0}
-            },
-            "content": [{"type": "text", "text": "ok"}],
-            "context_management": null
-        },
+    let assistant = parse_assistant_log_line(assistant_log_line_json(serde_json::json!({
         "apiBlockIndex": 2,
-        "requestId": "req_011Cef5aFmC2FNPZybBeEqNr",
-        "userType": "external",
-        "entrypoint": "cli",
-        "cwd": "/test",
-        "sessionId": "22222222-2222-2222-2222-222222222222",
-        "version": "2.1.257",
-        "gitBranch": "HEAD"
-    });
+        "version": "2.1.257"
+    })));
 
-    let line: LogLine =
-        serde_json::from_value(json).expect("Failed to parse assistant with apiBlockIndex");
-    match line {
-        LogLine::Assistant(assistant) => {
-            assert_eq!(assistant.api_block_index, Some(2));
-        }
-        _ => panic!("Expected Assistant variant"),
-    }
+    assert_eq!(assistant.api_block_index, Some(2));
+}
+
+#[test]
+fn test_parse_assistant_with_truncated_after_output() {
+    let assistant = parse_assistant_log_line(assistant_log_line_json(serde_json::json!({
+        "message": {"model": "<synthetic>"},
+        "error": "server_error",
+        "truncatedAfterOutput": true,
+        "isApiErrorMessage": true,
+        "version": "2.1.257"
+    })));
+
+    assert_eq!(assistant.truncated_after_output, Some(true));
+    assert_eq!(assistant.is_api_error_message, Some(true));
+    assert_eq!(assistant.error.as_deref(), Some("server_error"));
 }
 
 #[test]
 fn test_parse_assistant_with_is_aborted_mid_stream() {
-    let json = serde_json::json!({
-        "parentUuid": "eede2871-e78d-4c6e-864a-76cac855f446",
-        "isSidechain": false,
-        "type": "assistant",
-        "uuid": "97d081ac-aa71-436d-bda0-0a53b196e6fe",
-        "timestamp": "2026-07-27T21:55:37.279Z",
-        "message": {
-            "id": "msg_011Cctf6yyjGaNhwgqmUY6KP",
-            "container": null,
-            "model": "claude-opus-5",
-            "role": "assistant",
-            "stop_details": null,
-            "stop_reason": null,
-            "stop_sequence": null,
-            "type": "message",
-            "usage": {
-                "input_tokens": 2,
-                "output_tokens": 1,
-                "cache_creation_input_tokens": 261,
-                "cache_read_input_tokens": 61828,
-                "service_tier": "standard",
-                "cache_creation": {"ephemeral_1h_input_tokens": 261, "ephemeral_5m_input_tokens": 0}
-            },
-            "content": [{"type": "text", "text": "interrupted"}]
-        },
-        "requestId": "req_011Cctf6yyjGaNhwgqmUY6KP",
-        "userType": "external",
-        "entrypoint": "cli",
-        "cwd": "/test",
-        "sessionId": "22222222-2222-2222-2222-222222222222",
-        "session_id": "22222222-2222-2222-2222-222222222222",
+    let assistant = parse_assistant_log_line(assistant_log_line_json(serde_json::json!({
         "version": "2.1.219",
-        "gitBranch": "HEAD",
-        "isAbortedMidStream": true,
-        "effort": "xhigh"
-    });
+        "isAbortedMidStream": true
+    })));
 
-    let line: LogLine =
-        serde_json::from_value(json).expect("Failed to parse assistant with isAbortedMidStream");
-    match line {
-        LogLine::Assistant(assistant) => assert_eq!(assistant.is_aborted_mid_stream, Some(true)),
-        _ => panic!("Expected Assistant variant"),
-    }
+    assert_eq!(assistant.is_aborted_mid_stream, Some(true));
 }
 
-// Pre-2.1.214 assistant records omit `effort`, so it stays `None`.
+// Older assistant records omit the fields later Claude Code versions added, so each stays `None`.
 #[test]
-fn test_parse_assistant_without_effort() {
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
-        "type": "assistant",
-        "uuid": "97d081ac-aa71-436d-bda0-0a53b196e6fe",
-        "timestamp": "2026-07-09T22:47:12.395Z",
-        "message": {
-            "id": "msg_011Cctf6yyjGaNhwgqmUY6KP",
-            "container": null,
-            "model": "claude-opus-4-8",
-            "role": "assistant",
-            "stop_details": null,
-            "stop_reason": "end_turn",
-            "stop_sequence": null,
-            "type": "message",
-            "usage": {
-                "input_tokens": 4,
-                "output_tokens": 8,
-                "cache_creation_input_tokens": 0,
-                "cache_read_input_tokens": 0,
-                "server_tool_use": {"web_search_requests": 0, "web_fetch_requests": 0},
-                "service_tier": null,
-                "cache_creation": {"ephemeral_1h_input_tokens": 0, "ephemeral_5m_input_tokens": 0}
-            },
-            "content": [{"type": "text", "text": "ok"}],
-            "context_management": null
-        },
-        "requestId": "req_011Cctf6yyjGaNhwgqmUY6KP",
-        "userType": "external",
-        "cwd": "/test",
-        "sessionId": "22222222-2222-2222-2222-222222222222",
-        "version": "2.1.104",
-        "gitBranch": "HEAD"
-    });
+fn test_parse_assistant_without_later_optional_fields() {
+    let assistant = parse_assistant_log_line(assistant_log_line_json(serde_json::json!({})));
 
-    let line: LogLine =
-        serde_json::from_value(json).expect("Failed to parse assistant without effort");
-    match line {
-        LogLine::Assistant(assistant) => assert_eq!(assistant.effort, None),
-        _ => panic!("Expected Assistant variant"),
-    }
+    assert_eq!(assistant.effort, None);
+    assert_eq!(assistant.entrypoint, None);
+    assert_eq!(assistant.api_block_index, None);
+    assert_eq!(assistant.truncated_after_output, None);
+    assert_eq!(assistant.is_aborted_mid_stream, None);
+    assert_eq!(assistant.session_id_snake, None);
 }
 
 // The effort enum is strict so a genuinely new level surfaces as a parse error rather than being
@@ -9933,73 +9745,11 @@ fn test_parse_attachment_rejects_unknown_fields() {
 
 #[test]
 fn test_parse_assistant_log_line_with_entrypoint() {
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
-        "userType": "test",
-        "cwd": "/test",
-        "sessionId": "test-session",
-        "version": "2.1.104",
-        "gitBranch": "main",
-        "message": {
-            "id": "msg-1",
-            "type": "message",
-            "role": "assistant",
-            "content": "response",
-            "model": "claude-sonnet-4-6",
-            "stop_reason": "end_turn",
-            "usage": {
-                "input_tokens": 100,
-                "cache_creation_input_tokens": 0,
-                "cache_read_input_tokens": 0,
-                "cache_creation": {
-                    "ephemeral_5m_input_tokens": 0,
-                    "ephemeral_1h_input_tokens": 0
-                },
-                "output_tokens": 50
-            }
-        },
-        "uuid": "550e8400-e29b-41d4-a716-446655440002",
-        "timestamp": "2025-01-01T00:00:00Z",
+    let assistant = parse_assistant_log_line(assistant_log_line_json(serde_json::json!({
         "entrypoint": "cli"
-    });
-    let line: AssistantLogLine = serde_json::from_value(json).unwrap();
-    assert_eq!(line.entrypoint, Some("cli".to_string()));
-}
+    })));
 
-#[test]
-fn test_parse_assistant_log_line_without_entrypoint() {
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
-        "userType": "test",
-        "cwd": "/test",
-        "sessionId": "test-session",
-        "version": "1.0",
-        "gitBranch": "main",
-        "message": {
-            "id": "msg-1",
-            "type": "message",
-            "role": "assistant",
-            "content": "response",
-            "model": "claude-3-5-sonnet",
-            "stop_reason": "end_turn",
-            "usage": {
-                "input_tokens": 100,
-                "cache_creation_input_tokens": 0,
-                "cache_read_input_tokens": 0,
-                "cache_creation": {
-                    "ephemeral_5m_input_tokens": 0,
-                    "ephemeral_1h_input_tokens": 0
-                },
-                "output_tokens": 50
-            }
-        },
-        "uuid": "550e8400-e29b-41d4-a716-446655440002",
-        "timestamp": "2025-01-01T00:00:00Z"
-    });
-    let line: AssistantLogLine = serde_json::from_value(json).unwrap();
-    assert_eq!(line.entrypoint, None);
+    assert_eq!(assistant.entrypoint.as_deref(), Some("cli"));
 }
 
 #[test]
