@@ -141,7 +141,11 @@ test in a separate process, making this safe and preventing tests from clobberin
   roster; `tools` is `Option` because some snapshots omit it entirely) (all added in Claude Code 2.1.257+), and an
   `already_read_file` attachment (a file the turn already had in context, re-stated rather than re-read; its payload is
   byte-identical to `file`'s, so the variant reuses `FileAttachment` rather than declaring a duplicate struct; also
-  added in Claude Code 2.1.257+)
+  added in Claude Code 2.1.257+), and a `_meta` member on the `mcpMeta` envelope (`McpMeta.meta`, MCP's reserved
+  per-result metadata object carried through verbatim from the responding server; unlike its `structuredContent`
+  sibling and the rest of the strict envelope, its keys are server-defined rather than Claude Code protocol, so it is
+  kept an opaque `HashMap<String, serde_json::Value>` for the same reason `ToolUseResult::Map` is; observed in Claude
+  Code 2.1.257+)
 - Also owns the structured view of the raw `model` string via `model::Model { family, version }` plus `ModelFamily` and
   `ModelVersion`. Both `cost_analyzer` (for pricing) and `moriarty::api_pricing` (for grouping/display) consume this one
   parser so family/version classification is not duplicated across crates. The parser preserves capability-decorated raw

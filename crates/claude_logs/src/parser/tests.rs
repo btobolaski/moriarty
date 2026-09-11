@@ -1,5 +1,31 @@
 use super::*;
 
+/// Overlays `extra` onto the minimal required `UserLogLine` envelope, so a case can state only the
+/// keys it is about; an overlaid key replaces the envelope's value.
+fn user_log_line_json(extra: serde_json::Value) -> serde_json::Value {
+    let mut json = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "userType": "test",
+        "cwd": "/test",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "version": "2.1.158",
+        "gitBranch": "main",
+        "message": {"role": "user", "content": "test"},
+        "uuid": "550e8400-e29b-41d4-a716-446655440001",
+        "timestamp": "2025-01-01T00:00:00Z"
+    });
+    json.as_object_mut()
+        .expect("envelope is a JSON object")
+        .extend(
+            extra
+                .as_object()
+                .expect("overlay must be a JSON object")
+                .clone(),
+        );
+    json
+}
+
 /// `target` selects the object the extra field is inserted into, so a caller can exercise a nested
 /// payload's strictness (an artifact entry) as well as the line's own.
 fn assert_log_line_rejects_extra_field(
@@ -34,78 +60,37 @@ fn parse_attachment(json: serde_json::Value) -> AttachmentData {
 
 #[test]
 fn test_parse_user_log_line_with_agent_id() {
-    let json = serde_json::json!({
-        "agentId": "agent-123",
-        "parentUuid": null,
-        "isSidechain": false,
-        "userType": "test",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
-        "version": "1.0",
-        "gitBranch": "main",
-        "message": {"role": "user", "content": "test"},
-        "uuid": "550e8400-e29b-41d4-a716-446655440001",
-        "timestamp": "2025-01-01T00:00:00Z"
-    });
+    let json = user_log_line_json(serde_json::json!({
+        "agentId": "agent-123"
+    }));
     let line: UserLogLine = serde_json::from_value(json).unwrap();
     assert_eq!(line.agent_id, Some("agent-123".to_string()));
 }
 
 #[test]
 fn test_parse_user_log_line_with_null_agent_id() {
-    let json = serde_json::json!({
-        "agentId": null,
-        "parentUuid": null,
-        "isSidechain": false,
-        "userType": "test",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
-        "version": "1.0",
-        "gitBranch": "main",
-        "message": {"role": "user", "content": "test"},
-        "uuid": "550e8400-e29b-41d4-a716-446655440001",
-        "timestamp": "2025-01-01T00:00:00Z"
-    });
+    let json = user_log_line_json(serde_json::json!({
+        "agentId": null
+    }));
     let line: UserLogLine = serde_json::from_value(json).unwrap();
     assert_eq!(line.agent_id, None);
 }
 
 #[test]
 fn test_parse_user_log_line_without_agent_id() {
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
-        "userType": "test",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
-        "version": "1.0",
-        "gitBranch": "main",
-        "message": {"role": "user", "content": "test"},
-        "uuid": "550e8400-e29b-41d4-a716-446655440001",
-        "timestamp": "2025-01-01T00:00:00Z"
-    });
+    let json = user_log_line_json(serde_json::json!({}));
     let line: UserLogLine = serde_json::from_value(json).unwrap();
     assert_eq!(line.agent_id, None);
 }
 
 #[test]
 fn test_parse_user_log_line_with_todos() {
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
-        "userType": "test",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
-        "version": "1.0",
-        "gitBranch": "main",
-        "message": {"role": "user", "content": "test"},
-        "uuid": "550e8400-e29b-41d4-a716-446655440001",
-        "timestamp": "2025-01-01T00:00:00Z",
+    let json = user_log_line_json(serde_json::json!({
         "todos": [
             {"content": "Task 1", "status": "pending", "activeForm": "Working on Task 1"},
             {"content": "Task 2", "status": "completed", "activeForm": "Working on Task 2"}
         ]
-    });
+    }));
     let line: UserLogLine = serde_json::from_value(json).unwrap();
     assert!(line.todos.is_some());
     let todos = line.todos.unwrap();
@@ -120,21 +105,11 @@ fn test_parse_user_log_line_with_todos() {
 
 #[test]
 fn test_parse_user_log_line_with_in_progress_todo() {
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
-        "userType": "test",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
-        "version": "1.0",
-        "gitBranch": "main",
-        "message": {"role": "user", "content": "test"},
-        "uuid": "550e8400-e29b-41d4-a716-446655440001",
-        "timestamp": "2025-01-01T00:00:00Z",
+    let json = user_log_line_json(serde_json::json!({
         "todos": [
             {"content": "Task 1", "status": "in_progress", "activeForm": "Working on Task 1"}
         ]
-    });
+    }));
     let line: UserLogLine = serde_json::from_value(json).unwrap();
     let todos = line.todos.unwrap();
     assert_eq!(todos.len(), 1);
@@ -461,75 +436,34 @@ fn test_fork_context_ref_round_trips() {
 
 #[test]
 fn test_parse_user_log_line_with_null_todos() {
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
-        "userType": "test",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
-        "version": "1.0",
-        "gitBranch": "main",
-        "message": {"role": "user", "content": "test"},
-        "uuid": "550e8400-e29b-41d4-a716-446655440001",
-        "timestamp": "2025-01-01T00:00:00Z",
+    let json = user_log_line_json(serde_json::json!({
         "todos": null
-    });
+    }));
     let line: UserLogLine = serde_json::from_value(json).unwrap();
     assert_eq!(line.todos, None);
 }
 
 #[test]
 fn test_parse_user_log_line_without_todos() {
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
-        "userType": "test",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
-        "version": "1.0",
-        "gitBranch": "main",
-        "message": {"role": "user", "content": "test"},
-        "uuid": "550e8400-e29b-41d4-a716-446655440001",
-        "timestamp": "2025-01-01T00:00:00Z"
-    });
+    let json = user_log_line_json(serde_json::json!({}));
     let line: UserLogLine = serde_json::from_value(json).unwrap();
     assert_eq!(line.todos, None);
 }
 
 #[test]
 fn test_parse_user_log_line_with_empty_todos() {
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
-        "userType": "test",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
-        "version": "1.0",
-        "gitBranch": "main",
-        "message": {"role": "user", "content": "test"},
-        "uuid": "550e8400-e29b-41d4-a716-446655440001",
-        "timestamp": "2025-01-01T00:00:00Z",
+    let json = user_log_line_json(serde_json::json!({
         "todos": []
-    });
+    }));
     let line: UserLogLine = serde_json::from_value(json).unwrap();
     assert_eq!(line.todos, Some(vec![]));
 }
 
 #[test]
 fn test_parse_user_log_line_rejects_unknown_fields() {
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
-        "userType": "test",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
-        "version": "1.0",
-        "gitBranch": "main",
-        "message": {"role": "user", "content": "test"},
-        "uuid": "550e8400-e29b-41d4-a716-446655440001",
-        "timestamp": "2025-01-01T00:00:00Z",
+    let json = user_log_line_json(serde_json::json!({
         "unknownField": "should be rejected"
-    });
+    }));
 
     let err_msg = serde_json::from_value::<UserLogLine>(json)
         .expect_err("Should reject unknown fields due to deny_unknown_fields")
@@ -543,17 +477,7 @@ fn test_parse_user_log_line_rejects_unknown_fields() {
 
 #[test]
 fn test_parse_todo_rejects_unknown_fields() {
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
-        "userType": "test",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
-        "version": "1.0",
-        "gitBranch": "main",
-        "message": {"role": "user", "content": "test"},
-        "uuid": "550e8400-e29b-41d4-a716-446655440001",
-        "timestamp": "2025-01-01T00:00:00Z",
+    let json = user_log_line_json(serde_json::json!({
         "todos": [
             {
                 "content": "Task 1",
@@ -562,7 +486,7 @@ fn test_parse_todo_rejects_unknown_fields() {
                 "unknownField": "should be rejected"
             }
         ]
-    });
+    }));
 
     let err_msg = serde_json::from_value::<UserLogLine>(json)
         .expect_err("Should reject unknown fields in Todo struct")
@@ -705,14 +629,7 @@ fn test_parse_document_content() {
 
 #[test]
 fn test_parse_user_message_with_document() {
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
-        "userType": "test",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
-        "version": "1.0",
-        "gitBranch": "main",
+    let json = user_log_line_json(serde_json::json!({
         "message": {
             "role": "user",
             "content": [{
@@ -723,10 +640,8 @@ fn test_parse_user_message_with_document() {
                     "data": "JVBERi0xLjQK"
                 }
             }]
-        },
-        "uuid": "550e8400-e29b-41d4-a716-446655440001",
-        "timestamp": "2025-01-01T00:00:00Z"
-    });
+        }
+    }));
 
     let line: UserLogLine = serde_json::from_value(json).unwrap();
 
@@ -1916,18 +1831,11 @@ fn test_parse_stop_hook_summary_with_snake_case_session_id() {
 // Pre-2.1.206 records omit the snake_case duplicate, so `session_id_snake` stays `None`.
 #[test]
 fn test_parse_user_without_snake_case_session_id_yields_none() {
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
+    let json = user_log_line_json(serde_json::json!({
         "userType": "external",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
         "version": "2.1.201",
-        "gitBranch": "main",
-        "message": {"role": "user", "content": "test"},
-        "uuid": "550e8400-e29b-41d4-a716-446655440001",
         "timestamp": "2026-07-09T00:00:00Z"
-    });
+    }));
     let line: UserLogLine = serde_json::from_value(json).unwrap();
     assert_eq!(line.session_id_snake, None);
 }
@@ -3520,19 +3428,10 @@ fn test_parse_system_log_informational_rejects_unknown_fields() {
 
 #[test]
 fn test_parse_user_log_line_with_source_tool_assistant_uuid() {
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
-        "userType": "test",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+    let json = user_log_line_json(serde_json::json!({
         "version": "2.0.51",
-        "gitBranch": "main",
-        "message": {"role": "user", "content": "test"},
-        "uuid": "550e8400-e29b-41d4-a716-446655440001",
-        "timestamp": "2025-01-01T00:00:00Z",
         "sourceToolAssistantUUID": "550e8400-e29b-41d4-a716-446655440099"
-    });
+    }));
     let line: UserLogLine = serde_json::from_value(json).unwrap();
     assert_eq!(
         line.source_tool_assistant_uuid,
@@ -3577,20 +3476,16 @@ fn test_parse_user_log_line_with_tool_ends_turn() {
 
 #[test]
 fn test_parse_user_log_line_with_tool_ends_turn_false() {
-    let json = serde_json::json!({
-        "parentUuid": null,
+    let json = user_log_line_json(serde_json::json!({
         "isSidechain": true,
-        "agentId": "agent-1",
         "userType": "external",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
         "version": "2.1.206",
         "gitBranch": "HEAD",
         "message": {"role": "user", "content": "continue"},
-        "uuid": "550e8400-e29b-41d4-a716-446655440001",
         "timestamp": "2026-07-15T15:53:10.905Z",
+        "agentId": "agent-1",
         "toolEndsTurn": false
-    });
+    }));
 
     let line: UserLogLine = serde_json::from_value(json).expect("Should preserve false");
     assert_eq!(line.tool_ends_turn, Some(false));
@@ -3598,37 +3493,19 @@ fn test_parse_user_log_line_with_tool_ends_turn_false() {
 
 #[test]
 fn test_parse_user_log_line_with_null_source_tool_assistant_uuid() {
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
-        "userType": "test",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+    let json = user_log_line_json(serde_json::json!({
         "version": "2.0.51",
-        "gitBranch": "main",
-        "message": {"role": "user", "content": "test"},
-        "uuid": "550e8400-e29b-41d4-a716-446655440001",
-        "timestamp": "2025-01-01T00:00:00Z",
         "sourceToolAssistantUUID": null
-    });
+    }));
     let line: UserLogLine = serde_json::from_value(json).unwrap();
     assert_eq!(line.source_tool_assistant_uuid, None);
 }
 
 #[test]
 fn test_parse_user_log_line_without_source_tool_assistant_uuid() {
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
-        "userType": "test",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
-        "version": "2.0.50",
-        "gitBranch": "main",
-        "message": {"role": "user", "content": "test"},
-        "uuid": "550e8400-e29b-41d4-a716-446655440001",
-        "timestamp": "2025-01-01T00:00:00Z"
-    });
+    let json = user_log_line_json(serde_json::json!({
+        "version": "2.0.50"
+    }));
     let line: UserLogLine = serde_json::from_value(json).unwrap();
     assert_eq!(line.source_tool_assistant_uuid, None);
 }
@@ -6127,19 +6004,10 @@ fn test_parse_fallback_content_block_rejects_unknown_fields() {
 
 #[test]
 fn test_parse_user_log_line_with_prompt_id() {
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
-        "userType": "test",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+    let json = user_log_line_json(serde_json::json!({
         "version": "2.1.77",
-        "gitBranch": "main",
-        "message": {"role": "user", "content": "test"},
-        "uuid": "550e8400-e29b-41d4-a716-446655440001",
-        "timestamp": "2025-01-01T00:00:00Z",
         "promptId": "550e8400-e29b-41d4-a716-446655440088"
-    });
+    }));
     let line: UserLogLine = serde_json::from_value(json).unwrap();
     assert_eq!(
         line.prompt_id,
@@ -6149,56 +6017,29 @@ fn test_parse_user_log_line_with_prompt_id() {
 
 #[test]
 fn test_parse_user_log_line_with_null_prompt_id() {
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
-        "userType": "test",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+    let json = user_log_line_json(serde_json::json!({
         "version": "2.1.77",
-        "gitBranch": "main",
-        "message": {"role": "user", "content": "test"},
-        "uuid": "550e8400-e29b-41d4-a716-446655440001",
-        "timestamp": "2025-01-01T00:00:00Z",
         "promptId": null
-    });
+    }));
     let line: UserLogLine = serde_json::from_value(json).unwrap();
     assert_eq!(line.prompt_id, None);
 }
 
 #[test]
 fn test_parse_user_log_line_without_prompt_id() {
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
-        "userType": "test",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
-        "version": "2.0.50",
-        "gitBranch": "main",
-        "message": {"role": "user", "content": "test"},
-        "uuid": "550e8400-e29b-41d4-a716-446655440001",
-        "timestamp": "2025-01-01T00:00:00Z"
-    });
+    let json = user_log_line_json(serde_json::json!({
+        "version": "2.0.50"
+    }));
     let line: UserLogLine = serde_json::from_value(json).unwrap();
     assert_eq!(line.prompt_id, None);
 }
 
 #[test]
 fn test_parse_user_log_line_with_prompt_source() {
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
-        "userType": "test",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+    let json = user_log_line_json(serde_json::json!({
         "version": "2.1.170",
-        "gitBranch": "main",
-        "message": {"role": "user", "content": "test"},
-        "uuid": "550e8400-e29b-41d4-a716-446655440001",
-        "timestamp": "2025-01-01T00:00:00Z",
         "promptSource": "typed"
-    });
+    }));
     let line: UserLogLine = serde_json::from_value(json).unwrap();
     assert_eq!(line.prompt_source.as_deref(), Some("typed"));
 }
@@ -6333,18 +6174,9 @@ fn test_parse_user_log_line_with_automode_unavailable_tool_denial_kind() {
 #[test]
 fn test_parse_user_log_line_without_tool_denial_kind() {
     // The field is absent on ordinary user turns, so it must default to None.
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
-        "userType": "test",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
-        "version": "2.1.201",
-        "gitBranch": "main",
-        "message": {"role": "user", "content": "test"},
-        "uuid": "550e8400-e29b-41d4-a716-446655440001",
-        "timestamp": "2025-01-01T00:00:00Z"
-    });
+    let json = user_log_line_json(serde_json::json!({
+        "version": "2.1.201"
+    }));
     let line: UserLogLine = serde_json::from_value(json).unwrap();
     assert_eq!(line.tool_denial_kind, None);
 }
@@ -6353,19 +6185,10 @@ fn test_parse_user_log_line_without_tool_denial_kind() {
 fn test_parse_user_log_line_rejects_unknown_tool_denial_kind() {
     // ToolDenialKind is a closed enum: an unrecognized denial kind must fail to parse so the new
     // value surfaces rather than being silently dropped.
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
-        "userType": "test",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+    let json = user_log_line_json(serde_json::json!({
         "version": "2.1.201",
-        "gitBranch": "main",
-        "message": {"role": "user", "content": "test"},
-        "uuid": "550e8400-e29b-41d4-a716-446655440001",
-        "timestamp": "2025-01-01T00:00:00Z",
         "toolDenialKind": "totally-bogus-kind"
-    });
+    }));
     let err_msg = serde_json::from_value::<UserLogLine>(json)
         .expect_err("Should reject unknown toolDenialKind variant")
         .to_string();
@@ -6502,23 +6325,19 @@ fn test_parse_user_log_line_with_classifier_meta_lines() {
 
 #[test]
 fn test_parse_user_log_line_with_image_paste_ids() {
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
+    let json = user_log_line_json(serde_json::json!({
         "userType": "external",
-        "entrypoint": "cli",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
         "version": "2.1.257",
         "gitBranch": "HEAD",
+        "uuid": "f7c10d66-4699-489b-8f4c-df52f5e0fd34",
+        "timestamp": "2026-09-03T15:51:51.767Z",
+        "entrypoint": "cli",
         "message": {"role": "user", "content": [
             {"type": "text", "text": "[Image #1] what is this"},
             {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGk="}}
         ]},
-        "uuid": "f7c10d66-4699-489b-8f4c-df52f5e0fd34",
-        "timestamp": "2026-09-03T15:51:51.767Z",
         "imagePasteIds": [1]
-    });
+    }));
     let line: UserLogLine = serde_json::from_value(json).unwrap();
     assert_eq!(line.image_paste_ids, Some(vec![1]));
 }
@@ -6526,18 +6345,9 @@ fn test_parse_user_log_line_with_image_paste_ids() {
 #[test]
 fn test_parse_user_log_line_without_queue_priority() {
     // The field is absent on turns sent immediately, so it must default to None.
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
-        "userType": "test",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
-        "version": "2.1.201",
-        "gitBranch": "main",
-        "message": {"role": "user", "content": "test"},
-        "uuid": "550e8400-e29b-41d4-a716-446655440001",
-        "timestamp": "2025-01-01T00:00:00Z"
-    });
+    let json = user_log_line_json(serde_json::json!({
+        "version": "2.1.201"
+    }));
     let line: UserLogLine = serde_json::from_value(json).unwrap();
     assert_eq!(line.queue_priority, None);
 }
@@ -6546,19 +6356,10 @@ fn test_parse_user_log_line_without_queue_priority() {
 fn test_parse_user_log_line_rejects_unknown_queue_priority() {
     // QueuePriority is a closed enum: an unrecognized priority must fail to parse so the new value
     // surfaces rather than being silently dropped.
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
-        "userType": "test",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+    let json = user_log_line_json(serde_json::json!({
         "version": "2.1.201",
-        "gitBranch": "main",
-        "message": {"role": "user", "content": "test"},
-        "uuid": "550e8400-e29b-41d4-a716-446655440001",
-        "timestamp": "2025-01-01T00:00:00Z",
         "queuePriority": "totally-bogus-priority"
-    });
+    }));
     let err_msg = serde_json::from_value::<UserLogLine>(json)
         .expect_err("Should reject unknown queuePriority variant")
         .to_string();
@@ -6571,19 +6372,10 @@ fn test_parse_user_log_line_rejects_unknown_queue_priority() {
 
 #[test]
 fn test_parse_user_log_line_with_source_tool_use_id() {
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
-        "userType": "test",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+    let json = user_log_line_json(serde_json::json!({
         "version": "2.1.170",
-        "gitBranch": "main",
-        "message": {"role": "user", "content": "test"},
-        "uuid": "550e8400-e29b-41d4-a716-446655440001",
-        "timestamp": "2025-01-01T00:00:00Z",
         "sourceToolUseID": "toolu_01TnFtjG2oYQQKKKUULR9y6V"
-    });
+    }));
     let line: UserLogLine = serde_json::from_value(json).unwrap();
     assert_eq!(
         line.source_tool_use_id.as_deref(),
@@ -6593,113 +6385,59 @@ fn test_parse_user_log_line_with_source_tool_use_id() {
 
 #[test]
 fn test_parse_user_log_line_with_permission_mode_plan() {
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
-        "userType": "test",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+    let json = user_log_line_json(serde_json::json!({
         "version": "2.1.77",
-        "gitBranch": "main",
-        "message": {"role": "user", "content": "test"},
-        "uuid": "550e8400-e29b-41d4-a716-446655440001",
-        "timestamp": "2025-01-01T00:00:00Z",
         "permissionMode": "plan"
-    });
+    }));
     let line: UserLogLine = serde_json::from_value(json).unwrap();
     assert_eq!(line.permission_mode, Some(PermissionMode::Plan));
 }
 
 #[test]
 fn test_parse_user_log_line_with_permission_mode_accept_edits() {
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
-        "userType": "test",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+    let json = user_log_line_json(serde_json::json!({
         "version": "2.1.77",
-        "gitBranch": "main",
-        "message": {"role": "user", "content": "test"},
-        "uuid": "550e8400-e29b-41d4-a716-446655440001",
-        "timestamp": "2025-01-01T00:00:00Z",
         "permissionMode": "acceptEdits"
-    });
+    }));
     let line: UserLogLine = serde_json::from_value(json).unwrap();
     assert_eq!(line.permission_mode, Some(PermissionMode::AcceptEdits));
 }
 
 #[test]
 fn test_parse_user_log_line_with_permission_mode_auto() {
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
-        "userType": "test",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+    let json = user_log_line_json(serde_json::json!({
         "version": "2.1.77",
-        "gitBranch": "main",
-        "message": {"role": "user", "content": "test"},
-        "uuid": "550e8400-e29b-41d4-a716-446655440001",
-        "timestamp": "2025-01-01T00:00:00Z",
         "permissionMode": "auto"
-    });
+    }));
     let line: UserLogLine = serde_json::from_value(json).unwrap();
     assert_eq!(line.permission_mode, Some(PermissionMode::Auto));
 }
 
 #[test]
 fn test_parse_user_log_line_with_permission_mode_default() {
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
-        "userType": "test",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+    let json = user_log_line_json(serde_json::json!({
         "version": "2.1.77",
-        "gitBranch": "main",
-        "message": {"role": "user", "content": "test"},
-        "uuid": "550e8400-e29b-41d4-a716-446655440001",
-        "timestamp": "2025-01-01T00:00:00Z",
         "permissionMode": "default"
-    });
+    }));
     let line: UserLogLine = serde_json::from_value(json).unwrap();
     assert_eq!(line.permission_mode, Some(PermissionMode::Default));
 }
 
 #[test]
 fn test_parse_user_log_line_without_permission_mode() {
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
-        "userType": "test",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
-        "version": "2.0.50",
-        "gitBranch": "main",
-        "message": {"role": "user", "content": "test"},
-        "uuid": "550e8400-e29b-41d4-a716-446655440001",
-        "timestamp": "2025-01-01T00:00:00Z"
-    });
+    let json = user_log_line_json(serde_json::json!({
+        "version": "2.0.50"
+    }));
     let line: UserLogLine = serde_json::from_value(json).unwrap();
     assert_eq!(line.permission_mode, None);
 }
 
 #[test]
 fn test_parse_user_log_line_with_plan_content() {
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
-        "userType": "test",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+    let json = user_log_line_json(serde_json::json!({
         "version": "2.1.77",
-        "gitBranch": "main",
-        "message": {"role": "user", "content": "test"},
-        "uuid": "550e8400-e29b-41d4-a716-446655440001",
-        "timestamp": "2025-01-01T00:00:00Z",
         "planContent": "# My Plan\n\n## Steps\n1. Do the thing"
-    });
+    }));
     let line: UserLogLine = serde_json::from_value(json).unwrap();
     assert_eq!(
         line.plan_content,
@@ -6709,37 +6447,19 @@ fn test_parse_user_log_line_with_plan_content() {
 
 #[test]
 fn test_parse_user_log_line_with_null_plan_content() {
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
-        "userType": "test",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+    let json = user_log_line_json(serde_json::json!({
         "version": "2.1.77",
-        "gitBranch": "main",
-        "message": {"role": "user", "content": "test"},
-        "uuid": "550e8400-e29b-41d4-a716-446655440001",
-        "timestamp": "2025-01-01T00:00:00Z",
         "planContent": null
-    });
+    }));
     let line: UserLogLine = serde_json::from_value(json).unwrap();
     assert_eq!(line.plan_content, None);
 }
 
 #[test]
 fn test_parse_user_log_line_without_plan_content() {
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
-        "userType": "test",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
-        "version": "2.0.50",
-        "gitBranch": "main",
-        "message": {"role": "user", "content": "test"},
-        "uuid": "550e8400-e29b-41d4-a716-446655440001",
-        "timestamp": "2025-01-01T00:00:00Z"
-    });
+    let json = user_log_line_json(serde_json::json!({
+        "version": "2.0.50"
+    }));
     let line: UserLogLine = serde_json::from_value(json).unwrap();
     assert_eq!(line.plan_content, None);
 }
@@ -6940,19 +6660,10 @@ fn test_parse_assistant_usage_without_iterations_and_speed() {
 
 #[test]
 fn test_parse_user_log_line_with_permission_mode_bypass_permissions() {
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
-        "userType": "test",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+    let json = user_log_line_json(serde_json::json!({
         "version": "2.1.77",
-        "gitBranch": "main",
-        "message": {"role": "user", "content": "test"},
-        "uuid": "550e8400-e29b-41d4-a716-446655440001",
-        "timestamp": "2025-01-01T00:00:00Z",
         "permissionMode": "bypassPermissions"
-    });
+    }));
     let line: UserLogLine = serde_json::from_value(json).unwrap();
     assert_eq!(
         line.permission_mode,
@@ -6962,19 +6673,10 @@ fn test_parse_user_log_line_with_permission_mode_bypass_permissions() {
 
 #[test]
 fn test_parse_user_log_line_rejects_unknown_permission_mode() {
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
-        "userType": "test",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+    let json = user_log_line_json(serde_json::json!({
         "version": "2.1.77",
-        "gitBranch": "main",
-        "message": {"role": "user", "content": "test"},
-        "uuid": "550e8400-e29b-41d4-a716-446655440001",
-        "timestamp": "2025-01-01T00:00:00Z",
         "permissionMode": "totallyBogusMode"
-    });
+    }));
     let err_msg = serde_json::from_value::<UserLogLine>(json)
         .expect_err("Should reject unknown permissionMode variant")
         .to_string();
@@ -7658,56 +7360,29 @@ fn test_parse_mode_rejects_unknown_mode() {
 
 #[test]
 fn test_parse_user_log_line_with_entrypoint() {
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
-        "userType": "test",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+    let json = user_log_line_json(serde_json::json!({
         "version": "2.1.104",
-        "gitBranch": "main",
-        "message": {"role": "user", "content": "test"},
-        "uuid": "550e8400-e29b-41d4-a716-446655440001",
-        "timestamp": "2025-01-01T00:00:00Z",
         "entrypoint": "cli"
-    });
+    }));
     let line: UserLogLine = serde_json::from_value(json).unwrap();
     assert_eq!(line.entrypoint, Some("cli".to_string()));
 }
 
 #[test]
 fn test_parse_user_log_line_with_null_entrypoint() {
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
-        "userType": "test",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+    let json = user_log_line_json(serde_json::json!({
         "version": "2.1.104",
-        "gitBranch": "main",
-        "message": {"role": "user", "content": "test"},
-        "uuid": "550e8400-e29b-41d4-a716-446655440001",
-        "timestamp": "2025-01-01T00:00:00Z",
         "entrypoint": null
-    });
+    }));
     let line: UserLogLine = serde_json::from_value(json).unwrap();
     assert_eq!(line.entrypoint, None);
 }
 
 #[test]
 fn test_parse_user_log_line_without_entrypoint() {
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
-        "userType": "test",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
-        "version": "2.0.50",
-        "gitBranch": "main",
-        "message": {"role": "user", "content": "test"},
-        "uuid": "550e8400-e29b-41d4-a716-446655440001",
-        "timestamp": "2025-01-01T00:00:00Z"
-    });
+    let json = user_log_line_json(serde_json::json!({
+        "version": "2.0.50"
+    }));
     let line: UserLogLine = serde_json::from_value(json).unwrap();
     assert_eq!(line.entrypoint, None);
 }
@@ -11183,19 +10858,10 @@ fn test_parse_turn_duration_with_zero_pending_workflows() {
 
 #[test]
 fn test_parse_user_log_line_with_origin() {
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
-        "userType": "test",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+    let json = user_log_line_json(serde_json::json!({
         "version": "2.1.104",
-        "gitBranch": "main",
-        "message": {"role": "user", "content": "test"},
-        "uuid": "550e8400-e29b-41d4-a716-446655440001",
-        "timestamp": "2025-01-01T00:00:00Z",
         "origin": {"kind": "task-notification"}
-    });
+    }));
     let line: UserLogLine = serde_json::from_value(json).unwrap();
     let origin = line.origin.unwrap();
     assert_eq!(origin.kind, "task-notification");
@@ -11203,56 +10869,29 @@ fn test_parse_user_log_line_with_origin() {
 
 #[test]
 fn test_parse_user_log_line_with_null_origin() {
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
-        "userType": "test",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+    let json = user_log_line_json(serde_json::json!({
         "version": "2.1.104",
-        "gitBranch": "main",
-        "message": {"role": "user", "content": "test"},
-        "uuid": "550e8400-e29b-41d4-a716-446655440001",
-        "timestamp": "2025-01-01T00:00:00Z",
         "origin": null
-    });
+    }));
     let line: UserLogLine = serde_json::from_value(json).unwrap();
     assert_eq!(line.origin, None);
 }
 
 #[test]
 fn test_parse_user_log_line_without_origin() {
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
-        "userType": "test",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
-        "version": "2.0.50",
-        "gitBranch": "main",
-        "message": {"role": "user", "content": "test"},
-        "uuid": "550e8400-e29b-41d4-a716-446655440001",
-        "timestamp": "2025-01-01T00:00:00Z"
-    });
+    let json = user_log_line_json(serde_json::json!({
+        "version": "2.0.50"
+    }));
     let line: UserLogLine = serde_json::from_value(json).unwrap();
     assert_eq!(line.origin, None);
 }
 
 #[test]
 fn test_parse_user_log_line_with_interrupted_message_id() {
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
-        "userType": "test",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+    let json = user_log_line_json(serde_json::json!({
         "version": "2.1.104",
-        "gitBranch": "main",
-        "message": {"role": "user", "content": "test"},
-        "uuid": "550e8400-e29b-41d4-a716-446655440001",
-        "timestamp": "2025-01-01T00:00:00Z",
         "interruptedMessageId": "msg_01Hs25nR7X58UvPnVBqreDRB"
-    });
+    }));
     let line: UserLogLine = serde_json::from_value(json).unwrap();
     assert_eq!(
         line.interrupted_message_id,
@@ -11262,38 +10901,20 @@ fn test_parse_user_log_line_with_interrupted_message_id() {
 
 #[test]
 fn test_parse_user_log_line_with_null_interrupted_message_id() {
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
-        "userType": "test",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+    let json = user_log_line_json(serde_json::json!({
         "version": "2.1.104",
-        "gitBranch": "main",
-        "message": {"role": "user", "content": "test"},
-        "uuid": "550e8400-e29b-41d4-a716-446655440001",
-        "timestamp": "2025-01-01T00:00:00Z",
         "interruptedMessageId": null
-    });
+    }));
     let line: UserLogLine = serde_json::from_value(json).unwrap();
     assert_eq!(line.interrupted_message_id, None);
 }
 
 #[test]
 fn test_parse_message_origin_rejects_unknown_fields() {
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
-        "userType": "test",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+    let json = user_log_line_json(serde_json::json!({
         "version": "2.1.104",
-        "gitBranch": "main",
-        "message": {"role": "user", "content": "test"},
-        "uuid": "550e8400-e29b-41d4-a716-446655440001",
-        "timestamp": "2025-01-01T00:00:00Z",
         "origin": {"kind": "task-notification", "extraField": "should fail"}
-    });
+    }));
     let err =
         serde_json::from_value::<UserLogLine>(json).expect_err("Should reject unknown fields");
     assert!(
@@ -11304,194 +10925,140 @@ fn test_parse_message_origin_rejects_unknown_fields() {
 }
 
 #[test]
-fn test_parse_user_log_line_with_mcp_meta() {
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
-        "userType": "test",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
-        "version": "2.1.158",
-        "gitBranch": "main",
-        "message": {"role": "user", "content": "test"},
-        "uuid": "550e8400-e29b-41d4-a716-446655440001",
-        "timestamp": "2025-01-01T00:00:00Z",
-        "mcpMeta": {
-            "structuredContent": {
-                "exit_code": 0,
-                "stderr": "",
-                "stdout": "diff output"
-            }
-        }
-    });
-    let line: UserLogLine = serde_json::from_value(json).unwrap();
-    let mcp_meta = line.mcp_meta.expect("mcpMeta should be present");
-    let Some(ToolUseResult::Map(content)) = mcp_meta.structured_content else {
-        panic!("structuredContent from an MCP server is a JSON object");
-    };
-    assert_eq!(content["exit_code"], serde_json::json!(0));
-    assert_eq!(content["stderr"], serde_json::json!(""));
-    assert_eq!(content["stdout"], serde_json::json!("diff output"));
-}
+fn test_parse_user_log_line_mcp_meta_shapes() {
+    let cases = [
+        ("absent", serde_json::json!({}), None),
+        ("null", serde_json::json!({"mcpMeta": null}), None),
+        // An `mcpMeta` with neither member must still parse: serde defaults both absent `Option`
+        // fields to `None` even under `deny_unknown_fields`, so an MCP result carrying no metadata
+        // does not drop the whole log line.
+        (
+            "no members",
+            serde_json::json!({"mcpMeta": {}}),
+            Some(McpMeta {
+                structured_content: None,
+                meta: None,
+            }),
+        ),
+        // Both members are `Option` precisely so an explicit JSON `null` lands on the `Option`
+        // rather than on an inner arm: the untagged `ToolUseResult` cannot represent `null` at all.
+        (
+            "null members",
+            serde_json::json!({"mcpMeta": {"structuredContent": null, "_meta": null}}),
+            Some(McpMeta {
+                structured_content: None,
+                meta: None,
+            }),
+        ),
+        (
+            "string structuredContent",
+            serde_json::json!({"mcpMeta": {"structuredContent": "plain text result"}}),
+            Some(McpMeta {
+                structured_content: Some(ToolUseResult::String("plain text result".to_string())),
+                meta: None,
+            }),
+        ),
+        (
+            "object structuredContent",
+            serde_json::json!({
+                "mcpMeta": {
+                    "structuredContent": {"exit_code": 0, "stderr": "", "stdout": "diff output"}
+                }
+            }),
+            Some(McpMeta {
+                structured_content: Some(ToolUseResult::Map(HashMap::from([
+                    ("exit_code".to_string(), serde_json::json!(0)),
+                    ("stderr".to_string(), serde_json::json!("")),
+                    ("stdout".to_string(), serde_json::json!("diff output")),
+                ]))),
+                meta: None,
+            }),
+        ),
+        // Observed in Claude Code 2.1.257: the server returned MCP's reserved `_meta` and no
+        // `structuredContent`. Its keys are server-defined, so they survive verbatim rather than
+        // being validated against a fixed schema.
+        (
+            "server-defined _meta",
+            serde_json::json!({
+                "mcpMeta": {
+                    "_meta": {"encoding": "json", "type": "search-results", "version": "1"}
+                }
+            }),
+            Some(McpMeta {
+                structured_content: None,
+                meta: Some(HashMap::from([
+                    ("encoding".to_string(), serde_json::json!("json")),
+                    ("type".to_string(), serde_json::json!("search-results")),
+                    ("version".to_string(), serde_json::json!("1")),
+                ])),
+            }),
+        ),
+        (
+            "_meta alongside structuredContent",
+            serde_json::json!({
+                "mcpMeta": {
+                    "structuredContent": {"exit_code": 0},
+                    "_meta": {"encoding": "json"}
+                }
+            }),
+            Some(McpMeta {
+                structured_content: Some(ToolUseResult::Map(HashMap::from([(
+                    "exit_code".to_string(),
+                    serde_json::json!(0),
+                )]))),
+                meta: Some(HashMap::from([(
+                    "encoding".to_string(),
+                    serde_json::json!("json"),
+                )])),
+            }),
+        ),
+    ];
 
-#[test]
-fn test_parse_user_log_line_without_mcp_meta() {
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
-        "userType": "test",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
-        "version": "2.1.158",
-        "gitBranch": "main",
-        "message": {"role": "user", "content": "test"},
-        "uuid": "550e8400-e29b-41d4-a716-446655440001",
-        "timestamp": "2025-01-01T00:00:00Z"
-    });
-    let line: UserLogLine = serde_json::from_value(json).unwrap();
-    assert_eq!(line.mcp_meta, None);
+    for (label, overlay, expected) in cases {
+        let line: UserLogLine = serde_json::from_value(user_log_line_json(overlay))
+            .unwrap_or_else(|err| panic!("{label} should parse: {err}"));
+        assert_eq!(line.mcp_meta, expected, "case: {label}");
+    }
 }
 
 #[test]
 fn test_parse_mcp_meta_rejects_unknown_fields() {
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
-        "userType": "test",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
-        "version": "2.1.158",
-        "gitBranch": "main",
-        "message": {"role": "user", "content": "test"},
-        "uuid": "550e8400-e29b-41d4-a716-446655440001",
-        "timestamp": "2025-01-01T00:00:00Z",
+    let json = user_log_line_json(serde_json::json!({
         "mcpMeta": {
             "structuredContent": {"exit_code": 0},
             "extraField": "should fail"
         }
-    });
+    }));
     let err =
         serde_json::from_value::<UserLogLine>(json).expect_err("Should reject unknown fields");
     assert!(
-        err.to_string().contains("unknown field"),
-        "Error should mention unknown field, got: {}",
+        err.to_string().contains("unknown field `extraField`"),
+        "Error should name the rejected field, got: {}",
         err
     );
-}
-
-#[test]
-fn test_parse_user_log_line_with_mcp_meta_string_content() {
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
-        "userType": "test",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
-        "version": "2.1.158",
-        "gitBranch": "main",
-        "message": {"role": "user", "content": "test"},
-        "uuid": "550e8400-e29b-41d4-a716-446655440001",
-        "timestamp": "2025-01-01T00:00:00Z",
-        "mcpMeta": {"structuredContent": "plain text result"}
-    });
-    let line: UserLogLine = serde_json::from_value(json).unwrap();
-    let mcp_meta = line.mcp_meta.expect("mcpMeta should be present");
-    assert_eq!(
-        mcp_meta.structured_content,
-        Some(ToolUseResult::String("plain text result".to_string()))
-    );
-}
-
-#[test]
-fn test_parse_user_log_line_with_null_structured_content() {
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
-        "userType": "test",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
-        "version": "2.1.158",
-        "gitBranch": "main",
-        "message": {"role": "user", "content": "test"},
-        "uuid": "550e8400-e29b-41d4-a716-446655440001",
-        "timestamp": "2025-01-01T00:00:00Z",
-        "mcpMeta": {"structuredContent": null}
-    });
-    let line: UserLogLine = serde_json::from_value(json).unwrap();
-    let mcp_meta = line.mcp_meta.expect("mcpMeta should be present");
-    assert_eq!(mcp_meta.structured_content, None);
-}
-
-#[test]
-fn test_parse_user_log_line_with_null_mcp_meta() {
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
-        "userType": "test",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
-        "version": "2.1.158",
-        "gitBranch": "main",
-        "message": {"role": "user", "content": "test"},
-        "uuid": "550e8400-e29b-41d4-a716-446655440001",
-        "timestamp": "2025-01-01T00:00:00Z",
-        "mcpMeta": null
-    });
-    let line: UserLogLine = serde_json::from_value(json).unwrap();
-    assert_eq!(line.mcp_meta, None);
 }
 
 #[test]
 fn test_parse_user_log_line_with_mcp_meta_and_tool_use_result() {
     // The same MCP tool-result turn carries both the rendered string form (`toolUseResult`) and
     // the structured object form (`mcpMeta.structuredContent`); both must decode independently.
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
-        "userType": "test",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
-        "version": "2.1.158",
-        "gitBranch": "main",
-        "message": {"role": "user", "content": "test"},
-        "uuid": "550e8400-e29b-41d4-a716-446655440001",
-        "timestamp": "2025-01-01T00:00:00Z",
+    let json = user_log_line_json(serde_json::json!({
         "toolUseResult": "rendered string result",
         "mcpMeta": {"structuredContent": {"exit_code": 0}}
-    });
+    }));
     let line: UserLogLine = serde_json::from_value(json).unwrap();
     assert_eq!(
         line.tool_use_result,
         Some(ToolUseResult::String("rendered string result".to_string()))
     );
-    let mcp_meta = line.mcp_meta.expect("mcpMeta should be present");
-    let Some(ToolUseResult::Map(content)) = mcp_meta.structured_content else {
-        panic!("structuredContent from an MCP server is a JSON object");
-    };
-    assert_eq!(content["exit_code"], serde_json::json!(0));
-}
-
-#[test]
-fn test_parse_user_log_line_with_empty_mcp_meta() {
-    // An empty `mcpMeta` (no `structuredContent` key) must parse: serde defaults the absent
-    // `Option` field to `None` even under `deny_unknown_fields`, so an MCP result without
-    // structured content does not drop the whole log line.
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "isSidechain": false,
-        "userType": "test",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
-        "version": "2.1.158",
-        "gitBranch": "main",
-        "message": {"role": "user", "content": "test"},
-        "uuid": "550e8400-e29b-41d4-a716-446655440001",
-        "timestamp": "2025-01-01T00:00:00Z",
-        "mcpMeta": {}
-    });
-    let line: UserLogLine = serde_json::from_value(json).unwrap();
-    let mcp_meta = line.mcp_meta.expect("mcpMeta should be present");
-    assert_eq!(mcp_meta.structured_content, None);
+    assert_eq!(
+        line.mcp_meta
+            .and_then(|mcp_meta| mcp_meta.structured_content),
+        Some(ToolUseResult::Map(HashMap::from([(
+            "exit_code".to_string(),
+            serde_json::json!(0)
+        )])))
+    );
 }
 
 #[test]

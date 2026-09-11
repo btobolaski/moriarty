@@ -2051,6 +2051,13 @@ pub struct McpMeta {
     /// structured content: the MCP spec makes it optional, and the untagged `ToolUseResult` cannot
     /// itself represent a JSON `null`.
     pub structured_content: Option<ToolUseResult>,
+    /// MCP's reserved `_meta` object, carried through verbatim from the responding server's result
+    /// (observed: `encoding`/`type`/`version` on a search-results payload). The MCP spec defines it
+    /// as an open string-keyed object whose contents belong to the server, so unlike the rest of this
+    /// envelope its keys are not Claude Code protocol and must not be validated; it is kept as an
+    /// opaque map for the same reason [`ToolUseResult::Map`] is.
+    #[serde(rename = "_meta")]
+    pub meta: Option<HashMap<String, serde_json::Value>>,
 }
 
 /// Origin metadata for a message. Added in Claude Code 2.1.104+.
