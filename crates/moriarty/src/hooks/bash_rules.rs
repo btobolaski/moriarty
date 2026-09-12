@@ -7,11 +7,15 @@
 use std::{
     collections::{BTreeSet, HashMap},
     path::Path,
-    sync::Arc,
+    sync::{Arc, LazyLock},
 };
 
 use miette::miette;
-use regex::{Regex, RegexSet};
+use regex::{Error as RegexError, Regex, RegexSet};
+use regex_automata::{
+    nfa::thompson::{NFA, WhichCaptures},
+    util::syntax,
+};
 use serde::Serialize;
 use tokio::{
     task::{JoinError, spawn_blocking},
@@ -34,6 +38,40 @@ use crate::{
     },
 };
 
+static FRAGMENT_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\{\{([a-zA-Z_][a-zA-Z0-9_-]*)\}\}").expect("Fragment regex pattern is valid")
+});
+
+// Mirrors regex::RegexBuilder's default; syntax validity alone does not enforce this bound.
+const REGEX_NFA_SIZE_LIMIT: usize = 10 * (1 << 20);
+
+/// Both directions count: Regex::new can reject a reverse NFA even when the forward one fits.
+pub(crate) fn validate_rule_pattern(pattern: &str) -> Result<(), RegexError> {
+    let valid = syntax::parse_with(pattern, &syntax::Config::new().utf8(true))
+        .ok()
+        .is_some_and(|hir| {
+            let config = NFA::config()
+                .utf8(true)
+                .shrink(false)
+                .which_captures(WhichCaptures::All)
+                .nfa_size_limit(Some(REGEX_NFA_SIZE_LIMIT));
+            NFA::compiler()
+                .configure(config.clone())
+                .build_from_hir(&hir)
+                .is_ok()
+                && NFA::compiler()
+                    .configure(config.reverse(true).which_captures(WhichCaptures::None))
+                    .build_from_hir(&hir)
+                    .is_ok()
+        });
+    if valid {
+        Ok(())
+    } else {
+        // Preserve canonical diagnostics and acceptance of Regex's literal-only fast paths.
+        Regex::new(pattern).map(drop)
+    }
+}
+
 #[derive(Debug)]
 struct CompiledCommandRules {
     regex_set: RegexSet,
@@ -43,16 +81,24 @@ struct CompiledCommandRules {
 #[derive(Debug)]
 struct CompiledCommandRule {
     metadata: Arc<MatchedRuleMetadata>,
-    regex: Regex,
     modes: Option<BTreeSet<PermissionMode>>,
     action: CommandAction,
+}
+
+#[derive(Debug)]
+enum CompiledAction {
+    Command(CommandAction),
+    Redirect(RedirectRuleAction),
 }
 
 #[derive(Debug)]
 enum CommandAction {
     Allow,
     Deny(String),
-    Modify(String),
+    Modify {
+        value: String,
+        regex: Regex,
+    },
     Ask,
     ArgumentFilter {
         remove: Option<Vec<String>>,
@@ -71,7 +117,6 @@ struct CompiledRedirectRules {
 #[derive(Debug)]
 struct CompiledRedirectRule {
     metadata: Arc<MatchedRuleMetadata>,
-    regex: Regex,
     modes: Option<BTreeSet<PermissionMode>>,
     action: Arc<RedirectRuleAction>,
 }
@@ -225,13 +270,9 @@ pub(crate) fn expand_fragments(
     pattern: &str,
     fragments: &HashMap<String, String>,
 ) -> miette::Result<String> {
-    let fragment_pattern =
-        Regex::new(r"\{\{([a-zA-Z_][a-zA-Z0-9_-]*)\}\}").expect("Fragment regex pattern is valid");
-
     FragmentExpander {
         root_pattern: pattern,
         fragments,
-        fragment_pattern: &fragment_pattern,
         active: Vec::new(),
         expansions: 0,
     }
@@ -244,7 +285,6 @@ struct FragmentExpander<'a> {
     /// the fragment body the dangling reference happened to sit in.
     root_pattern: &'a str,
     fragments: &'a HashMap<String, String>,
-    fragment_pattern: &'a Regex,
     /// The chain of fragments whose bodies are currently being expanded, innermost last. A
     /// reference to a name already on this chain is the only true cycle; the same fragment reached
     /// by two different paths is an acyclic graph and expands normally.
@@ -276,12 +316,11 @@ impl FragmentExpander<'_> {
         // Copied out of `self` so the borrows below are independent of the `&mut self` the
         // recursive call needs.
         let fragments = self.fragments;
-        let fragment_pattern = self.fragment_pattern;
 
         let mut result = String::new();
         let mut last_end = 0;
 
-        for cap in fragment_pattern.captures_iter(text) {
+        for cap in FRAGMENT_PATTERN.captures_iter(text) {
             let full_match = cap.get(0).unwrap();
             let fragment_name = &cap[1];
 
@@ -718,7 +757,7 @@ impl CommandAction {
         match self {
             Self::Allow => "Allow".to_string(),
             Self::Deny(reason) => format!("Deny: {reason}"),
-            Self::Modify(command) => format!("Modify → {command}"),
+            Self::Modify { value, .. } => format!("Modify → {value}"),
             Self::Ask => "Ask".to_string(),
             Self::ArgumentFilter { reason, .. } => match reason {
                 Some(reason) => format!("ArgumentFilter ({reason})"),
@@ -785,7 +824,10 @@ impl CompiledCommandRules {
     ) -> Option<&CompiledCommandRule> {
         self.regex_set.matches(text).iter().find_map(|index| {
             let rule = &self.rules[index];
-            debug_assert!(rule.regex.is_match(text));
+            debug_assert_eq!(
+                self.regex_set.patterns()[index],
+                rule.metadata.expanded_pattern
+            );
             is_mode_eligible(rule.modes.as_ref(), mode).then_some(rule)
         })
     }
@@ -818,7 +860,10 @@ impl CompiledRedirectRules {
     ) -> Option<&CompiledRedirectRule> {
         self.regex_set.matches(text).iter().find_map(|index| {
             let rule = &self.rules[index];
-            debug_assert!(rule.regex.is_match(text));
+            debug_assert_eq!(
+                self.regex_set.patterns()[index],
+                rule.metadata.expanded_pattern
+            );
             (is_mode_eligible(rule.modes.as_ref(), mode)
                 && rule
                     .action
@@ -881,8 +926,42 @@ impl BashRuleEngine {
                     continue;
                 }
             };
-            let regex = match Regex::new(&expanded_pattern) {
-                Ok(regex) => regex,
+            let validated = |action| validate_rule_pattern(&expanded_pattern).map(|()| action);
+            let compiled = match rule.action {
+                BashRuleAction::Allow => validated(CompiledAction::Command(CommandAction::Allow)),
+                BashRuleAction::Deny { value } => {
+                    validated(CompiledAction::Command(CommandAction::Deny(value)))
+                }
+                BashRuleAction::Modify { value } => Regex::new(&expanded_pattern)
+                    .map(|regex| CompiledAction::Command(CommandAction::Modify { value, regex })),
+                BashRuleAction::Ask => validated(CompiledAction::Command(CommandAction::Ask)),
+                BashRuleAction::ArgumentFilter {
+                    remove,
+                    add,
+                    replace,
+                    reason,
+                } => validated(CompiledAction::Command(CommandAction::ArgumentFilter {
+                    remove,
+                    add,
+                    replace,
+                    reason,
+                })),
+                BashRuleAction::AllowRedirect {
+                    allow_local,
+                    direction,
+                } => validated(CompiledAction::Redirect(RedirectRuleAction::Allow {
+                    allow_local,
+                    direction,
+                })),
+                BashRuleAction::DenyRedirect { value, direction } => {
+                    validated(CompiledAction::Redirect(RedirectRuleAction::Deny {
+                        value,
+                        direction,
+                    }))
+                }
+            };
+            let action = match compiled {
+                Ok(action) => action,
                 Err(error) => {
                     diagnostics.push(RuleDiagnostic {
                         rule_name: rule.name,
@@ -893,53 +972,33 @@ impl BashRuleEngine {
                     continue;
                 }
             };
-
-            if let Some(action) = RedirectRuleAction::from_config(&rule.action) {
-                redirect_patterns.push(expanded_pattern.clone());
-                redirect_rules.push(CompiledRedirectRule {
-                    metadata: Arc::new(MatchedRuleMetadata {
-                        rule_name: rule.name,
-                        expanded_pattern,
-                        action_summary: redirect_action_summary(&action),
-                    }),
-                    regex,
-                    modes: rule.modes,
-                    action: Arc::new(action),
-                });
-                continue;
-            }
-
-            let action = match rule.action {
-                BashRuleAction::Allow => CommandAction::Allow,
-                BashRuleAction::Deny { value } => CommandAction::Deny(value),
-                BashRuleAction::Modify { value } => CommandAction::Modify(value),
-                BashRuleAction::Ask => CommandAction::Ask,
-                BashRuleAction::ArgumentFilter {
-                    remove,
-                    add,
-                    replace,
-                    reason,
-                } => CommandAction::ArgumentFilter {
-                    remove,
-                    add,
-                    replace,
-                    reason,
-                },
-                BashRuleAction::AllowRedirect { .. } | BashRuleAction::DenyRedirect { .. } => {
-                    continue;
-                }
+            let action_summary = match &action {
+                CompiledAction::Command(action) => action.summary(),
+                CompiledAction::Redirect(action) => redirect_action_summary(action),
             };
-            command_patterns.push(expanded_pattern.clone());
-            command_rules.push(CompiledCommandRule {
-                metadata: Arc::new(MatchedRuleMetadata {
-                    rule_name: rule.name,
-                    expanded_pattern,
-                    action_summary: action.summary(),
-                }),
-                regex,
-                modes: rule.modes,
-                action,
+            let metadata = Arc::new(MatchedRuleMetadata {
+                rule_name: rule.name,
+                expanded_pattern: expanded_pattern.clone(),
+                action_summary,
             });
+            match action {
+                CompiledAction::Command(action) => {
+                    command_patterns.push(expanded_pattern);
+                    command_rules.push(CompiledCommandRule {
+                        metadata,
+                        modes: rule.modes,
+                        action,
+                    });
+                }
+                CompiledAction::Redirect(action) => {
+                    redirect_patterns.push(expanded_pattern);
+                    redirect_rules.push(CompiledRedirectRule {
+                        metadata,
+                        modes: rule.modes,
+                        action: Arc::new(action),
+                    });
+                }
+            }
         }
 
         Ok((
@@ -986,9 +1045,8 @@ impl BashRuleEngine {
                 rule: matched,
                 reason: reason.clone(),
             },
-            CommandAction::Modify(value) => {
-                let captures = rule
-                    .regex
+            CommandAction::Modify { value, regex } => {
+                let captures = regex
                     .captures(command)
                     .expect("Invariant violation: RegexSet and Regex desynchronized");
                 let replacement = expand_captures(&captures, value);

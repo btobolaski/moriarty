@@ -19,10 +19,16 @@ fs2 = "0.4"
 futures = { workspace = true }
 hex = "0.4"
 miette = { workspace = true }
+mimalloc = { version = "0.1.52", optional = true, default-features = false }
 my-workspace-hack = { version = "0.1", path = "../my-workspace-hack" }
 pi_logs = { path = "../pi_logs" }
 ratatui = "0.30.0"
 regex = { workspace = true }
+regex-automata = { version = "0.4.14", default-features = false, features = [
+  "std",
+  "syntax",
+  "nfa-thompson",
+] }
 rmcp = { version = "1.7", features = ["server", "schemars", "transport-io"] }
 rust_decimal = { workspace = true }
 schemars = "1.0.4"
@@ -42,4 +48,11 @@ which = "7.0"
 xdg = "3.0.0"
 
 [dev-dependencies]
+criterion = { version = "0.8", default-features = false, features = [
+  "cargo_bench_support",
+] }
 tempfile = "3"
+
+[[bench]]
+name = "bash_rules"
+harness = false

@@ -1,0 +1,2280 @@
+# Sanitized performance fixture, not an installable security-policy recommendation.
+# Preserves 193 Bash rules, 165 tool rules, and 106 fragments from the profiled policy.
+# Personal identifiers, rule names, reasons, and comments were removed or replaced.
+bash_path_aliases = [
+  "B",
+  "D",
+  "F",
+  "P",
+  "R",
+  "S",
+  "SCRATCH",
+  "SP",
+  "W",
+  "f",
+  "src",
+]
+
+[pattern_fragments]
+git_read_ops = "(status|diff|log|show|branch|remote|tag|ls-files|cat-file|check-attr|rev-parse|ls-remote)"
+git_write_ops = "(commit|push|pull|rebase|merge|checkout|switch|reset)"
+git_globals = "( -C ({{safe_relative_path}}|\\.))?"
+cargo_safe_ops = "(nextest run|build|check|test|fmt|clippy|doc|clean|tree)"
+jj_read_ops = "(status|st|diff|log|show|root|evolog|help)"
+jj_globals = "( --ignore-working-copy| (-R|--repository) {{safe_relative_path}})*"
+jj_bookmark_glob = "({{rg_quoted_pattern}}|{{safe_relative_path}})"
+package_safe_ops = "(build|lint|test|typecheck|check|format|fmt)"
+npm_test_args = "( --workspace(=| ){{safe_relative_path}})? -- {{safe_relative_path}}( {{safe_relative_path}})*"
+env_subdir_prefix = "(env (-C|--chdir) {{safe_relative_path}} )?"
+env_pre_program = "( (-i|-0|--ignore-environment|--null)| (-u|--unset) [A-Za-z_][A-Za-z0-9_]*| (-C|--chdir) \\S+| [A-Za-z_][A-Za-z0-9_]*=\\S*)*"
+demo_iac_manifest_validator = "(\\./)?scripts/validate-manifests\\.sh"
+demo_iac_alloy_validator = "node scripts/validate-alloy-configs\\.mjs"
+pnpm_filter_scope = "( --filter {{safe_relative_path}})*"
+nix_develop_command = "(treefmt{{safe_arg_tail}}|pnpm{{pnpm_filter_scope}} exec eslint \\.|pnpm{{pnpm_script_scope}} (run )?{{package_safe_ops}}|{{demo_iac_manifest_validator}}|{{demo_iac_alloy_validator}}|{{helm_render_chart}}|yamllint{{safe_arg_tail}}|ci/{{safe_relative_path}}\\.sh)"
+safe_arg_tail = "( [A-Za-z0-9_.@+=,:/-]+)*"
+pnpm_safe_selector = "(-r|--recursive|--filter \\S+|(-C|--dir) {{safe_relative_path}})"
+pnpm_script_scope = "( (-r|--recursive|-w|--workspace-root|--if-present|--filter \\S+))*"
+vitest_write_arg = "(-u|--update(=true)?|--coverage(=true)?|--coverage\\.enabled(=true)?|--coverage\\.(reportsDirectory|reporter|clean|cleanOnRerun|provider|customProviderModule|reportOnFailure)([.=]\\S+)?|--outputFile([.=]\\S+)?)"
+safe_relative_path = "[A-Za-z0-9_@+][A-Za-z0-9_.@+-]*(/[A-Za-z0-9_@+][A-Za-z0-9_.@+-]*)*"
+timeout_prefix = "(timeout [0-9]+ )?"
+env_assignment_prefix = "([A-Za-z_][A-Za-z0-9_]*=\\S* )*"
+scratchpad_file_pair = "({{claude_scratchpad_file}} ({{claude_scratchpad_file}}|{{safe_relative_path}})|{{safe_relative_path}} {{claude_scratchpad_file}})"
+helm_unsafe_flags = "(--post-renderer|--validate|--kube-context|--kubeconfig|--kube-apiserver|--kube-token|--kube-as-user|--kube-as-group|--dependency-update|--repository-config|--output-dir|--dry-run=server)"
+helm_safe_arg_tail = "( (-{1,2}[A-Za-z0-9][A-Za-z0-9-]*(=[A-Za-z0-9_.@+,:%-]+(/[A-Za-z0-9_.@+,:%-]+)*)?|{{safe_relative_path}}|[A-Za-z0-9_.@+-]+(\\[[0-9]+\\])?(\\.[A-Za-z0-9_.@+-]+(\\[[0-9]+\\])?)*=[A-Za-z0-9_.@+,:%-]*(/[A-Za-z0-9_.@+,:%-]+)*|'[A-Za-z0-9_.@+{\\[][^'|;&<>$`\\\\]*'|{{claude_scratchpad_file}}|-))*"
+helm_oci_chart_ref = "oci://[A-Za-z0-9][A-Za-z0-9.-]*(/[A-Za-z0-9_.-]+)+( --version [A-Za-z0-9_.+-]+)?"
+helm_render_chart = "helm (lint|template|unittest)( [A-Za-z0-9_.-]+)?( \\.|/| \\./| {{safe_relative_path}}| {{helm_oci_chart_ref}}){{helm_safe_arg_tail}}"
+safe_stream_redirect = "( 2>\\&1| 2>/dev/null| >/dev/null| >\\&2| 1>\\&2)*"
+just_safe_recipes = "(android|android-bindings|android-debug|android-ffi|android-format|android-lint|android-release|android-test|default|format|lint|rust-format|rust-lint|rust-test|test)"
+moriarty_cost_report = "(api-pricing|pi cost)( --last-days [0-9]+)?"
+pulumi_stack_name = "{{flag_value_name}}(/[A-Za-z0-9_.-]+){0,2}"
+pulumi_cwd_flag = "( (-C|--cwd) {{safe_relative_path}})"
+flag_value_name = "[A-Za-z0-9_][A-Za-z0-9_.-]*"
+example_home = "/home/example"
+review_oracle_hidden_path = "^(~|{{example_home}})/src/example-project(/|$)"
+wasteful_path = "(/nix/store|/nix|{{example_home}}/src|{{example_home}}|~/|/)"
+nonexistent_path = "(/Users/(Shared|runner|devuser)|/home/devuser)"
+nix_store_output_root = "/nix/store/[0-9abcdfghijklmnpqrsvwxyz]{32}-[A-Za-z0-9+_?=-][A-Za-z0-9+._?=-]*"
+nix_store_output_path = "^{{nix_store_output_root}}(/.*)?$"
+nix_store_output_shell_path = "{{nix_store_output_root}}(/[A-Za-z0-9_.@+-]+)*/?"
+pi_npm_extension_skills = "npm/node_modules/(@[A-Za-z0-9_+-][A-Za-z0-9_.+-]*/)?[A-Za-z0-9_@+-][A-Za-z0-9_.@+-]*/skills"
+pi_installed_skills_path = "^(~|{{example_home}})/\\.pi/agent/({{pi_npm_extension_skills}}|git/github\\.com/example-org/pi-subagents/skills/pi-subagents)(/.*)?$"
+pi_mcp_scripting_skill_path = "^(~|{{example_home}})/\\.pi/agent/npm/node_modules/pi-mcp-adapter/skills/mcp-scripting(/|$)"
+skill_file_path = "^{{example_home}}/\\.pi/agent/skills/[A-Za-z0-9_-]+/[A-Za-z0-9_-][A-Za-z0-9_.-]*$"
+skill_python_script = "^(python|python3) {{example_home}}/\\.pi/agent/skills/[A-Za-z0-9_-]+/scripts/[A-Za-z0-9_-][A-Za-z0-9_.-]*\\.py(\\s+.+)?"
+agent_skill_root = "(~|{{example_home}})/(\\.claude/skills|\\.pi/agent/skills)"
+post_pr_review_safe = "^{{agent_skill_root}}/post-pr-review/scripts/(pr-context\\.sh|anchor-findings\\.py|findings-from-review\\.py)(\\s+.+)?$"
+pr_review_threads_safe = "^{{agent_skill_root}}/pr-review-threads/scripts/fetch-pr-threads\\.sh(\\s+.+)?$"
+rust_doc_extract_safe = "^{{agent_skill_root}}/rust-doc-extract/scripts/extract\\.py(\\s+.+)?$"
+agent_skill_dir = "{{agent_skill_root}}(/[A-Za-z0-9_-]+){0,2}"
+cargo_registry_root = "(~|{{example_home}})/\\.cargo/registry"
+helm_cache_root = "(~|/Users/example)/Library/Caches/helm"
+go_modcache_root = "(~|{{example_home}})/go/pkg/mod"
+dependency_cache_path = "^({{cargo_registry_root}}|{{helm_cache_root}}|{{go_modcache_root}})(/.*)?$"
+dependency_cache_shell_path = "({{cargo_registry_root}}/src|{{helm_cache_root}}|{{go_modcache_root}})(/[A-Za-z0-9_@+!][A-Za-z0-9_.@+!-]*)*/?"
+cargo_registry_glob_path = "{{cargo_registry_root}}/src(/[A-Za-z0-9_@+*][A-Za-z0-9_.@+*-]*)*/?"
+dependency_cache_search_path = "({{dependency_cache_shell_path}}|{{cargo_registry_glob_path}})"
+pi_tmpdir = "(/private)?(/tmp|/var/folders/[A-Za-z0-9_+-]+/[A-Za-z0-9_+-]+/T)(/nix-shell\\.[A-Za-z0-9]+)?"
+uuid = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+pi_bash_output_file = "{{pi_tmpdir}}/pi-bash-[0-9a-f]{16}\\.log"
+claude_scratchpad_root = "(/private)?/tmp/claude-[0-9]+/[A-Za-z0-9_-]+/{{uuid}}/scratchpad"
+claude_scratchpad_file = "{{claude_scratchpad_root}}(/[A-Za-z0-9_@+-][A-Za-z0-9_.@+-]*)+"
+claude_scratchpad_tree = "{{claude_scratchpad_root}}(/[A-Za-z0-9_@+-][A-Za-z0-9_.@+-]*)*/?"
+claude_task_output_file = "(/private)?/tmp/claude-[0-9]+/[A-Za-z0-9_-]+/{{uuid}}/tasks/[A-Za-z0-9_-]+\\.output"
+agent_temp_file = "({{pi_bash_output_file}}|{{claude_scratchpad_file}}|{{claude_task_output_file}})"
+agent_temp_path = "^{{agent_temp_file}}$"
+pi_mcp_output_file = "{{pi_tmpdir}}/pi-mcp-output-[A-Za-z0-9_-]{6}/output-[0-9a-f]{8}\\.txt"
+pi_mcp_output_path = "^{{pi_mcp_output_file}}$"
+pi_subagent_output_path = "^{{pi_tmpdir}}/pi-subagents-uid-[0-9]+(/.*)?$"
+pi_subagent_status_file = "{{pi_tmpdir}}/pi-subagents-uid-[0-9]+/async-subagent-runs/{{uuid}}/status\\.json"
+pi_subagent_run_path = "^{{pi_tmpdir}}/pi-subagent-[A-Za-z0-9]+(/.*)?$"
+pi_subagent_run_shell_file = "{{pi_tmpdir}}/pi-subagent-[A-Za-z0-9]+(/[A-Za-z0-9_@+][A-Za-z0-9_.@+-]*)*"
+claude_tool_results_file = "{{example_home}}/\\.claude/projects/[A-Za-z0-9_-]+/{{uuid}}/tool-results(/.*)?"
+claude_tool_results_path = "^{{claude_tool_results_file}}$"
+claude_tool_results_shell_file = "{{example_home}}/\\.claude/projects/[A-Za-z0-9_-]+/{{uuid}}/tool-results(/[A-Za-z0-9_@+][A-Za-z0-9_.@+-]*)*"
+rg_read_flag = "( -[A-Za-z0-9]+| -[A-Za-z] [0-9]+)"
+rg_cwd_flag = "( -(i|l|n|S|w|x))"
+grep_read_flag = "( -[ABCEFcilnorvw0-9]+| -[ABC] [0-9]+)"
+agent_output_file = "({{agent_temp_file}}|{{claude_tool_results_shell_file}}|{{claude_workflow_record_file}})"
+read_only_file_commands = "(cat|head|tail|nl|wc|grep|jq|ls|cut)"
+read_only_file_arguments = "( [^/$~\\s]+)*"
+read_only_file_redirect = "( 2>/dev/null| 2>\\&1)?"
+dev_null_file = "/dev/null"
+claude_read_only_file = "(~|{{example_home}})/\\.claude/(CLAUDE\\.md|projects/[A-Za-z0-9_-]+/memory/[A-Za-z0-9_-]+\\.md)"
+rg_quoted_pattern = "('[^']*'|\"([^\"$`\\\\]|\\\\.)*\")"
+jq_filter_option = "(-[nRscrjaSCMe]+|--(null-input|raw-input|slurp|compact-output|raw-output|raw-output0|join-output|ascii-output|sort-keys|color-output|monochrome-output|tab|unbuffered|stream|stream-errors|seq|exit-status))"
+jq_single_quoted_program = "jq( {{jq_filter_option}})* '[^']*'"
+jq_safe_input = "((\\./)?{{safe_relative_path}}|\"(\\./)?{{safe_relative_path}}\"|\"?{{agent_output_file}}\"?)"
+jq_absolute_input = "\"?/{{safe_relative_path}}\"?"
+jq_env_builtin = "env\\b([^:]|$)"
+jq_environment_access = "(\\$ENV|[^.A-Za-z0-9_]{{jq_env_builtin}})"
+gh_api_get_flag = "( (-f|--raw-field) [A-Za-z0-9_.-]+=([A-Za-z0-9_.:/+-]+|{{rg_quoted_pattern}})| (-H|--header) '[^']*'| --paginate| --cache [0-9]+[smh]?| (--jq|-q) {{gh_jq_program}})"
+gh_jq_program = "({{rg_quoted_pattern}}|\\.[A-Za-z0-9_]+(\\.[A-Za-z0-9_]+)*)"
+gh_api_endpoint = "/?[A-Za-z0-9._/-]+(\\?[A-Za-z0-9._~%&=+:/-]+)?"
+gh_api_readonly_flag = "( (--jq|-q) {{gh_jq_program}}| (-H|--header) '(Accept|X-GitHub-Api-Version): [A-Za-z0-9_.+/;=, -]+'| --paginate| --cache [0-9]+[smh]?| (-i|--include)| --slurp| (-t|--template) {{rg_quoted_pattern}})"
+gh_graphql_query = "'(query[ (]|\\{)[^']*'"
+gh_graphql_var = "( (-f|--raw-field) [A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9_.@/-]+| (-F|--field) [A-Za-z_][A-Za-z0-9_]*=[0-9]+)"
+sed_safe_abs_file = "({{agent_temp_file}}|{{pi_mcp_output_file}}|{{pi_subagent_status_file}}|{{pi_subagent_run_shell_file}}|{{claude_tool_results_shell_file}}|{{nix_store_output_shell_path}}|{{dependency_cache_shell_path}})"
+sed_print_script = "'?[0-9]+(,[0-9]+)?p(;[0-9]+(,[0-9]+)?p)*'?"
+sed_subst_script = "'s/[^/']*/[^/']*/[gpiImM0-9]*'"
+claude_workflow_record_file = "{{example_home}}/\\.claude/projects/[A-Za-z0-9_-]+/{{uuid}}/(subagents|workflows)(/[A-Za-z0-9_@+-][A-Za-z0-9_.@+-]*)*"
+agent_skill_shell_file = "{{agent_skill_root}}(/[A-Za-z0-9_@+-][A-Za-z0-9_.@+-]*){1,3}"
+tar_archive_operand = "({{safe_relative_path}}|-)"
+tar_member = "[A-Za-z0-9_.+/-]+"
+review_oracle_alignment_path = "^(~|{{example_home}})/src/example-project/code_review_alignment\\.md$"
+test_review_alignment_path = "^(~|{{example_home}})/src/example-project/test_review_alignment\\.md$"
+
+[[bash_rules]]
+name = "bash_rules-000"
+pattern = "^{{nonexistent_path}}(/|$)"
+action = { "type" = "DenyRedirect", "value" = "Benchmark policy denial" }
+
+[[bash_rules]]
+name = "bash_rules-001"
+pattern = "^\\.config/tools\\.toml$"
+action = { "type" = "DenyRedirect", "value" = "Benchmark policy denial" }
+
+[[bash_rules]]
+name = "bash_rules-002"
+pattern = "^/dev/null$"
+action = { "type" = "AllowRedirect" }
+
+[[bash_rules]]
+name = "bash_rules-003"
+pattern = "^&(1|2|-)$"
+action = { "type" = "AllowRedirect" }
+
+[[bash_rules]]
+name = "bash_rules-004"
+pattern = "^{{claude_scratchpad_file}}$"
+action = { "type" = "AllowRedirect", "direction" = "input" }
+
+[[bash_rules]]
+name = "bash_rules-005"
+pattern = "^{{claude_scratchpad_file}}$"
+modes = ["plan", "acceptEdits", "auto", "dontAsk", "bypassPermissions"]
+action = { "type" = "AllowRedirect", "direction" = "output" }
+
+[[bash_rules]]
+name = "bash_rules-006"
+pattern = "^"
+modes = ["plan", "acceptEdits", "auto", "dontAsk", "bypassPermissions"]
+action = { "type" = "AllowRedirect", "allow_local" = true, "direction" = "both" }
+
+[[bash_rules]]
+name = "bash_rules-007"
+pattern = "^echo\\b"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-008"
+pattern = "^jq\\b.*{{jq_environment_access}}"
+action = { "type" = "Ask" }
+
+[[bash_rules]]
+name = "bash_rules-009"
+pattern = "^jq\\b.*'(\\s*(import|include)\\b|[^']*;\\s*(import|include)\\b)"
+action = { "type" = "Ask" }
+
+[[bash_rules]]
+name = "bash_rules-010"
+pattern = "^{{jq_single_quoted_program}} \"?\\$f\"?{{read_only_file_redirect}}$"
+action = { "type" = "Ask" }
+
+[[bash_rules]]
+name = "bash_rules-011"
+pattern = "^{{jq_single_quoted_program}}( {{jq_safe_input}})*{{read_only_file_redirect}}$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-012"
+pattern = "^{{jq_single_quoted_program}}( {{jq_safe_input}})* {{jq_absolute_input}}( ({{jq_safe_input}}|{{jq_absolute_input}}))*{{read_only_file_redirect}}$"
+action = { "type" = "Ask" }
+
+[[bash_rules]]
+name = "bash_rules-013"
+pattern = "(^|[\\s=])[\"']?\\\\?{{wasteful_path}}[\"']?(\\s|$)"
+action = { "type" = "Deny", "value" = "Benchmark policy denial" }
+
+[[bash_rules]]
+name = "bash_rules-014"
+pattern = "(^|[\\s=])[\"']?\\\\?{{nonexistent_path}}(/|[\"']|\\s|$)"
+action = { "type" = "Deny", "value" = "Benchmark policy denial" }
+
+[[bash_rules]]
+name = "bash_rules-015"
+pattern = "^ls ~/src/example-project/$"
+action = { "type" = "Deny", "value" = "Benchmark policy denial" }
+
+[[bash_rules]]
+name = "bash_rules-016"
+pattern = "^cd(\\s|$)"
+action = { "type" = "Deny", "value" = "Benchmark policy denial" }
+
+[[bash_rules]]
+name = "bash_rules-017"
+pattern = "^cargo\\b.*--manifest-path\\b"
+action = { "type" = "Deny", "value" = "Benchmark policy denial" }
+
+[[bash_rules]]
+name = "bash_rules-018"
+pattern = "(^|[\\s=/])[\"']?\\.\\.(/|[\\s\"']|$)"
+action = { "type" = "Deny", "value" = "Benchmark policy denial" }
+
+[[bash_rules]]
+name = "bash_rules-019"
+pattern = "^{{example_home}}/\\.pi/agent/agents/crate-fetch($|\\s)"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-020"
+pattern = "^crate-fetch ('https://crates\\.io/api/v1/crates/[A-Za-z0-9_-]+'|https://crates\\.io/api/v1/crates/[A-Za-z0-9_-]+){{read_only_file_redirect}}$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-021"
+pattern = "{{skill_python_script}}"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-022"
+pattern = "{{post_pr_review_safe}}"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-023"
+pattern = "{{pr_review_threads_safe}}"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-024"
+pattern = "{{rust_doc_extract_safe}}"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-025"
+pattern = "^find ({{agent_skill_dir}}|{{claude_scratchpad_tree}})( -maxdepth [0-9]+| -type [fdl]| -i?name ({{rg_quoted_pattern}}|[A-Za-z0-9_.-]+))*{{read_only_file_redirect}}$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-026"
+pattern = "^ls( -[1aAlhFR]+)* {{agent_skill_dir}}/?$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-027"
+pattern = "^(/bin/)?bash --version$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-028"
+pattern = "^node scripts/render-demo-charts\\.mjs( > ?/dev/null)?$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-029"
+pattern = "^rg\\b.*--(pre|hostname-bin)(=|\\s|$)"
+action = { "type" = "Ask" }
+
+[[bash_rules]]
+name = "bash_rules-030"
+pattern = "^rg\\b('[^']*'|\"([^\"\\\\]|\\\\.)*\"|[^'\"])*\\s-[A-Za-z0-9]*r"
+action = { "type" = "Deny", "value" = "Benchmark policy denial" }
+
+[[bash_rules]]
+name = "bash_rules-031"
+pattern = "^rg\\b('[^']*'|\"([^\"\\\\]|\\\\.)*\"|[^'\"])*\\s(-[A-Za-z0-9]*f\\S*|--file(=|\\s))"
+action = { "type" = "Ask" }
+
+[[bash_rules]]
+name = "bash_rules-032"
+pattern = "^rg{{rg_cwd_flag}}* {{rg_quoted_pattern}}{{rg_cwd_flag}}*{{read_only_file_redirect}}$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-033"
+pattern = "^grep{{grep_read_flag}}* {{rg_quoted_pattern}}{{grep_read_flag}}*( \\.| (\\./)?{{safe_relative_path}})+{{read_only_file_redirect}}$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-034"
+pattern = "^env{{env_pre_program}} (\\S*/)?[gmn]?awk\\b"
+action = { "type" = "Deny", "value" = "Benchmark policy denial" }
+
+[[bash_rules]]
+name = "bash_rules-035"
+pattern = "^env{{env_pre_program}} (\\S*/)?sed\\b"
+action = { "type" = "Deny", "value" = "Benchmark policy denial" }
+
+[[bash_rules]]
+name = "bash_rules-036"
+pattern = "^{{env_assignment_prefix}}(\\S*/)?[gmn]?awk\\b"
+action = { "type" = "Deny", "value" = "Benchmark policy denial" }
+
+[[bash_rules]]
+name = "bash_rules-037"
+pattern = "^{{timeout_prefix}}{{env_assignment_prefix}}((npx( --no-install)?( -y)?|(pnpm|npm|yarn|bun)( \\S+)* exec) )?(\\./)?(node_modules/\\.bin/)?prettier\\b"
+action = { "type" = "Deny", "value" = "Benchmark policy denial" }
+
+[[bash_rules]]
+name = "bash_rules-038"
+pattern = "^{{read_only_file_commands}}\\b{{read_only_file_arguments}} \"?{{agent_output_file}}\"?{{read_only_file_redirect}}$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-039"
+pattern = "^(rg|grep){{rg_read_flag}}* {{rg_quoted_pattern}}{{rg_read_flag}}*( \"?{{agent_output_file}}\"?| {{claude_read_only_file}})+{{read_only_file_redirect}}$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-040"
+pattern = "^mkdir -p {{claude_scratchpad_file}}$"
+modes = ["plan", "acceptEdits", "auto", "dontAsk", "bypassPermissions"]
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-041"
+pattern = "^cp {{scratchpad_file_pair}}$"
+modes = ["plan", "acceptEdits", "auto", "dontAsk", "bypassPermissions"]
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-042"
+pattern = "^diff( -[a-zA-Z]+)* {{scratchpad_file_pair}}{{read_only_file_redirect}}$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-043"
+pattern = "^{{read_only_file_commands}}\\b{{read_only_file_arguments}} {{pi_mcp_output_file}}{{read_only_file_redirect}}$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-044"
+pattern = "^{{read_only_file_commands}}\\b{{read_only_file_arguments}} {{pi_subagent_status_file}}{{read_only_file_redirect}}$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-045"
+pattern = "^{{read_only_file_commands}}\\b{{read_only_file_arguments}} {{pi_subagent_run_shell_file}}{{read_only_file_redirect}}$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-046"
+pattern = "^{{read_only_file_commands}}\\b{{read_only_file_arguments}} {{agent_skill_shell_file}}{{read_only_file_redirect}}$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-047"
+pattern = "^{{read_only_file_commands}}\\b{{read_only_file_arguments}} {{nix_store_output_shell_path}}{{read_only_file_redirect}}$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-048"
+pattern = "^rg( -[A-Za-z0-9]+| --no-filename)* {{rg_quoted_pattern}} {{nix_store_output_shell_path}}( {{nix_store_output_shell_path}})*( (--glob|-g) {{rg_quoted_pattern}})*{{read_only_file_redirect}}$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-049"
+pattern = "^{{read_only_file_commands}}\\b{{read_only_file_arguments}} {{dependency_cache_shell_path}}{{read_only_file_redirect}}$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-050"
+pattern = "^ls( -[1aAlhFR]+)* {{cargo_registry_glob_path}}{{read_only_file_redirect}}$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-051"
+pattern = "^find {{dependency_cache_shell_path}}( -maxdepth [0-9]+| -name {{rg_quoted_pattern}})*{{read_only_file_redirect}}$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-052"
+pattern = "^rg{{rg_read_flag}}* {{rg_quoted_pattern}}{{rg_read_flag}}* {{dependency_cache_search_path}}( {{dependency_cache_search_path}})*({{rg_read_flag}}| (--type|-t) [a-z0-9]+| (--glob|-g) {{rg_quoted_pattern}})*{{read_only_file_redirect}}$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-053"
+pattern = "^sed -n {{sed_print_script}} {{sed_safe_abs_file}}{{read_only_file_redirect}}$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-054"
+pattern = "^sed( -[neEr]+)* {{sed_subst_script}} {{sed_safe_abs_file}}{{read_only_file_redirect}}$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-055"
+pattern = "^sed\\b.* {{sed_safe_abs_file}}{{read_only_file_redirect}}$"
+action = { "type" = "Deny", "value" = "Benchmark policy denial" }
+
+[[bash_rules]]
+name = "bash_rules-056"
+pattern = "^sed( -[A-Za-z]+)* [\"']?/"
+action = { "type" = "Deny", "value" = "Benchmark policy denial" }
+
+[[bash_rules]]
+name = "bash_rules-057"
+pattern = "^gh (api|pr|issue|repo|release|run|search|label)\\b.*(--jq|-q|-t|--template)([= ]{{jq_env_builtin}}|[= ].*{{jq_environment_access}})"
+action = { "type" = "Ask" }
+
+[[bash_rules]]
+name = "bash_rules-058"
+pattern = "^gh api (--method GET|-X GET) /?[A-Za-z0-9._/-]+{{gh_api_get_flag}}*( 2>/dev/null| 2>\\&1)?$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-059"
+pattern = "^gh api graphql\\b.*mutation"
+action = { "type" = "Ask" }
+
+[[bash_rules]]
+name = "bash_rules-060"
+pattern = "^gh api graphql{{gh_graphql_var}}* -f query={{gh_graphql_query}}{{gh_graphql_var}}*{{gh_api_readonly_flag}}*{{read_only_file_redirect}}$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-061"
+pattern = "^gh api\\b.*( (-X|--method) \\S+| (-f|-F|--field|--raw-field|--input)(=|\\s))"
+action = { "type" = "Ask" }
+
+[[bash_rules]]
+name = "bash_rules-062"
+pattern = "^gh api ({{gh_api_endpoint}}|'{{gh_api_endpoint}}'|\"{{gh_api_endpoint}}\"){{gh_api_readonly_flag}}*{{read_only_file_redirect}}$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-063"
+pattern = "^gh (pr (view|list|diff|status|checks)|issue (view|list|status)|repo view|release (view|list)|run (view|list)|search (code|issues|prs|repos)|label list)\\b( ({{rg_quoted_pattern}}|[^|;&<>$`\\\\'\"\\s]+))*{{read_only_file_redirect}}$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-064"
+pattern = "^{{read_only_file_commands}}\\b{{read_only_file_arguments}} {{dev_null_file}}{{read_only_file_redirect}}$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-065"
+pattern = "^rg( -[A-Za-z0-9]+)* {{rg_quoted_pattern}} {{dev_null_file}}{{read_only_file_redirect}}$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-066"
+pattern = "^{{read_only_file_commands}}\\b{{read_only_file_arguments}} {{claude_read_only_file}}( {{claude_read_only_file}})*{{read_only_file_redirect}}$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-067"
+pattern = "^{{timeout_prefix}}helm\\b.*{{helm_unsafe_flags}}(=|\\s|$)"
+action = { "type" = "Ask" }
+
+[[bash_rules]]
+name = "bash_rules-068"
+pattern = "^helm (version( --short)?|plugin list|env|show (chart|values|readme) ({{safe_relative_path}}|{{helm_oci_chart_ref}})|dependency list( {{safe_relative_path}})?){{read_only_file_redirect}}$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-069"
+pattern = "^{{timeout_prefix}}{{helm_render_chart}}{{safe_stream_redirect}}$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-070"
+pattern = "^kubeconform( -(strict|summary|schema-location (default|'https://raw\\.githubusercontent\\.com/datreeio/CRDs-catalog/[^']*')))*( -| {{safe_relative_path}}| {{claude_scratchpad_file}})+{{read_only_file_redirect}}$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-071"
+pattern = "^nix derivation show {{nix_store_output_root}}\\.drv{{read_only_file_redirect}}$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-072"
+pattern = "^test -e /run/current-system/sw/share/nix-ld/lib/ld\\.so$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-073"
+pattern = "^git (-C|--git-dir)(=| )[\"']?/"
+action = { "type" = "Deny", "value" = "Benchmark policy denial" }
+
+[[bash_rules]]
+name = "bash_rules-074"
+pattern = "(^|[\\s=])[$\"'\\\\]*/"
+action = { "type" = "Ask" }
+
+[[bash_rules]]
+name = "bash_rules-075"
+pattern = "(^~|\\s~|=~)"
+action = { "type" = "Ask" }
+
+[[bash_rules]]
+name = "bash_rules-076"
+pattern = "^rg\\b"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-077"
+pattern = "^fd\\b.*\\s(-x|-X|--exec|--exec-batch)(=|\\s|$)"
+action = { "type" = "Ask" }
+
+[[bash_rules]]
+name = "bash_rules-078"
+pattern = "^fd\\b"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-079"
+pattern = "^command -v( [A-Za-z0-9_.@+-]+)+{{read_only_file_redirect}}$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-080"
+pattern = "![!$^*0-9a-zA-Z-]"
+action = { "type" = "Ask" }
+
+[[bash_rules]]
+name = "bash_rules-081"
+pattern = "^(sudo|systemctl)\\s"
+action = { "type" = "Deny", "value" = "Benchmark policy denial" }
+
+[[bash_rules]]
+name = "bash_rules-082"
+pattern = "^{{timeout_prefix}}pnpm{{pnpm_filter_scope}}( (-C|--dir) ({{safe_relative_path}}|\\.))? exec eslint( \\.| {{safe_relative_path}}/?)+( >/dev/null 2>\\&1| 2>\\&1)?$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-083"
+pattern = "^pnpm( {{pnpm_safe_selector}})* exec tsc --noEmit( --pretty( (true|false))?)?( 2>\\&1)?$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-084"
+pattern = "^{{timeout_prefix}}pnpm( {{pnpm_safe_selector}})* (exec )?vitest run\\b.*\\s{{vitest_write_arg}}(\\s|$)"
+action = { "type" = "Ask" }
+
+[[bash_rules]]
+name = "bash_rules-085"
+pattern = "^{{timeout_prefix}}pnpm( {{pnpm_safe_selector}})* (exec )?vitest run(\\s|$)"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-086"
+pattern = "^timeout [0-9]+ npx vitest run\\b"
+action = { "type" = "Deny", "value" = "Benchmark policy denial" }
+
+[[bash_rules]]
+name = "bash_rules-087"
+pattern = "^(node )?(\\./)?node_modules/(\\.bin/tsc|typescript/bin/tsc)\\b"
+action = { "type" = "Deny", "value" = "Benchmark policy denial" }
+
+[[bash_rules]]
+name = "bash_rules-088"
+pattern = "^{{env_subdir_prefix}}nix develop\\b.*--tree-root-cmd(=|\\s|$)"
+action = { "type" = "Ask" }
+
+[[bash_rules]]
+name = "bash_rules-089"
+pattern = "^{{env_subdir_prefix}}nix develop\\b.*{{helm_unsafe_flags}}(=|\\s|$)"
+action = { "type" = "Ask" }
+
+[[bash_rules]]
+name = "bash_rules-090"
+pattern = "^{{env_subdir_prefix}}nix develop( \\.#[A-Za-z0-9_-]+)? (-c|--command) {{nix_develop_command}}( 2>\\&1)?$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-091"
+pattern = "^{{env_subdir_prefix}}nix develop( \\.#[A-Za-z0-9_-]+)? (-c|--command) [A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9_.@+,:/-]* ci/{{safe_relative_path}}\\.sh( 2>\\&1)?$"
+modes = ["acceptEdits", "auto", "dontAsk", "bypassPermissions"]
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-092"
+pattern = "\\bexec(dir)?\\b"
+action = { "type" = "Ask" }
+
+[[bash_rules]]
+name = "bash_rules-093"
+pattern = "^find\\b.* -(delete|ok|okdir|fprintf|fprint|fls)\\b"
+action = { "type" = "Ask" }
+
+[[bash_rules]]
+name = "bash_rules-094"
+pattern = "^cargo doc\\b.*--(open|browser)"
+action = { "type" = "ArgumentFilter", "remove" = [
+  "--open",
+  "-o",
+  "--browser",
+], "reason" = "Benchmark argument adjustment" }
+
+[[bash_rules]]
+name = "bash_rules-095"
+pattern = "^cargo nextest run( -(p|-package) \\S+)?$"
+action = { "type" = "ArgumentFilter", "add" = [
+  "--no-fail-fast",
+  "--hide-progress-bar",
+  "--success-output",
+  "never",
+  "--status-level",
+  "fail",
+  "--final-status-level",
+  "flaky",
+], "reason" = "Benchmark argument adjustment" }
+
+[[bash_rules]]
+name = "bash_rules-096"
+pattern = "^test( !)? -e {{safe_relative_path}}$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-097"
+pattern = "^test \\$\\? -eq [0-9]+$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-098"
+pattern = "^mkdir( (-p|--parents))? {{safe_relative_path}}( {{safe_relative_path}})*$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-099"
+pattern = "^cargo {{cargo_safe_ops}}\\b"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-100"
+pattern = "^cargo hakari verify( 2>\\&1)?$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-101"
+pattern = "^cargo hakari manage-deps --dry-run( 2>\\&1)?$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-102"
+pattern = "^cargo hakari generate --diff( 2>\\&1)?$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-103"
+pattern = "^cargo hakari manage-deps --help$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-104"
+pattern = "^cargo deny check( licenses)?( 2>\\&1)?$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-105"
+pattern = "^cargo audit( 2>\\&1)?$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-106"
+pattern = "^cargo run( -q| --quiet)? (--bin|-p|--package) moriarty -- {{moriarty_cost_report}}( 2>\\&1)?$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-107"
+pattern = "^(\\./)?target/(debug|release)/moriarty {{moriarty_cost_report}}( 2>\\&1)?$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-108"
+pattern = "^python3 users/example/graphical/claude-code/test_terminal_notification\\.py$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-109"
+pattern = "^mandoc -Tlint (doc/man/moriarty-bash-rules\\.5|doc/man/moriarty\\.1 doc/man/moriarty-tool-rules\\.5 doc/man/moriarty-bash-rules\\.5)$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-110"
+pattern = "^node --test scripts/\\*\\.test\\.mjs$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-111"
+pattern = "^node --test scripts/\\*\\.test\\.mjs argocd/\\*\\.node-test\\.mjs$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-112"
+pattern = "^(timeout [0-9]+ )?node (--experimental-strip-types )?--test( {{safe_relative_path}}[.-]test\\.[cm]?[jt]s)+( 2>\\&1)?$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-113"
+pattern = "^{{demo_iac_manifest_validator}}$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-114"
+pattern = "^{{demo_iac_alloy_validator}}$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-115"
+pattern = "^pnpm render:(service|root-auth) --( --[a-z][a-z-]* [A-Za-z0-9_.:@+-][A-Za-z0-9_.:@+/-]*)+$"
+modes = ["acceptEdits", "auto", "dontAsk", "bypassPermissions"]
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-116"
+pattern = "^pnpm (-C|--dir) {{safe_relative_path}} (run )?{{package_safe_ops}}( 2>\\&1)?$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-117"
+pattern = "^bash -n {{safe_relative_path}}$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-118"
+pattern = "^node (--check|-c) {{safe_relative_path}}$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-119"
+pattern = "^RUSTDOCFLAGS=(\"(-D|--deny) warnings\"|'(-D|--deny) warnings') cargo doc( --workspace)? --no-deps( --all-features)?( 2>\\&1)?$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-120"
+pattern = "^bats( {{safe_relative_path}}\\.bats)+( 2>\\&1)?$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-121"
+pattern = "^tr\\b"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-122"
+pattern = "^sha256sum( {{safe_relative_path}})*{{read_only_file_redirect}}$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-123"
+pattern = "^ps -C [A-Za-z0-9_.+-]+ -o stat={{read_only_file_redirect}}$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-124"
+pattern = "^((jj|watchman|rustc) --version|uptime( -s)?|who -b|getconf _NPROCESSORS_ONLN){{read_only_file_redirect}}$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-125"
+pattern = "^curl -Ls https://static\\.crates\\.io/crates/[A-Za-z0-9_-]+/[A-Za-z0-9_.+-]+\\.crate$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-126"
+pattern = "^gh auth status$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-127"
+pattern = "^git{{git_globals}} branch\\s+(-[a-zA-Z]*[dDmMcCf]\\b|--(delete|move|copy|force|edit-description)\\b|[^-])"
+action = { "type" = "Ask" }
+
+[[bash_rules]]
+name = "bash_rules-128"
+pattern = "^git{{git_globals}} tag\\s+(-[a-zA-Z]*[adfsuFm]\\b|--(delete|force|annotate|sign|local-user|create-reflog|edit|message|file)\\b|[^-])"
+action = { "type" = "Ask" }
+
+[[bash_rules]]
+name = "bash_rules-129"
+pattern = "^git{{git_globals}} remote\\s+(add|remove|rm|rename|set-url|set-head|set-branches|prune|update)\\b"
+action = { "type" = "Ask" }
+
+[[bash_rules]]
+name = "bash_rules-130"
+pattern = "^git{{git_globals}} {{git_read_ops}}\\b"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-131"
+pattern = "^git{{git_globals}} {{git_write_ops}}\\b"
+action = { "type" = "Ask" }
+
+[[bash_rules]]
+name = "bash_rules-132"
+pattern = "^jj{{jj_globals}} {{jj_read_ops}}\\b"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-133"
+pattern = "^jj{{jj_globals}} ((git remote|tag|workspace) list|bookmark list( --all-remotes| --no-pager| --remote {{flag_value_name}}| {{jj_bookmark_glob}})*)$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-134"
+pattern = "^jj\\b.*\\bgit push\\b.*\\s--allow-new(\\s|$)"
+action = { "type" = "Deny", "value" = "Benchmark policy denial" }
+
+[[bash_rules]]
+name = "bash_rules-135"
+pattern = "^jj{{jj_globals}} git fetch( --remote {{flag_value_name}})*$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-136"
+pattern = "^jj{{jj_globals}} op (log|show|diff)\\b"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-137"
+pattern = "^jj{{jj_globals}} file (show|list)\\b"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-138"
+pattern = "^jj{{jj_globals}} resolve --list\\b"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-139"
+pattern = "^jj{{jj_globals}}( [a-z][a-z-]*)+ --help$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-140"
+pattern = "^rm\\b"
+action = { "type" = "Ask" }
+
+[[bash_rules]]
+name = "bash_rules-141"
+pattern = "^set (-euo|-o) pipefail$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-142"
+pattern = "^sort\\b.*(\\s-o|--output|--compress-program)"
+action = { "type" = "Ask" }
+
+[[bash_rules]]
+name = "bash_rules-143"
+pattern = "^(ls|cat|head|tail|nl|pwd|which|whoami|date|wc|grep|jq|man|sort|sleep|printf|true|cut|diff)\\b"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-144"
+pattern = "^hostname( -[sfd])?$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-145"
+pattern = "^command -v [A-Za-z0-9_.+-]+( >/dev/null)?$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-146"
+pattern = "^tar -?tzf {{tar_archive_operand}}$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-147"
+pattern = "^tar -?x(zOf {{tar_archive_operand}}( {{tar_member}})+|zf {{tar_archive_operand}} -O( {{tar_member}})+)$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-148"
+pattern = "^uniq( +-{1,2}\\S+( +[0-9]+)?)*$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-149"
+pattern = "^base64 (-d|-D|--decode)( {{safe_relative_path}})?$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-150"
+pattern = "^find\\b"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-151"
+pattern = "^sed -n {{sed_print_script}}( [^-]\\S*)?$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-152"
+pattern = "^sed( -[neEr]+)* {{sed_subst_script}}( [^-]\\S*)?$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-153"
+pattern = "^sed\\b"
+action = { "type" = "Deny", "value" = "Benchmark policy denial" }
+
+[[bash_rules]]
+name = "bash_rules-154"
+pattern = "^xargs( -[a-zA-Z0-9-]+)* (grep|cat|head|tail|wc|file|ls)\\b"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-155"
+pattern = "^jscpd\\b"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-156"
+pattern = "^launchctl list\\b"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-157"
+pattern = "^npx vitest run\\b.*\\s(-u|--update|--coverage)(\\s|=|$)"
+action = { "type" = "Ask" }
+
+[[bash_rules]]
+name = "bash_rules-158"
+pattern = "^npx vitest run\\b"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-159"
+pattern = "^semgrep scan --config=\\./\\.config/semgrep_rules\\.yaml --timeout 30 --strict --error \\.( 2>/dev/null| 2>\\&1)?$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-160"
+pattern = "^(PULUMI_EXPERIMENTAL=true )?pulumi\\s+(.*\\s)?--help$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-161"
+pattern = "^pulumi version( 2>\\&1)?$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-162"
+pattern = "^pulumi whoami( -v| --verbose)?( 2>\\&1)?$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-163"
+pattern = "^pulumi preview{{pulumi_cwd_flag}}? (-s|--stack) {{pulumi_stack_name}}( --policy-pack {{safe_relative_path}})? --non-interactive( --diff| --json)*{{read_only_file_redirect}}$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-164"
+pattern = "^pulumi{{pulumi_cwd_flag}}? stack( ls| output( {{flag_value_name}})?)?( --json| (-s|--stack) {{pulumi_stack_name}}|{{pulumi_cwd_flag}})*{{read_only_file_redirect}}$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-165"
+pattern = "^gcloud\\s+(.*\\s)?--help$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-166"
+pattern = "^nix --version( 2>/dev/null)?$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-167"
+pattern = "^nix run --inputs-from \\. nixpkgs#rumdl -- check( \\.| {{safe_relative_path}})+{{read_only_file_redirect}}$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-168"
+pattern = "^nix run --inputs-from \\. nixpkgs#rumdl -- fmt( \\.| {{safe_relative_path}})+{{read_only_file_redirect}}$"
+modes = ["acceptEdits", "auto", "dontAsk", "bypassPermissions"]
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-169"
+pattern = "^nix run( --inputs-from \\.)? nixpkgs#biome -- (--version|check( \\.| {{safe_relative_path}})+){{read_only_file_redirect}}$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-170"
+pattern = "^nix run( --inputs-from \\.)? nixpkgs#biome -- (check|format) --write( \\.| {{safe_relative_path}})+{{read_only_file_redirect}}$"
+modes = ["acceptEdits", "auto", "dontAsk", "bypassPermissions"]
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-171"
+pattern = "^((\\./)?result/bin/)?claude --version( 2>\\&1)?$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-172"
+pattern = "^nix (build|flake check|eval|derivation show)\\b.*(--no-sandbox|--option(=|\\s|$)|[\"'\\\\])"
+action = { "type" = "Ask" }
+
+[[bash_rules]]
+name = "bash_rules-173"
+pattern = "^nix derivation show\\b"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-174"
+pattern = "^nix build\\b"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-175"
+pattern = "^nix flake check\\b"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-176"
+pattern = "^nix eval\\b.*--write-to(=|\\s|$)"
+action = { "type" = "Ask" }
+
+[[bash_rules]]
+name = "bash_rules-177"
+pattern = "^nix eval\\b"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-178"
+pattern = "^nix fmt( 2>\\&1)?$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-179"
+pattern = "^just( {{just_safe_recipes}})?( 2>\\&1)?$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-180"
+pattern = "^pnpm --version$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-181"
+pattern = "^pnpm --filter @example-scope/pi-permission-system run verify:public-types{{read_only_file_redirect}}$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-182"
+pattern = "^pnpm fallow dead-code{{read_only_file_redirect}}$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-183"
+pattern = "^pnpm --filter @example-scope/pi-permission-system run gen:schema{{read_only_file_redirect}}$"
+modes = ["acceptEdits", "auto", "dontAsk", "bypassPermissions"]
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-184"
+pattern = "^(timeout [0-9]+ )?pnpm{{pnpm_script_scope}} (run )?{{package_safe_ops}}(\\s|$)"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-185"
+pattern = "^npm( --prefix {{safe_relative_path}})? run {{package_safe_ops}}( --prefix {{safe_relative_path}})?( 2>\\&1)?$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-186"
+pattern = "^npm run test{{npm_test_args}}{{read_only_file_redirect}}$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-187"
+pattern = "^npm test({{npm_test_args}})?{{read_only_file_redirect}}$"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-188"
+pattern = "^moriarty (rules (lint|replay|suggest)|test bash-rules)\\b"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-189"
+pattern = "^taplo (fmt\\b|format --check( 2>\\&1)?$)"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-190"
+pattern = "^treefmt\\b.*--tree-root-cmd(=|\\s|$)"
+action = { "type" = "Ask" }
+
+[[bash_rules]]
+name = "bash_rules-191"
+pattern = "^treefmt\\b"
+action = { "type" = "Allow" }
+
+[[bash_rules]]
+name = "bash_rules-192"
+pattern = "^yamllint{{safe_arg_tail}}{{safe_stream_redirect}}$"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-000"
+tool = "ast_grep_dump"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-001"
+tool = "ast_grep_outline"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-002"
+tool = "ast_grep_replace"
+modes = ["default", "plan"]
+conditions = [{ "type" = "Equals", "field" = "apply", "value" = true }]
+action = { "type" = "Deny", "value" = "Benchmark policy denial" }
+
+[[tool_rules]]
+name = "tool_rules-003"
+tool = "ast_grep_replace"
+modes = ["acceptEdits", "auto", "dontAsk", "bypassPermissions"]
+conditions = [{ "type" = "Equals", "field" = "apply", "value" = true }]
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-004"
+tool = "ast_grep_replace"
+conditions = [{ "type" = "Absent", "field" = "apply" }]
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-005"
+tool = "ast_grep_replace"
+conditions = [{ "type" = "Equals", "field" = "apply", "value" = false }]
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-006"
+tool = "ast_grep_search"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-007"
+tool = "get_search_content"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-008"
+tool = "lens_diagnostic_mark"
+modes = ["default", "plan"]
+conditions = [
+  { "type" = "Equals", "field" = "disposition", "value" = "suppress" },
+]
+action = { "type" = "Deny", "value" = "Benchmark policy denial" }
+
+[[tool_rules]]
+name = "tool_rules-009"
+tool = "lens_diagnostic_mark"
+modes = ["acceptEdits", "auto", "dontAsk", "bypassPermissions"]
+conditions = [
+  { "type" = "Equals", "field" = "disposition", "value" = "suppress" },
+]
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-010"
+tool = "lens_diagnostic_mark"
+conditions = [
+  { "type" = "Matches", "field" = "disposition", "pattern" = "^(false-positive|defer|flagged)$" },
+]
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-011"
+tool = "lens_diagnostics"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-012"
+tool = "lsp_diagnostics"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-013"
+tool = "lsp_navigation"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-014"
+tool = "pi_lens_activate_tools"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-015"
+tool = "project_report"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-016"
+tool = "symbol_search"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-017"
+tool = "ask_user"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-018"
+tool = "plannotator_submit_plan"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-019"
+tool = "contact_supervisor"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-020"
+tool = "mcp_list"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-021"
+tool = "mcp__project-tools"
+conditions = [
+  { "type" = "Equals", "field" = "server", "value" = "project-tools" },
+  { "type" = "Absent", "field" = "action" },
+  { "type" = "Absent", "field" = "tool" },
+  { "type" = "Absent", "field" = "args" },
+  { "type" = "Absent", "field" = "connect" },
+  { "type" = "Absent", "field" = "describe" },
+  { "type" = "Absent", "field" = "instructions" },
+  { "type" = "Absent", "field" = "search" },
+  { "type" = "Absent", "field" = "regex" },
+  { "type" = "Absent", "field" = "includeSchemas" },
+]
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-022"
+tool = "mcp__jj-read-only"
+conditions = [
+  { "type" = "Equals", "field" = "server", "value" = "jj-read-only" },
+  { "type" = "Absent", "field" = "action" },
+  { "type" = "Absent", "field" = "tool" },
+  { "type" = "Absent", "field" = "args" },
+  { "type" = "Absent", "field" = "connect" },
+  { "type" = "Absent", "field" = "describe" },
+  { "type" = "Absent", "field" = "instructions" },
+  { "type" = "Absent", "field" = "search" },
+  { "type" = "Absent", "field" = "regex" },
+  { "type" = "Absent", "field" = "includeSchemas" },
+]
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-023"
+tool = "mcp__git-read-only"
+conditions = [
+  { "type" = "Equals", "field" = "server", "value" = "git-read-only" },
+  { "type" = "Absent", "field" = "action" },
+  { "type" = "Absent", "field" = "tool" },
+  { "type" = "Absent", "field" = "args" },
+  { "type" = "Absent", "field" = "connect" },
+  { "type" = "Absent", "field" = "describe" },
+  { "type" = "Absent", "field" = "instructions" },
+  { "type" = "Absent", "field" = "search" },
+  { "type" = "Absent", "field" = "regex" },
+  { "type" = "Absent", "field" = "includeSchemas" },
+]
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-024"
+tool = "mcp__project-tools"
+conditions = [
+  { "type" = "Equals", "field" = "server", "value" = "project-tools" },
+  { "type" = "Matches", "field" = "describe", "pattern" = ".+" },
+  { "type" = "Absent", "field" = "action" },
+  { "type" = "Absent", "field" = "args" },
+  { "type" = "Absent", "field" = "connect" },
+]
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-025"
+tool = "mcp__jj-read-only"
+conditions = [
+  { "type" = "Equals", "field" = "server", "value" = "jj-read-only" },
+  { "type" = "Matches", "field" = "describe", "pattern" = ".+" },
+  { "type" = "Absent", "field" = "action" },
+  { "type" = "Absent", "field" = "args" },
+  { "type" = "Absent", "field" = "connect" },
+]
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-026"
+tool = "mcp__git-read-only"
+conditions = [
+  { "type" = "Equals", "field" = "server", "value" = "git-read-only" },
+  { "type" = "Matches", "field" = "describe", "pattern" = ".+" },
+  { "type" = "Absent", "field" = "action" },
+  { "type" = "Absent", "field" = "args" },
+  { "type" = "Absent", "field" = "connect" },
+]
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-027"
+tool = "mcp__project-tools"
+conditions = [
+  { "type" = "Equals", "field" = "server", "value" = "project-tools" },
+  { "type" = "Matches", "field" = "search", "pattern" = ".+" },
+  { "type" = "Absent", "field" = "action" },
+  { "type" = "Absent", "field" = "args" },
+  { "type" = "Absent", "field" = "connect" },
+  { "type" = "Absent", "field" = "tool" },
+]
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-028"
+tool = "mcp__jj-read-only"
+conditions = [
+  { "type" = "Equals", "field" = "server", "value" = "jj-read-only" },
+  { "type" = "Matches", "field" = "search", "pattern" = ".+" },
+  { "type" = "Absent", "field" = "action" },
+  { "type" = "Absent", "field" = "args" },
+  { "type" = "Absent", "field" = "connect" },
+  { "type" = "Absent", "field" = "tool" },
+]
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-029"
+tool = "mcp__git-read-only"
+conditions = [
+  { "type" = "Equals", "field" = "server", "value" = "git-read-only" },
+  { "type" = "Matches", "field" = "search", "pattern" = ".+" },
+  { "type" = "Absent", "field" = "action" },
+  { "type" = "Absent", "field" = "args" },
+  { "type" = "Absent", "field" = "connect" },
+  { "type" = "Absent", "field" = "tool" },
+]
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-030"
+tool = "mcp__project-tools__project_tools_run_build"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-031"
+tool = "mcp__project-tools__project_tools_run_checks"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-032"
+tool = "mcp__project-tools__project_tools_run_formatter"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-033"
+tool = "mcp__project-tools__project_tools_run_lint"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-034"
+tool = "mcp__project-tools__project_tools_run_tests"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-035"
+tool = "mcp"
+conditions = [
+  { "type" = "Absent", "field" = "action" },
+  { "type" = "Absent", "field" = "tool" },
+  { "type" = "Absent", "field" = "connect" },
+  { "type" = "Matches", "field" = "describe", "pattern" = ".+" },
+]
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-036"
+tool = "mcp"
+conditions = [
+  { "type" = "Absent", "field" = "action" },
+  { "type" = "Absent", "field" = "tool" },
+  { "type" = "Absent", "field" = "args" },
+  { "type" = "Absent", "field" = "connect" },
+  { "type" = "Absent", "field" = "describe" },
+  { "type" = "Absent", "field" = "instructions" },
+  { "type" = "Absent", "field" = "search" },
+  { "type" = "Absent", "field" = "regex" },
+  { "type" = "Absent", "field" = "includeSchemas" },
+  { "type" = "Absent", "field" = "server" },
+]
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-037"
+tool = "mcp"
+conditions = [
+  { "type" = "Matches", "field" = "connect", "pattern" = "^(project-tools|git-read-only|jj-read-only)$" },
+  { "type" = "Absent", "field" = "action" },
+  { "type" = "Absent", "field" = "tool" },
+  { "type" = "Absent", "field" = "args" },
+]
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-038"
+tool = "mcp"
+conditions = [
+  { "type" = "Matches", "field" = "instructions", "pattern" = "^(project-tools|git-read-only|jj-read-only)$" },
+  { "type" = "Absent", "field" = "action" },
+  { "type" = "Absent", "field" = "tool" },
+  { "type" = "Absent", "field" = "args" },
+]
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-039"
+tool = "mcpScript"
+action = { "type" = "Deny", "value" = "Benchmark policy denial" }
+
+[[tool_rules]]
+name = "tool_rules-040"
+tool = "subagent_supervisor"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-041"
+tool = "subagent_status"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-042"
+tool = "todo"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-043"
+tool = "recall"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-044"
+tool = "structured_output"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-045"
+tool = "jj_read_only"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-046"
+tool = "subagent_wait"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-047"
+tool = "project_tools_run_tests"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-048"
+tool = "mcp__project-tools__project_tools_run_tests"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-049"
+tool = "project_tools_run_build"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-050"
+tool = "project_tools_run_lint"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-051"
+tool = "project_tools_run_formatter"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-052"
+tool = "*"
+field = "path"
+pattern = "(^|/)\\.\\.(/|$)"
+action = { "type" = "Deny", "value" = "Benchmark policy denial" }
+
+[[tool_rules]]
+name = "tool_rules-053"
+tool = "*"
+field = "file_path"
+pattern = "(^|/)\\.\\.(/|$)"
+action = { "type" = "Deny", "value" = "Benchmark policy denial" }
+
+[[tool_rules]]
+name = "tool_rules-054"
+tool = "*"
+field = "path"
+pattern = "^{{wasteful_path}}$"
+action = { "type" = "Deny", "value" = "Benchmark policy denial" }
+
+[[tool_rules]]
+name = "tool_rules-055"
+tool = "*"
+field = "file_path"
+pattern = "^{{wasteful_path}}$"
+action = { "type" = "Deny", "value" = "Benchmark policy denial" }
+
+[[tool_rules]]
+name = "tool_rules-056"
+tool = "*"
+field = "path"
+pattern = "^{{nonexistent_path}}(/|$)"
+action = { "type" = "Deny", "value" = "Benchmark policy denial" }
+
+[[tool_rules]]
+name = "tool_rules-057"
+tool = "*"
+field = "file_path"
+pattern = "^{{nonexistent_path}}(/|$)"
+action = { "type" = "Deny", "value" = "Benchmark policy denial" }
+
+[[tool_rules]]
+name = "tool_rules-058"
+tool = "LS"
+field = "path"
+pattern = "{{review_oracle_hidden_path}}"
+action = { "type" = "Deny", "value" = "Benchmark policy denial" }
+
+[[tool_rules]]
+name = "tool_rules-059"
+tool = "Glob"
+field = "path"
+pattern = "{{review_oracle_hidden_path}}"
+action = { "type" = "Deny", "value" = "Benchmark policy denial" }
+
+[[tool_rules]]
+name = "tool_rules-060"
+tool = "Find"
+field = "path"
+pattern = "{{review_oracle_hidden_path}}"
+action = { "type" = "Deny", "value" = "Benchmark policy denial" }
+
+[[tool_rules]]
+name = "tool_rules-061"
+tool = "ls"
+field = "path"
+pattern = "{{review_oracle_hidden_path}}"
+action = { "type" = "Deny", "value" = "Benchmark policy denial" }
+
+[[tool_rules]]
+name = "tool_rules-062"
+tool = "find"
+field = "path"
+pattern = "{{review_oracle_hidden_path}}"
+action = { "type" = "Deny", "value" = "Benchmark policy denial" }
+
+[[tool_rules]]
+name = "tool_rules-063"
+tool = "Grep"
+field = "path"
+pattern = "{{review_oracle_hidden_path}}"
+action = { "type" = "Deny", "value" = "Benchmark policy denial" }
+
+[[tool_rules]]
+name = "tool_rules-064"
+tool = "grep"
+field = "path"
+pattern = "{{review_oracle_hidden_path}}"
+action = { "type" = "Deny", "value" = "Benchmark policy denial" }
+
+[[tool_rules]]
+name = "tool_rules-065"
+tool = "subagent"
+field = "action"
+pattern = "^(list|children\\.list|get|models|watchdog\\.(status|check|recommend-model|configure)|mission\\.close|create|update|delete|eject|disable|enable|reset|grant-spawn-budget|status|interrupt|stop|resume|steer|append-step|schedule|schedule-list|schedule-status|schedule-cancel|doctor)$"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-066"
+tool = "subagent"
+conditions = [
+  { "type" = "Absent", "field" = "action" },
+  { "type" = "Equals", "field" = "async", "value" = true },
+  { "type" = "Absent", "field" = "turnBudget" },
+  { "type" = "Absent", "field" = "turn_budget" },
+]
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-067"
+tool = "subagent"
+conditions = [{ "type" = "Absent", "field" = "action" }]
+action = { "type" = "Deny", "value" = "Benchmark policy denial" }
+
+[[tool_rules]]
+name = "tool_rules-068"
+tool = "subagent"
+action = { "type" = "Deny", "value" = "Benchmark policy denial" }
+
+[[tool_rules]]
+name = "tool_rules-069"
+tool = "Read"
+field = "path"
+pattern = "{{review_oracle_alignment_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-070"
+tool = "Read"
+field = "file_path"
+pattern = "{{review_oracle_alignment_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-071"
+tool = "read"
+field = "path"
+pattern = "{{review_oracle_alignment_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-072"
+tool = "Read"
+field = "path"
+pattern = "{{test_review_alignment_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-073"
+tool = "Read"
+field = "file_path"
+pattern = "{{test_review_alignment_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-074"
+tool = "read"
+field = "path"
+pattern = "{{test_review_alignment_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-075"
+tool = "Read"
+field = "path"
+pattern = "{{review_oracle_hidden_path}}"
+action = { "type" = "Deny", "value" = "Benchmark policy denial" }
+
+[[tool_rules]]
+name = "tool_rules-076"
+tool = "Read"
+field = "file_path"
+pattern = "{{review_oracle_hidden_path}}"
+action = { "type" = "Deny", "value" = "Benchmark policy denial" }
+
+[[tool_rules]]
+name = "tool_rules-077"
+tool = "read"
+field = "path"
+pattern = "{{review_oracle_hidden_path}}"
+action = { "type" = "Deny", "value" = "Benchmark policy denial" }
+
+[[tool_rules]]
+name = "tool_rules-078"
+tool = "Read"
+field = "path"
+pattern = "{{skill_file_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-079"
+tool = "Read"
+field = "file_path"
+pattern = "{{skill_file_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-080"
+tool = "read"
+field = "path"
+pattern = "{{skill_file_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-081"
+tool = "*"
+field = "path"
+pattern = "{{pi_mcp_scripting_skill_path}}"
+action = { "type" = "Deny", "value" = "Benchmark policy denial" }
+
+[[tool_rules]]
+name = "tool_rules-082"
+tool = "*"
+field = "file_path"
+pattern = "{{pi_mcp_scripting_skill_path}}"
+action = { "type" = "Deny", "value" = "Benchmark policy denial" }
+
+[[tool_rules]]
+name = "tool_rules-083"
+tool = "Read"
+field = "path"
+pattern = "{{pi_installed_skills_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-084"
+tool = "Read"
+field = "file_path"
+pattern = "{{pi_installed_skills_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-085"
+tool = "read"
+field = "path"
+pattern = "{{pi_installed_skills_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-086"
+tool = "Read"
+field = "path"
+pattern = "{{nix_store_output_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-087"
+tool = "Grep"
+field = "path"
+pattern = "{{nix_store_output_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-088"
+tool = "Glob"
+field = "path"
+pattern = "{{nix_store_output_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-089"
+tool = "LS"
+field = "path"
+pattern = "{{nix_store_output_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-090"
+tool = "Read"
+field = "path"
+pattern = "{{dependency_cache_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-091"
+tool = "Read"
+field = "file_path"
+pattern = "{{dependency_cache_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-092"
+tool = "Grep"
+field = "path"
+pattern = "{{dependency_cache_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-093"
+tool = "Find"
+field = "path"
+pattern = "{{dependency_cache_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-094"
+tool = "Glob"
+field = "path"
+pattern = "{{dependency_cache_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-095"
+tool = "Read"
+field = "path"
+pattern = "{{agent_temp_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-096"
+tool = "Read"
+field = "file_path"
+pattern = "{{agent_temp_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-097"
+tool = "read"
+field = "path"
+pattern = "{{agent_temp_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-098"
+tool = "Grep"
+field = "path"
+pattern = "{{agent_temp_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-099"
+tool = "grep"
+field = "path"
+pattern = "{{agent_temp_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-100"
+tool = "Read"
+field = "path"
+pattern = "{{pi_mcp_output_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-101"
+tool = "Read"
+field = "file_path"
+pattern = "{{pi_mcp_output_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-102"
+tool = "read"
+field = "path"
+pattern = "{{pi_mcp_output_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-103"
+tool = "Grep"
+field = "path"
+pattern = "{{pi_mcp_output_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-104"
+tool = "grep"
+field = "path"
+pattern = "{{pi_mcp_output_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-105"
+tool = "Read"
+field = "path"
+pattern = "{{pi_subagent_output_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-106"
+tool = "Read"
+field = "file_path"
+pattern = "{{pi_subagent_output_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-107"
+tool = "read"
+field = "path"
+pattern = "{{pi_subagent_output_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-108"
+tool = "Grep"
+field = "path"
+pattern = "{{pi_subagent_output_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-109"
+tool = "grep"
+field = "path"
+pattern = "{{pi_subagent_output_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-110"
+tool = "Find"
+field = "path"
+pattern = "{{pi_subagent_output_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-111"
+tool = "Glob"
+field = "path"
+pattern = "{{pi_subagent_output_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-112"
+tool = "find"
+field = "path"
+pattern = "{{pi_subagent_output_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-113"
+tool = "LS"
+field = "path"
+pattern = "{{pi_subagent_output_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-114"
+tool = "ls"
+field = "path"
+pattern = "{{pi_subagent_output_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-115"
+tool = "Read"
+field = "path"
+pattern = "{{pi_subagent_run_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-116"
+tool = "Read"
+field = "file_path"
+pattern = "{{pi_subagent_run_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-117"
+tool = "read"
+field = "path"
+pattern = "{{pi_subagent_run_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-118"
+tool = "Grep"
+field = "path"
+pattern = "{{pi_subagent_run_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-119"
+tool = "grep"
+field = "path"
+pattern = "{{pi_subagent_run_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-120"
+tool = "Find"
+field = "path"
+pattern = "{{pi_subagent_run_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-121"
+tool = "Glob"
+field = "path"
+pattern = "{{pi_subagent_run_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-122"
+tool = "find"
+field = "path"
+pattern = "{{pi_subagent_run_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-123"
+tool = "Read"
+field = "path"
+pattern = "{{claude_tool_results_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-124"
+tool = "Read"
+field = "file_path"
+pattern = "{{claude_tool_results_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-125"
+tool = "read"
+field = "path"
+pattern = "{{claude_tool_results_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-126"
+tool = "Grep"
+field = "path"
+pattern = "{{claude_tool_results_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-127"
+tool = "grep"
+field = "path"
+pattern = "{{claude_tool_results_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-128"
+tool = "Find"
+field = "path"
+pattern = "{{claude_tool_results_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-129"
+tool = "Glob"
+field = "path"
+pattern = "{{claude_tool_results_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-130"
+tool = "find"
+field = "path"
+pattern = "{{claude_tool_results_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-131"
+tool = "LS"
+field = "path"
+pattern = "{{claude_tool_results_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-132"
+tool = "ls"
+field = "path"
+pattern = "{{claude_tool_results_path}}"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-133"
+tool = "LS"
+conditions = [{ "type" = "Absent", "field" = "path" }]
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-134"
+tool = "LS"
+conditions = [{ "type" = "Equals", "field" = "path", "value" = "" }]
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-135"
+tool = "Glob"
+conditions = [
+  { "type" = "Absent", "field" = "path" },
+  { "type" = "Absent", "field" = "file_path" },
+]
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-136"
+tool = "Glob"
+conditions = [{ "type" = "Equals", "field" = "path", "value" = "" }]
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-137"
+tool = "Grep"
+conditions = [{ "type" = "Absent", "field" = "path" }]
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-138"
+tool = "Grep"
+conditions = [{ "type" = "Equals", "field" = "path", "value" = "" }]
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-139"
+tool = "ls"
+conditions = [{ "type" = "Absent", "field" = "path" }]
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-140"
+tool = "ls"
+conditions = [{ "type" = "Equals", "field" = "path", "value" = "" }]
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-141"
+tool = "find"
+conditions = [
+  { "type" = "Absent", "field" = "path" },
+  { "type" = "Absent", "field" = "file_path" },
+]
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-142"
+tool = "find"
+conditions = [{ "type" = "Equals", "field" = "path", "value" = "" }]
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-143"
+tool = "grep"
+conditions = [{ "type" = "Absent", "field" = "path" }]
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-144"
+tool = "grep"
+conditions = [{ "type" = "Equals", "field" = "path", "value" = "" }]
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-145"
+tool = "module_report"
+allow_local = true
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-146"
+tool = "read_enclosing"
+allow_local = true
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-147"
+tool = "read_symbol"
+allow_local = true
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-148"
+tool = "Read"
+allow_local = true
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-149"
+tool = "Write"
+allow_local = true
+field = "path"
+pattern = "^\\.config/tools\\.toml$"
+action = { "type" = "Ask" }
+
+[[tool_rules]]
+name = "tool_rules-150"
+tool = "Write"
+allow_local = true
+field = "file_path"
+pattern = "^\\.config/tools\\.toml$"
+action = { "type" = "Ask" }
+
+[[tool_rules]]
+name = "tool_rules-151"
+tool = "Edit"
+allow_local = true
+field = "path"
+pattern = "^\\.config/tools\\.toml$"
+action = { "type" = "Ask" }
+
+[[tool_rules]]
+name = "tool_rules-152"
+tool = "Edit"
+allow_local = true
+field = "file_path"
+pattern = "^\\.config/tools\\.toml$"
+action = { "type" = "Ask" }
+
+[[tool_rules]]
+name = "tool_rules-153"
+tool = "Write"
+modes = ["plan", "acceptEdits", "auto", "dontAsk", "bypassPermissions"]
+allow_local = true
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-154"
+tool = "Edit"
+modes = ["plan", "acceptEdits", "auto", "dontAsk", "bypassPermissions"]
+allow_local = true
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-155"
+tool = "Grep"
+allow_local = true
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-156"
+tool = "Glob"
+allow_local = true
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-157"
+tool = "LS"
+allow_local = true
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-158"
+tool = "mcp"
+field = "tool"
+pattern = "^(git_read_only_|git-read-only_)"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-159"
+tool = "mcp"
+field = "server"
+pattern = "^(mcp_server_)?git-read-only$"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-160"
+tool = "mcp"
+field = "tool"
+pattern = "^(jj_read_only_|jj-read-only_)"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-161"
+tool = "mcp__jj-read-only__jj_read_only_run"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-162"
+tool = "mcp"
+field = "server"
+pattern = "^(mcp_server_)?jj-read-only$"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-163"
+tool = "mcp"
+field = "tool"
+pattern = "^(project_tools_|project-tools_)"
+action = { "type" = "Allow" }
+
+[[tool_rules]]
+name = "tool_rules-164"
+tool = "mcp"
+field = "server"
+pattern = "^(mcp_server_)?project-tools$"
+action = { "type" = "Allow" }

@@ -9,12 +9,14 @@ slow-timeout = { period = "15s", terminate-after = 4 }
 #
 # Categories of skipped tests:
 #
-# - `pi_cost_cli_defaults_to_local_timezone`: chrono's `Local` reads
-#   `/usr/share/zoneinfo` to interpret `TZ=America/New_York`; the sandbox has
-#   no tzdata so chrono silently falls back to UTC.
-# - `mcp::git_read_only::tests::*`, `mcp::jj_read_only::tests::*`, and
-#   `repository::tests::test_workspace_root_git_worktree`: invoke the real
-#   `git`/`jj` binaries, which are not on PATH inside the sandbox.
+# - `pi_cost_cli_defaults_to_local_timezone` and
+#   `rules::report::tests::daily_groups_use_the_selected_timezone_at_a_date_boundary`:
+#   chrono's `Local` reads `/usr/share/zoneinfo` for named TZ values such as
+#   America/New_York and Australia/Sydney; without tzdata it falls back to UTC.
+# - `mcp::git_read_only::tests::*`, `mcp::jj_read_only::tests::*`,
+#   `repository::tests::test_workspace_root_git_worktree`, and
+#   `approval_tui::tests::test_new_from_nested_subdirectory_loads_workspace_root_config`:
+#   invoke the real git/jj binaries, which are not on PATH inside the sandbox.
 # - `mcp::tool_runner::tests::test_full_approval_lifecycle` and
 #   `mcp::tool_runner::tests::test_approval_lifecycle_with_binary_modification`,
 #   plus `project_config::runner::tests::{test_canonicalize_path,
@@ -32,6 +34,8 @@ slow-timeout = { period = "15s", terminate-after = 4 }
 fail-fast = false
 default-filter = """
   not test(=pi_cost_cli_defaults_to_local_timezone)
+  and not test(=rules::report::tests::daily_groups_use_the_selected_timezone_at_a_date_boundary)
+  and not test(=approval_tui::tests::test_new_from_nested_subdirectory_loads_workspace_root_config)
   and not test(/^mcp::git_read_only::tests::/)
   and not test(/^mcp::jj_read_only::tests::/)
   and not test(=repository::tests::test_workspace_root_git_worktree)

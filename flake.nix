@@ -37,9 +37,8 @@
 
         inherit (pkgs) lib;
 
-        # On Linux, build against musl so the resulting binaries are fully
-        # statically linked. The dependency tree is pure Rust, so rustc's
-        # self-contained musl runtime suffices; no C cross toolchain needed.
+        # Keep Linux binaries fully static while using mimalloc for Rust allocations.
+        # Its C sources need musl headers, not the native glibc compiler's headers.
         # nixpkgs' rustc only ships the native target's std, hence rust-overlay.
         muslTargets = {
           "x86_64-linux" = "x86_64-unknown-linux-musl";
@@ -59,6 +58,7 @@
           {
             inherit src;
             strictDeps = true;
+            cargoExtraArgs = "--locked" + lib.optionalString (muslTarget != null) " --features moriarty/mimalloc";
           }
           # if/else rather than two optionalAttrs merges so the branches can
           # never both set CARGO_BUILD_RUSTFLAGS: a later `//` merge would
@@ -67,6 +67,8 @@
             if muslTarget != null
             then {
               CARGO_BUILD_TARGET = muslTarget;
+              # Target-qualified CC leaves native build scripts/proc macros on glibc.
+              "CC_${lib.replaceStrings ["-"] ["_"] muslTarget}" = "${pkgs.pkgsStatic.stdenv.cc}/bin/${pkgs.pkgsStatic.stdenv.cc.targetPrefix}cc";
               # musl targets default to +crt-static; set it explicitly so the
               # static-linking intent survives toolchain changes.
               CARGO_BUILD_RUSTFLAGS = "-C target-feature=+crt-static";
@@ -121,7 +123,7 @@
           individualCrateArgs
           // {
             pname = "moriarty";
-            cargoExtraArgs = "-p moriarty";
+            cargoExtraArgs = commonArgs.cargoExtraArgs + " -p moriarty";
             src = lib.fileset.toSource {
               root = ./.;
               fileset = lib.fileset.unions [

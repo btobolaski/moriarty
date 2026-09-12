@@ -7,10 +7,14 @@ use clap::{Args, Parser, Subcommand};
 use hooks::result::PreToolResult;
 use mcp::McpServers;
 use miette::{IntoDiagnostic, WrapErr};
+#[cfg(feature = "mimalloc")]
+use mimalloc::MiMalloc;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 mod api_pricing;
 mod approval_tui;
+#[cfg(test)]
+mod benchmarks;
 mod checks;
 mod combined_graphs;
 mod cost_report;
@@ -29,8 +33,22 @@ mod test_runner;
 mod tui;
 mod user_config;
 
+// Feature gating preserves system-allocator builds for native use and comparisons.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static ALLOCATOR: MiMalloc = MiMalloc;
+
+fn main() -> miette::Result<()> {
+    // Cargo supplies --bench; the fallback keeps CLI code reachable to unit-test dead-code lints.
+    #[cfg(test)]
+    if env::args().any(|arg| arg == "--bench") {
+        return benchmarks::run();
+    }
+    run_cli()
+}
+
 #[tokio::main]
-async fn main() -> miette::Result<()> {
+async fn run_cli() -> miette::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {

@@ -4432,8 +4432,8 @@ pub struct PiLensActivateToolsDetails {
 /// pattern path adds `totalMatches`/`truncated`), plus `{stalePreview: true}`
 /// when a dry-run preview went stale. Error paths emit an empty `details`
 /// object; that empty error sentinel is dropped to `None` by
-/// [`resolve_tool_result_details`] because the tool is not in
-/// [`preserves_empty_error_details`], while a (never-observed) empty
+/// `resolve_tool_result_details` because the tool is not in
+/// `preserves_empty_error_details`, while a (never-observed) empty
 /// success payload would route to `ToolResultDetails::Empty`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -4454,8 +4454,8 @@ pub struct AstGrepReplaceDetails {
 /// `validateOnly`, `mode`, `warning`) with paginated match outputs, and no
 /// field is shared by every shape, so all fields are optional. Error paths
 /// emit an empty `details` object; that empty error sentinel is dropped to
-/// `None` by [`resolve_tool_result_details`] because the tool is not in
-/// [`preserves_empty_error_details`], while a (never-observed) empty
+/// `None` by `resolve_tool_result_details` because the tool is not in
+/// `preserves_empty_error_details`, while a (never-observed) empty
 /// success payload would route to `ToolResultDetails::Empty`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

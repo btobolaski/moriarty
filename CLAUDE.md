@@ -100,6 +100,21 @@ cargo nextest run --no-fail-fast --hide-progress-bar --success-output never --st
 isolated XDG config directories, which is only safe when each test runs in its own process. `cargo nextest` runs each
 test in a separate process, making this safe and preventing tests from clobbering real config files.
 
+**Benchmarking:**
+
+`cargo bench -p moriarty --bench bash_rules` runs self-contained Criterion benchmarks against a committed sanitized
+policy fixture. Cases call Rust functions directly; they do not spawn the CLI or read user configuration. The harness
+reuses the binary's private modules, with test-only entry-point dispatch so production behavior stays unchanged. Use
+Nextest for tests, and `cargo bench -p moriarty --bench bash_rules -- --test` for a one-iteration benchmark smoke check.
+Linux Nix deployment uses static musl with mimalloc: add `--target x86_64-unknown-linux-musl --features mimalloc` when
+measuring that deployment, and keep target/allocator baselines separate. The flake enables `moriarty/mimalloc` for the
+package, dependency artifacts, and Linux checks; it sets target-qualified `CC_<target_with_underscores>` to the musl C
+compiler so mimalloc never picks up host glibc headers while native build scripts retain their host compiler. Ad-hoc
+Cargo musl builds need that C compiler configured too. Native Cargo and Darwin builds retain the system allocator unless
+explicitly built with the optional feature; the global allocator declaration in `main.rs` is shared with the included
+benchmark. See [the profiling report](doc/benchmarks/bash-rules.md) for timing boundaries, baseline data, and
+reproduction commands.
+
 ## Architecture
 
 ### High-Level Module Organization
@@ -475,6 +490,12 @@ with warnings, while explicit missing paths and having no available source are e
   split `hooks report` rows; contributor differences still do. Rows recorded before `cwd` was logged are excluded (with
   disclosed counts) from replay/suggest because component path policy cannot be reproduced, while the effectiveness
   report retains them in an explicit `Unknown` bucket.
+- **Bash pattern validation**: Non-Modify patterns use `validate_rule_pattern`, which compiles forward and reverse
+  Thompson NFAs with the string `Regex::new` defaults, including UTF-8 checks, capture-state accounting, and the 10 MiB
+  NFA size limit. Failed probes fall back to `Regex::new` for canonical diagnostics and literal-fast-path acceptance.
+  Keep `REGEX_NFA_SIZE_LIMIT` and the validation parity tests aligned when upgrading `regex` or `regex-automata`. Only
+  `CommandAction::Modify` owns a full per-rule capture regex; ordinary command and redirect matching still use the
+  separate RegexSets, whose indexed patterns are checked against their metadata in debug builds.
 - **Compile diagnostics & `rules` authoring tooling**: `BashRuleEngine::compile_with_diagnostics` and
   `ToolRuleEngine::compile_with_diagnostics` return the engine plus a `RuleDiagnostic` for every dropped rule
   (undefined/circular/over-depth/over-count fragment, invalid regex, or — tool rules only — a `field`/`pattern` given
@@ -622,6 +643,9 @@ with warnings, while explicit missing paths and having no available source are e
 - Module: `repository.rs` provides `detect_repository_root()` function
 
 ## Development Notes
+
+**Plans and reports**: Keep implementation and remediation plans in `plans/`, separate from retained reports. Delete
+plans when their work is complete; retain durable findings and benchmark evidence in the appropriate documentation.
 
 **Workspace Optimization**: The `my-workspace-hack` crate is managed by cargo-hakari to unify dependencies.
 
@@ -777,7 +801,7 @@ the on-disk protocol exactly, even when that means snake_case fields like `GitRe
    because the inner tag appears at the outer level and serde does not register it as claimed; a strict outer struct
    then rejects it at runtime. `WebSearchResultsData` keeps that wire shape but restores strict outer-key validation
    with a manual deserializer. The same limitation applies to `McpSearchDetails`' flattened `McpPagination`: its custom
-   deserializer rejects every flattened key except `hasMore` and `nextOffset`. _Adjacently_ tagged flatten targets
+   deserializer rejects every flattened key except `hasMore` and `nextOffset`. *Adjacently* tagged flatten targets
    (those with both `tag` and `content`) do not hit this collision, so structs like `CustomLine` and `CustomMessageLine`
    keep derived `deny_unknown_fields` handling. Each exception must carry an inline comment naming the limitation.
 2. **Corrupt-stream tolerance**: tool-argument structs (e.g. `EditArgs`, `EditReplacement`, `GrepArgs`, and now
