@@ -29,7 +29,7 @@ regex-automata = { version = "0.4.14", default-features = false, features = [
   "syntax",
   "nfa-thompson",
 ] }
-rmcp = { version = "1.7", features = ["server", "schemars", "transport-io"] }
+rmcp = { version = "3.2.0", features = ["server", "schemars", "transport-io"] }
 rust_decimal = { workspace = true }
 schemars = "1.0.4"
 serde = { workspace = true }

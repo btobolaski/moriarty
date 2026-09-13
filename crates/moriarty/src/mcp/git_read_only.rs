@@ -13,17 +13,22 @@
 //!   modes and rejects flags that widen the command beyond repository-focused
 //!   inspection
 
-use std::path::{Path, PathBuf};
+use std::{
+    borrow::Cow,
+    path::{Path, PathBuf},
+};
 
 use rmcp::{
-    ErrorData as McpError, Json, RoleServer, ServerHandler, handler::server::wrapper::Parameters,
-    model::*, prompt, prompt_handler, prompt_router, service::RequestContext, tool, tool_handler,
-    tool_router,
+    ErrorData as McpError, Json, ServerHandler, handler::server::wrapper::Parameters, model::*,
+    prompt, prompt_handler, prompt_router, tool, tool_handler, tool_router,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::read_only::{CommandResult, run_read_only_command};
+use super::{
+    MCP_PROTOCOL_VERSION, MCP_SUPPORTED_PROTOCOL_VERSIONS,
+    read_only::{CommandResult, run_read_only_command},
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct StatusArgs {
@@ -158,9 +163,9 @@ fn build_prompt(
 ) -> GetPromptResult {
     let project = project_dir.to_string_lossy();
     GetPromptResult::new(vec![
-        PromptMessage::new_text(PromptMessageRole::Assistant, role_msg.to_string()),
+        PromptMessage::new_text(Role::Assistant, role_msg.to_string()),
         PromptMessage::new_text(
-            PromptMessageRole::User,
+            Role::User,
             format!("run the {tool_label} tool with project \"{project}\""),
         ),
     ])
@@ -232,6 +237,7 @@ impl ServerHandler for GitReadOnly {
                 .enable_tools()
                 .build(),
         )
+        .with_protocol_version(MCP_PROTOCOL_VERSION)
         .with_server_info(Implementation::new(
             env!("CARGO_CRATE_NAME"),
             env!("CARGO_PKG_VERSION"),
@@ -239,6 +245,10 @@ impl ServerHandler for GitReadOnly {
         .with_instructions(
             "This server provides prompt templates for read only git actions. All prompts are designed to provide structured, context-aware assistance".to_string(),
         )
+    }
+
+    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+        Cow::Borrowed(MCP_SUPPORTED_PROTOCOL_VERSIONS)
     }
 }
 
@@ -493,12 +503,12 @@ mod tests {
             assert_eq!(prompt.messages.len(), 2, "{name}: message count");
             assert_eq!(
                 prompt.messages[0].role,
-                PromptMessageRole::Assistant,
+                Role::Assistant,
                 "{name}: messages[0] role"
             );
             assert_eq!(
                 prompt.messages[1].role,
-                PromptMessageRole::User,
+                Role::User,
                 "{name}: messages[1] role"
             );
         }
@@ -579,6 +589,15 @@ mod tests {
         let server = GitReadOnly;
         let info = server.get_info();
 
+        assert_eq!(info.protocol_version.as_str(), "2025-11-25");
+        assert_eq!(
+            server
+                .supported_protocol_versions()
+                .iter()
+                .map(ProtocolVersion::as_str)
+                .collect::<Vec<_>>(),
+            ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"]
+        );
         assert!(
             info.capabilities.tools.is_some(),
             "GitReadOnly must expose tools capability"

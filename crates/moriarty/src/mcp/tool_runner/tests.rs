@@ -447,6 +447,15 @@ fn test_get_info_metadata() {
     let server = ToolRunner;
     let info = server.get_info();
 
+    assert_eq!(info.protocol_version.as_str(), "2025-11-25");
+    assert_eq!(
+        server
+            .supported_protocol_versions()
+            .iter()
+            .map(ProtocolVersion::as_str)
+            .collect::<Vec<_>>(),
+        ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"]
+    );
     assert!(
         info.capabilities.tools.is_some(),
         "ToolRunner must expose tools capability"

@@ -85,7 +85,7 @@
 //!   memory, or disk; `run_checks` bounds checks with a 5-minute timeout and output-size caps
 //!   (see [`crate::checks`])
 
-use std::path::PathBuf;
+use std::{borrow::Cow, path::PathBuf};
 
 use rmcp::{
     ErrorData as McpError, ServerHandler, handler::server::wrapper::Parameters, model::*, tool,
@@ -94,6 +94,7 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use super::{MCP_PROTOCOL_VERSION, MCP_SUPPORTED_PROTOCOL_VERSIONS};
 use crate::{checks::CheckRunOutcome, project_config::runner::verify_and_load_project};
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -182,8 +183,8 @@ impl ToolRunner {
         })?;
 
         let content = vec![
-            Content::text(format!("stdout: \n\n {}", output.stdout)),
-            Content::text(format!("stderr: \n\n {}", output.stderr)),
+            ContentBlock::text(format!("stdout: \n\n {}", output.stdout)),
+            ContentBlock::text(format!("stderr: \n\n {}", output.stderr)),
         ];
         if matches!(output.exit_code, Some(0)) {
             Ok(CallToolResult::success(content))
@@ -205,18 +206,21 @@ impl ToolRunner {
         // McpError so the agent sees the Stop hook's actionable reason text (e.g.
         // "Run: moriarty approve-project ..."); only an unexpected internal failure is an McpError.
         match outcome {
-            CheckRunOutcome::NoChecks(note) => Ok(CallToolResult::success(vec![Content::text(
-                format!("No checks were run: {note}"),
-            )])),
+            CheckRunOutcome::NoChecks(note) => {
+                Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                    "No checks were run: {note}"
+                ))]))
+            }
             CheckRunOutcome::Blocked(reason) => {
-                Ok(CallToolResult::error(vec![Content::text(reason)]))
+                Ok(CallToolResult::error(vec![ContentBlock::text(reason)]))
             }
             CheckRunOutcome::Ran { outputs, failures } => {
-                let mut content: Vec<Content> = outputs.into_iter().map(Content::text).collect();
+                let mut content: Vec<ContentBlock> =
+                    outputs.into_iter().map(ContentBlock::text).collect();
                 if failures.is_empty() {
                     Ok(CallToolResult::success(content))
                 } else {
-                    content.push(Content::text(format!(
+                    content.push(ContentBlock::text(format!(
                         "Checks failed:\n\n{}",
                         failures.join("\n\n")
                     )));
@@ -270,6 +274,7 @@ impl ToolRunner {
 impl ServerHandler for ToolRunner {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_protocol_version(MCP_PROTOCOL_VERSION)
             .with_server_info(Implementation::new(
                 env!("CARGO_CRATE_NAME"),
                 env!("CARGO_PKG_VERSION"),
@@ -277,6 +282,10 @@ impl ServerHandler for ToolRunner {
             .with_instructions(
                 "This server provides configured tooling from the project".to_string(),
             )
+    }
+
+    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+        Cow::Borrowed(MCP_SUPPORTED_PROTOCOL_VERSIONS)
     }
 }
 

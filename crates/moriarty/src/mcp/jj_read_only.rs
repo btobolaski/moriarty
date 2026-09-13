@@ -19,7 +19,7 @@
 //!   external-tool, config-injection, and repository-override flags
 
 // standard library imports
-use std::path::PathBuf;
+use std::{borrow::Cow, path::PathBuf};
 
 // 3rd party crates
 use rmcp::{
@@ -29,7 +29,10 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::read_only::{CommandResult, run_read_only_command};
+use super::{
+    MCP_PROTOCOL_VERSION, MCP_SUPPORTED_PROTOCOL_VERSIONS,
+    read_only::{CommandResult, run_read_only_command},
+};
 
 /// Supported jj commands that can be executed via the MCP server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -164,6 +167,7 @@ impl JjReadOnly {
 impl ServerHandler for JjReadOnly {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_protocol_version(MCP_PROTOCOL_VERSION)
             .with_server_info(Implementation::new(
                 env!("CARGO_CRATE_NAME"),
                 env!("CARGO_PKG_VERSION"),
@@ -173,6 +177,10 @@ impl ServerHandler for JjReadOnly {
                  diff, log, show, op-log, file-show, or file-list with the command field."
                     .to_string(),
             )
+    }
+
+    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+        Cow::Borrowed(MCP_SUPPORTED_PROTOCOL_VERSIONS)
     }
 }
 
@@ -539,6 +547,15 @@ mod tests {
         let server = JjReadOnly;
         let info = server.get_info();
 
+        assert_eq!(info.protocol_version.as_str(), "2025-11-25");
+        assert_eq!(
+            server
+                .supported_protocol_versions()
+                .iter()
+                .map(ProtocolVersion::as_str)
+                .collect::<Vec<_>>(),
+            ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"]
+        );
         assert!(
             info.capabilities.tools.is_some(),
             "JjReadOnly must expose tools capability"

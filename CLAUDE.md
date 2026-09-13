@@ -319,6 +319,11 @@ with warnings, while explicit missing paths and having no available source are e
 
 - Three MCP servers: `git_read_only` (status, diff, log, show), `jj_read_only` (status, diff, log, show, op log, file
   show, file list), and `tool_runner` (lint, test, build, format, checks)
+- Moriarty explicitly caps MCP support at `2025-11-25` while retaining `2024-11-05`, `2025-03-26`, and `2025-06-18`.
+  Each handler sets both its initialization fallback and supported-version list; upgrading rmcp must not implicitly opt
+  into newer revisions. Initialization requests for unknown versions fall back to the ceiling, so unknown older strings
+  are no longer echoed; newer per-request metadata is rejected. Upstream `discover` remains available but advertises
+  only this restricted list.
 - `read_only`: Shared infrastructure used by both `git_read_only` and `jj_read_only`. Provides `CommandResult`,
   `validate_project_dir`, and the generic `run_read_only_command`. It rejects parent-traversal and non-directory targets
   before canonicalizing the working directory, while the per-server wrappers add command-specific flag restrictions
