@@ -140,6 +140,7 @@
             nativeBuildInputs = [pkgs.installShellFiles];
             postInstall = ''
               installManPage doc/man/moriarty.1
+              installManPage doc/man/moriarty-test-rules.1
               installManPage doc/man/moriarty-tool-rules.5
               installManPage doc/man/moriarty-bash-rules.5
             '';

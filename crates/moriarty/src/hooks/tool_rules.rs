@@ -11,9 +11,12 @@ use std::{
     collections::{BTreeSet, HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
+use miette::{IntoDiagnostic, WrapErr};
 use regex::Regex;
+use serde::Serialize;
 use tokio::{task::spawn_blocking, time::timeout};
 use tracing::{debug, warn};
 
@@ -23,7 +26,7 @@ use super::{
         RuleDiagnostic, RuleDiagnosticKind, classify_fragment_error, default_fragments,
         expand_fragments,
     },
-    fail_closed_blocking,
+    checked_blocking,
     path_resolution::canonicalize_allow_missing,
 };
 use crate::{
@@ -135,11 +138,22 @@ impl LocalPathEvaluation {
 }
 
 /// Result of evaluating tool rules against a tool call.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
 pub enum ToolRuleResult {
-    Allowed { rule_name: String },
-    Denied { rule_name: String, reason: String },
-    Asked { rule_name: String },
+    Allowed {
+        #[serde(rename = "rule")]
+        rule_name: String,
+    },
+    Denied {
+        #[serde(rename = "rule")]
+        rule_name: String,
+        reason: String,
+    },
+    Asked {
+        #[serde(rename = "rule")]
+        rule_name: String,
+    },
     NoMatch,
 }
 
@@ -147,6 +161,7 @@ pub enum ToolRuleResult {
 #[derive(Debug)]
 pub struct ToolRuleEngine {
     rules: Vec<CompiledToolRule>,
+    locality_timeout: Duration,
 }
 
 /// Extracts only the `path` and `file_path` fields from the tool input so that only those
@@ -307,7 +322,13 @@ impl ToolRuleEngine {
             });
         }
 
-        (Self { rules: compiled }, diagnostics)
+        (
+            Self {
+                rules: compiled,
+                locality_timeout: FILESYSTEM_EVALUATION_TIMEOUT,
+            },
+            diagnostics,
+        )
     }
 
     fn has_matching_allow_local_rule(&self, tool_name: &str, mode: Option<PermissionMode>) -> bool {
@@ -395,24 +416,53 @@ impl ToolRuleEngine {
         cwd: &str,
         mode: Option<PermissionMode>,
     ) -> ToolRuleResult {
-        let local_evaluation = if self.has_matching_allow_local_rule(tool_name, mode) {
-            let locality_value = locality_input(tool_input);
-            let cwd_owned = cwd.to_string();
-            fail_closed_blocking(
-                timeout(
-                    FILESYSTEM_EVALUATION_TIMEOUT,
-                    spawn_blocking(move || {
-                        evaluate_local_paths(&locality_value, Path::new(&cwd_owned))
-                    }),
-                )
-                .await,
-                "allow_local path evaluation",
-            )
-        } else {
-            None
-        };
+        match self
+            .apply_rules_checked(tool_name, tool_input, cwd, mode)
+            .await
+        {
+            Ok(result) => result,
+            Err(_) => self.apply_rules_core(tool_name, tool_input, cwd, mode, None),
+        }
+    }
 
-        self.apply_rules_core(tool_name, tool_input, cwd, mode, local_evaluation.as_ref())
+    /// Batch validation must distinguish an infrastructure failure from a policy `NoMatch`, while
+    /// the hook-facing path deliberately preserves its historical fail-closed fallback.
+    pub(crate) async fn apply_rules_checked(
+        &self,
+        tool_name: &str,
+        tool_input: &serde_json::Value,
+        cwd: &str,
+        mode: Option<PermissionMode>,
+    ) -> miette::Result<ToolRuleResult> {
+        let local_evaluation = self
+            .local_evaluation(tool_name, tool_input, cwd, mode)
+            .await?;
+        Ok(self.apply_rules_core(tool_name, tool_input, cwd, mode, local_evaluation.as_ref()))
+    }
+
+    async fn local_evaluation(
+        &self,
+        tool_name: &str,
+        tool_input: &serde_json::Value,
+        cwd: &str,
+        mode: Option<PermissionMode>,
+    ) -> miette::Result<Option<LocalPathEvaluation>> {
+        if !self.has_matching_allow_local_rule(tool_name, mode) {
+            return Ok(None);
+        }
+        let locality_value = locality_input(tool_input);
+        let cwd_owned = cwd.to_string();
+        let evaluation = checked_blocking(
+            timeout(
+                self.locality_timeout,
+                spawn_blocking(move || {
+                    evaluate_local_paths(&locality_value, Path::new(&cwd_owned))
+                }),
+            )
+            .await,
+            "allow_local path evaluation",
+        )?;
+        evaluation.map(Some)
     }
 
     #[cfg(test)]
@@ -426,7 +476,7 @@ impl ToolRuleEngine {
         let local_evaluation = self
             .has_matching_allow_local_rule(tool_name, mode)
             .then(|| evaluate_local_paths(&locality_input(tool_input), Path::new(cwd)))
-            .flatten();
+            .and_then(Result::ok);
 
         self.apply_rules_core(tool_name, tool_input, cwd, mode, local_evaluation.as_ref())
     }
@@ -563,16 +613,23 @@ fn rule_matches_regex(
         .is_some_and(|value| legacy.regex.is_match(&value))
 }
 
-fn evaluate_local_paths(tool_input: &serde_json::Value, cwd: &Path) -> Option<LocalPathEvaluation> {
-    let canonical_cwd = match fs::canonicalize(cwd) {
-        Ok(path) => path,
-        Err(error) => {
+fn evaluate_local_paths(
+    tool_input: &serde_json::Value,
+    cwd: &Path,
+) -> miette::Result<LocalPathEvaluation> {
+    let canonical_cwd = fs::canonicalize(cwd)
+        .inspect_err(|error| {
             warn!(cwd = %cwd.display(), error = %error, "Failed to canonicalize hook cwd for allow_local check");
-            return None;
-        }
-    };
+        })
+        .into_diagnostic()
+        .wrap_err_with(|| {
+            format!(
+                "Failed to canonicalize hook cwd for allow_local check: {}",
+                cwd.display()
+            )
+        })?;
 
-    Some(LocalPathEvaluation {
+    Ok(LocalPathEvaluation {
         canonical_cwd: canonical_cwd.clone(),
         path: evaluate_candidate_path(tool_input, PATH_FIELD, &canonical_cwd),
         file_path: evaluate_candidate_path(tool_input, FILE_PATH_FIELD, &canonical_cwd),
@@ -657,10 +714,17 @@ mod tests {
     use tokio::time::timeout;
 
     use super::*;
+    use crate::test_helpers::with_saturated_blocking_pool;
+
+    impl ToolRuleEngine {
+        pub(crate) fn force_locality_timeout(&mut self) {
+            self.locality_timeout = Duration::from_millis(1);
+        }
+    }
 
     #[tokio::test]
     async fn allow_local_timeout_fails_closed() {
-        let evaluation = fail_closed_blocking(
+        let evaluation = checked_blocking(
             timeout(
                 Duration::from_millis(1),
                 tokio::task::spawn_blocking(|| {
@@ -675,12 +739,12 @@ mod tests {
             .await,
             "test locality evaluation",
         );
-        assert!(evaluation.is_none());
+        assert!(evaluation.is_err());
     }
 
     #[tokio::test]
     async fn allow_local_task_failure_fails_closed() {
-        let evaluation = fail_closed_blocking(
+        let evaluation = checked_blocking(
             Ok(
                 tokio::task::spawn_blocking(|| -> Option<LocalPathEvaluation> {
                     panic!("simulated locality evaluator failure")
@@ -689,12 +753,12 @@ mod tests {
             ),
             "test locality evaluation",
         );
-        assert!(evaluation.is_none());
+        assert!(evaluation.is_err());
     }
 
     #[test]
     fn successful_local_evaluation_passes_through() {
-        let evaluation = fail_closed_blocking(
+        let evaluation = checked_blocking(
             Ok(Ok(Some(LocalPathEvaluation {
                 canonical_cwd: PathBuf::from("/project"),
                 path: None,
@@ -702,6 +766,7 @@ mod tests {
             }))),
             "test locality evaluation",
         )
+        .unwrap()
         .unwrap();
         assert_eq!(evaluation.canonical_cwd, Path::new("/project"));
     }
@@ -717,6 +782,66 @@ mod tests {
             conditions: Vec::new(),
             action: ToolRuleAction::Allow,
         }
+    }
+
+    fn local_with_fallback_engine() -> ToolRuleEngine {
+        let mut local = make_rule("local", "Read");
+        local.allow_local = true;
+        let mut fallback = make_rule("fallback", "Read");
+        fallback.action = ToolRuleAction::Deny {
+            value: "fallback deny".to_string(),
+        };
+        let (engine, diagnostics) =
+            ToolRuleEngine::compile_with_diagnostics(vec![local, fallback], None);
+        assert!(diagnostics.is_empty());
+        engine
+    }
+
+    #[tokio::test]
+    async fn checked_cwd_failure_is_error_while_apply_rules_keeps_fallback() {
+        let cwd = tempfile::tempdir().unwrap();
+        let cwd_path = cwd.path().to_path_buf();
+        drop(cwd);
+        let cwd = cwd_path.to_str().unwrap();
+        let engine = local_with_fallback_engine();
+        let input = serde_json::json!({"path": "file"});
+
+        let error = engine
+            .apply_rules_checked("Read", &input, cwd, None)
+            .await
+            .expect_err("missing cwd must be an infrastructure error");
+        assert!(error.to_string().contains(cwd));
+        assert_eq!(
+            engine.apply_rules("Read", &input, cwd, None).await,
+            ToolRuleResult::Denied {
+                rule_name: "fallback".to_string(),
+                reason: "fallback deny".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn checked_locality_timeout_is_an_error_while_apply_rules_keeps_fallback() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut engine = local_with_fallback_engine();
+        engine.force_locality_timeout();
+        let input = serde_json::json!({"path": cwd.path().join("file")});
+        let cwd = cwd.path().to_str().unwrap();
+
+        with_saturated_blocking_pool(async {
+            let error = engine
+                .apply_rules_checked("Read", &input, cwd, None)
+                .await
+                .expect_err("locality timeout must be an infrastructure error");
+            assert!(error.to_string().contains("timed out"));
+            assert_eq!(
+                engine.apply_rules("Read", &input, cwd, None).await,
+                ToolRuleResult::Denied {
+                    rule_name: "fallback".to_string(),
+                    reason: "fallback deny".to_string(),
+                }
+            );
+        });
     }
 
     fn local_allow(name: &str, conditions: Vec<ToolRuleCondition>) -> ToolRule {
@@ -777,9 +902,7 @@ mod tests {
                 .map(|path| path.to_string_lossy().to_string()),
         });
 
-        evaluate_local_paths(&tool_input, cwd)
-            .as_ref()
-            .is_some_and(LocalPathEvaluation::any_local)
+        evaluate_local_paths(&tool_input, cwd).is_ok_and(|evaluation| evaluation.any_local())
     }
 
     /// Keeps individual tests focused on rule behavior instead of repeating engine setup.

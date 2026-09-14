@@ -71,10 +71,33 @@ the agent can make its own decision. This allows for moriarty to be a pre-filter
 never want to rely on auto mode making a decision, you'll need to add catch-all rules at the end of of `tool_rules.toml`
 that set everything to ask.
 
-## General guidance
+## Regression suites
 
-I strongly recommend having a test suite for the rules, this way you can build confidence that the rules do not allow
-harmful commands to be auto-approved and they also function as a way to prevent regressions. I use [bats][2] for this.
-It works reasonably well but, it is a bit slow.
+Keep caller-owned assertions beside your policy so unsafe approvals and intended denials do not regress. For example:
 
-[2]: https://github.com/bats-core/bats-core
+```toml
+format_version = 1
+
+[[cases]]
+id = "remove-root"
+name = "Root removal is never auto-approved"
+request = { kind = "bash", command = "rm -rf /" }
+expect = "not_auto_allowed"
+
+[[cases]]
+id = "protect-env"
+name = "Writes to .env are denied"
+request = { kind = "tool", tool = "Write", input_json = '{"file_path":".env","content":"x"}' }
+expect = "denied"
+reason = "Cannot write to .env files"
+```
+
+Evaluate it against the policy you intend to deploy:
+
+```bash
+moriarty test rules suite.toml --config candidate-tool-rules.toml
+```
+
+Moriarty evaluates the data without executing its commands or tools. See
+[Rule Regression Suites](../BASH_RULES.md#rule-regression-suites) for the strict format, cwd/interpolation behavior,
+reports, statuses, and host-filesystem limitations.

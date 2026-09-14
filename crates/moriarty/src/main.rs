@@ -621,6 +621,23 @@ enum TestCommand {
         #[arg(default_value = ".")]
         project_dir: PathBuf,
     },
+    /// Test a rule suite against an explicit candidate policy
+    Rules {
+        /// TOML rule suite to evaluate
+        suite: PathBuf,
+
+        /// Candidate tool and bash rule policy
+        #[arg(short, long)]
+        config: PathBuf,
+
+        /// Default evaluation directory (defaults to the process cwd)
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+
+        /// Output the complete report as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Test bash command against configured rules
     BashRules {
         /// Command to test (if not provided, reads from stdin)
@@ -1272,6 +1289,39 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn cli_parses_rule_suite_options_and_requires_paths() {
+        let cli = Cli::try_parse_from([
+            "moriarty",
+            "test",
+            "rules",
+            "suite.toml",
+            "--config",
+            "policy.toml",
+            "--cwd",
+            "project",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Test {
+                subcommand:
+                    TestCommand::Rules {
+                        suite,
+                        config,
+                        cwd,
+                        json,
+                    },
+            } => {
+                assert_eq!(suite, PathBuf::from("suite.toml"));
+                assert_eq!(config, PathBuf::from("policy.toml"));
+                assert_eq!(cwd, Some(PathBuf::from("project")));
+                assert!(json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 
     #[test]

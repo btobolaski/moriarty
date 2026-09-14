@@ -1,12 +1,6 @@
 //! Tests for hooks module
 
-use std::{
-    fs,
-    future::Future,
-    io::Cursor,
-    sync::mpsc::{SyncSender, sync_channel},
-    time::Duration,
-};
+use std::{fs, io::Cursor};
 
 use serde_json::Value;
 use tempfile::TempDir;
@@ -17,38 +11,9 @@ use crate::{
     test_helpers::{
         PATH_ALIAS_COMMAND, PATH_ALIAS_READ_RULES, SUBAGENT_EXECUTION_RULES, remove_test_env_var,
         set_test_env_var, setup_isolated_xdg_config, setup_isolated_xdg_state,
+        with_saturated_blocking_pool,
     },
 };
-
-fn with_saturated_blocking_pool<F: Future>(future: F) -> F::Output {
-    struct ReleaseBlockingTask(Option<SyncSender<()>>);
-
-    impl Drop for ReleaseBlockingTask {
-        fn drop(&mut self) {
-            if let Some(sender) = self.0.take() {
-                let _ = sender.send(());
-            }
-        }
-    }
-
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
-        .max_blocking_threads(1)
-        .enable_all()
-        .build()
-        .unwrap();
-    let (started_tx, started_rx) = sync_channel(0);
-    let (release_tx, release_rx) = sync_channel(0);
-    runtime.spawn_blocking(move || {
-        started_tx.send(()).unwrap();
-        release_rx.recv().unwrap();
-    });
-    started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    let release = ReleaseBlockingTask(Some(release_tx));
-    let output = runtime.block_on(future);
-    drop(release);
-    output
-}
 
 async fn setup_user_bash_rules(rules_toml: &str) -> TempDir {
     let temp_dir = setup_isolated_xdg_config();

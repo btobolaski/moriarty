@@ -1,6 +1,6 @@
 .\" Copyright (c) 2025 Moriarty contributors
 .\" SPDX-License-Identifier: GPL-3.0-only
-.Dd August 2026
+.Dd September 13, 2026
 .Dt MORIARTY 1
 .Os
 .Sh NAME
@@ -74,6 +74,12 @@
 .Nm
 .Cm test checks
 .Op Ar project_dir
+.Nm
+.Cm test rules
+.Ar suite
+.Fl c Ar config
+.Op Fl \-cwd Ar dir
+.Op Fl \-json
 .Nm
 .Cm test bash\-rules
 .Op Fl c Ar config
@@ -325,6 +331,17 @@ Run all configured project tools in parallel.
 Defaults to the current directory.
 .It Cm test checks Op Ar project_dir
 Run all configured project checks in parallel.
+.It Cm test rules Ar suite Fl c Ar config
+Evaluate a strict, caller-owned TOML rule suite against one explicit candidate
+policy without executing represented commands or tools.
+Relative suite and config paths use the invocation directory;
+.Fl \-cwd
+sets only the default evaluation directory.
+A completed all-pass report exits 0, a complete mismatch report exits 1,
+and argument, input, compilation, infrastructure, or output failure exits 2.
+See
+.Xr moriarty\-test\-rules 1
+for the suite format, rendering, and limitations.
 .It Cm test bash\-rules Op Ar command
 Test a bash command against configured rules.
 If no command is provided, reads from stdin.
@@ -576,5 +593,6 @@ and
 Hook execution log directory (JSON lines, daily-rotated).
 .El
 .Sh SEE ALSO
-.Xr moriarty\-tool\-rules 5 ,
-.Xr moriarty\-bash\-rules 5
+.Xr moriarty\-test\-rules 1 ,
+.Xr moriarty\-bash\-rules 5 ,
+.Xr moriarty\-tool\-rules 5

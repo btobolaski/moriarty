@@ -26,7 +26,7 @@ fn expected_leaf_with_normalized(
     redirects: Vec<Value>,
     matched: Option<(&str, &str, &str)>,
 ) -> Value {
-    let mut leaf = json!({"original": command, "normalized": normalized});
+    let mut leaf = json!({"original": command, "normalized": normalized, "matched": null});
     if !redirects.is_empty() {
         leaf["redirects"] = Value::Array(redirects);
     }
@@ -68,8 +68,10 @@ fn expected_trace(
         "sub_commands": sub_commands,
         "bail": null,
         "final_result": final_result,
-        "contributors": contributors,
     });
+    if !contributors.is_empty() {
+        trace["contributors"] = json!(contributors);
+    }
     if !rewritten_sub_commands.is_empty() {
         trace["rewritten_sub_commands"] = Value::Array(rewritten_sub_commands);
     }
@@ -322,6 +324,47 @@ fn explain_json_preserves_modify_bail_shape() {
             })),
             json!({"Asked": {"rule_name": "dynamic-rewrite"}}),
             &["dynamic-rewrite"],
+        )
+    );
+}
+
+#[test]
+fn explain_json_preserves_analyzable_modified_shape() {
+    let engine = make_engine(vec![modify_rule("rewrite", r"^safe$", "echo hi")]);
+
+    assert_eq!(
+        actual_trace(&engine, "safe", ""),
+        expected_trace(
+            "safe",
+            vec![expected_leaf(
+                "safe",
+                Vec::new(),
+                Some(("rewrite", "^safe$", "Modify → echo hi")),
+            )],
+            vec![expected_leaf("echo hi", Vec::new(), None)],
+            None,
+            json!({"Modified": {
+                "rule_name": "rewrite",
+                "new_command": "echo hi",
+            }}),
+            &["rewrite"],
+        )
+    );
+}
+
+#[test]
+fn explain_json_preserves_no_match_shape() {
+    let engine = make_engine(Vec::new());
+
+    assert_eq!(
+        actual_trace(&engine, "unknown", ""),
+        expected_trace(
+            "unknown",
+            vec![expected_leaf("unknown", Vec::new(), None)],
+            Vec::new(),
+            None,
+            json!("NoMatch"),
+            &[],
         )
     );
 }

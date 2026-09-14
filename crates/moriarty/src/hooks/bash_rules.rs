@@ -144,9 +144,47 @@ impl<'a> RedirectRewrite<'a> {
     }
 }
 
-/// Includes `rule_name` in all match variants to support logging and debugging.
+/// Decision-bearing variants retain the matching rule for logging and diagnostics.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
 pub enum RuleResult {
+    Allowed {
+        #[serde(rename = "rule")]
+        rule_name: String,
+    },
+    Denied {
+        #[serde(rename = "rule")]
+        rule_name: String,
+        reason: String,
+    },
+    Modified {
+        #[serde(rename = "rule")]
+        rule_name: String,
+        #[serde(rename = "rewrite")]
+        new_command: String,
+    },
+    Asked {
+        #[serde(rename = "rule")]
+        rule_name: String,
+    },
+    /// Command arguments should be filtered and then re-validated for security.
+    ArgumentFiltered {
+        #[serde(rename = "rule")]
+        rule_name: String,
+        #[serde(rename = "rewrite")]
+        new_command: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    NoMatch,
+}
+
+// `moriarty test bash-rules --explain --json` predates the rule-suite wire contract, so its
+// public output retains the legacy externally tagged result while direct serialization uses the
+// stable suite shape above.
+#[derive(Serialize)]
+#[serde(remote = "RuleResult")]
+enum ExplainRuleResult {
     Allowed {
         rule_name: String,
     },
@@ -161,7 +199,6 @@ pub enum RuleResult {
     Asked {
         rule_name: String,
     },
-    /// Command arguments should be filtered and then re-validated for security.
     ArgumentFiltered {
         rule_name: String,
         new_command: String,
@@ -482,6 +519,7 @@ pub(crate) struct CommandTrace {
     pub rewritten_bail: Option<RewrittenBailTrace>,
     /// Set when the command could not be analyzed and fell back to whole-command evaluation.
     pub bail: Option<BailReason>,
+    #[serde(with = "ExplainRuleResult")]
     pub final_result: RuleResult,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub contributors: Vec<String>,
@@ -877,11 +915,7 @@ impl BashRuleEngine {
     /// Compiles rules with pattern fragment expansion, logging and skipping any rule that fails to
     /// expand or compile (fail-open per rule, preserving the hook hot path's behavior).
     pub fn from_config(config: UserConfig) -> miette::Result<Self> {
-        let (mut engine, diagnostics) = Self::compile_with_diagnostics(
-            config.bash_rules.unwrap_or_default(),
-            config.pattern_fragments,
-        )?;
-        engine.path_aliases = config.bash_path_aliases;
+        let (engine, diagnostics) = Self::from_config_with_diagnostics(config)?;
         for diagnostic in &diagnostics {
             tracing::error!(
                 rule_name = %diagnostic.rule_name,
@@ -891,6 +925,19 @@ impl BashRuleEngine {
             );
         }
         Ok(engine)
+    }
+
+    /// The alias policy belongs to the compiled engine even when diagnostics are surfaced by the
+    /// caller instead of logged on the hook path.
+    pub(crate) fn from_config_with_diagnostics(
+        config: UserConfig,
+    ) -> miette::Result<(Self, Vec<RuleDiagnostic>)> {
+        let (mut engine, diagnostics) = Self::compile_with_diagnostics(
+            config.bash_rules.unwrap_or_default(),
+            config.pattern_fragments,
+        )?;
+        engine.path_aliases = config.bash_path_aliases;
+        Ok((engine, diagnostics))
     }
 
     /// Compiles rules, returning the engine alongside a diagnostic for every rule that was dropped.

@@ -20,8 +20,9 @@
 //! ```
 
 use std::{
+    env,
     io::{self, Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use miette::{IntoDiagnostic, WrapErr};
@@ -45,10 +46,32 @@ use crate::{
     user_config::{RedirectDirection, load_user_config_from},
 };
 
+mod rules_suite;
+
 pub async fn exec_test(cmd: crate::TestCommand) -> miette::Result<()> {
     match cmd {
         crate::TestCommand::ProjectTools { project_dir } => run_project_tools(project_dir).await,
         crate::TestCommand::Checks { project_dir } => run_checks(project_dir).await,
+        crate::TestCommand::Rules {
+            suite,
+            config,
+            cwd,
+            json,
+        } => {
+            init_test_tracing();
+            match test_rules_suite(&suite, &config, cwd.as_deref(), json).await {
+                Ok(has_failures) => {
+                    if has_failures {
+                        std::process::exit(1);
+                    }
+                    Ok(())
+                }
+                Err(error) => {
+                    eprintln!("{error:?}");
+                    std::process::exit(2);
+                }
+            }
+        }
         crate::TestCommand::BashRules {
             command,
             config,
@@ -214,6 +237,38 @@ async fn run_checks(project_dir: PathBuf) -> miette::Result<()> {
     .await
 }
 
+fn init_test_tracing() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer().with_writer(io::stderr))
+        .try_init();
+}
+
+async fn test_rules_suite(
+    suite_path: &Path,
+    config_path: &Path,
+    cwd: Option<&Path>,
+    json: bool,
+) -> miette::Result<bool> {
+    let invocation_cwd = env::current_dir()
+        .into_diagnostic()
+        .wrap_err("Failed to determine invocation working directory")?;
+    let report =
+        rules_suite::run_rules_suite(suite_path, config_path, &invocation_cwd, cwd).await?;
+    let rendered = report.render(json)?;
+    let mut stdout = io::stdout().lock();
+    stdout
+        .write_all(rendered.as_bytes())
+        .into_diagnostic()
+        .wrap_err("Failed to write rule suite report")?;
+    stdout
+        .flush()
+        .into_diagnostic()
+        .wrap_err("Failed to flush rule suite report")?;
+    Ok(report.has_failures())
+}
+
 /// Test a bash command against configured rules.
 ///
 /// Both normal and explain output use the live hook's compound analysis. Explain additionally
@@ -228,11 +283,7 @@ async fn test_bash_rules(
     mode: Option<PermissionMode>,
 ) -> miette::Result<RuleResult> {
     // Initialize tracing to stderr for debug output (RUST_LOG env var controls level)
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let _ = tracing_subscriber::registry()
-        .with(filter)
-        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
-        .try_init();
+    init_test_tracing();
 
     // Read command from argument or stdin
     let command = match command {

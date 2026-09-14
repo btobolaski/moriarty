@@ -88,19 +88,23 @@ const REDACTED_LOG_VALUE: &str = "[redacted]";
 // Tokio cannot cancel a running blocking syscall; this bounds hook latency, not pool occupancy.
 const FILESYSTEM_EVALUATION_TIMEOUT: Duration = Duration::from_secs(2);
 
-fn fail_closed_blocking<T: Default>(
+fn checked_blocking<T>(
     result: StdResult<StdResult<T, JoinError>, Elapsed>,
     operation: &'static str,
-) -> T {
+) -> miette::Result<T> {
     match result {
-        Ok(Ok(value)) => value,
+        Ok(Ok(value)) => Ok(value),
         Ok(Err(error)) => {
-            warn!(%error, operation, "Blocking hook evaluation task failed; failing closed");
-            T::default()
+            warn!(%error, operation, "Blocking hook evaluation task failed");
+            Err(miette::miette!(
+                "Blocking hook evaluation task failed during {operation}: {error}"
+            ))
         }
         Err(error) => {
-            warn!(%error, operation, "Blocking hook evaluation timed out; failing closed");
-            T::default()
+            warn!(%error, operation, "Blocking hook evaluation timed out");
+            Err(miette::miette!(
+                "Blocking hook evaluation timed out during {operation}: {error}"
+            ))
         }
     }
 }

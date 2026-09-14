@@ -15,6 +15,7 @@ command-level validation specifically for Bash tool calls.
 - [Pattern Fragments](#pattern-fragments)
 - [Security Best Practices](#security-best-practices)
 - [Examples](#examples)
+- [Rule Regression Suites](#rule-regression-suites)
 - [Troubleshooting](#troubleshooting)
 
 ## Quick Start
@@ -1045,6 +1046,77 @@ action = { type = "Allow" }
 
 # Default: ask for anything not explicitly allowed
 ```
+
+## Rule Regression Suites
+
+Run caller-owned policy assertions in one process with an explicit candidate configuration:
+
+```bash
+moriarty test rules suite.toml --config candidate-tool-rules.toml
+moriarty test rules suite.toml -c candidate-tool-rules.toml --cwd project --json
+```
+
+The command never reads the deployed XDG policy as a fallback, and it never executes commands or tools represented by
+suite data. Both paths are resolved from the invocation directory. `--cwd` only sets the default evaluation directory;
+it does not change the process directory or where the suite and policy are found.
+
+A suite is strict TOML format version 1. The version is numeric, and all shown fields except `modes`, `cwd`, `reason`,
+and `expand_cwd` are required:
+
+```toml
+format_version = 1
+
+[[cases]]
+id = "filesystem/remove-root"
+name = "Removing root must not auto-allow"
+request = { kind = "bash", command = "rm -rf /" }
+expect = "not_auto_allowed"
+
+[[cases]]
+id = "tool/null-async"
+name = "Null is distinct from absence"
+request = { kind = "tool", tool = "subagent", input_json = '{"async":null}' }
+modes = ["default"]
+expect = "denied"
+reason = "async must be true"
+```
+
+Unknown suite, case, and request fields are errors. Bash requests require `command`. Tool requests require a nonempty
+non-`Bash` `tool` and `input_json`; the JSON is parsed once as an arbitrary JSON value, preserving nulls and literal
+keys. IDs must be nonempty and unique, names must be nonempty, and suites and supplied mode lists must be nonempty.
+Modes use exactly `default`, `plan`, `acceptEdits`, `auto`, `dontAsk`, or `bypassPermissions` and expand in listed
+order. Omitting `modes` creates one mode-less evaluation in which only unrestricted rules participate.
+
+`expect` is one of `allowed`, `ask`, `denied`, `no_match`, or `not_auto_allowed`. Asked, denied, and unmatched results
+satisfy `not_auto_allowed`; a modified Bash command satisfies no v1 assertion. `reason` is valid only with `denied` and
+must match the actual denial reason byte for byte. An omitted reason accepts any denial reason; an explicit empty reason
+requires an empty actual reason.
+
+A case `cwd` is absolute or relative to the default evaluation cwd. Every effective cwd must already be an existing
+UTF-8 directory. With `expand_cwd = true`, at least one exact `{{cwd}}` marker is required and is replaced
+non-recursively in the Bash command or JSON string values, never JSON keys. Without opt-in, markers remain literal.
+Fixture paths are not created for the suite.
+
+Moriarty prepares every case before loading and compiling the candidate policy, so a late invalid case prevents all
+evaluation. It then compiles each engine once and evaluates rows sequentially. Any rule compilation diagnostic rejects
+the candidate policy instead of silently skipping that rule.
+
+JSON output is one complete object. It includes numeric `format_version`, source/evaluation/pass/fail counts, and every
+ordered row. Rows include ID, name, nullable mode, effective cwd, the prepared request, expected assertion, optional
+`expected_reason`, actual engine result, and pass status. Tool requests contain parsed `input`; actual results retain
+rule, reason, and rewrite details where relevant. Human output prints failed rows only, safely escaped, followed by the
+same totals.
+
+Exit status is 0 when every expanded row passes, 1 after a complete report containing mismatches, and 2 for CLI, input,
+preparation, policy-compilation, evaluation-infrastructure, or output failures. A status-2 failure before rendering has
+no report on stdout.
+
+Bash cases use the offline completed Bash evaluator, not generic PreToolUse dispatch. Tool cases use the checked tool
+path, so locality infrastructure failures abort the suite; the live hook intentionally falls back instead. Existing path
+behavior can depend on the host filesystem and `HOME`, and results are not guaranteed across concurrent filesystem
+mutation. A suite can establish bounded semantic parity with live hooks, but it is not a universal hook emulator.
+
+See `moriarty-test-rules(1)` for the command manual.
 
 ## Troubleshooting
 

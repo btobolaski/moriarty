@@ -1,0 +1,228 @@
+.\" Copyright (c) 2026 Moriarty contributors
+.\" SPDX-License-Identifier: GPL-3.0-only
+.Dd September 13, 2026
+.Dt MORIARTY\-TEST\-RULES 1
+.Os
+.Sh NAME
+.Nm moriarty\-test\-rules
+.Nd evaluate a rule regression suite against an explicit policy
+.Sh SYNOPSIS
+.Nm moriarty
+.Cm test rules
+.Ar suite
+.Fl c Ar config
+.Op Fl \-cwd Ar directory
+.Op Fl \-json
+.Sh DESCRIPTION
+The
+.Cm test rules
+command parses a caller-owned TOML suite, completely prepares it,
+compiles the bash and tool engines once, and evaluates every expanded row
+sequentially in the current process.
+Commands and tools represented by fixture data are never executed.
+.Pp
+.Ar suite
+and
+.Ar config
+are required paths.
+Relative paths are resolved from the process invocation directory.
+The command never falls back to the deployed XDG policy.
+.Sh OPTIONS
+.Bl -tag -width Ds
+.It Fl c , Fl \-config Ar config
+Select the candidate
+.Xr moriarty\-tool\-rules 5
+and
+.Xr moriarty\-bash\-rules 5
+policy.
+This option is required.
+.It Fl \-cwd Ar directory
+Set the default evaluation directory.
+An absolute path is used directly;
+a relative path is joined to the invocation directory.
+The default is the invocation directory.
+This option does not change the process directory or suite/config path lookup.
+.It Fl \-json
+Write one complete JSON report instead of the human report.
+.El
+.Sh SUITE FORMAT
+The top level is strict TOML with numeric format version 1 and a nonempty
+case array:
+.Bd -literal -offset indent
+format_version = 1
+
+[[cases]]
+id = "filesystem/remove-root"
+name = "Removing root must not auto-allow"
+request = { kind = "bash", command = "rm -rf /" }
+expect = "not_auto_allowed"
+
+[[cases]]
+id = "tool/null-async"
+name = "Null is distinct from absence"
+request = { kind = "tool", tool = "subagent", input_json = '{"async":null}' }
+modes = ["default"]
+expect = "denied"
+reason = "async must be true"
+.Ed
+.Pp
+These are caller-owned assertions, not a policy or suite bundled with Moriarty.
+Unknown top-level, case, and request fields are errors.
+.Bl -tag -width expand_cwd
+.It Ic format_version
+Required numeric value 1.
+Other numbers and nonnumeric values are rejected.
+.It Ic cases
+Required nonempty array of case tables.
+.It Ic id
+Required nonempty identifier, unique within the suite.
+.It Ic name
+Required nonempty display name.
+Names need not be unique.
+.It Ic request
+Required tagged inline table.
+.Ic kind = "bash"
+requires a nonempty
+.Ic command .
+.Ic kind = "tool"
+requires a nonempty
+.Ic tool
+other than
+.Ql Bash
+and an
+.Ic input_json
+string containing any valid JSON value.
+JSON nulls and literal dotted keys are preserved.
+.It Ic expect
+Required closed assertion:
+.Cm allowed , ask , denied , no_match ,
+or
+.Cm not_auto_allowed .
+.It Ic modes
+Optional nonempty list using exactly
+.Cm default , plan , acceptEdits , auto , dontAsk ,
+or
+.Cm bypassPermissions .
+Duplicates are rejected.
+Rows expand in case and listed-mode order.
+Omission creates one mode-less row,
+in which only unrestricted rules participate.
+.It Ic cwd
+Optional case evaluation directory.
+A relative value is joined to the default evaluation directory.
+.It Ic reason
+Optional only with
+.Cm denied .
+It must equal the actual denial reason byte for byte.
+Omission accepts any denial reason;
+an empty value requires an empty actual reason.
+.It Ic expand_cwd
+Optional boolean, default false.
+When true, the request must contain an exact
+.Ql {{cwd}}
+marker.
+The marker is replaced non-recursively in a Bash command or JSON string
+values, never JSON object keys.
+Without opt-in it remains literal.
+.El
+.Sh ASSERTIONS
+An allowed command, a successfully revalidated argument-filter rewrite,
+or an allowed tool satisfies
+.Cm allowed .
+Asked, denied, and unmatched results satisfy their same-named assertions.
+Asked, denied, and unmatched results also satisfy
+.Cm not_auto_allowed .
+A non-Bash tool no-match means hook pass-through, not Ask.
+.Pp
+A Bash
+.Cm modified
+result satisfies no version-1 assertion; its rewrite remains in the report.
+When
+.Ic reason
+is present, the result must also be an actual denial with the exact reason.
+.Sh PREPARATION AND EVALUATION
+Moriarty validates the default cwd, reads and strictly parses the entire
+suite, and prepares every case before loading the candidate policy.
+A late invalid case therefore prevents all evaluation and report rendering.
+Every effective cwd must be an existing directory with a valid UTF-8 path.
+Fixture paths are not created.
+.Pp
+The candidate policy is loaded once.
+Both engines use their diagnostic compilers;
+any dropped-rule diagnostic rejects the policy rather than silently
+weakening it.
+Each Bash row receives fresh evaluation and alias state while sharing the
+compiled engine.
+.Pp
+Bash rows use completed offline Bash decision evaluation,
+not generic PreToolUse dispatch or a tool-rule short circuit.
+Tool rows use checked evaluation,
+so locality infrastructure errors abort the run.
+The live hook intentionally falls back when that infrastructure fails.
+.Sh OUTPUT
+JSON output directly serializes one report object containing:
+.Bl -bullet -compact
+.It
+numeric
+.Ic format_version ;
+.It
+.Ic source_case_count , evaluation_count , passed_count ,
+and
+.Ic failed_count ;
+.It
+every ordered row, including passes.
+.El
+.Pp
+Each row contains
+.Ic id , name , mode , effective_cwd , request , expected , actual ,
+and
+.Ic passed .
+.Ic mode
+is null for a mode-less row.
+.Ic expected_reason
+is omitted only when absent; an explicit empty string remains present.
+Tool requests contain parsed
+.Ic input
+rather than the original JSON string.
+Actual results retain applicable rule, reason, and rewrite data.
+.Pp
+Human output prints only failed rows, followed by one line with all four counts.
+IDs, names, cwds, requests, expected reasons, and actual details are escaped
+so embedded controls do not create ambiguous row boundaries.
+.Sh EXIT STATUS
+.Bl -tag -width 2
+.It 0
+A nonempty suite completed and every expanded row passed.
+.It 1
+Evaluation completed with one or more assertion mismatches.
+The complete report is written before exit,
+including failures after an earlier mismatch.
+.It 2
+CLI, file, parse, preparation, policy compilation,
+evaluation infrastructure, or report output failed.
+A failure before rendering writes diagnostics to standard error and no report
+to standard output.
+.El
+.Sh LIMITATIONS
+Results may depend on the host filesystem and
+.Ev HOME
+because existing rule path handling does.
+The runner does not create fixture paths and makes no accuracy guarantee
+under concurrent filesystem mutation.
+Offline Bash evaluation and checked tool evaluation can establish bounded
+semantic parity with the live hook,
+but the command is not a universal hook emulator.
+.Sh EXAMPLES
+Evaluate a suite and print only failed rows plus totals:
+.Bd -literal -offset indent
+moriarty test rules suite.toml --config candidate.toml
+.Ed
+.Pp
+Evaluate relative to a project directory and retain all rows as JSON:
+.Bd -literal -offset indent
+moriarty test rules suite.toml -c candidate.toml --cwd project --json
+.Ed
+.Sh SEE ALSO
+.Xr moriarty 1 ,
+.Xr moriarty\-bash\-rules 5 ,
+.Xr moriarty\-tool\-rules 5

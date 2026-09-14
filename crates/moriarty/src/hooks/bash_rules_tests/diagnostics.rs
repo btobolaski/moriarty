@@ -127,3 +127,48 @@ fn test_classify_fragment_error_distinguishes_kinds() {
         RuleDiagnosticKind::FragmentExpansionLimitExceeded
     );
 }
+
+fn diagnostic_config() -> UserConfig {
+    UserConfig {
+        pattern_fragments: None,
+        bash_path_aliases: BTreeSet::from([BashPathAlias::validate("P".to_string()).unwrap()]),
+        bash_rules: Some(vec![
+            BashRule {
+                name: "bad".to_string(),
+                pattern: "[".to_string(),
+                modes: None,
+                action: BashRuleAction::Allow,
+            },
+            allow_rule("read-alias", r"^cat file$"),
+        ]),
+        tool_rules: None,
+    }
+}
+
+fn diagnostic_constructor_result(engine: &BashRuleEngine) -> RuleResult {
+    let context = EvaluationContext::new("/work", None);
+    engine
+        .evaluate_sync(
+            "P=/work; cat $P/file",
+            &context,
+            EvaluationPurpose::Decision,
+        )
+        .rule_result()
+}
+
+#[test]
+fn diagnostic_constructor_preserves_aliases_and_from_config_behavior() {
+    let (engine, diagnostics) =
+        BashRuleEngine::from_config_with_diagnostics(diagnostic_config()).unwrap();
+    assert_eq!(diagnostics.len(), 1);
+    assert!(matches!(
+        diagnostic_constructor_result(&engine),
+        RuleResult::Allowed { .. }
+    ));
+
+    let legacy = BashRuleEngine::from_config(diagnostic_config()).unwrap();
+    assert_eq!(
+        diagnostic_constructor_result(&legacy),
+        diagnostic_constructor_result(&engine)
+    );
+}

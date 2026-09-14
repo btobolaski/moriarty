@@ -4,8 +4,11 @@
 
 use std::{
     ffi::{OsStr, OsString},
+    future::Future,
     path::{Path, PathBuf},
     process::Command,
+    sync::mpsc::{SyncSender, sync_channel},
+    time::Duration,
 };
 
 use tempfile::TempDir;
@@ -28,6 +31,36 @@ name = "allow-head"
 pattern = "^head($|\\s)"
 action = { type = "Allow" }
 "#;
+
+struct ReleaseBlockingTask(Option<SyncSender<()>>);
+
+impl Drop for ReleaseBlockingTask {
+    fn drop(&mut self) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(());
+        }
+    }
+}
+
+pub(crate) fn with_saturated_blocking_pool<F: Future>(future: F) -> F::Output {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (started_tx, started_rx) = sync_channel(0);
+    let (release_tx, release_rx) = sync_channel(0);
+    runtime.spawn_blocking(move || {
+        started_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    });
+    started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let release = ReleaseBlockingTask(Some(release_tx));
+    let output = runtime.block_on(future);
+    drop(release);
+    output
+}
 
 pub(crate) fn redirect_rule(name: &str, pattern: &str, allow_local: bool) -> BashRule {
     directional_redirect_rule(name, pattern, allow_local, RedirectDirection::Output)
