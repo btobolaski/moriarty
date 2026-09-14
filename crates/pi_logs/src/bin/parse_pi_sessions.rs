@@ -3,7 +3,9 @@
 //! This binary is a smoke test / coverage tool for [`pi_logs::parser`]. It
 //! defaults to `~/.pi/agent/sessions`, walks it in a deterministic order, and
 //! reports per-file parse failures. It exits non-zero if any file fails to
-//! parse so coverage gaps are visible in CI.
+//! parse so coverage gaps are visible in CI. Subagent artifact
+//! `*_transcript.jsonl` files are skipped: they use a separate `recordType`
+//! envelope and duplicate the child run's own `session.jsonl`.
 
 use std::{
     path::{Path, PathBuf},
@@ -11,7 +13,7 @@ use std::{
 };
 
 use clap::Parser;
-use pi_logs::parser::{ParseError, parse_file};
+use pi_logs::parser::{ParseError, is_subagent_transcript_artifact, parse_file};
 use walkdir::WalkDir;
 
 #[derive(Parser, Debug)]
@@ -41,7 +43,9 @@ fn collect_jsonl_files(root: &Path) -> Result<Vec<PathBuf>, walkdir::Error> {
             continue;
         }
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+        if path.extension().and_then(|e| e.to_str()) == Some("jsonl")
+            && !is_subagent_transcript_artifact(path)
+        {
             files.push(path.to_path_buf());
         }
     }

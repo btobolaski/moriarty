@@ -141,6 +141,19 @@ impl Ord for JsonBlob {
     }
 }
 
+/// True for pi-subagents' `<runId>_<agent>_transcript.jsonl` artifact
+/// archives. The filename-suffix match is deliberately location-agnostic,
+/// mirroring the Claude-side basename skips: the archives are written under
+/// `subagent-artifacts/` today, but the suffix alone is what identifies them.
+/// Consumers must skip these files rather than parse them: they use a
+/// separate `recordType` envelope and duplicate the billable turns already
+/// logged to each child run's own `session.jsonl`.
+pub fn is_subagent_transcript_artifact(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with("_transcript.jsonl"))
+}
+
 // ---------------------------------------------------------------------------
 // Top-level line
 // ---------------------------------------------------------------------------
@@ -397,6 +410,11 @@ pub enum CustomMessagePayload {
     /// field.
     #[serde(rename = "subagent-notify")]
     SubagentNotify,
+    /// Incremental per-child workflow notification emitted while a workflow
+    /// run is still in progress. Carries no `details` payload; the
+    /// human-readable summary lives in the outer `content` field.
+    #[serde(rename = "subagent-incremental-child-notify")]
+    SubagentIncrementalChildNotify,
     /// Intercom relays render as custom messages so the UI can show the rich
     /// sender banner without teaching the top-level log format about inboxes.
     #[serde(rename = "intercom_message")]
@@ -547,6 +565,14 @@ pub struct ToolResultMessage {
     /// newer runtimes; optional so older logs still parse. Not billable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub added_tool_names: Option<Vec<String>>,
+    /// Token/cost usage of the model turn whose completion the blocking
+    /// tool call (e.g. `bg_wait`) waited through. Pi attaches this only to
+    /// newer wait results; optional so older logs still parse. Parsed for
+    /// completeness and deliberately not billed: the turn it mirrors is
+    /// already logged as its own assistant message, so counting this too
+    /// would double-count (the same reasoning as Claude's `cost-state`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<AssistantUsage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -561,6 +587,8 @@ struct RawToolResultMessage {
     pub details: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub added_tool_names: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<AssistantUsage>,
 }
 
 /// Pi can emit `null` or omit `details` entirely when no structured result is
@@ -603,6 +631,7 @@ impl<'de> Deserialize<'de> for ToolResultMessage {
             timestamp,
             details: raw_details,
             added_tool_names,
+            usage,
         } = RawToolResultMessage::deserialize(deserializer)?;
         let resolved = resolve_tool_result_details(raw_details, &tool_name, is_error);
         let details = resolved.map_err(de::Error::custom)?;
@@ -614,6 +643,7 @@ impl<'de> Deserialize<'de> for ToolResultMessage {
             timestamp,
             details,
             added_tool_names,
+            usage,
         })
     }
 }
@@ -2273,6 +2303,12 @@ pub struct SubagentResultDetails {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
     pub results: Vec<SubagentResultSummary>,
+    /// Aggregate agent-capability listing returned by management `list`
+    /// calls. Kept as raw JSON because the pi-subagents extension owns this
+    /// envelope (per-agent tool rosters, fallback model lists, extension
+    /// bindings, …) and evolves it independently of the log format.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_capabilities: Option<Box<JsonBlob>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifacts: Option<SubagentArtifacts>,
     /// Inheritance mode the parent passed to the subagent (for example
@@ -2371,6 +2407,23 @@ pub struct SubagentResultDetails {
     /// blocking, one entry per awaited run. Added in newer pi versions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completions: Option<Vec<SubagentWaitCompletion>>,
+    /// The remaining fields are all owned by the pi-subagents extension's
+    /// workflow/mission subsystem, which evolves them independently of the
+    /// log format (the sibling `mission` field is raw JSON for the same
+    /// reason), so they stay opaque rather than chase the extension's schema:
+    /// concurrent-run capacity (`used`/`limit`), fan-out budget
+    /// (`used`/`limit`/`remaining`), the workflow child inventory, the
+    /// workflow trace/console snapshot, and the workflow receipt path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_async_capacity: Option<Box<JsonBlob>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_fanout_budget: Option<Box<JsonBlob>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_children: Option<Box<JsonBlob>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<Box<JsonBlob>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_receipt_path: Option<PathBuf>,
 }
 
 /// One awaited async run reported by a `subagent_wait` management result.
@@ -2392,11 +2445,19 @@ pub struct SubagentWaitCompletion {
     /// so no archive path is guaranteed even after the run completes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archive_path: Option<PathBuf>,
+    /// Workflow-run receipt path and child inventory, carried only by
+    /// workflow-mode completions. The child inventory is extension-owned raw
+    /// JSON for the same reason as `SubagentResultDetails::workflow_children`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_receipt_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_children: Option<Box<JsonBlob>>,
 }
 
 /// Per-agent result summary inside a [`SubagentWaitCompletion`]. Leaner than
-/// [`SubagentResultSummary`]: the wait call reports only identity, outcome,
-/// and where the archived output lives.
+/// [`SubagentResultSummary`]: identity, outcome, artifact locations, and —
+/// on newer workflow completions — the child run's own usage, session
+/// transcript, and structured output.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SubagentWaitCompletionResult {
@@ -2425,6 +2486,18 @@ pub struct SubagentWaitCompletionResult {
     /// Error message for a failed child run; absent on success.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The child run's own token/cost usage. Present on newer workflow
+    /// completions; absent on older entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<SubagentUsage>,
+    /// The child run's session transcript, recorded only by newer workflow
+    /// completions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_file: Option<PathBuf>,
+    /// The child run's structured output payload, if the run declared one.
+    /// Kept as raw JSON because its shape is caller-defined.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_output: Option<Box<JsonBlob>>,
 }
 
 /// Wait completions record either the saved output path alone or the full
@@ -2956,6 +3029,14 @@ pub struct SubagentControlEventPayload {
     /// include runtime observability counters.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub elapsed_ms: Option<Decimal>,
+    /// Label identifying the workflow child the event concerns; present
+    /// only on workflow-mode events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_key: Option<String>,
+    /// Preview of the child's in-flight task text; present only on
+    /// workflow-mode attention events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_preview: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -3111,6 +3192,10 @@ pub struct SubagentControlNoticeDetails {
     pub async_dir: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub child_intercom_target: Option<String>,
+    /// Label identifying the workflow child the notice concerns; present
+    /// only on workflow-mode notices.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_key: Option<String>,
     pub notice_text: String,
 }
 
@@ -3127,6 +3212,18 @@ pub struct SubagentSupervisorRequestDetails {
     pub run_id: String,
     pub agent: String,
     pub child_index: u32,
+    /// Correlation id for an async request the parent can answer later;
+    /// absent on synchronous supervisor requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    /// Routing target for a nested child reply (e.g. a subagent_wait id the
+    /// parent must reply through); absent on top-level requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_target: Option<String>,
+    /// The child's message body, present on progress_update requests that
+    /// carry their payload in the details rather than the outer content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_body: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

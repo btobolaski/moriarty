@@ -1323,4 +1323,33 @@ mod tests {
         assert!(!result.had_errors);
         assert_eq!(result.lines.len(), 1);
     }
+
+    #[tokio::test]
+    async fn analyze_directory_skips_pi_subagent_transcript_artifacts() {
+        let temp_dir = temp_dir();
+        // pi-subagents writes `<runId>_<agent>_transcript.jsonl` archive copies
+        // of each child run's conversation under `subagent-artifacts/` using a
+        // `recordType` envelope this parser does not model; the same billable
+        // turns are already logged to the child run's own `session.jsonl`, so
+        // skipping the archives avoids both a parse failure and double-counting.
+        write_log_files(
+            temp_dir.path(),
+            &[
+                (
+                    "subagent-artifacts/00e44314_scout_transcript.jsonl",
+                    "{\"version\":1,\"recordType\":\"message\"}\n".to_string(),
+                ),
+                (
+                    "session.jsonl",
+                    format!("{}\n", pi_assistant_log("a1", CLAUDE_TIMESTAMP)),
+                ),
+            ],
+        )
+        .await;
+
+        let result = analyze_directory::<PiLogLine>(temp_dir.path().to_path_buf()).await;
+
+        assert!(!result.had_errors);
+        assert_eq!(result.lines.len(), 1);
+    }
 }

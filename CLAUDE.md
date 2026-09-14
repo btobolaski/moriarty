@@ -273,12 +273,16 @@ with warnings, while explicit missing paths and having no available source are e
   opaque `Vec<JsonBlob>` because its element shape is intentionally unmodeled until a populated example exists (the only
   observed payload had an empty list)
 - Includes a `parse_pi_sessions` binary that recursively smoke-tests a sessions tree by parsing every `*.jsonl` file
+  except pi-subagents' `*_transcript.jsonl` artifact archives (which use a separate `recordType` envelope and duplicate
+  each child run's `session.jsonl`)
 
 **`cost_analyzer/`** - Generic cost-analysis library:
 
 - Workspace crate for recursively scanning JSONL directories, parsing logs in parallel, and deduplicating billable model
   responses. It skips Claude's well-known non-transcript `history.jsonl` and workflow `journal.jsonl` files by basename
-  wherever they occur because neither schema contains billable model responses
+  wherever they occur because neither schema contains billable model responses, and pi's pi-subagents
+  `<runId>_<agent>_transcript.jsonl` artifact archives because they use a separate `recordType` envelope while
+  duplicating the billable turns already logged to each child run's own `session.jsonl`
 - Core abstractions: `AnalyzableLog` for pluggable log formats, `LlmCost` for input/cache/output cost breakdowns,
   `TokenType` plus `AnalyzableLog::token_count(...) -> Option<u64>` for raw token extraction, `LineWithCost` for
   normalized billable entries, and `AnalysisResult` for returning those deduplicated lines alongside a partial-failure

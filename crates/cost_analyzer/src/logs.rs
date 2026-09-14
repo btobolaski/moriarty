@@ -13,6 +13,7 @@ use claude_logs::{
 };
 use pi_logs::{
     AssistantMessage, AssistantUsage as PiAssistantUsage, PiLogLine, Provider, RoleMessage,
+    parser::is_subagent_transcript_artifact,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -670,6 +671,10 @@ impl AnalyzableLog for PiLogLine {
 
     fn parse(value: &str) -> miette::Result<Self> {
         parse_json_backed_log(value)
+    }
+
+    fn should_parse_file(path: &Path) -> bool {
+        !is_subagent_transcript_artifact(path)
     }
 }
 

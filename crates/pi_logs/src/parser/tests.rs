@@ -8477,6 +8477,294 @@ fn subagent_wait_tool_result_accepts_management_completions() {
 }
 
 #[test]
+fn subagent_details_passthroughs_extension_owned_fields() {
+    // One consolidated guard for the shared contract behind the extension-
+    // owned pi-subagents fields (including `agentCapabilities` from newer
+    // management `list` results): each parses via `#[serde(default)]` and
+    // raw-JSON passthroughs round-trip verbatim; the inner schemas are the
+    // extension's, so only presence is pinned.
+    let capabilities = json!({
+        "agents": [{
+            "name": "scout",
+            "description": "Fast codebase recon",
+            "source": "user",
+            "executable": true,
+            "runner": {"type": "pi"},
+            "tools": {"ambient": false, "names": ["read"], "mcpDirectTools": []},
+            "model": {"thinking": "medium"},
+            "output": {"mode": "inline"}
+        }],
+        "restrictedCount": 0
+    });
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "subagent",
+        vec![json!({"type": "text", "text": "Run fan-out: 0/2 used"})],
+        false,
+        Some(json!({
+            "mode": "workflow",
+            "results": [],
+            "agentCapabilities": capabilities,
+            "activeAsyncCapacity": {"used": 0, "limit": 0},
+            "runFanoutBudget": {"used": 0, "limit": 2, "remaining": 2},
+            "workflowChildren": {"version": 1, "children": []},
+            "workflow": {"trace": [], "emits": [], "console": []},
+            "workflowReceiptPath": "/tmp/run/workflow-receipt.json"
+        })),
+    ));
+    let Some(ToolResultDetails::Subagent(details)) = tool_result.details else {
+        panic!("expected Subagent details")
+    };
+    assert_eq!(
+        details.agent_capabilities.as_deref().map(|blob| &blob.0),
+        Some(&capabilities)
+    );
+    assert_eq!(
+        details.active_async_capacity.as_deref().map(|blob| &blob.0),
+        Some(&json!({"used": 0, "limit": 0}))
+    );
+    assert_eq!(
+        details.run_fanout_budget.as_deref().map(|blob| &blob.0),
+        Some(&json!({"used": 0, "limit": 2, "remaining": 2}))
+    );
+    assert_eq!(
+        details.workflow_children.as_deref().map(|blob| &blob.0),
+        Some(&json!({"version": 1, "children": []}))
+    );
+    assert_eq!(
+        details.workflow.as_deref().map(|blob| &blob.0),
+        Some(&json!({"trace": [], "emits": [], "console": []}))
+    );
+    assert_eq!(
+        details.workflow_receipt_path,
+        Some(PathBuf::from("/tmp/run/workflow-receipt.json"))
+    );
+
+    // Absent representative: none of the raw fields are required.
+    let absent = parse_tool_result_message(tool_result_message_json(
+        "subagent",
+        vec![json!({"type": "text", "text": "launched"})],
+        false,
+        Some(json!({"mode": "single", "results": []})),
+    ));
+    let Some(ToolResultDetails::Subagent(details)) = absent.details else {
+        panic!("expected Subagent details")
+    };
+    assert_eq!(details.agent_capabilities, None);
+    assert_eq!(details.active_async_capacity, None);
+    assert_eq!(details.run_fanout_budget, None);
+    assert_eq!(details.workflow_children, None);
+    assert_eq!(details.workflow, None);
+    assert_eq!(details.workflow_receipt_path, None);
+}
+
+#[test]
+fn is_subagent_transcript_artifact_matches_by_suffix_location_agnostically() {
+    // Positive: any `<runId>_<agent>_transcript.jsonl` basename matches.
+    assert!(is_subagent_transcript_artifact(Path::new(
+        "/sessions/proj/subagent-artifacts/00e44314_scout_transcript.jsonl"
+    )));
+    assert!(is_subagent_transcript_artifact(Path::new(
+        "00e44314_scout_transcript.jsonl"
+    )));
+    // Negatives: the child run's own transcript must still parse, a name
+    // without the `_`-separated prefix is not an artifact, and non-UTF8
+    // basenames fail closed (no skip) rather than matching.
+    assert!(!is_subagent_transcript_artifact(Path::new(
+        "/sessions/proj/run-0/session.jsonl"
+    )));
+    assert!(!is_subagent_transcript_artifact(Path::new(
+        "/sessions/proj/transcript.jsonl"
+    )));
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let non_utf8 = Path::new(std::ffi::OsStr::from_bytes(b"/tmp/ff\xff_transcript.jsonl"));
+        assert!(!is_subagent_transcript_artifact(non_utf8));
+    }
+}
+
+#[test]
+fn tool_result_message_parses_optional_usage() {
+    // `usage` is threaded by hand through the custom deserializer, so the
+    // test pins both the present and absent cases to catch a dropped field.
+    let mut with_usage = tool_result_message_json(
+        "bg_wait",
+        vec![json!({"type": "text", "text": "Waited 2m10s; done."})],
+        false,
+        None,
+    );
+    with_usage["message"]["usage"] = json!({
+        "input": 275087,
+        "output": 30956,
+        "cacheRead": 954304,
+        "cacheWrite": 0,
+        "totalTokens": 1260347,
+        "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": "0.3793"}
+    });
+    let tool_result = parse_tool_result_message(with_usage);
+    let usage = tool_result.usage.expect("expected usage");
+    assert_eq!(usage.input, 275087);
+    assert_eq!(usage.output, 30956);
+    assert_eq!(usage.total_tokens, 1260347);
+    assert_eq!(usage.cost.total, Decimal::from_str_exact("0.3793").unwrap());
+
+    let without_usage = parse_tool_result_message(tool_result_message_json(
+        "bg_wait",
+        vec![json!({"type": "text", "text": "done"})],
+        false,
+        None,
+    ));
+    assert_eq!(without_usage.usage, None);
+}
+
+#[test]
+fn custom_message_subagent_incremental_child_notify_parses_without_details() {
+    match parse_custom_message_payload(
+        "Workflow child completed: **host-config**",
+        "subagent-incremental-child-notify",
+        None,
+    ) {
+        CustomMessagePayload::SubagentIncrementalChildNotify => {}
+        other => panic!("expected SubagentIncrementalChildNotify, got {other:?}"),
+    }
+}
+
+#[test]
+fn subagent_supervisor_request_accepts_async_correlation_fields() {
+    let line = parse(json!({
+        "type": "custom_message",
+        "customType": "subagent_supervisor_request",
+        "content": "Progress update",
+        "display": false,
+        "details": {
+            "id": "req-9",
+            "reason": "progress_update",
+            "expectsReply": false,
+            "runId": "run-7",
+            "agent": "researcher",
+            "childIndex": 0,
+            "requestId": "00e190ab-4d82-413a-b79d-9390544ac39c",
+            "childTarget": "subagent-researcher-run-7-1",
+            "requestBody": "UPDATE: research complete"
+        },
+        "id": "cm-9",
+        "parentId": "msg-9",
+        "timestamp": FIXED_TIMESTAMP,
+    }));
+    let PiLogLine::CustomMessage(msg) = line else {
+        panic!("expected custom_message")
+    };
+    let CustomMessagePayload::SubagentSupervisorRequest(req) = &msg.payload else {
+        panic!("expected SubagentSupervisorRequest")
+    };
+    assert_eq!(
+        req.request_id.as_deref(),
+        Some("00e190ab-4d82-413a-b79d-9390544ac39c")
+    );
+    assert_eq!(
+        req.child_target.as_deref(),
+        Some("subagent-researcher-run-7-1")
+    );
+    assert_eq!(
+        req.request_body.as_deref(),
+        Some("UPDATE: research complete")
+    );
+}
+
+#[test]
+fn subagent_control_event_accepts_workflow_task_fields() {
+    match parse_custom_message_payload(
+        "Subagent needs attention: test-quality-reviewer",
+        "subagent_control_notice",
+        Some(json!({
+            "event": {
+                "type": "needs_attention",
+                "to": "needs_attention",
+                "ts": 1777921594147_u64,
+                "runId": "f62935d9",
+                "agent": "test-quality-reviewer",
+                "index": 0,
+                "message": "tool mcp open for 240s",
+                "reason": "tool_held_open",
+                "workflowKey": "review-test-quality",
+                "taskPreview": "[prompt redacted]"
+            },
+            "source": "async",
+            "noticeText": "Subagent needs attention"
+        })),
+    ) {
+        CustomMessagePayload::SubagentControlNotice(details) => {
+            let SubagentControlEvent::NeedsAttention(event) = details.event else {
+                panic!("expected needs_attention event")
+            };
+            assert_eq!(event.workflow_key.as_deref(), Some("review-test-quality"));
+            assert_eq!(event.task_preview.as_deref(), Some("[prompt redacted]"));
+        }
+        other => panic!("expected SubagentControlNotice, got {other:?}"),
+    }
+}
+
+#[test]
+fn subagent_wait_completion_accepts_workflow_and_usage_fields() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "bg_wait",
+        vec![json!({"type": "text", "text": "Waited 4m12s; done."})],
+        false,
+        Some(json!({
+            "mode": "management",
+            "results": [],
+            "completions": [{
+                "runId": "f077ede7",
+                "agent": "workflow",
+                "mode": "workflow",
+                "workflowReceiptPath": "/tmp/run/workflow-receipt.json",
+                "workflowChildren": {"version": 1, "children": []},
+                "state": "complete",
+                "success": true,
+                "results": [{
+                    "agent": "strong_worker",
+                    "runId": "a0d3ac26",
+                    "success": true,
+                    "outputState": "present",
+                    "usage": {"input": 83806, "output": 8008, "cacheRead": 923392, "cacheWrite": 0, "cost": "2.161852", "turns": 17},
+                    "sessionFile": "/sessions/a0d3ac26/run-0/session.jsonl",
+                    "structuredOutput": {"verdict": "pass"}
+                }]
+            }]
+        })),
+    ));
+    let Some(ToolResultDetails::Subagent(details)) = tool_result.details else {
+        panic!("expected Subagent details")
+    };
+    let [completion] = details
+        .completions
+        .as_deref()
+        .expect("expected one completion")
+    else {
+        panic!("expected exactly one completion")
+    };
+    assert_eq!(
+        completion.workflow_receipt_path,
+        Some(PathBuf::from("/tmp/run/workflow-receipt.json"))
+    );
+    let [child] = completion.results.as_slice() else {
+        panic!("expected one child result")
+    };
+    assert_eq!(
+        child.usage.as_ref().expect("expected child usage").turns,
+        17
+    );
+    assert_eq!(
+        child.session_file,
+        Some(PathBuf::from("/sessions/a0d3ac26/run-0/session.jsonl"))
+    );
+    assert_eq!(
+        child.structured_output.as_deref().map(|blob| &blob.0),
+        Some(&json!({"verdict": "pass"}))
+    );
+}
+
+#[test]
 fn subagent_wait_tool_result_rejects_unknown_completion_field() {
     // Pins `deny_unknown_fields` on `SubagentWaitCompletion` so pi-side
     // schema additions to a wait completion surface as loud errors.
@@ -8745,6 +9033,8 @@ fn subagent_result_summary_serializes_control_events_as_camel_case() {
                 current_tool_duration_ms: None,
                 current_path: Some(PathBuf::from("charts/temporal/values.yaml")),
                 elapsed_ms: Some(Decimal::from(97198)),
+                workflow_key: None,
+                task_preview: None,
             },
         )]),
         acceptance: None,
