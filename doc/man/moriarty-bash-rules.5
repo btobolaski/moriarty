@@ -168,15 +168,17 @@ Descriptor duplication and closure use tokens such as
 .Ql &1 , &2 ,
 and
 .Ql &- .
-Only an unquoted plain current-user
+Only an unquoted current-user
 .Ql ~
-is expanded through home.
+or
+.Ql ~/...
+form is expanded through home.
 A quoted or escaped tilde remains a cwd-relative literal and is rendered as
 .Ql ./~/... ,
 so it cannot collide with the home-relative form.
 An invalid or unavailable
 .Ev HOME
-prevents plain tilde expansion but does not block unrelated local, absolute,
+prevents current-user tilde expansion but does not block unrelated local, absolute,
 device, or descriptor targets.
 An ordinary
 .Ql $HOME

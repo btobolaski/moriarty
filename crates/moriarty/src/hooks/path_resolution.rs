@@ -23,6 +23,16 @@ fn is_windows_error_directory(error: &io::Error) -> bool {
     error.raw_os_error() == Some(267)
 }
 
+pub(crate) fn expand_home_tilde_path(target: &str, home: &Path) -> Option<PathBuf> {
+    if target == "~" {
+        Some(home.to_path_buf())
+    } else {
+        target
+            .strip_prefix("~/")
+            .map(|relative| home.join(relative.trim_start_matches('/')))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RedirectTargetResolution {
     pub(crate) match_text: String,
@@ -54,11 +64,13 @@ impl RedirectResolutionContext {
         target: &str,
         expand_home_tilde: bool,
     ) -> io::Result<RedirectTargetResolution> {
-        let candidate = if expand_home_tilde && target == "~" {
-            self.home_for_expansion()?.to_path_buf()
-        } else if expand_home_tilde && let Some(relative) = target.strip_prefix("~/") {
-            self.home_for_expansion()?
-                .join(relative.trim_start_matches('/'))
+        let candidate = if expand_home_tilde {
+            expand_home_tilde_path(target, self.home_for_expansion()?).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "target is not a supported home-relative path",
+                )
+            })?
         } else {
             let path = PathBuf::from(target);
             if path.is_absolute() {
@@ -416,6 +428,21 @@ mod tests {
     }
 
     #[test]
+    fn expands_only_current_user_tilde_paths() {
+        let home = Path::new("/home/person");
+
+        for (target, expected) in [
+            ("~", Some(home.to_path_buf())),
+            ("~/", Some(home.to_path_buf())),
+            ("~/x", Some(home.join("x"))),
+            ("~//x", Some(home.join("x"))),
+            ("~x", None),
+        ] {
+            assert_eq!(expand_home_tilde_path(target, home), expected);
+        }
+    }
+
+    #[test]
     fn redirect_target_resolution_matrix() {
         let (_root, [cwd, home, external]) = resolution_fixture(["project", "home", "external"]);
         let context = RedirectResolutionContext::new(&cwd, Some(&home));
@@ -452,6 +479,10 @@ mod tests {
                 "case {target:?}"
             );
         }
+        assert_eq!(
+            context.resolve("out.txt", true).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
         let no_home = RedirectResolutionContext::new(&cwd, None);
         assert!(no_home.resolve("~/out", true).is_err());
         let stale_home = RedirectResolutionContext::new(&cwd, Some(&home.join("missing")));

@@ -111,6 +111,12 @@ does not select a path.
 If no path is selected, the legacy fallback applies.
 Relative paths are resolved against
 .Ic cwd .
+.Ql ~
+and
+.Ql ~/...
+first expand against
+.Ev HOME ;
+other tilde forms cannot satisfy locality.
 Existing paths are fully canonicalized; non\-existent paths are checked by canonicalizing the deepest existing ancestor and safely rebuilding the missing suffix so
 .Ql ..
 cannot escape above that ancestor.

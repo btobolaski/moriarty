@@ -88,8 +88,9 @@ action = { type = "ActionType", ... }
   satisfy locality. For a rule with `conditions`, every distinct `path` or `file_path` referenced by `Present`,
   `Equals`, or `Matches`, or by the legacy `field` when it names one of those path keys, must resolve locally; `Absent`
   does not select a path. If no path is selected, the legacy fallback still applies. Relative inputs are resolved
-  against `cwd`; existing paths are fully canonicalized; non-existent paths are checked by canonicalizing the deepest
-  existing ancestor and safely rebuilding the missing suffix so `..` cannot escape above that ancestor. Symlinks that
+  against `cwd`; `~` and `~/...` first expand against `HOME`, while other tilde forms cannot satisfy locality. Existing
+  paths are fully canonicalized; non-existent paths are checked by canonicalizing the deepest existing ancestor and
+  safely rebuilding the missing suffix so `..` cannot escape above that ancestor. Symlinks that
   resolve outside `cwd` and broken symlinks are rejected. Hard links are treated as ordinary local filesystem entries.
   In the live hook, if locality inspection does not finish within two seconds, every `allow_local` rule is skipped and
   evaluation falls through to a later rule or no match; synchronous analysis runs without this latency deadline.

@@ -9,7 +9,7 @@
 
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
-    fs,
+    env, fs,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -27,7 +27,7 @@ use super::{
         expand_fragments,
     },
     checked_blocking,
-    path_resolution::canonicalize_allow_missing,
+    path_resolution::{canonicalize_allow_missing, expand_home_tilde_path},
 };
 use crate::{
     permission_mode::{PermissionMode, is_mode_eligible},
@@ -642,9 +642,10 @@ fn evaluate_candidate_path(
     canonical_cwd: &Path,
 ) -> Option<CandidatePathEvaluation> {
     let candidate = tool_input.get(field).and_then(|value| value.as_str())?;
-    let candidate = PathBuf::from(candidate);
-    let resolved = if candidate.is_absolute() {
-        candidate
+    let resolved = if candidate.starts_with('~') {
+        // Tool inputs carry no shell context, so only current-user tilde forms can be resolved.
+        let home = PathBuf::from(env::var_os("HOME").filter(|home| !home.is_empty())?);
+        expand_home_tilde_path(candidate, &home)?
     } else {
         canonical_cwd.join(candidate)
     };
@@ -714,7 +715,7 @@ mod tests {
     use tokio::time::timeout;
 
     use super::*;
-    use crate::test_helpers::with_saturated_blocking_pool;
+    use crate::test_helpers::{TestEnvVarGuard, with_saturated_blocking_pool};
 
     impl ToolRuleEngine {
         pub(crate) fn force_locality_timeout(&mut self) {
@@ -1482,6 +1483,34 @@ mod tests {
         for path in ["../outside.txt", "nested/../../outside.txt"] {
             assert_no_local_path(&[PathBuf::from(path)], cwd);
         }
+    }
+
+    #[test]
+    fn test_allow_local_expands_home_tilde() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = home.path().join("project");
+        fs::create_dir(&cwd).unwrap();
+
+        {
+            let _home = TestEnvVarGuard::set("HOME", home.path());
+            assert_has_local_path(&[PathBuf::from("~/project/local.txt")], &cwd);
+            assert_no_local_path(
+                &[
+                    PathBuf::from("~"),
+                    PathBuf::from("~root/secret"),
+                    PathBuf::from("~/.cargo/credentials.toml"),
+                ],
+                &cwd,
+            );
+        }
+
+        {
+            let _home = TestEnvVarGuard::unset("HOME");
+            assert_no_local_path(&[PathBuf::from("~/project/local.txt")], &cwd);
+        }
+
+        let _home = TestEnvVarGuard::set("HOME", "");
+        assert_no_local_path(&[PathBuf::from("~/project/local.txt")], &cwd);
     }
 
     #[test]
