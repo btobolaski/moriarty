@@ -5,7 +5,7 @@ use std::path::Path;
 use chrono::{DateTime, NaiveDate, Utc};
 #[cfg(test)]
 use miette::IntoDiagnostic;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de, ser::SerializeMap};
 #[cfg(test)]
 use tokio::fs::read_to_string;
 use uuid::Uuid;
@@ -511,13 +511,14 @@ pub struct ForkContextRef {
 }
 
 /// Attachment log line for deferred tools, hooks, and other metadata. Added in Claude Code 2.1.104+.
+/// Deserializes through a strict wire shape because rendering keys are siblings on the wire but
+/// must retain their co-occurrence invariant in the domain model.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "AttachmentLogLineWire")]
 pub struct AttachmentLogLine {
     pub parent_uuid: Option<Uuid>,
     pub is_sidechain: bool,
-    /// Identifier for the subagent that emitted this attachment. Only set on subagent transcripts.
     pub agent_id: Option<String>,
     pub attachment: AttachmentData,
     pub uuid: Uuid,
@@ -529,13 +530,82 @@ pub struct AttachmentLogLine {
     pub version: String,
     pub git_branch: String,
     pub slug: Option<String>,
-    /// Claude Code 2.1.206+ repeats the session id under the snake_case key `session_id` alongside
-    /// the camelCase `sessionId` (`session_id` above); the two always carry the same value. Modeled
-    /// as its own field rather than a `#[serde(alias)]` on `session_id` because both keys appear at
-    /// once, which serde would reject as a duplicate. `Option` so pre-2.1.206 lines still parse.
+    #[serde(flatten)]
+    pub rendering: Option<AttachmentRendering>,
     #[serde(rename = "session_id")]
     pub session_id_snake: Option<Uuid>,
     pub session_kind: Option<SessionKind>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AttachmentLogLineWire {
+    parent_uuid: Option<Uuid>,
+    is_sidechain: bool,
+    agent_id: Option<String>,
+    attachment: AttachmentData,
+    uuid: Uuid,
+    timestamp: DateTime<Utc>,
+    user_type: String,
+    entrypoint: Option<String>,
+    cwd: String,
+    session_id: Uuid,
+    version: String,
+    git_branch: String,
+    slug: Option<String>,
+    rendered: Option<Vec<RenderedAttachment>>,
+    rendered_in_human_turn: Option<Vec<RenderedAttachment>>,
+    #[serde(rename = "session_id")]
+    session_id_snake: Option<Uuid>,
+    session_kind: Option<SessionKind>,
+}
+
+impl TryFrom<AttachmentLogLineWire> for AttachmentLogLine {
+    type Error = String;
+
+    fn try_from(wire: AttachmentLogLineWire) -> Result<Self, Self::Error> {
+        let rendering = match (wire.rendered, wire.rendered_in_human_turn) {
+            (Some(rendered), rendered_in_human_turn) => Some(AttachmentRendering {
+                rendered,
+                rendered_in_human_turn,
+            }),
+            (None, None) => None,
+            (None, Some(_)) => return Err("`renderedInHumanTurn` requires `rendered`".to_string()),
+        };
+        Ok(Self {
+            parent_uuid: wire.parent_uuid,
+            is_sidechain: wire.is_sidechain,
+            agent_id: wire.agent_id,
+            attachment: wire.attachment,
+            uuid: wire.uuid,
+            timestamp: wire.timestamp,
+            user_type: wire.user_type,
+            entrypoint: wire.entrypoint,
+            cwd: wire.cwd,
+            session_id: wire.session_id,
+            version: wire.version,
+            git_branch: wire.git_branch,
+            slug: wire.slug,
+            rendering,
+            session_id_snake: wire.session_id_snake,
+            session_kind: wire.session_kind,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AttachmentRendering {
+    pub rendered: Vec<RenderedAttachment>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rendered_in_human_turn: Option<Vec<RenderedAttachment>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct RenderedAttachment {
+    pub content: String,
 }
 
 /// Attachment payload types. Added in Claude Code 2.1.104+.
@@ -558,6 +628,7 @@ pub enum AttachmentData {
     Date(DateAttachment),
     DateChange(DateChange),
     DeferredToolsDelta(DeferredToolsDelta),
+    DeferredToolsRecord(DeferredToolsRecord),
     Diagnostics(DiagnosticsAttachment),
     Directory(DirectoryAttachment),
     EditedTextFile(EditedTextFile),
@@ -581,9 +652,11 @@ pub enum AttachmentData {
     PromptSnapshot(PromptSnapshot),
     QueuedCommand(QueuedCommand),
     ReadTruncationNotice(ReadTruncationNotice),
+    RemoteSessionChange(RemoteSessionChange),
     SessionContext(SessionContext),
     SilentTurnReminder(SilentTurnReminder),
     SkillListing(SkillListing),
+    StructuredOutput(StructuredOutput),
     TaskReminder(TaskReminder),
     TaskStatus(TaskStatus),
     TotalTokensReminder(TotalTokensReminder),
@@ -627,6 +700,10 @@ pub struct AutoModeBehaviorFlags {
     pub auto_mode_consent_flow: bool,
     pub bash_first: bool,
     pub steer_only: bool,
+    /// How strictly bash-first is enforced (observed: `strict`). Kept a `String` because the
+    /// vocabulary is undocumented and nothing downstream reads it, and `Option` because only some
+    /// 2.1.270 payloads carry it. Added in Claude Code 2.1.270+.
+    pub bash_first_steer: Option<String>,
     /// Added in Claude Code 2.1.238+; nullable so 2.1.226-era payloads without it still match this
     /// variant rather than falling through to an untagged mismatch.
     pub bypass: Option<bool>,
@@ -745,10 +822,23 @@ pub struct DeferredToolsDelta {
     pub pending_mcp_servers: Vec<String>,
     #[serde(default)]
     pub failed_mcp_servers: Vec<String>,
+    /// Servers which deferred tools require authentication for. The wire payload currently names
+    /// only their server ids, so the element type matches the other server lists.
+    #[serde(default)]
+    pub needs_auth_mcp_servers: Vec<String>,
     /// Tools withheld from the wire schema; only ever observed empty, so the element type is
     /// assumed to match its `*_names` siblings.
     #[serde(default)]
     pub wire_hidden_names: Vec<String>,
+}
+
+/// The full definitions of the deferred tools whose schemas were loaded into the turn, the
+/// counterpart to [`DeferredToolsDelta`]'s name-only bookkeeping. Added in Claude Code 2.1.270+.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct DeferredToolsRecord {
+    pub entries: Vec<DeferredToolSchema>,
 }
 
 /// Editor diagnostics Claude Code attaches after a file changed, so the model sees the errors its
@@ -821,21 +911,142 @@ pub struct SilentTurnReminder {
 /// A record of the system prompt (as its constituent blocks) and tool roster a turn was sent with.
 /// `tools` is absent on turns whose snapshot predates the tool roster being captured, hence
 /// `Option`. Added in Claude Code 2.1.257+.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+/// `Hash`/`Ord` are deliberately not derived here or on [`PromptSnapshotTool`]: the tool roster
+/// reaches [`PromptToolSchema::input_schema`], an opaque map that implements neither.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct PromptSnapshot {
+    /// The identity line that precedes [`Self::system_prompt`]'s blocks. Added in Claude Code
+    /// 2.1.270+.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cli_prefix: Option<String>,
     pub system_prompt: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<PromptSnapshotTool>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromptSnapshotTool {
+    Bare {
+        name: String,
+        description: String,
+        server: Option<String>,
+    },
+    Defined {
+        schema: PromptToolSchema,
+        server: Option<String>,
+    },
+}
+
+impl Serialize for PromptSnapshotTool {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let (name, description, schema, server) = match self {
+            Self::Bare {
+                name,
+                description,
+                server,
+            } => (name, description, None, server),
+            Self::Defined { schema, server } => {
+                (&schema.name, &schema.description, Some(schema), server)
+            }
+        };
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("name", name)?;
+        map.serialize_entry("description", description)?;
+        if let Some(schema) = schema {
+            map.serialize_entry("schema", schema)?;
+        }
+        if let Some(server) = server {
+            map.serialize_entry("server", server)?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for PromptSnapshotTool {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| de::Error::custom("prompt snapshot tool must be an object"))?;
+        for field in object.keys() {
+            if !["name", "description", "schema", "server"].contains(&field.as_str()) {
+                return Err(de::Error::unknown_field(
+                    field,
+                    &["name", "description", "schema", "server"],
+                ));
+            }
+        }
+        let name = serde_json::from_value(
+            object
+                .get("name")
+                .cloned()
+                .ok_or_else(|| de::Error::missing_field("name"))?,
+        )
+        .map_err(de::Error::custom)?;
+        let description = serde_json::from_value(
+            object
+                .get("description")
+                .cloned()
+                .ok_or_else(|| de::Error::missing_field("description"))?,
+        )
+        .map_err(de::Error::custom)?;
+        let schema: Option<PromptToolSchema> = object
+            .get("schema")
+            .filter(|value| !value.is_null())
+            .map(|value| serde_json::from_value(value.clone()).map_err(de::Error::custom))
+            .transpose()?;
+        let server: Option<String> = object
+            .get("server")
+            .filter(|value| !value.is_null())
+            .map(|value| serde_json::from_value(value.clone()).map_err(de::Error::custom))
+            .transpose()?;
+
+        match schema {
+            Some(schema) if schema.name == name && schema.description == description => {
+                Ok(Self::Defined { schema, server })
+            }
+            Some(_) => Err(de::Error::custom(
+                "prompt snapshot tool schema must match its name and description",
+            )),
+            None => Ok(Self::Bare {
+                name,
+                description,
+                server,
+            }),
+        }
+    }
+}
+
+/// A tool definition as sent to the API, shared by `prompt_snapshot`'s tool roster and
+/// `deferred_tools_record`'s entries. Wire keys are snake_case here, unlike the camelCase log
+/// envelope around them, because this is the API's own tool shape carried through verbatim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PromptSnapshotTool {
+pub struct PromptToolSchema {
     pub name: String,
     pub description: String,
+    pub eager_input_streaming: bool,
+    /// JSON Schema for the tool's input, kept opaque for the same reason as
+    /// [`ContentBlock::ToolUse`]'s `input`: the shape belongs to the tool, not to Claude Code.
+    pub input_schema: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeferredToolSchema {
+    pub name: String,
+    pub description: String,
+    pub eager_input_streaming: bool,
+    pub input_schema: HashMap<String, serde_json::Value>,
+    pub defer_loading: bool,
 }
 
 /// The model-identity blurb Claude Code injects into a turn, alongside the structured identity it
@@ -987,7 +1198,9 @@ pub struct EnvironmentSnapshot {
     pub platform: String,
     pub shell: String,
     pub os_version: String,
-    pub scratchpad_directory: String,
+    /// Claude Code 2.1.270 emits snapshots both with and without this key, so it cannot be inferred
+    /// from the record's version.
+    pub scratchpad_directory: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1319,6 +1532,42 @@ pub struct ReadTruncationNotice {
     pub banner: String,
     #[serde(rename = "toolUseID")]
     pub tool_use_id: String,
+}
+
+/// The schema-conforming result a tool (e.g. a workflow subagent) returned. `data` is kept opaque
+/// because its shape is whatever schema the caller asked for, not a Claude Code protocol type.
+/// Added in Claude Code 2.1.270+.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct StructuredOutput {
+    pub data: HashMap<String, serde_json::Value>,
+    #[serde(rename = "toolUseID")]
+    pub tool_use_id: String,
+}
+
+/// The remote-session settings Claude Code injects into a turn: the attribution lines to append to
+/// commits and pull requests, the session's remote URL, and whether Claude Code manages each of
+/// them. Added in Claude Code 2.1.270+.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct RemoteSessionChange {
+    /// Only ever observed null, but emitted on every payload.
+    #[serde(deserialize_with = "deserialize_required_nullable_string")]
+    pub url: Option<String>,
+    pub commit: String,
+    pub pr: String,
+    pub send_user_file_hint: bool,
+    pub managed_commit: bool,
+    pub managed_pr: bool,
+}
+
+fn deserialize_required_nullable_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -2402,6 +2651,10 @@ pub struct AssistantLogLine {
     /// Reasoning-effort level the turn was generated at (e.g. "xhigh"). `Option` so pre-2.1.214
     /// lines still parse. Added in Claude Code 2.1.214+.
     pub effort: Option<ReasoningEffort>,
+    /// Effort requested for this turn alone, overriding the session's [`Self::effort`] (which then
+    /// reports the raised level too). Null whenever the turn ran at the session level. Added in
+    /// Claude Code 2.1.270+.
+    pub per_turn_effort: Option<ReasoningEffort>,
     pub session_kind: Option<SessionKind>,
     /// 0-based position of this line's content block within the API response it came from: Claude
     /// Code logs one assistant line per content block, so the lines sharing a `request_id` are
@@ -2415,6 +2668,20 @@ pub struct AssistantLogLine {
     /// Quota state reported alongside a rate-limit error turn. `Option` because ordinary turns omit
     /// the key entirely. Added in Claude Code 2.1.257+.
     pub quota_limits: Option<QuotaLimits>,
+    /// The tool inputs as they arrived on the wire, keyed by tool_use id. Kept opaque for the same
+    /// reason as [`ContentBlock::ToolUse`]'s `input`: the shape belongs to whichever tool was
+    /// called. Added in Claude Code 2.1.270+.
+    pub wire_tool_inputs: Option<HashMap<String, HashMap<String, serde_json::Value>>>,
+    /// The working directory each tool call was issued against, keyed by tool_use id like
+    /// [`Self::wire_tool_inputs`]. Added in Claude Code 2.1.270+.
+    pub wire_ingest_context: Option<HashMap<String, WireIngestContext>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct WireIngestContext {
+    pub cwd: String,
 }
 
 /// Quota/rate-limit state the API returned with a refused request, carried on the synthetic

@@ -120,6 +120,25 @@ fn parse_attachment(json: serde_json::Value) -> AttachmentData {
     parse_attachment_line(json).attachment
 }
 
+/// Wraps `attachment` in a minimal attachment-line envelope, so a case about a payload does not
+/// restate the dozen envelope keys every attachment line carries.
+fn attachment_line_json(attachment: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "type": "attachment",
+        "parentUuid": "8b6e6e3a-2a58-4e4a-9a8d-4de0e0f1b3a7",
+        "isSidechain": false,
+        "attachment": attachment,
+        "uuid": "3d19f293-ac4e-47a7-97fc-35a80eaa1157",
+        "timestamp": "2026-09-15T18:30:33.680Z",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "723b9031-3708-4082-97e4-4eb76aa117bc",
+        "version": "2.1.270",
+        "gitBranch": "HEAD"
+    })
+}
+
 #[test]
 fn test_parse_user_log_line_with_agent_id() {
     let json = user_log_line_json(serde_json::json!({
@@ -7464,6 +7483,7 @@ fn test_parse_attachment_deferred_tools_delta_with_readded_and_pending() {
             "readdedNames": ["PreviouslyRemoved"],
             "pendingMcpServers": ["server-a", "server-b"],
             "failedMcpServers": ["server-c"],
+            "needsAuthMcpServers": ["server-d"],
             "wireHiddenNames": ["HiddenTool"]
         },
         "uuid": "550e8400-e29b-41d4-a716-446655440000",
@@ -7483,6 +7503,7 @@ fn test_parse_attachment_deferred_tools_delta_with_readded_and_pending() {
     assert_eq!(delta.readded_names, vec!["PreviouslyRemoved"]);
     assert_eq!(delta.pending_mcp_servers, vec!["server-a", "server-b"]);
     assert_eq!(delta.failed_mcp_servers, vec!["server-c"]);
+    assert_eq!(delta.needs_auth_mcp_servers, vec!["server-d"]);
     assert_eq!(delta.wire_hidden_names, vec!["HiddenTool"]);
 }
 
@@ -9307,10 +9328,76 @@ fn test_parse_attachment_prompt_snapshot() {
     );
     assert_eq!(
         snapshot.tools,
-        Some(vec![PromptSnapshotTool {
+        Some(vec![PromptSnapshotTool::Bare {
             name: "Read".to_string(),
             description: "Reads a file.".to_string(),
+            server: None,
         }])
+    );
+}
+
+// Claude Code 2.1.270+ carries each tool's full API definition, and the providing MCP server for
+// tools that come from one, alongside the name and description.
+#[test]
+fn test_parse_attachment_prompt_snapshot_tool_schema() {
+    let json = attachment_line_json(serde_json::json!({
+        "type": "prompt_snapshot",
+        "cliPrefix": "You are Claude Code, Anthropic's official CLI for Claude.",
+        "systemPrompt": ["# Harness"],
+        "tools": [{
+            "name": "status",
+            "description": "Shows git status.",
+            "server": "git-read-only",
+            "schema": {
+                "name": "status",
+                "description": "Shows git status.",
+                "eager_input_streaming": true,
+                "input_schema": {"type": "object"}
+            }
+        }]
+    }));
+    let AttachmentData::PromptSnapshot(snapshot) = parse_attachment(json) else {
+        panic!("Expected PromptSnapshot");
+    };
+    assert_eq!(
+        snapshot.cli_prefix.as_deref(),
+        Some("You are Claude Code, Anthropic's official CLI for Claude.")
+    );
+    assert_eq!(
+        snapshot.tools,
+        Some(vec![PromptSnapshotTool::Defined {
+            schema: PromptToolSchema {
+                name: "status".to_string(),
+                description: "Shows git status.".to_string(),
+                eager_input_streaming: true,
+                input_schema: HashMap::from([("type".to_string(), serde_json::json!("object"))]),
+            },
+            server: Some("git-read-only".to_string()),
+        }])
+    );
+}
+
+#[test]
+fn test_parse_attachment_prompt_snapshot_rejects_mismatched_tool_schema() {
+    let json = attachment_line_json(serde_json::json!({
+        "type": "prompt_snapshot",
+        "systemPrompt": [],
+        "tools": [{
+            "name": "status",
+            "description": "Shows git status.",
+            "schema": {
+                "name": "status",
+                "description": "Different description.",
+                "eager_input_streaming": true,
+                "input_schema": {"type": "object"}
+            }
+        }]
+    }));
+    let err = serde_json::from_value::<LogLine>(json)
+        .expect_err("prompt snapshot tool schema must match the outer tool");
+    assert!(
+        err.to_string()
+            .contains("must match its name and description")
     );
 }
 
@@ -9571,7 +9658,7 @@ fn expected_environment_snapshot() -> EnvironmentSnapshot {
         platform: "darwin".to_string(),
         shell: "bash".to_string(),
         os_version: "Darwin 25.5.0".to_string(),
-        scratchpad_directory: "/private/tmp/claude-501/scratchpad".to_string(),
+        scratchpad_directory: Some("/private/tmp/claude-501/scratchpad".to_string()),
     }
 }
 
@@ -9602,6 +9689,65 @@ fn test_parse_attachment_environment_with_changes() {
             }]),
         })
     );
+}
+
+// Claude Code 2.1.270 emits environment snapshots with and without `scratchpadDirectory`.
+#[test]
+fn test_parse_attachment_environment_without_scratchpad_directory() {
+    let mut json = environment_json(None);
+    json["attachment"]["snapshot"]
+        .as_object_mut()
+        .expect("snapshot is a JSON object")
+        .remove("scratchpadDirectory");
+    assert_eq!(
+        parse_attachment(json),
+        AttachmentData::Environment(EnvironmentAttachment {
+            snapshot: EnvironmentSnapshot {
+                scratchpad_directory: None,
+                ..expected_environment_snapshot()
+            },
+            changes: None,
+        })
+    );
+}
+
+// Claude Code 2.1.270+ records the prose an attachment was rendered into, optionally with the
+// distinct rendering delivered alongside the user's turn.
+#[test]
+fn test_parse_attachment_line_rendered() {
+    let mut json = environment_json(None);
+    json["rendered"] = serde_json::json!([{"content": "<system-reminder>env</system-reminder>"}]);
+    json["renderedInHumanTurn"] = serde_json::json!([{"content": "queued"}]);
+    let line = parse_attachment_line(json);
+    assert_eq!(
+        line.rendering
+            .as_ref()
+            .map(|rendering| rendering.rendered.as_slice()),
+        Some(
+            [RenderedAttachment {
+                content: "<system-reminder>env</system-reminder>".to_string(),
+            }]
+            .as_slice()
+        )
+    );
+    assert_eq!(
+        line.rendering
+            .as_ref()
+            .and_then(|rendering| rendering.rendered_in_human_turn.as_deref()),
+        Some(
+            [RenderedAttachment {
+                content: "queued".to_string(),
+            }]
+            .as_slice()
+        )
+    );
+}
+
+#[test]
+fn test_parse_attachment_line_rejects_human_turn_rendering_without_rendering() {
+    let mut json = environment_json(None);
+    json["renderedInHumanTurn"] = serde_json::json!([{"content": "queued"}]);
+    serde_json::from_value::<LogLine>(json).expect_err("renderedInHumanTurn must require rendered");
 }
 
 fn instructions_json(
@@ -10114,6 +10260,23 @@ fn test_parse_attachment_auto_mode_behavior_flags_with_bypass() {
         panic!("Expected AutoMode behavior flags");
     };
     assert_eq!(flags.bypass, Some(false));
+}
+
+// Claude Code 2.1.270+ adds how strictly bash-first is enforced to the behavior flags.
+#[test]
+fn test_parse_attachment_auto_mode_behavior_flags_with_bash_first_steer() {
+    let json = attachment_line_json(serde_json::json!({
+        "type": "auto_mode",
+        "autoModeConsentFlow": false,
+        "bashFirst": true,
+        "bashFirstSteer": "strict",
+        "steerOnly": true,
+        "bypass": false
+    }));
+    let AttachmentData::AutoMode(AutoMode::BehaviorFlags(flags)) = parse_attachment(json) else {
+        panic!("Expected AutoMode behavior flags");
+    };
+    assert_eq!(flags.bash_first_steer.as_deref(), Some("strict"));
 }
 
 #[test]
@@ -11207,5 +11370,126 @@ fn test_parse_attachment_turn_reminders() {
             text: "Request every independent item in this one response.".to_string(),
             model: Model::from_model_string("claude-fable-5-1".to_string()).unwrap(),
         })
+    );
+}
+
+#[test]
+fn test_parse_attachment_remote_session_change_requires_url() {
+    let json = attachment_line_json(serde_json::json!({
+        "type": "remote_session_change",
+        "commit": "Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>",
+        "pr": "Generated with Claude Code",
+        "sendUserFileHint": false,
+        "managedCommit": false,
+        "managedPr": false
+    }));
+    let err = serde_json::from_value::<LogLine>(json)
+        .expect_err("remote_session_change must include url, even when null");
+    assert!(err.to_string().contains("missing field `url`"));
+}
+
+#[test]
+fn test_parse_attachment_remote_session_change() {
+    let AttachmentData::RemoteSessionChange(change) =
+        parse_attachment(attachment_line_json(serde_json::json!({
+            "type": "remote_session_change",
+            "url": null,
+            "commit": "Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>",
+            "pr": "Generated with Claude Code",
+            "sendUserFileHint": false,
+            "managedCommit": false,
+            "managedPr": false
+        })))
+    else {
+        panic!("expected RemoteSessionChange");
+    };
+    assert_eq!(change.url, None);
+    assert_eq!(
+        change.commit,
+        "Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
+    );
+    assert_eq!(change.pr, "Generated with Claude Code");
+    assert!(!change.send_user_file_hint && !change.managed_commit && !change.managed_pr);
+}
+
+#[test]
+fn test_parse_attachment_structured_output() {
+    let AttachmentData::StructuredOutput(output) =
+        parse_attachment(attachment_line_json(serde_json::json!({
+            "type": "structured_output",
+            "data": {"status": "FAIL"},
+            "toolUseID": "toolu_01QwQuhp6qaXMGsQYRCNsgim"
+        })))
+    else {
+        panic!("expected StructuredOutput");
+    };
+    assert_eq!(output.data.get("status"), Some(&serde_json::json!("FAIL")));
+    assert_eq!(output.tool_use_id, "toolu_01QwQuhp6qaXMGsQYRCNsgim");
+}
+
+#[test]
+fn test_parse_attachment_deferred_tools_record() {
+    let AttachmentData::DeferredToolsRecord(record) =
+        parse_attachment(attachment_line_json(serde_json::json!({
+            "type": "deferred_tools_record",
+            "entries": [{
+                "name": "WebFetch",
+                "description": "Fetches a URL.",
+                "input_schema": {"type": "object"},
+                "eager_input_streaming": true,
+                "defer_loading": true
+            }]
+        })))
+    else {
+        panic!("expected DeferredToolsRecord");
+    };
+    let [entry] = record.entries.as_slice() else {
+        panic!("expected one deferred tool");
+    };
+    assert_eq!(entry.name, "WebFetch");
+    assert_eq!(entry.description, "Fetches a URL.");
+    assert!(entry.eager_input_streaming);
+    assert_eq!(
+        entry.input_schema.get("type"),
+        Some(&serde_json::json!("object"))
+    );
+    assert!(entry.defer_loading);
+}
+
+// Claude Code 2.1.270+ records the effort a single turn was raised to, distinct from the session's
+// `effort` (which reports the raised level too).
+#[test]
+fn test_parse_assistant_per_turn_effort() {
+    let line = parse_assistant_log_line(assistant_log_line_json(serde_json::json!({
+        "effort": "xhigh",
+        "perTurnEffort": "xhigh"
+    })));
+    assert_eq!(line.effort, Some(ReasoningEffort::Xhigh));
+    assert_eq!(line.per_turn_effort, Some(ReasoningEffort::Xhigh));
+}
+
+// Claude Code 2.1.270+ records each tool call's wire input and the directory it was issued
+// against, both keyed by tool_use id.
+#[test]
+fn test_parse_assistant_wire_tool_metadata() {
+    let line = parse_assistant_log_line(assistant_log_line_json(serde_json::json!({
+        "wireToolInputs": {"toolu_01Sazb9yeuHngpwKLbz2rFHS": {"command": "ls"}},
+        "wireIngestContext": {"toolu_01Sazb9yeuHngpwKLbz2rFHS": {"cwd": "/test"}}
+    })));
+    assert_eq!(
+        line.wire_tool_inputs,
+        Some(HashMap::from([(
+            "toolu_01Sazb9yeuHngpwKLbz2rFHS".to_string(),
+            HashMap::from([("command".to_string(), serde_json::json!("ls"))])
+        )]))
+    );
+    assert_eq!(
+        line.wire_ingest_context,
+        Some(HashMap::from([(
+            "toolu_01Sazb9yeuHngpwKLbz2rFHS".to_string(),
+            WireIngestContext {
+                cwd: "/test".to_string(),
+            }
+        )]))
     );
 }
