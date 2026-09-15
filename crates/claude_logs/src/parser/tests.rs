@@ -1447,6 +1447,43 @@ fn test_parse_assistant_with_api_block_index() {
 }
 
 #[test]
+fn test_parse_assistant_with_quota_limits() {
+    let assistant = parse_assistant_log_line(assistant_log_line_json(serde_json::json!({
+        "message": {"model": "<synthetic>"},
+        "error": "rate_limit",
+        "isApiErrorMessage": true,
+        "apiErrorStatus": 429,
+        "version": "2.1.257",
+        "quotaLimits": {
+            "status": "rejected",
+            "resetsAt": 1789179600i64,
+            "unifiedRateLimitFallbackAvailable": false,
+            "rateLimitType": "five_hour",
+            "overageStatus": "rejected",
+            "overageResetsAt": 1790812800i64,
+            "overageDisabledReason": "org_spend_cap_reached",
+            "upgradePaths": ["overage"],
+            "isUsingOverage": false
+        }
+    })));
+
+    assert_eq!(
+        assistant.quota_limits,
+        Some(QuotaLimits {
+            status: "rejected".to_string(),
+            resets_at: 1789179600,
+            unified_rate_limit_fallback_available: false,
+            rate_limit_type: "five_hour".to_string(),
+            overage_status: "rejected".to_string(),
+            overage_resets_at: 1790812800,
+            overage_disabled_reason: "org_spend_cap_reached".to_string(),
+            upgrade_paths: vec!["overage".to_string()],
+            is_using_overage: false,
+        })
+    );
+}
+
+#[test]
 fn test_parse_assistant_with_truncated_after_output() {
     let assistant = parse_assistant_log_line(assistant_log_line_json(serde_json::json!({
         "message": {"model": "<synthetic>"},
@@ -1482,6 +1519,7 @@ fn test_parse_assistant_without_later_optional_fields() {
     assert_eq!(assistant.truncated_after_output, None);
     assert_eq!(assistant.is_aborted_mid_stream, None);
     assert_eq!(assistant.session_id_snake, None);
+    assert_eq!(assistant.quota_limits, None);
 }
 
 // The effort enum is strict so a genuinely new level surfaces as a parse error rather than being

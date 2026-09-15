@@ -2412,6 +2412,33 @@ pub struct AssistantLogLine {
     /// Claude Code emits the key on both roles so the field is required for strict parsing to
     /// succeed. Added in Claude Code 2.1.257+.
     pub image_paste_ids: Option<Vec<u32>>,
+    /// Quota state reported alongside a rate-limit error turn. `Option` because ordinary turns omit
+    /// the key entirely. Added in Claude Code 2.1.257+.
+    pub quota_limits: Option<QuotaLimits>,
+}
+
+/// Quota/rate-limit state the API returned with a refused request, carried on the synthetic
+/// assistant error turn Claude Code logs in its place. The `status`, `rate_limit_type`,
+/// `overage_status`, `overage_disabled_reason`, and `upgrade_paths` vocabularies are undocumented
+/// billing-side strings, so they stay `String` rather than strict enums; nothing downstream reads
+/// them, and pricing comes from the turn's usage instead. Every observed payload carries all nine
+/// keys, including the overage ones, so each field is required and a narrower shape surfaces as a
+/// parse error rather than being silently accepted. Added in Claude Code 2.1.257+.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct QuotaLimits {
+    pub status: String,
+    /// Unix epoch seconds, kept as the raw integer Claude Code logged rather than a `DateTime`
+    /// because the field is recorded for schema completeness only.
+    pub resets_at: i64,
+    pub unified_rate_limit_fallback_available: bool,
+    pub rate_limit_type: String,
+    pub overage_status: String,
+    pub overage_resets_at: i64,
+    pub overage_disabled_reason: String,
+    pub upgrade_paths: Vec<String>,
+    pub is_using_overage: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
