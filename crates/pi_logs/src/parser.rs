@@ -372,6 +372,10 @@ pub enum CustomPayload {
     /// built-in webui integration.
     #[serde(rename = "webui-subagent-retained-runs-v1")]
     WebuiSubagentRetainedRuns(WebuiSubagentRetainedRunsData),
+    /// The parent's answer to a child's supervisor request, recorded when the
+    /// parent replies through `subagent_supervisor`. Added in newer pi versions.
+    #[serde(rename = "subagent_supervisor_reply")]
+    SubagentSupervisorReply(SubagentSupervisorReplyData),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -1989,9 +1993,7 @@ fn parse_tool_result_details(
         "read_enclosing" => serde_json::from_value(details).map(ToolResultDetails::ReadEnclosing),
         "read_symbol" => serde_json::from_value(details).map(ToolResultDetails::ReadSymbol),
         "skill" => empty_or(details, ToolResultDetails::Skill),
-        "subagent" | "subagent_wait" => {
-            serde_json::from_value(details).map(ToolResultDetails::Subagent)
-        }
+        "bg_wait" | "subagent" | "subagent_wait" => parse_subagent_result_details(details),
         "subagent_supervisor" => {
             serde_json::from_value(details).map(ToolResultDetails::SubagentSupervisor)
         }
@@ -2003,6 +2005,17 @@ fn parse_tool_result_details(
         }
         _ => serde_json::from_value(details),
     }
+}
+
+fn parse_subagent_result_details(details: Value) -> Result<ToolResultDetails, serde_json::Error> {
+    let details: SubagentResultDetails = serde_json::from_value(details)?;
+    details.validate_wait_outcome().map_err(|message| {
+        serde_json::Error::io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            message,
+        ))
+    })?;
+    Ok(ToolResultDetails::Subagent(Box::new(details)))
 }
 
 fn parse_mcp_tool_result_details(details: Value) -> Result<ToolResultDetails, serde_json::Error> {
@@ -2403,10 +2416,13 @@ pub struct SubagentResultDetails {
     /// independently of the log format (it carries its own `schemaVersion`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mission: Option<Box<JsonBlob>>,
-    /// Async runs that finished while a `subagent_wait` management call was
-    /// blocking, one entry per awaited run. Added in newer pi versions.
+    /// A blocking wait either completes awaited runs or returns early with its
+    /// remaining active work. Kept private so callers use [`Self::wait_outcome`],
+    /// while parsing validates their mutual exclusivity without changing the wire shape.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub completions: Option<Vec<SubagentWaitCompletion>>,
+    completions: Option<Vec<SubagentWaitCompletion>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    wait: Option<SubagentWaitStatus>,
     /// The remaining fields are all owned by the pi-subagents extension's
     /// workflow/mission subsystem, which evolves them independently of the
     /// log format (the sibling `mission` field is raw JSON for the same
@@ -2424,6 +2440,44 @@ pub struct SubagentResultDetails {
     pub workflow: Option<Box<JsonBlob>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_receipt_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SubagentWaitOutcome {
+    Completed(Vec<SubagentWaitCompletion>),
+    EarlyReturn(SubagentWaitStatus),
+}
+
+impl SubagentResultDetails {
+    fn validate_wait_outcome(&self) -> Result<(), &'static str> {
+        if self.completions.is_some() && self.wait.is_some() {
+            return Err("`completions` and `wait` are mutually exclusive");
+        }
+        Ok(())
+    }
+
+    pub fn wait_outcome(&self) -> Option<SubagentWaitOutcome> {
+        match (&self.completions, &self.wait) {
+            (Some(completions), None) => Some(SubagentWaitOutcome::Completed(completions.clone())),
+            (None, Some(wait)) => Some(SubagentWaitOutcome::EarlyReturn(wait.clone())),
+            (None, None) | (Some(_), Some(_)) => None,
+        }
+    }
+}
+
+/// Why a blocking wait (`bg_wait`) returned while background work was still
+/// running, and what remained active when it did.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SubagentWaitStatus {
+    /// Kept as `String` rather than a strict enum because the vocabulary
+    /// (observed: `supervisor_request`) is undocumented and volatile.
+    pub reason: String,
+    pub timed_out: bool,
+    pub active_run_ids: Vec<String>,
+    /// Only ever observed empty, so the element shape stays unmodeled rather
+    /// than guessed, the same treatment as `CompactionDetailsV2::omissions`.
+    pub active_provider_items: Vec<JsonBlob>,
 }
 
 /// One awaited async run reported by a `subagent_wait` management result.
@@ -3022,6 +3076,10 @@ pub struct SubagentControlEventPayload {
     pub current_tool: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_tool_duration_ms: Option<u64>,
+    /// Id of the child's in-flight tool call, so the parent can correlate the
+    /// event with the call named by `current_tool`. Added in newer pi versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_path: Option<PathBuf>,
     /// The runtime measures elapsed time with a sub-millisecond clock.
@@ -3224,6 +3282,30 @@ pub struct SubagentSupervisorRequestDetails {
     /// carry their payload in the details rather than the outer content.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_body: Option<String>,
+    /// A ready-made `subagent_supervisor` reply call the parent can issue to
+    /// answer this request. Added in newer pi versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_hint: Option<String>,
+}
+
+/// Payload for the `subagent_supervisor_reply` custom line: the parent's answer
+/// to the [`SubagentSupervisorRequestDetails`] request named by `request_id`,
+/// with the same routing fields echoed back.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SubagentSupervisorReplyData {
+    pub request_id: String,
+    pub reason: String,
+    pub run_id: String,
+    pub agent: String,
+    pub child_index: u32,
+    /// Absent for the same reason as the request's `child_target`: a top-level
+    /// child needs no nested routing target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_target: Option<String>,
+    pub message: String,
+    /// Milliseconds since the Unix epoch, like the control events' `ts`.
+    pub created_at: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

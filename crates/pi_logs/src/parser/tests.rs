@@ -497,7 +497,10 @@ fn parse_subagent_wait_completions(completions: Value) -> Vec<SubagentWaitComple
     let Some(ToolResultDetails::Subagent(details)) = tool_result.details else {
         panic!("expected Subagent details")
     };
-    details.completions.expect("expected completions")
+    let Some(SubagentWaitOutcome::Completed(completions)) = details.wait_outcome() else {
+        panic!("expected completed wait outcome")
+    };
+    completions
 }
 
 // Keep this overlapping Ls/Find details shape shared so the augmentation
@@ -8400,11 +8403,10 @@ fn subagent_wait_tool_result_accepts_management_completions() {
         };
         assert_eq!(details.mode, SubagentResultMode::Management);
         assert!(details.results.is_empty());
-        let [completion] = details
-            .completions
-            .as_deref()
-            .expect("expected one completion")
-        else {
+        let Some(SubagentWaitOutcome::Completed(completions)) = details.wait_outcome() else {
+            panic!("expected completed wait outcome")
+        };
+        let [completion] = completions.as_slice() else {
             panic!("expected exactly one completion")
         };
         assert_eq!(completion.run_id, "8ed59eb6-c8f5-4814-9b93-bace8d289649");
@@ -8645,7 +8647,8 @@ fn subagent_supervisor_request_accepts_async_correlation_fields() {
             "childIndex": 0,
             "requestId": "00e190ab-4d82-413a-b79d-9390544ac39c",
             "childTarget": "subagent-researcher-run-7-1",
-            "requestBody": "UPDATE: research complete"
+            "requestBody": "UPDATE: research complete",
+            "replyHint": "subagent_supervisor({ action: \"reply\", replyTo: \"req-9\" })"
         },
         "id": "cm-9",
         "parentId": "msg-9",
@@ -8669,10 +8672,42 @@ fn subagent_supervisor_request_accepts_async_correlation_fields() {
         req.request_body.as_deref(),
         Some("UPDATE: research complete")
     );
+    assert_eq!(
+        req.reply_hint.as_deref(),
+        Some("subagent_supervisor({ action: \"reply\", replyTo: \"req-9\" })")
+    );
+}
+
+// The parent's answer to the request above, recorded as its own custom line.
+#[test]
+fn subagent_supervisor_reply_parses() {
+    let payload = parse_custom_payload(
+        "subagent_supervisor_reply",
+        json!({
+            "requestId": "00e190ab-4d82-413a-b79d-9390544ac39c",
+            "reason": "need_decision",
+            "runId": "run-7",
+            "agent": "researcher",
+            "childIndex": 0,
+            "childTarget": "subagent-researcher-run-7-1",
+            "message": "Approved: one fresh retry.",
+            "createdAt": 1789492170348_u64
+        }),
+    );
+    let CustomPayload::SubagentSupervisorReply(reply) = payload else {
+        panic!("expected SubagentSupervisorReply")
+    };
+    assert_eq!(reply.request_id, "00e190ab-4d82-413a-b79d-9390544ac39c");
+    assert_eq!(
+        reply.child_target.as_deref(),
+        Some("subagent-researcher-run-7-1")
+    );
+    assert_eq!(reply.message, "Approved: one fresh retry.");
+    assert_eq!(reply.created_at, 1789492170348);
 }
 
 #[test]
-fn subagent_control_event_accepts_workflow_task_fields() {
+fn subagent_control_event_accepts_newer_optional_fields() {
     match parse_custom_message_payload(
         "Subagent needs attention: test-quality-reviewer",
         "subagent_control_notice",
@@ -8687,7 +8722,8 @@ fn subagent_control_event_accepts_workflow_task_fields() {
                 "message": "tool mcp open for 240s",
                 "reason": "tool_held_open",
                 "workflowKey": "review-test-quality",
-                "taskPreview": "[prompt redacted]"
+                "taskPreview": "[prompt redacted]",
+                "toolCallId": "call_3wtSYa6Qj9Wb9bkWWPJZMIcS"
             },
             "source": "async",
             "noticeText": "Subagent needs attention"
@@ -8699,9 +8735,70 @@ fn subagent_control_event_accepts_workflow_task_fields() {
             };
             assert_eq!(event.workflow_key.as_deref(), Some("review-test-quality"));
             assert_eq!(event.task_preview.as_deref(), Some("[prompt redacted]"));
+            assert_eq!(
+                event.tool_call_id.as_deref(),
+                Some("call_3wtSYa6Qj9Wb9bkWWPJZMIcS")
+            );
         }
         other => panic!("expected SubagentControlNotice, got {other:?}"),
     }
+}
+
+// A wait that returns while background work is still running reports why it stopped instead of
+// the completions a finished wait carries.
+#[test]
+fn bg_wait_reports_early_return_status() {
+    let tool_result = tool_result_with_details(
+        "bg_wait",
+        json!({
+            "mode": "management",
+            "results": [],
+            "wait": {
+                "reason": "supervisor_request",
+                "timedOut": false,
+                "activeRunIds": ["3ae4bda9-09e6-4d2e-b347-fd94c87f4e63"],
+                "activeProviderItems": []
+            }
+        }),
+    );
+    let Some(ToolResultDetails::Subagent(details)) = tool_result.details else {
+        panic!("expected Subagent details")
+    };
+    let Some(SubagentWaitOutcome::EarlyReturn(wait)) = details.wait_outcome() else {
+        panic!("expected early-return wait outcome")
+    };
+    assert_eq!(
+        wait,
+        SubagentWaitStatus {
+            reason: "supervisor_request".to_string(),
+            timed_out: false,
+            active_run_ids: vec!["3ae4bda9-09e6-4d2e-b347-fd94c87f4e63".to_string()],
+            active_provider_items: vec![],
+        }
+    );
+    let serialized = serde_json::to_value(details).expect("subagent details serialize");
+    assert!(serialized.get("waitOutcome").is_none());
+    assert_eq!(serialized["wait"]["reason"], "supervisor_request");
+}
+
+#[test]
+fn bg_wait_rejects_completed_and_early_return_outcomes() {
+    let err = parse_tool_result_details(
+        "bg_wait",
+        json!({
+            "mode": "management",
+            "results": [],
+            "completions": [],
+            "wait": {
+                "reason": "supervisor_request",
+                "timedOut": false,
+                "activeRunIds": [],
+                "activeProviderItems": []
+            }
+        }),
+    )
+    .expect_err("bg_wait cannot be both completed and an early return");
+    assert!(err.to_string().contains("mutually exclusive"));
 }
 
 #[test]
@@ -8736,11 +8833,10 @@ fn subagent_wait_completion_accepts_workflow_and_usage_fields() {
     let Some(ToolResultDetails::Subagent(details)) = tool_result.details else {
         panic!("expected Subagent details")
     };
-    let [completion] = details
-        .completions
-        .as_deref()
-        .expect("expected one completion")
-    else {
+    let Some(SubagentWaitOutcome::Completed(completions)) = details.wait_outcome() else {
+        panic!("expected completed wait outcome")
+    };
+    let [completion] = completions.as_slice() else {
         panic!("expected exactly one completion")
     };
     assert_eq!(
@@ -9031,6 +9127,7 @@ fn subagent_result_summary_serializes_control_events_as_camel_case() {
                 tool_count: Some(44),
                 current_tool: None,
                 current_tool_duration_ms: None,
+                tool_call_id: None,
                 current_path: Some(PathBuf::from("charts/temporal/values.yaml")),
                 elapsed_ms: Some(Decimal::from(97198)),
                 workflow_key: None,

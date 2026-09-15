@@ -245,6 +245,8 @@ with warnings, while explicit missing paths and having no available source are e
   accepts their observed action-agnostic fields plus the real `{}` validation-error payload used by the extension
 - Strict by default with `#[serde(deny_unknown_fields)]`, path-aware parse errors, and narrowly documented exceptions
   for shapes that require custom deserialization or specific corrupt-stream tolerance
+- Newer pi-subagents metadata includes `SubagentSupervisorReplyData`, request `reply_hint`s, control-event
+  `tool_call_id`s, and `SubagentWaitStatus` in mutually exclusive completed/early-return `bg_wait` outcomes
 - Pi-lens result details use tool-name-routed, derived Serde schemas: `lens_diagnostics` distinguishes delta/all/full
   (including unavailable) responses, `lsp_diagnostics` distinguishes file/batch/directory responses,
   `lens_diagnostic_mark` keeps typed dispositions and nonzero lines, and `module_report` accepts optional callback
