@@ -155,16 +155,12 @@ tool_rules = [{ name = "deployed-allow", tool = "*", action = { type = "Allow" }
     assert_eq!(report["rows"][1]["mode"], "default");
     assert_eq!(report["rows"][2]["mode"], "auto");
     assert!(report["rows"][3]["mode"].is_null());
-    let default_cwd = fixture
-        .root
-        .path()
-        .join("eval")
+    let default_cwd = fs::canonicalize(fixture.root.path().join("eval"))
+        .unwrap()
         .to_string_lossy()
         .into_owned();
-    let case_cwd = fixture
-        .root
-        .path()
-        .join("eval/case")
+    let case_cwd = fs::canonicalize(fixture.root.path().join("eval/case"))
+        .unwrap()
         .to_string_lossy()
         .into_owned();
     assert_eq!(report["rows"][0]["effective_cwd"], default_cwd);
