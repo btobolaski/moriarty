@@ -7484,7 +7484,8 @@ fn test_parse_attachment_deferred_tools_delta_with_readded_and_pending() {
             "pendingMcpServers": ["server-a", "server-b"],
             "failedMcpServers": ["server-c"],
             "needsAuthMcpServers": ["server-d"],
-            "wireHiddenNames": ["HiddenTool"]
+            "wireHiddenNames": ["HiddenTool"],
+            "surfacedNames": ["WebFetch"]
         },
         "uuid": "550e8400-e29b-41d4-a716-446655440000",
         "timestamp": "2026-05-28T00:00:00Z",
@@ -7505,6 +7506,7 @@ fn test_parse_attachment_deferred_tools_delta_with_readded_and_pending() {
     assert_eq!(delta.failed_mcp_servers, vec!["server-c"]);
     assert_eq!(delta.needs_auth_mcp_servers, vec!["server-d"]);
     assert_eq!(delta.wire_hidden_names, vec!["HiddenTool"]);
+    assert_eq!(delta.surfaced_names, vec!["WebFetch"]);
 }
 
 #[test]

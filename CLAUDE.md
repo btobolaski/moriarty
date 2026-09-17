@@ -168,7 +168,9 @@ reproduction commands.
   adds required `defer_loading`), a `remote_session_change`
   attachment (`RemoteSessionChange`, the commit/PR attribution lines and remote URL Claude Code injects into a turn),
   and a `structured_output` attachment (`StructuredOutput`, the schema-conforming result a tool such as a workflow
-  subagent returned; `data` is opaque because its shape is whatever schema the caller asked for)
+  subagent returned; `data` is opaque because its shape is whatever schema the caller asked for), and a `surfacedNames`
+  field on `deferred_tools_delta` (`DeferredToolsDelta`, the subset of the delta actually named in the reminder shown to
+  the model, matching its existing name-list siblings)
 - Also owns the structured view of the raw `model` string via `model::Model { family, version }` plus `ModelFamily` and
   `ModelVersion`. Both `cost_analyzer` (for pricing) and `moriarty::api_pricing` (for grouping/display) consume this one
   parser so family/version classification is not duplicated across crates. The parser preserves capability-decorated raw

@@ -830,6 +830,10 @@ pub struct DeferredToolsDelta {
     /// assumed to match its `*_names` siblings.
     #[serde(default)]
     pub wire_hidden_names: Vec<String>,
+    /// The subset of the delta actually named in the reminder shown to the model, which can be
+    /// narrower than `added_names` when a tool is added without being announced.
+    #[serde(default)]
+    pub surfaced_names: Vec<String>,
 }
 
 /// The full definitions of the deferred tools whose schemas were loaded into the turn, the
