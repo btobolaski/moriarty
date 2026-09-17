@@ -8547,83 +8547,30 @@ fn subagent_wait_tool_result_accepts_management_completions() {
 
 #[test]
 fn subagent_details_passthroughs_extension_owned_fields() {
-    // One consolidated guard for the shared contract behind the extension-
-    // owned pi-subagents fields (including `agentCapabilities` from newer
-    // management `list` results): each parses via `#[serde(default)]` and
-    // raw-JSON passthroughs round-trip verbatim; the inner schemas are the
-    // extension's, so only presence is pinned.
-    let capabilities = json!({
-        "agents": [{
-            "name": "scout",
-            "description": "Fast codebase recon",
-            "source": "user",
-            "executable": true,
-            "runner": {"type": "pi"},
-            "tools": {"ambient": false, "names": ["read"], "mcpDirectTools": []},
-            "model": {"thinking": "medium"},
-            "output": {"mode": "inline"}
-        }],
-        "restrictedCount": 0
+    let expected = json!({
+        "mode": "workflow",
+        "results": [],
+        "agentCapabilities": {"sentinel": true},
+        "preflight": {"version": 1, "lanes": [{"key": "repo-map"}]},
+        "activeAsyncCapacity": {"used": 0, "limit": 0},
+        "runFanoutBudget": {"used": 0, "limit": 2, "remaining": 2},
+        "workflowChildren": {"version": 1, "children": []},
+        "workflow": {"trace": [], "emits": [], "console": []},
+        "workflowReceiptPath": "/tmp/run/workflow-receipt.json"
     });
     let tool_result = parse_tool_result_message(tool_result_message_json(
         "subagent",
         vec![json!({"type": "text", "text": "Run fan-out: 0/2 used"})],
         false,
-        Some(json!({
-            "mode": "workflow",
-            "results": [],
-            "agentCapabilities": capabilities,
-            "activeAsyncCapacity": {"used": 0, "limit": 0},
-            "runFanoutBudget": {"used": 0, "limit": 2, "remaining": 2},
-            "workflowChildren": {"version": 1, "children": []},
-            "workflow": {"trace": [], "emits": [], "console": []},
-            "workflowReceiptPath": "/tmp/run/workflow-receipt.json"
-        })),
+        Some(expected.clone()),
     ));
     let Some(ToolResultDetails::Subagent(details)) = tool_result.details else {
         panic!("expected Subagent details")
     };
     assert_eq!(
-        details.agent_capabilities.as_deref().map(|blob| &blob.0),
-        Some(&capabilities)
+        serde_json::to_value(&details).expect("serialize subagent details"),
+        expected
     );
-    assert_eq!(
-        details.active_async_capacity.as_deref().map(|blob| &blob.0),
-        Some(&json!({"used": 0, "limit": 0}))
-    );
-    assert_eq!(
-        details.run_fanout_budget.as_deref().map(|blob| &blob.0),
-        Some(&json!({"used": 0, "limit": 2, "remaining": 2}))
-    );
-    assert_eq!(
-        details.workflow_children.as_deref().map(|blob| &blob.0),
-        Some(&json!({"version": 1, "children": []}))
-    );
-    assert_eq!(
-        details.workflow.as_deref().map(|blob| &blob.0),
-        Some(&json!({"trace": [], "emits": [], "console": []}))
-    );
-    assert_eq!(
-        details.workflow_receipt_path,
-        Some(PathBuf::from("/tmp/run/workflow-receipt.json"))
-    );
-
-    // Absent representative: none of the raw fields are required.
-    let absent = parse_tool_result_message(tool_result_message_json(
-        "subagent",
-        vec![json!({"type": "text", "text": "launched"})],
-        false,
-        Some(json!({"mode": "single", "results": []})),
-    ));
-    let Some(ToolResultDetails::Subagent(details)) = absent.details else {
-        panic!("expected Subagent details")
-    };
-    assert_eq!(details.agent_capabilities, None);
-    assert_eq!(details.active_async_capacity, None);
-    assert_eq!(details.run_fanout_budget, None);
-    assert_eq!(details.workflow_children, None);
-    assert_eq!(details.workflow, None);
-    assert_eq!(details.workflow_receipt_path, None);
 }
 
 #[test]

@@ -2422,6 +2422,10 @@ pub struct SubagentResultDetails {
     /// independently of the log format (it carries its own `schemaVersion`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mission: Option<Box<JsonBlob>>,
+    /// Preflight lane metadata is owned by the pi-subagents extension and can
+    /// grow independently of the session log schema, so preserve it opaque.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preflight: Option<Box<JsonBlob>>,
     /// A blocking wait either completes awaited runs or returns early with its
     /// remaining active work. Kept private so callers use [`Self::wait_outcome`],
     /// while parsing validates their mutual exclusivity without changing the wire shape.
