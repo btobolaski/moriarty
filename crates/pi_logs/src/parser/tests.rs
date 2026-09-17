@@ -5937,6 +5937,73 @@ fn custom_message_subagent_control_notice_requires_details() {
 }
 
 #[test]
+fn custom_message_subagent_steering_notice_accepts_failed_delivery() {
+    match parse_custom_message_payload(
+        "Steering failed for run c4048a9a: child completed before consuming steering",
+        "subagent_steering_notice",
+        Some(json!({
+            "type": "subagent.steering.notice",
+            "ts": 1789429350099_u64,
+            "runId": "c4048a9a-53e3-43e9-8144-73892a8d2757",
+            "requestId": "7e0e1872-8253-475a-ad57-2ef6b5e6c4cc",
+            "state": "failed",
+            "message": "Steering failed for run c4048a9a: child completed before consuming steering",
+            "currentSessionId": "/sessions/2026-09-14T22-56-44-542Z_session.jsonl",
+            "source": "async",
+            "asyncDir": "/tmp/async-subagent-runs/c4048a9a",
+            "noticeText": "Steering failed for run c4048a9a: child completed before consuming steering"
+        })),
+    ) {
+        CustomMessagePayload::SubagentSteeringNotice(details) => {
+            assert_eq!(details.kind, "subagent.steering.notice");
+            assert_eq!(details.ts, 1789429350099);
+            assert_eq!(details.run_id, "c4048a9a-53e3-43e9-8144-73892a8d2757");
+            assert_eq!(details.request_id, "7e0e1872-8253-475a-ad57-2ef6b5e6c4cc");
+            assert_eq!(details.state, "failed");
+            assert_eq!(
+                details.current_session_id,
+                Some(PathBuf::from(
+                    "/sessions/2026-09-14T22-56-44-542Z_session.jsonl"
+                ))
+            );
+            assert_eq!(details.source, "async");
+            assert_eq!(
+                details.async_dir,
+                Some(PathBuf::from("/tmp/async-subagent-runs/c4048a9a"))
+            );
+            assert_eq!(
+                details.notice_text,
+                "Steering failed for run c4048a9a: child completed before consuming steering"
+            );
+        }
+        other => panic!("expected SubagentSteeringNotice, got {other:?}"),
+    }
+}
+
+#[test]
+fn custom_message_subagent_steering_notice_rejects_unknown_details_field() {
+    assert_parse_error_contains_any(
+        "rejects unknown subagent steering notice field",
+        custom_message_json(
+            "Steering failed for run c4048a9a",
+            "subagent_steering_notice",
+            Some(json!({
+                "type": "subagent.steering.notice",
+                "ts": 1789429350099_u64,
+                "runId": "c4048a9a",
+                "requestId": "7e0e1872",
+                "state": "failed",
+                "message": "steering failed",
+                "source": "async",
+                "noticeText": "Steering failed for run c4048a9a",
+                "unexpected": true
+            })),
+        ),
+        &["unexpected"],
+    );
+}
+
+#[test]
 fn custom_message_pi_loaded_tools_accepts_modeled_manifest_names() {
     let builtin_cases = ["read"];
     let intercom_cases = ["contact_supervisor"];
@@ -8857,6 +8924,49 @@ fn subagent_wait_completion_accepts_workflow_and_usage_fields() {
     assert_eq!(
         child.structured_output.as_deref().map(|blob| &blob.0),
         Some(&json!({"verdict": "pass"}))
+    );
+}
+
+#[test]
+fn subagent_wait_completion_accepts_structured_output_path() {
+    // Newer completions record where the structured output was persisted
+    // beside the inline payload; both may appear at once (observed on a
+    // documentation-reviewer bg_wait completion).
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "bg_wait",
+        vec![json!({"type": "text", "text": "Waited 35.1s; done."})],
+        false,
+        Some(json!({
+            "mode": "management",
+            "results": [],
+            "completions": [{
+                "runId": "47deace6",
+                "agent": "documentation-reviewer",
+                "mode": "single",
+                "state": "complete",
+                "success": true,
+                "results": [{
+                    "agent": "documentation-reviewer",
+                    "success": true,
+                    "outputState": "present",
+                    "structuredOutput": {"status": "PASS"},
+                    "structuredOutputPath": "/tmp/run/structured-output/output.json"
+                }]
+            }]
+        })),
+    ));
+    let Some(ToolResultDetails::Subagent(details)) = tool_result.details else {
+        panic!("expected Subagent details")
+    };
+    let Some(SubagentWaitOutcome::Completed(completions)) = details.wait_outcome() else {
+        panic!("expected completed wait outcome")
+    };
+    let [child] = completions[0].results.as_slice() else {
+        panic!("expected one child result")
+    };
+    assert_eq!(
+        child.structured_output_path,
+        Some(PathBuf::from("/tmp/run/structured-output/output.json"))
     );
 }
 

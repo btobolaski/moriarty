@@ -456,6 +456,12 @@ pub enum CustomMessagePayload {
     /// no `details` payload, so it must be a unit variant to parse.
     #[serde(rename = "rpiv-todo-continuation")]
     RpivTodoContinuation,
+    /// Steering outcome notice emitted when a mid-run steer could not be
+    /// delivered to an async child run (e.g. it completed before consuming
+    /// the steering). The rendered notice text repeats in the outer
+    /// `content` field.
+    #[serde(rename = "subagent_steering_notice")]
+    SubagentSteeringNotice(Box<SubagentSteeringNoticeDetails>),
     /// State announcement broadcast by the firstpick session-summary
     /// extension over its RPC channel (summary generation configured/enabled,
     /// durable or not). The human-readable text lives in the outer `content`
@@ -2552,6 +2558,10 @@ pub struct SubagentWaitCompletionResult {
     /// Kept as raw JSON because its shape is caller-defined.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub structured_output: Option<Box<JsonBlob>>,
+    /// Path where the structured output was persisted, recorded beside the
+    /// inline `structured_output` payload by newer workflow completions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_output_path: Option<PathBuf>,
 }
 
 /// Wait completions record either the saved output path alone or the full
@@ -2613,6 +2623,35 @@ pub struct SubagentSteeringTarget {
     /// Unix epoch milliseconds when the steering was delivered to this target.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivered_at: Option<u64>,
+}
+
+/// Details of a `subagent_steering_notice` custom message, recorded when a
+/// steer directed at an async subagent run could not be delivered. `kind`
+/// stays a `String` because only the `subagent.steering.notice`
+/// discriminator has been observed, and `state`/`source` follow the same
+/// undocumented-runtime vocabulary rule as [`SubagentSteeringDetails`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SubagentSteeringNoticeDetails {
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// Unix epoch milliseconds when the steering attempt concluded.
+    pub ts: u64,
+    pub run_id: String,
+    pub request_id: String,
+    /// Kept as `String` (observed: `failed`) — see
+    /// [`SubagentSteeringDetails::state`].
+    pub state: String,
+    pub message: String,
+    /// Async notices name the session file the notice was recorded into.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_session_id: Option<PathBuf>,
+    pub source: String,
+    /// Async notices retain the run directory, mirroring
+    /// [`SubagentControlNoticeDetails::async_dir`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub async_dir: Option<PathBuf>,
+    pub notice_text: String,
 }
 
 /// The native supervisor tool uses a different strict payload for each action.
