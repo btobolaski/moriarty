@@ -4366,8 +4366,75 @@ pub enum LensDiagnosticsDetails {
     Delta(LensDiagnosticsDelta),
     #[serde(rename = "all")]
     All(LensDiagnosticsSummary),
+    #[serde(rename = "batch")]
+    Batch(LensDiagnosticsBatch),
     #[serde(rename = "full")]
     Full(LensDiagnosticsFull),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LensDiagnosticsSource {
+    Lsp,
+    Session,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LensDiagnosticsScope {
+    Paths,
+    Workspace,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LensDiagnosticsSeverity {
+    Error,
+    Warning,
+    Information,
+    Hint,
+    All,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LensDiagnosticsServerScope {
+    Primary,
+    All,
+}
+
+/// The lens batch envelope carries its producer and requested scope, unlike the
+/// similarly shaped `lsp_diagnostics` batch response, so the two stay strict.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LensDiagnosticsBatch {
+    pub files_checked: u32,
+    pub concurrency: NonZeroUsize,
+    pub severity: LensDiagnosticsSeverity,
+    pub server_scope: LensDiagnosticsServerScope,
+    pub source: LensDiagnosticsSource,
+    pub scope: LensDiagnosticsScope,
+    pub diagnostics: Vec<JsonValue>,
+    pub primary_diagnostics_count: u32,
+    pub auxiliary_diagnostics_count: u32,
+    pub total_diagnostics: u32,
+    pub truncated: bool,
+    pub clean_files: u32,
+    pub unconfirmed_files: u32,
+    pub outcomes: Vec<JsonValue>,
+    pub outcome_counts: JsonValue,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disposition_suppressed: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lsp_health_warnings: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timed_out_files: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incomplete_files: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_errors: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

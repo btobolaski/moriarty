@@ -311,6 +311,14 @@ fn lens_full_details(summary: Value) -> Value {
     details
 }
 
+fn lsp_batch_details() -> Value {
+    serde_json::from_str(r#"{"mode":"batch","filesChecked":2,"concurrency":8,"severity":"error","serverScope":"primary","diagnostics":[],"primaryDiagnosticsCount":0,"auxiliaryDiagnosticsCount":0,"totalDiagnostics":0,"truncated":false,"cleanFiles":1,"unconfirmedFiles":0,"outcomes":[],"outcomeCounts":{"clean":1},"waitMs":2000,"timedOutFiles":2,"incompleteFiles":1,"fileErrors":["read failed"]}"#).expect("valid lsp batch fixture")
+}
+
+fn lens_batch_details() -> Value {
+    serde_json::from_str(r#"{"mode":"batch","filesChecked":1,"concurrency":8,"severity":"warning","serverScope":"all","source":"lsp","scope":"paths","diagnostics":[],"primaryDiagnosticsCount":0,"auxiliaryDiagnosticsCount":0,"totalDiagnostics":0,"truncated":false,"cleanFiles":1,"unconfirmedFiles":0,"outcomes":[],"outcomeCounts":{"clean":1},"dispositionSuppressed":13,"waitMs":3000,"timedOutFiles":1}"#).expect("valid lens batch fixture")
+}
+
 fn bash_execution_message_json(
     command: &str,
     output: &str,
@@ -4717,153 +4725,105 @@ fn fetch_content_tool_result_accepts_top_level_error_summary() {
     assert_eq!(details.error.as_deref(), Some("fetch failed"));
 }
 
-#[test]
-fn pi_lens_tool_result_details_route_current_shapes() {
-    let kind = |tool_name, details| match tool_result_with_details(tool_name, details).details {
-        Some(ToolResultDetails::LspDiagnostics(LspDiagnosticsDetails::File(_))) => "lsp-file",
-        Some(ToolResultDetails::LspDiagnostics(LspDiagnosticsDetails::Batch(_))) => "lsp-batch",
-        Some(ToolResultDetails::LspDiagnostics(LspDiagnosticsDetails::Directory(_))) => {
-            "lsp-directory"
-        }
-        Some(ToolResultDetails::ModuleReport(details)) => match details.callback_support {
-            None => "module-none",
-            Some(CallbackSupport::Tuned) => "module-tuned",
-            Some(CallbackSupport::Generic) => "module-generic",
-        },
-        Some(ToolResultDetails::LensDiagnosticMark(details)) => match details.disposition {
-            LensDiagnosticDisposition::FalsePositive => "mark-false-positive",
-            LensDiagnosticDisposition::Suppress => "mark-suppress",
-            LensDiagnosticDisposition::Defer => "mark-defer",
-            LensDiagnosticDisposition::Flagged => "mark-flagged",
-        },
-        Some(ToolResultDetails::LensDiagnostics(LensDiagnosticsDetails::Delta(_))) => "lens-delta",
-        Some(ToolResultDetails::LensDiagnostics(LensDiagnosticsDetails::All(_))) => "lens-all",
-        Some(ToolResultDetails::LensDiagnostics(LensDiagnosticsDetails::Full(
-            LensDiagnosticsFull::Findings(_),
-        ))) => "lens-full",
-        Some(ToolResultDetails::LensDiagnostics(LensDiagnosticsDetails::Full(
-            LensDiagnosticsFull::Unavailable(_),
-        ))) => "lens-unavailable",
-        Some(ToolResultDetails::AstGrepReplace(details)) => {
-            if details.stale_preview == Some(true) {
-                "ast-replace-stale"
-            } else if details.total_matches.is_some() {
-                "ast-replace"
-            } else {
-                "ast-replace-rule"
-            }
-        }
-        Some(ToolResultDetails::AstGrepSearch(details)) => {
-            if details.validate_only == Some(true) {
-                "ast-search-validate"
-            } else {
-                "ast-search"
-            }
-        }
-        Some(ToolResultDetails::McpScript(details)) => {
-            if details.error.is_some() {
-                "mcp-script-error"
-            } else {
-                "mcp-script"
-            }
-        }
-        Some(ToolResultDetails::Empty(_)) => "empty",
-        other => panic!("unexpected tool details: {other:?}"),
+// Keep fixture rows compact so the labeled routing matrix remains easy to scan.
+#[rustfmt::skip]
+fn route_fixture(name: &str) -> Value {
+    let raw = match name {
+        "lsp-file" => r#"{"mode":"file","filePath":"/tmp/example.rs","severity":"error","serverScope":"primary","primaryDiagnosticsCount":0,"auxiliaryDiagnosticsCount":0,"diagnostics":[],"totalDiagnostics":0,"truncated":false,"unconfirmed":true,"timedOut":true}"#,
+        "lsp-directory" => r#"{"mode":"directory","filePath":"/tmp","severity":"error","serverScope":"primary","filesScanned":2,"capped":false,"diagnostics":[],"primaryDiagnosticsCount":0,"auxiliaryDiagnosticsCount":0,"totalDiagnostics":0,"truncated":false,"cleanFiles":2,"unconfirmedFiles":0,"concurrency":8}"#,
+        "module-report" => r#"{"available":false,"staleness":"unavailable","symbols":0,"exports":0,"callbacks":0,"callbackSupport":"tuned","view":"default"}"#,
+        "lens-mark" => r#"{"anchor":"ddw:de888769f455","disposition":"suppress","line":11}"#,
+        "lens-delta" => r#"{"mode":"delta","warnings":0,"carriedOverFiles":1}"#,
+        "lens-all" => r#"{"mode":"all","filesChecked":4,"staleDropped":0}"#,
+        "lens-summary" => r#"{"filesWithIssues":2,"totalBlocking":1,"totalErrors":1,"totalWarnings":3,"staleDropped":0}"#,
+        "lens-unavailable" => r#"{"mode":"full","filesChecked":0,"lspUnavailable":true}"#,
+        "ast-replace" => r#"{"matchCount":8,"totalMatches":8,"truncated":false,"applied":true}"#,
+        "ast-structural" => r#"{"matchCount":2,"applied":true}"#,
+        "ast-empty" => r#"{}"#,
+        "ast-search" => r#"{"matchCount":0,"totalMatches":0,"truncated":false,"hasMore":false,"skip":0,"groupByFile":false,"searchReads":[],"matchLocations":[],"suggestedDump":{"tool":"ast_grep_dump"}}"#,
+        "mcp-script" => r#"{"mode":"script","timeoutMs":3600000,"calls":[{"operation":"call","path":"project-tools_run_tests","ok":true,"durationMs":20022}]}"#,
+        "mcp-error" => r#"{"mode":"script","error":"not_initialized"}"#,
+        _ => panic!("unknown route fixture {name}"),
     };
-    let module = |support| json!({"available":false,"staleness":"unavailable","symbols":0,"exports":0,"callbacks":0,"callbackSupport":support,"view":"default"});
-    let mark =
-        |disposition| json!({"anchor":"ddw:de888769f455","disposition":disposition,"line":11});
-    let mut full = lens_full_details(
-        json!({"filesWithIssues":2,"totalBlocking":1,"totalErrors":1,"totalWarnings":3,"staleDropped":0}),
-    );
+    serde_json::from_str(raw).expect("valid route fixture")
+}
+
+// One-line patterns keep each routing contract visible beside its fixture.
+#[rustfmt::skip]
+macro_rules! route_pattern {
+    (LspFile) => { ToolResultDetails::LspDiagnostics(LspDiagnosticsDetails::File(_)) };
+    (LspBatch) => { ToolResultDetails::LspDiagnostics(LspDiagnosticsDetails::Batch(_)) };
+    (LspDirectory) => { ToolResultDetails::LspDiagnostics(LspDiagnosticsDetails::Directory(_)) };
+    (ModuleReport) => { ToolResultDetails::ModuleReport(ModuleReportDetails { callback_support: Some(CallbackSupport::Tuned), .. }) };
+    (LensMark) => { ToolResultDetails::LensDiagnosticMark(LensDiagnosticMarkDetails { disposition: LensDiagnosticDisposition::Suppress, .. }) };
+    (LensDelta) => { ToolResultDetails::LensDiagnostics(LensDiagnosticsDetails::Delta(_)) };
+    (LensAll) => { ToolResultDetails::LensDiagnostics(LensDiagnosticsDetails::All(_)) };
+    (LensBatch) => { ToolResultDetails::LensDiagnostics(LensDiagnosticsDetails::Batch(_)) };
+    (LensFindings) => { ToolResultDetails::LensDiagnostics(LensDiagnosticsDetails::Full(LensDiagnosticsFull::Findings(_))) };
+    (LensUnavailable) => { ToolResultDetails::LensDiagnostics(LensDiagnosticsDetails::Full(LensDiagnosticsFull::Unavailable(_))) };
+    (AstReplace) => { ToolResultDetails::AstGrepReplace(AstGrepReplaceDetails { total_matches: Some(8), .. }) };
+    (AstStructural) => { ToolResultDetails::AstGrepReplace(AstGrepReplaceDetails { match_count: Some(2), .. }) };
+    (AstEmpty) => { ToolResultDetails::Empty(_) };
+    (AstSearch) => { ToolResultDetails::AstGrepSearch(AstGrepSearchDetails { total_matches: Some(0), .. }) };
+    (McpScript) => { ToolResultDetails::McpScript(McpScriptDetails { calls: Some(_), error: None, .. }) };
+    (McpError) => { ToolResultDetails::McpScript(McpScriptDetails { error: Some(_), .. }) };
+}
+
+#[rustfmt::skip]
+macro_rules! assert_routes {
+    ($(($label:literal, $tool_name:expr, $details:expr, $pattern:ident)),+ $(,)?) => { $(assert!(matches!(tool_result_with_details($tool_name, $details).details, Some(route_pattern!($pattern))), "route {}", $label);)+ };
+}
+
+#[test]
+// Keep one row per routing contract; rustfmt otherwise obscures the matrix with wrapping.
+#[rustfmt::skip]
+fn tool_result_details_route_current_shapes() {
+    let mut full = lens_full_details(route_fixture("lens-summary"));
     full["projectDiagnostics"]["tier"] = json!("all");
-    for (tool_name, details, expected) in [
-        (
-            "lsp_diagnostics",
-            json!({"mode":"file","filePath":"/tmp/example.rs","severity":"error","serverScope":"primary","primaryDiagnosticsCount":0,"auxiliaryDiagnosticsCount":0,"diagnostics":[],"totalDiagnostics":0,"truncated":false,"unconfirmed":true,"waitMs":3000,"timedOut":true,"unconfirmedServerIds":["ast-grep"]}),
-            "lsp-file",
-        ),
-        (
-            "lsp_diagnostics",
-            json!({"mode":"batch","filesChecked":2,"concurrency":8,"severity":"error","serverScope":"primary","diagnostics":[],"primaryDiagnosticsCount":0,"auxiliaryDiagnosticsCount":0,"totalDiagnostics":0,"truncated":false,"cleanFiles":1,"unconfirmedFiles":0,"outcomes":[],"outcomeCounts":{"clean":1},"waitMs":2000,"timedOutFiles":2,"incompleteFiles":1,"fileErrors":["read failed"]}),
-            "lsp-batch",
-        ),
-        (
-            "lsp_diagnostics",
-            json!({"mode":"directory","filePath":"/tmp","severity":"error","serverScope":"primary","filesScanned":2,"capped":false,"diagnostics":[],"primaryDiagnosticsCount":0,"auxiliaryDiagnosticsCount":0,"totalDiagnostics":0,"truncated":false,"cleanFiles":2,"unconfirmedFiles":0,"concurrency":8,"waitMs":1000}),
-            "lsp-directory",
-        ),
-        (
-            "module_report",
-            json!({"available":false,"staleness":"unavailable","symbols":0,"exports":0,"callbacks":0,"view":"default"}),
-            "module-none",
-        ),
-        ("module_report", module("tuned"), "module-tuned"),
-        ("module_report", module("generic"), "module-generic"),
-        (
-            "lens_diagnostic_mark",
-            mark("false-positive"),
-            "mark-false-positive",
-        ),
-        ("lens_diagnostic_mark", mark("suppress"), "mark-suppress"),
-        ("lens_diagnostic_mark", mark("defer"), "mark-defer"),
-        ("lens_diagnostic_mark", mark("flagged"), "mark-flagged"),
-        ("lens_diagnostic_mark", json!({}), "empty"),
-        (
-            "lens_diagnostics",
-            json!({"mode":"delta","warnings":0,"carriedOverFiles":1}),
-            "lens-delta",
-        ),
-        (
-            "lens_diagnostics",
-            json!({"mode":"all","filesChecked":4,"staleDropped":0}),
-            "lens-all",
-        ),
-        ("lens_diagnostics", full, "lens-full"),
-        (
-            "lens_diagnostics",
-            json!({"mode":"full","filesChecked":0,"lspUnavailable":true}),
-            "lens-unavailable",
-        ),
-        (
-            "ast_grep_replace",
-            json!({"matchCount":8,"totalMatches":8,"truncated":false,"applied":true}),
-            "ast-replace",
-        ),
-        (
-            "ast_grep_replace",
-            json!({"matchCount":2,"applied":true}),
-            "ast-replace-rule",
-        ),
-        (
-            "ast_grep_replace",
-            json!({"stalePreview":true}),
-            "ast-replace-stale",
-        ),
-        ("ast_grep_replace", json!({}), "empty"),
-        (
-            "ast_grep_search",
-            json!({"matchCount":0,"totalMatches":0,"truncated":false,"hasMore":false,"skip":0,"groupByFile":false,"searchReads":[],"matchLocations":[],"suggestedDump":{"tool":"ast_grep_dump"}}),
-            "ast-search",
-        ),
-        (
-            "ast_grep_search",
-            json!({"valid":false,"validateOnly":true}),
-            "ast-search-validate",
-        ),
-        ("ast_grep_search", json!({}), "empty"),
-        (
-            "mcpScript",
-            json!({"mode":"script","timeoutMs":3600000,"calls":[{"operation":"call","path":"project-tools_run_tests","ok":true,"durationMs":20022},{"operation":"call","path":"project-tools_run_lint","ok":false,"error":"tool_error","durationMs":12289}]}),
-            "mcp-script",
-        ),
-        (
-            "mcpScript",
-            json!({"mode":"script","error":"not_initialized"}),
-            "mcp-script-error",
-        ),
-    ] {
-        assert_eq!(kind(tool_name, details), expected);
+    assert_routes!(
+        ("lsp file", "lsp_diagnostics", route_fixture("lsp-file"), LspFile),
+        ("lsp batch", "lsp_diagnostics", lsp_batch_details(), LspBatch),
+        ("lsp directory", "lsp_diagnostics", route_fixture("lsp-directory"), LspDirectory),
+        ("module report", "module_report", route_fixture("module-report"), ModuleReport),
+        ("lens mark", "lens_diagnostic_mark", route_fixture("lens-mark"), LensMark),
+        ("lens delta", "lens_diagnostics", route_fixture("lens-delta"), LensDelta),
+        ("lens all", "lens_diagnostics", route_fixture("lens-all"), LensAll),
+        ("lens batch", "lens_diagnostics", lens_batch_details(), LensBatch),
+        ("lens findings", "lens_diagnostics", full, LensFindings),
+        ("lens unavailable", "lens_diagnostics", route_fixture("lens-unavailable"), LensUnavailable),
+        ("ast replace", "ast_grep_replace", route_fixture("ast-replace"), AstReplace),
+        ("ast structural rule", "ast_grep_replace", route_fixture("ast-structural"), AstStructural),
+        ("ast empty", "ast_grep_replace", route_fixture("ast-empty"), AstEmpty),
+        ("ast search", "ast_grep_search", route_fixture("ast-search"), AstSearch),
+        ("mcp script", "mcpScript", route_fixture("mcp-script"), McpScript),
+        ("mcp error", "mcpScript", route_fixture("mcp-error"), McpError)
+    );
+}
+
+#[test]
+fn lens_diagnostics_batch_preserves_lens_metadata() {
+    let Some(ToolResultDetails::LensDiagnostics(LensDiagnosticsDetails::Batch(details))) =
+        tool_result_with_details("lens_diagnostics", lens_batch_details()).details
+    else {
+        panic!("expected lens batch details")
+    };
+    assert_eq!(details.source, LensDiagnosticsSource::Lsp);
+    assert_eq!(details.scope, LensDiagnosticsScope::Paths);
+    assert_eq!(details.severity, LensDiagnosticsSeverity::Warning);
+    assert_eq!(details.server_scope, LensDiagnosticsServerScope::All);
+    assert_eq!(details.disposition_suppressed, Some(13));
+    assert_eq!(details.timed_out_files, Some(1));
+}
+
+#[test]
+fn lens_and_lsp_batch_shapes_remain_strictly_distinct() {
+    assert!(serde_json::from_value::<LensDiagnosticsDetails>(lsp_batch_details()).is_err());
+    assert!(serde_json::from_value::<LspDiagnosticsDetails>(lens_batch_details()).is_err());
+
+    for (field, value) in [("severity", "debug"), ("serverScope", "secondary")] {
+        let mut details = lens_batch_details();
+        details[field] = json!(value);
+        assert!(serde_json::from_value::<LensDiagnosticsDetails>(details).is_err());
     }
 }
 

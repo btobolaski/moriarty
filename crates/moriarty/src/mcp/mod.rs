@@ -173,7 +173,10 @@ mod tests {
         test_helpers::{setup_isolated_xdg_config, setup_project_dir_with_config},
     };
 
-    const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+    // Full Nextest runs can briefly starve the duplex server while many isolated
+    // approval and subprocess tests run concurrently; keep the timeout above
+    // scheduling jitter without masking a genuinely stuck server.
+    const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
     struct TestClient {
         reader: BufReader<ReadHalf<DuplexStream>>,
