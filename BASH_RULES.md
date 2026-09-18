@@ -90,10 +90,10 @@ action = { type = "ActionType", ... }
   does not select a path. If no path is selected, the legacy fallback still applies. Relative inputs are resolved
   against `cwd`; `~` and `~/...` first expand against `HOME`, while other tilde forms cannot satisfy locality. Existing
   paths are fully canonicalized; non-existent paths are checked by canonicalizing the deepest existing ancestor and
-  safely rebuilding the missing suffix so `..` cannot escape above that ancestor. Symlinks that
-  resolve outside `cwd` and broken symlinks are rejected. Hard links are treated as ordinary local filesystem entries.
-  In the live hook, if locality inspection does not finish within two seconds, every `allow_local` rule is skipped and
-  evaluation falls through to a later rule or no match; synchronous analysis runs without this latency deadline.
+  safely rebuilding the missing suffix so `..` cannot escape above that ancestor. Symlinks that resolve outside `cwd`
+  and broken symlinks are rejected. Hard links are treated as ordinary local filesystem entries. In the live hook, if
+  locality inspection does not finish within two seconds, every `allow_local` rule is skipped and evaluation falls
+  through to a later rule or no match; synchronous analysis runs without this latency deadline.
 - **field** + **pattern**: Optional legacy pair. When both are present, the regex matches the named top-level field. If
   only one is present, the entire rule is skipped and reported as a configuration error.
 - **conditions**: Optional list of typed top-level input predicates. Conditions are ANDed with each other and with the

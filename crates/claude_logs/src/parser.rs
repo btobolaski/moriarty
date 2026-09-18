@@ -1039,7 +1039,7 @@ pub struct PromptToolSchema {
     pub description: String,
     pub eager_input_streaming: bool,
     /// JSON Schema for the tool's input, kept opaque for the same reason as
-    /// [`ContentBlock::ToolUse`]'s `input`: the shape belongs to the tool, not to Claude Code.
+    /// [`LogMessageTaggedContent::ToolUse`]'s `input`: the shape belongs to the tool, not to Claude Code.
     pub input_schema: HashMap<String, serde_json::Value>,
 }
 
@@ -2673,7 +2673,7 @@ pub struct AssistantLogLine {
     /// the key entirely. Added in Claude Code 2.1.257+.
     pub quota_limits: Option<QuotaLimits>,
     /// The tool inputs as they arrived on the wire, keyed by tool_use id. Kept opaque for the same
-    /// reason as [`ContentBlock::ToolUse`]'s `input`: the shape belongs to whichever tool was
+    /// reason as [`LogMessageTaggedContent::ToolUse`]'s `input`: the shape belongs to whichever tool was
     /// called. Added in Claude Code 2.1.270+.
     pub wire_tool_inputs: Option<HashMap<String, HashMap<String, serde_json::Value>>>,
     /// The working directory each tool call was issued against, keyed by tool_use id like

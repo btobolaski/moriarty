@@ -2,6 +2,9 @@
 #
 # https://taplo.tamasfe.dev/configuration/file.html#configuration-file
 
+# Hakari owns this file's formatting too; reformatting breaks `cargo hakari generate --diff`.
+exclude = ["crates/my-workspace-hack/Cargo.toml"]
+
 [formatting]
 reorder_keys = false
 

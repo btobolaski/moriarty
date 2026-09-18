@@ -5,10 +5,11 @@
 //! assert on the typed result, while others pin serialization behavior or
 //! shape-routing assumptions that the parser relies on.
 
-use std::path::PathBuf;
+use std::{fmt::Debug, path::PathBuf};
 
 use chrono::{DateTime, Utc};
-use serde_json::{Value, json};
+use serde::de::DeserializeOwned;
+use serde_json::{Value, error::Category, json};
 
 use super::*;
 
@@ -547,6 +548,11 @@ fn parse_custom_message_payload(
     };
 
     custom_message.payload
+}
+
+fn assert_untagged_rejection<T: DeserializeOwned + Debug>(value: Value) {
+    let error = serde_json::from_value::<T>(value).expect_err("invalid shape must be rejected");
+    assert_eq!(error.classify(), Category::Data, "{error}");
 }
 
 fn assert_parse_error_contains_any(name: &str, value: Value, expected_fragments: &[&str]) {
@@ -7072,11 +7078,10 @@ fn mcp_tool_result_accepts_initialization_error() {
 
 #[test]
 fn mcp_details_sessions_only_shape_rejects_unknown_fields() {
-    serde_json::from_value::<McpDetails>(json!({
+    assert_untagged_rejection::<McpDetails>(json!({
         "sessions": 3,
         "unexpected": true
-    }))
-    .expect_err("sessions-only shape should reject unknown fields");
+    }));
 }
 
 #[test]
@@ -7124,26 +7129,23 @@ fn mcp_details_rejects_fields_from_other_modes() {
         }),
         json!({"mode": "search", "error": "unsafe_pattern"}),
     ] {
-        serde_json::from_value::<McpDetails>(details)
-            .expect_err("mode-specific fields should be rejected");
+        assert_untagged_rejection::<McpDetails>(details);
     }
 }
 
 #[test]
 fn mcp_details_normal_mode_rejects_unknown_fields() {
-    serde_json::from_value::<McpDetails>(json!({
+    assert_untagged_rejection::<McpDetails>(json!({
         "mode": "call",
         "garbage": true
-    }))
-    .expect_err("mode-based shape should reject unknown fields");
+    }));
 }
 
 #[test]
 fn mcp_details_missing_mode_without_sessions_is_rejected() {
-    serde_json::from_value::<McpDetails>(json!({
+    assert_untagged_rejection::<McpDetails>(json!({
         "server": "git"
-    }))
-    .expect_err("no-mode no-sessions shape should be rejected");
+    }));
 }
 
 /// Pins the routed async-only fields on subagent results.
@@ -10013,19 +10015,17 @@ fn intercom_result_accepts_supervisor_status_payload() {
 /// details.
 #[test]
 fn intercom_result_rejects_half_present_status() {
-    serde_json::from_value::<IntercomResultDetails>(json!({
+    assert_untagged_rejection::<IntercomResultDetails>(json!({
         "active": true,
         "pending": 0
-    }))
-    .expect_err("half-present supervisor status payload must be rejected");
+    }));
 }
 
 /// A `pending` value matching neither shape (not an items list, not a
 /// count) must fail loudly instead of silently defaulting.
 #[test]
 fn intercom_result_rejects_unknown_pending_shape() {
-    serde_json::from_value::<IntercomResultDetails>(json!({"pending": "many"}))
-        .expect_err("pending matching neither shape must be rejected");
+    assert_untagged_rejection::<IntercomResultDetails>(json!({"pending": "many"}));
 }
 
 #[test]

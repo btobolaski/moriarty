@@ -124,6 +124,8 @@ reproduction commands.
 
 **`claude_logs/`** - Claude Code log parsing:
 
+<!-- prettier-ignore-start -->
+
 - Independent workspace crate for parsing Claude Code JSONL logs into strongly typed serde models
 
 - The `LogLine` enum covers both core conversation records and newer metadata/event records, including user/assistant
@@ -176,6 +178,8 @@ reproduction commands.
   parser so family/version classification is not duplicated across crates. The parser preserves capability-decorated raw
   ids such as `claude-opus-4-8[1m]` while excluding the `[1m]` context-window suffix from version classification
 - Used by `moriarty`'s `api_pricing` module to analyze Claude Code conversation logs
+
+<!-- prettier-ignore-end -->
 
 **`cost_report/`** - Shared cost report rendering and filtering:
 
@@ -313,6 +317,30 @@ with warnings, while explicit missing paths and having no available source are e
 - Deduplication keeps the highest-cost duplicate for a `(ModelId, LogId)` pair and breaks equal-cost ties by keeping the
   earliest timestamped entry
 - Public entry point: `cost_analyzer::analyze_directory(path)`
+
+**`process_supervisor/`** - Standalone asynchronous process-group supervision (not yet used by Moriarty callers):
+
+- Supports ordinary Linux/macOS process trees, not a security sandbox or deliberately escaped descendants. Both the
+  crate and test roots forbid unsafe code; std and pinned rustix safe APIs own the OS boundary. `lib.rs` contains only
+  crate attributes (including rustdoc), private module declarations, and API reexports.
+- Detached, admission-bounded std launch threads own stalled creation; one Tokio driver owns each handed-off child and
+  both bounded captures. Non-reaping `waitid(EXITED | NOHANG | NOWAIT)` pins the leader until final signaling, and
+  reaping requires an exclusive disarmed view, including error/Drop paths. Keep the raw child and semaphore-closing
+  authority private; preserve revocation when changing the backend. Startup outcomes must encode ownership, creation
+  certainty, and interruption reason explicitly rather than require classification from mutable evidence fields.
+- At a Running control boundary, a fresh non-reaping exit observation takes precedence over cancellation/timeout;
+  selected TERM causes remain fixed. Confirmed group absence is monotonic. Failed/closed capture settles error cleanup
+  without inventing EOF, and phase-tagged interruption metadata survives cleanup uncertainty. Lost driver reports cannot
+  establish successful cleanup.
+- Late-launch failures use output-excluding tracing diagnostics. Subscriber dispatch can block while retaining the
+  launcher's admission slot; this is an accepted risk, not a nonblocking logging guarantee.
+- Crate rustdoc is the contract reference for validated options, direct `CancellationToken` ownership, null stdin,
+  startup uncertainty, descendant cleanup, completed versus partial outcomes, and host-lifetime/reaping limits.
+- Tests use exact ignored libtest subprocess fixtures and private module-selected fault seams (`launch::hooks` and the
+  process-operations alias); production functions contain no `#[cfg(test)]` logic. Fixture dispatch needs body evidence,
+  and rescue must remain independent, identity-safe, and bounded. See crate rustdoc for watchdog mechanics and the
+  limits of indirect SIGCHLD-isolation evidence. Never replace safe dependency operations with local FFI/pre-exec hooks,
+  migrate existing callers, or change MCP protocol support as part of this standalone crate.
 
 **`tui/`** - Terminal UI event infrastructure:
 
@@ -814,7 +842,7 @@ the on-disk protocol exactly, even when that means snake_case fields like `GitRe
    because the inner tag appears at the outer level and serde does not register it as claimed; a strict outer struct
    then rejects it at runtime. `WebSearchResultsData` keeps that wire shape but restores strict outer-key validation
    with a manual deserializer. The same limitation applies to `McpSearchDetails`' flattened `McpPagination`: its custom
-   deserializer rejects every flattened key except `hasMore` and `nextOffset`. *Adjacently* tagged flatten targets
+   deserializer rejects every flattened key except `hasMore` and `nextOffset`. _Adjacently_ tagged flatten targets
    (those with both `tag` and `content`) do not hit this collision, so structs like `CustomLine` and `CustomMessageLine`
    keep derived `deny_unknown_fields` handling. Each exception must carry an inline comment naming the limitation.
 2. **Corrupt-stream tolerance**: tool-argument structs (e.g. `EditArgs`, `EditReplacement`, `GrepArgs`, and now

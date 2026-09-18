@@ -9749,7 +9749,13 @@ fn test_parse_attachment_line_rendered() {
 fn test_parse_attachment_line_rejects_human_turn_rendering_without_rendering() {
     let mut json = environment_json(None);
     json["renderedInHumanTurn"] = serde_json::json!([{"content": "queued"}]);
-    serde_json::from_value::<LogLine>(json).expect_err("renderedInHumanTurn must require rendered");
+    let error = serde_json::from_value::<LogLine>(json)
+        .expect_err("renderedInHumanTurn must require rendered");
+    assert!(
+        error
+            .to_string()
+            .contains("`renderedInHumanTurn` requires `rendered`")
+    );
 }
 
 fn instructions_json(

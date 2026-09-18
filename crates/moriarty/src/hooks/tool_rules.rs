@@ -740,7 +740,12 @@ mod tests {
             .await,
             "test locality evaluation",
         );
-        assert!(evaluation.is_err());
+        let error = evaluation.expect_err("locality timeout must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("timed out during test locality evaluation")
+        );
     }
 
     #[tokio::test]
@@ -754,7 +759,12 @@ mod tests {
             ),
             "test locality evaluation",
         );
-        assert!(evaluation.is_err());
+        let error = evaluation.expect_err("locality task failure must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("task failed during test locality evaluation")
+        );
     }
 
     #[test]

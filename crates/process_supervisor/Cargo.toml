@@ -1,0 +1,19 @@
+[package]
+name = "process_supervisor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+miette = { workspace = true }
+my-workspace-hack = { version = "0.1", path = "../my-workspace-hack" }
+rustix = { version = "=1.1.4", features = ["process"] }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["io-util"] }
+# The token/drop-guard API was qualified at this version, including sync without rt.
+tokio-util = { version = "=0.7.18", default-features = false }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["signal"] }
