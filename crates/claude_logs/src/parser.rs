@@ -820,8 +820,11 @@ pub struct DeferredToolsDelta {
     pub readded_names: Vec<String>,
     #[serde(default)]
     pub pending_mcp_servers: Vec<String>,
+    /// Unlike its bare-id siblings, each failed server arrives as an object. The bare-id element
+    /// type this field previously carried was an unverified assumption copied from those siblings
+    /// and has never been observed on the wire, so no string form is accepted.
     #[serde(default)]
-    pub failed_mcp_servers: Vec<String>,
+    pub failed_mcp_servers: Vec<FailedMcpServer>,
     /// Servers which deferred tools require authentication for. The wire payload currently names
     /// only their server ids, so the element type matches the other server lists.
     #[serde(default)]
@@ -834,6 +837,15 @@ pub struct DeferredToolsDelta {
     /// narrower than `added_names` when a tool is added without being announced.
     #[serde(default)]
     pub surfaced_names: Vec<String>,
+}
+
+/// A server whose connection failed, carried as an object rather than a bare id so Claude Code can
+/// attach failure detail to it later; strict so any such addition surfaces instead of being dropped.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct FailedMcpServer {
+    pub name: String,
 }
 
 /// The full definitions of the deferred tools whose schemas were loaded into the turn, the
@@ -1754,6 +1766,10 @@ pub struct ModelRefusalFallback {
     /// Only `"refusal"` has been observed; raw `String` for the same
     /// forward-compatibility reason as `direction`.
     pub trigger: String,
+    /// How far the fallback applies (observed: `"session"`); raw `String` for the same
+    /// forward-compatibility reason as `direction`, and `Option` because pre-2.1.270 records
+    /// omit it. Added in Claude Code 2.1.270+.
+    pub scope: Option<String>,
     pub original_model: Model,
     pub fallback_model: Model,
     pub request_id: String,
@@ -2679,6 +2695,10 @@ pub struct AssistantLogLine {
     /// The working directory each tool call was issued against, keyed by tool_use id like
     /// [`Self::wire_tool_inputs`]. Added in Claude Code 2.1.270+.
     pub wire_ingest_context: Option<HashMap<String, WireIngestContext>>,
+    /// Assistant turns this one replaces, e.g. the refused turns listed in the preceding
+    /// [`ModelRefusalFallback`]'s `retracted_message_uuids` when the request was retried on the
+    /// fallback model. Added in Claude Code 2.1.270+.
+    pub supersedes_uuids: Option<Vec<Uuid>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]

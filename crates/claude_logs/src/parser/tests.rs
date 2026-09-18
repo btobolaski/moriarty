@@ -69,6 +69,43 @@ fn assistant_log_line_json(extra: serde_json::Value) -> serde_json::Value {
     json
 }
 
+fn model_refusal_fallback_json(extra: serde_json::Value) -> serde_json::Value {
+    let mut json = serde_json::json!({
+        "type": "system",
+        "subtype": "model_refusal_fallback",
+        "parentUuid": "9528e913-20fc-42ea-9e4c-5fb080b07c04",
+        "isSidechain": false,
+        "direction": "retry",
+        "content": "Fable 5's safeguards flagged this message. Switched to Opus 4.8.",
+        "level": "warning",
+        "trigger": "refusal",
+        "originalModel": "claude-fable-5",
+        "fallbackModel": "claude-opus-4-8",
+        "requestId": "req_011Ccmjmo1wkFV3JyX6W34NT",
+        "apiRefusalCategory": "cyber",
+        "apiRefusalExplanation": null,
+        "isMeta": false,
+        "timestamp": "2026-07-07T00:19:18.167Z",
+        "uuid": "5eba741a-e6a1-449a-adbe-4d29aaa8468a",
+        "retractedMessageUuids": ["490b7142-41ad-4667-8166-469606129093"],
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "583790a4-8207-4478-92ee-ebb9538b54dd",
+        "version": "2.1.201",
+        "gitBranch": "HEAD"
+    });
+    merge_json(&mut json, extra);
+    json
+}
+
+fn parse_model_refusal_fallback(json: serde_json::Value) -> ModelRefusalFallback {
+    match serde_json::from_value::<LogLine>(json).expect("Failed to parse model_refusal_fallback") {
+        LogLine::System(SystemLogLine::ModelRefusalFallback(fallback)) => fallback,
+        other => panic!("Expected System(ModelRefusalFallback), got {other:?}"),
+    }
+}
+
 fn merge_json(target: &mut serde_json::Value, overlay: serde_json::Value) {
     match (target, overlay) {
         (serde_json::Value::Object(target), serde_json::Value::Object(overlay)) => {
@@ -2379,6 +2416,19 @@ fn test_parse_model_refusal_fallback_with_refused_user_message_uuid() {
         }
         _ => panic!("Expected System(ModelRefusalFallback) variant"),
     }
+}
+
+// Claude Code 2.1.270+ records how far the fallback applies; pre-2.1.270 records omit the key.
+#[test]
+fn test_parse_model_refusal_fallback_scope() {
+    let with_scope = parse_model_refusal_fallback(model_refusal_fallback_json(serde_json::json!({
+        "scope": "session"
+    })));
+    assert_eq!(with_scope.scope.as_deref(), Some("session"));
+
+    let without_scope =
+        parse_model_refusal_fallback(model_refusal_fallback_json(serde_json::json!({})));
+    assert_eq!(without_scope.scope, None);
 }
 
 #[test]
@@ -7482,7 +7532,7 @@ fn test_parse_attachment_deferred_tools_delta_with_readded_and_pending() {
             "removedNames": ["OldTool"],
             "readdedNames": ["PreviouslyRemoved"],
             "pendingMcpServers": ["server-a", "server-b"],
-            "failedMcpServers": ["server-c"],
+            "failedMcpServers": [{"name": "server-c"}],
             "needsAuthMcpServers": ["server-d"],
             "wireHiddenNames": ["HiddenTool"],
             "surfacedNames": ["WebFetch"]
@@ -7503,7 +7553,12 @@ fn test_parse_attachment_deferred_tools_delta_with_readded_and_pending() {
     assert_eq!(delta.removed_names, vec!["OldTool"]);
     assert_eq!(delta.readded_names, vec!["PreviouslyRemoved"]);
     assert_eq!(delta.pending_mcp_servers, vec!["server-a", "server-b"]);
-    assert_eq!(delta.failed_mcp_servers, vec!["server-c"]);
+    assert_eq!(
+        delta.failed_mcp_servers,
+        vec![FailedMcpServer {
+            name: "server-c".to_string()
+        }]
+    );
     assert_eq!(delta.needs_auth_mcp_servers, vec!["server-d"]);
     assert_eq!(delta.wire_hidden_names, vec!["HiddenTool"]);
     assert_eq!(delta.surfaced_names, vec!["WebFetch"]);
@@ -11493,5 +11548,22 @@ fn test_parse_assistant_wire_tool_metadata() {
                 cwd: "/test".to_string(),
             }
         )]))
+    );
+}
+
+// Claude Code 2.1.270+ lists the turns a retry replaces, matching the preceding
+// `model_refusal_fallback`'s `retractedMessageUuids`.
+#[test]
+fn test_parse_assistant_supersedes_uuids() {
+    let line = parse_assistant_log_line(assistant_log_line_json(serde_json::json!({
+        "supersedesUuids": ["3ac8f110-d2de-4a71-8313-83bf5301c7b5"]
+    })));
+    assert_eq!(
+        line.supersedes_uuids,
+        Some(vec![
+            "3ac8f110-d2de-4a71-8313-83bf5301c7b5"
+                .parse()
+                .expect("valid uuid")
+        ])
     );
 }
