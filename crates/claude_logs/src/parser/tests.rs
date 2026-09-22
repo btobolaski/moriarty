@@ -2282,32 +2282,11 @@ fn test_parse_stop_hook_summary_with_mixed_error_formats() {
 
 #[test]
 fn test_parse_model_refusal_fallback() {
-    let json = serde_json::json!({
-        "type": "system",
-        "subtype": "model_refusal_fallback",
-        "parentUuid": "77502799-98d4-4548-b903-ed5d6f797e41",
-        "isSidechain": false,
-        "direction": "retry",
-        "content": "Fable 5's safety measures flagged this message. Switched to Opus 4.8.",
-        "level": "warning",
-        "trigger": "refusal",
-        "originalModel": "claude-fable-5",
-        "fallbackModel": "claude-opus-4-8",
-        "requestId": "req_011CbtEUxmnDLZxNhMjZT5dt",
+    let json = model_refusal_fallback_json(serde_json::json!({
         "apiRefusalCategory": null,
         "apiRefusalExplanation": null,
-        "isMeta": false,
-        "timestamp": "2026-06-09T19:24:49.832Z",
-        "uuid": "6e45b19e-8f68-4144-9eac-c1577fe3737e",
-        "retractedMessageUuids": ["6102750b-5a74-4578-bf67-d42e5b5f85ee"],
-        "userType": "external",
-        "entrypoint": "cli",
-        "cwd": "/test",
-        "sessionId": "f671f20e-5ef4-41d5-bfe5-aa4b87a2bd54",
-        "version": "2.1.170",
-        "gitBranch": "HEAD",
-        "slug": "i-need-to-run-hashed-stroustrup"
-    });
+        "version": "2.1.170"
+    }));
 
     let line: LogLine =
         serde_json::from_value(json).expect("Failed to parse model_refusal_fallback");
@@ -2329,32 +2308,58 @@ fn test_parse_model_refusal_fallback() {
 }
 
 #[test]
-fn test_parse_model_refusal_fallback_with_populated_refusal_details() {
+fn test_parse_model_refusal_no_fallback() {
     let json = serde_json::json!({
         "type": "system",
-        "subtype": "model_refusal_fallback",
-        "parentUuid": "77502799-98d4-4548-b903-ed5d6f797e41",
+        "subtype": "model_refusal_no_fallback",
+        "parentUuid": "a9892cbf-754d-460d-ab2d-425e09af0c6a",
         "isSidechain": false,
-        "direction": "retry",
-        "content": "Switched to Opus 4.8.",
+        "content": "",
         "level": "warning",
-        "trigger": "refusal",
-        "originalModel": "claude-fable-5",
-        "fallbackModel": "claude-opus-4-8",
-        "requestId": "req_011CbtEUxmnDLZxNhMjZT5dt",
-        "apiRefusalCategory": "cyber",
-        "apiRefusalExplanation": "Flagged for cybersecurity topics.",
+        "originalModel": "claude-opus-5",
+        "requestId": "req_011CfHQQDVawJmF8rb41V1nb",
+        "apiRefusalCategory": "reasoning_extraction",
+        "apiRefusalExplanation": "This request was blocked.",
+        "refusedUserMessageUuid": "a668db4b-29bc-4fb1-9021-4a0f397d390b",
         "isMeta": false,
-        "timestamp": "2026-06-09T19:24:49.832Z",
-        "uuid": "6e45b19e-8f68-4144-9eac-c1577fe3737e",
-        "retractedMessageUuids": [],
+        "uuid": "dfa790ed-a82d-4318-82e4-9c7f63b9ecaa",
+        "timestamp": "2026-09-21T22:52:07.251Z",
         "userType": "external",
         "entrypoint": "cli",
         "cwd": "/test",
-        "sessionId": "f671f20e-5ef4-41d5-bfe5-aa4b87a2bd54",
-        "version": "2.1.170",
+        "sessionId": "ed3786e4-913f-4fd2-9925-d22703da5845",
+        "version": "2.1.270",
         "gitBranch": "HEAD"
     });
+
+    match serde_json::from_value::<LogLine>(json)
+        .expect("Failed to parse model_refusal_no_fallback")
+    {
+        LogLine::System(SystemLogLine::ModelRefusalNoFallback(refusal)) => {
+            assert_eq!(refusal.original_model.raw(), "claude-opus-5");
+            assert_eq!(
+                refusal.api_refusal_category.as_deref(),
+                Some("reasoning_extraction")
+            );
+            assert_eq!(
+                refusal.api_refusal_explanation.as_deref(),
+                Some("This request was blocked.")
+            );
+            assert_eq!(
+                refusal.refused_user_message_uuid,
+                Some("a668db4b-29bc-4fb1-9021-4a0f397d390b".parse().unwrap())
+            );
+        }
+        other => panic!("Expected System(ModelRefusalNoFallback), got {other:?}"),
+    }
+}
+
+#[test]
+fn test_parse_model_refusal_fallback_with_populated_refusal_details() {
+    let json = model_refusal_fallback_json(serde_json::json!({
+        "apiRefusalExplanation": "Flagged for cybersecurity topics.",
+        "retractedMessageUuids": []
+    }));
 
     match serde_json::from_value::<LogLine>(json)
         .expect("Failed to parse model_refusal_fallback with populated refusal details")
@@ -2374,32 +2379,9 @@ fn test_parse_model_refusal_fallback_with_populated_refusal_details() {
 
 #[test]
 fn test_parse_model_refusal_fallback_with_refused_user_message_uuid() {
-    let json = serde_json::json!({
-        "type": "system",
-        "subtype": "model_refusal_fallback",
-        "parentUuid": "9528e913-20fc-42ea-9e4c-5fb080b07c04",
-        "isSidechain": false,
-        "direction": "retry",
-        "content": "Fable 5's safeguards flagged this message. Switched to Opus 4.8.",
-        "level": "warning",
-        "trigger": "refusal",
-        "originalModel": "claude-fable-5",
-        "fallbackModel": "claude-opus-4-8",
-        "requestId": "req_011Ccmjmo1wkFV3JyX6W34NT",
-        "apiRefusalCategory": "cyber",
-        "apiRefusalExplanation": null,
-        "isMeta": false,
-        "timestamp": "2026-07-07T00:19:18.167Z",
-        "uuid": "5eba741a-e6a1-449a-adbe-4d29aaa8468a",
-        "retractedMessageUuids": ["490b7142-41ad-4667-8166-469606129093"],
-        "refusedUserMessageUuid": "490b7142-41ad-4667-8166-469606129093",
-        "userType": "external",
-        "entrypoint": "cli",
-        "cwd": "/test",
-        "sessionId": "583790a4-8207-4478-92ee-ebb9538b54dd",
-        "version": "2.1.201",
-        "gitBranch": "HEAD"
-    });
+    let json = model_refusal_fallback_json(serde_json::json!({
+        "refusedUserMessageUuid": "490b7142-41ad-4667-8166-469606129093"
+    }));
 
     match serde_json::from_value::<LogLine>(json)
         .expect("Failed to parse model_refusal_fallback with refusedUserMessageUuid")
@@ -2433,34 +2415,10 @@ fn test_parse_model_refusal_fallback_scope() {
 
 #[test]
 fn test_parse_model_refusal_fallback_with_null_refused_user_message_uuid() {
-    // The real 2.1.201 shape records the key present but JSON-null (Claude Code noted no refused
-    // user message), distinct from the absent-key path the base fixtures cover.
-    let json = serde_json::json!({
-        "type": "system",
-        "subtype": "model_refusal_fallback",
-        "parentUuid": "9528e913-20fc-42ea-9e4c-5fb080b07c04",
-        "isSidechain": false,
-        "direction": "retry",
-        "content": "Fable 5's safeguards flagged this message. Switched to Opus 4.8.",
-        "level": "warning",
-        "trigger": "refusal",
-        "originalModel": "claude-fable-5",
-        "fallbackModel": "claude-opus-4-8",
-        "requestId": "req_011Ccmjmo1wkFV3JyX6W34NT",
-        "apiRefusalCategory": "cyber",
-        "apiRefusalExplanation": null,
-        "isMeta": false,
-        "timestamp": "2026-07-07T00:19:18.167Z",
-        "uuid": "5eba741a-e6a1-449a-adbe-4d29aaa8468a",
-        "retractedMessageUuids": ["490b7142-41ad-4667-8166-469606129093"],
-        "refusedUserMessageUuid": null,
-        "userType": "external",
-        "entrypoint": "cli",
-        "cwd": "/test",
-        "sessionId": "583790a4-8207-4478-92ee-ebb9538b54dd",
-        "version": "2.1.201",
-        "gitBranch": "HEAD"
-    });
+    // JSON null is distinct from the absent-key path covered by the base fixture.
+    let json = model_refusal_fallback_json(serde_json::json!({
+        "refusedUserMessageUuid": null
+    }));
 
     match serde_json::from_value::<LogLine>(json)
         .expect("Failed to parse model_refusal_fallback with null refusedUserMessageUuid")
@@ -2474,32 +2432,9 @@ fn test_parse_model_refusal_fallback_with_null_refused_user_message_uuid() {
 
 #[test]
 fn test_parse_model_refusal_fallback_rejects_unknown_fields() {
-    let json = serde_json::json!({
-        "type": "system",
-        "subtype": "model_refusal_fallback",
-        "parentUuid": "77502799-98d4-4548-b903-ed5d6f797e41",
-        "isSidechain": false,
-        "direction": "retry",
-        "content": "Switched to Opus 4.8.",
-        "level": "warning",
-        "trigger": "refusal",
-        "originalModel": "claude-fable-5",
-        "fallbackModel": "claude-opus-4-8",
-        "requestId": "req_011CbtEUxmnDLZxNhMjZT5dt",
-        "apiRefusalCategory": null,
-        "apiRefusalExplanation": null,
-        "isMeta": false,
-        "timestamp": "2026-06-09T19:24:49.832Z",
-        "uuid": "6e45b19e-8f68-4144-9eac-c1577fe3737e",
-        "retractedMessageUuids": [],
-        "userType": "external",
-        "entrypoint": "cli",
-        "cwd": "/test",
-        "sessionId": "f671f20e-5ef4-41d5-bfe5-aa4b87a2bd54",
-        "version": "2.1.170",
-        "gitBranch": "HEAD",
+    let json = model_refusal_fallback_json(serde_json::json!({
         "unknownField": "should be rejected"
-    });
+    }));
 
     let err_msg = serde_json::from_value::<LogLine>(json)
         .expect_err("Should reject unknown fields due to deny_unknown_fields")
@@ -10986,6 +10921,16 @@ fn test_parse_user_log_line_with_origin() {
     let line: UserLogLine = serde_json::from_value(json).unwrap();
     let origin = line.origin.unwrap();
     assert_eq!(origin.kind, "task-notification");
+}
+
+#[test]
+fn test_parse_user_log_line_with_turn_origin() {
+    let json = user_log_line_json(serde_json::json!({
+        "version": "2.1.278",
+        "turnOrigin": "human"
+    }));
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(line.turn_origin.as_deref(), Some("human"));
 }
 
 #[test]

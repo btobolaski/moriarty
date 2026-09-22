@@ -406,6 +406,10 @@ fn claude_system_fields(system: &ClaudeSystemLogLine) -> ClaudeSystemFields {
             timestamp: line.timestamp,
             uuid: line.uuid,
         },
+        ClaudeSystemLogLine::ModelRefusalNoFallback(line) => ClaudeSystemFields {
+            timestamp: line.timestamp,
+            uuid: line.uuid,
+        },
         ClaudeSystemLogLine::ModelConsentFallback(line) => ClaudeSystemFields {
             timestamp: line.timestamp,
             uuid: line.uuid,
@@ -715,6 +719,7 @@ mod tests {
     const CLAUDE_SYSTEM_STOP_HOOK_SUMMARY_UUID: &str = "13131313-1313-4313-8313-131313131313";
     const CLAUDE_SYSTEM_TURN_DURATION_UUID: &str = "14141414-1414-4414-8414-141414141414";
     const CLAUDE_SYSTEM_CONSENT_FALLBACK_UUID: &str = "17171717-1717-4717-8717-171717171717";
+    const CLAUDE_SYSTEM_REFUSAL_NO_FALLBACK_UUID: &str = "20202020-2020-4020-8020-202020202020";
     const CLAUDE_SYSTEM_AWAY_SUMMARY_UUID: &str = "18181818-1818-4818-8818-181818181818";
     const CLAUDE_SYSTEM_AGENTS_KILLED_UUID: &str = "19191919-1919-4919-8919-191919191919";
     const CLAUDE_SYSTEM_LOGICAL_PARENT_UUID: &str = "15151515-1515-4515-8515-151515151515";
@@ -1309,6 +1314,30 @@ mod tests {
         metadata.insert("persistedAsDefault".to_string(), json!(false));
         metadata.insert("isMeta".to_string(), json!(false));
         metadata.insert("session_id".to_string(), json!(CLAUDE_SESSION_ID));
+        serde_json::Value::Object(metadata)
+    }
+
+    fn claude_system_refusal_no_fallback_json() -> serde_json::Value {
+        let mut metadata = claude_system_json(
+            "model_refusal_no_fallback",
+            Some(CLAUDE_PARENT_UUID),
+            CLAUDE_SYSTEM_REFUSAL_NO_FALLBACK_UUID,
+        );
+        metadata.remove("slug");
+        metadata.insert("content".to_string(), json!(""));
+        metadata.insert("level".to_string(), json!("warning"));
+        metadata.insert("originalModel".to_string(), json!("claude-opus-5"));
+        metadata.insert("requestId".to_string(), json!("req-refusal"));
+        metadata.insert(
+            "apiRefusalCategory".to_string(),
+            json!("reasoning_extraction"),
+        );
+        metadata.insert("apiRefusalExplanation".to_string(), json!("refusal"));
+        metadata.insert(
+            "refusedUserMessageUuid".to_string(),
+            json!(CLAUDE_USER_UUID),
+        );
+        metadata.insert("isMeta".to_string(), json!(false));
         serde_json::Value::Object(metadata)
     }
 
@@ -2111,6 +2140,12 @@ mod tests {
                 value: claude_system_consent_fallback_json,
                 expected_timestamp: ExpectedClaudeTimestamp::Real,
                 expected_id: CLAUDE_SYSTEM_CONSENT_FALLBACK_UUID.to_string(),
+            },
+            ClaudeNonBillableCase {
+                name: "system refusal without fallback",
+                value: claude_system_refusal_no_fallback_json,
+                expected_timestamp: ExpectedClaudeTimestamp::Real,
+                expected_id: CLAUDE_SYSTEM_REFUSAL_NO_FALLBACK_UUID.to_string(),
             },
             ClaudeNonBillableCase {
                 name: "queue operation",

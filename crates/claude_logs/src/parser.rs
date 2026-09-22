@@ -1660,6 +1660,7 @@ pub enum SystemLogLine {
     StopHookSummary(StopHookSummary),
     TurnDuration(TurnDuration),
     ModelRefusalFallback(ModelRefusalFallback),
+    ModelRefusalNoFallback(ModelRefusalNoFallback),
     ModelConsentFallback(ModelConsentFallback),
     AwaySummary(AwaySummary),
     AgentsKilled(AgentsKilled),
@@ -1788,6 +1789,32 @@ pub struct ModelRefusalFallback {
     /// The user message whose request was refused; `null` when Claude Code recorded none.
     /// Added in Claude Code 2.1.201+.
     pub refused_user_message_uuid: Option<Uuid>,
+}
+
+/// Records a refusal when Claude Code has no fallback model to retry with. Its distinct subtype
+/// carries no retry direction, fallback model, or retracted-turn list. Added in Claude Code 2.1.270+.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct ModelRefusalNoFallback {
+    pub parent_uuid: Option<Uuid>,
+    pub is_sidechain: bool,
+    pub user_type: String,
+    pub cwd: String,
+    pub session_id: Uuid,
+    pub version: String,
+    pub git_branch: String,
+    pub content: String,
+    pub level: String,
+    pub original_model: Model,
+    pub request_id: String,
+    pub api_refusal_category: Option<String>,
+    pub api_refusal_explanation: Option<String>,
+    pub refused_user_message_uuid: Option<Uuid>,
+    pub is_meta: bool,
+    pub timestamp: DateTime<Utc>,
+    pub uuid: Uuid,
+    pub entrypoint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -2326,6 +2353,9 @@ pub struct UserLogLine {
     pub prompt_id: Option<Uuid>,
     /// How the prompt was submitted (e.g., "typed"). Added in Claude Code 2.1.170+.
     pub prompt_source: Option<String>,
+    /// Whether the turn originated from a human or another source; preserved because strict
+    /// deserialization would otherwise discard the entire conversation record. Added in 2.1.278+.
+    pub turn_origin: Option<String>,
     /// Current permission mode. Added in Claude Code 2.1.77+.
     pub permission_mode: Option<PermissionMode>,
     /// Plan content when in plan mode. Added in Claude Code 2.1.77+.
