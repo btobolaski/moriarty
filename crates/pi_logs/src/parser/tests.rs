@@ -4735,6 +4735,7 @@ fn route_fixture(name: &str) -> Value {
         "lens-mark" => r#"{"anchor":"ddw:de888769f455","disposition":"suppress","line":11}"#,
         "lens-delta" => r#"{"mode":"delta","warnings":0,"carriedOverFiles":1}"#,
         "lens-all" => r#"{"mode":"all","filesChecked":4,"staleDropped":0}"#,
+        "lens-all-findings" => r#"{"mode":"all","filesWithIssues":1,"totalBlocking":3,"totalErrors":3,"totalWarnings":1,"totalAdvisories":0,"staleDropped":0,"dispositionSuppressed":0,"waitMs":0}"#,
         "lens-directory" => r#"{"mode":"directory","filePath":"/tmp","severity":"error","serverScope":"all","filesScanned":100,"capped":true,"diagnostics":[],"primaryDiagnosticsCount":0,"auxiliaryDiagnosticsCount":0,"totalDiagnostics":0,"truncated":false,"cleanFiles":1,"unconfirmedFiles":99,"concurrency":8,"source":"lsp","scope":"paths"}"#,
         "lens-summary" => r#"{"filesWithIssues":2,"totalBlocking":1,"totalErrors":1,"totalWarnings":3,"staleDropped":0}"#,
         "lens-unavailable" => r#"{"mode":"full","filesChecked":0,"lspUnavailable":true}"#,
@@ -4816,6 +4817,36 @@ fn lens_diagnostics_batch_preserves_lens_metadata() {
     assert_eq!(details.server_scope, LensDiagnosticsServerScope::All);
     assert_eq!(details.disposition_suppressed, Some(13));
     assert_eq!(details.timed_out_files, Some(1));
+}
+
+#[test]
+fn lens_diagnostics_all_preserves_optional_findings_metadata() {
+    let Some(ToolResultDetails::LensDiagnostics(LensDiagnosticsDetails::All(
+        LensDiagnosticsSummary::Findings(details),
+    ))) = tool_result_with_details("lens_diagnostics", route_fixture("lens-all-findings")).details
+    else {
+        panic!("expected lens all findings details")
+    };
+    assert_eq!(details.total_advisories, Some(0));
+    assert_eq!(details.disposition_suppressed, Some(0));
+    assert_eq!(details.wait_ms, Some(0));
+
+    let mut legacy = route_fixture("lens-summary");
+    legacy["mode"] = json!("all");
+    let Some(ToolResultDetails::LensDiagnostics(LensDiagnosticsDetails::All(
+        LensDiagnosticsSummary::Findings(details),
+    ))) = tool_result_with_details("lens_diagnostics", legacy).details
+    else {
+        panic!("expected legacy lens all findings details")
+    };
+    assert_eq!(
+        (
+            details.total_advisories,
+            details.disposition_suppressed,
+            details.wait_ms
+        ),
+        (None, None, None)
+    );
 }
 
 #[test]

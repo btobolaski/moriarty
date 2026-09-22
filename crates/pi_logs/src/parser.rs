@@ -4508,7 +4508,23 @@ pub struct LensDiagnosticsDeltaFindings {
 #[serde(untagged)]
 pub enum LensDiagnosticsSummary {
     Clean(LensDiagnosticsClean),
-    Findings(LensDiagnosticsFindings),
+    Findings(LensDiagnosticsSummaryFindings),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LensDiagnosticsSummaryFindings {
+    pub files_with_issues: NonZeroUsize,
+    pub total_blocking: u32,
+    pub total_errors: u32,
+    pub total_warnings: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_advisories: Option<u32>,
+    pub stale_dropped: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disposition_suppressed: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
