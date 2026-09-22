@@ -1955,6 +1955,9 @@ fn parse_tool_result_details(
             serde_json::from_value(details).map(ToolResultDetails::ContactSupervisor)
         }
         "edit" => serde_json::from_value(details).map(ToolResultDetails::Edit),
+        "effective_config" => {
+            serde_json::from_value(details).map(ToolResultDetails::EffectiveConfig)
+        }
         "fetch_content" => serde_json::from_value(details).map(ToolResultDetails::FetchContent),
         "fact_list" | "instinct_list" => {
             serde_json::from_value(details).map(ToolResultDetails::Count)
@@ -2184,9 +2187,11 @@ pub enum ToolResultDetails {
     LensDiagnosticMark(LensDiagnosticMarkDetails),
     LensDiagnostics(LensDiagnosticsDetails),
     LspDiagnostics(LspDiagnosticsDetails),
-    // Pi-lens owns this evolving envelope and no caller reads its fields;
-    // tool-name routing retains it without making unrelated untagged shapes
-    // deserialize as navigation details.
+    // Pi-lens owns these evolving envelopes and cost analysis does not read
+    // their fields; explicit tool-name routing preserves them without letting
+    // arbitrary objects absorb unrelated untagged details.
+    #[serde(skip_deserializing)]
+    EffectiveConfig(JsonBlob),
     #[serde(skip_deserializing)]
     LspNavigation(JsonBlob),
     ModuleReport(ModuleReportDetails),

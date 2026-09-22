@@ -4831,6 +4831,23 @@ fn lens_and_lsp_batch_shapes_remain_strictly_distinct() {
 }
 
 #[test]
+fn effective_config_tool_result_preserves_evolving_details() {
+    let details = json!({
+        "summary": "effective_config ~/repo/config.yaml — 0 config file(s) · 4 server(s) selected · 6 tool(s)",
+        "documents": 0,
+        "provenance": 0,
+        "file": "~/repo/config.yaml",
+        "selectedServers": 4,
+        "futureMetadata": {"enabled": true}
+    });
+    let tool_result = tool_result_with_details("effective_config", details.clone());
+    let Some(ToolResultDetails::EffectiveConfig(JsonBlob(parsed))) = tool_result.details else {
+        panic!("expected effective_config details")
+    };
+    assert_eq!(parsed, details);
+}
+
+#[test]
 fn lsp_navigation_tool_result_accepts_success_and_future_metadata() {
     let tool_result = tool_result_with_details(
         "lsp_navigation",
