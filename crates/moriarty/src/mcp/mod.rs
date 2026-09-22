@@ -17,6 +17,8 @@
 //! moriarty mcp install  # Install all servers to Claude Code
 //! ```
 
+use std::path::PathBuf;
+
 use clap::Subcommand;
 
 use git_read_only::GitReadOnly;
@@ -38,6 +40,11 @@ pub mod git_read_only;
 pub mod jj_read_only;
 pub mod read_only;
 pub mod tool_runner;
+
+// Resolving `.` at use time keeps omitted project directories relative to the server's cwd.
+fn default_project_dir() -> PathBuf {
+    PathBuf::from(".")
+}
 
 #[derive(Debug, Subcommand)]
 pub enum McpServers {
@@ -157,7 +164,11 @@ async fn install_single_mcp_server(server_name: &str) -> miette::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeSet, time::Duration};
+    use std::{
+        collections::BTreeSet,
+        env::{current_dir, set_current_dir},
+        time::Duration,
+    };
 
     use rmcp::{ServerHandler, ServiceExt};
     use serde_json::{Value, json};
@@ -167,7 +178,10 @@ mod tests {
         time::timeout,
     };
 
-    use super::{GitReadOnly, JjReadOnly, ToolRunner};
+    use super::{
+        GitReadOnly, JjReadOnly, ToolRunner, git_read_only::StatusArgs, jj_read_only::JjArgs,
+        tool_runner::RunArgs,
+    };
     use crate::{
         project_config::approvals,
         test_helpers::{setup_isolated_xdg_config, setup_project_dir_with_config},
@@ -358,8 +372,8 @@ mod tests {
             let tool = find_tool(response, name);
             let actual_required: BTreeSet<_> = tool["inputSchema"]["required"]
                 .as_array()
-                .unwrap()
-                .iter()
+                .into_iter()
+                .flatten()
                 .map(|field| field.as_str().unwrap())
                 .collect();
             assert_eq!(actual_required, required.iter().copied().collect());
@@ -374,13 +388,24 @@ mod tests {
         assert_tool_contract(
             &tools,
             &[
-                ("status", &["project_dir", "args"]),
-                ("diff", &["project_dir", "args"]),
-                ("log", &["project_dir", "args"]),
-                ("show", &["project_dir", "args"]),
+                ("status", &["args"]),
+                ("diff", &["args"]),
+                ("log", &["args"]),
+                ("show", &["args"]),
             ],
         );
         client.close().await;
+    }
+
+    #[test]
+    fn omitted_project_dir_defaults_to_server_cwd() {
+        let git: StatusArgs = serde_json::from_value(json!({ "args": [] })).unwrap();
+        let jj: JjArgs =
+            serde_json::from_value(json!({ "command": "status", "args": [] })).unwrap();
+        let tools: RunArgs = serde_json::from_value(json!({})).unwrap();
+        for dir in [git.project_dir, jj.project_dir, tools.project_dir] {
+            assert_eq!(dir.canonicalize().unwrap(), current_dir().unwrap());
+        }
     }
 
     #[tokio::test]
@@ -450,6 +475,18 @@ mod tests {
             }))
             .await;
         assert_legacy_result_shape(&prompt);
+        let status = client
+            .request(json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "tools/call",
+                "params": { "name": "status", "arguments": { "args": [] } }
+            }))
+            .await;
+        assert_eq!(
+            status["result"]["structuredContent"]["exit_code"], 0,
+            "{status}"
+        );
         assert_eq!(
             prompt["result"]["messages"]
                 .as_array()
@@ -468,7 +505,7 @@ mod tests {
         assert_eq!(response["result"]["protocolVersion"], "2025-11-25");
 
         let tools = list_tools(&mut client).await;
-        assert_tool_contract(&tools, &[("run", &["project_dir", "command", "args"])]);
+        assert_tool_contract(&tools, &[("run", &["command", "args"])]);
         let command_values: BTreeSet<_> =
             find_tool(&tools, "run")["inputSchema"]["$defs"]["JjCommand"]["enum"]
                 .as_array()
@@ -490,6 +527,21 @@ mod tests {
             .into_iter()
             .collect()
         );
+        let status = client
+            .request(json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "run",
+                    "arguments": { "command": "status", "args": [] }
+                }
+            }))
+            .await;
+        assert_eq!(
+            status["result"]["structuredContent"]["exit_code"], 0,
+            "{status}"
+        );
         client.close().await;
     }
 
@@ -502,11 +554,11 @@ mod tests {
         assert_tool_contract(
             &tools,
             &[
-                ("run_lint", &["project_dir"]),
-                ("run_build", &["project_dir"]),
-                ("run_formatter", &["project_dir"]),
-                ("run_tests", &["project_dir"]),
-                ("run_checks", &["project_dir"]),
+                ("run_lint", &[]),
+                ("run_build", &[]),
+                ("run_formatter", &[]),
+                ("run_tests", &[]),
+                ("run_checks", &[]),
             ],
         );
         client.close().await;
@@ -565,6 +617,23 @@ lint = ["sh", "-c", "printf failure-out; printf failure-err >&2; exit 7"]
             .await;
         assert_legacy_result_shape(&nonzero);
         assert_eq!(nonzero["result"]["isError"], true);
+
+        let original_dir = current_dir().unwrap();
+        set_current_dir(project.path()).unwrap();
+        let defaulted = client
+            .request(json!({
+                "jsonrpc": "2.0",
+                "id": 6,
+                "method": "tools/call",
+                "params": { "name": "run_tests", "arguments": {} }
+            }))
+            .await;
+        set_current_dir(original_dir).unwrap();
+        assert_eq!(defaulted["result"]["isError"], false, "{defaulted}");
+        assert_eq!(
+            defaulted["result"]["content"][0]["text"],
+            "stdout: \n\n success-out"
+        );
 
         let absent = client
             .request(json!({
