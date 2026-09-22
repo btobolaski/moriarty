@@ -255,8 +255,12 @@ with warnings, while explicit missing paths and having no available source are e
   for shapes that require custom deserialization or specific corrupt-stream tolerance
 - Newer pi-subagents metadata includes `SubagentSupervisorReplyData`, request `reply_hint`s, control-event
   `tool_call_id`s, and `SubagentWaitStatus` in mutually exclusive completed/early-return `bg_wait` outcomes
-- Pi-lens result details use tool-name-routed, derived Serde schemas: `lens_diagnostics` distinguishes delta/all/batch/full
-  (including unavailable) responses, `lsp_diagnostics` distinguishes file/batch/directory responses,
+- Custom messages keep accreting extension-owned types: `shepard-assignment` (a shepard live-test assignment whose task
+  text lives in the outer `content`) parses as a unit variant like `subagent-notify`
+- Pi-lens result details use tool-name-routed, derived Serde schemas: `lens_diagnostics` distinguishes
+  delta/all/batch/directory/full (including unavailable) responses — the directory sweep shares the lsp_diagnostics
+  directory shape but keeps lens's typed severity/source/scope enums, with the same optional sibling fields as the
+  lens batch envelope (`dispositionSuppressed`, timeouts, health warnings, wait) — `lsp_diagnostics` distinguishes file/batch/directory responses,
   `lens_diagnostic_mark` keeps typed dispositions and nonzero lines, and `module_report` accepts optional callback
   support. `fetch_content` also accepts its optional timestamp metadata. `ast_grep_replace`/`ast_grep_search` are routed
   to all-optional detail structs because each tool emits several partially-overlapping shapes (structural-rule vs

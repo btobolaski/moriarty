@@ -4735,6 +4735,7 @@ fn route_fixture(name: &str) -> Value {
         "lens-mark" => r#"{"anchor":"ddw:de888769f455","disposition":"suppress","line":11}"#,
         "lens-delta" => r#"{"mode":"delta","warnings":0,"carriedOverFiles":1}"#,
         "lens-all" => r#"{"mode":"all","filesChecked":4,"staleDropped":0}"#,
+        "lens-directory" => r#"{"mode":"directory","filePath":"/tmp","severity":"error","serverScope":"all","filesScanned":100,"capped":true,"diagnostics":[],"primaryDiagnosticsCount":0,"auxiliaryDiagnosticsCount":0,"totalDiagnostics":0,"truncated":false,"cleanFiles":1,"unconfirmedFiles":99,"concurrency":8,"source":"lsp","scope":"paths"}"#,
         "lens-summary" => r#"{"filesWithIssues":2,"totalBlocking":1,"totalErrors":1,"totalWarnings":3,"staleDropped":0}"#,
         "lens-unavailable" => r#"{"mode":"full","filesChecked":0,"lspUnavailable":true}"#,
         "ast-replace" => r#"{"matchCount":8,"totalMatches":8,"truncated":false,"applied":true}"#,
@@ -4759,6 +4760,7 @@ macro_rules! route_pattern {
     (LensDelta) => { ToolResultDetails::LensDiagnostics(LensDiagnosticsDetails::Delta(_)) };
     (LensAll) => { ToolResultDetails::LensDiagnostics(LensDiagnosticsDetails::All(_)) };
     (LensBatch) => { ToolResultDetails::LensDiagnostics(LensDiagnosticsDetails::Batch(_)) };
+    (LensDirectory) => { ToolResultDetails::LensDiagnostics(LensDiagnosticsDetails::Directory(LensDiagnosticsDirectory { clean_files: 1, unconfirmed_files: 99, .. })) };
     (LensFindings) => { ToolResultDetails::LensDiagnostics(LensDiagnosticsDetails::Full(LensDiagnosticsFull::Findings(_))) };
     (LensUnavailable) => { ToolResultDetails::LensDiagnostics(LensDiagnosticsDetails::Full(LensDiagnosticsFull::Unavailable(_))) };
     (AstReplace) => { ToolResultDetails::AstGrepReplace(AstGrepReplaceDetails { total_matches: Some(8), .. }) };
@@ -4789,6 +4791,7 @@ fn tool_result_details_route_current_shapes() {
         ("lens delta", "lens_diagnostics", route_fixture("lens-delta"), LensDelta),
         ("lens all", "lens_diagnostics", route_fixture("lens-all"), LensAll),
         ("lens batch", "lens_diagnostics", lens_batch_details(), LensBatch),
+        ("lens directory", "lens_diagnostics", route_fixture("lens-directory"), LensDirectory),
         ("lens findings", "lens_diagnostics", full, LensFindings),
         ("lens unavailable", "lens_diagnostics", route_fixture("lens-unavailable"), LensUnavailable),
         ("ast replace", "ast_grep_replace", route_fixture("ast-replace"), AstReplace),
@@ -5532,6 +5535,20 @@ fn custom_message_firstpick_session_summary_rpc() {
         }
         other => panic!("expected FirstPickSessionSummaryRpc, got {other:?}"),
     }
+}
+
+#[test]
+fn custom_message_shepard_assignment_has_no_details() {
+    // Pinned from a production line (the parse failure that motivated the
+    // variant): shepard live-test assignments carry only outer `content`.
+    assert!(matches!(
+        parse_custom_message_payload(
+            "Perform this one live test: ...",
+            "shepard-assignment",
+            None,
+        ),
+        CustomMessagePayload::ShepardAssignment
+    ));
 }
 
 #[test]

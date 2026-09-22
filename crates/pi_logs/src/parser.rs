@@ -468,6 +468,11 @@ pub enum CustomMessagePayload {
     /// field, which is observed empty for these state records.
     #[serde(rename = "firstpick:session-summary-rpc")]
     FirstPickSessionSummaryRpc(FirstPickSessionSummaryRpcDetails),
+    /// Live-test assignment message from the shepard extension: the task
+    /// text lives in the outer `content` field and no structured `details`
+    /// payload is attached.
+    #[serde(rename = "shepard-assignment")]
+    ShepardAssignment,
 }
 
 // ---------------------------------------------------------------------------
@@ -4368,6 +4373,8 @@ pub enum LensDiagnosticsDetails {
     All(LensDiagnosticsSummary),
     #[serde(rename = "batch")]
     Batch(LensDiagnosticsBatch),
+    #[serde(rename = "directory")]
+    Directory(LensDiagnosticsDirectory),
     #[serde(rename = "full")]
     Full(LensDiagnosticsFull),
 }
@@ -4435,6 +4442,39 @@ pub struct LensDiagnosticsBatch {
     pub incomplete_files: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_errors: Option<Vec<String>>,
+}
+
+/// The lens directory sweep shares the lsp_diagnostics directory shape but
+/// keeps lens's typed severity/source/scope enums, like the lens batch
+/// envelope above.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LensDiagnosticsDirectory {
+    pub file_path: PathBuf,
+    pub severity: LensDiagnosticsSeverity,
+    pub server_scope: LensDiagnosticsServerScope,
+    pub source: LensDiagnosticsSource,
+    pub scope: LensDiagnosticsScope,
+    pub files_scanned: u32,
+    pub capped: bool,
+    pub diagnostics: Vec<JsonValue>,
+    pub primary_diagnostics_count: u32,
+    pub auxiliary_diagnostics_count: u32,
+    pub total_diagnostics: u32,
+    pub truncated: bool,
+    pub clean_files: u32,
+    pub unconfirmed_files: u32,
+    pub concurrency: NonZeroUsize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disposition_suppressed: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timed_out_files: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_errors: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lsp_health_warnings: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
