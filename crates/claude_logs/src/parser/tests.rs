@@ -1420,6 +1420,25 @@ fn test_parse_assistant_with_web_fetch_and_context_management() {
     }
 }
 
+#[test]
+fn test_parse_assistant_with_request_transformations_and_advisor_metadata() {
+    let assistant = parse_assistant_log_line(assistant_log_line_json(serde_json::json!({
+        "message": {"input_transformations": []},
+        "serverClassifierRequest": "eaa2d39a-7616-47a4-9dd0-2b2ffcdde685",
+        "advisorModel": "claude-opus-5"
+    })));
+
+    assert_eq!(
+        assistant.message.input_transformations,
+        Some(serde_json::json!([]))
+    );
+    assert_eq!(
+        assistant.server_classifier_request.as_deref(),
+        Some("eaa2d39a-7616-47a4-9dd0-2b2ffcdde685")
+    );
+    assert_eq!(assistant.advisor_model.as_deref(), Some("claude-opus-5"));
+}
+
 // Synthetic API-error assistant turn (Claude Code 2.1.158) carrying error type + HTTP status.
 #[test]
 fn test_parse_assistant_api_error_message_with_status() {

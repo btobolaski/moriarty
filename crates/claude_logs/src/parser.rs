@@ -2656,6 +2656,9 @@ pub struct AssistantLogLine {
     pub slug: Option<String>,
     pub message: AssistantLogMessage,
     pub request_id: Option<String>,
+    /// Opaque identifiers/metadata that do not affect usage attribution.
+    pub server_classifier_request: Option<String>,
+    pub advisor_model: Option<String>,
     pub uuid: Uuid,
     pub timestamp: DateTime<Utc>,
     pub is_api_error_message: Option<bool>,
@@ -2779,6 +2782,8 @@ pub struct AssistantLogMessage {
     /// Diagnostic details from Claude Code about the request (e.g., cache miss reason).
     /// Added in Claude Code 2.1.141+.
     pub diagnostics: Option<Diagnostics>,
+    /// Provider-managed data is unused by reports and can evolve independently.
+    pub input_transformations: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
