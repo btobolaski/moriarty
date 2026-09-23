@@ -2406,6 +2406,121 @@ pub struct UserLogLine {
     /// and the `image` content blocks carrying the data. Logged as `null` on turns with no paste, so
     /// `Option` covers both the null and the absent case. Added in Claude Code 2.1.257+.
     pub image_paste_ids: Option<Vec<u32>>,
+    /// Structured environment context Claude Code sends alongside the request for server-side
+    /// classification, the object-shaped counterpart of `classifier_meta_lines`. Absent on older
+    /// lines, hence `Option`. Added in Claude Code 2.1.278+.
+    pub server_classifier_context: Option<ServerClassifierContext>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerClassifierContext {
+    pub request: Uuid,
+    pub context: ClassifierEnvironment,
+}
+
+/// Wire keys are snake_case, unlike the camelCase log envelope around them.
+///
+/// `platform` stays a `String` because its vocabulary (observed: `macos`) is undocumented and
+/// nothing downstream reads it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClassifierEnvironment {
+    pub git_state: ClassifierGitState,
+    pub live_cwd: String,
+    pub platform: String,
+}
+
+/// Untagged over the two shapes Claude Code emits, for the same reason as [`AutoModeExit`]: sibling
+/// `Option` fields could represent a half-collected snapshot the wire format never produces.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ClassifierGitState {
+    Collected(Box<CollectedGitState>),
+    Pending(PendingGitState),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CollectedGitState {
+    pub cwd: String,
+    pub root: String,
+    pub branch: String,
+    pub default_branch: Option<String>,
+    pub status: ClassifierGitStatus,
+    pub visibility: ClassifierGitVisibility,
+}
+
+/// Logged while Claude Code is still collecting git state: the collected keys are present but
+/// always `null`, so they are `()` fields (serde reads `null` into `()`) that reject any value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PendingGitState {
+    pub cwd: String,
+    pub root: (),
+    pub branch: (),
+    pub default_branch: (),
+    pub status: (),
+    pub visibility: (),
+    pub error: GitStateError,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitStateError {
+    Pending,
+}
+
+/// Only `null` has been observed for `porcelain`, so it is `()` like [`PendingGitState`]'s null
+/// keys: the first non-null payload fails to parse and exposes the real shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClassifierGitStatus {
+    pub clean: bool,
+    pub counts: ClassifierGitCounts,
+    pub porcelain: (),
+    pub truncated: bool,
+}
+
+/// `untracked` has only been observed `null` alongside a populated `untracked_normal`, so it is
+/// `Option` while its sibling counts are required.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClassifierGitCounts {
+    pub staged: u64,
+    pub modified: u64,
+    pub untracked: Option<u64>,
+    pub untracked_normal: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClassifierGitVisibility {
+    pub origin: ClassifierRemoteVisibility,
+    pub push_remote: Option<String>,
+    pub remotes: Vec<ClassifierNamedRemote>,
+    pub visibility_cache: Vec<ClassifierRemoteVisibility>,
+}
+
+/// `visibility` stays a `String` because its vocabulary (observed: `private`, `unknown`) is
+/// undocumented and nothing downstream reads it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClassifierRemoteVisibility {
+    pub host: String,
+    pub remote: String,
+    pub visibility: String,
+}
+
+/// Repeats [`ClassifierRemoteVisibility`]'s fields rather than flattening it because
+/// `serde(flatten)` cannot be combined with `deny_unknown_fields`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClassifierNamedRemote {
+    pub name: String,
+    pub host: String,
+    pub remote: String,
+    pub visibility: String,
 }
 
 /// Summarization metadata on a compact-summary user turn. Added in Claude Code 2.1.214+.

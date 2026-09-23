@@ -6215,6 +6215,92 @@ fn test_parse_user_log_line_with_image_paste_ids() {
     assert_eq!(line.image_paste_ids, Some(vec![1]));
 }
 
+fn classifier_git_state_line(git_state: serde_json::Value) -> serde_json::Value {
+    user_log_line_json(serde_json::json!({
+        "version": "2.1.280",
+        "serverClassifierContext": {
+            "request": "eb3b6cbc-983e-4e58-b358-cf4355106ea2",
+            "context": {"git_state": git_state, "live_cwd": "/repo", "platform": "macos"}
+        }
+    }))
+}
+
+fn parse_classifier_git_state(git_state: serde_json::Value) -> ClassifierGitState {
+    let line: UserLogLine = serde_json::from_value(classifier_git_state_line(git_state)).unwrap();
+    line.server_classifier_context.unwrap().context.git_state
+}
+
+fn collected_git_status_json() -> serde_json::Value {
+    serde_json::json!({
+        "clean": false,
+        "counts": {"staged": 40, "modified": 2, "untracked": null, "untracked_normal": 0},
+        "porcelain": null,
+        "truncated": false
+    })
+}
+
+#[test]
+fn test_parse_user_log_line_with_server_classifier_context() {
+    let git_state = parse_classifier_git_state(serde_json::json!({
+        "cwd": "/repo",
+        "root": "/repo",
+        "branch": "HEAD",
+        "default_branch": null,
+        "status": collected_git_status_json(),
+        "visibility": {
+            "origin": {"host": "github.com", "remote": "github.com/org/repo", "visibility": "private"},
+            "push_remote": "github.com/org/repo",
+            "remotes": [{
+                "name": "origin",
+                "host": "github.com",
+                "remote": "github.com/org/repo",
+                "visibility": "private"
+            }],
+            "visibility_cache": [
+                {"host": "github.com", "remote": "github.com/org/repo", "visibility": "private"}
+            ]
+        }
+    }));
+    let ClassifierGitState::Collected(collected) = git_state else {
+        panic!("expected collected git state, got {git_state:?}");
+    };
+    assert_eq!(collected.status.counts.untracked, None);
+    assert_eq!(collected.visibility.remotes[0].name, "origin");
+}
+
+fn pending_git_state_json(status: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "cwd": "/repo",
+        "root": null,
+        "branch": null,
+        "default_branch": null,
+        "status": status,
+        "visibility": null,
+        "error": "pending"
+    })
+}
+
+#[test]
+fn test_parse_user_log_line_with_pending_server_classifier_git_state() {
+    let git_state = parse_classifier_git_state(pending_git_state_json(serde_json::Value::Null));
+    let ClassifierGitState::Pending(pending) = git_state else {
+        panic!("expected pending git state, got {git_state:?}");
+    };
+    assert_eq!(pending.error, GitStateError::Pending);
+}
+
+#[test]
+fn test_parse_user_log_line_rejects_pending_git_state_with_collected_status() {
+    // A pending marker alongside collected data matches neither untagged variant.
+    let json = classifier_git_state_line(pending_git_state_json(collected_git_status_json()));
+    let err = serde_json::from_value::<UserLogLine>(json)
+        .expect_err("Should reject a pending git state carrying collected status");
+    assert!(
+        err.to_string().contains("did not match any variant"),
+        "unexpected error: {err}"
+    );
+}
+
 #[test]
 fn test_parse_user_log_line_without_queue_priority() {
     // The field is absent on turns sent immediately, so it must default to None.

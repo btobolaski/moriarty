@@ -176,7 +176,12 @@ siblings stay `String`), and an `imagePasteIds` field on both user and assistant
   (`ModelRefusalFallback`, how far the fallback applies — observed `session` — kept a `String` for the same
   forward-compatibility reason as its `direction`/`trigger` siblings), and a `supersedesUuids` field on assistant turns
   (`AssistantLogLine`, the turns this one replaces; the retry's counterpart to the preceding refusal record's
-  `retractedMessageUuids`)
+  `retractedMessageUuids`), and a `serverClassifierContext` field on user turns (`ServerClassifierContext`, the
+  structured request id, live cwd, platform, and git state/remote-visibility snapshot sent for server-side
+  classification; its snake_case keys mirror the wire, and its git state is an untagged enum over a collected snapshot
+  and the pending one Claude Code logs with `error: "pending"` and every field but `cwd` null, so a half-collected
+  payload is not representable; undocumented vocabularies such as `visibility`/`platform` stay `String`; added in
+  Claude Code 2.1.278+)
 - Also owns the structured view of the raw `model` string via `model::Model { family, version }` plus `ModelFamily` and
   `ModelVersion`. Both `cost_analyzer` (for pricing) and `moriarty::api_pricing` (for grouping/display) consume this one
   parser so family/version classification is not duplicated across crates. The parser preserves capability-decorated raw
