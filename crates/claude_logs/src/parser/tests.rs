@@ -1831,9 +1831,10 @@ fn test_parse_assistant_without_web_fetch_requests() {
     }
 }
 
-#[test]
-fn test_parse_scheduled_task_fire() {
-    let json = serde_json::json!({
+/// Overlays `extra` onto a pre-2.1.280 `scheduled_task_fire` record, so a case states only the
+/// keys it is about.
+fn scheduled_task_fire_json(extra: serde_json::Value) -> serde_json::Value {
+    let mut json = serde_json::json!({
         "parentUuid": "eee9f696-e699-4606-873c-3134cfe5a284",
         "isSidechain": false,
         "type": "system",
@@ -1850,40 +1851,70 @@ fn test_parse_scheduled_task_fire() {
         "gitBranch": "HEAD",
         "slug": "we-need-to-build-mutable-hamming"
     });
+    merge_json(&mut json, extra);
+    json
+}
 
-    let line: LogLine =
-        serde_json::from_value(json).expect("Failed to parse scheduled_task_fire system message");
+fn parse_scheduled_task_fire(json: serde_json::Value) -> ScheduledTaskFire {
+    let LogLine::System(SystemLogLine::ScheduledTaskFire(fire)) =
+        serde_json::from_value(json).expect("Failed to parse scheduled_task_fire system message")
+    else {
+        panic!("Expected System(ScheduledTaskFire) variant");
+    };
+    fire
+}
 
-    match line {
-        LogLine::System(SystemLogLine::ScheduledTaskFire(fire)) => {
-            assert_eq!(fire.content, "Claude resuming /loop wakeup (Jun 1 10:45am)");
-            assert_eq!(fire.entrypoint.as_deref(), Some("cli"));
-            assert!(!fire.is_meta);
-        }
-        _ => panic!("Expected System(ScheduledTaskFire) variant"),
-    }
+#[test]
+fn test_parse_scheduled_task_fire() {
+    let fire = parse_scheduled_task_fire(scheduled_task_fire_json(serde_json::json!({})));
+    assert_eq!(fire.content, "Claude resuming /loop wakeup (Jun 1 10:45am)");
+    assert_eq!(fire.entrypoint.as_deref(), Some("cli"));
+    assert!(!fire.is_meta);
+    assert!(fire.task.is_none());
+}
+
+#[test]
+fn test_parse_scheduled_task_fire_with_task_metadata() {
+    let fire = parse_scheduled_task_fire(scheduled_task_fire_json(serde_json::json!({
+        "version": "2.1.280",
+        "taskId": "b160e32d",
+        "cron": "57 18 * * *",
+        "prompt": "Fix all of the parsing issues.",
+        "taskKind": "loop",
+        "cronKind": "loop"
+    })));
+    assert_eq!(
+        fire.task,
+        Some(ScheduledTaskInfo {
+            task_id: ScheduledTaskId("b160e32d".to_string()),
+            cron: "57 18 * * *".to_string(),
+            prompt: "Fix all of the parsing issues.".to_string(),
+            task_kind: ScheduledTaskKind::Loop,
+            cron_kind: ScheduledTaskKind::Loop,
+        })
+    );
+}
+
+#[test]
+fn test_parse_scheduled_task_fire_rejects_partial_task_metadata() {
+    let json = scheduled_task_fire_json(serde_json::json!({
+        "taskId": "b160e32d",
+        "cron": "57 18 * * *"
+    }));
+    let err_msg = serde_json::from_value::<LogLine>(json)
+        .expect_err("a partial task metadata set must be rejected")
+        .to_string();
+    assert!(
+        err_msg.contains("must all be present or all be absent"),
+        "unexpected error: {err_msg}"
+    );
 }
 
 #[test]
 fn test_parse_scheduled_task_fire_rejects_unknown_fields() {
-    let json = serde_json::json!({
-        "parentUuid": "eee9f696-e699-4606-873c-3134cfe5a284",
-        "isSidechain": false,
-        "type": "system",
-        "subtype": "scheduled_task_fire",
-        "content": "Claude resuming /loop wakeup (Jun 1 10:45am)",
-        "isMeta": false,
-        "timestamp": "2026-06-01T15:45:52.142Z",
-        "uuid": "ac7c4318-679d-45c7-8d86-3ca6934f8611",
-        "userType": "external",
-        "entrypoint": "cli",
-        "cwd": "/Users/brendan/src/switchboard-jj",
-        "sessionId": "2883cea4-f496-44b6-a291-354d7e39bdc6",
-        "version": "2.1.141",
-        "gitBranch": "HEAD",
-        "slug": "we-need-to-build-mutable-hamming",
+    let json = scheduled_task_fire_json(serde_json::json!({
         "unknownField": "should be rejected"
-    });
+    }));
 
     let err_msg = serde_json::from_value::<LogLine>(json)
         .expect_err("Should reject unknown fields due to deny_unknown_fields")
@@ -10221,6 +10252,41 @@ fn test_parse_attachment_queued_command_with_source_uuid() {
 }
 
 #[test]
+fn test_parse_attachment_queued_command_with_human_turn() {
+    let json = attachment_line_json(serde_json::json!({
+        "type": "queued_command",
+        "prompt": "queued while busy",
+        "commandMode": "prompt",
+        "humanTurn": true
+    }));
+    let AttachmentData::QueuedCommand(cmd) = parse_attachment(json) else {
+        panic!("Expected QueuedCommand");
+    };
+    assert_eq!(cmd.human_turn, Some(true));
+}
+
+#[test]
+fn test_parse_attachment_queued_command_with_usage() {
+    let json = attachment_line_json(serde_json::json!({
+        "type": "queued_command",
+        "prompt": "<task-notification>...</task-notification>",
+        "commandMode": "task-notification",
+        "usage": {"totalTokens": 198551, "toolUses": 19, "durationMs": 588282}
+    }));
+    let AttachmentData::QueuedCommand(cmd) = parse_attachment(json) else {
+        panic!("Expected QueuedCommand");
+    };
+    assert_eq!(
+        cmd.usage,
+        Some(QueuedCommandUsage {
+            total_tokens: 198551,
+            tool_uses: 19,
+            duration_ms: 588282
+        })
+    );
+}
+
+#[test]
 fn test_parse_attachment_queued_command_with_null_origin() {
     let json = serde_json::json!({
         "type": "attachment",
@@ -11036,6 +11102,28 @@ fn test_parse_user_log_line_with_turn_origin() {
     }));
     let line: UserLogLine = serde_json::from_value(json).unwrap();
     assert_eq!(line.turn_origin.as_deref(), Some("human"));
+}
+
+#[test]
+fn test_parse_user_log_line_with_scheduled_task_ids() {
+    let json = user_log_line_json(serde_json::json!({
+        "version": "2.1.280",
+        "scheduledTaskId": "b160e32d",
+        "scheduledFireId": "1dafc7d8-e39e-4e17-8250-e66dd45b5ad4"
+    }));
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(
+        line.scheduled_task_id,
+        Some(ScheduledTaskId("b160e32d".to_string()))
+    );
+    assert_eq!(
+        line.scheduled_fire_id,
+        Some(
+            "1dafc7d8-e39e-4e17-8250-e66dd45b5ad4"
+                .parse::<Uuid>()
+                .unwrap()
+        )
+    );
 }
 
 #[test]

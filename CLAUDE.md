@@ -181,7 +181,15 @@ siblings stay `String`), and an `imagePasteIds` field on both user and assistant
   classification; its snake_case keys mirror the wire, and its git state is an untagged enum over a collected snapshot
   and the pending one Claude Code logs with `error: "pending"` and every field but `cwd` null, so a half-collected
   payload is not representable; undocumented vocabularies such as `visibility`/`platform` stay `String`; added in
-  Claude Code 2.1.278+)
+  Claude Code 2.1.278+), and an optional undocumented `humanTurn` flag plus a `usage` object (`QueuedCommandUsage`,
+  the reported background task's token/tool-use/duration totals, present on `task-notification` commands) on
+  `queued_command` attachments (`QueuedCommand`), `scheduledTaskId`/`scheduledFireId` fields on user turns
+  (`UserLogLine`, linking a scheduled turn to the task and `scheduled_task_fire` record that produced it; the task id is
+  the shared `ScheduledTaskId` newtype), and `taskId`/`cron`/`prompt`/`taskKind`/`cronKind` on `scheduled_task_fire`
+  system records, grouped as `ScheduledTaskFire.task: Option<ScheduledTaskInfo>` because the wire always emits all
+  five together; like `SessionContext` it deserializes via a strict wire struct and `TryFrom` that rejects a partial
+  set, and both kinds parse into the strict `ScheduledTaskKind` enum (only `loop` observed, so a new kind surfaces as
+  a parse error) (all observed in Claude Code 2.1.280+)
 - Also owns the structured view of the raw `model` string via `model::Model { family, version }` plus `ModelFamily` and
   `ModelVersion`. Both `cost_analyzer` (for pricing) and `moriarty::api_pricing` (for grouping/display) consume this one
   parser so family/version classification is not duplicated across crates. The parser preserves capability-decorated raw

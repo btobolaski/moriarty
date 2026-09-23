@@ -1536,6 +1536,22 @@ pub struct QueuedCommand {
     pub origin: Option<MessageOrigin>,
     /// When the command was queued; absent in logs before Claude Code 2.1.197.
     pub timestamp: Option<DateTime<Utc>>,
+    /// Undocumented flag first observed (as `true`, on a human-originated `prompt` command) in
+    /// Claude Code 2.1.280; its meaning relative to `origin` is unknown. `Option` because earlier
+    /// logs omit it.
+    pub human_turn: Option<bool>,
+    /// Resource totals of the background task a `task-notification` command reports on. Observed
+    /// in Claude Code 2.1.280+; other command modes omit it.
+    pub usage: Option<QueuedCommandUsage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct QueuedCommandUsage {
+    pub total_tokens: u64,
+    pub tool_uses: u64,
+    pub duration_ms: u64,
 }
 
 /// Preserves the warning Claude Code emits when `Read` returns only part of an oversized result,
@@ -2173,9 +2189,42 @@ pub struct MicrocompactMetadata {
     pub cleared_attachment_uuids: Vec<Uuid>,
 }
 
+/// Shared by [`ScheduledTaskInfo`] and [`UserLogLine::scheduled_task_id`] so the link from a
+/// scheduled turn back to the task that fired it is visible in the types.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ScheduledTaskId(pub String);
+
+/// `taskId`/`cron`/`prompt`/`taskKind`/`cronKind` are always emitted together on the wire (first
+/// observed in Claude Code 2.1.280; older records omit all of them), so they are grouped into one
+/// type rather than sibling `Option` fields, which would make a half-present payload
+/// representable.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
+pub struct ScheduledTaskInfo {
+    pub task_id: ScheduledTaskId,
+    pub cron: String,
+    pub prompt: String,
+    pub task_kind: ScheduledTaskKind,
+    pub cron_kind: ScheduledTaskKind,
+}
+
+/// Kind of scheduled task (`taskKind`) and of its schedule (`cronKind`); both carry the same
+/// vocabulary on the wire. Only `loop` has been observed, but it is a strict enum (like
+/// [`SessionKind`]) so a new kind surfaces as a parse error rather than being accepted silently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ScheduledTaskKind {
+    Loop,
+}
+
+/// Deserializes via `ScheduledTaskFireWire` because the [`ScheduledTaskInfo`] fields are wire-level
+/// siblings of the envelope rather than a nested object, and `#[serde(flatten)]` cannot be combined
+/// with `#[serde(deny_unknown_fields)]` on this struct directly.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(try_from = "ScheduledTaskFireWire")]
 pub struct ScheduledTaskFire {
     pub parent_uuid: Option<Uuid>,
     pub is_sidechain: bool,
@@ -2192,6 +2241,80 @@ pub struct ScheduledTaskFire {
     pub is_meta: bool,
     /// Entry point that started the session (e.g., "cli"). Added in Claude Code 2.1.104+.
     pub entrypoint: Option<String>,
+    #[serde(flatten)]
+    pub task: Option<ScheduledTaskInfo>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+struct ScheduledTaskFireWire {
+    parent_uuid: Option<Uuid>,
+    is_sidechain: bool,
+    user_type: String,
+    cwd: String,
+    session_id: Uuid,
+    version: String,
+    git_branch: String,
+    slug: Option<String>,
+    content: String,
+    timestamp: DateTime<Utc>,
+    uuid: Uuid,
+    is_meta: bool,
+    entrypoint: Option<String>,
+    task_id: Option<ScheduledTaskId>,
+    cron: Option<String>,
+    prompt: Option<String>,
+    task_kind: Option<ScheduledTaskKind>,
+    cron_kind: Option<ScheduledTaskKind>,
+}
+
+impl TryFrom<ScheduledTaskFireWire> for ScheduledTaskFire {
+    type Error = String;
+
+    fn try_from(wire: ScheduledTaskFireWire) -> Result<Self, Self::Error> {
+        let task = match (
+            wire.task_id,
+            wire.cron,
+            wire.prompt,
+            wire.task_kind,
+            wire.cron_kind,
+        ) {
+            (Some(task_id), Some(cron), Some(prompt), Some(task_kind), Some(cron_kind)) => {
+                Some(ScheduledTaskInfo {
+                    task_id,
+                    cron,
+                    prompt,
+                    task_kind,
+                    cron_kind,
+                })
+            }
+            (None, None, None, None, None) => None,
+            _ => {
+                return Err(
+                    "`taskId`, `cron`, `prompt`, `taskKind`, and `cronKind` must all be present \
+                     or all be absent"
+                        .to_string(),
+                );
+            }
+        };
+        Ok(Self {
+            parent_uuid: wire.parent_uuid,
+            is_sidechain: wire.is_sidechain,
+            user_type: wire.user_type,
+            cwd: wire.cwd,
+            session_id: wire.session_id,
+            version: wire.version,
+            git_branch: wire.git_branch,
+            slug: wire.slug,
+            content: wire.content,
+            timestamp: wire.timestamp,
+            uuid: wire.uuid,
+            is_meta: wire.is_meta,
+            entrypoint: wire.entrypoint,
+            task,
+        })
+    }
 }
 
 /// Duration of a single turn (user message → assistant response cycle).
@@ -2356,6 +2479,12 @@ pub struct UserLogLine {
     /// Whether the turn originated from a human or another source; preserved because strict
     /// deserialization would otherwise discard the entire conversation record. Added in 2.1.278+.
     pub turn_origin: Option<String>,
+    /// The scheduled task that produced this turn. Present only on scheduled turns. Observed in
+    /// Claude Code 2.1.280+.
+    pub scheduled_task_id: Option<ScheduledTaskId>,
+    /// The `uuid` of the `scheduled_task_fire` record that produced this turn. Present only on
+    /// scheduled turns. Observed in Claude Code 2.1.280+.
+    pub scheduled_fire_id: Option<Uuid>,
     /// Current permission mode. Added in Claude Code 2.1.77+.
     pub permission_mode: Option<PermissionMode>,
     /// Plan content when in plan mode. Added in Claude Code 2.1.77+.
