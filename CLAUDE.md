@@ -268,9 +268,15 @@ with warnings, while explicit missing paths and having no available source are e
   for shapes that require custom deserialization or specific corrupt-stream tolerance
 - Newer pi-subagents metadata includes `SubagentSupervisorReplyData`, request `reply_hint`s, control-event
   `tool_call_id`s, and `SubagentWaitStatus` in mutually exclusive completed/early-return `bg_wait` outcomes
-- Custom messages keep accreting extension-owned types: `shepard-assignment` (a shepard live-test assignment whose task
-  text lives in the outer `content`) parses as a unit variant like `subagent-notify`
-- Pi-lens result details use tool-name-routed, derived Serde schemas: `lens_diagnostics` distinguishes
+- Custom messages keep accreting extension-owned types: `shepard-assignment` and `shepard-roster` (a shepard live-test
+  assignment and delegation-roster announcement whose text lives in the outer `content`) parse as unit variants like
+  `subagent-notify`, while `shepard-event` (a progress relay) carries only the composite `<child run id>:<event id>` in
+  its `details` (`ShepardEventId`, shared with the `shepard-seen` custom-record acknowledgement); supervisor requests
+  carry `interview` as an opaque `JsonBlob` because pi-subagents deliberately types it `unknown`
+- Pi-lens result details use tool-name-routed, derived Serde schemas: `effective_config` stays an opaque
+  `skip_deserializing` `JsonBlob` because pi-lens owns that envelope, may grow new fields, and cost analysis reads none
+  of them, the
+  all-mode findings summary gained an optional `totalAdvisories` (absent on older logs), `lens_diagnostics` distinguishes
   delta/all/batch/directory/full (including unavailable) responses — the directory sweep shares the lsp_diagnostics
   directory shape but keeps lens's typed severity/source/scope enums, with the same optional sibling fields as the
   lens batch envelope (`dispositionSuppressed`, timeouts, health warnings, wait) — `lsp_diagnostics` distinguishes file/batch/directory responses,
@@ -286,8 +292,10 @@ with warnings, while explicit missing paths and having no available source are e
 - The `intercom` tool result's `details` (`IntercomResultDetails`) is an untagged enum over the supervisor-status
   payload (`{active, pending: count, root}`; carried verbatim from the native supervisor channel when the pi-intercom
   extension delegates to it, reusing `SubagentSupervisorStatusDetails`) and the extension's loose
-  accreted-optional-fields shape (`IntercomLooseDetails`), mirroring `claude_logs`' `AutoModeExit`/`FrameLink` pattern
-  so the supervisor triple's co-occurrence is required and half-present states fail loudly.
+  accreted-optional-fields shape (`IntercomLooseDetails`), mirroring `claude_logs`' `AutoModeExit`/`FrameLink` pattern,
+  so the supervisor triple's co-occurrence is required and half-present states fail loudly
+- `shepard_contact`/`shepard_contact_parent` tool results carry only the queued event id (the shared
+  `ShepardEventId` composite), routed by tool name like the other extension tools
 - `CompactionLine` and `BranchSummaryLine` carry an optional `usage: Option<AssistantUsage>` recording the cost/tokens
   of the summarization call pi made to produce them (pi added this field after the initial compaction schema, so it is
   `#[serde(default)]` for backward compatibility); the lines record no provider/model of their own, so attribution is
@@ -335,6 +343,11 @@ with warnings, while explicit missing paths and having no available source are e
   undercount is visible rather than silent
 - Deduplication keeps the highest-cost duplicate for a `(ModelId, LogId)` pair and breaks equal-cost ties by keeping the
   earliest timestamped entry
+- `parse_json_line` (the shared typed JSON-line funnel for both log formats) retries a failed line once after
+  rewriting lone UTF-16 surrogate `\uXXXX` escapes to U+FFFD: pi logs legitimately contain them (JSON.stringify
+  serializes ill-formed provider strings that way, and the grammar is valid per RFC 8259) but serde_json's
+  well-formed-UTF-8 validation rejects them; a failure whose sanitized form still does not parse surfaces the
+  original error so reported positions refer to the raw line
 - Public entry point: `cost_analyzer::analyze_directory(path)`
 
 **`tui/`** - Terminal UI event infrastructure:

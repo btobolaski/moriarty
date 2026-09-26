@@ -376,6 +376,10 @@ pub enum CustomPayload {
     /// parent replies through `subagent_supervisor`. Added in newer pi versions.
     #[serde(rename = "subagent_supervisor_reply")]
     SubagentSupervisorReply(SubagentSupervisorReplyData),
+    /// Seen-acknowledgement from the shepard extension recording that a
+    /// queued message reached the child.
+    #[serde(rename = "shepard-seen")]
+    ShepardSeen(ShepardEventId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -473,6 +477,16 @@ pub enum CustomMessagePayload {
     /// payload is attached.
     #[serde(rename = "shepard-assignment")]
     ShepardAssignment,
+    /// Delegation-roster announcement from the shepard extension; the
+    /// rendered roster text lives in the outer `content` field and no
+    /// structured `details` payload is attached.
+    #[serde(rename = "shepard-roster")]
+    ShepardRoster,
+    /// Progress-event relay from the shepard extension; the rendered text
+    /// lives in the outer `content` field and `details` carries the same
+    /// composite event id as `shepard-seen` acknowledgements.
+    #[serde(rename = "shepard-event")]
+    ShepardEvent(ShepardEventId),
 }
 
 // ---------------------------------------------------------------------------
@@ -1646,6 +1660,16 @@ pub struct IntercomSentData {
     pub subagent: Option<JsonBlob>,
 }
 
+/// Composite `<child run id>:<event id>` shared by shepard's
+/// seen-acknowledgement and progress-event records and by the
+/// `shepard_contact`/`shepard_contact_parent` tool results, which all
+/// identify a queued message by this one id field.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ShepardEventId {
+    pub id: String,
+}
+
 /// Emitted by the om extension when it records observations extracted
 /// during a session.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -2006,6 +2030,9 @@ fn parse_tool_result_details(
         "read" => serde_json::from_value(details).map(ToolResultDetails::Read),
         "read_enclosing" => serde_json::from_value(details).map(ToolResultDetails::ReadEnclosing),
         "read_symbol" => serde_json::from_value(details).map(ToolResultDetails::ReadSymbol),
+        "shepard_contact" | "shepard_contact_parent" => {
+            serde_json::from_value(details).map(ToolResultDetails::ShepardContact)
+        }
         "skill" => empty_or(details, ToolResultDetails::Skill),
         "bg_wait" | "subagent" | "subagent_wait" => parse_subagent_result_details(details),
         "subagent_supervisor" => {
@@ -2114,6 +2141,10 @@ pub enum ToolResultDetails {
     AskUser(AskUserDetails),
     CodeSearch(CodeSearchDetails),
     ContactSupervisor(ContactSupervisorResultDetails),
+    // `shepard_contact`/`shepard_contact_parent` results carry only the
+    // composite queued-event id; routed by tool name like the other
+    // extension tools.
+    ShepardContact(ShepardEventId),
     WebSearch(WebSearchDetails),
     // Grep precedes Read for direct `ToolResultDetails` shape matching
     // because both accept `{matchLimitReached, linesTruncated}` and
@@ -3339,6 +3370,13 @@ pub struct SubagentSupervisorRequestDetails {
     /// answer this request. Added in newer pi versions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_hint: Option<String>,
+    /// Structured interview payload on `interview_request` requests.
+    /// pi-subagents deliberately types this as an extension-defined opaque
+    /// object (its own supervisor UI only re-serializes it), so it stays a
+    /// raw JSON blob rather than a shape that breaks on every interview
+    /// evolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interview: Option<JsonBlob>,
 }
 
 /// Payload for the `subagent_supervisor_reply` custom line: the parent's answer
@@ -4541,6 +4579,10 @@ pub struct LensDiagnosticsFindings {
     pub total_blocking: u32,
     pub total_errors: u32,
     pub total_warnings: u32,
+    /// Hint/info advisories, reported separately from warnings by newer
+    /// pi-lens builds; absent on summaries recorded by older ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_advisories: Option<u32>,
     pub stale_dropped: u32,
 }
 

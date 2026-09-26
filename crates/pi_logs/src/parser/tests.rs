@@ -15,6 +15,8 @@ use super::*;
 const FIXED_TIMESTAMP: &str = "2026-04-25T01:48:25.742Z";
 const MESSAGE_TIMESTAMP: i64 = 1_700_000_000;
 const SESSION_ID: &str = "019dc252-e50e-766c-8182-d654b46881af";
+const SHEPARD_EVENT_ID: &str =
+    "76ab74cd-3905-4229-a11f-ca7f27da111f:0001790380837905-de004eec-5f0a-4e21-8b4b-57653972c41e";
 
 #[derive(Clone, Copy)]
 struct AssistantFixture<'a> {
@@ -5600,6 +5602,51 @@ fn custom_message_shepard_assignment_has_no_details() {
 }
 
 #[test]
+fn custom_message_shepard_roster_has_no_details() {
+    // Pinned from a production line (the parse failure that motivated the
+    // variant): shepard roster announcements carry only outer `content`.
+    assert!(matches!(
+        parse_custom_message_payload(
+            "Delegation records: /home/brendan/.pi/agent/shepard/<session>\n0 runs.",
+            "shepard-roster",
+            None,
+        ),
+        CustomMessagePayload::ShepardRoster
+    ));
+}
+
+#[test]
+fn shepard_contact_tool_results_parse() {
+    for tool_name in ["shepard_contact", "shepard_contact_parent"] {
+        let tool_result = tool_result_with_details(tool_name, json!({"id": SHEPARD_EVENT_ID}));
+        let Some(ToolResultDetails::ShepardContact(details)) = tool_result.details else {
+            panic!("expected ShepardContact details for {tool_name}")
+        };
+        assert_eq!(details.id, SHEPARD_EVENT_ID);
+    }
+}
+
+#[test]
+fn custom_shepard_seen_parses() {
+    assert!(matches!(
+        parse_custom_payload("shepard-seen", json!({"id": SHEPARD_EVENT_ID})),
+        CustomPayload::ShepardSeen(_)
+    ));
+}
+
+#[test]
+fn custom_message_shepard_event_parses() {
+    assert!(matches!(
+        parse_custom_message_payload(
+            "Shepard progress\nRun ID (id): 76ab74cd",
+            "shepard-event",
+            Some(json!({"id": SHEPARD_EVENT_ID})),
+        ),
+        CustomMessagePayload::ShepardEvent(_)
+    ));
+}
+
+#[test]
 fn custom_firstpick_session_summary_name_provenance() {
     match parse_custom_payload(
         "firstpick:session-summary-name-provenance",
@@ -8679,7 +8726,7 @@ fn subagent_supervisor_request_accepts_async_correlation_fields() {
         "display": false,
         "details": {
             "id": "req-9",
-            "reason": "progress_update",
+            "reason": "interview_request",
             "expectsReply": false,
             "runId": "run-7",
             "agent": "researcher",
@@ -8687,7 +8734,11 @@ fn subagent_supervisor_request_accepts_async_correlation_fields() {
             "requestId": "00e190ab-4d82-413a-b79d-9390544ac39c",
             "childTarget": "subagent-researcher-run-7-1",
             "requestBody": "UPDATE: research complete",
-            "replyHint": "subagent_supervisor({ action: \"reply\", replyTo: \"req-9\" })"
+            "replyHint": "subagent_supervisor({ action: \"reply\", replyTo: \"req-9\" })",
+            "interview": {
+                "blocking_issue": "All mcp tool calls are rejected by auto-approval",
+                "questions": [{"question": "Retry the diff call?"}],
+            },
         },
         "id": "cm-9",
         "parentId": "msg-9",
@@ -8714,6 +8765,16 @@ fn subagent_supervisor_request_accepts_async_correlation_fields() {
     assert_eq!(
         req.reply_hint.as_deref(),
         Some("subagent_supervisor({ action: \"reply\", replyTo: \"req-9\" })")
+    );
+    // The interview payload is extension-defined (pi-subagents types it
+    // `unknown`), so it must round-trip untouched rather than being
+    // shape-checked.
+    assert_eq!(
+        req.interview,
+        Some(JsonBlob(json!({
+            "blocking_issue": "All mcp tool calls are rejected by auto-approval",
+            "questions": [{"question": "Retry the diff call?"}],
+        })))
     );
 }
 

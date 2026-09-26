@@ -56,9 +56,102 @@ pub(crate) fn parse_json_line<T: DeserializeOwned>(
     value: &str,
     context: &'static str,
 ) -> miette::Result<T> {
-    serde_json::from_str(value)
-        .into_diagnostic()
-        .context(context)
+    match serde_json::from_str(value) {
+        Ok(parsed) => Ok(parsed),
+        Err(original) => {
+            // Log lines can contain `\uXXXX` escapes for lone UTF-16
+            // surrogates (observed in pi logs whose assistant content carried
+            // an ill-formed string from a provider; JSON.stringify serializes
+            // lone surrogates as `\uXXXX` escapes). The grammar is valid per
+            // RFC 8259, but serde_json's well-formed UTF-8 validation rejects
+            // it. Retry once with unpaired surrogate escapes rewritten to
+            // U+FFFD; if that still fails, surface the ORIGINAL error so the
+            // reported position refers to the raw line.
+            let sanitized = replace_lone_surrogate_escapes(value);
+            if sanitized == value {
+                return Err(original).into_diagnostic().context(context);
+            }
+            match serde_json::from_str(&sanitized) {
+                Ok(parsed) => Ok(parsed),
+                Err(_) => Err(original).into_diagnostic().context(context),
+            }
+        }
+    }
+}
+
+/// Rewrites `\uXXXX` escapes for unpaired UTF-16 surrogates to U+FFFD so the
+/// line parses under serde_json's well-formed UTF-8 validation. Paired
+/// surrogate escapes are left untouched for serde_json to combine.
+fn replace_lone_surrogate_escapes(line: &str) -> String {
+    let bytes = line.as_bytes();
+    let mut out = String::with_capacity(line.len());
+    // Start of the plain-text run not yet copied into `out`. Escape-free
+    // regions are copied in slices, so all cut points stay at ASCII escape
+    // boundaries and the input's UTF-8 encoding is preserved verbatim.
+    let mut plain_start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'\\' {
+            i += 1;
+            continue;
+        }
+        // Only a `\uXXXX` escape is a surrogate-escape candidate. Any other
+        // escape (`\n`, `\\`, ...) is skipped as-is: without this `u` check,
+        // an ordinary escape followed by four hex-looking text characters
+        // (e.g. `\n` then the literal text `d800`) would be misread as a
+        // unicode escape and corrupted, and an escaped backslash could start
+        // a phantom `\u` escape. Skipping (rather than copying) keeps every
+        // slice cut point at an escape start; a bare i += 2 may land mid
+        // multi-byte character, which is safe because that content stays
+        // inside the plain run copied whole below.
+        if bytes.get(i + 1) != Some(&b'u') {
+            i += 2;
+            continue;
+        }
+        let Some(hex) = decode_hex_escape(bytes, i + 2) else {
+            // `\u` without four hex digits is not a unicode escape; skip the
+            // two bytes and let serde_json report the malformed escape.
+            i += 2;
+            continue;
+        };
+        match hex {
+            // A leading surrogate is paired only when immediately followed by
+            // a `\uDC00..=\uDFFF` escape; anything else is what serde_json
+            // rejects. A valid pair is skipped past WHOLE (both escapes) so
+            // its trailing half is not re-scanned as a lone trailing
+            // surrogate.
+            0xD800..=0xDBFF if is_trailing_escape(bytes, i + 6) => i += 12,
+            0xD800..=0xDFFF => {
+                out.push_str(&line[plain_start..i]);
+                out.push_str("\\uFFFD");
+                i += 6;
+                plain_start = i;
+            }
+            // Verbatim non-surrogate escapes stay in the plain run for
+            // serde_json to handle.
+            _ => i += 6,
+        }
+    }
+    out.push_str(&line[plain_start..]);
+    out
+}
+
+/// Whether the bytes at `start` begin a `\uDC00..=\uDFFF` escape.
+fn is_trailing_escape(bytes: &[u8], start: usize) -> bool {
+    bytes.get(start) == Some(&b'\\')
+        && bytes.get(start + 1) == Some(&b'u')
+        && matches!(decode_hex_escape(bytes, start + 2), Some(0xDC00..=0xDFFF))
+}
+
+/// Decodes the 4 hex digits at `digits_start`, if present and all hex.
+fn decode_hex_escape(bytes: &[u8], digits_start: usize) -> Option<u16> {
+    let digits = bytes.get(digits_start..digits_start + 4)?;
+    let mut value: u16 = 0;
+    for &digit in digits {
+        // Four hex digits max out at 0xFFFF; no overflow is possible.
+        value = value * 16 + (digit as char).to_digit(16)? as u16;
+    }
+    Some(value)
 }
 
 fn parse_json_backed_log<T: DeserializeOwned>(value: &str) -> miette::Result<T> {
@@ -694,6 +787,7 @@ mod tests {
         CLAUDE_SESSION_ID, CLAUDE_TIMESTAMP, CLAUDE_USER_UUID, CLAUDE_VERSION,
         claude_assistant_json, claude_transcript_envelope, claude_usage_json,
     };
+    use pi_logs::AssistantContentItem;
 
     fn timestamp() -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(CLAUDE_TIMESTAMP)
@@ -2333,5 +2427,111 @@ mod tests {
 
             assert_eq!(line.identifier(), case.expected_id, "case {}", case.name);
         }
+    }
+
+    fn pi_line_with_raw_text(text: &str) -> String {
+        assistant_message_json()
+            .to_string()
+            .replace("\"hello\"", &format!("\"{text}\""))
+    }
+
+    fn parsed_assistant_text(line: &str) -> String {
+        let PiLogLine::Message(message) = <PiLogLine as AnalyzableLog>::parse(line).unwrap() else {
+            panic!("expected message line")
+        };
+        let RoleMessage::Assistant(assistant) = message.message else {
+            panic!("expected assistant message")
+        };
+        match &assistant.content[0] {
+            AssistantContentItem::Text(text) => text.text.clone(),
+            other => panic!("expected text block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lone_surrogate_escape_parses_as_replacement_char() {
+        let line = pi_line_with_raw_text("a \\ud800 b");
+        assert_eq!(parsed_assistant_text(&line), "a \u{FFFD} b");
+    }
+
+    #[test]
+    fn lone_trailing_surrogate_escape_parses_as_replacement_char() {
+        let line = pi_line_with_raw_text("a \\udd23");
+        assert_eq!(parsed_assistant_text(&line), "a \u{FFFD}");
+    }
+
+    #[test]
+    fn lone_surrogate_and_valid_pair_survive_together() {
+        // Reaches the sanitizer (the lone surrogate forces the retry) and
+        // proves the valid pair is skipped whole: its trailing half must not
+        // be re-scanned as a lone trailing surrogate.
+        let line = pi_line_with_raw_text("\\ud800 \\ud83d\\ude00");
+        assert_eq!(parsed_assistant_text(&line), "\u{FFFD} \u{1F600}");
+    }
+
+    #[test]
+    fn newline_escape_before_hex_text_survives_sanitization() {
+        // Regression: `\n` followed by the literal text `dc00` must not be
+        // misread as a `\udc00` escape; only real `\u` escapes are rewritten.
+        let line = pi_line_with_raw_text("x \\ud800 y \\ndc00 z");
+        assert_eq!(parsed_assistant_text(&line), "x \u{FFFD} y \ndc00 z");
+    }
+
+    #[test]
+    fn consecutive_lone_leading_surrogates_become_replacements() {
+        let line = pi_line_with_raw_text("\\ud800\\ud801");
+        assert_eq!(parsed_assistant_text(&line), "\u{FFFD}\u{FFFD}");
+    }
+
+    #[test]
+    fn leading_surrogate_before_non_surrogate_escape_splits() {
+        let line = pi_line_with_raw_text("\\ud800\\u0041");
+        assert_eq!(parsed_assistant_text(&line), "\u{FFFD}A");
+    }
+
+    #[test]
+    fn backslash_before_multibyte_char_does_not_panic() {
+        // Malformed JSON: serde_json rejects `\中` as an invalid escape, and
+        // the sanitizer must skip it without slicing mid-character.
+        let raw = "{\"type\":\"custom\",\"data\":\"x\\中y\"}";
+        assert_eq!(replace_lone_surrogate_escapes(raw), raw);
+        assert!(<PiLogLine as AnalyzableLog>::parse(raw).is_err());
+    }
+
+    #[test]
+    fn u_escape_with_too_few_hex_digits_stays_unparsed() {
+        // The None arm must leave the line byte-identical so the raw error
+        // surfaces instead of a sanitized-retry error.
+        let raw = r#"{"type":"custom","data":"x \u0z"}"#;
+        assert_eq!(replace_lone_surrogate_escapes(raw), raw);
+        assert!(<PiLogLine as AnalyzableLog>::parse(raw).is_err());
+    }
+
+    #[test]
+    fn failing_sanitized_line_reports_the_raw_line_error() {
+        // The lone surrogate makes the sanitizer rewrite the line, but the
+        // truncated JSON still fails: the surfaced failure must be the raw
+        // line's error (the hex escape serde stopped on), not the sanitized
+        // retry's (whose rewrite turns the same truncation into an EOF
+        // error). Comparing against a reference chain built from the raw
+        // error keeps the assertion free of serde's wording.
+        let raw = r#"{"type":"custom","data":"\ud800""#;
+        let error = <PiLogLine as AnalyzableLog>::parse(raw).expect_err("truncated line must fail");
+        let expected = serde_json::from_str::<PiLogLine>(raw)
+            .into_diagnostic()
+            .context(LOG_LINE_PARSE_CONTEXT)
+            .unwrap_err();
+        assert_eq!(format!("{error:?}"), format!("{expected:?}"));
+    }
+
+    #[test]
+    fn escaped_backslash_before_u_stays_literal() {
+        let line = pi_line_with_raw_text("regex \\\\uD800-\\\\uDBFF");
+        assert_eq!(parsed_assistant_text(&line), "regex \\uD800-\\uDBFF");
+    }
+
+    #[test]
+    fn unrelated_parse_failure_still_fails() {
+        assert!(<PiLogLine as AnalyzableLog>::parse(r#"{"type":"custom""#).is_err());
     }
 }
