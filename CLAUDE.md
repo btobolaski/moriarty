@@ -180,7 +180,8 @@ siblings stay `String`), and an `imagePasteIds` field on both user and assistant
   structured request id, live cwd, platform, and git state/remote-visibility snapshot sent for server-side
   classification; its snake_case keys mirror the wire, and its git state is an untagged enum over a collected snapshot
   and the pending one Claude Code logs with `error: "pending"` and every field but `cwd` null, so a half-collected
-  payload is not representable; undocumented vocabularies such as `visibility`/`platform` stay `String`; added in
+  payload is not representable; undocumented vocabularies such as `visibility`/`platform` stay `String`, and the
+  collected snapshot's `visibility.origin` is `Option` because a repository with no remotes logs it `null`; added in
   Claude Code 2.1.278+), and an optional undocumented `humanTurn` flag plus a `usage` object (`QueuedCommandUsage`,
   the reported background task's token/tool-use/duration totals, present on `task-notification` commands) on
   `queued_command` attachments (`QueuedCommand`), `scheduledTaskId`/`scheduledFireId` fields on user turns

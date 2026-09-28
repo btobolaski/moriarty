@@ -2625,7 +2625,8 @@ pub struct ClassifierGitCounts {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClassifierGitVisibility {
-    pub origin: ClassifierRemoteVisibility,
+    /// `null` in a repository with no remotes.
+    pub origin: Option<ClassifierRemoteVisibility>,
     pub push_remote: Option<String>,
     pub remotes: Vec<ClassifierNamedRemote>,
     pub visibility_cache: Vec<ClassifierRemoteVisibility>,

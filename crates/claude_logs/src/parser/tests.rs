@@ -6270,33 +6270,51 @@ fn collected_git_status_json() -> serde_json::Value {
     })
 }
 
-#[test]
-fn test_parse_user_log_line_with_server_classifier_context() {
+fn parse_collected_git_state(visibility: serde_json::Value) -> Box<CollectedGitState> {
     let git_state = parse_classifier_git_state(serde_json::json!({
         "cwd": "/repo",
         "root": "/repo",
         "branch": "HEAD",
         "default_branch": null,
         "status": collected_git_status_json(),
-        "visibility": {
-            "origin": {"host": "github.com", "remote": "github.com/org/repo", "visibility": "private"},
-            "push_remote": "github.com/org/repo",
-            "remotes": [{
-                "name": "origin",
-                "host": "github.com",
-                "remote": "github.com/org/repo",
-                "visibility": "private"
-            }],
-            "visibility_cache": [
-                {"host": "github.com", "remote": "github.com/org/repo", "visibility": "private"}
-            ]
-        }
+        "visibility": visibility
     }));
     let ClassifierGitState::Collected(collected) = git_state else {
         panic!("expected collected git state, got {git_state:?}");
     };
+    collected
+}
+
+#[test]
+fn test_parse_user_log_line_with_server_classifier_context() {
+    let collected = parse_collected_git_state(serde_json::json!({
+        "origin": {"host": "github.com", "remote": "github.com/org/repo", "visibility": "private"},
+        "push_remote": "github.com/org/repo",
+        "remotes": [{
+            "name": "origin",
+            "host": "github.com",
+            "remote": "github.com/org/repo",
+            "visibility": "private"
+        }],
+        "visibility_cache": [
+            {"host": "github.com", "remote": "github.com/org/repo", "visibility": "private"}
+        ]
+    }));
     assert_eq!(collected.status.counts.untracked, None);
     assert_eq!(collected.visibility.remotes[0].name, "origin");
+}
+
+#[test]
+fn test_parse_server_classifier_context_with_null_origin() {
+    // Observed in a repository with no remotes: `push_remote` still names the default remote
+    // even though nothing backs it.
+    let collected = parse_collected_git_state(serde_json::json!({
+        "origin": null,
+        "push_remote": "origin",
+        "remotes": [],
+        "visibility_cache": []
+    }));
+    assert_eq!(collected.visibility.origin, None);
 }
 
 fn pending_git_state_json(status: serde_json::Value) -> serde_json::Value {
