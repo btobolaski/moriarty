@@ -2274,6 +2274,12 @@ pub struct ContactSupervisorResultDetails {
     pub error: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivered: Option<bool>,
+    /// The schema-conforming structured reply pi-subagents returned alongside
+    /// the prose answer (observed on `interview_request` replies). Kept opaque
+    /// because its shape is whatever the requesting tool's schema asked for
+    /// and nothing downstream reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_reply: Option<JsonBlob>,
 }
 
 /// `ls` tool results are either a plain listing (no `details`), a lean-ctx
@@ -4613,6 +4619,10 @@ pub struct LensDiagnosticsFullDetails<S> {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_diagnostics_delta: Option<LensProjectDiagnosticsDelta>,
     pub cold_runners: Vec<String>,
+    /// Runners that answered with partial coverage (newer pi-lens builds);
+    /// absent on older logs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial_runners: Option<Vec<String>>,
     pub cold_reasons: BTreeMap<String, String>,
     pub failed_analyzers: Vec<LensAnalyzerFailure>,
     pub analyzer_timings_ms: BTreeMap<String, u64>,
@@ -5583,10 +5593,101 @@ pub enum ParseError {
 }
 
 pub fn parse_line(raw: &str) -> Result<PiLogLine, ParseError> {
-    serde_json::from_str::<PiLogLine>(raw).map_err(|source| ParseError::SingleLine {
+    parse_json_with_surrogate_retry::<PiLogLine>(raw).map_err(|source| ParseError::SingleLine {
         content: raw.to_owned(),
         source,
     })
+}
+
+/// Shared retry orchestration for every pi log line parse: parse once, and on
+/// failure retry once with lone UTF-16 surrogate escapes rewritten to U+FFFD
+/// (JSON.stringify's serialization of ill-formed provider strings, which
+/// serde_json's well-formed-UTF-8 validation rejects). On a retry failure the
+/// ORIGINAL error is returned so reported positions refer to the raw line.
+pub fn parse_json_with_surrogate_retry<T: DeserializeOwned>(
+    raw: &str,
+) -> Result<T, serde_json::Error> {
+    match serde_json::from_str(raw) {
+        Ok(parsed) => Ok(parsed),
+        Err(original) => {
+            serde_json::from_str(&replace_lone_surrogate_escapes(raw)).map_err(|_| original)
+        }
+    }
+}
+
+/// Rewrites `\uXXXX` escapes for unpaired UTF-16 surrogates to U+FFFD so the
+/// line parses under serde_json's well-formed UTF-8 validation. Paired
+/// surrogate escapes are left untouched for serde_json to combine.
+fn replace_lone_surrogate_escapes(line: &str) -> String {
+    let bytes = line.as_bytes();
+    let mut out = String::with_capacity(line.len());
+    // Start of the plain-text run not yet copied into `out`. Escape-free
+    // regions are copied in slices, so all cut points stay at ASCII escape
+    // boundaries and the input's UTF-8 encoding is preserved verbatim.
+    let mut plain_start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'\\' {
+            i += 1;
+            continue;
+        }
+        // Only a `\uXXXX` escape is a surrogate-escape candidate. Any other
+        // escape (`\n`, `\\`, ...) is skipped as-is: without this `u` check,
+        // an ordinary escape followed by four hex-looking text characters
+        // (e.g. `\n` then the literal text `d800`) would be misread as a
+        // unicode escape and corrupted, and an escaped backslash could start
+        // a phantom `\u` escape. Skipping (rather than copying) keeps every
+        // slice cut point at an escape start; a bare i += 2 may land mid
+        // multi-byte character, which is safe because that content stays
+        // inside the plain run copied whole below.
+        if bytes.get(i + 1) != Some(&b'u') {
+            i += 2;
+            continue;
+        }
+        let Some(hex) = decode_hex_escape(bytes, i + 2) else {
+            // `\u` without four hex digits is not a unicode escape; skip the
+            // two bytes and let serde_json report the malformed escape.
+            i += 2;
+            continue;
+        };
+        match hex {
+            // A leading surrogate is paired only when immediately followed by
+            // a `\uDC00..=\uDFFF` escape; anything else is what serde_json
+            // rejects. A valid pair is skipped past WHOLE (both escapes) so
+            // its trailing half is not re-scanned as a lone trailing
+            // surrogate.
+            0xD800..=0xDBFF if is_trailing_escape(bytes, i + 6) => i += 12,
+            0xD800..=0xDFFF => {
+                out.push_str(&line[plain_start..i]);
+                out.push_str("\\uFFFD");
+                i += 6;
+                plain_start = i;
+            }
+            // Verbatim non-surrogate escapes stay in the plain run for
+            // serde_json to handle.
+            _ => i += 6,
+        }
+    }
+    out.push_str(&line[plain_start..]);
+    out
+}
+
+/// Whether the bytes at `start` begin a `\uDC00..=\uDFFF` escape.
+fn is_trailing_escape(bytes: &[u8], start: usize) -> bool {
+    bytes.get(start) == Some(&b'\\')
+        && bytes.get(start + 1) == Some(&b'u')
+        && matches!(decode_hex_escape(bytes, start + 2), Some(0xDC00..=0xDFFF))
+}
+
+/// Decodes the 4 hex digits at `digits_start`, if present and all hex.
+fn decode_hex_escape(bytes: &[u8], digits_start: usize) -> Option<u16> {
+    let digits = bytes.get(digits_start..digits_start + 4)?;
+    let mut value: u16 = 0;
+    for &digit in digits {
+        // Four hex digits max out at 0xFFFF; no overflow is possible.
+        value = value * 16 + (digit as char).to_digit(16)? as u16;
+    }
+    Some(value)
 }
 
 /// Errors carry the file path and 1-based line number of the offending line
@@ -5608,13 +5709,14 @@ pub fn parse_file(path: impl AsRef<Path>) -> Result<Vec<PiLogLine>, ParseError> 
         if line.trim().is_empty() {
             continue;
         }
-        let parsed =
-            serde_json::from_str::<PiLogLine>(&line).map_err(|source| ParseError::LineParse {
+        let parsed = parse_json_with_surrogate_retry::<PiLogLine>(&line).map_err(|source| {
+            ParseError::LineParse {
                 path: path.to_path_buf(),
                 line: idx + 1,
                 content: line.clone(),
                 source,
-            })?;
+            }
+        })?;
         out.push(parsed);
     }
 

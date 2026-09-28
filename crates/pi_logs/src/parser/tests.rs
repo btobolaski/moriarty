@@ -5,7 +5,7 @@
 //! assert on the typed result, while others pin serialization behavior or
 //! shape-routing assumptions that the parser relies on.
 
-use std::path::PathBuf;
+use std::{error::Error as _, path::PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
@@ -577,6 +577,133 @@ fn assert_parse_error_contains_all(name: &str, value: Value, expected_fragments:
             "case {name} expected error to mention {fragment:?}: {msg}"
         );
     }
+}
+
+/// Raw wire form of a line whose text carries lone UTF-16 surrogate escapes
+/// (the JSON.stringify ill-formed-provider-string shape); shared by the
+/// `parse_line` and `parse_file` retry tests.
+const SURROGATE_LINE: &str = r#"{"type":"message","id":"x","parentId":"y","timestamp":"2026-04-25T01:48:25.742Z","message":{"role":"assistant","content":[{"type":"text","text":"regex /[\ud800-\udbff]/ guard"}],"api":"openai-completions","provider":"openrouter","model":"z-ai/glm-5.3-flash","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"reasoning":0,"totalTokens":2,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0,"source":"provider"}},"stopReason":"stop","timestamp":1700000000}}"#;
+
+/// Assistant line carrying `text` verbatim (JSON-escaped by serde) so the
+/// sanitizer's escape-arm behavior can be exercised through `parse_line`.
+fn pi_line_with_raw_text(text: &str) -> String {
+    let fixture = AssistantFixture::new(
+        "openai-completions",
+        "openrouter",
+        "z-ai/glm-5.3-flash",
+        "stop",
+    );
+    let line =
+        assistant_message_json(vec![json!({"type": "text", "text": "hello"})], fixture).to_string();
+    line.replace("\"hello\"", &format!("\"{text}\""))
+}
+
+/// Parses a raw message line and returns its first assistant text block.
+fn surrogate_line_text(raw: &str) -> String {
+    let Ok(PiLogLine::Message(line)) = parse_line(raw) else {
+        panic!("expected Message line")
+    };
+    let RoleMessage::Assistant(assistant) = &line.message else {
+        panic!("expected Assistant message")
+    };
+    let AssistantContentItem::Text(text) = &assistant.content[0] else {
+        panic!("expected text block")
+    };
+    text.text.clone()
+}
+
+#[test]
+fn parse_line_rewrites_lone_surrogate_escapes() {
+    // serde_json reports "unexpected end of hex escape" for this shape; the
+    // retry must surface it as U+FFFD replacements around the literal text.
+    assert_eq!(
+        surrogate_line_text(SURROGATE_LINE),
+        "regex /[\u{FFFD}-\u{FFFD}]/ guard"
+    );
+}
+
+#[test]
+fn surrogate_retries_replace_lone_leading_and_trailing_escapes() {
+    assert_eq!(
+        surrogate_line_text(&pi_line_with_raw_text("a \\ud800 b")),
+        "a \u{FFFD} b"
+    );
+    assert_eq!(
+        surrogate_line_text(&pi_line_with_raw_text("a \\udd23")),
+        "a \u{FFFD}"
+    );
+}
+
+#[test]
+fn surrogate_retries_keep_valid_pairs_whole() {
+    // The lone surrogate forces the retry and proves the valid pair is
+    // skipped whole: its trailing half must not be re-scanned as a lone
+    // trailing surrogate.
+    assert_eq!(
+        surrogate_line_text(&pi_line_with_raw_text("\\ud800 \\ud83d\\ude00")),
+        "\u{FFFD} \u{1F600}"
+    );
+}
+
+#[test]
+fn surrogate_retries_do_not_misread_adjacent_escapes() {
+    // Regression: `\n` followed by the literal text `dc00` must not be
+    // misread as a `\udc00` escape; only real `\u` escapes are rewritten.
+    assert_eq!(
+        surrogate_line_text(&pi_line_with_raw_text("x \\ud800 y \\ndc00 z")),
+        "x \u{FFFD} y \ndc00 z"
+    );
+    assert_eq!(
+        surrogate_line_text(&pi_line_with_raw_text("\\ud800\\u0041")),
+        "\u{FFFD}A"
+    );
+    assert_eq!(
+        surrogate_line_text(&pi_line_with_raw_text("regex \\\\uD800-\\\\uDBFF")),
+        "regex \\uD800-\\uDBFF"
+    );
+}
+
+#[test]
+fn consecutive_lone_leading_surrogates_become_replacements() {
+    assert_eq!(
+        surrogate_line_text(&pi_line_with_raw_text("\\ud800\\ud801")),
+        "\u{FFFD}\u{FFFD}"
+    );
+}
+
+#[test]
+fn replace_lone_surrogate_escapes_backslash_before_multibyte_char_does_not_panic() {
+    // Malformed JSON: serde_json rejects `\中` as an invalid escape, and
+    // the sanitizer must skip it without slicing mid-character.
+    let raw = "{\"type\":\"custom\",\"data\":\"x\\中y\"}";
+    assert_eq!(replace_lone_surrogate_escapes(raw), raw);
+    assert!(parse_line(raw).is_err());
+}
+
+#[test]
+fn replace_lone_surrogate_escapes_too_few_hex_digits_stays_unparsed() {
+    // The None arm must leave the line byte-identical so the raw error
+    // surfaces instead of a sanitized-retry error.
+    let raw = r#"{"type":"custom","data":"x \u0z"}"#;
+    assert_eq!(replace_lone_surrogate_escapes(raw), raw);
+    assert!(parse_line(raw).is_err());
+}
+
+#[test]
+fn failing_sanitized_line_reports_the_raw_line_error() {
+    // The lone surrogate makes the sanitizer rewrite the line, but the
+    // truncated JSON still fails: the surfaced failure must be the raw
+    // line's error (the hex escape serde stopped on), not the sanitized
+    // retry's (whose rewrite turns the same truncation into an EOF
+    // error). Comparing against a reference chain built from the raw
+    // error keeps the assertion free of serde's wording.
+    let raw = r#"{"type":"custom","data":"\ud800""#;
+    let error = parse_line(raw).expect_err("truncated line must fail");
+    let expected = serde_json::from_str::<PiLogLine>(raw).unwrap_err();
+    assert_eq!(
+        error.source().map(|e| e.to_string()),
+        Some(expected.to_string())
+    );
 }
 
 #[test]
@@ -2416,6 +2543,51 @@ fn contact_supervisor_tool_result_accepts_error_flag() {
     };
 
     assert_eq!(details.error, Some(true));
+}
+
+#[test]
+fn contact_supervisor_tool_result_accepts_structured_reply() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "contact_supervisor",
+        vec![json!({
+            "type": "text",
+            "text": "**Reply from supervisor:**\n{\"challenge\":\"test\"}"
+        })],
+        false,
+        Some(json!({
+            "requestId": "c8262d7c-32d6-430a-96e2-a515bf6c6085",
+            "reason": "interview_request",
+            "structuredReply": {"challenge": "test"}
+        })),
+    ));
+
+    let Some(ToolResultDetails::ContactSupervisor(details)) = tool_result.details else {
+        panic!("expected ContactSupervisor details")
+    };
+
+    assert_eq!(details.reason.as_deref(), Some("interview_request"));
+    assert_eq!(
+        details.structured_reply,
+        Some(JsonBlob::from(json!({"challenge": "test"})))
+    );
+}
+
+#[test]
+fn lens_diagnostics_full_accepts_partial_runners() {
+    let mut full = lens_full_details(route_fixture("lens-summary"));
+    full["partialRunners"] = json!(["opengrep", "typos"]);
+
+    let Some(ToolResultDetails::LensDiagnostics(LensDiagnosticsDetails::Full(
+        LensDiagnosticsFull::Findings(details),
+    ))) = tool_result_with_details("lens_diagnostics", full).details
+    else {
+        panic!("expected lens full findings details")
+    };
+
+    assert_eq!(
+        details.partial_runners,
+        Some(vec!["opengrep".to_string(), "typos".to_string()])
+    );
 }
 
 #[test]
@@ -4379,6 +4551,25 @@ fn tool_call_partial_json_preserved() {
         tool_call.partial_json.as_deref(),
         Some("{\"command\": \"ls\"")
     );
+}
+
+#[test]
+fn parse_file_rewrites_lone_surrogate_escapes() {
+    // `parse_file` must apply the same surrogate retry as `parse_line`, not
+    // just the plain serde path; the sanitization content itself is pinned
+    // by the `parse_line` retry tests.
+    let tmp = std::env::temp_dir().join(format!("pi_logs_surr_{}.jsonl", uuid::Uuid::new_v4()));
+    std::fs::write(
+        &tmp,
+        format!("{}\n{}\n", session_json("/tmp"), SURROGATE_LINE),
+    )
+    .unwrap();
+
+    let parsed = parse_file(&tmp).expect("expected surrogate line to parse after retry");
+    let _ = std::fs::remove_file(&tmp);
+
+    assert_eq!(parsed.len(), 2);
+    assert!(matches!(&parsed[1], PiLogLine::Message(_)));
 }
 
 #[test]

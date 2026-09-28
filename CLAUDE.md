@@ -296,6 +296,11 @@ with warnings, while explicit missing paths and having no available source are e
   so the supervisor triple's co-occurrence is required and half-present states fail loudly
 - `shepard_contact`/`shepard_contact_parent` tool results carry only the queued event id (the shared
   `ShepardEventId` composite), routed by tool name like the other extension tools
+- `contact_supervisor` tool-result details gained an optional `structuredReply` (`ContactSupervisorResultDetails.structured_reply`,
+  observed on `interview_request` replies carrying the schema-conforming answer beside the prose one; kept opaque as
+  `JsonBlob` because its shape is whatever the requesting tool's schema asked for)
+- `lens_diagnostics` full responses gained an optional `partialRunners` sibling of `coldRunners`
+  (`LensDiagnosticsFullDetails.partial_runners`; runners that answered with partial coverage, absent on older logs)
 - `CompactionLine` and `BranchSummaryLine` carry an optional `usage: Option<AssistantUsage>` recording the cost/tokens
   of the summarization call pi made to produce them (pi added this field after the initial compaction schema, so it is
   `#[serde(default)]` for backward compatibility); the lines record no provider/model of their own, so attribution is
@@ -347,7 +352,9 @@ with warnings, while explicit missing paths and having no available source are e
   rewriting lone UTF-16 surrogate `\uXXXX` escapes to U+FFFD: pi logs legitimately contain them (JSON.stringify
   serializes ill-formed provider strings that way, and the grammar is valid per RFC 8259) but serde_json's
   well-formed-UTF-8 validation rejects them; a failure whose sanitized form still does not parse surfaces the
-  original error so reported positions refer to the raw line
+  original error so reported positions refer to the raw line. The retry helper itself
+  (`pi_logs::parser::parse_json_with_surrogate_retry`) lives in `pi_logs`, so `pi_logs`' own public entry points
+  (`parse_line`/`parse_file`) apply the same retry; `cost_analyzer::parse_json_line` delegates to it
 - Public entry point: `cost_analyzer::analyze_directory(path)`
 
 **`tui/`** - Terminal UI event infrastructure:
