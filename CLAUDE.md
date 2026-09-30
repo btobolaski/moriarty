@@ -261,6 +261,21 @@ with warnings, while explicit missing paths and having no available source are e
   `stop_reason` pi maps it onto (e.g. the openai-codex-responses `completed` that pi records as `toolUse` or `stop`).
   Like tool names, it stays a `String` rather than a strict enum because the vocabulary belongs to whichever provider
   served the turn; it is `Option` because only some providers emit it.
+- System-role messages (`RoleMessage::System`) carry text or text blocks plus optional named `sections` (null removes
+  a section), `toolsAdded`, and `toolsRemoved`; compaction `systemMessage` snapshots accept only that role. Tool
+  definitions keep their envelope strict but preserve tool-owned JSON Schema and sampling configuration
+- `context_edit` records (`ContextEditLine`) change an earlier entry's model-context contribution: null `replacement`
+  hides it, otherwise only its content changes. They do not revise the original response's billable usage, so
+  `cost_analyzer` treats them as non-billable metadata
+- Assistant `thinkingLevel` is optional and reuses the strict `ThinkingLevel` enum. Tool-result `nestedCalls` keeps
+  core nested-call statuses and omission metadata typed; it is execution metadata, not another billable response
+- `codemode` details preserve extension-owned call breadcrumbs (including JSON-string arguments and fractional
+  durations) separately from core `nestedCalls`, with optional `fullOutputPath` for spilled output. Empty success
+  details use the shared empty-details variant. The `codemode-store` custom payload preserves caller-defined values
+  under `set` plus deleted key names under `delete`
+- Observer catch-up custom records persist the source range after compaction (`om.observer.catch-up.job`) and either
+  a next-source cursor or completion flag (`om.observer.catch-up.progress`); the latter uses strict, mutually exclusive
+  pending/complete shapes so a mixed or empty progress state fails to parse
 - Hermes memory/session-search result details are modeled by their shared envelopes rather than per-action sub-schemas:
   search tools use the `success/count/message/output` summary shape, while `memory` and `skill` are routed by
   `tool_name` first because their error details can collapse to either `{}` or a bare `{error}`; once routed, the parser

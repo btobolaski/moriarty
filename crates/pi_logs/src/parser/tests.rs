@@ -1115,12 +1115,44 @@ fn compaction_line_with_usage() {
 }
 
 #[test]
+fn compaction_preserves_system_snapshot() {
+    let mut value = compaction_json(false);
+    value["systemMessage"] = json!({
+        "role": "system", "content": "", "timestamp": MESSAGE_TIMESTAMP,
+        "sections": {"preamble": "Base prompt"}, "toolsAdded": []
+    });
+    let parsed = parse(value.clone());
+    assert_eq!(serde_json::to_value(&parsed).unwrap(), value);
+    value["systemMessage"]["role"] = json!("assistant");
+    parse_err(value);
+}
+
+#[test]
 fn compaction_line_from_hook() {
     let line = parse(compaction_json(true));
 
     match line {
         PiLogLine::Compaction(compaction) => assert!(compaction.from_hook),
         other => panic!("expected Compaction, got {other:?}"),
+    }
+}
+
+#[test]
+fn context_edit_preserves_nullable_replacement() {
+    let mut value = json!({
+        "type": "context_edit", "id": "edit1", "parentId": "p1",
+        "timestamp": FIXED_TIMESTAMP, "targetId": "a1", "replacement": null
+    });
+    for replacement in [Value::Null, json!({"content": "New context"})] {
+        value["replacement"] = replacement.clone();
+        let PiLogLine::ContextEdit(edit) = parse(value.clone()) else {
+            panic!("expected ContextEdit")
+        };
+        assert_eq!(edit.target_id, "a1");
+        assert_eq!(
+            edit.replacement.map(|r| r.content.0),
+            replacement.get("content").cloned()
+        );
     }
 }
 
@@ -1406,6 +1438,96 @@ fn compaction_line_v2_with_retained_tool_output() {
             assert!(projection.omissions.is_empty());
         }
         other => panic!("expected Compaction, got {other:?}"),
+    }
+}
+
+#[test]
+fn system_message_preserves_sections_and_tool_changes() {
+    let value = message_line_json(
+        "s1",
+        "p1",
+        json!({
+            "role": "system",
+            "content": "",
+            "timestamp": MESSAGE_TIMESTAMP,
+            "sections": {"preamble": "Instructions", "extension-section": null},
+            "toolsAdded": [{
+                "name": "read", "description": "Read a file",
+                "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+                "constrainedSampling": {"type": "json_schema", "strict": "prefer"}
+            }],
+            "toolsRemoved": [{"name": "old-tool"}]
+        }),
+    );
+    let RoleMessage::System(system) = parse_role_message(value.clone()) else {
+        panic!("expected System")
+    };
+    assert_eq!(system.sections.as_ref().unwrap()["extension-section"], None);
+    assert_eq!(
+        serde_json::to_value(RoleMessage::System(system)).unwrap(),
+        value["message"]
+    );
+}
+
+#[test]
+fn system_message_accepts_text_and_blocks_without_optional_metadata() {
+    for content in [
+        json!("Base prompt"),
+        json!([{"type": "text", "text": "Update", "textSignature": "sig"}]),
+    ] {
+        let value = message_line_json(
+            "s1",
+            "p1",
+            json!({
+                "role": "system", "content": content, "timestamp": MESSAGE_TIMESTAMP
+            }),
+        );
+        let parsed = parse(value.clone());
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), value);
+    }
+}
+
+#[test]
+fn new_metadata_rejects_unknown_fields() {
+    for (mut value, pointer) in [
+        (
+            json!({
+                "type": "context_edit", "id": "edit1", "parentId": "p1",
+                "timestamp": FIXED_TIMESTAMP, "targetId": "a1", "replacement": null
+            }),
+            "",
+        ),
+        (
+            message_line_json(
+                "s1",
+                "p1",
+                json!({
+                    "role": "system", "content": "", "timestamp": MESSAGE_TIMESTAMP
+                }),
+            ),
+            "/message",
+        ),
+        (
+            tool_result_message_json("codemode", vec![], false, Some(json!({"calls": []}))),
+            "/message/details",
+        ),
+        (
+            custom_json("codemode-store", json!({"set": {}, "delete": []})),
+            "/data",
+        ),
+        (
+            custom_json(
+                "om.observer.catch-up.job",
+                json!({
+                    "version": 1, "compactionId": "c1", "fromId": "e1", "throughId": "e2"
+                }),
+            ),
+            "/data",
+        ),
+    ] {
+        parse(value.clone());
+        value.pointer_mut(pointer).unwrap()["unexpected"] = json!(true);
+        parse_err(value);
     }
 }
 
@@ -2039,6 +2161,29 @@ fn assistant_raw_stop_reason_kept_beside_normalized_stop_reason() {
 
     assert_eq!(assistant.stop_reason, AssistantStopReason::ToolUse);
     assert_eq!(assistant.raw_stop_reason.as_deref(), Some("completed"));
+}
+
+#[test]
+fn assistant_thinking_level_is_optional() {
+    let base = assistant_message_json(
+        vec![],
+        AssistantFixture::new(
+            "openai-completions",
+            "openrouter",
+            "z-ai/glm-5.3-flash",
+            "stop",
+        ),
+    );
+    let mut value = base.clone();
+    value["message"]["thinkingLevel"] = json!("high");
+    let RoleMessage::Assistant(assistant) = parse_role_message(value) else {
+        panic!("expected Assistant")
+    };
+    assert_eq!(assistant.thinking_level, Some(ThinkingLevel::High));
+    let RoleMessage::Assistant(assistant) = parse_role_message(base) else {
+        panic!("expected Assistant")
+    };
+    assert_eq!(assistant.thinking_level, None);
 }
 
 #[test]
@@ -3652,6 +3797,74 @@ fn tool_result_with_edit_details() {
 }
 
 #[test]
+fn tool_result_preserves_nested_calls() {
+    let nested = json!({"calls": [
+        {"id": "call_1/1", "name": "read", "status": "ok", "arguments": {"path": "src/lib.rs"}, "durationMs": 12},
+        {"id": "call_1/2", "name": "bash", "status": "error", "argumentsBytes": 2048, "error": "Failed"},
+        {"id": "call_1/3", "name": "read", "status": "unfinished"}
+    ], "complete": false});
+    let mut value = tool_result_message_json("codemode", vec![], false, None);
+    value["message"]["nestedCalls"] = nested.clone();
+    let tool = parse_tool_result_message(value);
+    assert_eq!(
+        serde_json::to_value(tool.nested_calls.unwrap()).unwrap(),
+        nested
+    );
+}
+
+#[test]
+fn nested_call_rejects_conflicting_arguments() {
+    let mut value = tool_result_message_json("codemode", vec![], false, None);
+    value["message"]["nestedCalls"] = json!({"calls": [{
+        "id": "call_1/1", "name": "read", "status": "ok", "arguments": {}, "argumentsBytes": 42
+    }], "complete": false});
+    assert_parse_error_contains_all(
+        "nested call arguments",
+        value,
+        &["both arguments and argumentsBytes"],
+    );
+}
+
+#[test]
+fn codemode_nonempty_details_require_calls() {
+    assert_parse_error_contains_all(
+        "codemode required calls",
+        tool_result_message_json(
+            "codemode",
+            vec![],
+            false,
+            Some(json!({"fullOutputPath": "/tmp/x"})),
+        ),
+        &["missing field", "calls"],
+    );
+}
+
+#[test]
+fn codemode_tool_result_accepts_empty_details() {
+    assert!(matches!(
+        tool_result_with_details("codemode", json!({})).details,
+        Some(ToolResultDetails::Empty(_))
+    ));
+}
+
+#[test]
+fn codemode_details_preserve_extension_call_breadcrumbs() {
+    let details = json!({"calls": [{
+        "id": "call_1/1", "name": "read", "args": "{\"path\":\"src/lib.rs\"}",
+        "status": "ok", "durationMs": 123.789
+    }], "fullOutputPath": "/tmp/pi-codemode.txt"});
+    let tool = tool_result_with_details("codemode", details.clone());
+    let Some(ToolResultDetails::Codemode(parsed)) = tool.details else {
+        panic!("expected Codemode")
+    };
+    assert_eq!(parsed.calls[0].0, details["calls"][0]);
+    assert_eq!(
+        parsed.full_output_path,
+        Some(PathBuf::from("/tmp/pi-codemode.txt"))
+    );
+}
+
+#[test]
 fn tool_result_without_details() {
     let tool_result = parse_tool_result_message(tool_result_message_json(
         "bash",
@@ -4192,6 +4405,57 @@ fn custom_plannotator_execute() {
             assert_eq!(details.plan_file_path, None);
         }
         other => panic!("expected PlannotatorExecute, got {other:?}"),
+    }
+}
+
+#[test]
+fn custom_codemode_store_preserves_script_defined_values() {
+    let CustomPayload::CodemodeStore(store) = parse_custom_payload(
+        "codemode-store",
+        json!({
+            "set": {"files": ["src/lib.rs"], "count": 3, "nested": {"ready": true}, "empty": null},
+            "delete": ["old-key"]
+        }),
+    ) else {
+        panic!("expected CodemodeStore")
+    };
+    assert_eq!(store.set["files"].0, json!(["src/lib.rs"]));
+    assert_eq!(store.delete, ["old-key"]);
+}
+
+#[test]
+fn custom_om_observer_catch_up_job() {
+    let CustomPayload::OmObserverCatchUpJob(job) = parse_custom_payload(
+        "om.observer.catch-up.job",
+        json!({
+            "version": 1, "compactionId": "c1", "fromId": "e1", "throughId": "e2"
+        }),
+    ) else {
+        panic!("expected catch-up job")
+    };
+    assert_eq!(job.from_id, "e1");
+}
+
+#[test]
+fn custom_om_observer_catch_up_progress() {
+    for extra in [json!({"nextSourceId": "e3"}), json!({"complete": true})] {
+        let mut data = json!({"version": 1, "compactionId": "c1"});
+        data.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let CustomPayload::OmObserverCatchUpProgress(progress) =
+            parse_custom_payload("om.observer.catch-up.progress", data.clone())
+        else {
+            panic!("expected catch-up progress")
+        };
+        assert_eq!(serde_json::to_value(progress).unwrap(), data);
+    }
+    for data in [
+        json!({"version": 1, "compactionId": "c1"}),
+        json!({"version": 1, "compactionId": "c1", "complete": true, "nextSourceId": "e3"}),
+        json!({"version": 1, "compactionId": "c1", "complete": false}),
+    ] {
+        parse_err(custom_json("om.observer.catch-up.progress", data));
     }
 }
 

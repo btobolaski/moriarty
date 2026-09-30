@@ -167,6 +167,7 @@ pub enum PiLogLine {
     ThinkingLevelChange(ThinkingLevelChangeLine),
     Compaction(CompactionLine),
     BranchSummary(BranchSummaryLine),
+    ContextEdit(ContextEditLine),
     Custom(CustomLine),
     CustomMessage(Box<CustomMessageLine>),
     Message(MessageLine),
@@ -237,6 +238,8 @@ pub struct CompactionLine {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<AssistantUsage>,
     pub from_hook: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_message: Option<SystemMessageSnapshot>,
 }
 
 /// Branch summaries snapshot the detour taken on another conversation branch
@@ -330,6 +333,24 @@ pub struct OmFolded {
 // `deny_unknown_fields` and catch any unknown sibling keys.
 // ---------------------------------------------------------------------------
 
+/// Context edits change what the model sees, not the original billable response.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ContextEditLine {
+    pub id: String,
+    pub parent_id: String,
+    pub timestamp: DateTime<Utc>,
+    pub target_id: String,
+    pub replacement: Option<ContextEditReplacement>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextEditReplacement {
+    /// The target may be a user, assistant, tool result, or extension-defined custom message.
+    pub content: JsonBlob,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CustomLine {
@@ -349,6 +370,8 @@ pub enum CustomPayload {
     Plannotator(PlannotatorData),
     #[serde(rename = "dcp-state")]
     DcpState(DcpStateData),
+    #[serde(rename = "codemode-store")]
+    CodemodeStore(CodemodeStoreData),
     #[serde(rename = "web-search-results")]
     WebSearchResults(WebSearchResultsData),
     #[serde(rename = "plannotator-execute")]
@@ -363,6 +386,10 @@ pub enum CustomPayload {
     OmObservationsDropped(OmObservationsDroppedData),
     #[serde(rename = "om.reflections.dropped")]
     OmReflectionsDropped(OmReflectionsDroppedData),
+    #[serde(rename = "om.observer.catch-up.job")]
+    OmObserverCatchUpJob(OmObserverCatchUpJobData),
+    #[serde(rename = "om.observer.catch-up.progress")]
+    OmObserverCatchUpProgress(OmObserverCatchUpProgressData),
     /// Name-provenance record emitted by the firstpick session-summary
     /// extension: whether the session's summary name was set explicitly by
     /// the user or derived.
@@ -505,6 +532,8 @@ pub struct MessageLine {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "camelCase")]
 pub enum RoleMessage {
+    #[serde(rename = "system")]
+    System(Box<SystemMessage>),
     #[serde(rename = "user")]
     User(UserMessage),
     #[serde(rename = "assistant")]
@@ -520,6 +549,58 @@ pub enum RoleMessage {
 pub struct UserMessage {
     pub content: Vec<UserContentItem>,
     pub timestamp: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SystemMessage {
+    pub content: SystemContent,
+    pub timestamp: i64,
+    /// Section names are extension-defined; null removes a previously declared section.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sections: Option<BTreeMap<String, Option<String>>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools_added: Option<Vec<SystemTool>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools_removed: Option<Vec<SystemToolReference>>,
+}
+
+/// A compaction snapshot carries the role tag but cannot contain a billable message.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(tag = "role", rename_all = "lowercase")]
+pub enum SystemMessageSnapshot {
+    System(Box<SystemMessage>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SystemContent {
+    Text(String),
+    Blocks(Vec<SystemContentItem>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum SystemContentItem {
+    Text(TextAssistantContent),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SystemTool {
+    pub name: String,
+    pub description: String,
+    /// Pi tool schemas require an object, but their keywords and values are tool-owned.
+    pub parameters: BTreeMap<String, JsonBlob>,
+    /// Provider-side sampling controls are preserved without interpreting them for costing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constrained_sampling: Option<JsonBlob>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SystemToolReference {
+    pub name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -544,6 +625,8 @@ pub struct AssistantMessage {
     /// construction. Only some providers emit it, hence `Option`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_stop_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_level: Option<ThinkingLevel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
     /// Provider diagnostics attached when the assistant turn fails due to
@@ -602,6 +685,99 @@ pub struct ToolResultMessage {
     /// would double-count (the same reasoning as Claude's `cost-state`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<AssistantUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nested_calls: Option<NestedToolCalls>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NestedToolCalls {
+    pub calls: Vec<NestedToolCall>,
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "RawNestedToolCall", into = "RawNestedToolCall")]
+pub struct NestedToolCall {
+    pub id: String,
+    pub name: String,
+    pub status: NestedToolCallStatus,
+    pub arguments: Option<NestedCallArguments>,
+    pub duration_ms: Option<u64>,
+    pub error: Option<String>,
+}
+
+/// Size-limit omission metadata cannot coexist with the arguments it replaces.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum NestedCallArguments {
+    Inline(BTreeMap<String, JsonBlob>),
+    Omitted { arguments_bytes: u64 },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RawNestedToolCall {
+    id: String,
+    name: String,
+    status: NestedToolCallStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    arguments: Option<BTreeMap<String, JsonBlob>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    arguments_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+impl TryFrom<RawNestedToolCall> for NestedToolCall {
+    type Error = &'static str;
+
+    fn try_from(raw: RawNestedToolCall) -> Result<Self, Self::Error> {
+        let arguments = match (raw.arguments, raw.arguments_bytes) {
+            (Some(_), Some(_)) => {
+                return Err("nested call cannot contain both arguments and argumentsBytes");
+            }
+            (Some(arguments), None) => Some(NestedCallArguments::Inline(arguments)),
+            (None, Some(arguments_bytes)) => Some(NestedCallArguments::Omitted { arguments_bytes }),
+            (None, None) => None,
+        };
+        Ok(Self {
+            id: raw.id,
+            name: raw.name,
+            status: raw.status,
+            arguments,
+            duration_ms: raw.duration_ms,
+            error: raw.error,
+        })
+    }
+}
+
+impl From<NestedToolCall> for RawNestedToolCall {
+    fn from(call: NestedToolCall) -> Self {
+        let (arguments, arguments_bytes) = match call.arguments {
+            Some(NestedCallArguments::Inline(arguments)) => (Some(arguments), None),
+            Some(NestedCallArguments::Omitted { arguments_bytes }) => (None, Some(arguments_bytes)),
+            None => (None, None),
+        };
+        Self {
+            id: call.id,
+            name: call.name,
+            status: call.status,
+            arguments,
+            arguments_bytes,
+            duration_ms: call.duration_ms,
+            error: call.error,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NestedToolCallStatus {
+    Ok,
+    Error,
+    Unfinished,
 }
 
 #[derive(Debug, Deserialize)]
@@ -618,6 +794,7 @@ struct RawToolResultMessage {
     pub added_tool_names: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<AssistantUsage>,
+    pub nested_calls: Option<NestedToolCalls>,
 }
 
 /// Pi can emit `null` or omit `details` entirely when no structured result is
@@ -661,6 +838,7 @@ impl<'de> Deserialize<'de> for ToolResultMessage {
             details: raw_details,
             added_tool_names,
             usage,
+            nested_calls,
         } = RawToolResultMessage::deserialize(deserializer)?;
         let resolved = resolve_tool_result_details(raw_details, &tool_name, is_error);
         let details = resolved.map_err(de::Error::custom)?;
@@ -673,6 +851,7 @@ impl<'de> Deserialize<'de> for ToolResultMessage {
             details,
             added_tool_names,
             usage,
+            nested_calls,
         })
     }
 }
@@ -1670,6 +1849,41 @@ pub struct ShepardEventId {
     pub id: String,
 }
 
+/// Persists the source range so observation extraction can resume after compaction.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OmObserverCatchUpJobData {
+    pub version: u32,
+    pub compaction_id: String,
+    pub from_id: String,
+    pub through_id: String,
+}
+
+/// Progress either names the next source or marks completion, never both.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(untagged, rename_all_fields = "camelCase", deny_unknown_fields)]
+pub enum OmObserverCatchUpProgressData {
+    Pending {
+        version: u32,
+        compaction_id: String,
+        next_source_id: String,
+    },
+    Complete {
+        version: u32,
+        compaction_id: String,
+        #[serde(deserialize_with = "deserialize_complete")]
+        complete: bool,
+    },
+}
+
+fn deserialize_complete<'de, D: Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    if bool::deserialize(deserializer)? {
+        Ok(true)
+    } else {
+        Err(de::Error::custom("observer completion flag must be true"))
+    }
+}
+
 /// Emitted by the om extension when it records observations extracted
 /// during a session.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -1974,6 +2188,7 @@ fn parse_tool_result_details(
         "ast_grep_search" => empty_or(details, ToolResultDetails::AstGrepSearch),
         "bash" => serde_json::from_value(details).map(ToolResultDetails::Bash),
         "code_search" => serde_json::from_value(details).map(ToolResultDetails::CodeSearch),
+        "codemode" => empty_or(details, ToolResultDetails::Codemode),
         "compress" => serde_json::from_value(details).map(ToolResultDetails::Compress),
         "contact_supervisor" => {
             serde_json::from_value(details).map(ToolResultDetails::ContactSupervisor)
@@ -2164,6 +2379,7 @@ pub enum ToolResultDetails {
     Intercom(IntercomResultDetails),
     Mcp(McpDetails),
     McpScript(McpScriptDetails),
+    Codemode(CodemodeDetails),
     McpToolResult(McpToolResult),
     Bash(BashDetails),
     PlannotatorSubmitPlan(PlannotatorSubmitPlanDetails),
@@ -3999,6 +4215,26 @@ pub struct McpSessionsDetails {
     pub sessions: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_guard: Option<JsonBlob>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CodemodeStoreData {
+    /// Store keys and values belong to caller scripts, not the extension protocol.
+    pub set: BTreeMap<String, JsonBlob>,
+    pub delete: Vec<String>,
+}
+
+/// Empty success details reuse ToolResultDetails::Empty rather than a codemode-only state;
+/// non-empty payloads require calls. Error sentinels are dropped before this routing.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CodemodeDetails {
+    /// Extension call breadcrumbs vary independently of core nestedCalls metadata,
+    /// including JSON-string args and fractional durationMs; costing reads neither.
+    pub calls: Vec<JsonBlob>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_output_path: Option<PathBuf>,
 }
 
 /// Results from the adapter's `mcpScript` batch tool carry `mode: "script"`

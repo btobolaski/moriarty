@@ -621,6 +621,7 @@ impl AnalyzableLog for PiLogLine {
         match self {
             PiLogLine::BranchSummary(branch_summary) => branch_summary.id.clone(),
             PiLogLine::Compaction(compaction) => compaction.id.clone(),
+            PiLogLine::ContextEdit(edit) => edit.id.clone(),
             PiLogLine::Custom(custom) => custom.id.clone(),
             PiLogLine::CustomMessage(message) => message.id.clone(),
             PiLogLine::Message(message) => message.id.clone(),
@@ -656,6 +657,7 @@ impl AnalyzableLog for PiLogLine {
         match self {
             PiLogLine::BranchSummary(branch_summary) => branch_summary.timestamp,
             PiLogLine::Compaction(compaction) => compaction.timestamp,
+            PiLogLine::ContextEdit(edit) => edit.timestamp,
             PiLogLine::Custom(custom) => custom.timestamp,
             PiLogLine::CustomMessage(message) => message.timestamp,
             PiLogLine::Message(message) => message.timestamp,
@@ -1517,6 +1519,13 @@ mod tests {
 
     #[test]
     fn line_with_cost_parse_returns_none_for_non_assistant_messages() {
+        let context_edit = json!({
+            "type": "context_edit", "id": "edit-1", "parentId": "p1", "timestamp": CLAUDE_TIMESTAMP,
+            "targetId": "a1", "replacement": null
+        });
+        let log = parse_pi_log(context_edit.clone());
+        assert_eq!(log.identifier(), "edit-1");
+        assert_eq!(log.timestamp(), timestamp());
         let cases = [
             user_message_json(),
             tool_result_message_json(),
@@ -1526,6 +1535,25 @@ mod tests {
             branch_summary_json(),
             custom_json(),
             custom_message_json(),
+            context_edit,
+            json!({
+                "type": "message", "id": "system-1", "parentId": "p1", "timestamp": CLAUDE_TIMESTAMP,
+                "message": {
+                    "role": "system", "content": "Instructions", "timestamp": 1_700_000_000,
+                    "sections": {"preamble": "Base"},
+                    "toolsAdded": [{"name": "read", "description": "Read", "parameters": {}}]
+                }
+            }),
+            json!({
+                "type": "custom", "id": "job-1", "parentId": "p1", "timestamp": CLAUDE_TIMESTAMP,
+                "customType": "om.observer.catch-up.job",
+                "data": {"version": 1, "compactionId": "c1", "fromId": "e1", "throughId": "e2"}
+            }),
+            json!({
+                "type": "custom", "id": "progress-1", "parentId": "p1", "timestamp": CLAUDE_TIMESTAMP,
+                "customType": "om.observer.catch-up.progress",
+                "data": {"version": 1, "compactionId": "c1", "complete": true}
+            }),
         ];
 
         for (index, value) in cases.into_iter().enumerate() {
