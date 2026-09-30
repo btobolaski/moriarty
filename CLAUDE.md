@@ -190,7 +190,17 @@ siblings stay `String`), and an `imagePasteIds` field on both user and assistant
   system records, grouped as `ScheduledTaskFire.task: Option<ScheduledTaskInfo>` because the wire always emits all
   five together; like `SessionContext` it deserializes via a strict wire struct and `TryFrom` that rejects a partial
   set, and both kinds parse into the strict `ScheduledTaskKind` enum (only `loop` observed, so a new kind surfaces as
-  a parse error) (all observed in Claude Code 2.1.280+)
+  a parse error) (all observed in Claude Code 2.1.280+), and, in Claude Code 2.1.285+, a `renderedRole` on attachment
+  lines (the strict `RenderedRole` enum, `system`/`user`, folded into `AttachmentRendering` so it cannot appear without
+  `rendered`), a `turnPosition` object on user turns (`TurnPosition`, `promptIndex`/`turnIndex`), a `producer` on
+  `MessageOrigin` (the strict `MessageProducer` enum), a `builtInTypes` list on `agent_listing_delta`, a
+  `credential_org` attachment (`CredentialOrg`, the credentials' organization UUID), prompt-shaping flags on
+  `prompt_snapshot` (`reminderFold`/`systemTurns`/`toolChangeHeader`/`inlineTools`/`keptReminders`/`echoWireToolInputs`
+  plus the strict `ContextRendering` enum; kept as independent `Option`s because snapshots carry different subsets), a
+  `parent` path on `nested_memory` content (the memory file that imported it), a `toolInputCopies` list on
+  `deferred_tools_record` (`ToolInputCopy`, whose `copy` is the strict `ToolInputCopyKind` enum), and a
+  `fallback_credit` on `AssistantUsage`, typed `Option<()>` because only `null` has been observed and a real credit
+  could change a response's cost, so its shape must surface as a parse error
 - Also owns the structured view of the raw `model` string via `model::Model { family, version }` plus `ModelFamily` and
   `ModelVersion`. Both `cost_analyzer` (for pricing) and `moriarty::api_pricing` (for grouping/display) consume this one
   parser so family/version classification is not duplicated across crates. The parser preserves capability-decorated raw

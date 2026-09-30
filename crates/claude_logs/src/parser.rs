@@ -555,6 +555,7 @@ struct AttachmentLogLineWire {
     slug: Option<String>,
     rendered: Option<Vec<RenderedAttachment>>,
     rendered_in_human_turn: Option<Vec<RenderedAttachment>>,
+    rendered_role: Option<RenderedRole>,
     #[serde(rename = "session_id")]
     session_id_snake: Option<Uuid>,
     session_kind: Option<SessionKind>,
@@ -564,13 +565,21 @@ impl TryFrom<AttachmentLogLineWire> for AttachmentLogLine {
     type Error = String;
 
     fn try_from(wire: AttachmentLogLineWire) -> Result<Self, Self::Error> {
-        let rendering = match (wire.rendered, wire.rendered_in_human_turn) {
-            (Some(rendered), rendered_in_human_turn) => Some(AttachmentRendering {
+        let rendering = match (
+            wire.rendered,
+            wire.rendered_in_human_turn,
+            wire.rendered_role,
+        ) {
+            (Some(rendered), rendered_in_human_turn, rendered_role) => Some(AttachmentRendering {
                 rendered,
                 rendered_in_human_turn,
+                rendered_role,
             }),
-            (None, None) => None,
-            (None, Some(_)) => return Err("`renderedInHumanTurn` requires `rendered`".to_string()),
+            (None, None, None) => None,
+            (None, Some(_), _) => {
+                return Err("`renderedInHumanTurn` requires `rendered`".to_string());
+            }
+            (None, None, Some(_)) => return Err("`renderedRole` requires `rendered`".to_string()),
         };
         Ok(Self {
             parent_uuid: wire.parent_uuid,
@@ -599,6 +608,18 @@ pub struct AttachmentRendering {
     pub rendered: Vec<RenderedAttachment>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rendered_in_human_turn: Option<Vec<RenderedAttachment>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rendered_role: Option<RenderedRole>,
+}
+
+/// The message role an attachment's rendering was injected under. Strict so a newly observed role
+/// surfaces as a parse error rather than being silently misattributed. Added in Claude Code
+/// 2.1.285+.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RenderedRole {
+    System,
+    User,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -625,6 +646,7 @@ pub enum AttachmentData {
     CommandPermissions(CommandPermissions),
     CompactFileReference(CompactFileReference),
     ContextTip(ContextTip),
+    CredentialOrg(CredentialOrg),
     Date(DateAttachment),
     DateChange(DateChange),
     DeferredToolsDelta(DeferredToolsDelta),
@@ -662,6 +684,14 @@ pub enum AttachmentData {
     TotalTokensReminder(TotalTokensReminder),
 }
 
+/// The organization the session's credentials belong to. Added in Claude Code 2.1.285+.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct CredentialOrg {
+    pub organization_uuid: Uuid,
+}
+
 /// The agent (subagent) analogue of `deferred_tools_delta`. Added in Claude Code 2.1.175+.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -669,6 +699,9 @@ pub enum AttachmentData {
 pub struct AgentListingDelta {
     pub added_types: Vec<String>,
     pub added_lines: Vec<String>,
+    /// The agent types that ship with Claude Code rather than coming from user or project agent
+    /// definitions; absent on older logs, hence `Option`. Added in Claude Code 2.1.285+.
+    pub built_in_types: Option<Vec<String>>,
     pub removed_types: Vec<String>,
     pub is_initial: bool,
     pub show_concurrency_note: bool,
@@ -855,6 +888,23 @@ pub struct FailedMcpServer {
 #[serde(deny_unknown_fields)]
 pub struct DeferredToolsRecord {
     pub entries: Vec<DeferredToolSchema>,
+    /// Absent on older logs, hence `Option`. Added in Claude Code 2.1.285+.
+    pub tool_input_copies: Option<Vec<ToolInputCopy>>,
+}
+
+/// Which copy of the input was recorded for the `tool_use` call named by `id`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolInputCopy {
+    pub id: String,
+    pub copy: ToolInputCopyKind,
+}
+
+/// Strict so a new kind of copy surfaces as a parse error; only `wire` has been observed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ToolInputCopyKind {
+    Wire,
 }
 
 /// Editor diagnostics Claude Code attaches after a file changed, so the model sees the errors its
@@ -940,6 +990,32 @@ pub struct PromptSnapshot {
     pub system_prompt: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<PromptSnapshotTool>>,
+    // Prompt-shaping flags added in Claude Code 2.1.285+. They stay independent `Option`s rather
+    // than one grouped struct because snapshots carry different subsets: every observed 2.1.285
+    // snapshot has `reminderFold`/`echoWireToolInputs`/`contextRendering`, but only some have
+    // `systemTurns`/`keptReminders` and fewer still `toolChangeHeader`/`inlineTools`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reminder_fold: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_turns: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_change_header: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inline_tools: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kept_reminders: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub echo_wire_tool_inputs: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_rendering: Option<ContextRendering>,
+}
+
+/// How injected context is rendered. Strict so a new mode surfaces as a parse error; only
+/// `announced` has been observed. Added in Claude Code 2.1.285+.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ContextRendering {
+    Announced,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1484,6 +1560,10 @@ pub struct NestedMemoryContent {
     // type does not enforce that pairing — it is an upstream protocol invariant.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_content: Option<String>,
+    /// The memory file whose import pulled this one in (observed: a `CLAUDE.md` importing an
+    /// `AGENTS.md`); absent for files loaded directly. Added in Claude Code 2.1.285+.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
 }
 
 /// Plan file surfaced into the conversation with its full text inlined in `plan_content`; the
@@ -2479,6 +2559,8 @@ pub struct UserLogLine {
     /// Whether the turn originated from a human or another source; preserved because strict
     /// deserialization would otherwise discard the entire conversation record. Added in 2.1.278+.
     pub turn_origin: Option<String>,
+    /// Where this turn sits in the session's prompt/turn sequence. Added in Claude Code 2.1.285+.
+    pub turn_position: Option<TurnPosition>,
     /// The scheduled task that produced this turn. Present only on scheduled turns. Observed in
     /// Claude Code 2.1.280+.
     pub scheduled_task_id: Option<ScheduledTaskId>,
@@ -2688,12 +2770,33 @@ pub struct McpMeta {
     pub meta: Option<HashMap<String, serde_json::Value>>,
 }
 
+/// Strict so a new producer surfaces as a parse error; only `session-task` (on a task
+/// notification) has been observed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MessageProducer {
+    SessionTask,
+}
+
+/// Observed with `promptIndex` 0 on a system-injected task notification and 1 on the first typed
+/// prompt, so a zero index does not mean "first prompt". Added in Claude Code 2.1.285+.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct TurnPosition {
+    pub prompt_index: u32,
+    pub turn_index: u32,
+}
+
 /// Origin metadata for a message. Added in Claude Code 2.1.104+.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct MessageOrigin {
     pub kind: String,
+    /// What produced the message; absent on origins without a producer, hence `Option`. Added in
+    /// Claude Code 2.1.285+.
+    pub producer: Option<MessageProducer>,
 }
 
 /// Why Claude Code denied a tool call. Modeled as a strict enum (not a free `String`) so a new
@@ -3102,6 +3205,10 @@ pub struct AssistantUsage {
     pub iterations: Option<Vec<Iteration>>,
     /// Speed setting for the response. Added in Claude Code 2.1.77+.
     pub speed: Option<Speed>,
+    /// Only ever observed `null`. Typed as `Option<()>` so any populated payload fails to parse:
+    /// a credit could change what a response costs, so its real shape must be modeled rather than
+    /// silently discarded. Added in Claude Code 2.1.285+.
+    pub fallback_credit: Option<()>,
 }
 
 /// Added in Claude Code 2.1.238+. `thinking_tokens` is required because every observed payload

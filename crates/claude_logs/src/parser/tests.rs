@@ -5638,6 +5638,19 @@ fn test_parse_assistant_usage_with_inference_geo() {
     );
 }
 
+// Claude Code 2.1.285+ emits `fallback_credit`; only `null` has been observed, so any populated
+// value, even an empty object, must still fail to parse.
+#[test]
+fn test_parse_assistant_usage_rejects_populated_fallback_credit() {
+    let json = assistant_log_line_json(serde_json::json!({
+        "message": {"usage": {"fallback_credit": {}}}
+    }));
+    let err = serde_json::from_value::<AssistantLogLine>(json)
+        .expect_err("a populated fallback_credit must surface its unmodeled shape")
+        .to_string();
+    assert!(err.contains("expected unit"), "unexpected error: {err}");
+}
+
 #[test]
 fn test_parse_assistant_usage_with_null_inference_geo() {
     let json = serde_json::json!({
@@ -7514,6 +7527,7 @@ fn test_parse_attachment_agent_listing_delta() {
             "type": "agent_listing_delta",
             "addedTypes": ["claude", "Explore"],
             "addedLines": ["- claude: catch-all", "- Explore: read-only search"],
+            "builtInTypes": ["Explore"],
             "removedTypes": [],
             "isInitial": true,
             "showConcurrencyNote": true
@@ -7524,7 +7538,7 @@ fn test_parse_attachment_agent_listing_delta() {
         "entrypoint": "cli",
         "cwd": "/test",
         "sessionId": "550e8400-e29b-41d4-a716-446655440001",
-        "version": "2.1.175",
+        "version": "2.1.285",
         "gitBranch": "main",
         "slug": null
     });
@@ -7536,6 +7550,7 @@ fn test_parse_attachment_agent_listing_delta() {
         delta.added_lines,
         vec!["- claude: catch-all", "- Explore: read-only search"]
     );
+    assert_eq!(delta.built_in_types, Some(vec!["Explore".to_string()]));
     assert!(delta.removed_types.is_empty());
     assert!(delta.is_initial);
     assert!(delta.show_concurrency_note);
@@ -7570,6 +7585,7 @@ fn test_parse_attachment_agent_listing_delta_non_initial() {
     };
     assert_eq!(delta.added_types, vec!["new-agent"]);
     assert_eq!(delta.added_lines, vec!["- new-agent: added mid-session"]);
+    assert_eq!(delta.built_in_types, None);
     assert_eq!(delta.removed_types, vec!["old-agent"]);
     assert!(!delta.is_initial);
     assert!(!delta.show_concurrency_note);
@@ -9890,10 +9906,130 @@ fn test_parse_attachment_line_rendered() {
 }
 
 #[test]
-fn test_parse_attachment_line_rejects_human_turn_rendering_without_rendering() {
+fn test_parse_attachment_line_rejects_rendering_siblings_without_rendering() {
+    for (key, value) in [
+        (
+            "renderedInHumanTurn",
+            serde_json::json!([{"content": "queued"}]),
+        ),
+        ("renderedRole", serde_json::json!("system")),
+    ] {
+        let mut json = environment_json(None);
+        json[key] = value;
+        let err = serde_json::from_value::<LogLine>(json)
+            .expect_err("rendering siblings must require rendered")
+            .to_string();
+        assert!(
+            err.contains(&format!("`{key}` requires `rendered`")),
+            "unexpected error for {key}: {err}"
+        );
+    }
+}
+
+// Attachment payloads and fields first observed in Claude Code 2.1.285, each fixture trimmed from
+// a real log line.
+#[test]
+fn test_parse_attachment_payloads_added_in_2_1_285() {
+    let cases = [
+        (
+            "credential_org",
+            serde_json::json!({
+                "type": "credential_org",
+                "organizationUuid": "53b79fff-9628-4879-adba-b68e8d80e9eb"
+            }),
+            AttachmentData::CredentialOrg(CredentialOrg {
+                organization_uuid: "53b79fff-9628-4879-adba-b68e8d80e9eb".parse().unwrap(),
+            }),
+        ),
+        (
+            "prompt_snapshot shaping flags",
+            serde_json::json!({
+                "type": "prompt_snapshot",
+                "systemPrompt": [],
+                "reminderFold": false,
+                "systemTurns": true,
+                "toolChangeHeader": true,
+                "inlineTools": true,
+                "keptReminders": true,
+                "echoWireToolInputs": true,
+                "contextRendering": "announced"
+            }),
+            AttachmentData::PromptSnapshot(PromptSnapshot {
+                cli_prefix: None,
+                system_prompt: vec![],
+                tools: None,
+                reminder_fold: Some(false),
+                system_turns: Some(true),
+                tool_change_header: Some(true),
+                inline_tools: Some(true),
+                kept_reminders: Some(true),
+                echo_wire_tool_inputs: Some(true),
+                context_rendering: Some(ContextRendering::Announced),
+            }),
+        ),
+        (
+            "nested_memory parent",
+            serde_json::json!({
+                "type": "nested_memory",
+                "path": "/abs/AGENTS.md",
+                "content": {
+                    "path": "/abs/AGENTS.md",
+                    "type": "Project",
+                    "content": "# Agents",
+                    "contentDiffersFromDisk": false,
+                    "parent": "/abs/CLAUDE.md"
+                },
+                "displayPath": "AGENTS.md"
+            }),
+            AttachmentData::NestedMemory(NestedMemory {
+                path: "/abs/AGENTS.md".to_string(),
+                content: NestedMemoryContent {
+                    path: "/abs/AGENTS.md".to_string(),
+                    r#type: "Project".to_string(),
+                    content: "# Agents".to_string(),
+                    content_differs_from_disk: false,
+                    raw_content: None,
+                    parent: Some("/abs/CLAUDE.md".to_string()),
+                },
+                display_path: "AGENTS.md".to_string(),
+            }),
+        ),
+        (
+            "deferred_tools_record toolInputCopies",
+            serde_json::json!({
+                "type": "deferred_tools_record",
+                "entries": [],
+                "toolInputCopies": [{"id": "toolu_01VuxS7meykZdAaGNjfg7JMj", "copy": "wire"}]
+            }),
+            AttachmentData::DeferredToolsRecord(DeferredToolsRecord {
+                entries: vec![],
+                tool_input_copies: Some(vec![ToolInputCopy {
+                    id: "toolu_01VuxS7meykZdAaGNjfg7JMj".to_string(),
+                    copy: ToolInputCopyKind::Wire,
+                }]),
+            }),
+        ),
+    ];
+    for (label, payload, expected) in cases {
+        assert_eq!(
+            parse_attachment(attachment_line_json(payload)),
+            expected,
+            "{label}"
+        );
+    }
+}
+
+// Claude Code 2.1.285+ records the role an attachment's rendering was injected under.
+#[test]
+fn test_parse_attachment_line_rendered_role() {
     let mut json = environment_json(None);
-    json["renderedInHumanTurn"] = serde_json::json!([{"content": "queued"}]);
-    serde_json::from_value::<LogLine>(json).expect_err("renderedInHumanTurn must require rendered");
+    json["rendered"] = serde_json::json!([{"content": "env"}]);
+    json["renderedRole"] = serde_json::json!("system");
+    let line = parse_attachment_line(json);
+    assert_eq!(
+        line.rendering.and_then(|rendering| rendering.rendered_role),
+        Some(RenderedRole::System)
+    );
 }
 
 fn instructions_json(
@@ -10225,7 +10361,8 @@ fn test_parse_attachment_queued_command_with_origin() {
     assert_eq!(
         cmd.origin,
         Some(MessageOrigin {
-            kind: "human".to_string()
+            kind: "human".to_string(),
+            producer: None,
         })
     );
     assert_eq!(
@@ -11122,6 +11259,31 @@ fn test_parse_user_log_line_with_turn_origin() {
     assert_eq!(line.turn_origin.as_deref(), Some("human"));
 }
 
+// A Claude Code 2.1.285 task-notification turn, which carries both the origin's producer and the
+// turn's position.
+#[test]
+fn test_parse_user_log_line_task_notification_metadata() {
+    let json = user_log_line_json(serde_json::json!({
+        "version": "2.1.285",
+        "origin": {"kind": "task-notification", "producer": "session-task"},
+        "turnPosition": {"promptIndex": 0, "turnIndex": 1}
+    }));
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(
+        (line.origin, line.turn_position),
+        (
+            Some(MessageOrigin {
+                kind: "task-notification".to_string(),
+                producer: Some(MessageProducer::SessionTask),
+            }),
+            Some(TurnPosition {
+                prompt_index: 0,
+                turn_index: 1,
+            })
+        )
+    );
+}
+
 #[test]
 fn test_parse_user_log_line_with_scheduled_task_ids() {
     let json = user_log_line_json(serde_json::json!({
@@ -11667,6 +11829,7 @@ fn test_parse_attachment_deferred_tools_record() {
         Some(&serde_json::json!("object"))
     );
     assert!(entry.defer_loading);
+    assert_eq!(record.tool_input_copies, None);
 }
 
 // Claude Code 2.1.270+ records the effort a single turn was raised to, distinct from the session's
