@@ -2813,6 +2813,10 @@ pub struct SubagentWaitCompletionResult {
     /// Error message for a failed child run; absent on success.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Why pi-subagents interrupted a child and the files it had changed.
+    /// The termination and report-status vocabularies are extension-owned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_recovery: Option<SubagentTimeoutRecovery>,
     /// The child run's own token/cost usage. Present on newer workflow
     /// completions; absent on older entries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2829,6 +2833,49 @@ pub struct SubagentWaitCompletionResult {
     /// inline `structured_output` payload by newer workflow completions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub structured_output_path: Option<PathBuf>,
+}
+
+/// Whether pi-subagents ended the child by timeout or explicit stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SubagentTimeoutTermination {
+    TimedOut,
+    Stopped,
+}
+
+/// State of the requested report output: `Missing` means it was not written, while `Unknown` means
+/// its status could not be determined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SubagentTimeoutReportStatus {
+    Missing,
+    Written,
+    NotRequested,
+    Unknown,
+}
+
+/// Why a timed-out child needs review because it changed files without its requested report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SubagentTimeoutRecoveryReason {
+    TimedOutWithDirtyWorktree,
+}
+
+/// Timeout recovery is extension-owned run metadata, projected to this bounded
+/// subset by pi-subagents before it is recorded in a wait result.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SubagentTimeoutRecovery {
+    pub termination: SubagentTimeoutTermination,
+    pub changed_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_needed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<SubagentTimeoutRecoveryReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report_status: Option<SubagentTimeoutReportStatus>,
 }
 
 /// Wait completions record either the saved output path alone or the full
@@ -4868,6 +4915,10 @@ pub struct LensDiagnosticsFullDetails<S> {
     pub analyzers_aborted: bool,
     pub analyzers_aborted_ids: Vec<String>,
     pub analyzers_unsafe_root: bool,
+    /// Pi-lens owns the validation detail shape and this report does not
+    /// interpret it, so retain new validation metadata without guessing fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analysis_root_validation: Option<JsonBlob>,
     pub project_walk_unsafe_root: bool,
     pub lsp_files_confirmed: u32,
     pub lsp_files_unconfirmed: u32,

@@ -293,7 +293,9 @@ with warnings, while explicit missing paths and having no available source are e
 - Strict by default with `#[serde(deny_unknown_fields)]`, path-aware parse errors, and narrowly documented exceptions
   for shapes that require custom deserialization or specific corrupt-stream tolerance
 - Newer pi-subagents metadata includes `SubagentSupervisorReplyData`, request `reply_hint`s, control-event
-  `tool_call_id`s, and `SubagentWaitStatus` in mutually exclusive completed/early-return `bg_wait` outcomes
+  `tool_call_id`s, `SubagentWaitStatus` in mutually exclusive completed/early-return `bg_wait` outcomes, and typed
+  `timeoutRecovery` projections on child wait results (`SubagentTimeoutRecovery`; closed termination/report-status
+  enums with optional truncation and dirty-worktree recovery metadata)
 - Custom messages keep accreting extension-owned types: `shepard-assignment` and `shepard-roster` (a shepard live-test
   assignment and delegation-roster announcement whose text lives in the outer `content`) parse as unit variants like
   `subagent-notify`, while `shepard-event` (a progress relay) carries only the composite `<child run id>:<event id>` in
@@ -326,7 +328,8 @@ with warnings, while explicit missing paths and having no available source are e
   observed on `interview_request` replies carrying the schema-conforming answer beside the prose one; kept opaque as
   `JsonBlob` because its shape is whatever the requesting tool's schema asked for)
 - `lens_diagnostics` full responses gained an optional `partialRunners` sibling of `coldRunners`
-  (`LensDiagnosticsFullDetails.partial_runners`; runners that answered with partial coverage, absent on older logs)
+  (`LensDiagnosticsFullDetails.partial_runners`; runners that answered with partial coverage, absent on older logs),
+  plus opaque optional `analysisRootValidation` metadata whose detail shape is owned by pi-lens
 - `CompactionLine` and `BranchSummaryLine` carry an optional `usage: Option<AssistantUsage>` recording the cost/tokens
   of the summarization call pi made to produce them (pi added this field after the initial compaction schema, so it is
   `#[serde(default)]` for backward compatibility); the lines record no provider/model of their own, so attribution is

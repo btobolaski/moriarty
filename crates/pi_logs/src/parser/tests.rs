@@ -498,8 +498,15 @@ fn parse_tool_result_message(value: Value) -> ToolResultMessage {
 }
 
 fn parse_subagent_wait_completions(completions: Value) -> Vec<SubagentWaitCompletion> {
+    parse_subagent_wait_completions_for_tool("subagent_wait", completions)
+}
+
+fn parse_subagent_wait_completions_for_tool(
+    tool_name: &str,
+    completions: Value,
+) -> Vec<SubagentWaitCompletion> {
     let tool_result = parse_tool_result_message(tool_result_message_json(
-        "subagent_wait",
+        tool_name,
         vec![json!({"type": "text", "text": "done"})],
         false,
         Some(json!({"mode": "management", "results": [], "completions": completions})),
@@ -2718,9 +2725,10 @@ fn contact_supervisor_tool_result_accepts_structured_reply() {
 }
 
 #[test]
-fn lens_diagnostics_full_accepts_partial_runners() {
+fn lens_diagnostics_full_accepts_partial_runners_and_analysis_root_validation() {
     let mut full = lens_full_details(route_fixture("lens-summary"));
     full["partialRunners"] = json!(["opengrep", "typos"]);
+    full["analysisRootValidation"] = json!({"state": "safe", "root": "/tmp/project"});
 
     let Some(ToolResultDetails::LensDiagnostics(LensDiagnosticsDetails::Full(
         LensDiagnosticsFull::Findings(details),
@@ -2732,6 +2740,13 @@ fn lens_diagnostics_full_accepts_partial_runners() {
     assert_eq!(
         details.partial_runners,
         Some(vec!["opengrep".to_string(), "typos".to_string()])
+    );
+    assert_eq!(
+        details
+            .analysis_root_validation
+            .expect("expected validation")
+            .0,
+        json!({"state": "safe", "root": "/tmp/project"})
     );
 }
 
@@ -9357,40 +9372,54 @@ fn bg_wait_rejects_completed_and_early_return_outcomes() {
 }
 
 #[test]
+fn subagent_timeout_recovery_rejects_unknown_statuses() {
+    let base = json!({"termination": "stopped", "changedFiles": []});
+    serde_json::from_value::<SubagentTimeoutRecovery>(base.clone())
+        .expect("optional recovery fields may be absent");
+
+    let mut with_status = base.clone();
+    with_status["reportStatus"] = json!("not-requested");
+    serde_json::from_value::<SubagentTimeoutRecovery>(with_status)
+        .expect("not-requested report status should parse");
+
+    for (field, value) in [("termination", "expired"), ("reportStatus", "pending")] {
+        let mut invalid = base.clone();
+        invalid[field] = json!(value);
+        assert!(serde_json::from_value::<SubagentTimeoutRecovery>(invalid).is_err());
+    }
+}
+
+#[test]
 fn subagent_wait_completion_accepts_workflow_and_usage_fields() {
-    let tool_result = parse_tool_result_message(tool_result_message_json(
+    let completions = parse_subagent_wait_completions_for_tool(
         "bg_wait",
-        vec![json!({"type": "text", "text": "Waited 4m12s; done."})],
-        false,
-        Some(json!({
-            "mode": "management",
-            "results": [],
-            "completions": [{
-                "runId": "f077ede7",
-                "agent": "workflow",
-                "mode": "workflow",
-                "workflowReceiptPath": "/tmp/run/workflow-receipt.json",
-                "workflowChildren": {"version": 1, "children": []},
-                "state": "complete",
+        json!([{
+            "runId": "f077ede7",
+            "agent": "workflow",
+            "mode": "workflow",
+            "workflowReceiptPath": "/tmp/run/workflow-receipt.json",
+            "workflowChildren": {"version": 1, "children": []},
+            "state": "complete",
+            "success": true,
+            "results": [{
+                "agent": "strong_worker",
+                "runId": "a0d3ac26",
                 "success": true,
-                "results": [{
-                    "agent": "strong_worker",
-                    "runId": "a0d3ac26",
-                    "success": true,
-                    "outputState": "present",
-                    "usage": {"input": 83806, "output": 8008, "cacheRead": 923392, "cacheWrite": 0, "cost": "2.161852", "turns": 17},
-                    "sessionFile": "/sessions/a0d3ac26/run-0/session.jsonl",
-                    "structuredOutput": {"verdict": "pass"}
-                }]
+                "outputState": "present",
+                "usage": {"input": 83806, "output": 8008, "cacheRead": 923392, "cacheWrite": 0, "cost": "2.161852", "turns": 17},
+                "sessionFile": "/sessions/a0d3ac26/run-0/session.jsonl",
+                "structuredOutput": {"verdict": "pass"},
+                "timeoutRecovery": {
+                    "termination": "timed-out",
+                    "changedFiles": ["/tmp/changed.rs"],
+                    "truncated": true,
+                    "recoveryNeeded": true,
+                    "reason": "timed-out-with-dirty-worktree",
+                    "reportStatus": "missing"
+                }
             }]
-        })),
-    ));
-    let Some(ToolResultDetails::Subagent(details)) = tool_result.details else {
-        panic!("expected Subagent details")
-    };
-    let Some(SubagentWaitOutcome::Completed(completions)) = details.wait_outcome() else {
-        panic!("expected completed wait outcome")
-    };
+        }]),
+    );
     let [completion] = completions.as_slice() else {
         panic!("expected exactly one completion")
     };
@@ -9412,6 +9441,17 @@ fn subagent_wait_completion_accepts_workflow_and_usage_fields() {
     assert_eq!(
         child.structured_output.as_deref().map(|blob| &blob.0),
         Some(&json!({"verdict": "pass"}))
+    );
+    assert_eq!(
+        child.timeout_recovery,
+        Some(SubagentTimeoutRecovery {
+            termination: SubagentTimeoutTermination::TimedOut,
+            changed_files: vec!["/tmp/changed.rs".into()],
+            truncated: Some(true),
+            recovery_needed: Some(true),
+            reason: Some(SubagentTimeoutRecoveryReason::TimedOutWithDirtyWorktree),
+            report_status: Some(SubagentTimeoutReportStatus::Missing),
+        })
     );
 }
 
