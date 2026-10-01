@@ -28,6 +28,9 @@ pub struct QueueOperation {
     /// kept a raw `String` for the same reason as `operation` above. Added in Claude Code 2.1.257+.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// The queued command the operation acted on. Added in Claude Code 2.1.285+.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command_uuid: Option<Uuid>,
 }
 
 /// Progress events from Claude Code 2.1+.
@@ -842,7 +845,9 @@ pub struct DateAttachment {
     pub changed: Option<bool>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+/// `Hash`/`Ord` are not derived because [`Self::surfaced_definitions`] reaches
+/// [`PromptToolSchema::input_schema`], an opaque map that implements neither.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct DeferredToolsDelta {
@@ -870,6 +875,45 @@ pub struct DeferredToolsDelta {
     /// narrower than `added_names` when a tool is added without being announced.
     #[serde(default)]
     pub surfaced_names: Vec<String>,
+    /// Full definitions of the tools in [`Self::surfaced_names`]. Every observed record names the
+    /// same set in both, but they are not cross-checked because nothing downstream reads either.
+    /// Added in Claude Code 2.1.285+.
+    #[serde(default)]
+    pub surfaced_definitions: Vec<SurfacedToolDefinition>,
+}
+
+/// Reuses [`PromptToolSchema`] rather than [`DeferredToolSchema`] because surfaced definitions
+/// carry no `defer_loading` key. The wire repeats the tool name beside `definition`; deserializing
+/// via `SurfacedToolDefinitionWire` rejects a mismatch and keeps only `definition.name`, as
+/// [`PromptSnapshotTool::Defined`] does.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "SurfacedToolDefinitionWire")]
+pub struct SurfacedToolDefinition {
+    /// An opaque hex digest identifying the listing entry the definition was surfaced from.
+    pub listing: String,
+    pub definition: PromptToolSchema,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SurfacedToolDefinitionWire {
+    name: String,
+    listing: String,
+    definition: PromptToolSchema,
+}
+
+impl TryFrom<SurfacedToolDefinitionWire> for SurfacedToolDefinition {
+    type Error = String;
+
+    fn try_from(wire: SurfacedToolDefinitionWire) -> Result<Self, Self::Error> {
+        if wire.name != wire.definition.name {
+            return Err("surfaced tool definition must match its name".to_string());
+        }
+        Ok(Self {
+            listing: wire.listing,
+            definition: wire.definition,
+        })
+    }
 }
 
 /// A server whose connection failed, carried as an object rather than a bare id so Claude Code can
@@ -1118,7 +1162,7 @@ impl<'de> Deserialize<'de> for PromptSnapshotTool {
 }
 
 /// A tool definition as sent to the API, shared by `prompt_snapshot`'s tool roster and
-/// `deferred_tools_record`'s entries. Wire keys are snake_case here, unlike the camelCase log
+/// `deferred_tools_delta`'s surfaced definitions. Wire keys are snake_case here, unlike the camelCase log
 /// envelope around them, because this is the API's own tool shape carried through verbatim.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

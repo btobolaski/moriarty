@@ -7669,6 +7669,62 @@ fn test_parse_attachment_deferred_tools_delta_with_readded_and_pending() {
     assert_eq!(delta.surfaced_names, vec!["WebFetch"]);
 }
 
+/// A `deferred_tools_delta` carrying `surfacedDefinitions` (Claude Code 2.1.285+), whose entry
+/// names the tool both beside and inside `definition`.
+fn surfaced_definitions_json(outer_name: &str) -> serde_json::Value {
+    let mut json = attachment_line_json(serde_json::json!({
+        "type": "deferred_tools_delta",
+        "addedNames": ["WebFetch"],
+        "addedLines": ["WebFetch"],
+        "removedNames": [],
+        "surfacedNames": ["WebFetch"],
+        "surfacedDefinitions": [{
+            "name": outer_name,
+            "listing": "b18caec4513bd82d",
+            "definition": {
+                "name": "WebFetch",
+                "description": "Fetch a URL.",
+                "input_schema": {"type": "object"},
+                "eager_input_streaming": true
+            }
+        }]
+    }));
+    json["version"] = serde_json::json!("2.1.285");
+    json
+}
+
+#[test]
+fn test_parse_attachment_deferred_tools_delta_with_surfaced_definitions() {
+    let AttachmentData::DeferredToolsDelta(delta) =
+        parse_attachment(surfaced_definitions_json("WebFetch"))
+    else {
+        panic!("Expected DeferredToolsDelta");
+    };
+    assert_eq!(
+        delta.surfaced_definitions,
+        vec![SurfacedToolDefinition {
+            listing: "b18caec4513bd82d".to_string(),
+            definition: PromptToolSchema {
+                name: "WebFetch".to_string(),
+                description: "Fetch a URL.".to_string(),
+                eager_input_streaming: true,
+                input_schema: HashMap::from([("type".to_string(), serde_json::json!("object"))]),
+            },
+        }]
+    );
+}
+
+#[test]
+fn test_parse_attachment_deferred_tools_delta_rejects_mismatched_surfaced_definition() {
+    let err = serde_json::from_value::<LogLine>(surfaced_definitions_json("OtherTool"))
+        .expect_err("surfaced definition must match its outer name")
+        .to_string();
+    assert!(
+        err.contains("surfaced tool definition must match its name"),
+        "got: {err}"
+    );
+}
+
 #[test]
 fn test_parse_attachment_file() {
     let json = serde_json::json!({
@@ -11536,16 +11592,18 @@ fn test_parse_assistant_log_line_with_null_entrypoint() {
     assert_eq!(line.entrypoint, None);
 }
 
-// `reason` on a `queue-operation` (Claude Code 2.1.257+) records why the entry left the queue.
+// `reason` (Claude Code 2.1.257+) and `commandUuid` (2.1.285+) on a `queue-operation` record why
+// the entry left the queue and which queued command it was.
 #[test]
-fn test_parse_queue_operation_with_reason() {
+fn test_parse_queue_operation_with_reason_and_command_uuid() {
     let json = serde_json::json!({
         "type": "queue-operation",
         "operation": "remove",
         "timestamp": "2026-09-02T18:27:29.921Z",
         "content": "Likely it is missing a rule to egress to traefik.",
         "sessionId": "fa4fd201-5dac-417e-b2d2-bae37c14f350",
-        "reason": "absorbed_mid_turn"
+        "reason": "absorbed_mid_turn",
+        "commandUuid": "dfe8d71e-0e1c-4eb4-9dca-e4a030808e46"
     });
 
     let line: LogLine =
@@ -11553,6 +11611,10 @@ fn test_parse_queue_operation_with_reason() {
     match line {
         LogLine::QueueOperation(op) => {
             assert_eq!(op.reason.as_deref(), Some("absorbed_mid_turn"));
+            assert_eq!(
+                op.command_uuid,
+                Some(Uuid::parse_str("dfe8d71e-0e1c-4eb4-9dca-e4a030808e46").unwrap())
+            );
         }
         _ => panic!("Expected QueueOperation variant"),
     }

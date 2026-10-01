@@ -198,7 +198,9 @@ siblings stay `String`), and an `imagePasteIds` field on both user and assistant
   `prompt_snapshot` (`reminderFold`/`systemTurns`/`toolChangeHeader`/`inlineTools`/`keptReminders`/`echoWireToolInputs`
   plus the strict `ContextRendering` enum; kept as independent `Option`s because snapshots carry different subsets), a
   `parent` path on `nested_memory` content (the memory file that imported it), a `toolInputCopies` list on
-  `deferred_tools_record` (`ToolInputCopy`, whose `copy` is the strict `ToolInputCopyKind` enum), and a
+  `deferred_tools_record` (`ToolInputCopy`, whose `copy` is the strict `ToolInputCopyKind` enum), a
+  `surfacedDefinitions` list on `deferred_tools_delta` (`SurfacedToolDefinition`, each surfaced tool's listing digest
+  plus its full `PromptToolSchema`; the wire's duplicate outer `name` is checked against the schema and folded away), a `commandUuid` on `queue-operation` records, and a
   `fallback_credit` on `AssistantUsage`, typed `Option<()>` because only `null` has been observed and a real credit
   could change a response's cost, so its shape must surface as a parse error
 - Also owns the structured view of the raw `model` string via `model::Model { family, version }` plus `ModelFamily` and
