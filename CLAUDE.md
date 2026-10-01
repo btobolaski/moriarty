@@ -303,6 +303,9 @@ with warnings, while explicit missing paths and having no available source are e
   `subagent-notify`, while `shepard-event` (a progress relay) carries only the composite `<child run id>:<event id>` in
   its `details` (`ShepardEventId`, shared with the `shepard-seen` custom-record acknowledgement); supervisor requests
   carry `interview` as an opaque `JsonBlob` because pi-subagents deliberately types it `unknown`
+- Custom lines keep accreting extension-owned payloads too: `rpiv-todo-snapshot` (emitted by the rpiv-todo extension
+  whenever the todo list changes; reuses the `todo` tool's `TodoDetails` shape, with `params` mirroring the tool-call
+  arguments that produced the snapshot) (added in newer pi versions)
 - Pi-lens result details use tool-name-routed, derived Serde schemas: `effective_config` stays an opaque
   `skip_deserializing` `JsonBlob` because pi-lens owns that envelope, may grow new fields, and cost analysis reads none
   of them, the

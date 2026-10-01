@@ -407,6 +407,10 @@ pub enum CustomPayload {
     /// queued message reached the child.
     #[serde(rename = "shepard-seen")]
     ShepardSeen(ShepardEventId),
+    /// Emitted by the rpiv-todo extension whenever the todo list changes;
+    /// the payload is the same shape the `todo` tool's result details use.
+    #[serde(rename = "rpiv-todo-snapshot")]
+    RpivTodoSnapshot(TodoDetails),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

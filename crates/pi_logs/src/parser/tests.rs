@@ -6105,6 +6105,25 @@ fn custom_shepard_seen_parses() {
 }
 
 #[test]
+fn custom_rpiv_todo_snapshot_parses() {
+    let payload = parse_custom_payload(
+        "rpiv-todo-snapshot",
+        json!({
+            "action": "create",
+            "params": {"action": "create", "subject": "Do the thing", "status": "pending"},
+            "tasks": [{"id": 1, "subject": "Do the thing", "status": "pending"}],
+            "nextId": 2
+        }),
+    );
+    let CustomPayload::RpivTodoSnapshot(details) = payload else {
+        panic!("expected RpivTodoSnapshot")
+    };
+    assert_eq!(details.action, "create");
+    assert_eq!(details.next_id, 2);
+    assert_eq!(details.tasks.len(), 1);
+}
+
+#[test]
 fn custom_message_shepard_event_parses() {
     assert!(matches!(
         parse_custom_message_payload(
