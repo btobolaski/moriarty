@@ -10419,6 +10419,10 @@ fn test_parse_attachment_queued_command_with_origin() {
         Some(MessageOrigin {
             kind: "human".to_string(),
             producer: None,
+            from: None,
+            sender_task_id: None,
+            body: None,
+            handback: None,
         })
     );
     assert_eq!(
@@ -10474,6 +10478,44 @@ fn test_parse_attachment_queued_command_with_human_turn() {
         panic!("Expected QueuedCommand");
     };
     assert_eq!(cmd.human_turn, Some(true));
+}
+
+// A Claude Code 2.1.285 subagent hand-back, queued as a peer message rendered into a system
+// reminder.
+#[test]
+fn test_parse_attachment_queued_command_peer_handback() {
+    let json = attachment_line_json(serde_json::json!({
+        "type": "queued_command",
+        "prompt": "<agent-message from=\"a089663affe364877\">report</agent-message>",
+        "commandMode": "prompt",
+        "origin": {
+            "kind": "peer",
+            "from": "a089663affe364877",
+            "senderTaskId": "a089663affe364877",
+            "body": "report",
+            "handback": true
+        },
+        "isMeta": true,
+        "reminderId": "1d87a9185b328afe"
+    }));
+    let AttachmentData::QueuedCommand(cmd) = parse_attachment(json) else {
+        panic!("Expected QueuedCommand");
+    };
+    assert_eq!(
+        (cmd.origin, cmd.is_meta, cmd.reminder_id.as_deref()),
+        (
+            Some(MessageOrigin {
+                kind: "peer".to_string(),
+                producer: None,
+                from: Some("a089663affe364877".to_string()),
+                sender_task_id: Some("a089663affe364877".to_string()),
+                body: Some("report".to_string()),
+                handback: Some(true),
+            }),
+            Some(true),
+            Some("1d87a9185b328afe")
+        )
+    );
 }
 
 #[test]
@@ -11331,6 +11373,10 @@ fn test_parse_user_log_line_task_notification_metadata() {
             Some(MessageOrigin {
                 kind: "task-notification".to_string(),
                 producer: Some(MessageProducer::SessionTask),
+                from: None,
+                sender_task_id: None,
+                body: None,
+                handback: None,
             }),
             Some(TurnPosition {
                 prompt_index: 0,

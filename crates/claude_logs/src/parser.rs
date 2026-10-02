@@ -1667,6 +1667,12 @@ pub struct QueuedCommand {
     /// Resource totals of the background task a `task-notification` command reports on. Observed
     /// in Claude Code 2.1.280+; other command modes omit it.
     pub usage: Option<QueuedCommandUsage>,
+    /// Observed (as `true`) on a peer hand-back command, which is injected as a system reminder
+    /// rather than typed by the user. Added in Claude Code 2.1.285+.
+    pub is_meta: Option<bool>,
+    /// The id of the `<system-reminder id=...>` frame the command was rendered into, linking it to
+    /// the attachment line's rendered text. Added in Claude Code 2.1.285+.
+    pub reminder_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -2841,6 +2847,18 @@ pub struct MessageOrigin {
     /// What produced the message; absent on origins without a producer, hence `Option`. Added in
     /// Claude Code 2.1.285+.
     pub producer: Option<MessageProducer>,
+    /// The remaining fields are observed only on `peer` origins (a message from another agent in the
+    /// same session, e.g. a subagent hand-back). They stay independent `Option`s because only the
+    /// hand-back shape has been observed, so which of them a plain peer message carries is unknown.
+    /// Added in Claude Code 2.1.285+.
+    ///
+    /// The sending agent's address, as used in the `<agent-message from=...>` frame.
+    pub from: Option<String>,
+    pub sender_task_id: Option<String>,
+    /// The peer's message text, without the system-reminder framing the prompt wraps it in.
+    pub body: Option<String>,
+    /// Marks the message as a subagent's final report to the agent that delegated to it.
+    pub handback: Option<bool>,
 }
 
 /// Why Claude Code denied a tool call. Modeled as a strict enum (not a free `String`) so a new
