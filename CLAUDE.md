@@ -407,7 +407,9 @@ with warnings, while explicit missing paths and having no available source are e
   Each handler sets both its initialization fallback and supported-version list; upgrading rmcp must not implicitly opt
   into newer revisions. Initialization requests for unknown versions fall back to the ceiling, so unknown older strings
   are no longer echoed; newer per-request metadata is rejected. Upstream `discover` remains available but advertises
-  only this restricted list.
+  only this restricted list. Every stdio server rejects unsupported-version `server/discover` probes at the transport
+  boundary, before rmcp selects its inline lifecycle, so clients can fall back to legacy `initialize` on the same
+  connection.
 - `read_only`: Shared infrastructure used by both `git_read_only` and `jj_read_only`. Provides `CommandResult`,
   `validate_project_dir`, and the generic `run_read_only_command`. It rejects parent-traversal and non-directory targets
   before canonicalizing the working directory, while the per-server wrappers add command-specific flag restrictions

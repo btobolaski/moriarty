@@ -20,12 +20,17 @@
 use std::path::PathBuf;
 
 use clap::Subcommand;
-
-use git_read_only::GitReadOnly;
-use jj_read_only::JjReadOnly;
 use miette::IntoDiagnostic;
-use rmcp::{ServiceExt, model::ProtocolVersion, transport::stdio};
-use tool_runner::ToolRunner;
+use rmcp::{
+    RoleServer, ServerHandler, ServiceExt,
+    model::{
+        ClientJsonRpcMessage, ClientRequest, ErrorData, GetMeta, ProtocolVersion,
+        ServerJsonRpcMessage,
+    },
+    transport::{IntoTransport, Transport, stdio},
+};
+
+use self::{git_read_only::GitReadOnly, jj_read_only::JjReadOnly, tool_runner::ToolRunner};
 
 // Dependency upgrades must not expand Moriarty's supported MCP revisions.
 const MCP_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V_2025_11_25;
@@ -40,6 +45,52 @@ pub mod git_read_only;
 pub mod jj_read_only;
 pub mod read_only;
 pub mod tool_runner;
+
+// rmcp 3.2 commits a non-initialize opener to the inline lifecycle even when
+// discovery fails. Reject unsupported probes before that happens so a client
+// can fall back to the legacy handshake on the same connection.
+struct DiscoveryFallbackTransport<T>(T);
+
+impl<T: Transport<RoleServer>> Transport<RoleServer> for DiscoveryFallbackTransport<T> {
+    type Error = T::Error;
+
+    fn send(
+        &mut self,
+        message: ServerJsonRpcMessage,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
+        self.0.send(message)
+    }
+
+    async fn receive(&mut self) -> Option<ClientJsonRpcMessage> {
+        loop {
+            let message = self.0.receive().await?;
+            if let ClientJsonRpcMessage::Request(request) = &message
+                && matches!(request.request, ClientRequest::DiscoverRequest(_))
+                && let Some(version) = request.request.get_meta().protocol_version()
+                && !MCP_SUPPORTED_PROTOCOL_VERSIONS.contains(&version)
+            {
+                let error = ErrorData::unsupported_protocol_version(
+                    version,
+                    MCP_SUPPORTED_PROTOCOL_VERSIONS,
+                );
+                if let Err(error) = self
+                    .0
+                    .send(ServerJsonRpcMessage::error(error, Some(request.id.clone())))
+                    .await
+                {
+                    tracing::warn!(%error, "failed to reject MCP discovery probe");
+                    return None;
+                }
+                continue;
+            }
+            return Some(message);
+        }
+    }
+
+    fn close(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        self.0.close()
+    }
+}
 
 // Resolving `.` at use time keeps omitted project directories relative to the server's cwd.
 fn default_project_dir() -> PathBuf {
@@ -61,29 +112,21 @@ pub enum McpServers {
 impl McpServers {
     pub async fn run(self) -> miette::Result<()> {
         match self {
-            Self::GitReadOnly => {
-                let server = GitReadOnly;
-                let service = server.serve(stdio()).await.into_diagnostic()?;
-                service.waiting().await.into_diagnostic()?;
-                Ok(())
-            }
-            Self::JjReadOnly => {
-                let server = JjReadOnly;
-                let service = server.serve(stdio()).await.into_diagnostic()?;
-                service.waiting().await.into_diagnostic()?;
-                Ok(())
-            }
-            Self::ProjectTools => {
-                let server = ToolRunner;
-
-                let service = server.serve(stdio()).await.into_diagnostic()?;
-
-                service.waiting().await.into_diagnostic()?;
-                Ok(())
-            }
+            Self::GitReadOnly => serve_stdio(GitReadOnly).await,
+            Self::JjReadOnly => serve_stdio(JjReadOnly).await,
+            Self::ProjectTools => serve_stdio(ToolRunner).await,
             Self::Install => install_mcp_server().await,
         }
     }
+}
+
+async fn serve_stdio<S: ServerHandler>(server: S) -> miette::Result<()> {
+    let service = server
+        .serve(DiscoveryFallbackTransport(stdio().into_transport()))
+        .await
+        .into_diagnostic()?;
+    service.waiting().await.into_diagnostic()?;
+    Ok(())
 }
 
 async fn install_mcp_server() -> miette::Result<()> {
@@ -170,7 +213,10 @@ mod tests {
         time::Duration,
     };
 
-    use rmcp::{ServerHandler, ServiceExt};
+    use rmcp::{
+        ServerHandler, ServiceExt,
+        transport::{IntoTransport, OneshotTransport, Transport},
+    };
     use serde_json::{Value, json};
     use tokio::{
         io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, ReadHalf, WriteHalf, split},
@@ -179,8 +225,8 @@ mod tests {
     };
 
     use super::{
-        GitReadOnly, JjReadOnly, ToolRunner, git_read_only::StatusArgs, jj_read_only::JjArgs,
-        tool_runner::RunArgs,
+        DiscoveryFallbackTransport, GitReadOnly, JjReadOnly, ToolRunner, git_read_only::StatusArgs,
+        jj_read_only::JjArgs, tool_runner::RunArgs,
     };
     use crate::{
         project_config::approvals,
@@ -202,7 +248,10 @@ mod tests {
         async fn start<S: ServerHandler>(server: S) -> Self {
             let (server_io, client_io) = tokio::io::duplex(64 * 1024);
             let server_task = tokio::spawn(async move {
-                let service = server.serve(server_io).await.unwrap();
+                let service = server
+                    .serve(DiscoveryFallbackTransport(server_io.into_transport()))
+                    .await
+                    .unwrap();
                 service.waiting().await.unwrap();
             });
             let (reader, writer) = split(client_io);
@@ -239,6 +288,30 @@ mod tests {
             serde_json::from_str(&response).unwrap()
         }
 
+        async fn initialize(&mut self, requested_version: &str) -> Value {
+            let response = self
+                .request(json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": requested_version,
+                        "capabilities": {},
+                        "clientInfo": {
+                            "name": "moriarty-protocol-test",
+                            "version": "0"
+                        }
+                    }
+                }))
+                .await;
+            self.send(json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized"
+            }))
+            .await;
+            response
+        }
+
         async fn close(self) {
             let Self {
                 reader,
@@ -259,27 +332,7 @@ mod tests {
         requested_version: &str,
     ) -> (TestClient, Value) {
         let mut client = TestClient::start(server).await;
-        let response = client
-            .request(json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": requested_version,
-                    "capabilities": {},
-                    "clientInfo": {
-                        "name": "moriarty-protocol-test",
-                        "version": "0"
-                    }
-                }
-            }))
-            .await;
-        client
-            .send(json!({
-                "jsonrpc": "2.0",
-                "method": "notifications/initialized"
-            }))
-            .await;
+        let response = client.initialize(requested_version).await;
         (client, response)
     }
 
@@ -294,6 +347,17 @@ mod tests {
             .await
     }
 
+    fn protocol_meta(version: &str) -> Value {
+        json!({
+            "io.modelcontextprotocol/protocolVersion": version,
+            "io.modelcontextprotocol/clientCapabilities": {},
+            "io.modelcontextprotocol/clientInfo": {
+                "name": "moriarty-protocol-test",
+                "version": "0"
+            }
+        })
+    }
+
     async fn request_with_newer_protocol(client: &mut TestClient) -> Value {
         client
             .request(json!({
@@ -301,14 +365,7 @@ mod tests {
                 "id": 99,
                 "method": "tools/list",
                 "params": {
-                    "_meta": {
-                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-                        "io.modelcontextprotocol/clientCapabilities": {},
-                        "io.modelcontextprotocol/clientInfo": {
-                            "name": "moriarty-protocol-test",
-                            "version": "0"
-                        }
-                    }
+                    "_meta": protocol_meta("2026-07-28")
                 }
             }))
             .await
@@ -341,6 +398,34 @@ mod tests {
         let mut fresh = TestClient::start(server).await;
         assert_newer_protocol_rejected(&request_with_newer_protocol(&mut fresh).await);
         fresh.close().await;
+    }
+
+    async fn assert_discover_fallback<S: ServerHandler>(server: S) {
+        let mut client = TestClient::start(server).await;
+        let discovery = client
+            .request(json!({
+                "jsonrpc": "2.0",
+                "id": 0,
+                "method": "server/discover",
+                "params": { "_meta": protocol_meta("2026-07-28") }
+            }))
+            .await;
+        assert_eq!(discovery["id"], 0);
+        assert_newer_protocol_rejected(&discovery);
+
+        let initialized = client.initialize("2025-11-25").await;
+        assert_eq!(initialized["result"]["protocolVersion"], "2025-11-25");
+        let tools = list_tools(&mut client).await;
+        assert!(
+            !tools["result"]["tools"].as_array().unwrap().is_empty(),
+            "{tools}"
+        );
+        assert_legacy_result_shape(&tools);
+
+        assert_newer_protocol_rejected(&request_with_newer_protocol(&mut client).await);
+        let tools = list_tools(&mut client).await;
+        assert!(tools.get("error").is_none(), "{tools}");
+        client.close().await;
     }
 
     fn assert_legacy_result_shape(response: &Value) {
@@ -432,6 +517,66 @@ mod tests {
     #[tokio::test]
     async fn tool_runner_rejects_newer_request_protocol() {
         assert_server_rejects_newer_protocol(ToolRunner).await;
+    }
+
+    #[tokio::test]
+    async fn supported_and_versionless_discovery_pass_through_unchanged() {
+        let supported = protocol_meta("2025-11-25");
+        let mut versionless = supported.clone();
+        versionless
+            .as_object_mut()
+            .unwrap()
+            .remove("io.modelcontextprotocol/protocolVersion");
+        for meta in [supported, versionless] {
+            let expected = json!({
+                "jsonrpc": "2.0",
+                "id": "discovery",
+                "method": "server/discover",
+                "params": { "_meta": meta }
+            });
+            let (inner, _responses) =
+                OneshotTransport::new(serde_json::from_value(expected.clone()).unwrap());
+            let mut transport = DiscoveryFallbackTransport(inner);
+            let forwarded = timeout(TEST_TIMEOUT, transport.receive())
+                .await
+                .expect("timed out forwarding discovery")
+                .expect("discovery was intercepted");
+            assert_eq!(serde_json::to_value(forwarded).unwrap(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn discovery_rejection_send_failure_closes_transport() {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "server/discover",
+            "params": { "_meta": protocol_meta("2026-07-28") }
+        });
+        let (inner, responses) = OneshotTransport::new(serde_json::from_value(request).unwrap());
+        drop(responses);
+        let mut transport = DiscoveryFallbackTransport(inner);
+        let received = timeout(TEST_TIMEOUT, transport.receive())
+            .await
+            .expect("timed out after discovery rejection send failure");
+        assert!(received.is_none());
+    }
+
+    // Each handler has its own tool contract; keep a fallback regression per server
+    // so handler changes cannot silently break just one advertised MCP connection.
+    #[tokio::test]
+    async fn git_discover_fallback_preserves_legacy_tools() {
+        assert_discover_fallback(GitReadOnly).await;
+    }
+
+    #[tokio::test]
+    async fn jj_discover_fallback_preserves_legacy_tools() {
+        assert_discover_fallback(JjReadOnly).await;
+    }
+
+    #[tokio::test]
+    async fn tool_runner_discover_fallback_preserves_legacy_tools() {
+        assert_discover_fallback(ToolRunner).await;
     }
 
     #[tokio::test]
