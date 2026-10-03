@@ -4122,6 +4122,7 @@ fn custom_plannotator_defaults_phase_added_tools_when_omitted() {
         CustomPayload::Plannotator(details) => {
             assert!(details.phase_added_tools.is_empty());
             assert!(!details.framing_delivered);
+            assert!(!details.idle_notice_pending);
         }
         other => panic!("expected Plannotator, got {other:?}"),
     }
@@ -10704,6 +10705,20 @@ fn custom_plannotator_accepts_framing_delivered() {
     ) {
         CustomPayload::Plannotator(details) => {
             assert!(details.framing_delivered);
+        }
+        other => panic!("expected Plannotator, got {other:?}"),
+    }
+}
+
+#[test]
+fn custom_plannotator_accepts_idle_notice_pending() {
+    // Emitted by the plannotator extension alongside framingDelivered.
+    match parse_custom_payload(
+        "plannotator",
+        json!({"phase": "idle", "idleNoticePending": true}),
+    ) {
+        CustomPayload::Plannotator(details) => {
+            assert!(details.idle_notice_pending);
         }
         other => panic!("expected Plannotator, got {other:?}"),
     }

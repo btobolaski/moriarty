@@ -5514,6 +5514,11 @@ pub struct PlannotatorData {
     /// framing delivery.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub framing_delivered: bool,
+    /// True while the plannotator extension still owes the user an idle
+    /// notice. Defaults false because older records predate idle-notice
+    /// tracking.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub idle_notice_pending: bool,
 }
 
 /// Payload of a `subagent-wait-subscription` custom message. Emitted when a
