@@ -1,6 +1,6 @@
 .\" Copyright (c) 2025 Moriarty contributors
 .\" SPDX-License-Identifier: GPL-3.0-only
-.Dd September 13, 2026
+.Dd October 3, 2026
 .Dt MORIARTY 1
 .Os
 .Sh NAME
@@ -244,6 +244,22 @@ The
 .Cm mcp
 subcommand runs one of the built\-in Model Context Protocol servers
 for read\-only git operations, read\-only jj operations, and project tools.
+The project\-tools server maps the
+.Ic lint , test , build ,
+and
+.Ic format
+keys in the workspace's
+.Pa .config/tools.toml
+.Ic [commands]
+table to its four command tools; its
+.Cm run_checks
+tool runs the file's
+.Ic [[checks]]
+entries.
+See
+.Xr moriarty\-project\-tools 5
+for the configuration format, examples, execution directories,
+and approval requirements.
 .Ss Project Approval
 The
 .Cm approve\-project
@@ -583,6 +599,13 @@ Defaults to
 .El
 .Sh FILES
 .Bl -tag -width Ds
+.It Pa <workspace>/.config/tools.toml
+Project commands and checks configuration.
+See
+.Xr moriarty\-project\-tools 5 .
+.It Pa ~/.config/moriarty/project_approvals.toml
+Per\-item project command and check approvals, respecting
+.Ev XDG_CONFIG_HOME .
 .It Pa ~/.config/moriarty/tool_rules.toml
 Tool and bash rules configuration file.
 See
@@ -595,4 +618,5 @@ Hook execution log directory (JSON lines, daily-rotated).
 .Sh SEE ALSO
 .Xr moriarty\-test\-rules 1 ,
 .Xr moriarty\-bash\-rules 5 ,
+.Xr moriarty\-project\-tools 5 ,
 .Xr moriarty\-tool\-rules 5
