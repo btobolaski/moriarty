@@ -363,6 +363,9 @@ pub struct CustomLine {
 
 /// Adjacently tagged enum selected by `customType` with the typed body living
 /// under `data`.
+// TodoDetails dwarfs the other custom payloads; boxing this public variant
+// would change its payload type.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "customType", content = "data")]
 pub enum CustomPayload {
@@ -2320,6 +2323,11 @@ fn parse_web_search_details(details: Value) -> Result<ToolResultDetails, serde_j
             cancelled: lean.cancelled.unwrap_or(false),
             error: lean.error,
             cancel_reason: lean.cancel_reason,
+            query_providers: None,
+            truncated: false,
+            original_chars: 0,
+            returned_chars: 0,
+            omitted_chars: 0,
         }))
     } else {
         serde_json::from_value(details).map(ToolResultDetails::WebSearch)
@@ -2408,9 +2416,10 @@ pub enum ToolResultDetails {
     // FetchContent has no shape overlap with anything above (it declares
     // `urls`, `urlCount`, ... that no other variant carries).
     //
-    // GetSearchContent is dual-shape: its Success arm is uniquely
-    // identified by `{url, title, contentLength}`, and its Error arm is
-    // `{error}` with an optional `url`. Earlier variants that also declare
+    // GetSearchContent is triple-shape: its Success arm is uniquely
+    // identified by `{url, title, contentLength}`, its Error arm is
+    // `{error}` with an optional `url`, and its Find arm (a text-match
+    // replay) is identified by `findMode` beside the success breadcrumb. Earlier variants that also declare
     // an `error` field (CodeSearchDetails, McpDetails, TodoDetails,
     // SubagentResultDetails-via-Subagent, WebSearchDetails) all require
     // additional discriminator fields (e.g. `query`+`maxTokens`,
@@ -3817,6 +3826,28 @@ pub struct WebSearchDetails {
     /// Reason a search curation was cancelled (e.g. "stale").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cancel_reason: Option<String>,
+    /// Newer pi versions record which provider answered each query;
+    /// older payloads omit the whole list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_providers: Option<Vec<QueryProviderInfo>>,
+    /// Content-size accounting for bounded-result searches; older payloads
+    /// omit these.
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub original_chars: u64,
+    #[serde(default)]
+    pub returned_chars: u64,
+    #[serde(default)]
+    pub omitted_chars: u64,
+}
+
+/// Newer pi versions record which provider answered each search query.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct QueryProviderInfo {
+    pub query: String,
+    pub providers: Vec<String>,
 }
 
 /// `read` emits two sub-shapes for `details` that classify here: a plain
@@ -3914,6 +3945,22 @@ pub struct FetchContentDetails {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<String>,
+    /// Raw-mode single-URL fetches record these breadcrumbs; older payloads
+    /// and other modes omit them entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_lines: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shown_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shown_lines: Option<u64>,
 }
 
 /// Replaying a single previously-fetched URL via `get_search_content`
@@ -3926,6 +3973,9 @@ pub struct FetchContentDetails {
 pub enum GetSearchContentDetails {
     Success(GetSearchContentSuccessDetails),
     Error(GetSearchContentErrorDetails),
+    /// A text-match replay over a cached page: pi reports per-query match
+    /// counts beside the usual success breadcrumb.
+    Find(GetSearchContentFindDetails),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -3934,6 +3984,28 @@ pub struct GetSearchContentSuccessDetails {
     pub url: String,
     pub title: String,
     pub content_length: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GetSearchContentFindDetails {
+    pub url: String,
+    pub title: String,
+    pub content_length: u64,
+    /// e.g. "case-insensitive"; the vocabulary belongs to pi's own text
+    /// matching, so it stays a raw `String`.
+    pub find_mode: String,
+    pub match_count: u64,
+    pub returned_matches: u64,
+    pub query_results: Vec<FindQueryResult>,
+}
+
+/// Per-query match counts from a `get_search_content` text-match replay.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FindQueryResult {
+    pub query: String,
+    pub match_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -4703,6 +4775,8 @@ impl<'de> Deserialize<'de> for JsonValue {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "camelCase", deny_unknown_fields)]
 pub enum LensDiagnosticsDetails {
+    #[serde(rename = "file")]
+    File(LensDiagnosticsFile),
     #[serde(rename = "delta")]
     Delta(LensDiagnosticsDelta),
     #[serde(rename = "all")]
@@ -4744,6 +4818,30 @@ pub enum LensDiagnosticsSeverity {
 pub enum LensDiagnosticsServerScope {
     Primary,
     All,
+}
+
+/// Per-file lens results retain typed severity, server, source, and scope
+/// values instead of sharing the less-specific `lsp_diagnostics` response.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LensDiagnosticsFile {
+    pub file_path: PathBuf,
+    pub severity: LensDiagnosticsSeverity,
+    pub server_scope: LensDiagnosticsServerScope,
+    pub source: LensDiagnosticsSource,
+    pub scope: LensDiagnosticsScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_server_id: Option<String>,
+    pub primary_diagnostics_count: u32,
+    pub auxiliary_diagnostics_count: u32,
+    pub diagnostics: Vec<JsonValue>,
+    pub total_diagnostics: u32,
+    pub truncated: bool,
+    pub unconfirmed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timed_out: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unconfirmed_server_ids: Option<Vec<String>>,
 }
 
 /// The lens batch envelope carries its producer and requested scope, unlike the
@@ -5685,6 +5783,16 @@ pub struct WebSearchResultsData {
     pub payload: WebSearchResultsPayload,
 }
 
+const FETCH_FIELDS: [&str; 3] = ["urls", "urlMetadata", "fetchCache"];
+const FETCH_EXPECTED_FIELDS: [&str; 6] = [
+    "id",
+    "timestamp",
+    "type",
+    FETCH_FIELDS[0],
+    FETCH_FIELDS[1],
+    FETCH_FIELDS[2],
+];
+
 impl<'de> Deserialize<'de> for WebSearchResultsData {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -5702,7 +5810,7 @@ impl<'de> Deserialize<'de> for WebSearchResultsData {
 
         let expected_fields = match kind {
             "search" => &["id", "timestamp", "type", "queries"][..],
-            "fetch" => &["id", "timestamp", "type", "urls"][..],
+            "fetch" => &FETCH_EXPECTED_FIELDS,
             other => {
                 return Err(de::Error::unknown_variant(other, &["search", "fetch"]));
             }
@@ -5716,9 +5824,17 @@ impl<'de> Deserialize<'de> for WebSearchResultsData {
             "search" => WebSearchResultsPayload::Search(WebSearchResultsSearch {
                 queries: object_field(object, "queries").map_err(de::Error::custom)?,
             }),
-            "fetch" => WebSearchResultsPayload::Fetch(WebSearchResultsFetch {
-                urls: object_field(object, "urls").map_err(de::Error::custom)?,
-            }),
+            "fetch" => {
+                let fetch_object = object
+                    .iter()
+                    .filter(|(key, _)| FETCH_FIELDS.contains(&key.as_str()))
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect();
+                WebSearchResultsPayload::Fetch(
+                    serde_json::from_value(Value::Object(fetch_object))
+                        .map_err(de::Error::custom)?,
+                )
+            }
             _ => unreachable!("kind validated above"),
         };
 
@@ -5774,9 +5890,66 @@ pub struct WebSearchResultsSearch {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase", try_from = "WebSearchResultsFetchWire")]
 pub struct WebSearchResultsFetch {
-    pub urls: Vec<WebFetchResult>,
+    /// Legacy fetch shape: full result bodies. Newer pi versions record only
+    /// [`WebUrlMetadata`] entries instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub urls: Option<Vec<WebFetchResult>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url_metadata: Option<Vec<WebUrlMetadata>>,
+    /// Newer pi versions record where the fetch result was cached on disk.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fetch_cache: Option<WebFetchCache>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WebSearchResultsFetchWire {
+    urls: Option<Vec<WebFetchResult>>,
+    url_metadata: Option<Vec<WebUrlMetadata>>,
+    fetch_cache: Option<WebFetchCache>,
+}
+
+impl TryFrom<WebSearchResultsFetchWire> for WebSearchResultsFetch {
+    type Error = &'static str;
+
+    fn try_from(wire: WebSearchResultsFetchWire) -> Result<Self, Self::Error> {
+        if wire.urls.is_none() && wire.url_metadata.is_none() {
+            return Err("fetch payload must contain `urls` or `urlMetadata`");
+        }
+        Ok(Self {
+            urls: wire.urls,
+            url_metadata: wire.url_metadata,
+            fetch_cache: wire.fetch_cache,
+        })
+    }
+}
+
+/// Newer fetch payloads describe each URL without carrying its body content.
+/// `contentLength` is nullable: `null` or absence means the length was
+/// unknown.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WebUrlMetadata {
+    pub url: String,
+    pub title: String,
+    #[serde(deserialize_with = "deserialize_required_nullable_string")]
+    pub error: Option<String>,
+    pub content_length: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+}
+
+/// Newer pi versions record where a fetch result was cached on disk.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WebFetchCache {
+    pub version: i64,
+    pub key: String,
+    pub stored_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -5791,6 +5964,10 @@ pub struct WebSearchQueryResult {
     /// aborted"`) can be recorded before the provider was selected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+    /// Newer pi versions list every provider that contributed results;
+    /// older payloads carry only the singular `provider`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub providers: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

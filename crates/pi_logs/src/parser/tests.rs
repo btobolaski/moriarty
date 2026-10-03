@@ -3079,7 +3079,12 @@ fn web_search_tool_result_accepts_details() {
             "totalResults": 3,
             "includeContent": true,
             "queries": ["rust serde deny_unknown_fields", "pi log parser"],
-            "fetchUrls": ["https://example.com/page1", "https://example.com/page2"]
+            "fetchUrls": ["https://example.com/page1", "https://example.com/page2"],
+            "queryProviders": [{"query": "rust serde deny_unknown_fields", "providers": ["exa"]}],
+            "truncated": false,
+            "originalChars": 12007u64,
+            "returnedChars": 12007u64,
+            "omittedChars": 0u64
         })),
     ));
 
@@ -3099,6 +3104,19 @@ fn web_search_tool_result_accepts_details() {
     assert!(!details.cancelled);
     assert_eq!(details.error, None);
     assert_eq!(details.cancel_reason, None);
+    assert_eq!(
+        details.query_providers.as_deref(),
+        Some(
+            &[QueryProviderInfo {
+                query: "rust serde deny_unknown_fields".to_string(),
+                providers: vec!["exa".to_string()],
+            }][..]
+        )
+    );
+    assert_eq!(details.original_chars, 12007);
+    assert_eq!(details.returned_chars, 12007);
+    assert_eq!(details.omitted_chars, 0);
+    assert!(!details.truncated);
     assert_eq!(
         details.fetch_urls.as_deref(),
         Some(
@@ -4144,7 +4162,8 @@ fn custom_web_search_results() {
                     "url": "https://serde.rs",
                     "snippet": "deny_unknown_fields"
                 }],
-                "provider": "exa"
+                "provider": "exa",
+                "providers": ["exa"]
             }]
         }),
     ) {
@@ -4154,6 +4173,7 @@ fn custom_web_search_results() {
             };
             assert_eq!(search.queries.len(), 1);
             assert_eq!(search.queries[0].provider.as_deref(), Some("exa"));
+            assert_eq!(search.queries[0].providers, vec!["exa".to_string()]);
         }
         other => panic!("expected WebSearchResults, got {other:?}"),
     }
@@ -4179,12 +4199,74 @@ fn custom_web_search_results_fetch() {
             let WebSearchResultsPayload::Fetch(fetch) = &results.payload else {
                 panic!("expected Fetch payload, got {:?}", results.payload);
             };
-            assert_eq!(fetch.urls.len(), 1);
-            assert_eq!(fetch.urls[0].url, "https://example.com");
-            assert_eq!(fetch.urls[0].error, None);
+            let urls = fetch.urls.as_ref().expect("expected legacy urls");
+            assert_eq!(urls.len(), 1);
+            assert_eq!(urls[0].url, "https://example.com");
+            assert_eq!(urls[0].error, None);
         }
         other => panic!("expected WebSearchResults, got {other:?}"),
     }
+}
+
+#[test]
+fn custom_web_search_results_fetch_url_metadata() {
+    match parse_custom_payload(
+        "web-search-results",
+        json!({
+            "id": "muswx43ctksmun",
+            "timestamp": MESSAGE_TIMESTAMP,
+            "type": "fetch",
+            "urlMetadata": [{
+                "url": "https://example.com/CHANGELOG.md",
+                "title": "CHANGELOG.md",
+                "error": null,
+                "contentLength": 14,
+                "mimeType": "text/plain",
+                "status": 404
+            }],
+            "fetchCache": {
+                "version": 1,
+                "key": "muswx43ctksmun.json",
+                "storedAt": 1791063425787i64
+            }
+        }),
+    ) {
+        CustomPayload::WebSearchResults(results) => {
+            let WebSearchResultsPayload::Fetch(fetch) = &results.payload else {
+                panic!("expected Fetch payload, got {:?}", results.payload);
+            };
+            assert_eq!(fetch.urls, None);
+            let metadata = fetch.url_metadata.as_ref().expect("expected urlMetadata");
+            assert_eq!(metadata.len(), 1);
+            let metadata = &metadata[0];
+            assert_eq!(metadata.error, None);
+            assert_eq!(metadata.content_length, Some(14));
+            assert_eq!(metadata.mime_type.as_deref(), Some("text/plain"));
+            assert_eq!(metadata.status, Some(404));
+            let cache = fetch.fetch_cache.as_ref().expect("expected fetchCache");
+            assert_eq!(cache.version, 1);
+            assert_eq!(cache.key, "muswx43ctksmun.json");
+            assert_eq!(cache.stored_at, 1791063425787);
+        }
+        other => panic!("expected WebSearchResults, got {other:?}"),
+    }
+}
+
+#[test]
+fn web_search_results_fetch_validates_its_own_shape() {
+    let err = serde_json::from_value::<WebSearchResultsFetch>(json!({
+        "fetchCache": {"version": 1, "key": "fetch.json", "storedAt": 1}
+    }))
+    .expect_err("fetchCache alone is not a fetch result list")
+    .to_string();
+    assert!(
+        err.contains("must contain `urls` or `urlMetadata`"),
+        "{err}"
+    );
+
+    let empty_urls = serde_json::from_value::<WebSearchResultsFetch>(json!({"urls": []}))
+        .expect("an explicitly empty result list is valid");
+    assert_eq!(empty_urls.urls, Some(Vec::new()));
 }
 
 #[test]
@@ -4204,6 +4286,7 @@ fn web_search_results_data_serializes_and_roundtrips() {
                     }],
                     error: None,
                     provider: Some("exa".to_string()),
+                    providers: Vec::new(),
                 }],
             }),
         },
@@ -4211,12 +4294,34 @@ fn web_search_results_data_serializes_and_roundtrips() {
             id: "fetch_1".to_string(),
             timestamp: MESSAGE_TIMESTAMP,
             payload: WebSearchResultsPayload::Fetch(WebSearchResultsFetch {
-                urls: vec![WebFetchResult {
+                urls: Some(vec![WebFetchResult {
                     url: "https://example.com".to_string(),
                     title: "Example".to_string(),
                     content: "Body".to_string(),
                     error: None,
-                }],
+                }]),
+                url_metadata: None,
+                fetch_cache: None,
+            }),
+        },
+        WebSearchResultsData {
+            id: "fetch_2".to_string(),
+            timestamp: MESSAGE_TIMESTAMP,
+            payload: WebSearchResultsPayload::Fetch(WebSearchResultsFetch {
+                urls: None,
+                url_metadata: Some(vec![WebUrlMetadata {
+                    url: "https://example.com/CHANGELOG.md".to_string(),
+                    title: "CHANGELOG.md".to_string(),
+                    error: None,
+                    content_length: Some(14),
+                    mime_type: Some("text/plain".to_string()),
+                    status: Some(404),
+                }]),
+                fetch_cache: Some(WebFetchCache {
+                    version: 1,
+                    key: "fetch_2.json".to_string(),
+                    stored_at: 1791063425787,
+                }),
             }),
         },
     ] {
@@ -4344,7 +4449,7 @@ fn custom_web_search_results_rejects_wrong_variant_keys_or_missing_payload() {
                 "timestamp": MESSAGE_TIMESTAMP,
                 "type": "fetch"
             }),
-            vec!["missing field", "urls"],
+            vec!["must contain `urls` or `urlMetadata`"],
         ),
     ] {
         assert_parse_error_contains_all(
@@ -5124,7 +5229,14 @@ fn fetch_content_tool_result_accepts_details() {
             "hasImage": false,
             "imageCount": 0,
             "prompt": "Summarize this page",
-            "timestamp": "0"
+            "timestamp": "0",
+            "mode": "raw",
+            "mimeType": "text/plain",
+            "status": 200,
+            "totalBytes": 12000u64,
+            "totalLines": 300u64,
+            "shownBytes": 8000u64,
+            "shownLines": 200u64
         })),
     ));
     let Some(ToolResultDetails::FetchContent(details)) = tool_result.details else {
@@ -5141,6 +5253,13 @@ fn fetch_content_tool_result_accepts_details() {
     assert_eq!(details.image_count, 0);
     assert_eq!(details.prompt.as_deref(), Some("Summarize this page"));
     assert_eq!(details.timestamp.as_deref(), Some("0"));
+    assert_eq!(details.mode.as_deref(), Some("raw"));
+    assert_eq!(details.mime_type.as_deref(), Some("text/plain"));
+    assert_eq!(details.status, Some(200));
+    assert_eq!(details.total_bytes, Some(12000));
+    assert_eq!(details.total_lines, Some(300));
+    assert_eq!(details.shown_bytes, Some(8000));
+    assert_eq!(details.shown_lines, Some(200));
 }
 
 #[test]
@@ -5274,6 +5393,44 @@ fn tool_result_details_route_current_shapes() {
         ("ast search", "ast_grep_search", route_fixture("ast-search"), AstSearch),
         ("mcp script", "mcpScript", route_fixture("mcp-script"), McpScript),
         ("mcp error", "mcpScript", route_fixture("mcp-error"), McpError)
+    );
+}
+
+#[test]
+fn lens_diagnostics_file_preserves_lens_metadata() {
+    let Some(ToolResultDetails::LensDiagnostics(LensDiagnosticsDetails::File(details))) =
+        tool_result_with_details(
+            "lens_diagnostics",
+            json!({
+                "mode": "file",
+                "filePath": "/tmp/example.py",
+                "severity": "all",
+                "serverScope": "all",
+                "source": "lsp",
+                "scope": "workspace",
+                "primaryServerId": "python",
+                "primaryDiagnosticsCount": 0,
+                "auxiliaryDiagnosticsCount": 0,
+                "diagnostics": [],
+                "totalDiagnostics": 0,
+                "truncated": false,
+                "unconfirmed": true,
+                "timedOut": false,
+                "unconfirmedServerIds": ["opengrep", "typos"]
+            }),
+        )
+        .details
+    else {
+        panic!("expected lens file details")
+    };
+    assert_eq!(details.source, LensDiagnosticsSource::Lsp);
+    assert_eq!(details.scope, LensDiagnosticsScope::Workspace);
+    assert_eq!(details.severity, LensDiagnosticsSeverity::All);
+    assert_eq!(details.primary_server_id.as_deref(), Some("python"));
+    assert_eq!(details.timed_out, Some(false));
+    assert_eq!(
+        details.unconfirmed_server_ids.as_deref(),
+        Some(["opengrep".to_string(), "typos".to_string()].as_slice())
     );
 }
 
@@ -5529,6 +5686,33 @@ fn get_search_content_tool_result_accepts_success_details() {
     assert_eq!(details.url, "https://example.com");
     assert_eq!(details.title, "Example");
     assert_eq!(details.content_length, 4096);
+}
+
+#[test]
+fn get_search_content_tool_result_accepts_find_details() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "get_search_content",
+        vec![json!({"type": "text", "text": "no matches"})],
+        false,
+        Some(json!({
+            "url": "https://example.com",
+            "title": "Example",
+            "contentLength": 2088693u64,
+            "findMode": "case-insensitive",
+            "matchCount": 0u64,
+            "returnedMatches": 0u64,
+            "queryResults": [{"query": "[\"throughput\", \"latency_\"]", "matchCount": 0u64}]
+        })),
+    ));
+    let Some(ToolResultDetails::GetSearchContent(GetSearchContentDetails::Find(details))) =
+        tool_result.details
+    else {
+        panic!("expected GetSearchContent find details")
+    };
+    assert_eq!(details.find_mode, "case-insensitive");
+    assert_eq!(details.match_count, 0);
+    assert_eq!(details.query_results.len(), 1);
+    assert_eq!(details.query_results[0].match_count, 0);
 }
 
 #[test]

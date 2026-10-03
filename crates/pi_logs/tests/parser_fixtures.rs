@@ -61,8 +61,9 @@ fn parse_recent_fixture_file() {
     };
     match &results.payload {
         WebSearchResultsPayload::Fetch(fetch) => {
-            assert_eq!(fetch.urls.len(), 1);
-            assert_eq!(fetch.urls[0].error, None);
+            let urls = fetch.urls.as_ref().expect("expected legacy urls");
+            assert_eq!(urls.len(), 1);
+            assert_eq!(urls[0].error, None);
         }
         other => panic!("expected fetch payload, got {other:?}"),
     }

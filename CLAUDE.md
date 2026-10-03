@@ -312,11 +312,18 @@ with warnings, while explicit missing paths and having no available source are e
   `skip_deserializing` `JsonBlob` because pi-lens owns that envelope, may grow new fields, and cost analysis reads none
   of them, the
   all-mode findings summary gained an optional `totalAdvisories` (absent on older logs), `lens_diagnostics` distinguishes
-  delta/all/batch/directory/full (including unavailable) responses — the directory sweep shares the lsp_diagnostics
+  file/delta/all/batch/directory/full (including unavailable) responses — per-file responses retain the typed
+  severity/source/scope fields, and the directory sweep shares the lsp_diagnostics
   directory shape but keeps lens's typed severity/source/scope enums, with the same optional sibling fields as the
   lens batch envelope (`dispositionSuppressed`, timeouts, health warnings, wait) — `lsp_diagnostics` distinguishes file/batch/directory responses,
   `lens_diagnostic_mark` keeps typed dispositions and nonzero lines, and `module_report` accepts optional callback
-  support. `fetch_content` also accepts its optional timestamp metadata. `ast_grep_replace`/`ast_grep_search` are routed
+  support. `fetch_content` also accepts its optional timestamp metadata. Newer web-access payloads are strictly
+  accreted: the `web-search-results` fetch shape records `urlMetadata` entries (`WebUrlMetadata`, body-less
+  url/title/error/contentLength/mimeType/status) beside the legacy `urls` plus an optional `fetchCache`
+  (`WebFetchCache`), search queries gain `providers`, `web_search` details gain `queryProviders` and
+  truncated/originalChars/returnedChars/omittedChars, `fetch_content` details gain the raw-mode
+  mode/mimeType/status/totalBytes/totalLines/shownBytes/shownLines breadcrumbs, and `get_search_content`
+  gains a third `Find` variant (`GetSearchContentFindDetails`). `ast_grep_replace`/`ast_grep_search` are routed
   to all-optional detail structs because each tool emits several partially-overlapping shapes (structural-rule vs
   pattern success, validation, stale-preview) with no shared required field; their empty error sentinels drop to `None`
   before routing (the tools are not in `preserves_empty_error_details`, unlike `memory`/`skill`) and only a non-error
