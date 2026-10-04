@@ -134,10 +134,12 @@ impl fmt::Display for PartialState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "child={:?}, reaped={}, group_absent={}, stdout_eof={}, stderr_eof={}, launch_unconfirmed={}, interruption={:?}",
+            "child={:?}, reaped={}, group_absent={}, term_attempted={}, kill_attempted={}, stdout_eof={}, stderr_eof={}, launch_unconfirmed={}, interruption={:?}",
             self.child_id,
             self.status.is_some(),
             self.group_absent,
+            self.term_attempted,
+            self.kill_attempted,
             self.stdout.eof,
             self.stderr.eof,
             self.launch_unconfirmed,
@@ -184,6 +186,23 @@ impl ProcessError {
         }
     }
 
+    pub(crate) fn from_startup(
+        mut state: PartialState,
+        reason: Option<InterruptionReason>,
+        unconfirmed: bool,
+    ) -> Self {
+        state.interruption = reason.map(Interruption::Startup);
+        state.launch_unconfirmed = unconfirmed;
+        let state = Box::new(state);
+        if reason.is_some() {
+            Self::StartupInterrupted { state }
+        } else if unconfirmed {
+            Self::CleanupUnconfirmed { state }
+        } else {
+            Self::StartFailed { state }
+        }
+    }
+
     pub(crate) fn driver_closed(channel: DriverChannel) -> Self {
         let mut state = PartialState {
             launch_unconfirmed: matches!(channel, DriverChannel::Startup),
@@ -206,6 +225,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn startup_failure_projects_outcome_facts_over_stale_metadata() {
+        for (reason, unconfirmed, kind) in [
+            (None, false, "start"),
+            (Some(InterruptionReason::Cancelled), false, "interrupted"),
+            (None, true, "unconfirmed"),
+            (Some(InterruptionReason::TimedOut), true, "interrupted"),
+        ] {
+            let state = PartialState {
+                launch_unconfirmed: !unconfirmed,
+                interruption: Some(Interruption::Execution(InterruptionReason::Cancelled)),
+                ..PartialState::default()
+            };
+            let error = ProcessError::from_startup(state, reason, unconfirmed);
+            let actual_kind = match &error {
+                ProcessError::StartFailed { .. } => "start",
+                ProcessError::StartupInterrupted { .. } => "interrupted",
+                ProcessError::CleanupUnconfirmed { .. } => "unconfirmed",
+                ProcessError::SupervisionFailed { .. } => "supervision",
+            };
+            assert_eq!(actual_kind, kind);
+            assert_eq!(error.partial().launch_unconfirmed, unconfirmed);
+            assert_eq!(
+                error.partial().interruption,
+                reason.map(Interruption::Startup)
+            );
+        }
+    }
+
+    #[test]
     fn every_stage_retains_only_its_first_source_in_order() {
         let mut state = PartialState::default();
         assert!(!state.failed());
@@ -226,6 +274,8 @@ mod tests {
         let mut state = PartialState {
             child_id: Some(7),
             group_absent: true,
+            term_attempted: true,
+            kill_attempted: true,
             ..PartialState::default()
         };
         state.stdout.bytes = b"stdout-private-marker".to_vec();
@@ -240,6 +290,12 @@ mod tests {
         };
         let diagnostic = error.to_string();
         assert!(diagnostic.contains("child=Some(7)") && diagnostic.contains("group_absent=true"));
+        assert!(
+            diagnostic.contains("term_attempted=true")
+                && diagnostic.contains("kill_attempted=true")
+        );
+        let empty = PartialState::default().to_string();
+        assert!(empty.contains("term_attempted=false") && empty.contains("kill_attempted=false"));
         assert!(diagnostic.contains("Stdout: read failed"));
         assert!(!diagnostic.contains("stdout-private-marker"));
         assert!(!diagnostic.contains("stderr-private-marker"));

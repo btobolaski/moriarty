@@ -15,7 +15,7 @@ pub(crate) use self::{admission::Admission, hooks::Hooks};
 use crate::{
     options::{ProcessOptions, ProcessSpec},
     process::Owner,
-    result::{Interruption, InterruptionReason, PartialState, Stage},
+    result::{InterruptionReason, PartialState, Stage},
 };
 
 static ADMISSION: OnceLock<Admission> = OnceLock::new();
@@ -117,18 +117,16 @@ pub(crate) async fn admit(
     options: &ProcessOptions,
     token: &CancellationToken,
     start: Instant,
-    state: &mut PartialState,
     hooks: &mut Hooks,
-) -> Option<Permit> {
+) -> Result<Permit, InterruptionReason> {
     let admission = hooks.admission(ADMISSION.get_or_init(|| Admission::new(4)).clone());
     let acquire = admission.acquire();
     let deadline = startup_deadline(start, options.startup_timeout);
     tokio::pin!(acquire, deadline);
     let permit = loop {
         if let Some(reason) = interruption(token, start, options) {
-            state.interruption = Some(Interruption::Startup(reason));
             token.cancel();
-            return None;
+            return Err(reason);
         }
         tokio::select! {
             biased;
@@ -137,7 +135,7 @@ pub(crate) async fn admit(
             permit = &mut acquire => break permit,
         }
     };
-    Some(permit)
+    Ok(permit)
 }
 
 /// Terminal outcomes describe creation certainty even when no owner was handed off.
@@ -146,10 +144,11 @@ pub(crate) enum LaunchOutcome {
     Ready(Owner),
     /// The caller owns cleanup before it may report startup interruption.
     Interrupted(Owner, InterruptionReason),
-    /// Creation failed or was skipped; interruption may coexist with a spawn diagnostic.
-    Failed(Option<InterruptionReason>),
-    /// A launcher may still create or clean a child; no handoff is not proof of absence.
-    Unconfirmed(Option<InterruptionReason>),
+    /// Creation certainty and interruption remain coupled even without a handoff.
+    Failure {
+        unconfirmed: bool,
+        reason: Option<InterruptionReason>,
+    },
 }
 
 pub(crate) async fn launch(
@@ -163,11 +162,17 @@ pub(crate) async fn launch(
 ) -> LaunchOutcome {
     if let Some(reason) = interruption(token, start, options) {
         token.cancel();
-        return LaunchOutcome::Failed(Some(reason));
+        return LaunchOutcome::Failure {
+            unconfirmed: false,
+            reason: Some(reason),
+        };
     }
     if let Some(error) = hooks.thread_failure() {
         state.record(Stage::Launcher, error);
-        return LaunchOutcome::Failed(None);
+        return LaunchOutcome::Failure {
+            unconfirmed: false,
+            reason: None,
+        };
     }
     let before_receive = hooks.take_before_receive();
     let receiver_closed = hooks.take_receiver_closed();
@@ -207,7 +212,10 @@ pub(crate) async fn launch(
         })
     {
         state.record(Stage::Launcher, error);
-        return LaunchOutcome::Failed(None);
+        return LaunchOutcome::Failure {
+            unconfirmed: false,
+            reason: None,
+        };
     }
     if let Some(before_receive) = before_receive {
         let _ = before_receive.await;
@@ -226,11 +234,17 @@ pub(crate) async fn launch(
                 Ok(Ok(owner)) => LaunchOutcome::Interrupted(owner, reason),
                 Ok(Err(error)) => {
                     state.record(Stage::Spawn, error);
-                    LaunchOutcome::Failed(Some(reason))
+                    LaunchOutcome::Failure {
+                        unconfirmed: false,
+                        reason: Some(reason),
+                    }
                 }
                 // Closing an empty channel cannot distinguish a blocked launcher
                 // from one concurrently finishing; do not promise no child exists.
-                Err(_) => LaunchOutcome::Unconfirmed(Some(reason)),
+                Err(_) => LaunchOutcome::Failure {
+                    unconfirmed: true,
+                    reason: Some(reason),
+                },
             };
         }
         tokio::select! {
@@ -249,11 +263,11 @@ pub(crate) async fn launch(
                     },
                     Ok(Err(error)) => {
                         state.record(Stage::Spawn, error);
-                        LaunchOutcome::Failed(interrupted)
+                        LaunchOutcome::Failure { unconfirmed: false, reason: interrupted }
                     },
                     Err(error) => {
                         state.record(Stage::Launcher, io::Error::other(error));
-                        LaunchOutcome::Unconfirmed(interrupted)
+                        LaunchOutcome::Failure { unconfirmed: true, reason: interrupted }
                     },
                 };
             },

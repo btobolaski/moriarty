@@ -28,6 +28,13 @@ pub struct RunningProcess {
 }
 
 impl RunningProcess {
+    /// Success acknowledges both child ownership and registered capture pipes. Requires
+    /// Tokio I/O and time; [startup uncertainty](crate#stalled-startup-and-host-lifetime)
+    /// remains explicit if creation outlives its budget.
+    pub async fn spawn(spec: ProcessSpec, options: ProcessOptions) -> miette::Result<Self> {
+        spawn_with(spec, options, Hooks::default()).await
+    }
+
     /// A clone can cancel while `wait(self)` owns this handle; dropping a clone does not cancel.
     pub fn cancellation_handle(&self) -> CancellationToken {
         self.token.clone()
@@ -48,13 +55,6 @@ impl RunningProcess {
         self.token.cancel();
         self.wait().await
     }
-}
-
-/// Success acknowledges both child ownership and registered capture pipes. Requires
-/// Tokio I/O and time; [startup uncertainty](crate#stalled-startup-and-host-lifetime)
-/// remains explicit if creation outlives its budget.
-pub async fn spawn(spec: ProcessSpec, options: ProcessOptions) -> miette::Result<RunningProcess> {
-    spawn_with(spec, options, Hooks::default()).await
 }
 
 async fn spawn_with(
@@ -94,11 +94,9 @@ async fn spawn_with(
 #[derive(Clone, Copy)]
 enum Cause {
     Exited,
-    Cancelled,
-    TimedOut,
+    Interrupted(Interruption),
     Failed,
     StartFailed,
-    Interrupted,
 }
 
 enum Pipe {
@@ -134,23 +132,18 @@ async fn prepare(
     mut hooks: Hooks,
 ) -> Result<Driver, ProcessError> {
     let mut state = PartialState::default();
-    let Some(permit) = launch::admit(options, token, start, &mut state, &mut hooks).await else {
-        return Err(if state.interruption.is_some() {
-            ProcessError::StartupInterrupted {
-                state: Box::new(state),
-            }
-        } else {
-            ProcessError::StartFailed {
-                state: Box::new(state),
-            }
-        });
+    let permit = match launch::admit(options, token, start, &mut hooks).await {
+        Ok(permit) => permit,
+        Err(reason) => {
+            return Err(ProcessError::from_startup(state, Some(reason), false));
+        }
     };
     let streams: io::Result<_> = (|| {
         let stdout = allocate_stream(options.stdout_limit, &mut hooks)?;
         let stderr = allocate_stream(options.stderr_limit, &mut hooks)?;
         Ok((stdout, stderr))
     })();
-    let (stdout, stderr) = match streams {
+    let (mut stdout, mut stderr) = match streams {
         Ok(streams) => streams,
         Err(error) => {
             state.record(Stage::Allocation, error);
@@ -160,92 +153,84 @@ async fn prepare(
         }
     };
     let pipe_setup = hooks.pipe_setup();
-    let (owner, mut cause) =
+    let (mut owner, mut cause) =
         match launch::launch(spec, options, token, start, &mut state, permit, hooks).await {
             LaunchOutcome::Ready(owner) => (owner, None),
-            LaunchOutcome::Interrupted(owner, reason) => {
-                state.interruption = Some(Interruption::Startup(reason));
-                (owner, Some(Cause::Interrupted))
-            }
-            LaunchOutcome::Failed(reason) => {
-                state.interruption = reason.map(Interruption::Startup);
-                return Err(match reason {
-                    Some(_) => ProcessError::StartupInterrupted {
-                        state: Box::new(state),
-                    },
-                    None => ProcessError::StartFailed {
-                        state: Box::new(state),
-                    },
-                });
-            }
-            LaunchOutcome::Unconfirmed(reason) => {
-                state.launch_unconfirmed = true;
-                state.interruption = reason.map(Interruption::Startup);
-                return Err(match reason {
-                    Some(_) => ProcessError::StartupInterrupted {
-                        state: Box::new(state),
-                    },
-                    None => ProcessError::CleanupUnconfirmed {
-                        state: Box::new(state),
-                    },
-                });
+            LaunchOutcome::Interrupted(owner, reason) => (
+                owner,
+                Some(Cause::Interrupted(Interruption::Startup(reason))),
+            ),
+            LaunchOutcome::Failure {
+                unconfirmed,
+                reason,
+            } => {
+                return Err(ProcessError::from_startup(state, reason, unconfirmed));
             }
         };
     state.child_id = Some(owner.id());
-    let mut driver = Driver {
+    let setup = setup_pipes(&mut owner, &mut stdout, &mut stderr)
+        .and_then(|()| pipe_setup.map_or(Ok(()), |hook| hook(token)));
+    if let Err(error) = setup {
+        state.record(Stage::PipeSetup, error);
+        stdout.close_failed();
+        stderr.close_failed();
+        cause.get_or_insert(Cause::StartFailed);
+    }
+    if !matches!(cause, Some(Cause::Interrupted(_)))
+        && let Some(reason) = launch::interruption(token, start, options)
+    {
+        token.cancel();
+        cause = Some(Cause::Interrupted(Interruption::Startup(reason)));
+    }
+    // Pipe registration belongs to startup, not the child's execution allowance.
+    let phase = match cause {
+        Some(cause) => final_phase(&mut owner, &mut state, cause),
+        None => Phase::Running(Instant::now()),
+    };
+    let driver = Driver {
         owner,
         stdout,
         stderr,
         state,
-        phase: Phase::Running(Instant::now()),
+        phase,
     };
-    let setup = driver
-        .setup_pipes()
-        .and_then(|()| pipe_setup.map_or(Ok(()), |hook| hook(token)));
-    if let Err(error) = setup {
-        driver.state.record(Stage::PipeSetup, error);
-        driver.stdout.close_failed();
-        driver.stderr.close_failed();
-        cause.get_or_insert(Cause::StartFailed);
-    }
-    if cause.is_none()
-        && let Some(reason) = launch::interruption(token, start, options)
-    {
-        driver.state.interruption = Some(Interruption::Startup(reason));
-        token.cancel();
-        cause = Some(Cause::Interrupted);
-    }
-    if let Some(cause) = cause {
-        driver.kill(cause);
+    if cause.is_some() {
         let (driver, cause) = driver.settle(options, token).await;
         return Err(driver.into_error(cause));
     }
-    driver.phase = Phase::Running(Instant::now());
     Ok(driver)
 }
 
-impl Driver {
-    fn setup_pipes(&mut self) -> io::Result<()> {
-        let stdout = self
-            .owner
-            .take_stdout()
-            .ok_or_else(|| io::Error::other("missing stdout pipe"))?;
-        self.stdout.reader = Some(ChildStdout::from_std(stdout)?);
-        let stderr = self
-            .owner
-            .take_stderr()
-            .ok_or_else(|| io::Error::other("missing stderr pipe"))?;
-        self.stderr.reader = Some(ChildStderr::from_std(stderr)?);
-        Ok(())
-    }
+fn setup_pipes(
+    owner: &mut Owner,
+    stdout: &mut Stream<ChildStdout>,
+    stderr: &mut Stream<ChildStderr>,
+) -> io::Result<()> {
+    let pipe = owner
+        .take_stdout()
+        .ok_or_else(|| io::Error::other("missing stdout pipe"))?;
+    stdout.register(ChildStdout::from_std(pipe)?);
+    let pipe = owner
+        .take_stderr()
+        .ok_or_else(|| io::Error::other("missing stderr pipe"))?;
+    stderr.register(ChildStderr::from_std(pipe)?);
+    Ok(())
+}
 
+fn final_phase(owner: &mut Owner, state: &mut PartialState, cause: Cause) -> Phase {
+    state.kill_attempted = true;
+    if let Err(error) = owner.final_kill() {
+        state.record(error.stage, error.source);
+    }
+    // Unconverted pipes must not keep a startup failure's cleanup open.
+    owner.take_stdout();
+    owner.take_stderr();
+    Phase::Final(Instant::now(), cause)
+}
+
+impl Driver {
     fn term(&mut self, cause: Cause) {
         self.phase = Phase::Term(Instant::now(), cause);
-        self.state.interruption = match cause {
-            Cause::Cancelled => Some(Interruption::Execution(InterruptionReason::Cancelled)),
-            Cause::TimedOut => Some(Interruption::Execution(InterruptionReason::TimedOut)),
-            _ => None,
-        };
         self.state.term_attempted = true;
         if let Err(error) = self.owner.term() {
             self.state.record(error.stage, error.source);
@@ -253,14 +238,8 @@ impl Driver {
     }
 
     fn kill(&mut self, cause: Cause) {
-        self.state.kill_attempted = true;
-        if let Err(error) = self.owner.final_kill() {
-            self.state.record(error.stage, error.source);
-        }
-        self.phase = Phase::Final(Instant::now(), cause);
-        // Unconverted pipes must not keep a startup failure's cleanup open.
-        self.owner.take_stdout();
-        self.owner.take_stderr();
+        self.phase = final_phase(&mut self.owner, &mut self.state, cause);
+        self.finalize();
     }
 
     fn observe(&mut self) {
@@ -299,14 +278,20 @@ impl Driver {
 
     fn into_error(mut self, cause: Cause) -> ProcessError {
         let confirmed = self.complete();
-        self.state.stdout = self.stdout.capture;
-        self.state.stderr = self.stderr.capture;
+        self.state.stdout = self.stdout.into_capture();
+        self.state.stderr = self.stderr.into_capture();
+        self.state.interruption = match cause {
+            Cause::Interrupted(interruption) => Some(interruption),
+            _ => None,
+        };
         let state = Box::new(self.state);
         if !confirmed {
             return ProcessError::CleanupUnconfirmed { state };
         }
         match cause {
-            Cause::Interrupted => ProcessError::StartupInterrupted { state },
+            Cause::Interrupted(Interruption::Startup(_)) => {
+                ProcessError::StartupInterrupted { state }
+            }
             Cause::StartFailed => ProcessError::StartFailed { state },
             _ => ProcessError::SupervisionFailed { state },
         }
@@ -315,8 +300,8 @@ impl Driver {
     fn finish(self, cause: Cause) -> Result<ProcessReport, ProcessError> {
         if !self.state.group_absent
             || self.state.failed()
-            || !self.stdout.capture.eof
-            || !self.stderr.capture.eof
+            || !self.stdout.eof()
+            || !self.stderr.eof()
         {
             return Err(self.into_error(cause));
         }
@@ -325,14 +310,18 @@ impl Driver {
         };
         let completion = match cause {
             Cause::Exited => Completion::Exited(status),
-            Cause::Cancelled => Completion::Cancelled(status),
-            Cause::TimedOut => Completion::TimedOut(status),
+            Cause::Interrupted(Interruption::Execution(InterruptionReason::Cancelled)) => {
+                Completion::Cancelled(status)
+            }
+            Cause::Interrupted(Interruption::Execution(InterruptionReason::TimedOut)) => {
+                Completion::TimedOut(status)
+            }
             _ => return Err(self.into_error(cause)),
         };
         Ok(ProcessReport {
             completion,
-            stdout: self.stdout.capture,
-            stderr: self.stderr.capture,
+            stdout: self.stdout.into_capture(),
+            stderr: self.stderr.into_capture(),
         })
     }
 
@@ -354,13 +343,17 @@ impl Driver {
         loop {
             // Control and fixed phase clocks always run before another ready chunk.
             let pending = match self.phase {
-                Phase::Running(_) if token.is_cancelled() => Some(Cause::Cancelled),
+                Phase::Running(_) if token.is_cancelled() => Some(Cause::Interrupted(
+                    Interruption::Execution(InterruptionReason::Cancelled),
+                )),
                 Phase::Running(start)
                     if options
                         .execution_timeout
                         .is_some_and(|budget| start.elapsed() >= budget) =>
                 {
-                    Some(Cause::TimedOut)
+                    Some(Cause::Interrupted(Interruption::Execution(
+                        InterruptionReason::TimedOut,
+                    )))
                 }
                 _ => None,
             };

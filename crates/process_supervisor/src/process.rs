@@ -77,9 +77,13 @@ mod platform {
             }
         }
 
-        fn identity(&self) -> io::Result<Pid> {
-            self.group
-                .ok_or_else(|| io::Error::other("invalid or host process-group identity"))
+        fn identity(&mut self) -> io::Result<Pid> {
+            // Job control can move the host after launch; rejection must outlive that move.
+            let group = self.group.filter(|group| *group != getpgrp());
+            if group.is_none() {
+                self.armed = false;
+            }
+            group.ok_or_else(|| io::Error::other("invalid or host process-group identity"))
         }
 
         // NOWAIT pins the leader's identity until the last destructive signal. Using
@@ -124,7 +128,7 @@ mod platform {
             })
         }
 
-        pub fn group_absent(&self) -> io::Result<bool> {
+        pub fn group_absent(&mut self) -> io::Result<bool> {
             let group = self.identity()?;
             match self.ops.group_absent(group) {
                 Ok(()) => Ok(false),
@@ -133,15 +137,19 @@ mod platform {
             }
         }
 
-        fn signal(&self, signal: Signal) -> io::Result<()> {
-            let group = self.identity()?;
-            match bounded_retry(|| self.ops.signal(group, signal)) {
-                Ok(()) | Err(Errno::SRCH) => Ok(()),
-                Err(error) => Err(error.into()),
+        fn signal(&mut self, signal: Signal) -> io::Result<()> {
+            let mut retries = 0;
+            loop {
+                let group = self.identity()?;
+                match self.ops.signal(group, signal) {
+                    Err(Errno::INTR) if retries < 2 => retries += 1,
+                    Ok(()) | Err(Errno::SRCH) => return Ok(()),
+                    Err(error) => return Err(error.into()),
+                }
             }
         }
 
-        pub fn record_group_absence(&self, state: &mut PartialState) {
+        pub fn record_group_absence(&mut self, state: &mut PartialState) {
             if !state.group_absent {
                 match self.group_absent() {
                     Ok(absent) => state.group_absent = absent,
@@ -251,12 +259,16 @@ mod platform {
     #[cfg(test)]
     mod tests {
         use std::{
-            env, fmt,
+            collections::VecDeque,
+            env, fmt, fs,
+            io::Read,
             os::unix::process::CommandExt,
             process::{Command, Stdio},
             sync::{Arc, Mutex},
         };
 
+        use rustix::process::setpgid;
+        use tempfile::TempDir;
         use tracing::{
             Event, Metadata, Subscriber,
             field::Field,
@@ -285,7 +297,9 @@ mod platform {
         #[derive(Default)]
         pub(crate) struct Script {
             errors: Vec<(Stage, Errno)>,
+            signal_errors: VecDeque<(Errno, Option<Pid>)>,
             exited: Option<bool>,
+            join_host_on_observe: Option<Pid>,
             status: Option<Option<ExitStatus>>,
             absent: Option<bool>,
             trace: Trace,
@@ -311,7 +325,11 @@ mod platform {
 
             pub(super) fn observe(&self, pid: Pid) -> rustix::io::Result<bool> {
                 self.check(Stage::Observation)?;
-                self.exited.map_or_else(|| System.observe(pid), Ok)
+                let exited = self.exited.map_or_else(|| System.observe(pid), Ok)?;
+                if let Some(group) = self.join_host_on_observe {
+                    setpgid(None, Some(group))?;
+                }
+                Ok(exited)
             }
 
             pub(super) fn group_absent(&self, group: Pid) -> rustix::io::Result<()> {
@@ -323,12 +341,18 @@ mod platform {
                 }
             }
 
-            pub(super) fn signal(&self, group: Pid, signal: Signal) -> rustix::io::Result<()> {
+            pub(super) fn signal(&mut self, group: Pid, signal: Signal) -> rustix::io::Result<()> {
                 self.check(if signal == Signal::TERM {
                     Stage::Term
                 } else {
                     Stage::Kill
                 })?;
+                if let Some((error, join)) = self.signal_errors.pop_front() {
+                    if let Some(group) = join {
+                        setpgid(None, Some(group))?;
+                    }
+                    return Err(error);
+                }
                 System.signal(group, signal)
             }
 
@@ -401,6 +425,7 @@ mod platform {
         }
 
         fn exited_owner() -> Owner {
+            let dir = TempDir::new().unwrap();
             let child = Command::new(env::current_exe().unwrap())
                 .args([
                     "--ignored",
@@ -408,8 +433,12 @@ mod platform {
                     "driver::tests::fixture",
                     "--nocapture",
                 ])
+                .env("HOME", dir.path())
+                .env("XDG_CONFIG_HOME", dir.path().join("config"))
+                .env("XDG_STATE_HOME", dir.path().join("state"))
+                .env("XDG_CACHE_HOME", dir.path().join("cache"))
                 .stdin(Stdio::null())
-                .stdout(Stdio::null())
+                .stdout(Stdio::piped())
                 .stderr(Stdio::null())
                 .process_group(0)
                 .spawn()
@@ -420,8 +449,86 @@ mod platform {
                 assert!(start.elapsed() < Duration::from_secs(5));
                 thread::sleep(POLL);
             }
+            let mut output = Vec::new();
+            owner
+                .take_stdout()
+                .unwrap()
+                .read_to_end(&mut output)
+                .unwrap();
+            assert!(
+                output
+                    .windows(b"fixture-body".len())
+                    .any(|bytes| bytes == b"fixture-body")
+            );
             owner.ops().trace_handle().clear();
             owner
+        }
+
+        #[test]
+        #[ignore = "subprocess host fixture"]
+        fn host_group_change_revokes_signals() {
+            let original = getpgrp();
+            assert_ne!(original.as_raw_pid() as u32, std::process::id());
+            for trigger in ["term", "kill", "drop", "late", "between", "retry"] {
+                let mut owner = exited_owner();
+                let group = owner.group.unwrap();
+                let trace = owner.ops().trace_handle();
+                if trigger == "between" {
+                    owner.ops().join_host_on_observe = Some(group);
+                } else if trigger == "retry" {
+                    owner
+                        .ops()
+                        .signal_errors
+                        .push_back((Errno::INTR, Some(group)));
+                } else {
+                    setpgid(None, Some(group)).unwrap();
+                    assert_eq!(getpgrp(), group);
+                }
+                match trigger {
+                    "term" | "between" | "retry" => {
+                        let error = owner
+                            .term()
+                            .expect_err("TERM must reject the current host group");
+                        assert_eq!(
+                            error.source.to_string(),
+                            "invalid or host process-group identity"
+                        );
+                    }
+                    "kill" => {
+                        owner
+                            .final_kill()
+                            .expect_err("KILL must reject the current host group");
+                    }
+                    _ => {}
+                }
+                if matches!(trigger, "term" | "kill" | "between" | "retry") {
+                    assert!(!owner.armed);
+                    setpgid(None, Some(original)).unwrap();
+                    let error = owner
+                        .term()
+                        .expect_err("leaving the group must not restore authority");
+                    assert_eq!(error.source.to_string(), "signal authority revoked");
+                }
+                if trigger == "late" {
+                    owner.late_cleanup(Duration::ZERO);
+                } else {
+                    drop(owner);
+                }
+                setpgid(None, Some(original)).unwrap();
+                assert_eq!(getpgrp(), original);
+                let expected = match trigger {
+                    "late" => vec![Stage::Reap, Stage::Reap],
+                    "between" => vec![Stage::Observation, Stage::Reap],
+                    "retry" => vec![Stage::Observation, Stage::Term, Stage::Reap],
+                    _ => vec![Stage::Reap],
+                };
+                assert_eq!(trace.snapshot(), expected);
+            }
+            fs::write(
+                env::var_os("SUPERVISOR_HOST_COMPLETED").unwrap(),
+                "host-group-rejected",
+            )
+            .unwrap();
         }
 
         #[test]

@@ -723,23 +723,24 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn allow_local_timeout_fails_closed() {
-        let evaluation = checked_blocking(
-            timeout(
-                Duration::from_millis(1),
-                tokio::task::spawn_blocking(|| {
-                    std::thread::sleep(Duration::from_millis(25));
-                    Some(LocalPathEvaluation {
-                        canonical_cwd: PathBuf::from("/"),
-                        path: None,
-                        file_path: None,
-                    })
-                }),
+    #[test]
+    fn allow_local_timeout_fails_closed() {
+        let evaluation = with_saturated_blocking_pool(async {
+            checked_blocking(
+                timeout(
+                    Duration::from_millis(1),
+                    tokio::task::spawn_blocking(|| {
+                        Some(LocalPathEvaluation {
+                            canonical_cwd: PathBuf::from("/"),
+                            path: None,
+                            file_path: None,
+                        })
+                    }),
+                )
+                .await,
+                "test locality evaluation",
             )
-            .await,
-            "test locality evaluation",
-        );
+        });
         let error = evaluation.expect_err("locality timeout must fail closed");
         assert!(
             error

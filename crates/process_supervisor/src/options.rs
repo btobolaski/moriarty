@@ -93,6 +93,17 @@ mod tests {
                 .unwrap_err(),
             OptionsError::CaptureTooLarge
         );
+        let max = isize::MAX as usize;
+        assert!(defaults.clone().with_capture_limits(max, max).is_ok());
+        for (stdout, stderr) in [(max + 1, 0), (0, max + 1)] {
+            assert_eq!(
+                defaults
+                    .clone()
+                    .with_capture_limits(stdout, stderr)
+                    .unwrap_err(),
+                OptionsError::CaptureTooLarge
+            );
+        }
         let options = defaults
             .with_capture_limits(0, 0)
             .unwrap()

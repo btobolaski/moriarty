@@ -9,7 +9,7 @@ use std::{
         net::{UnixListener, UnixStream},
         process::{CommandExt, ExitStatusExt},
     },
-    path::Path,
+    path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     thread,
     time::{Duration, Instant},
@@ -28,8 +28,17 @@ use tokio::{
 };
 
 use process_supervisor::{
-    Completion, ProcessOptions, ProcessReport, ProcessSpec, RunningProcess, spawn,
+    Capture, Completion, Interruption, InterruptionReason, ProcessError, ProcessOptions,
+    ProcessReport, ProcessSpec, RunningProcess,
 };
+
+fn isolate_home<'a>(command: &'a mut Command, home: &Path) -> &'a mut Command {
+    command
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("XDG_STATE_HOME", home.join("state"))
+        .env("XDG_CACHE_HOME", home.join("cache"))
+}
 
 fn fixture(name: &str) -> ProcessSpec {
     ProcessSpec {
@@ -43,7 +52,7 @@ fn fixture(name: &str) -> ProcessSpec {
 
 async fn run(name: &str, options: ProcessOptions) -> ProcessReport {
     timeout(Duration::from_secs(10), async {
-        spawn(fixture(name), options)
+        RunningProcess::spawn(fixture(name), options)
             .await
             .unwrap()
             .wait()
@@ -117,18 +126,23 @@ async fn ready(path: &Path) {
     .unwrap();
 }
 
-async fn start(mode: &str) -> (TempDir, RunningProcess, Pid) {
-    let dir = TempDir::new().unwrap();
-    fs::write(dir.path().join("mode"), mode).unwrap();
+async fn start(mode: &str) -> (PathBuf, RunningProcess, Pid) {
+    // cwd is the outer Host's isolated directory, not the repo. Its TempDir guard
+    // removes kept subtrees only after fixture socket EOF/rescue, including orphans.
+    let dir = TempDir::new_in(env::current_dir().unwrap()).unwrap().keep();
+    fs::write(dir.join("mode"), mode).unwrap();
     let mut spec = fixture("child_lifecycle");
-    spec.cwd = Some(dir.path().into());
-    let process = timeout(Duration::from_secs(5), spawn(spec, lifecycle_options()))
-        .await
-        .unwrap()
-        .unwrap();
-    ready(&dir.path().join("ready")).await;
+    spec.cwd = Some(dir.clone());
+    let process = timeout(
+        Duration::from_secs(5),
+        RunningProcess::spawn(spec, lifecycle_options()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    ready(&dir.join("ready")).await;
     let pid = Pid::from_raw(
-        fs::read_to_string(dir.path().join("ready"))
+        fs::read_to_string(dir.join("ready"))
             .unwrap()
             .parse()
             .unwrap(),
@@ -151,64 +165,142 @@ async fn gone(pid: Pid) {
     .unwrap();
 }
 
+// Orphan zombies may keep a group observable even after every fixture died.
+// The outer Host independently checks watchdog-socket EOF and owns rescue on failure.
+fn lifecycle_outcome(
+    result: miette::Result<ProcessReport>,
+    interruption: Option<Interruption>,
+) -> (ExitStatus, Capture, Capture) {
+    match result {
+        Ok(report) => {
+            let (status, actual) = match report.completion {
+                Completion::Exited(status) => (status, None),
+                Completion::Cancelled(status) => (
+                    status,
+                    Some(Interruption::Execution(InterruptionReason::Cancelled)),
+                ),
+                Completion::TimedOut(status) => (
+                    status,
+                    Some(Interruption::Execution(InterruptionReason::TimedOut)),
+                ),
+            };
+            assert_eq!(actual, interruption);
+            (status, report.stdout, report.stderr)
+        }
+        Err(error) => {
+            let error = error.downcast::<ProcessError>().unwrap();
+            let ProcessError::CleanupUnconfirmed { state } = error else {
+                panic!("unexpected lifecycle failure: {error}")
+            };
+            assert_eq!(state.interruption, interruption);
+            assert!(!state.group_absent && state.failures().next().is_none());
+            assert!(state.stdout.eof && state.stderr.eof);
+            (
+                state.status.expect("direct child reaped"),
+                state.stdout,
+                state.stderr,
+            )
+        }
+    }
+}
+
+fn lifecycle_host(name: &str, peers: usize) {
+    let dir = TempDir::new().unwrap();
+    let mut host = Host::spawn(name, dir.path());
+    assert!(host.wait(Duration::from_secs(20)).unwrap().success());
+    assert_eq!(
+        fs::read_to_string(dir.path().join("lifecycle.completed")).unwrap(),
+        name
+    );
+    assert_eq!(
+        host.peers.len(),
+        peers,
+        "every lifecycle fixture must register rescue"
+    );
+    host.fixtures_stopped(Duration::from_secs(2)).unwrap();
+    host.terminate().unwrap();
+}
+
+#[test]
+fn term_kill_descendants_and_continuous_output() {
+    lifecycle_host("host_term_kill_descendants", 9);
+}
+
 #[tokio::test]
-async fn term_kill_descendants_and_continuous_output() {
+#[ignore = "subprocess host fixture"]
+async fn host_term_kill_descendants() {
     for mode in ["cooperative", "ignore", "tree", "root-term", "flood"] {
         let (dir, process, pid) = start(mode).await;
         let token = process.cancellation_handle();
         drop(token.clone());
         assert!(!token.is_cancelled(), "dropping a token clone cancelled");
         if mode == "flood" {
-            ready(&dir.path().join("stdout.flooded")).await;
-            ready(&dir.path().join("stderr.flooded")).await;
+            ready(&dir.join("stdout.flooded")).await;
+            ready(&dir.join("stderr.flooded")).await;
         }
         let start = Instant::now();
+        let waiter = tokio::spawn(process.wait());
         token.cancel();
         token.cancel();
-        let report = timeout(Duration::from_secs(5), process.wait())
-            .await
-            .unwrap()
-            .unwrap();
-        let Completion::Cancelled(status) = report.completion else {
-            panic!("wrong completion: {mode}")
-        };
+        let (status, stdout, stderr) = lifecycle_outcome(
+            timeout(Duration::from_secs(5), waiter)
+                .await
+                .unwrap()
+                .unwrap(),
+            Some(Interruption::Execution(InterruptionReason::Cancelled)),
+        );
         if matches!(mode, "cooperative" | "root-term") {
             assert!(status.success());
-            assert!(dir.path().join("termed").exists());
+            assert!(dir.join("termed").exists());
         } else {
             assert_eq!(status.signal(), Some(9));
         }
         assert!(start.elapsed() >= Duration::from_millis(80));
-        assert!(report.stdout.eof && report.stderr.eof);
-        assert!(report.stdout.bytes.len() <= 1000 && report.stderr.bytes.len() <= 1000);
+        assert!(stdout.eof && stderr.eof);
+        assert!(stdout.bytes.len() <= 1000 && stderr.bytes.len() <= 1000);
         if mode == "flood" {
-            assert_eq!(
-                (report.stdout.bytes.len(), report.stderr.bytes.len()),
-                (1000, 1000)
-            );
-            assert!(report.stdout.truncated && report.stderr.truncated);
+            assert_eq!((stdout.bytes.len(), stderr.bytes.len()), (1000, 1000));
+            assert!(stdout.truncated && stderr.truncated);
         }
-        gone(pid).await;
+        // Orphan zombies may keep these tree groups observable; outer socket EOF proves fixture death.
+        if !matches!(mode, "tree" | "root-term") {
+            gone(pid).await;
+        }
         token.cancel();
     }
+    fs::write("lifecycle.completed", "host_term_kill_descendants").unwrap();
+}
+
+#[test]
+fn naturally_exited_root_does_not_leave_background_descendants() {
+    lifecycle_host("host_naturally_exited_root", 6);
 }
 
 #[tokio::test]
-async fn naturally_exited_root_does_not_leave_background_descendants() {
+#[ignore = "subprocess host fixture"]
+async fn host_naturally_exited_root() {
     for mode in ["root-exits", "root-exits-closed"] {
-        let (dir, process, pid) = start(mode).await;
-        fs::write(dir.path().join("go"), "").unwrap();
-        let report = timeout(Duration::from_secs(5), process.wait())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(matches!(report.completion, Completion::Exited(status) if status.success()));
-        gone(pid).await;
+        let (dir, process, _pid) = start(mode).await;
+        fs::write(dir.join("go"), "").unwrap();
+        let (status, stdout, stderr) = lifecycle_outcome(
+            timeout(Duration::from_secs(5), process.wait())
+                .await
+                .unwrap(),
+            None,
+        );
+        assert!(status.success() && stdout.eof && stderr.eof);
     }
+    fs::write("lifecycle.completed", "host_naturally_exited_root").unwrap();
+}
+
+#[test]
+fn dropping_owners_cancels_but_does_not_abort_cleanup_or_other_groups() {
+    lifecycle_host("host_dropping_owners", 3);
 }
 
 #[tokio::test]
-async fn dropping_owners_cancels_but_does_not_abort_cleanup_or_other_groups() {
+#[ignore = "subprocess host fixture"]
+async fn host_dropping_owners() {
     let (_dir, survivor, survivor_pid) = start("ignore").await;
     for wait in [false, true] {
         let (_dir, process, pid) = start("ignore").await;
@@ -228,6 +320,7 @@ async fn dropping_owners_cancels_but_does_not_abort_cleanup_or_other_groups() {
         Completion::Cancelled(_)
     ));
     gone(survivor_pid).await;
+    fs::write("lifecycle.completed", "host_dropping_owners").unwrap();
 }
 
 // Each fixture holds membership in the group it signals. Closing a socket asks that
@@ -272,7 +365,7 @@ impl Host {
             .map(|paths| env::split_paths(&paths).collect::<Vec<_>>())
             .unwrap_or_default();
         sockets.push(socket);
-        let child = Command::new(env::current_exe().unwrap())
+        let child = isolate_home(&mut Command::new(env::current_exe().unwrap()), dir)
             .args(["--ignored", "--exact", name, "--nocapture"])
             .current_dir(dir)
             .env(
@@ -280,12 +373,12 @@ impl Host {
                 env::join_paths(sockets).unwrap(),
             )
             .env("SUPERVISOR_TEST_ENV", "inherited ;$ spaces")
-            .env("HOME", dir)
-            .env("XDG_CONFIG_HOME", dir.join("config"))
-            .env("XDG_STATE_HOME", dir.join("state"))
-            .env("XDG_CACHE_HOME", dir.join("cache"))
             .stdin(Stdio::piped())
-            .stdout(Stdio::null())
+            .stdout(if name == "host_contract" {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stderr(Stdio::inherit())
             .process_group(0)
             .spawn()
@@ -334,25 +427,31 @@ impl Host {
         }
     }
 
+    fn fixtures_stopped(&mut self, budget: Duration) -> io::Result<()> {
+        let start = Instant::now();
+        for peer in &mut self.peers {
+            let remaining = budget.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            peer.set_read_timeout(Some(remaining))?;
+            if peer.read(&mut [0])? != 0 {
+                return Err(io::Error::other("unexpected watchdog response"));
+            }
+        }
+        Ok(())
+    }
+
     fn terminate(&mut self) -> io::Result<ExitStatus> {
         let _ = self.accept();
         self.listener.take();
-        for peer in self.peers.drain(..) {
-            let _ = peer.shutdown(Shutdown::Both);
+        for peer in &self.peers {
+            // Keep the read half live: local read shutdown would fabricate fixture EOF.
+            let _ = peer.shutdown(Shutdown::Write);
         }
         let _ = self.child.kill();
         let status = self.wait(Duration::from_secs(2))?;
-        let start = Instant::now();
-        while self
-            .groups
-            .iter()
-            .any(|group| test_kill_process_group(*group) != Err(Errno::SRCH))
-        {
-            if start.elapsed() >= Duration::from_secs(2) {
-                return Err(io::ErrorKind::TimedOut.into());
-            }
-            thread::sleep(Duration::from_millis(5));
-        }
+        self.fixtures_stopped(Duration::from_secs(2))?;
         Ok(status)
     }
 }
@@ -371,7 +470,7 @@ fn forced_watchdog_failure_contains_separate_groups_and_reaps_the_host() {
     outer.terminate().unwrap();
     assert_eq!(
         fs::read_to_string(dir.path().join("contained")).unwrap(),
-        "host reaped; all fixture groups absent"
+        "host reaped; all fixture sockets closed"
     );
 }
 
@@ -396,7 +495,7 @@ fn host_watchdog_failure() {
     let error = host.wait(Duration::ZERO).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     assert!(!host.terminate().unwrap().success());
-    fs::write("contained", "host reaped; all fixture groups absent").unwrap();
+    fs::write("contained", "host reaped; all fixture sockets closed").unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -404,7 +503,7 @@ fn host_watchdog_failure() {
 async fn host_watchdog_stall() {
     assert_eq!(getpgrp(), getpid());
     fixture_watchdog();
-    let _process = spawn(fixture("child_watchdog_tree"), ProcessOptions::default())
+    let _process = RunningProcess::spawn(fixture("child_watchdog_tree"), ProcessOptions::default())
         .await
         .unwrap();
     // Deliberately stop polling the runtime: rescue cannot rely on the driver or Drop.
@@ -422,7 +521,8 @@ async fn host_watchdog_stall() {
 fn child_watchdog_tree() {
     assert_eq!(getpgrp(), getpid());
     fixture_watchdog();
-    let _child = Command::new(env::current_exe().unwrap())
+    let home = env::current_dir().unwrap();
+    let _child = isolate_home(&mut Command::new(env::current_exe().unwrap()), &home)
         .args(["--ignored", "--exact", "child_watchdog_leaf", "--nocapture"])
         .env("SUPERVISOR_TREE_GROUP", getpgrp().as_raw_pid().to_string())
         .stdin(Stdio::null())
@@ -461,6 +561,18 @@ fn literal_program_cwd_environment_and_live_host_stdin_are_preserved() {
     // Keep the writer live: an accidentally inherited stdin must not get EOF.
     assert!(host.wait(Duration::from_secs(10)).unwrap().success());
     host.terminate().unwrap();
+    let mut output = Vec::new();
+    host.child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_end(&mut output)
+        .unwrap();
+    assert!(
+        !output
+            .windows(b"stdin-eof".len())
+            .any(|bytes| bytes == b"stdin-eof")
+    );
     assert_eq!(
         fs::read_to_string(dir.path().join("host.completed")).unwrap(),
         "contract checked"
@@ -477,7 +589,7 @@ async fn host_contract() {
     spec.program = "./executable spelling".into();
     spec.args
         .extend(["--skip".into(), "literal ;$ spaces".into()]);
-    let report = spawn(spec, ProcessOptions::default())
+    let report = RunningProcess::spawn(spec, ProcessOptions::default())
         .await
         .unwrap()
         .wait()
@@ -538,20 +650,24 @@ async fn repeated_completions_release_pipe_descriptors() {
 async fn supervision_preserves_host_group_and_unmanaged_child_waits() {
     let host_group = getpgrp();
     let dir = TempDir::new().unwrap();
-    let mut unmanaged = Command::new(env::current_exe().unwrap())
+    let mut unmanaged = isolate_home(&mut Command::new(env::current_exe().unwrap()), dir.path())
         .args(["--ignored", "--exact", "child_nonzero", "--nocapture"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .env("HOME", dir.path())
-        .env("XDG_CONFIG_HOME", dir.path().join("config"))
-        .env("XDG_STATE_HOME", dir.path().join("state"))
-        .env("XDG_CACHE_HOME", dir.path().join("cache"))
         .spawn()
         .unwrap();
     let report = run("child_success", ProcessOptions::default()).await;
     assert_contains(&report.stdout.bytes, b"literal output");
     assert!(matches!(report.completion, Completion::Exited(status) if status.success()));
+    let process = RunningProcess::spawn(fixture("child_lifecycle_timeout"), lifecycle_options())
+        .await
+        .unwrap();
+    let cancelled = timeout(Duration::from_secs(5), process.cancel_and_wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(cancelled.completion, Completion::Cancelled(_)));
     assert_eq!(getpgrp(), host_group);
     // A broad wait/reaper or SIGCHLD auto-reaping would lose this unrelated status.
     let status = timeout(Duration::from_secs(2), async {
@@ -576,9 +692,10 @@ async fn execution_timeout_and_pre_poll_cancellation() {
     .await;
     assert!(matches!(report.completion, Completion::TimedOut(_)));
     for _ in 0..10 {
-        let process = spawn(fixture("child_lifecycle_timeout"), lifecycle_options())
-            .await
-            .unwrap();
+        let process =
+            RunningProcess::spawn(fixture("child_lifecycle_timeout"), lifecycle_options())
+                .await
+                .unwrap();
         process.cancellation_handle().cancel();
         let wait = process.wait();
         assert!(matches!(
@@ -599,14 +716,16 @@ async fn execution_timeout_and_pre_poll_cancellation() {
     reason = "the supervisor must clean descendants after this fixture exits"
 )]
 async fn child_lifecycle() {
+    fixture_watchdog();
     let mode = fs::read_to_string("mode").unwrap();
     let mut term = signal(SignalKind::terminate()).unwrap();
     if matches!(
         mode.as_str(),
         "tree" | "root-term" | "root-exits" | "root-exits-closed"
     ) {
+        let home = env::current_dir().unwrap();
         let mut command = Command::new(env::current_exe().unwrap());
-        command
+        isolate_home(&mut command, &home)
             .args(["--ignored", "--exact", "child_middle", "--nocapture"])
             .stdin(Stdio::null());
         if mode == "root-exits-closed" {
@@ -653,8 +772,10 @@ async fn child_lifecycle() {
     reason = "ordinary grandchildren are intentionally owned by the supervisor"
 )]
 async fn child_middle() {
+    fixture_watchdog();
     let _term = signal(SignalKind::terminate()).unwrap();
-    let _child = Command::new(env::current_exe().unwrap())
+    let home = env::current_dir().unwrap();
+    let _child = isolate_home(&mut Command::new(env::current_exe().unwrap()), &home)
         .args(["--ignored", "--exact", "child_leaf", "--nocapture"])
         .stdin(Stdio::null())
         .spawn()
@@ -667,6 +788,16 @@ async fn child_middle() {
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "subprocess fixture"]
 async fn child_leaf() {
+    fixture_watchdog();
+    let home = env::current_dir().unwrap();
+    for (key, expected) in [
+        ("HOME", home.clone()),
+        ("XDG_CONFIG_HOME", home.join("config")),
+        ("XDG_STATE_HOME", home.join("state")),
+        ("XDG_CACHE_HOME", home.join("cache")),
+    ] {
+        assert_eq!(env::var_os(key).unwrap(), expected);
+    }
     let _term = signal(SignalKind::terminate()).unwrap();
     fs::write("leaf.ready", "").unwrap();
     sleep(Duration::from_secs(10)).await;

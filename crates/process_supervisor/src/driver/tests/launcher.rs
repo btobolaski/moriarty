@@ -14,6 +14,33 @@ use tempfile::TempDir;
 use super::*;
 use crate::launch::Admission;
 
+fn startup_options(reason: InterruptionReason) -> ProcessOptions {
+    options().with_startup_timeout(match reason {
+        InterruptionReason::Cancelled => Duration::MAX,
+        InterruptionReason::TimedOut => SHORT_STARTUP,
+    })
+}
+
+#[tokio::test]
+async fn dropping_unpolled_startup_never_launches() {
+    let allocations = Arc::new(Mutex::new(Vec::new()));
+    let allocated = allocations.clone();
+    drop(spawn_with(
+        spec(),
+        options(),
+        Hooks {
+            before_allocate: Some(Box::new(move |limit| {
+                allocated.lock().unwrap().push(limit);
+                Ok(())
+            })),
+            before_spawn: Some(Box::new(|_| panic!("unpolled startup launched"))),
+            ..Hooks::default()
+        },
+    ));
+    tokio::task::yield_now().await;
+    assert!(allocations.lock().unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn interrupted_startup_never_launches() {
     for reason in [InterruptionReason::Cancelled, InterruptionReason::TimedOut] {
@@ -45,24 +72,22 @@ async fn interrupted_startup_never_launches() {
 #[tokio::test]
 async fn blocked_admission_is_cancellable() {
     let token = CancellationToken::new();
-    let mut state = PartialState::default();
     let mut hooks = Hooks {
         admission: Some(Admission::new(0)),
         ..Hooks::default()
     };
     let huge = options().with_startup_timeout(Duration::MAX);
     {
-        let pending = launch::admit(&huge, &token, Instant::now(), &mut state, &mut hooks);
+        let pending = launch::admit(&huge, &token, Instant::now(), &mut hooks);
         tokio::pin!(pending);
         let blocked = timeout(Duration::from_millis(5), &mut pending).await;
         assert!(blocked.is_err());
         token.cancel();
-        assert!(within(&mut pending).await.is_none());
+        assert_eq!(
+            within(&mut pending).await.err(),
+            Some(InterruptionReason::Cancelled)
+        );
     }
-    assert_eq!(
-        state.interruption,
-        Some(Interruption::Startup(InterruptionReason::Cancelled))
-    );
 }
 
 #[tokio::test]
@@ -77,14 +102,17 @@ async fn interruption_after_admission_never_launches() {
     };
     let options = options();
     let start = Instant::now();
-    let permit = launch::admit(&options, &token, start, &mut state, &mut hooks)
+    let permit = launch::admit(&options, &token, start, &mut hooks)
         .await
         .unwrap();
     token.cancel();
     let outcome = launch::launch(spec(), &options, &token, start, &mut state, permit, hooks).await;
     assert!(matches!(
         outcome,
-        LaunchOutcome::Failed(Some(InterruptionReason::Cancelled))
+        LaunchOutcome::Failure {
+            unconfirmed: false,
+            reason: Some(InterruptionReason::Cancelled)
+        }
     ));
     assert_eq!(state.failures().count(), 0);
     assert_eq!(admission.available_permits(), 1);
@@ -127,11 +155,14 @@ async fn cancelled_empty_handoff_retains_launcher_ownership() {
     assert!(matches!(error, ProcessError::StartupInterrupted { .. }));
     assert!(error.partial().launch_unconfirmed);
     assert_eq!(admission.available_permits(), 0);
-    let blocked = returned_error(Hooks {
-        admission: Some(admission.clone()),
-        before_spawn: Some(Box::new(|_| panic!("occupied admission launched"))),
-        ..Hooks::default()
-    })
+    let blocked = returned_error(
+        options().with_startup_timeout(SHORT_STARTUP),
+        Hooks {
+            admission: Some(admission.clone()),
+            before_spawn: Some(Box::new(|_| panic!("occupied admission launched"))),
+            ..Hooks::default()
+        },
+    )
     .await;
     assert!(!blocked.partial().launch_unconfirmed);
     release_tx.send(()).unwrap();
@@ -219,10 +250,13 @@ async fn missing_program_preserves_spawn_stage() {
 
 #[tokio::test]
 async fn dropped_handoff_is_unconfirmed() {
-    let error = returned_error(Hooks {
-        before_spawn: Some(Box::new(|_| panic!("injected launcher panic"))),
-        ..Hooks::default()
-    })
+    let error = returned_error(
+        options(),
+        Hooks {
+            before_spawn: Some(Box::new(|_| panic!("injected launcher panic"))),
+            ..Hooks::default()
+        },
+    )
     .await;
     assert!(matches!(error, ProcessError::CleanupUnconfirmed { .. }));
     assert!(error.partial().launch_unconfirmed);
@@ -230,14 +264,48 @@ async fn dropped_handoff_is_unconfirmed() {
 }
 
 #[tokio::test]
+async fn execution_clock_starts_after_pipe_setup() {
+    static SETUP_END: Mutex<Option<Instant>> = Mutex::new(None);
+    let token = CancellationToken::new();
+    let options = options()
+        .with_startup_timeout(Duration::MAX)
+        .with_execution_timeout(Some(Duration::MAX));
+    let driver = within(prepare(
+        spec(),
+        &options,
+        &token,
+        Instant::now(),
+        Hooks {
+            before_spawn: Some(Box::new(|_| thread::sleep(Duration::from_millis(30)))),
+            pipe_setup: Some(|_| {
+                thread::sleep(Duration::from_millis(30));
+                *SETUP_END.lock().unwrap() = Some(Instant::now());
+                Ok(())
+            }),
+            ..Hooks::default()
+        },
+    ))
+    .await
+    .unwrap();
+    let Phase::Running(start) = driver.phase else {
+        panic!("startup not complete")
+    };
+    assert!(start >= SETUP_END.lock().unwrap().unwrap());
+    within(driver.run(options, token)).await.unwrap();
+}
+
+#[tokio::test]
 async fn interrupted_pipe_setup_cleans_child() {
-    let error = returned_error(Hooks {
-        pipe_setup: Some(|token| {
-            token.cancel();
-            Ok(())
-        }),
-        ..Hooks::default()
-    })
+    let error = returned_error(
+        options(),
+        Hooks {
+            pipe_setup: Some(|token| {
+                token.cancel();
+                Ok(())
+            }),
+            ..Hooks::default()
+        },
+    )
     .await;
     assert!(matches!(error, ProcessError::StartupInterrupted { .. }));
     let state = error.partial();
@@ -247,6 +315,43 @@ async fn interrupted_pipe_setup_cleans_child() {
     );
     assert!(state.child_id.is_some() && state.status.is_some() && state.kill_attempted);
     assert!(state.group_absent && state.stdout.eof && state.stderr.eof);
+}
+
+#[tokio::test]
+async fn failed_pipe_setup_preserves_startup_interruption() {
+    for reason in [InterruptionReason::Cancelled, InterruptionReason::TimedOut] {
+        let hook: fn(&CancellationToken) -> io::Result<()> = match reason {
+            InterruptionReason::Cancelled => |token| {
+                token.cancel();
+                Err(io::Error::other("interrupted pipe setup failure"))
+            },
+            InterruptionReason::TimedOut => |_| {
+                thread::sleep(SHORT_STARTUP);
+                Err(io::Error::other("interrupted pipe setup failure"))
+            },
+        };
+        let options = startup_options(reason);
+        let error = returned_error(
+            options,
+            Hooks {
+                pipe_setup: Some(hook),
+                ..Hooks::default()
+            },
+        )
+        .await;
+        assert!(
+            matches!(error, ProcessError::StartupInterrupted { .. }),
+            "{error}"
+        );
+        let state = error.partial();
+        assert_eq!(state.interruption, Some(Interruption::Startup(reason)));
+        assert_eq!(
+            failure(state, Stage::PipeSetup).to_string(),
+            "interrupted pipe setup failure"
+        );
+        assert!(state.status.is_some() && state.group_absent && state.kill_attempted);
+        assert!(!state.stdout.eof && !state.stderr.eof && !state.term_attempted);
+    }
 }
 
 #[tokio::test]
@@ -269,7 +374,7 @@ async fn pipe_setup_failures_preserve_stage() {
             "missing stderr pipe",
         ),
     ] {
-        let error = returned_error(hooks).await;
+        let error = returned_error(options(), hooks).await;
         assert!(matches!(error, ProcessError::StartFailed { .. }), "{error}");
         let failure = failure(error.partial(), Stage::PipeSetup).to_string();
         assert_eq!(failure, source);
@@ -279,10 +384,13 @@ async fn pipe_setup_failures_preserve_stage() {
 
 #[tokio::test]
 async fn thread_creation_failure_preserves_launcher_stage() {
-    let error = returned_error(Hooks {
-        fail_thread: true,
-        ..Hooks::default()
-    })
+    let error = returned_error(
+        options(),
+        Hooks {
+            fail_thread: true,
+            ..Hooks::default()
+        },
+    )
     .await;
     assert!(matches!(error, ProcessError::StartFailed { .. }), "{error}");
     assert_eq!(
@@ -304,10 +412,12 @@ async fn interrupted_handoffs_preserve_known_spawn_and_cleanup_outcomes() {
             let (resume_tx, resume_rx) = oneshot::channel();
             let token = CancellationToken::new();
             let driver_token = token.clone();
+            let options = startup_options(reason);
+            let startup_budget = options.startup_timeout;
             let task = tokio::spawn(async move {
                 prepare(
                     spec,
-                    &options(),
+                    &options,
                     &driver_token,
                     Instant::now(),
                     Hooks {
@@ -325,7 +435,7 @@ async fn interrupted_handoffs_preserve_known_spawn_and_cleanup_outcomes() {
             within(sent_rx).await.unwrap();
             match reason {
                 InterruptionReason::Cancelled => token.cancel(),
-                InterruptionReason::TimedOut => sleep(options().startup_timeout).await,
+                InterruptionReason::TimedOut => sleep(startup_budget).await,
             }
             resume_tx.send(()).unwrap();
             let error = within(task).await.unwrap();

@@ -29,7 +29,7 @@ async fn scripted_errors_preserve_initiating_failure_and_signal_order() {
     ] {
         let mut driver = model().await;
         driver.owner.ops().fail(stage, errno);
-        driver.stdout.capture.eof = false;
+
         driver.read_result(Pipe::Stdout, Err(io::Error::other("injected read failure")));
         let trace = driver.owner.ops().trace_handle();
         let options =
@@ -81,19 +81,26 @@ async fn scripted_errors_preserve_initiating_failure_and_signal_order() {
 
 #[tokio::test]
 async fn failed_capture_settles_without_inventing_eof_or_hiding_cleanup_uncertainty() {
-    for (stuck_process, stuck_stderr) in [(false, false), (true, false), (false, true)] {
+    for (stuck_process, stuck_stderr, stuck_group) in [
+        (false, false, false),
+        (true, false, false),
+        (false, true, false),
+        (false, false, true),
+    ] {
         let mut driver = model().await;
-        driver.stdout.capture.bytes = b"partial".to_vec();
-        driver.stdout.capture.truncated = true;
-        driver.stdout.capture.eof = false;
+        driver.stdout.bytes = b"\xff\0partial".to_vec();
+        driver.stdout.truncated = true;
         if stuck_process {
             driver.owner.ops().stall_cleanup();
         }
+        if stuck_group {
+            driver.owner.ops().group_absent_as(false);
+        }
         let (reader, _writer) = io::pipe().unwrap();
         if stuck_stderr {
-            driver.stderr.reader =
-                Some(ChildStderr::from_std(OwnedFd::from(reader).into()).unwrap());
-            driver.stderr.capture.eof = false;
+            driver
+                .stderr
+                .register(ChildStderr::from_std(OwnedFd::from(reader).into()).unwrap());
         }
         driver.read_result(Pipe::Stdout, Err(io::Error::other("original read failure")));
         let trace = driver.owner.ops().trace_handle();
@@ -111,25 +118,42 @@ async fn failed_capture_settles_without_inventing_eof_or_hiding_cleanup_uncertai
         .unwrap_err();
         assert_eq!(
             matches!(error, ProcessError::CleanupUnconfirmed { .. }),
-            stuck_process || stuck_stderr
+            stuck_process || stuck_stderr || stuck_group
         );
-        if stuck_process || stuck_stderr {
+        if stuck_process || stuck_stderr || stuck_group {
             assert!(start.elapsed() >= budget);
         }
         let state = error.partial();
         assert_eq!(state.status.is_none(), stuck_process);
-        assert_eq!(state.group_absent, !stuck_process);
-        assert_eq!(state.stdout.bytes, b"partial");
+        assert_eq!(state.group_absent, !(stuck_process || stuck_group));
+        assert_eq!(state.stdout.bytes, b"\xff\0partial");
         assert!(state.stdout.truncated && !state.stdout.eof);
         assert_eq!(state.stderr.eof, !stuck_stderr);
         assert_eq!(
             failure(state, Stage::Stdout).to_string(),
             "original read failure"
         );
-        if !stuck_process {
-            assert_eq!(stage_count(&trace.snapshot(), Stage::GroupProbe), 1);
+        let trace = trace.snapshot();
+        assert_signal_order(&trace);
+        if !stuck_process && !stuck_group {
+            assert_eq!(stage_count(&trace, Stage::GroupProbe), 1);
         }
     }
+}
+
+#[tokio::test]
+async fn final_transition_reaps_without_another_poll() {
+    let mut driver = model().await;
+    let trace = driver.owner.ops().trace_handle();
+    driver.observe();
+    assert!(matches!(driver.phase, Phase::Final(_, Cause::Exited)));
+    assert!(
+        driver.complete(),
+        "an exited, EOF-complete fixture needs no further poll"
+    );
+    let trace = trace.snapshot();
+    assert_eq!(stage_count(&trace, Stage::Reap), 1);
+    assert_signal_order(&trace);
 }
 
 #[tokio::test]
@@ -151,15 +175,20 @@ async fn confirmed_group_absence_is_monotonic() {
 async fn cleanup_uncertainty_retains_the_interrupted_phase() {
     for interruption in [
         Interruption::Startup(InterruptionReason::Cancelled),
+        Interruption::Startup(InterruptionReason::TimedOut),
+        Interruption::Execution(InterruptionReason::Cancelled),
         Interruption::Execution(InterruptionReason::TimedOut),
     ] {
         let mut driver = model().await;
-        driver.state.interruption = Some(interruption);
+        if matches!(interruption, Interruption::Startup(_)) {
+            driver.state.record(
+                Stage::PipeSetup,
+                io::Error::other("interrupted pipe setup failure"),
+            );
+            driver.stdout.close_failed();
+        }
         driver.owner.ops().stall_cleanup();
-        driver.kill(match interruption {
-            Interruption::Startup(_) => Cause::Interrupted,
-            Interruption::Execution(_) => Cause::TimedOut,
-        });
+        driver.kill(Cause::Interrupted(interruption));
         let error = driver
             .run(
                 options().with_cleanup_graces(Duration::ZERO, Duration::ZERO),
@@ -169,6 +198,13 @@ async fn cleanup_uncertainty_retains_the_interrupted_phase() {
             .unwrap_err();
         assert!(matches!(error, ProcessError::CleanupUnconfirmed { .. }));
         assert_eq!(error.partial().interruption, Some(interruption));
+        if matches!(interruption, Interruption::Startup(_)) {
+            assert_eq!(
+                failure(error.partial(), Stage::PipeSetup).to_string(),
+                "interrupted pipe setup failure"
+            );
+            assert!(!error.partial().stdout.eof);
+        }
     }
 }
 
@@ -245,8 +281,9 @@ async fn fresh_exit_observation_precedes_pending_control() {
 async fn term_phase_preserves_its_cause() {
     let mut driver = model().await;
     driver.owner.ops().observe_as(false);
-    driver.term(Cause::TimedOut);
-    driver.phase = Phase::Term(Instant::now() - Duration::from_secs(1), Cause::TimedOut);
+    let cause = Cause::Interrupted(Interruption::Execution(InterruptionReason::TimedOut));
+    driver.term(cause);
+    driver.phase = Phase::Term(Instant::now() - Duration::from_secs(1), cause);
     driver.owner.ops().observe_as(true);
     let trace = driver.owner.ops().trace_handle();
     let token = CancellationToken::new();

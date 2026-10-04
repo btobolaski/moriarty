@@ -325,9 +325,15 @@ with warnings, while explicit missing paths and having no available source are e
   crate attributes (including rustdoc), private module declarations, and API reexports.
 - Detached, admission-bounded std launch threads own stalled creation; one Tokio driver owns each handed-off child and
   both bounded captures. Non-reaping `waitid(EXITED | NOHANG | NOWAIT)` pins the leader until final signaling, and
-  reaping requires an exclusive disarmed view, including error/Drop paths. Keep the raw child and semaphore-closing
-  authority private; preserve revocation when changing the backend. Startup outcomes must encode ownership, creation
-  certainty, and interruption reason explicitly rather than require classification from mutable evidence fields.
+  reaping requires an exclusive disarmed view, including error/Drop paths. Recheck the current host process group before
+  each destructive attempt, including retries; matching it permanently revokes authority even if the host later leaves.
+  Keep the raw child and semaphore-closing authority private; preserve revocation when changing the backend. Startup
+  outcomes must encode ownership, creation certainty, and interruption reason explicitly rather than require
+  classification from mutable evidence fields.
+- `RunningProcess::spawn` is the owning async constructor. Before handoff, admission/failure outcomes carry explicit
+  interruption and creation certainty; after handoff, the phase's cause owns interruption and error metadata is derived
+  only at finalization. Capture lifecycle is a private enum holding the reader only while open; public EOF evidence is
+  derived from that lifecycle rather than synchronized flags. Register pipes before constructing the initial phase.
 - At a Running control boundary, a fresh non-reaping exit observation takes precedence over cancellation/timeout;
   selected TERM causes remain fixed. Confirmed group absence is monotonic. Failed/closed capture settles error cleanup
   without inventing EOF, and phase-tagged interruption metadata survives cleanup uncertainty. Lost driver reports cannot
@@ -339,8 +345,11 @@ with warnings, while explicit missing paths and having no available source are e
 - Tests use exact ignored libtest subprocess fixtures and private module-selected fault seams (`launch::hooks` and the
   process-operations alias); production functions contain no `#[cfg(test)]` logic. Fixture dispatch needs body evidence,
   and rescue must remain independent, identity-safe, and bounded. See crate rustdoc for watchdog mechanics and the
-  limits of indirect SIGCHLD-isolation evidence. Never replace safe dependency operations with local FFI/pre-exec hooks,
-  migrate existing callers, or change MCP protocol support as part of this standalone crate.
+  limits of indirect SIGCHLD-isolation evidence. Descendant tests independently require watchdog-socket EOF, not prompt
+  external orphan-zombie reaping; socket EOF is not group absence, which remains mandatory for successful supervisor
+  reports. Rescue must preserve the socket's read half so local shutdown cannot fabricate EOF. Never replace safe
+  dependency operations with local FFI/pre-exec hooks, migrate existing callers, or change MCP protocol support as part
+  of this standalone crate.
 
 **`tui/`** - Terminal UI event infrastructure:
 
@@ -686,6 +695,11 @@ with warnings, while explicit missing paths and having no available source are e
 
 **Plans and reports**: Keep implementation and remediation plans in `plans/`, separate from retained reports. Delete
 plans when their work is complete; retain durable findings and benchmark evidence in the appropriate documentation.
+
+**OpenSpec**: The spec-driven workflow stores proposals, spec deltas, designs, and tasks in
+`openspec/changes/<change>/`, with main capabilities in `openspec/specs/` and archived changes in
+`openspec/changes/archive/`. Proposal authoring is planning-only; start implementation only after an explicit apply
+request. Keep these workflow artifacts separate from ad-hoc `plans/` documents.
 
 **Workspace Optimization**: The `my-workspace-hack` crate is managed by cargo-hakari to unify dependencies.
 

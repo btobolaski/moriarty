@@ -17,7 +17,7 @@ the host environment is inherited. There is no implicit shell, environment overr
 stdin option, or raw child handle. Stdin is always null.
 
 ```no_run
-use process_supervisor::{spawn, Completion, ProcessOptions, ProcessSpec};
+use process_supervisor::{Completion, ProcessOptions, ProcessSpec, RunningProcess};
 
 # async fn example() -> miette::Result<()> {
 let spec = ProcessSpec {
@@ -26,7 +26,7 @@ let spec = ProcessSpec {
     cwd: None,
 };
 let options = ProcessOptions::default().with_capture_limits(4096, 4096)?;
-let process = spawn(spec, options).await?;
+let process = RunningProcess::spawn(spec, options).await?;
 let cancellation = process.cancellation_handle();
 // Move this token to another task if cancellation must race with wait().
 let report = process.wait().await?;
@@ -39,11 +39,11 @@ drop(cancellation);
 # }
 ```
 
-For one-shot execution use `spawn(spec, options).await?.wait().await`. A
+For one-shot execution use `RunningProcess::spawn(spec, options).await?.wait().await`. A
 [`RunningProcess`] is not clonable. Its independently clonable [`CancellationToken`]
 is the cancellation role: `cancel()` is persistent and idempotent; dropping a clone
-does not cancel. Dropping the running handle, its `wait` future, or a polled `spawn`
-future requests cancellation without aborting the driver. `cancel_and_wait` follows
+does not cancel. Dropping the running handle, its `wait` future, or a polled
+`RunningProcess::spawn` future requests cancellation without aborting the driver. `cancel_and_wait` follows
 the same result path. For application-wide shutdown, cancel all tokens first and
 then await results concurrently. No task registry or application shutdown policy is
 provided.
@@ -81,7 +81,10 @@ startup/execution interruptions remain visible when cleanup also fails. Failed r
 are closed and settled for error finalization, retaining their bytes and `eof = false`.
 Once the child is reaped, the group is absent and both readers are settled, capture
 failure returns `SupervisionFailed`, not cleanup uncertainty. An uninitialized reader
-is not EOF; failed pipe setup closes it and remains `StartFailed` after confirmed cleanup.
+is not EOF; failed pipe setup closes it and returns `StartFailed` after confirmed cleanup
+unless startup was also interrupted. Concurrent startup cancellation/timeout returns
+`StartupInterrupted` with the pipe-setup diagnostic and startup reason; unconfirmed
+cleanup retains both in `CleanupUnconfirmed`.
 The partial `term_attempted` and `kill_attempted` flags record entry into the respective
 signaling path, including identity/observation preflight. They do not establish that a
 signal syscall ran, succeeded, or killed anything; a preflight failure can set a flag
@@ -106,8 +109,13 @@ is TERM grace plus post-KILL grace, plus scheduler/syscall latency, not hard rea
 Non-reaping rustix `waitid(EXITED | NOHANG | NOWAIT)` reserves the leader's identity
 until the final destructive signal. Signal authority is permanently revoked before
 std `try_wait` may reap, including on error/Drop paths. `ECHILD` revokes authority
-rather than risking a recycled PID. The host must not concurrently reap these
-children or configure SIGCHLD auto-reaping. After reaping, zombies or PGID recycling
+rather than risking a recycled PID. Every destructive signal attempt, including
+EINTR retries, rechecks the current host group rather than trusting the launch-time
+comparison. If job control moves the host into the saved group, signaling is rejected
+and authority stays revoked even after the host leaves. These preflight checks are
+not an atomic exclusion against concurrent host job-control changes.
+The host must not concurrently reap these children or configure SIGCHLD auto-reaping.
+After reaping, zombies or PGID recycling
 may prevent proving group absence: the conservative result is an error, never
 another destructive signal. Once absence has been observed it is retained, not
 re-probed against a potentially recycled PGID while reaping or capture settles.
@@ -155,7 +163,14 @@ stale selector's zero-test success from masquerading as execution. Independent f
 watchdogs use Unix sockets so a live group member signals its own group, not a saved,
 potentially recycled PGID. Outer guards bound direct-host reaping, and the forced
 watchdog-failure scenario runs under another independent process. Rescue must not
-rely solely on the supervisor under test.
+rely solely on the supervisor under test. Descendant checks establish watchdog-socket
+EOF independently of the supervisor: orphan zombies can keep a group observable
+without holding a live fixture connection. They accept cleanup uncertainty only with
+a reaped child, both capture EOFs, no stage failures and the expected cause, then
+require every fixture connection to close. Socket EOF is not proof of group absence;
+normal reports still require that stricter fact. Rescue shuts down only the socket's
+write half so local read shutdown cannot fabricate fixture EOF. Isolated fixture
+HOME/XDG directories remain present through the outer guard's death checks and rescue.
 
 `supervision_preserves_host_group_and_unmanaged_child_waits` supplies **indirect**
 SIGCHLD/reaper-isolation evidence: the host group is unchanged and an unrelated child
@@ -173,7 +188,7 @@ mod process;
 mod result;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub use driver::{RunningProcess, spawn};
+pub use driver::RunningProcess;
 pub use options::{OptionsError, ProcessOptions, ProcessSpec};
 pub use result::{
     Capture, Completion, Interruption, InterruptionReason, PartialState, ProcessError,

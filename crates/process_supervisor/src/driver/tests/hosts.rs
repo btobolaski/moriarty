@@ -7,7 +7,7 @@ use std::{
 
 use rustix::{
     io::Errno,
-    process::{Pid, WaitId, WaitIdOptions, waitid},
+    process::{Pid, WaitId, WaitIdOptions, getpgrp, waitid},
 };
 use tempfile::TempDir;
 use tokio::runtime::Builder;
@@ -28,14 +28,21 @@ fn wait_for_exit(child: &mut Child, budget: Duration) -> io::Result<ExitStatus> 
 }
 
 #[test]
-fn hosts_exit_normally_after_stuck_launch_and_unconfirmed_kill() {
-    for (name, evidence) in [
-        ("driver::tests::hosts::host_stuck_launch", "stuck-launch"),
+fn host_fixtures_exit_normally() {
+    for (name, evidence, group) in [
+        ("driver::tests::hosts::host_stuck_launch", "stuck-launch", 0),
         (
             "driver::tests::hosts::host_unconfirmed_kill",
             "unconfirmed-kill",
+            0,
         ),
-        ("driver::tests::hosts::host_runtime_loss", "runtime-loss"),
+        ("driver::tests::hosts::host_runtime_loss", "runtime-loss", 0),
+        // A group leader cannot join its child's group; this fixture must not lead one.
+        (
+            "process::platform::tests::host_group_change_revokes_signals",
+            "host-group-rejected",
+            getpgrp().as_raw_pid(),
+        ),
     ] {
         let dir = TempDir::new().unwrap();
         let marker = dir.path().join("completed");
@@ -43,10 +50,14 @@ fn hosts_exit_normally_after_stuck_launch_and_unconfirmed_kill() {
         command
             .args(["--ignored", "--exact", name, "--nocapture"])
             .env("SUPERVISOR_HOST_COMPLETED", &marker)
+            .env("HOME", dir.path())
+            .env("XDG_CONFIG_HOME", dir.path().join("config"))
+            .env("XDG_STATE_HOME", dir.path().join("state"))
+            .env("XDG_CACHE_HOME", dir.path().join("cache"))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
-            .process_group(0);
+            .process_group(group);
         // These fixtures create only independently exiting 50 ms children (or stall
         // before creation). Rescue uses std directly, not the Owner under test.
         let mut host = command.spawn().unwrap();
@@ -142,14 +153,17 @@ fn host_runtime_loss() {
 fn host_stuck_launch() {
     let runtime = Builder::new_current_thread().enable_all().build().unwrap();
     runtime.block_on(async {
-        let error = returned_error(Hooks {
-            before_spawn: Some(Box::new(|_| {
-                loop {
-                    thread::park();
-                }
-            })),
-            ..Hooks::default()
-        })
+        let error = returned_error(
+            options().with_startup_timeout(SHORT_STARTUP),
+            Hooks {
+                before_spawn: Some(Box::new(|_| {
+                    loop {
+                        thread::park();
+                    }
+                })),
+                ..Hooks::default()
+            },
+        )
         .await;
         assert!(error.partial().launch_unconfirmed);
     });

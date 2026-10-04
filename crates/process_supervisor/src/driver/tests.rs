@@ -38,9 +38,11 @@ fn spec() -> ProcessSpec {
     }
 }
 
+const SHORT_STARTUP: Duration = Duration::from_millis(100);
+
 fn options() -> ProcessOptions {
     ProcessOptions::default()
-        .with_startup_timeout(Duration::from_millis(100))
+        .with_startup_timeout(Duration::MAX)
         .with_cleanup_graces(Duration::from_millis(30), Duration::from_secs(1))
 }
 
@@ -48,8 +50,8 @@ async fn within<T>(future: impl Future<Output = T>) -> T {
     timeout(Duration::from_secs(5), future).await.unwrap()
 }
 
-async fn returned_error(hooks: Hooks) -> ProcessError {
-    let error = within(spawn_with(spec(), options(), hooks))
+async fn returned_error(options: ProcessOptions, hooks: Hooks) -> ProcessError {
+    let error = within(spawn_with(spec(), options, hooks))
         .await
         .err()
         .expect("expected failure");
@@ -64,36 +66,38 @@ async fn model() -> Driver {
     let mut state = PartialState::default();
     let mut hooks = Hooks::default();
     let start = Instant::now();
-    let permit = launch::admit(&options, &token, start, &mut state, &mut hooks)
+    let permit = launch::admit(&options, &token, start, &mut hooks)
         .await
         .unwrap();
-    let owner =
+    let mut owner =
         match launch::launch(spec(), &options, &token, start, &mut state, permit, hooks).await {
             LaunchOutcome::Ready(owner) => owner,
             _ => panic!("fixture launch failed"),
         };
     state.child_id = Some(owner.id());
+    let mut stdout = Stream::allocate(32).unwrap();
+    let mut stderr = Stream::allocate(32).unwrap();
+    setup_pipes(&mut owner, &mut stdout, &mut stderr).unwrap();
     let mut driver = Driver {
         owner,
         state,
-        stdout: Stream::allocate(32).unwrap(),
-        stderr: Stream::allocate(32).unwrap(),
+        stdout,
+        stderr,
         phase: Phase::Running(Instant::now()),
     };
-    driver.setup_pipes().unwrap();
     within(async {
         while !driver.owner.observe().unwrap() {
             sleep(POLL).await;
         }
-        while driver.stdout.reader.is_some() {
+        while driver.stdout.is_open() {
             driver.stdout.read().await.unwrap();
         }
-        while driver.stderr.reader.is_some() {
+        while driver.stderr.is_open() {
             driver.stderr.read().await.unwrap();
         }
     })
     .await;
-    assert_contains(&driver.stdout.capture.bytes, b"fixture-body");
+    assert_contains(&driver.stdout.bytes, b"fixture-body");
     driver.owner.ops().trace_handle().clear();
     driver
 }
