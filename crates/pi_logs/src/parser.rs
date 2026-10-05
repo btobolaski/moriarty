@@ -715,9 +715,12 @@ pub struct NestedToolCall {
 }
 
 /// Size-limit omission metadata cannot coexist with the arguments it replaces.
+/// Arguments are the model-emitted JSON, which is not validated tool-side and
+/// is therefore not always an object (a failed call can carry a bare string);
+/// nothing downstream reads the payload, so it stays opaque.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum NestedCallArguments {
-    Inline(BTreeMap<String, JsonBlob>),
+    Inline(JsonBlob),
     Omitted { arguments_bytes: u64 },
 }
 
@@ -728,7 +731,7 @@ struct RawNestedToolCall {
     name: String,
     status: NestedToolCallStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
-    arguments: Option<BTreeMap<String, JsonBlob>>,
+    arguments: Option<JsonBlob>,
     #[serde(skip_serializing_if = "Option::is_none")]
     arguments_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]

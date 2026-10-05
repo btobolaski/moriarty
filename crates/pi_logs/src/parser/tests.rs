@@ -3834,7 +3834,8 @@ fn tool_result_preserves_nested_calls() {
     let nested = json!({"calls": [
         {"id": "call_1/1", "name": "read", "status": "ok", "arguments": {"path": "src/lib.rs"}, "durationMs": 12},
         {"id": "call_1/2", "name": "bash", "status": "error", "argumentsBytes": 2048, "error": "Failed"},
-        {"id": "call_1/3", "name": "read", "status": "unfinished"}
+        {"id": "call_1/3", "name": "ls", "status": "error", "arguments": "crates", "durationMs": 2, "error": "Validation failed"},
+        {"id": "call_1/4", "name": "read", "status": "unfinished"}
     ], "complete": false});
     let mut value = tool_result_message_json("codemode", vec![], false, None);
     value["message"]["nestedCalls"] = nested.clone();

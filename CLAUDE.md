@@ -282,7 +282,9 @@ with warnings, while explicit missing paths and having no available source are e
   hides it, otherwise only its content changes. They do not revise the original response's billable usage, so
   `cost_analyzer` treats them as non-billable metadata
 - Assistant `thinkingLevel` is optional and reuses the strict `ThinkingLevel` enum. Tool-result `nestedCalls` keeps
-  core nested-call statuses and omission metadata typed; it is execution metadata, not another billable response
+  core nested-call statuses and omission metadata typed, while call arguments stay an opaque `JsonBlob` because a
+  failed call can carry a bare-string argument (the model-emitted JSON is not validated tool-side); it is execution
+  metadata, not another billable response
 - `codemode` details preserve extension-owned call breadcrumbs (including JSON-string arguments and fractional
   durations) separately from core `nestedCalls`, with optional `fullOutputPath` for spilled output. Empty success
   details use the shared empty-details variant. The `codemode-store` custom payload preserves caller-defined values
