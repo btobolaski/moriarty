@@ -495,9 +495,14 @@ mod platform {
                         );
                     }
                     "kill" => {
-                        owner
+                        let error = owner
                             .final_kill()
                             .expect_err("KILL must reject the current host group");
+                        assert_eq!(error.stage, Stage::Observation);
+                        assert_eq!(
+                            error.source.to_string(),
+                            "invalid or host process-group identity"
+                        );
                     }
                     _ => {}
                 }

@@ -12,6 +12,10 @@
 //! 4. The verified program path is spawned, never the raw `command[0]`, so an unapproved local
 //!    copy cannot shadow the approved binary
 //!
+//! Supervision bounds each raw capture at 1 MiB without imposing an execution deadline.
+//! Lossy text may expand; each truncated stream is disclosed without altering exit-based success.
+//! Request/CLI owners retain completion through cancellation and normal shutdown.
+//!
 //! # Usage
 //!
 //! ```no_run
@@ -37,10 +41,13 @@ use std::{
 
 use futures::stream::{self, StreamExt};
 use miette::{Context, IntoDiagnostic};
-use tokio::process::Command;
 
 use super::{ItemType, ProjectApprovals, ProjectConfig, VerificationResult, load_project_settings};
-use crate::repository::{detect_repository_root, detect_workspace_root};
+use crate::{
+    execution,
+    repository::{RepositoryRoot, WorkspaceRoot, detect_repository_root, detect_workspace_root},
+};
+use process_supervisor::ProcessSpec;
 
 /// Maximum number of commands to run concurrently.
 ///
@@ -97,10 +104,10 @@ pub async fn verify_and_load_project(project_dir: PathBuf) -> miette::Result<Ver
         .into_diagnostic()
         .with_context(|| format!("Failed to canonicalize path: {}", project_dir.display()))?;
 
-    let repository_root = detect_repository_root(&canonical_dir)?;
-    let workspace_root = detect_workspace_root(&canonical_dir)?;
+    let repository_root = detect_repository_root(&canonical_dir).await?;
+    let workspace_root = detect_workspace_root(&canonical_dir).await?;
 
-    let settings = load_project_settings(workspace_root.clone()).await?;
+    let settings = load_project_settings(workspace_root.as_path().to_path_buf()).await?;
 
     let approvals = ProjectApprovals::load()
         .await
@@ -182,8 +189,8 @@ fn handle_verification_result(
 /// of items where some are approved and others are not.
 async fn verify_all_commands(
     approvals: &ProjectApprovals,
-    repository_root: &Path,
-    workspace_root: &Path,
+    repository_root: &RepositoryRoot,
+    workspace_root: &WorkspaceRoot,
     settings: &ProjectConfig,
 ) -> miette::Result<(HashMap<String, PathBuf>, HashMap<String, PathBuf>)> {
     let all_commands = settings.commands.all();
@@ -194,8 +201,11 @@ async fn verify_all_commands(
             .await
             .with_context(|| format!("Failed to verify command '{}'", command_name))?;
 
-        let program =
-            handle_verification_result(verification_result, ItemType::Command, workspace_root)?;
+        let program = handle_verification_result(
+            verification_result,
+            ItemType::Command,
+            workspace_root.as_path(),
+        )?;
         resolved_commands.insert(command_name.clone(), program);
     }
 
@@ -207,8 +217,11 @@ async fn verify_all_commands(
             .await
             .with_context(|| format!("Failed to verify check '{}'", check.name))?;
 
-        let program =
-            handle_verification_result(verification_result, ItemType::Check, workspace_root)?;
+        let program = handle_verification_result(
+            verification_result,
+            ItemType::Check,
+            workspace_root.as_path(),
+        )?;
         resolved_checks.insert(check.name.clone(), program);
     }
 
@@ -397,22 +410,22 @@ impl VerifiedProject {
             .split_first()
             .expect("invariant: verify_all_commands ensures non-empty before execution");
 
-        let output = Command::new(program)
-            .args(args)
-            .current_dir(canonical_dir)
-            .output()
-            .await
-            .into_diagnostic()
-            .with_context(|| format!("Failed to execute command '{}'", name))?;
+        let output = execution::execute(ProcessSpec {
+            program: program.as_os_str().to_owned(),
+            args: args.iter().map(Into::into).collect(),
+            cwd: Some(canonical_dir.to_path_buf()),
+        })
+        .await
+        .with_context(|| format!("Failed to execute command '{}'", name))?;
 
-        // Use lossy UTF-8 conversion to handle potentially invalid encodings
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let status = execution::exited(&output)?;
+        let stdout = execution::present(&output.stdout, None);
+        let stderr = execution::present(&output.stderr, None);
 
         Ok(CommandOutput {
             name: name.to_string(),
             command: command.to_vec(),
-            exit_code: output.status.code(),
+            exit_code: status.code(),
             stdout,
             stderr,
         })
@@ -421,14 +434,18 @@ impl VerifiedProject {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, os::unix::process::ExitStatusExt, process::ExitStatus};
+
     use tempfile::TempDir;
 
     use super::*;
     use crate::project_config::approvals;
     use crate::test_helpers::{
-        assert_workspace_local_copy_ran, setup_isolated_xdg_config,
+        assert_workspace_local_copy_ran, create_executable_script, setup_isolated_xdg_config,
         setup_jj_main_and_secondary_workspace, setup_project_dir_with_config as setup_test_project,
+        test_report,
     };
+    use process_supervisor::Completion;
 
     async fn setup_test_project_with_approvals(config_content: &str) -> (TempDir, TempDir) {
         let xdg_dir = setup_isolated_xdg_config();
@@ -500,6 +517,23 @@ lint = ["echo", "lint"]
             "Should fail on path canonicalization: {}",
             err_msg
         );
+    }
+
+    #[tokio::test]
+    async fn truncation_is_presented_without_changing_exit_success() {
+        let (_xdg, _directory, project) =
+            approved_project("[commands]\nlint = [\"echo\", \"ok\"]").await;
+        let mut report = test_report(Completion::Exited(ExitStatus::from_raw(0)));
+        report.stdout.bytes = b"retained".to_vec();
+        report.stdout.truncated = true;
+        report.stderr.bytes = vec![0xff];
+        report.stderr.truncated = true;
+        let output = execution::test_seams::with_result(Ok(report), project.run_command("lint"))
+            .await
+            .unwrap();
+        assert_eq!(output.exit_code, Some(0));
+        assert_eq!(output.stdout, "retained\n[output truncated]");
+        assert_eq!(output.stderr, "�\n[output truncated]");
     }
 
     #[tokio::test]
@@ -682,9 +716,7 @@ format = ["echo", "format"]
 
     #[tokio::test]
     async fn approved_secondary_workspace_runs_its_own_config_and_copy() {
-        // Once the workspace's own config + binary are approved, it runs its own ./tool.sh (not
-        // main's) under its own tools.toml (the "evil" check, not main's "where"), with the
-        // workspace as cwd.
+        // A nested shadow must not replace the approved program, but CLI work keeps caller cwd.
         let _xdg = setup_isolated_xdg_config();
         let (_base, _main, workspace) =
             setup_jj_main_and_secondary_workspace(DIVERGENT_MAIN_CONFIG, "tool.sh", false);
@@ -697,16 +729,21 @@ format = ["echo", "format"]
         approvals::approve_project_config(&workspace, DIVERGENT_WORKSPACE_CONFIG)
             .await
             .unwrap();
-        let project = verify_and_load_project(workspace.clone())
-            .await
-            .expect("workspace should verify against its own approved config");
-        assert_eq!(
-            project.settings.checks.as_ref().unwrap()[0].name,
-            "evil",
-            "settings must come from the workspace's own tools.toml"
-        );
-        let out = project.run_command("test").await.unwrap();
-        assert_workspace_local_copy_ran(&out.stdout, &workspace);
+        let nested = workspace.join("nested");
+        fs::create_dir(&nested).unwrap();
+        create_executable_script(&nested.join("tool.sh"), "echo shadow-copy\npwd -P");
+        for caller in [&workspace, &nested] {
+            let project = verify_and_load_project(caller.clone()).await.unwrap();
+            assert_eq!(project.settings.checks.as_ref().unwrap()[0].name, "evil");
+            let command = project.run_command("test").await.unwrap();
+            let checks = project.run_all_checks().await.unwrap();
+            for output in [&command, &checks[0]] {
+                assert_workspace_local_copy_ran(&output.stdout, &workspace);
+                assert!(!output.stdout.contains("shadow-copy"));
+                let cwd = caller.canonicalize().unwrap();
+                assert_eq!(output.stdout.lines().last(), cwd.to_str());
+            }
+        }
     }
 
     #[tokio::test]

@@ -33,7 +33,51 @@ very likely to have a rule allow the agent to write tests without manual approva
 test to do the thing that it wants to do and then the rules do not provide protection. It is better to think of the
 rules as guidance on what the agent is allowed to do.
 
+## Process execution
+
+On Linux/macOS, project commands, checks, read-only git/jj tools, and git root-discovery probes use the trusted
+`process_supervisor` lifecycle. They inherit the environment, pass literal arguments, and use null stdin. Approved
+program spelling and each entry point's existing cwd policy are preserved. This is not a security sandbox.
+
+- **Bounded captures (breaking change):** at most 1 MiB of raw bytes per stdout/stderr stream. Project/check reports
+  disclose truncation; VCS tools and root discovery reject incomplete output. Lossy UTF-8 conversion can expand retained
+  text. Truncation alone does not fail an otherwise successful project command/check.
+- **Budgets:** 5 s startup, no new execution deadline for project commands, CLI checks, or VCS tools, and separate 2 s
+  TERM / 1 s post-KILL cleanup budgets. Stop-hook/MCP checks keep four-way concurrency, a five-minute whole-batch
+  deadline including queueing/startup after verification, and a 10 MiB aggregate formatted-output gate. Rejection stops
+  queued work and cancels/awaits active work; cleanup may extend past the five-minute execution allowance.
+- **Cancellation:** existing MCP `notifications/cancelled` affects only its request. Admission and startup inspect
+  cancellation even inside a work poll; already-started work retains its awaited owner. Disconnect, transport failure,
+  and graceful SIGINT/SIGTERM close admission, cancel affected work, and await settlement before normal runtime exit,
+  subject to the blocked-stdout limitation below. MCP/hook hosts exit after that drain even with stdin held open; hook
+  reads yield to cancellation, and only these hosts use Tokio background runtime shutdown to avoid joining uncancellable
+  input reads. MCP stalled response writes, flushes, and transport closure wake on cancellation without resumed peer
+  reads; owned work still drains and partial delivery is a host failure. Approval-lock waiting is cancellable; admitted
+  load-modify-save transactions retain their lock and actual I/O through caller loss and host drain (not rollback). With
+  a live runtime, contained work-future panics still cancel and await admitted work. Retained failures keep safe write
+  context and available I/O causes; combined initiating/cleanup errors preserve their contextual sources without
+  exposing captured child output. Only genuine approval-file absence initializes an empty store; malformed/unreadable
+  stores remain errors and are not overwritten by an update. Approval initialization restores the terminal on errors or
+  interruption. Startup creation/late cleanup can remain uncertain; SIGKILL/crash containment is not guaranteed.
+  Git/root-resolution failures after the canonical-input snapshot fail closed, never becoming an alternate approval key
+  or successful no-checks result; initial missing-input setup keeps its existing no-checks behavior. Git PATH entries
+  (including relative/empty entries) use the probe cwd; unset PATH uses native executable-search defaults without an
+  environment override. Known English non-repository and filesystem-boundary diagnostics allow ordinary fallback;
+  translated or unknown wording fails closed even for a standalone project. Root whitespace is preserved; non-UTF-8
+  repository/workspace and original/canonical executable approval identities are rejected before lookup/save without
+  changing the approval format or verified program spelling. Named empty-argv errors and safe diagnostic cause chains
+  exclude captured child output.
+- **Blocked-stdout limitation (owner-accepted):** stdout from `moriarty hooks exec`, `moriarty test checks`, and
+  `moriarty test project-tools` remains blocking. A full, unread output pipe can prevent cooperative signal shutdown and
+  require SIGKILL; no output-write timeout or graceful signal exit is promised in that condition. This exception does
+  not apply to MCP transport shutdown or relax cancellation/admission and owned-work settlement obligations. Forceful
+  termination proves neither owned-child cleanup nor completed approval persistence.
+- **Compatibility:** MCP remains capped at 2025-11-25, supporting 2024-11-05, 2025-03-26, 2025-06-18, and 2025-11-25
+  without task-management APIs. `moriarty mcp install` is excluded and retains inherited terminal streams and behavior.
+
 ## Requirements
+
+Moriarty requires Linux or macOS; the entire binary depends on the platform-specific process supervisor.
 
 ### Testing
 
@@ -52,6 +96,10 @@ To install `cargo nextest`:
 ```bash
 cargo install cargo-nextest
 ```
+
+Process-group safety, signal escalation, reaping, and pipe-draining guarantees are tested in `process_supervisor`;
+Moriarty tests verify authorization, caller output policies, cancellation routing, and awaited ownership at that
+boundary.
 
 ## Development
 

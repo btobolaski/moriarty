@@ -9,8 +9,9 @@
 //! the files that were actually edited.
 
 use std::{
+    env,
     path::{Path, PathBuf},
-    process::Command,
+    str,
 };
 
 #[cfg(test)]
@@ -18,6 +19,56 @@ use std::fs;
 
 use miette::{IntoDiagnostic, WrapErr};
 use tracing::{debug, info};
+use which::{Error as WhichError, which_in};
+
+use crate::execution;
+use process_supervisor::{ProcessReport, ProcessSpec};
+
+/// Workspace identity must not silently substitute for the shared approval key.
+/// UTF-8 storage enforces representability without repeat preflights at lookup/save boundaries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceRoot(String);
+
+impl WorkspaceRoot {
+    fn new(path: PathBuf) -> miette::Result<Self> {
+        path.into_os_string().into_string().map(Self).map_err(|_| {
+            execution::interrupted(
+                "Non-UTF-8 filesystem identity cannot be represented by the approval format",
+            )
+        })
+    }
+
+    /// Borrows the validated working-copy root for path operations. Keep the typed identity at
+    /// approval boundaries so a workspace path cannot stand in for the shared repository root.
+    pub fn as_path(&self) -> &Path {
+        Path::new(&self.0)
+    }
+}
+
+/// Shared approval identity must not silently substitute for an execution workspace.
+/// A String cannot carry an unrepresentable key or require lossy conversion at approval lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryRoot(String);
+
+impl RepositoryRoot {
+    fn new(path: PathBuf) -> miette::Result<Self> {
+        path.into_os_string().into_string().map(Self).map_err(|_| {
+            execution::interrupted(
+                "Non-UTF-8 filesystem identity cannot be represented by the approval format",
+            )
+        })
+    }
+
+    /// Borrows the validated shared root for path operations. Keep the typed identity at approval
+    /// boundaries rather than letting a working-copy path become an approval-storage key.
+    pub fn as_path(&self) -> &Path {
+        Path::new(&self.0)
+    }
+
+    pub(crate) fn as_key(&self) -> &str {
+        &self.0
+    }
+}
 
 /// Detects the repository root directory for the given path.
 ///
@@ -33,34 +84,38 @@ use tracing::{debug, info};
 /// use std::path::Path;
 /// use moriarty::repository::detect_repository_root;
 ///
-/// let root = detect_repository_root(Path::new("/workspace/src/project"))?;
+/// # async fn example() -> miette::Result<()> {
+/// let root = detect_repository_root(Path::new("/workspace/src/project")).await?;
 /// // In a jj workspace: /workspace/src
 /// // In a git repo: /workspace
 /// // Not in repo: /workspace/src/project (canonicalized)
+/// # Ok(())
+/// # }
 /// ```
-pub fn detect_repository_root(path: &Path) -> miette::Result<PathBuf> {
+pub async fn detect_repository_root(path: &Path) -> miette::Result<RepositoryRoot> {
     info!(path = %path.display(), "Detecting repository root");
-
-    if let Some(jj_root) = try_jj_workspace_root(path) {
-        info!(root = %jj_root.display(), "Detected jj workspace root");
-        return Ok(jj_root);
-    }
-
-    if let Some(git_root) = try_git_repository_root(path) {
-        info!(root = %git_root.display(), "Detected git repository root");
-        return Ok(git_root);
-    }
-
     let canonical = path
         .canonicalize()
         .into_diagnostic()
-        .wrap_err_with(|| format!("Failed to canonicalize path: {}", path.display()))?;
+        .wrap_err_with(|| format!("Failed to canonicalize path: {}", path.display()));
+
+    // A missing descendant can still identify its jj store; only git needs a canonical cwd.
+    if let Some(jj_root) = try_jj_workspace_root(canonical.as_deref().unwrap_or(path)) {
+        info!(root = %jj_root.display(), "Detected jj workspace root");
+        return RepositoryRoot::new(jj_root);
+    }
+    let canonical = canonical?;
+
+    if let Some(git_root) = try_git_repository_root(&canonical).await? {
+        info!(root = %git_root.display(), "Detected git repository root");
+        return RepositoryRoot::new(git_root);
+    }
 
     info!(
         root = %canonical.display(),
         "Not in a repository, using canonicalized path as root"
     );
-    Ok(canonical)
+    RepositoryRoot::new(canonical)
 }
 
 /// Detects the root of the workspace containing `path` — the working copy
@@ -82,7 +137,7 @@ pub fn detect_repository_root(path: &Path) -> miette::Result<PathBuf> {
 ///
 /// The input is canonicalized before the jj walk so the returned root is
 /// canonical too (the walk returns an ancestor of its starting path verbatim).
-pub fn detect_workspace_root(path: &Path) -> miette::Result<PathBuf> {
+pub async fn detect_workspace_root(path: &Path) -> miette::Result<WorkspaceRoot> {
     info!(path = %path.display(), "Detecting workspace root");
 
     let canonical = path
@@ -92,19 +147,19 @@ pub fn detect_workspace_root(path: &Path) -> miette::Result<PathBuf> {
 
     if let Some(root) = nearest_jj_workspace_dir(&canonical) {
         info!(root = %root.display(), "Detected jj workspace directory");
-        return Ok(root);
+        return WorkspaceRoot::new(root);
     }
 
-    if let Some(root) = try_git_worktree_root(&canonical) {
+    if let Some(root) = try_git_worktree_root(&canonical).await? {
         info!(root = %root.display(), "Detected git worktree root");
-        return Ok(root);
+        return WorkspaceRoot::new(root);
     }
 
     info!(
         root = %canonical.display(),
         "Not in a repository, using canonicalized path as workspace root"
     );
-    Ok(canonical)
+    WorkspaceRoot::new(canonical)
 }
 
 /// Walks up from `path` to the nearest directory containing a `.jj/repo`
@@ -125,49 +180,14 @@ fn nearest_jj_workspace_dir(path: &Path) -> Option<PathBuf> {
 /// Attempts to detect the current git worktree's root via
 /// `git rev-parse --show-toplevel`, which stays inside the worktree instead of
 /// following it back to the shared repository like `--git-common-dir` does.
-fn try_git_worktree_root(path: &Path) -> Option<PathBuf> {
-    debug!(path = %path.display(), "Attempting git worktree root detection");
-
-    let output = Command::new("git")
-        .arg("rev-parse")
-        .arg("--show-toplevel")
-        .current_dir(path)
-        .output();
-
-    match output {
-        Ok(output) if output.status.success() => {
-            let toplevel_str = String::from_utf8_lossy(&output.stdout);
-            let toplevel = Path::new(toplevel_str.trim());
-
-            match toplevel.canonicalize() {
-                Ok(root) => {
-                    debug!(root = %root.display(), "Successfully detected git worktree root");
-                    Some(root)
-                }
-                Err(e) => {
-                    debug!(
-                        error = %e,
-                        toplevel = %toplevel.display(),
-                        "Failed to canonicalize git worktree root"
-                    );
-                    None
-                }
-            }
-        }
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            debug!(
-                exit_code = output.status.code(),
-                stderr = %stderr,
-                "git rev-parse --show-toplevel failed"
-            );
-            None
-        }
-        Err(e) => {
-            debug!(error = %e, "Failed to execute git command (may not be installed)");
-            None
-        }
-    }
+async fn try_git_worktree_root(path: &Path) -> miette::Result<Option<PathBuf>> {
+    let Some(output) = git_probe(path, "--show-toplevel").await? else {
+        return Ok(None);
+    };
+    let toplevel = git_root_path(&output)?;
+    toplevel.canonicalize().map(Some).map_err(|error| {
+        execution::interrupted(format!("Failed to resolve Git workspace root: {error}"))
+    })
 }
 
 /// Attempts to detect jujutsu repository root: the nearest workspace's
@@ -272,102 +292,410 @@ fn store_root(store: &Path) -> Option<PathBuf> {
 /// Uses `git rev-parse --git-common-dir` to find the common git directory,
 /// which works correctly for both regular repos and worktrees. The common dir
 /// is the `.git` directory of the main repository, and its parent is the repo root.
-fn try_git_repository_root(path: &Path) -> Option<PathBuf> {
-    debug!(path = %path.display(), "Attempting git repository root detection");
+async fn try_git_repository_root(path: &Path) -> miette::Result<Option<PathBuf>> {
+    let Some(output) = git_probe(path, "--git-common-dir").await? else {
+        return Ok(None);
+    };
+    let common = git_root_path(&output)?;
+    let common = if common.is_absolute() {
+        common
+    } else {
+        path.join(common)
+    };
+    let common = common.canonicalize().map_err(|error| {
+        execution::interrupted(format!("Failed to resolve Git common directory: {error}"))
+    })?;
+    common
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| execution::interrupted("Git common directory has no repository parent"))
+        .map(Some)
+}
 
-    let output = Command::new("git")
-        .arg("rev-parse")
-        .arg("--git-common-dir")
-        .current_dir(path)
-        .output();
+fn git_root_path(output: &ProcessReport) -> miette::Result<PathBuf> {
+    let bytes = output.stdout.bytes.strip_suffix(b"\n").ok_or_else(|| {
+        execution::interrupted("Git root output is missing its newline terminator")
+    })?;
+    let text = str::from_utf8(bytes)
+        .map_err(|error| execution::interrupted(format!("Non-UTF-8 Git root identity: {error}")))?;
+    if text.is_empty() {
+        return Err(execution::interrupted(
+            "Git returned an empty root identity",
+        ));
+    }
+    Ok(text.into())
+}
 
-    match output {
-        Ok(output) if output.status.success() => {
-            let git_common_dir_str = String::from_utf8_lossy(&output.stdout);
-            let git_common_dir = PathBuf::from(git_common_dir_str.trim());
-
-            // --git-common-dir can return a relative or absolute path
-            // Resolve relative paths relative to the current directory
-            let git_common_dir = if git_common_dir.is_absolute() {
-                git_common_dir
-            } else {
-                path.join(git_common_dir)
-            };
-
-            // Canonicalize and get parent (repository root)
-            match git_common_dir.canonicalize() {
-                Ok(canonical_git_dir) => match canonical_git_dir.parent() {
-                    Some(root) => {
-                        debug!(root = %root.display(), "Successfully detected git repository root");
-                        Some(root.to_path_buf())
+// The entry point owns the canonical cwd; revalidating here would observe later filesystem state.
+// Ordinary absence may fall back; incomplete execution must not invent an approval key.
+async fn git_probe(canonical: &Path, flag: &str) -> miette::Result<Option<ProcessReport>> {
+    let program = match env::var_os("PATH") {
+        Some(paths) => {
+            let mut program = None;
+            // which checks relative PATH entries against the host cwd; native launch uses the child cwd.
+            for directory in env::split_paths(&paths) {
+                let candidate = canonical.join(directory).join("git");
+                match which_in(candidate, Some(""), canonical) {
+                    Ok(found) => {
+                        program = Some(found);
+                        break;
                     }
-                    None => {
-                        debug!(
-                            git_dir = %canonical_git_dir.display(),
-                            "Git common dir has no parent"
-                        );
-                        None
+                    Err(WhichError::CannotFindBinaryPath) => {}
+                    Err(error) => {
+                        return Err(execution::interrupted(format!(
+                            "Failed to locate Git: {error}"
+                        )));
                     }
-                },
-                Err(e) => {
-                    debug!(
-                        error = %e,
-                        git_common_dir = %git_common_dir.display(),
-                        "Failed to canonicalize git common dir"
-                    );
-                    None
                 }
             }
+            let Some(program) = program else {
+                return Ok(None);
+            };
+            program
         }
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            debug!(
-                exit_code = output.status.code(),
-                stderr = %stderr,
-                "git rev-parse command failed"
-            );
-            None
-        }
-        Err(e) => {
-            debug!(error = %e, "Failed to execute git command (may not be installed)");
-            None
-        }
+        // libc owns unset-PATH defaults; guessing them would diverge across platforms/builds.
+        None => PathBuf::from("git"),
+    };
+    // A spawn NotFound can mean the recorded cwd vanished, not that Git is unavailable.
+    let output = execution::execute(ProcessSpec {
+        program: program.into(),
+        args: vec!["rev-parse".into(), flag.into()],
+        cwd: Some(canonical.to_path_buf()),
+    })
+    .await?;
+    let status = execution::complete_output(&output)?;
+    // Pin both English absence forms; unknown wording/locale still cannot grant another root.
+    if status.success() {
+        Ok(Some(output))
+    } else if status.code() == Some(128)
+        && output.stdout.bytes.is_empty()
+        && (output.stderr.bytes == b"fatal: not a git repository (or any of the parent directories): .git\n"
+            || output.stderr.bytes
+                .strip_prefix(b"fatal: not a git repository (or any parent up to mount point ")
+                .and_then(|rest| rest.strip_suffix(b")\nStopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).\n"))
+                .is_some_and(|mount| mount.starts_with(b"/")))
+    {
+        Ok(None)
+    } else {
+        Err(execution::interrupted(format!(
+            "Git root discovery ({flag}) failed with {status}"
+        )))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::env;
+    use std::{
+        env,
+        ffi::OsString,
+        future::ready,
+        os::unix::{ffi::OsStringExt, fs::symlink, process::ExitStatusExt},
+        process::ExitStatus,
+    };
 
     use tempfile::TempDir;
 
     use super::*;
-    use crate::test_helpers::{run_git_command, setup_git_repo_with_commit};
+    use crate::{
+        project_config::{approvals::ProjectApprovals, config::ProjectConfig},
+        test_helpers::{TestEnvVarGuard, run_git_command, setup_git_repo_with_commit, test_report},
+    };
+    use process_supervisor::{Completion, ProcessError, ProcessOptions, RunningProcess};
 
-    #[test]
-    fn test_detect_non_repository() -> miette::Result<()> {
+    impl WorkspaceRoot {
+        pub(crate) fn for_test(path: PathBuf) -> Self {
+            Self::new(path).expect("test root must be UTF-8")
+        }
+    }
+
+    #[tokio::test]
+    async fn whitespace_root_identity_survives_nested_discovery() {
+        let directory = TempDir::new().unwrap();
+        for name in [" leading and trailing ", "newline\n"] {
+            let root = directory.path().join(name);
+            fs::create_dir(&root).unwrap();
+            setup_git_repo_with_commit(&root);
+            let nested = root.join("nested");
+            fs::create_dir(&nested).unwrap();
+            let expected = root.canonicalize().unwrap();
+            assert_eq!(
+                detect_workspace_root(&nested).await.unwrap().as_path(),
+                expected
+            );
+            assert_eq!(
+                detect_repository_root(&nested).await.unwrap().as_path(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn non_utf8_roots_never_share_approval_keys() {
+        let directory = TempDir::new().unwrap();
+        let first = directory
+            .path()
+            .join(OsString::from_vec(b"project\xff".to_vec()));
+        let second = directory
+            .path()
+            .join(OsString::from_vec(b"project\xfe".to_vec()));
+        assert_ne!(first, second);
+        assert_eq!(first.to_string_lossy(), second.to_string_lossy());
+        let config: ProjectConfig =
+            toml::from_str("[commands]\nlint = [\"echo\", \"ok\"]").unwrap();
+        let mut approvals = ProjectApprovals::default();
+        // Even legacy replacement-character keys must not be consulted by byte-valued callers.
+        approvals
+            .projects
+            .entry(first.to_string_lossy().into_owned())
+            .or_default();
+        for root in [&first, &second] {
+            fs::create_dir(root).unwrap();
+            for repository in [false, true] {
+                let error = if repository {
+                    detect_repository_root(root).await.map(|_| ())
+                } else {
+                    detect_workspace_root(root).await.map(|_| ())
+                }
+                .expect_err("unrepresentable roots must fail discovery");
+                assert!(execution::is_execution_error(&error));
+                assert!(error.to_string().contains("Non-UTF-8"), "{error}");
+            }
+            for (repository, workspace) in [
+                (root.as_path(), directory.path()),
+                (directory.path(), root.as_path()),
+            ] {
+                let roots = WorkspaceRoot::new(workspace.into()).and_then(|workspace| {
+                    RepositoryRoot::new(repository.into()).map(|repository| (repository, workspace))
+                });
+                let error = match roots {
+                    Ok((repository, workspace)) => {
+                        approvals
+                            .verify_project_for_workspace(&repository, &workspace, &config, "lint")
+                            .await
+                    }
+                    Err(error) => Err(error),
+                }
+                .expect_err(
+                    "construction must reject either unrepresentable identity before lookup",
+                );
+                assert!(error.to_string().contains("Non-UTF-8"), "{error}");
+                let error = WorkspaceRoot::new(workspace.into())
+                    .and_then(|workspace| {
+                        RepositoryRoot::new(repository.into()).and_then(|repository| {
+                            approvals.approve_project(
+                                workspace,
+                                repository,
+                                Default::default(),
+                                Default::default(),
+                            )
+                        })
+                    })
+                    .expect_err(
+                        "construction must reject either unrepresentable identity before storage",
+                    );
+                assert!(error.to_string().contains("Non-UTF-8"), "{error}");
+                assert_eq!(
+                    approvals.projects.len(),
+                    1,
+                    "rejection must not mutate storage"
+                );
+            }
+        }
+        let mut report = test_report(Completion::Exited(ExitStatus::from_raw(0)));
+        report.stdout.bytes = first.as_os_str().as_encoded_bytes().to_vec();
+        report.stdout.bytes.push(b'\n');
+        fs::create_dir(first.to_string_lossy().as_ref()).unwrap();
+        let error =
+            execution::test_seams::with_result(Ok(report), detect_workspace_root(directory.path()))
+                .await
+                .expect_err(
+                    "a real replacement-character directory cannot substitute for byte output",
+                );
+        assert!(execution::is_execution_error(&error));
+        assert!(
+            error.to_string().contains("Non-UTF-8 Git root identity"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_probes_never_invent_roots() {
+        let directory = TempDir::new().unwrap();
+        let mut truncated = test_report(Completion::Exited(ExitStatus::from_raw(0)));
+        truncated.stdout.bytes = b"/guessed/root".to_vec();
+        truncated.stdout.truncated = true;
+        let cancelled = test_report(Completion::Cancelled(ExitStatus::from_raw(0)));
+        let startup = Err("Startup interrupted; launch and cleanup unconfirmed");
+        for (outcome, repository, expected) in [
+            (Ok(truncated), true, "Incomplete process output"),
+            (Ok(cancelled), false, "cancelled"),
+            (startup, true, "cleanup unconfirmed"),
+        ] {
+            let discovery = async {
+                if repository {
+                    detect_repository_root(directory.path()).await.map(|_| ())
+                } else {
+                    detect_workspace_root(directory.path()).await.map(|_| ())
+                }
+            };
+            let error = execution::test_seams::with_result(outcome, discovery)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains(expected), "{expected}: {error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unexpected_git_failures_never_invent_roots() {
+        let directory = TempDir::new().unwrap();
+        setup_git_repo_with_commit(directory.path());
+        fs::write(directory.path().join(".git/config"), "[broken\n").unwrap();
+        let nested = directory.path().join("nested");
+        fs::create_dir(&nested).unwrap();
+        for repository in [false, true] {
+            let error = if repository {
+                detect_repository_root(&nested).await.map(|_| ())
+            } else {
+                detect_workspace_root(&nested).await.map(|_| ())
+            }
+            .expect_err("corrupt Git config must not be ordinary absence");
+            assert!(execution::is_execution_error(&error));
+            assert!(error.to_string().contains("Git root discovery"), "{error}");
+        }
+        for flag in ["--show-toplevel", "--git-common-dir"] {
+            let mut report = test_report(Completion::Exited(ExitStatus::from_raw(0)));
+            report.stdout.bytes =
+                format!("{}\n", directory.path().join("missing-root").display()).into_bytes();
+            let error = execution::test_seams::with_result(Ok(report), async {
+                if flag == "--show-toplevel" {
+                    try_git_worktree_root(directory.path()).await
+                } else {
+                    try_git_repository_root(directory.path()).await
+                }
+            })
+            .await
+            .expect_err("unresolvable roots must fail");
+            assert!(execution::is_execution_error(&error));
+            assert!(
+                error.to_string().contains("Failed to resolve Git"),
+                "{error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn vanished_launch_cwd_is_not_missing_git() {
+        let directory = TempDir::new().unwrap();
+        let handler = |spec: ProcessSpec, _| async move {
+            assert!(Path::new(&spec.program).is_file(), "Git is available");
+            fs::remove_dir(spec.cwd.as_ref().unwrap()).unwrap();
+            let running = RunningProcess::spawn(spec, ProcessOptions::default()).await?;
+            running.wait().await
+        };
+        let error = execution::test_seams::with_operations(
+            handler,
+            detect_workspace_root(directory.path()),
+        )
+        .await
+        .expect_err("vanished cwd must be an execution failure");
+        assert!(error.downcast_ref::<ProcessError>().is_some());
+        assert!(execution::is_execution_error(&error));
+        assert!(
+            error.to_string().contains("process start failed"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_input_survives_alias_changes_during_probe() {
+        // Each entry point owns canonicalization independently; either caller can regress before the shared probe.
+        for repository in [false, true] {
+            let directory = TempDir::new().unwrap();
+            let first = directory.path().join("first");
+            let second = directory.path().join("second");
+            let alias = directory.path().join("alias");
+            fs::create_dir(&first).unwrap();
+            fs::create_dir(&second).unwrap();
+            symlink(&first, &alias).unwrap();
+            let canonical = first.canonicalize().unwrap();
+            let expected = canonical.clone();
+            let changed_alias = alias.clone();
+            let handler = move |spec: ProcessSpec, _| {
+                assert_eq!(spec.cwd.as_ref(), Some(&expected));
+                fs::remove_file(&changed_alias).unwrap();
+                symlink(&second, &changed_alias).unwrap();
+                let mut report = test_report(Completion::Exited(ExitStatus::from_raw(128 << 8)));
+                report.stderr.bytes =
+                    b"fatal: not a git repository (or any of the parent directories): .git\n"
+                        .to_vec();
+                ready(Ok(report))
+            };
+            let discovery = async {
+                if repository {
+                    detect_repository_root(&alias)
+                        .await
+                        .map(|root| root.as_path().to_path_buf())
+                } else {
+                    detect_workspace_root(&alias)
+                        .await
+                        .map(|root| root.as_path().to_path_buf())
+                }
+            };
+            let root = execution::test_seams::with_operations(handler, discovery)
+                .await
+                .unwrap();
+            assert_eq!(
+                root, canonical,
+                "fallback must use the same canonical input as the probe"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_git_preserves_canonical_fallback() {
+        let directory = TempDir::new().unwrap();
+        let _path = TestEnvVarGuard::set("PATH", "");
+        let expected = directory.path().canonicalize().unwrap();
+        assert_eq!(
+            detect_repository_root(directory.path())
+                .await
+                .unwrap()
+                .as_path(),
+            expected
+        );
+        assert_eq!(
+            detect_workspace_root(directory.path())
+                .await
+                .unwrap()
+                .as_path(),
+            expected
+        );
+    }
+
+    #[tokio::test]
+    async fn test_detect_non_repository() -> miette::Result<()> {
         // Use a temporary directory that's definitely not in a repo
         let temp_dir = env::temp_dir();
-        let root = detect_repository_root(&temp_dir)?;
+        let root = detect_repository_root(&temp_dir).await?;
 
         // Should return canonicalized temp dir
-        assert_eq!(root, temp_dir.canonicalize().into_diagnostic()?);
+        assert_eq!(root.as_path(), temp_dir.canonicalize().into_diagnostic()?);
         Ok(())
     }
 
-    #[test]
-    fn test_detect_git_repository() -> miette::Result<()> {
+    #[tokio::test]
+    async fn test_detect_git_repository() -> miette::Result<()> {
         // Test with current directory (which should be in git or jj)
         let current_dir = env::current_dir().into_diagnostic()?;
-        let root = detect_repository_root(&current_dir)?;
+        let root = detect_repository_root(&current_dir).await?;
 
         // Root should be an absolute path
         // Note: For jj workspaces, root may not be a parent of current_dir
         // since .jj/repo points to the actual repository location
         assert!(
-            root.is_absolute(),
+            root.as_path().is_absolute(),
             "Repository root should be absolute path, got: {}",
-            root.display()
+            root.as_path().display()
         );
         Ok(())
     }
@@ -386,10 +714,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_git_repository_root_not_in_repo() {
+    #[tokio::test]
+    async fn test_git_repository_root_not_in_repo() {
         let temp_dir = env::temp_dir();
-        let result = try_git_repository_root(&temp_dir);
+        let result = try_git_repository_root(&temp_dir).await.unwrap();
 
         // Temp dir should not be in a git repository
         // If this fails, the test environment is unusual (temp inside a repo)
@@ -400,10 +728,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_detect_repository_root_nonexistent_directory() {
+    #[tokio::test]
+    async fn test_detect_repository_root_nonexistent_directory() {
         let fake_path = Path::new("/this/path/definitely/does/not/exist/moriarty-test-12345");
-        let result = detect_repository_root(fake_path);
+        let result = detect_repository_root(fake_path).await;
 
         assert!(
             result.is_err(),
@@ -539,8 +867,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_workspace_root_secondary_workspace() {
+    #[tokio::test]
+    async fn test_workspace_root_secondary_workspace() {
         // The two detectors must disagree in a secondary workspace — the repository root follows
         // the pointer to the main store while the workspace root stays at the directory holding
         // the pointer file — and coincide in the main workspace.
@@ -554,23 +882,28 @@ mod tests {
         std::fs::create_dir_all(&nested).unwrap();
 
         let workspace_root = detect_workspace_root(&nested)
+            .await
             .expect("workspace root should resolve in a secondary workspace");
-        assert_eq!(workspace_root, workspace_dir.canonicalize().unwrap());
+        assert_eq!(
+            workspace_root.as_path(),
+            workspace_dir.canonicalize().unwrap()
+        );
 
         let repository_root = detect_repository_root(&nested)
+            .await
             .expect("repository root should resolve through the pointer");
-        assert_eq!(repository_root, store_root);
-        assert_ne!(workspace_root, repository_root);
+        assert_eq!(repository_root.as_path(), store_root);
+        assert_ne!(workspace_root.as_path(), repository_root.as_path());
 
         assert_eq!(
-            detect_workspace_root(&store_root).unwrap(),
+            detect_workspace_root(&store_root).await.unwrap().as_path(),
             store_root,
             "main workspace: the two roots should coincide"
         );
     }
 
-    #[test]
-    fn test_workspace_root_git_worktree() {
+    #[tokio::test]
+    async fn test_workspace_root_git_worktree() {
         // The git analogue of the secondary-workspace divergence: the
         // repository root follows --git-common-dir back to the main
         // repository, while the workspace root stays at the worktree.
@@ -586,19 +919,21 @@ mod tests {
         std::fs::create_dir_all(&nested).unwrap();
 
         let workspace_root = detect_workspace_root(&nested)
+            .await
             .expect("workspace root should resolve inside a git worktree");
-        assert_eq!(workspace_root, worktree.canonicalize().unwrap());
+        assert_eq!(workspace_root.as_path(), worktree.canonicalize().unwrap());
 
         let repository_root = detect_repository_root(&nested)
+            .await
             .expect("repository root should resolve to the main repository");
-        assert_eq!(repository_root, main.canonicalize().unwrap());
-        assert_ne!(workspace_root, repository_root);
+        assert_eq!(repository_root.as_path(), main.canonicalize().unwrap());
+        assert_ne!(workspace_root.as_path(), repository_root.as_path());
     }
 
-    #[test]
-    fn test_git_worktree_root_not_in_repo() {
+    #[tokio::test]
+    async fn test_git_worktree_root_not_in_repo() {
         let temp_dir = env::temp_dir();
-        let result = try_git_worktree_root(&temp_dir);
+        let result = try_git_worktree_root(&temp_dir).await.unwrap();
         assert!(
             result.is_none(),
             "Temp directory should not be detected as a git worktree: {:?}",
@@ -606,18 +941,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_workspace_root_not_in_repository() -> miette::Result<()> {
+    #[tokio::test]
+    async fn test_workspace_root_not_in_repository() -> miette::Result<()> {
         let temp_dir = env::temp_dir();
-        let root = detect_workspace_root(&temp_dir)?;
-        assert_eq!(root, temp_dir.canonicalize().into_diagnostic()?);
+        let root = detect_workspace_root(&temp_dir).await?;
+        assert_eq!(root.as_path(), temp_dir.canonicalize().into_diagnostic()?);
         Ok(())
     }
 
-    #[test]
-    fn test_workspace_root_nonexistent_directory() {
+    #[tokio::test]
+    async fn test_workspace_root_nonexistent_directory() {
         let fake_path = Path::new("/this/path/definitely/does/not/exist/moriarty-test-12345");
-        let err_msg = format!("{:?}", detect_workspace_root(fake_path).unwrap_err());
+        let err_msg = format!("{:?}", detect_workspace_root(fake_path).await.unwrap_err());
         assert!(
             err_msg.contains("Failed to canonicalize") || err_msg.contains("No such file"),
             "Error should mention canonicalization or file not found failure, got: {}",

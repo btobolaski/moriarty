@@ -19,7 +19,8 @@
 //! Stored binary paths are normalized relative to the workspace root when they live inside it
 //! ([`normalize_path_for_storage`]), so an approval made in worktree A matches byte-identical
 //! content in worktree B. PATH-resolved binaries (`which cargo`) live outside the workspace and
-//! stay absolute.
+//! stay absolute. String-based approvals cannot distinguish lossy executable-path spellings, so
+//! original/canonical binary identities must be UTF-8 before comparison or storage.
 //!
 //! # Security Model
 //!
@@ -38,7 +39,9 @@
 
 use std::{
     collections::HashMap,
+    io::ErrorKind,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 // Unix-specific permission checking. Windows code uses different APIs (see is_writable implementation).
@@ -50,7 +53,11 @@ use fs2::FileExt;
 use miette::{Context, IntoDiagnostic};
 use serde::{Deserialize, Serialize};
 
-use crate::{hashing, persistence::FileType, repository};
+use crate::{
+    execution, hashing,
+    persistence::FileType,
+    repository::{RepositoryRoot, WorkspaceRoot},
+};
 
 use super::config::ProjectConfig;
 
@@ -215,20 +222,7 @@ impl VerificationResult {
 impl ProjectApprovals {
     /// Load approvals from disk
     pub async fn load() -> miette::Result<Self> {
-        match FileType::Config.load::<Self>(APPROVALS_FILE).await {
-            Ok(approvals) => Ok(approvals),
-            Err(e) => {
-                let error_msg = format!("{:?}", e);
-                if error_msg.contains("No such file or directory")
-                    || error_msg.contains("cannot find the file")
-                    || error_msg.contains("NotFound")
-                {
-                    Ok(Self::default())
-                } else {
-                    Err(e)
-                }
-            }
-        }
+        FileType::Config.load_or_default(APPROVALS_FILE).await
     }
 
     /// Save approvals to disk
@@ -244,7 +238,7 @@ impl ProjectApprovals {
     /// stay atomic.
     pub async fn update<F>(f: F) -> miette::Result<()>
     where
-        F: FnOnce(&mut Self) -> miette::Result<()>,
+        F: FnOnce(&mut Self) -> miette::Result<()> + Send + 'static,
     {
         let approvals_path = FileType::Config.build_path(APPROVALS_FILE).await?;
         let lock_path = approvals_path.with_extension("lock");
@@ -265,14 +259,28 @@ impl ProjectApprovals {
             .into_diagnostic()
             .with_context(|| format!("Failed to open lock file: {}", lock_path.display()))?;
 
-        lock_file
-            .lock_exclusive()
-            .into_diagnostic()
-            .with_context(|| "Failed to acquire exclusive lock on approvals file")?;
-
-        let mut approvals = Self::load().await?;
-        f(&mut approvals)?;
-        approvals.save().await
+        // A blocked kernel lock cannot be cancelled; retries remain owned by the caller until admission.
+        // ponytail: 10 ms polling permits ~100 attempts/s; add backoff if contention costs matter.
+        loop {
+            match lock_file.try_lock_exclusive() {
+                Ok(()) => break,
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => {
+                    return Err(error)
+                        .into_diagnostic()
+                        .with_context(|| "Failed to acquire exclusive lock on approvals file");
+                }
+            }
+        }
+        execution::retain_persistence(async move {
+            let _lock = lock_file;
+            let mut approvals = Self::load().await?;
+            f(&mut approvals)?;
+            approvals.save().await
+        })
+        .await
     }
 
     /// Verify a command against the already-detected repository root, loading nothing: callers
@@ -280,8 +288,8 @@ impl ProjectApprovals {
     /// (for the command array). See [`Self::verify_item_for_workspace`] for the matching rules.
     pub async fn verify_project_for_workspace(
         &self,
-        repository_root: &Path,
-        workspace_root: &Path,
+        repository_root: &RepositoryRoot,
+        workspace_root: &WorkspaceRoot,
         config: &ProjectConfig,
         command_name: &str,
     ) -> miette::Result<VerificationResult> {
@@ -299,8 +307,8 @@ impl ProjectApprovals {
     /// [`Self::verify_project_for_workspace`].
     pub async fn verify_check_for_workspace(
         &self,
-        repository_root: &Path,
-        workspace_root: &Path,
+        repository_root: &RepositoryRoot,
+        workspace_root: &WorkspaceRoot,
         config: &ProjectConfig,
         check_name: &str,
     ) -> miette::Result<VerificationResult> {
@@ -331,15 +339,16 @@ impl ProjectApprovals {
     /// closed as `NotApproved` rather than bypassing anything.
     async fn verify_item_for_workspace(
         &self,
-        repository_root: &Path,
-        workspace_root: &Path,
+        repository_root: &RepositoryRoot,
+        workspace_root: &WorkspaceRoot,
         config: &ProjectConfig,
         item_name: &str,
         item_type: ItemType,
     ) -> miette::Result<VerificationResult> {
-        let project_key = repository_root.to_string_lossy().to_string();
+        let project_key = repository_root.as_key();
+        let workspace_root = workspace_root.as_path();
 
-        let Some(approval) = self.projects.get(&project_key) else {
+        let Some(approval) = self.projects.get(project_key) else {
             return Ok(VerificationResult::NotApproved);
         };
 
@@ -376,15 +385,17 @@ impl ProjectApprovals {
             });
         };
 
-        let binary_name = &command_array[0];
+        let binary_name = command_array.first().ok_or_else(|| {
+            miette::miette!("Configured item '{}' has an empty command array", item_name)
+        })?;
         let (original_path, canonical_path) =
             resolve_binary_path_with_original(binary_name, workspace_root)?;
 
         // Hash immediately after resolution to keep the TOCTOU property.
         let current_binary_hash = hashing::hash_file(&canonical_path).await?;
 
-        let norm_original = normalize_path_for_storage(&original_path, workspace_root);
-        let norm_canonical = normalize_path_for_storage(&canonical_path, workspace_root);
+        let norm_original = normalize_path_for_storage(&original_path, workspace_root)?;
+        let norm_canonical = normalize_path_for_storage(&canonical_path, workspace_root)?;
 
         let argv_matches = |v: &CommandApproval| {
             v.argv.as_deref().is_none() || v.argv.as_deref() == Some(command_array)
@@ -398,9 +409,9 @@ impl ProjectApprovals {
         // absolute — failing closed, which preserves legacy's pre-existing same-workspace-only scope.
         for version in versions {
             let stored_original =
-                normalize_path_for_storage(Path::new(&version.original_path), workspace_root);
+                normalize_path_for_storage(Path::new(&version.original_path), workspace_root)?;
             let stored_canonical =
-                normalize_path_for_storage(Path::new(&version.canonical_path), workspace_root);
+                normalize_path_for_storage(Path::new(&version.canonical_path), workspace_root)?;
             if argv_matches(version)
                 && stored_original == norm_original
                 && stored_canonical == norm_canonical
@@ -440,24 +451,36 @@ impl ProjectApprovals {
     /// change re-approval.
     pub fn approve_project(
         &mut self,
-        workspace_root: PathBuf,
+        workspace_root: WorkspaceRoot,
+        repository_root: RepositoryRoot,
         commands: HashMap<String, CommandApproval>,
         checks: HashMap<String, CommandApproval>,
     ) -> miette::Result<()> {
-        // Detect repository root (jj workspace root, git root, or canonicalized path) — approvals
-        // stay keyed by repository root so identical content across worktrees needs no re-approval.
-        let repository_root = repository::detect_repository_root(&workspace_root)?;
-        let project_key = repository_root.to_string_lossy().to_string();
+        // Discovery happens before entering the synchronous, locked persistence transaction.
+        // The caller must supply the discovered shared root, never a guessed fallback key.
+        let project_key = repository_root.as_key().to_owned();
 
         let entry = self.projects.entry(project_key).or_default();
         let now = Utc::now();
         entry.last_approved = now;
 
         for (name, approval) in commands {
-            upsert_version(&mut entry.commands, name, approval, now, &workspace_root);
+            upsert_version(
+                &mut entry.commands,
+                name,
+                approval,
+                now,
+                workspace_root.as_path(),
+            );
         }
         for (name, approval) in checks {
-            upsert_version(&mut entry.checks, name, approval, now, &workspace_root);
+            upsert_version(
+                &mut entry.checks,
+                name,
+                approval,
+                now,
+                workspace_root.as_path(),
+            );
         }
         Ok(())
     }
@@ -482,7 +505,11 @@ fn upsert_version(
     workspace_root: &Path,
 ) {
     let versions = map.entry(name).or_default();
-    let norm = |p: &str| normalize_path_for_storage(Path::new(p), workspace_root);
+    // Stored strings cannot carry the byte-valued paths rejected at filesystem conversion.
+    let norm = |p: &str| {
+        normalize_path_for_storage(Path::new(p), workspace_root)
+            .expect("stored approval paths are UTF-8")
+    };
 
     // Upgrade a legacy argv-less entry whose (normalized) paths + binary hash match: bind argv
     // and refresh approved_at, without growing the set.
@@ -541,11 +568,18 @@ fn upsert_version(
 /// so an approval made in worktree A matches byte-identical content in worktree B: a relative
 /// program like `./tool.sh` stores as `tool.sh` regardless of which worktree resolved it, while a
 /// PATH-resolved binary (`which cargo`) lives outside the workspace and stays absolute.
-pub fn normalize_path_for_storage(path: &Path, workspace_root: &Path) -> String {
-    match path.strip_prefix(workspace_root) {
-        Ok(relative) => relative.to_string_lossy().into_owned(),
-        Err(_) => path.to_string_lossy().into_owned(),
-    }
+pub fn normalize_path_for_storage(path: &Path, workspace_root: &Path) -> miette::Result<String> {
+    path.to_str().ok_or_else(|| {
+        miette::miette!(
+            "Non-UTF-8 executable identity cannot be represented by the approval format"
+        )
+    })?;
+    Ok(path
+        .strip_prefix(workspace_root)
+        .unwrap_or(path)
+        .to_str()
+        .expect("a component suffix of a UTF-8 path is UTF-8")
+        .to_owned())
 }
 
 /// Resolve a binary name to both its original and canonical paths

@@ -4,6 +4,8 @@
 
 use std::path::PathBuf;
 
+use crate::repository::WorkspaceRoot;
+
 /// Current screen in the approval flow
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Screen {
@@ -37,7 +39,7 @@ pub enum Section {
 #[derive(Debug)]
 pub struct ApprovalState {
     /// Canonical path to the project directory (the workspace root whose tools.toml was loaded)
-    pub project_dir: PathBuf,
+    pub project_dir: WorkspaceRoot,
     /// All commands from the project configuration
     pub commands: Vec<CommandInfo>,
     /// All checks from the project configuration
@@ -116,8 +118,9 @@ impl ApprovalState {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::path::PathBuf;
+
+    use super::*;
 
     fn create_test_command_info(name: &str) -> CommandInfo {
         CommandInfo {
@@ -142,7 +145,7 @@ mod tests {
         screen: Screen,
     ) -> ApprovalState {
         ApprovalState {
-            project_dir: PathBuf::from("/test"),
+            project_dir: WorkspaceRoot::for_test(PathBuf::from("/test")),
             commands,
             checks,
             current_section: section,

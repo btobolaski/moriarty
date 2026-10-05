@@ -3,6 +3,11 @@
 //! This module provides functionality to run all configured project tools
 //! (lint, test, build, format) and checks in parallel and display comprehensive output.
 //!
+//! `moriarty test checks` and `moriarty test project-tools` print stdout synchronously, so an unread
+//! full pipe can block cooperative polling and require SIGKILL (owner-accepted). No output timeout
+//! or graceful signal exit is promised then; forceful termination proves no cleanup/persistence.
+//! MCP transport shutdown and cancellation/admission/owned-work settlement are not waived.
+//!
 //! # Usage
 //!
 //! ```no_run
@@ -30,6 +35,7 @@ use serde_json::json;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::{
+    execution::CliExit,
     hooks::{
         bash_rules::{
             BashRuleEngine, CommandTrace, EndpointAnalysis, Evaluation, EvaluationContext,
@@ -183,10 +189,8 @@ where
             item_type_singular,
             if failed_count == 1 { "" } else { "s" }
         );
-        // Use process::exit instead of returning Err to provide a clean exit code
-        // for CI/CD integration. Returning Err would print a debug error message
-        // that duplicates the summary we just displayed.
-        std::process::exit(1);
+        // Defer the clean CI exit until the CLI owner has drained execution and dropped its runtime.
+        return Err(CliExit(1).into());
     }
 
     Ok(())

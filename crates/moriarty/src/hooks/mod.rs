@@ -20,22 +20,32 @@
 //! When set, it delegates to [`crate::checks::run_configured_checks`] and maps the returned
 //! `CheckRunOutcome` onto allow/deny. That shared routine takes a **fail-open** approach,
 //! reporting "no checks to run" (which the handler maps to `Allow`) when:
-//! - Project directory doesn't exist or cannot be canonicalized
+//! - Initial caller-directory setup failure before the canonical-input snapshot
 //! - `.config/tools.toml` cannot be loaded or parsed, except for duplicate check names
 //! - No checks are defined in the configuration
 //!
+//! After that snapshot, even ordinary filesystem discovery failures fail **closed** rather
+//! than selecting another configuration or treating the repository as absent. Unsupported root or
+//! executable approval identities and malformed/unreadable approval stores also fail **closed**.
 //! Duplicate check names fail **closed** because approvals and resolved programs are name-keyed;
 //! allowing duplicates could authorize one check's arguments using another check's approval.
 //!
 //! **Rationale**: This design prioritizes developer experience and avoids breaking workflows
 //! when projects don't use the checks feature. Since checks are opt-in security validations,
-//! their absence or ordinary load/parse failures should not block execution.
+//! their absence or ordinary project-config load/parse failures should not block execution.
 //!
 //! **Trade-offs**: An attacker who can manipulate the environment or filesystem to cause
 //! config loading failures could bypass checks. However, this requires the same level of
 //! access needed to modify approved binaries directly, so it doesn't meaningfully weaken
 //! the security model. Once checks are configured and approved, the handler fails **closed**
 //! on all verification failures (unapproved checks, argv/binary changes, check failures).
+//!
+//! ## Signal shutdown limitation
+//!
+//! Input reads yield to cancellation, but response stdout is synchronous. An unread full output
+//! pipe can keep the work poll blocked and require SIGKILL (owner-accepted); no write timeout is
+//! imposed. Forceful termination proves neither owned-child cleanup nor completed persistence.
+//! This exception does not apply to MCP's cancellation-aware output and awaited work settlement.
 //!
 //! ## Hook Output Fields: `reason` vs `system_message`
 //!
@@ -66,11 +76,15 @@ pub mod result;
 pub mod tool_rules;
 pub mod tracing;
 
-use std::{io::Read, path::PathBuf, result::Result as StdResult, sync::Arc, time::Duration};
+use std::{path::PathBuf, result::Result as StdResult, sync::Arc, time::Duration};
 
 use ::tracing::{debug, error, info, warn};
 use serde_json::{Map, Value};
-use tokio::{task::JoinError, time::error::Elapsed};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, stdin},
+    task::JoinError,
+    time::error::Elapsed,
+};
 
 use crate::{
     HooksCommand, checks::CheckRunOutcome, permission_mode::PermissionMode,
@@ -215,10 +229,10 @@ fn truncate_log_field(field: &str, max_size: usize) -> String {
 /// Parse failures must surface as a nonzero exit code so Claude Code can distinguish a hook
 /// crash from a deliberate decision.
 async fn exec_hook() -> miette::Result<()> {
-    exec_hook_impl(std::io::stdin()).await
+    exec_hook_impl(stdin()).await
 }
 
-async fn exec_hook_impl<R: Read>(reader: R) -> miette::Result<()> {
+async fn exec_hook_impl<R: AsyncRead + Unpin>(reader: R) -> miette::Result<()> {
     // Global tracing subscriber initialization races are acceptable in tests because nextest's
     // process isolation guarantees no cross-contamination, and failed initialization doesn't
     // affect correctness.
@@ -236,6 +250,7 @@ async fn exec_hook_impl<R: Read>(reader: R) -> miette::Result<()> {
     let bytes_read = reader
         .take(MAX_INPUT_SIZE as u64)
         .read_to_string(&mut input)
+        .await
         .map_err(|e| {
             miette::miette!(
                 "Failed to read hook input from stdin (this command expects JSON hook data): {}",

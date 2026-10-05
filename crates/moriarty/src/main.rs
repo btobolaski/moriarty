@@ -1,6 +1,7 @@
 use std::{
     env,
     path::{Path, PathBuf},
+    process::exit,
 };
 
 use clap::{Args, Parser, Subcommand};
@@ -9,7 +10,10 @@ use mcp::McpServers;
 use miette::{IntoDiagnostic, WrapErr};
 #[cfg(feature = "mimalloc")]
 use mimalloc::MiMalloc;
+use tokio::runtime::Builder;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+
+use crate::execution::CliExit;
 
 mod api_pricing;
 mod approval_tui;
@@ -18,6 +22,7 @@ mod benchmarks;
 mod checks;
 mod combined_graphs;
 mod cost_report;
+mod execution;
 mod hashing;
 mod hooks;
 mod mcp;
@@ -44,14 +49,69 @@ fn main() -> miette::Result<()> {
     if env::args().any(|arg| arg == "--bench") {
         return benchmarks::run();
     }
-    run_cli()
+    let result = run_cli();
+    if let Err(error) = &result
+        && let Some(code) = error.downcast_ref::<CliExit>()
+    {
+        exit(code.0);
+    }
+    result
 }
 
-#[tokio::main]
-async fn run_cli() -> miette::Result<()> {
-    let cli = Cli::parse();
+struct TerminalRestore;
 
-    match cli.command {
+impl Drop for TerminalRestore {
+    fn drop(&mut self) {
+        ratatui::restore();
+    }
+}
+
+fn run_cli() -> miette::Result<()> {
+    let cli = Cli::parse();
+    // Any non-MCP dispatch path reaching execution::submit must be listed here for signal-driven drain.
+    // MCP hosts own their scopes; the interactive installer intentionally bypasses supervision.
+    let scoped = matches!(
+        &cli.command,
+        Command::ApproveProject { .. }
+            | Command::Hooks {
+                subcommand: HooksCommand::Exec
+            }
+            | Command::Test {
+                subcommand: TestCommand::ProjectTools { .. } | TestCommand::Checks { .. }
+            }
+    );
+    // New stdin-reading MCP servers must be listed here; their uncancellable reads would otherwise
+    // keep ordinary runtime teardown waiting after owned-work drain.
+    let input_host = matches!(
+        &cli.command,
+        Command::Hooks {
+            subcommand: HooksCommand::Exec
+        } | Command::Mcp {
+            server: McpServers::GitReadOnly | McpServers::JjReadOnly | McpServers::ProjectTools
+        }
+    );
+    let runtime = Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .into_diagnostic()
+        .wrap_err("Failed to start CLI runtime")?;
+    let result = runtime.block_on(async {
+        if scoped {
+            execution::run_with_signals(dispatch(cli.command)).await
+        } else {
+            dispatch(cli.command).await
+        }
+    });
+    if input_host {
+        // Host admission is closed and owned work settled; uncancellable stdin syscalls must
+        // not keep runtime destruction waiting. Other commands retain ordinary teardown.
+        runtime.shutdown_background();
+    }
+    result
+}
+
+async fn dispatch(command: Command) -> miette::Result<()> {
+    match command {
         Command::ApiPricing { dir, cost_args } => {
             init_cost_report_tracing();
             let dir = resolve_claude_logs_dir(dir)?;
@@ -157,10 +217,11 @@ async fn run_cli() -> miette::Result<()> {
         }
         Command::ApproveProject { project_dir } => {
             let terminal = ratatui::init();
+            let restore = TerminalRestore;
             let app = approval_tui::ApprovalApp::new(project_dir).await?;
             let approved = app.run(terminal).await;
 
-            ratatui::restore();
+            drop(restore);
 
             match approved {
                 Ok(true) => {
@@ -169,7 +230,7 @@ async fn run_cli() -> miette::Result<()> {
                 }
                 Ok(false) => {
                     eprintln!("✗ Approval cancelled");
-                    std::process::exit(1);
+                    Err(CliExit(1).into())
                 }
                 Err(e) => Err(e),
             }?;

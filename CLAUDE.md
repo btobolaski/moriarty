@@ -318,7 +318,7 @@ with warnings, while explicit missing paths and having no available source are e
   earliest timestamped entry
 - Public entry point: `cost_analyzer::analyze_directory(path)`
 
-**`process_supervisor/`** - Standalone asynchronous process-group supervision (not yet used by Moriarty callers):
+**`process_supervisor/`** - Trusted asynchronous process-group supervision for Moriarty's non-installer subprocesses:
 
 - Supports ordinary Linux/macOS process trees, not a security sandbox or deliberately escaped descendants. Both the
   crate and test roots forbid unsafe code; std and pinned rustix safe APIs own the OS boundary. `lib.rs` contains only
@@ -348,8 +348,67 @@ with warnings, while explicit missing paths and having no available source are e
   limits of indirect SIGCHLD-isolation evidence. Descendant tests independently require watchdog-socket EOF, not prompt
   external orphan-zombie reaping; socket EOF is not group absence, which remains mandatory for successful supervisor
   reports. Rescue must preserve the socket's read half so local shutdown cannot fabricate EOF. Never replace safe
-  dependency operations with local FFI/pre-exec hooks, migrate existing callers, or change MCP protocol support as part
-  of this standalone crate.
+  dependency operations with local FFI/pre-exec hooks or change MCP protocol support as part of this crate. Moriarty's
+  integration tests verify policy and ownership, not a second set of signal/reaping/descendant guarantees.
+
+**`execution.rs`** - Private Moriarty execution ownership:
+
+- A token-free task-local submission handle routes project commands, checks, read-only VCS commands, and async git root
+  probes through `process_supervisor`. Preserve the exact verified program `PathBuf`, including dispatch-sensitive
+  symlinks; inherit the environment and pass literal argv with null stdin. Moriarty now requires Linux/macOS.
+- Unscoped library/test calls use a single process-completion owner, not a one-operation scope/dispatcher. Dropping the
+  operation requests cancellation while that owner retains the wait; runtime destruction still cannot guarantee drain.
+- Register scoped owners directly with `TaskTracker` under the admission gate; there is no dispatcher or job queue.
+  Operation tokens are children of the host-linked scope token. Request scopes also retain the actual request token:
+  admission/startup inspect it directly, even during work polling, and nested batch scopes inherit it. Each process
+  owner bridges that request cancellation to its operation token while retaining startup/awaited wait ownership;
+  cancellation wins before re-polling startup. No relay task or token is threaded through ordinary helper chains. Typed
+  cancellation before startup is polled proves no launch and cannot become a settlement failure, even when result
+  delivery is lost; it remains an execution failure for the caller. After polling, retain the supervisor's uncertainty
+  and cancel-and-await contract.
+- Tracked scope/request/process owners survive dropped callers. Close admission, broadcast cancellation, then await
+  concurrent settlement before normal runtime exit; do not abort completion owners. Request cancellation stays local.
+  With a live runtime, request owners contain work-future panics and still await child drain before delivery; synthetic
+  panic/cleanup diagnostics omit the payload and survive caller loss. Completed work and cleanup evidence stay separate
+  until the CLI/MCP boundary combines them; cleanup failure must not replace the initiating failure or blocked
+  tool-result content. Shared settlement composition uses alternate Display to preserve available source causes for both
+  errors without Debug-printing captures. Keep transport causes separate from execution's first cleanup error so both
+  survive. The MCP `Service` wrapper consumes pinned rmcp `RequestContext.ct`; observed EOF/errors close the scope
+  before rmcp drains pending handlers. Pending MCP write/flush/shutdown polls also register the service-cancellation
+  waker: stalled output fails instead of retaining rmcp's writer mutex, without a new timeout or aborting execution
+  owners. Writable EOF replies still drain; partial delivery is retained as a transport failure. Signals also settle
+  cooperative migrated CLI/hook work, and approval's drop guard restores the terminal even during initialization.
+  Unrelated CLI paths and inherited-stdio `mcp install` remain outside this scope.
+- The `scoped` match in `main.rs::run_cli` is the single CLI registry: add any new non-MCP dispatch path reaching
+  `execution::submit` there to retain signal-driven drain. MCP hosts own their scopes; the installer stays excluded.
+  `input_host` separately selects only MCP servers and `hooks exec` for `Runtime::shutdown_background` after that drain:
+  Tokio's uncancellable stdin syscall must not hold runtime destruction open. Hooks use asynchronous input reads so
+  cancellation can reach the owner; other commands and installation retain ordinary runtime teardown. Stdout from
+  `moriarty hooks exec`, `moriarty test checks`, and `moriarty test project-tools` remains blocking: an unread full pipe
+  can prevent cooperative polling and require SIGKILL (owner-accepted), with no output-write timeout or graceful signal
+  exit promised in that condition. This does not waive MCP backpressure shutdown, cancellation/admission, or owned-work
+  settlement. Forceful termination proves neither owned-child cleanup nor completed approval persistence.
+- Approval-lock acquisition uses nonblocking fs2 retries owned by the caller. After acquisition, `retain_persistence`
+  admits the load-modify-save future under the same scope gate/tracker as process work. Caller loss cannot drop its
+  transaction, lock or actual I/O wait; host drain includes it and retains failed writes. Retention uses alternate
+  Display (`{error:#}`) so safe I/O context and source causes survive caller loss without Debug-printing captures. No
+  rollback or crash guarantee.
+- Supervisor defaults: 1 MiB raw bytes per stream, 5 s startup, no execution timeout, 2 s TERM and 1 s post-KILL
+  cleanup. Project/check text discloses truncation; incomplete VCS/root-probe output fails closed. Lossy UTF-8
+  conversion can expand text; limits are not a global memory bound. Never log captured output in lifecycle diagnostics.
+- Stop-hook/MCP checks retain four-way concurrency, a five-minute whole-batch execution budget (including queueing and
+  startup after verification), and a 10 MiB aggregate formatted-output gate. Use `buffer_unordered` for bounded,
+  incremental scheduling. Dropping the pipeline cancels its operations before the owning batch scope drains them;
+  cleanup may exceed the execution deadline. CLI checks have neither that deadline nor aggregate gate, but still have
+  bounded captures. Only an ordinary exit qualifies for exit-code success; startup/cancellation/supervision uncertainty
+  must not become a fallback approval key or successful no-checks result.
+- Gated ownership tests and result-only injection seams live in `execution/tests.rs` and `execution/test_seams.rs`.
+  Deadline-routing tests rendezvous with admitted owners before advancing paused Tokio time; `test-util` is declared in
+  Moriarty's dev dependencies. Keep these tests at the integration boundary, not supervisor OS fault seams.
+- Keep OS cleanup assurance in the supervisor crate. Moriarty tests cover authorization, output policy, cancellation
+  routing, and awaited ownership. Graceful drain needs a live runtime; SIGKILL/crashes and stalled creation's
+  late-cleanup uncertainty retain the supervisor contract's limits. MCP revisions remain 2024-11-05 through the
+  2025-11-25 ceiling, without task-management capabilities.
 
 **`tui/`** - Terminal UI event infrastructure:
 
@@ -375,16 +434,19 @@ with warnings, while explicit missing paths and having no available source are e
 - `tool_runner`'s four command tools (`run_lint`/`run_build`/`run_formatter`/`run_tests`) run a single `[commands]`
   entry via `verify_and_load_project` + `run_command`; its `run_checks` tool runs the project's `[[checks]]` via the
   shared `crate::checks::run_configured_checks` routine — the same approval verification (checks only, not commands),
-  resource limits (5-min timeout, 1 MB/check + 10 MB total output caps), and fail-closed semantics as the Stop hook.
-  That shared routine is intentionally distinct from `project_config::runner::run_all_checks` (no limits, verifies all
-  commands too), which the `moriarty test checks` CLI uses. Both runner paths load `tools.toml` from the caller's
-  **workspace root** (`detect_workspace_root`) — so each jj secondary workspace or git worktree runs its own config and
-  its own relative programs — while approvals stay keyed by the shared **repository root**, so identical content across
-  worktrees needs no re-approval. Both spawn the program path `VerificationResult::Approved` carried back from
-  verification (never the raw `command[0]`), so an unapproved local copy cannot shadow the approved binary. Their
-  execution cwd differs: `project_config::runner` keeps the caller's canonicalized project dir, while the checks-runner
-  uses `detect_workspace_root(project_dir)`, which can walk up past a nested project dir to the enclosing workspace
-  root.
+  resource limits (5-min batch deadline, 1 MiB/stream capture + 10 MiB aggregate formatted-output gate), and fail-closed
+  semantics as the Stop hook. Cleanup has separate budgets and may extend past that deadline. That shared routine is
+  intentionally distinct from `project_config::runner::run_all_checks` (no batch deadline or aggregate gate, bounded
+  captures, verifies all commands too), which the `moriarty test checks` CLI uses. Both runner paths load `tools.toml`
+  from the caller's **workspace root** (`detect_workspace_root`) — so each jj secondary workspace or git worktree runs
+  its own config and its own relative programs — while approvals stay keyed by the shared **repository root**, so
+  identical content across worktrees needs no re-approval. Both spawn the program path `VerificationResult::Approved`
+  carried back from verification (never the raw `command[0]`), so an unapproved local copy cannot shadow the approved
+  binary. Their execution cwd differs: `project_config::runner` keeps the caller's canonicalized project dir, while the
+  checks-runner uses `detect_workspace_root(project_dir)`, which can walk up past a nested project dir to the enclosing
+  workspace root.
+- Project-tool errors use miette alternate Display (`{error:#}`) to retain contextual causes and TOML locations without
+  debug-printing supervisor captures; existing error codes/envelopes stay unchanged.
 - Uses rmcp library with stdio transport for Claude Code integration
 - All servers run as stdin/stdout servers that Claude Code can invoke
 - `install` command configures all servers in Claude Code's MCP registry
@@ -595,7 +657,9 @@ with warnings, while explicit missing paths and having no available source are e
 - Multi-screen TUI flow: ProjectOverview → CommandReview → InProjectWarning → Summary → Approved/Cancelled
 - Reviews both commands and checks, showing security details (binary path, hash, writability, in-project status)
 - Script contents preview for writable in-project scripts
-- Atomic file I/O with locking during final approval save
+- Empty configured command/check argv is rejected before metadata indexing with the item name, not a lost-owner panic
+- Admitted approval persistence retains its lock and actual I/O through cancellation; waiting for the lock is
+  cancellable
 
 **`project_config/`** - Project configuration and security:
 
@@ -630,9 +694,14 @@ with warnings, while explicit missing paths and having no available source are e
   identical content needs no re-approval. Stored binary paths are normalized relative to the workspace root when inside
   it, so a byte-identical `./script.sh` in a second worktree matches the first's approval
 - **SHA-256 verification**: All binaries hashed, symlinks resolved before hashing
-- **Dual path tracking**: Stores both original and canonical paths to detect symlink changes
-- **Atomic updates**: File locking (fs2 crate) prevents race conditions during approval saves
-- **Resource limits**: Check timeouts, concurrency limits, and output size caps prevent abuse
+- **Dual path tracking**: Stores both original and canonical paths to detect symlink changes. Approval lookup/storage
+  rejects non-UTF-8 executable identities instead of matching lossy spellings; verified program spelling stays intact
+- **Atomic updates**: File locking (fs2 crate) prevents race conditions during approval saves. Only `NotFound` at the
+  approval-file read initializes an empty store; setup, parse and other access errors propagate without running the
+  update. `FileType::load` and `load_or_default` share that read/parse pipeline; only the latter permits actual-read
+  `NotFound` to initialize defaults. Never classify absence from diagnostic text
+- **Resource limits**: Stop-hook/MCP checks have a whole-batch deadline, concurrency limits, and output caps. CLI checks
+  retain bounded captures and concurrency but no batch deadline or aggregate gate.
 - **Sensitive data protection**: Environment variables matching TOKEN|SECRET|KEY|PASSWORD patterns are redacted
 
 **TUI Architecture**:
@@ -667,6 +736,23 @@ with warnings, while explicit missing paths and having no available source are e
 
 **Repository Root Detection**:
 
+- Async discovery uses fallible constructors for distinct `RepositoryRoot` and `WorkspaceRoot` newtypes with private
+  UTF-8 string fields: unrepresentable identities cannot reach approval lookup/save, and no repeated preflight is
+  needed. Keep these identities through verification and saving; those interfaces require both types so swapping them
+  fails to compile. Use `as_path()` for path-based operations; git probes reuse the entry point's canonical cwd rather
+  than canonicalizing it again at helper boundaries. Git absence requires independent executable lookup or a completed
+  non-repository result; other probe/root-resolution failures stop discovery and block checks. Set-PATH entries are
+  tested as absolute candidates under the recorded probe cwd (empty entries mean that cwd); unset PATH launches bare Git
+  so libc owns native defaults without environment mutation. Spawn `NotFound` remains ambiguous, not absence. Only the
+  known English non-repository/mount-boundary diagnostics allow fallback; translated or unknown wording fails closed.
+  Strip only Git's output newline, never path whitespace. Construction enforces UTF-8 because the existing string-key
+  format cannot represent arbitrary path bytes; never substitute lossy text or migrate the format implicitly.
+- Before paired repository/workspace discovery, capture one canonical project input and pass it to both awaited
+  detectors, as the project runner and shared Stop-hook/MCP checks do. Re-resolving a caller alias between them can
+  authorize another workspace's tooling with the first repository's approvals; distinct root types alone do not
+  establish that pairing. After this snapshot, even ordinary filesystem discovery failures block shared Stop/MCP checks;
+  initial missing-input setup keeps its existing no-checks result. This closes alias retargeting and rejects observed
+  late failures, not general filesystem TOCTOU.
 - Approvals are keyed by **repository root**, not workspace directory, so identical content across jujutsu workspaces
   and git worktrees shares one approval. The configuration that verification parses (and the binaries it resolves) comes
   from the caller's **workspace root** (`detect_workspace_root`), which is what gives each worktree tooling
@@ -706,8 +792,8 @@ request. Keep these workflow artifacts separate from ad-hoc `plans/` documents.
 **Shared Test Utilities**: Test helpers used across multiple modules (`setup_isolated_xdg_config`,
 `setup_isolated_xdg_state`, `setup_project_dir_with_config`, `write_tools_config`, `create_executable_script`,
 `run_git_command`, `setup_git_repo_with_commit`, `setup_jj_main_and_secondary_workspace`,
-`assert_workspace_local_copy_ran`, `set_test_env_var`, `remove_test_env_var`, `TestEnvVarGuard`, `redirect_rule`,
-`directional_redirect_rule`, `deny_redirect_rule`, `SUBAGENT_EXECUTION_RULES`) live in
+`assert_workspace_local_copy_ran`, `set_test_env_var`, `remove_test_env_var`, `TestEnvVarGuard`, `test_report`,
+`redirect_rule`, `directional_redirect_rule`, `deny_redirect_rule`, `SUBAGENT_EXECUTION_RULES`) live in
 `crates/moriarty/src/test_helpers.rs`. This module is compiled only in test builds (`#[cfg(test)]`). All test
 environment mutations go through `apply_test_env_var()` — the module's single `unsafe` block — with process isolation
 guaranteed by `cargo nextest`. New test-only helpers needed in more than one module belong here rather than being

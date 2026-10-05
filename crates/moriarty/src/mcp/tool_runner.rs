@@ -56,9 +56,9 @@
 //! 2. **Review before use**: Always inspect `.config/tools.toml` in new projects
 //!    before running tools
 //!
-//! 3. **Avoid shell execution**: While the server uses `Command::new()` to prevent
-//!    shell metacharacter injection in arguments, the configuration itself can
-//!    specify shell invocation:
+//! 3. **Avoid shell execution**: The trusted process supervisor launches approved
+//!    programs with literal arguments and no implicit shell, but the configuration
+//!    itself can specify shell invocation:
 //!
 //!    ```toml
 //!    # DANGEROUS - executes arbitrary shell commands
@@ -158,15 +158,14 @@ impl ToolRunner {
             .await
             .map_err(|e| McpError {
                 code: ErrorCode::INVALID_REQUEST,
-                message: format!("{:?}", e).into(),
+                message: format!("{e:#}").into(),
                 data: None,
             })?;
 
         // Run the specific command
         let command_name = cmd.as_str();
         let output = project.run_command(command_name).await.map_err(|e| {
-            let error_msg = format!("{:?}", e);
-            if error_msg.contains("not configured") {
+            if e.to_string().contains("not configured") {
                 McpError {
                     code: ErrorCode::RESOURCE_NOT_FOUND,
                     message: format!("The {} command was not configured for the project", cmd)
@@ -176,7 +175,7 @@ impl ToolRunner {
             } else {
                 McpError {
                     code: ErrorCode::INTERNAL_ERROR,
-                    message: error_msg.into(),
+                    message: format!("{e:#}").into(),
                     data: None,
                 }
             }
@@ -198,7 +197,7 @@ impl ToolRunner {
             .await
             .map_err(|e| McpError {
                 code: ErrorCode::INTERNAL_ERROR,
-                message: format!("{:?}", e).into(),
+                message: format!("{e:#}").into(),
                 data: None,
             })?;
 

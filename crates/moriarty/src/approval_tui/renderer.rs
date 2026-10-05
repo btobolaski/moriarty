@@ -107,7 +107,7 @@ fn render_project_overview(
     let total_items = state.commands.len() + state.checks.len();
     let content_height = total_items as u16 * 2 + 15;
 
-    let mut content = format!("Project: {}\n\n", state.project_dir.display());
+    let mut content = format!("Project: {}\n\n", state.project_dir.as_path().display());
 
     if !state.commands.is_empty() {
         content.push_str(&format!(
@@ -295,7 +295,7 @@ fn render_summary(state: &ApprovalState, scroll_state: &mut ScrollViewState, fra
     let mut content = format!(
         "You have reviewed and approved all items for:\n\
         {}\n\n",
-        state.project_dir.display()
+        state.project_dir.as_path().display()
     );
 
     if !state.commands.is_empty() {
@@ -365,7 +365,7 @@ fn render_approved(state: &ApprovalState, frame: &mut Frame) {
         {} item(s) have been approved and saved ({} commands, {} checks).\n\
         \n\
         The MCP server will now execute these tools when requested by Claude.",
-        state.project_dir.display(),
+        state.project_dir.as_path().display(),
         total_items,
         state.commands.len(),
         state.checks.len()

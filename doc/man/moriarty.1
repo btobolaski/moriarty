@@ -244,6 +244,64 @@ The
 .Cm mcp
 subcommand runs one of the built\-in Model Context Protocol servers
 for read\-only git operations, read\-only jj operations, and project tools.
+.Ss Process Execution
+Moriarty requires Linux or macOS; the entire binary depends on the platform-specific
+process supervisor.
+Project commands, checks, read-only VCS commands, and git root probes
+use supervised process groups, inherited environment, literal argv, and null stdin.
+This is lifecycle management, not a security sandbox.
+Captures retain at most 1 MiB of raw bytes per stdout/stderr stream; lossy UTF-8 conversion
+may expand the retained text.
+Project/check output discloses truncation without changing ordinary exit-based success;
+VCS commands and discovery reject incomplete output.
+Startup has a 5-second budget; project commands, CLI checks, and VCS commands have no
+new execution deadline.
+Stop-hook/MCP checks retain four-way concurrency, a five-minute whole-batch deadline
+including queueing/startup after verification, and a 10 MiB aggregate formatted-output gate.
+Rejection stops queued work, cancels active operations together, and awaits settlement.
+Cleanup has separate 2-second TERM and 1-second post-KILL budgets and may extend past
+that execution allowance.
+.Pp
+Existing MCP request cancellation affects only its request. Admission and startup inspect
+cancellation even inside a work poll; already-started work retains its awaited owner.
+Disconnect, transport failure, and graceful SIGINT/SIGTERM close admission, cancel
+active work, and await settlement before normal runtime exit, subject to the stdout
+limitation below. MCP/hook hosts exit after drain even when stdin remains open: hook reads yield to
+cancellation, and only these hosts use background runtime shutdown to avoid joining
+uncancellable input reads. Other commands, including the installer, retain ordinary teardown.
+MCP stalled response writes, flushes, and transport closure wake on cancellation without
+resumed peer reads; owned work still drains and partial delivery is a host failure.
+Stdout from moriarty hooks exec, moriarty test checks, and moriarty test project-tools
+remains blocking: a full unread output pipe can prevent cooperative signal shutdown and
+require SIGKILL. No output-write timeout or graceful signal exit is promised in that condition.
+This owner-accepted exception does not apply to MCP transport shutdown or relax cancellation,
+admission, or owned-work settlement obligations. Forceful termination proves neither
+owned-child cleanup nor completed approval persistence.
+Approval-lock waiting is cancellable. Admitted approval transactions retain their lock
+and actual filesystem I/O through caller loss and host drain; cancellation does not
+promise rollback. Retained failures preserve safe write context and available I/O causes;
+combined initiating/cleanup errors preserve contextual sources, not captured child output.
+Only genuine approval-file absence initializes an empty store; malformed/unreadable stores
+remain errors and are not overwritten by an update.
+Approval initialization restores the terminal on errors or interruption.
+Cancellation/timeout and uncertain cleanup never qualify as ordinary exit success;
+Git/root-resolution failures after the canonical-input snapshot fail closed instead of
+inventing an approval key or allowing checks to be skipped. Initial missing-input setup
+keeps its existing no-checks behavior. Git PATH entries, including relative/empty entries, use
+the probe cwd; unset PATH retains native search defaults without an environment override.
+Known English non-repository and filesystem-boundary diagnostics permit ordinary fallback;
+translated or unknown wording fails closed even for standalone projects.
+Root whitespace is preserved; non-UTF-8 repository/workspace and original/canonical
+executable approval identities are rejected before lookup/save without changing the
+approval format or verified program spelling.
+Empty configured argv produces named errors. Diagnostic cause chains exclude captured child output.
+Stalled startup can leave creation/late cleanup uncertain; SIGKILL/crash containment is
+not guaranteed. OS cleanup assurance belongs to the supervisor tests, not duplicated
+Moriarty descendant/signal/reaping harnesses.
+MCP support stays at 2024-11-05, 2025-03-26, 2025-06-18, and the 2025-11-25 ceiling,
+without task-management APIs.
+.Cm mcp install
+is excluded from supervision and retains inherited terminal streams and behavior.
 .Ss Project Approval
 The
 .Cm approve\-project

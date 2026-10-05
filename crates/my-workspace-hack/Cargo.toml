@@ -18,15 +18,19 @@ edition.workspace = true
 arrayvec = { version = "0.7" }
 crossbeam-utils = { version = "0.8", default-features = false, features = ["std"] }
 fastrand = { version = "2" }
+futures-channel = { version = "0.3", default-features = false, features = ["sink", "std"] }
+futures-io = { version = "0.3" }
 futures-sink = { version = "0.3" }
+futures-util = { version = "0.3", features = ["channel", "io", "sink"] }
 memchr = { version = "2" }
 num-traits = { version = "0.2", default-features = false, features = ["i128", "std"] }
 peg-runtime = { version = "0.8", default-features = false, features = ["std"] }
+rustix = { version = "1", features = ["process", "pty", "termios"] }
 serde = { version = "1", features = ["alloc", "derive", "rc"] }
 serde_core = { version = "1", default-features = false, features = ["alloc", "rc", "result", "std"] }
 serde_json = { version = "1", features = ["alloc"] }
-tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "parking_lot", "process", "rt-multi-thread", "signal", "sync", "time"] }
-tokio-util = { version = "0.7", features = ["codec"] }
+tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "parking_lot", "process", "rt-multi-thread", "signal", "test-util"] }
+tokio-util = { version = "0.7", features = ["codec", "rt"] }
 tracing-core = { version = "0.1" }
 zerocopy = { version = "0.8", default-features = false, features = ["derive", "simd"] }
 

@@ -22,6 +22,7 @@ miette = { workspace = true }
 mimalloc = { version = "0.1.52", optional = true, default-features = false }
 my-workspace-hack = { version = "0.1", path = "../my-workspace-hack" }
 pi_logs = { path = "../pi_logs" }
+process_supervisor = { path = "../process_supervisor" }
 ratatui = "0.30.0"
 regex = { workspace = true }
 regex-automata = { version = "0.4.14", default-features = false, features = [
@@ -37,7 +38,8 @@ serde_json = { workspace = true }
 sha2 = "0.10"
 shell-words = "1.1"
 tabled = { version = "0.20", features = ["derive"] }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["signal"] }
+tokio-util = { version = "=0.7.18", features = ["rt"] }
 toml = "0.9.8"
 tracing = { workspace = true }
 tracing-appender = "0.2"
@@ -51,7 +53,9 @@ xdg = "3.0.0"
 criterion = { version = "0.8", default-features = false, features = [
   "cargo_bench_support",
 ] }
+rustix = { version = "=1.1.4", features = ["process", "pty", "termios"] }
 tempfile = "3"
+tokio = { workspace = true, features = ["test-util"] }
 
 [[bench]]
 name = "bash_rules"

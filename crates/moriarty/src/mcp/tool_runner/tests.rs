@@ -1,8 +1,31 @@
+use std::{
+    env,
+    ffi::OsString,
+    fs,
+    future::ready,
+    io::ErrorKind,
+    os::unix::{ffi::OsStringExt, fs::symlink, process::ExitStatusExt},
+    process::{Command, ExitStatus},
+};
+
+use serde_json::to_value;
 use tempfile::TempDir;
 
 use super::*;
-use crate::project_config::approvals;
-use crate::test_helpers::{setup_isolated_xdg_config, setup_project_dir_with_config};
+use crate::{
+    checks::{self, CheckRunOutcome},
+    execution,
+    project_config::approvals,
+    repository::{detect_repository_root, detect_workspace_root},
+    test_helpers::{
+        TestEnvVarGuard, assert_workspace_local_copy_ran, create_executable_script,
+        setup_git_repo_with_commit, setup_isolated_xdg_config,
+        setup_jj_main_and_secondary_workspace, setup_project_dir_with_config, test_report,
+    },
+};
+use process_supervisor::{
+    Completion, PartialState, ProcessError, ProcessOptions, ProcessSpec, RunningProcess,
+};
 
 async fn setup_project_dir_with_approvals(config_content: &str) -> (TempDir, TempDir) {
     let xdg_dir = setup_isolated_xdg_config();
@@ -87,6 +110,390 @@ async fn run_test_cmd(
 /// template, so the error code is the structural contract.
 fn assert_invalid_request(err: &rmcp::ErrorData) {
     assert_eq!(err.code, ErrorCode::INVALID_REQUEST);
+}
+
+#[tokio::test]
+async fn probe_cwd_path_entries_keep_root_checks_in_both_adapters() {
+    let _xdg = setup_isolated_xdg_config();
+    let project = TempDir::new().unwrap();
+    setup_git_repo_with_commit(project.path());
+    let nested = project.path().join("nested");
+    fs::create_dir_all(nested.join("tools")).unwrap();
+    assert_ne!(env::current_dir().unwrap(), nested);
+    let git = which::which("git").unwrap();
+    symlink(&git, nested.join("tools/git")).unwrap();
+    symlink(&git, nested.join("git")).unwrap();
+    let script = project.path().join("check.sh");
+    create_executable_script(&script, "printf 'probe-cwd-check\\n'");
+    let config = format!(
+        "[commands]\n[[checks]]\nname = \"root-only\"\ncommand = [{:?}]\n",
+        script.to_str().unwrap()
+    );
+    fs::create_dir(project.path().join(".config")).unwrap();
+    fs::write(project.path().join(".config/tools.toml"), &config).unwrap();
+    approvals::approve_project_config(project.path(), &config)
+        .await
+        .unwrap();
+    let expected = project.path().canonicalize().unwrap();
+    for path in ["tools", ""] {
+        let _path = TestEnvVarGuard::set("PATH", path);
+        assert_eq!(
+            detect_workspace_root(&nested).await.unwrap().as_path(),
+            expected
+        );
+        assert_eq!(
+            detect_repository_root(&nested).await.unwrap().as_path(),
+            expected
+        );
+        let CheckRunOutcome::Ran { outputs, failures } =
+            checks::run_configured_checks(&nested).await.unwrap()
+        else {
+            panic!("PATH {path:?} must not skip the root's checks")
+        };
+        assert!(failures.is_empty(), "{failures:?}");
+        assert!(outputs.iter().any(|text| text.contains("probe-cwd-check")));
+        let result = ToolRunner::run_checks_impl(run_args(&nested))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(false));
+        assert!(
+            to_value(result).unwrap()["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("probe-cwd-check")
+        );
+    }
+}
+
+#[tokio::test]
+async fn unset_path_matches_native_git_lookup_without_inventing_absence() {
+    let project = TempDir::new().unwrap();
+    setup_git_repo_with_commit(project.path());
+    let _path = TestEnvVarGuard::unset("PATH");
+    let native = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(project.path())
+        .output();
+    match native {
+        Ok(output) => {
+            assert!(
+                output.status.success(),
+                "native Git must find the fixture repository"
+            );
+            assert_eq!(
+                detect_workspace_root(project.path())
+                    .await
+                    .unwrap()
+                    .as_path(),
+                project.path().canonicalize().unwrap()
+            );
+        }
+        Err(error) => {
+            assert_eq!(error.kind(), ErrorKind::NotFound);
+            let error = detect_workspace_root(project.path())
+                .await
+                .expect_err("native lookup failure is not affirmative absence");
+            assert!(error.downcast_ref::<ProcessError>().is_some(), "{error}");
+            eprintln!(
+                "Native-default Git unavailable: successful unset-PATH lookup not exercised; native failure remains fail-closed"
+            );
+        }
+    }
+    assert!(
+        env::var_os("PATH").is_none(),
+        "discovery must inherit, not override PATH"
+    );
+}
+
+#[tokio::test]
+async fn filesystem_boundary_absence_keeps_config_and_unknown_wording_blocks() {
+    let _xdg = setup_isolated_xdg_config();
+    let project = setup_project_dir_with_config(
+        "[commands]\n[[checks]]\nname = \"boundary-check\"\ncommand = [\"echo\", \"ok\"]\n",
+    );
+    for (diagnostic, ordinary) in [
+        (
+            "fatal: not a git repository (or any parent up to mount point /fixture)\nStopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).\n",
+            true,
+        ),
+        ("fatal: bad config line 1 in file .git/config\n", false),
+        (
+            "fatal: not a git repository (or any parent up to mount point /fixture)\nunknown trailing error\n",
+            false,
+        ),
+    ] {
+        let handler = move |spec: ProcessSpec, _| {
+            assert_eq!(spec.args.first().unwrap(), "rev-parse");
+            let mut report = test_report(Completion::Exited(ExitStatus::from_raw(128 << 8)));
+            report.stderr.bytes = diagnostic.as_bytes().to_vec();
+            ready(Ok(report))
+        };
+        let work = async {
+            let CheckRunOutcome::Blocked(reason) =
+                checks::run_configured_checks(project.path()).await.unwrap()
+            else {
+                panic!("must process config or block discovery, never NoChecks")
+            };
+            let result = ToolRunner::run_checks_impl(run_args(project.path()))
+                .await
+                .unwrap();
+            assert_eq!(result.is_error, Some(true));
+            assert_eq!(to_value(result).unwrap()["content"][0]["text"], reason);
+            assert!(
+                reason.contains(if ordinary {
+                    "boundary-check"
+                } else {
+                    "Git root discovery"
+                }),
+                "{reason}"
+            );
+        };
+        execution::test_seams::with_operations(handler, work).await;
+    }
+}
+
+#[tokio::test]
+async fn malformed_toml_retains_parse_location_in_mcp_error() {
+    let _xdg = setup_isolated_xdg_config();
+    let project = setup_project_dir_with_config("[commands]\nlint = [\"echo\",\n");
+    let error = run_project_cmd(ProjectCommand::Lint, project.path())
+        .await
+        .expect_err("invalid TOML");
+    assert_invalid_request(&error);
+    for expected in [
+        "failed to parse project settings",
+        "TOML parse error",
+        "line 2",
+        "column",
+    ] {
+        assert!(error.message.contains(expected), "{}", error.message);
+    }
+    assert!(error.data.is_none());
+}
+
+#[tokio::test]
+async fn empty_previously_approved_argv_is_rejected_without_panic() {
+    let valid = "[commands]\nlint = [\"echo\", \"ok\"]\n[[checks]]\nname = \"security\"\ncommand = [\"echo\", \"ok\"]\n";
+    for check in [false, true] {
+        let (project, _xdg) = setup_project_dir_with_approvals(valid).await;
+        let invalid = if check {
+            valid.replace("command = [\"echo\", \"ok\"]", "command = []")
+        } else {
+            valid.replace("lint = [\"echo\", \"ok\"]", "lint = []")
+        };
+        fs::write(project.path().join(".config/tools.toml"), invalid).unwrap();
+        let (name, message) = if check {
+            let result = run_checks_tool(project.path()).await.unwrap();
+            assert_eq!(result.is_error, Some(true));
+            (
+                "security",
+                to_value(result).unwrap()["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+            )
+        } else {
+            let error = run_project_cmd(ProjectCommand::Lint, project.path())
+                .await
+                .expect_err("empty argv");
+            assert_invalid_request(&error);
+            ("lint", error.message.to_string())
+        };
+        assert!(
+            message.contains(name) && message.contains("empty command array"),
+            "{message}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn mcp_execution_diagnostic_never_includes_captured_child_bytes() {
+    let (project, _xdg) =
+        setup_project_dir_with_approvals("[commands]\nlint = [\"echo\", \"ok\"]\n").await;
+    let result = execution::test_seams::with_operations(
+        |spec, _| async move {
+            if spec.args.first().is_some_and(|arg| arg == "rev-parse") {
+                let mut report = test_report(Completion::Exited(ExitStatus::from_raw(128 << 8)));
+                report.stderr.bytes =
+                    b"fatal: not a git repository (or any of the parent directories): .git\n"
+                        .to_vec();
+                Ok(report)
+            } else {
+                let mut state = PartialState::default();
+                state.stdout.bytes = b"PRIVATE_CHILD_BYTES".to_vec();
+                state.stderr.bytes = b"PRIVATE_CHILD_BYTES".to_vec();
+                Err(miette::Error::new(ProcessError::CleanupUnconfirmed {
+                    state: Box::new(state),
+                }))
+            }
+        },
+        run_project_cmd(ProjectCommand::Lint, project.path()),
+    )
+    .await;
+    let Err(error) = result else {
+        panic!("uncertain cleanup must fail")
+    };
+    assert_eq!(error.code, ErrorCode::INTERNAL_ERROR);
+    for cause in ["Failed to execute command 'lint'", "cleanup"] {
+        assert!(error.message.contains(cause), "{}", error.message);
+    }
+    for private in [
+        "PRIVATE_CHILD_BYTES".to_owned(),
+        format!("{:?}", b"PRIVATE_CHILD_BYTES"),
+    ] {
+        assert!(!error.message.contains(&private), "{}", error.message);
+    }
+}
+
+#[tokio::test]
+async fn interrupted_discovery_keeps_stop_hook_blocking_reason_in_mcp_result() {
+    let _xdg = setup_isolated_xdg_config();
+    let project = setup_project_dir_with_config(
+        "[commands]\n[[checks]]\nname = \"check\"\ncommand = [\"echo\", \"ok\"]\n",
+    );
+    let cause = "Startup cancelled; cleanup unconfirmed";
+    let outcome = execution::test_seams::with_result(
+        Err(cause),
+        checks::run_configured_checks(project.path()),
+    )
+    .await
+    .unwrap();
+    let CheckRunOutcome::Blocked(reason) = outcome else {
+        panic!("Stop hook must block")
+    };
+    let result = execution::test_seams::with_result(
+        Err(cause),
+        ToolRunner::run_checks_impl(run_args(project.path())),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.is_error, Some(true));
+    let result = to_value(result).unwrap();
+    assert_eq!(result["content"][0]["text"], reason);
+    assert!(reason.contains(cause));
+}
+
+#[tokio::test]
+async fn git_root_failures_block_checks_in_both_adapters() {
+    let _xdg = setup_isolated_xdg_config();
+    for (case, expected) in [
+        ("corrupt config", "Git root discovery"),
+        ("vanished cwd", "process start failed"),
+        ("unresolvable root", "Failed to resolve Git"),
+        ("late canonicalization", "Failed to canonicalize path"),
+    ] {
+        for mcp in [false, true] {
+            let project = TempDir::new().unwrap();
+            if case == "corrupt config" || case == "late canonicalization" {
+                setup_git_repo_with_commit(project.path());
+            }
+            if case == "corrupt config" {
+                fs::write(project.path().join(".git/config"), "[broken\n").unwrap();
+            }
+            let nested = project.path().join("nested");
+            fs::create_dir(&nested).unwrap();
+            let missing = project.path().join("missing-root");
+            let work = async {
+                let reason = if mcp {
+                    let result = ToolRunner::run_checks_impl(run_args(&nested))
+                        .await
+                        .unwrap();
+                    assert_eq!(result.is_error, Some(true), "{case}");
+                    to_value(result).unwrap()["content"][0]["text"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned()
+                } else {
+                    let CheckRunOutcome::Blocked(reason) =
+                        checks::run_configured_checks(&nested).await.unwrap()
+                    else {
+                        panic!("{case} must block Stop checks")
+                    };
+                    reason
+                };
+                assert!(reason.contains(expected), "{case}: {reason}");
+                if case == "late canonicalization" {
+                    let cause = nested.canonicalize().unwrap_err().to_string();
+                    assert!(
+                        reason.contains(&cause),
+                        "{case}, MCP={mcp}: {reason}; missing I/O cause: {cause}"
+                    );
+                }
+            };
+            if case == "corrupt config" {
+                work.await;
+            } else {
+                execution::test_seams::with_operations(
+                    move |spec, _| {
+                        let missing = missing.clone();
+                        async move {
+                            if case == "vanished cwd" {
+                                fs::remove_dir(spec.cwd.as_ref().unwrap()).unwrap();
+                                RunningProcess::spawn(spec, ProcessOptions::default())
+                                    .await?
+                                    .wait()
+                                    .await
+                            } else if case == "late canonicalization" {
+                                assert_eq!(spec.args.last().unwrap(), "--git-common-dir");
+                                let cwd = spec.cwd.clone().unwrap();
+                                let common = cwd.parent().unwrap().join(".git").canonicalize().unwrap();
+                                let mut report = RunningProcess::spawn(spec, ProcessOptions::default())
+                                    .await?.wait().await?;
+                                assert!(matches!(report.completion, Completion::Exited(status) if status.success()), "first probe must succeed: {:?}", report.completion);
+                                // Preserve the successful probe's identity after deleting its relative-path base.
+                                report.stdout.bytes = format!("{}\n", common.display()).into_bytes();
+                                fs::remove_dir(cwd).unwrap();
+                                Ok(report)
+                            } else {
+                                let mut report =
+                                    test_report(Completion::Exited(ExitStatus::from_raw(0)));
+                                report.stdout.bytes =
+                                    format!("{}\n", missing.display()).into_bytes();
+                                Ok(report)
+                            }
+                        }
+                    },
+                    work,
+                )
+                .await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn root_identity_policy_reaches_stop_and_mcp_checks() {
+    let _xdg = setup_isolated_xdg_config();
+    for invalid in [false, true] {
+        let project = TempDir::new().unwrap();
+        let root = project.path().join(if invalid {
+            OsString::from_vec(b"root\xff".to_vec())
+        } else {
+            OsString::from(" whitespace root ")
+        });
+        fs::create_dir(&root).unwrap();
+        setup_git_repo_with_commit(&root);
+        let nested = root.join("nested");
+        fs::create_dir(&nested).unwrap();
+        fs::create_dir(root.join(".config")).unwrap();
+        fs::write(
+            root.join(".config/tools.toml"),
+            "[commands]\n[[checks]]\nname = \"root-only\"\ncommand = [\"echo\", \"ok\"]\n",
+        )
+        .unwrap();
+        let expected = if invalid { "Non-UTF-8" } else { "root-only" };
+        let CheckRunOutcome::Blocked(reason) =
+            checks::run_configured_checks(&nested).await.unwrap()
+        else {
+            panic!("root policy must never skip configured checks")
+        };
+        let result = ToolRunner::run_checks_impl(run_args(&nested))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(to_value(result).unwrap()["content"][0]["text"], reason);
+        assert!(reason.contains(expected), "{reason}");
+    }
 }
 
 #[tokio::test]
@@ -231,34 +638,78 @@ test = ["echo", "hello"]
 }
 
 #[tokio::test]
-async fn test_resolves_symlinks_in_tool_runner() {
-    let (temp_dir, _xdg_dir) = setup_project_dir_with_approvals(
-        r#"
-[commands]
-test = ["echo", "hello"]
-"#,
-    )
-    .await;
-
-    // Create a symlink to the project directory
-    let link_dir = TempDir::new().unwrap();
-    let link_path = link_dir.path().join("project_link");
-
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(temp_dir.path(), &link_path).unwrap();
-
-    #[cfg(windows)]
-    std::os::windows::fs::symlink_dir(temp_dir.path(), &link_path).unwrap();
-
-    let args = RunArgs {
-        project_dir: link_path,
-    };
-
-    // Should succeed - canonicalize resolves the symlink
-    let tool_result = ToolRunner::run_command(ProjectCommand::Test, args)
+async fn retargeted_alias_cannot_authorize_an_unapproved_workspace() {
+    let _xdg = setup_isolated_xdg_config();
+    let config = "[commands]\ntest = [\"cat\", \"marker\"]\n[[checks]]\nname = \"root-only\"\ncommand = [\"cat\", \"marker\"]\n";
+    let first = setup_project_dir_with_config(config);
+    let second = setup_project_dir_with_config(config);
+    for (project, marker) in [(&first, "approved-A-data"), (&second, "UNAPPROVED-B-DATA")] {
+        setup_git_repo_with_commit(project.path());
+        fs::write(project.path().join("marker"), marker).unwrap();
+    }
+    approvals::approve_project_config(first.path(), config)
         .await
         .unwrap();
-    assert_eq!(tool_result.is_error, Some(false));
+    let unapproved = run_checks_tool(second.path()).await.unwrap();
+    assert_eq!(unapproved.is_error, Some(true));
+    let link_dir = TempDir::new().unwrap();
+    let alias = link_dir.path().join("project_link");
+    for adapter in ["command", "stop", "mcp"] {
+        symlink(first.path(), &alias).unwrap();
+        let changed_alias = alias.clone();
+        let replacement = second.path().to_path_buf();
+        let handler = move |spec: ProcessSpec, _| {
+            let retarget = spec
+                .args
+                .last()
+                .is_some_and(|arg| arg == "--git-common-dir");
+            let changed_alias = changed_alias.clone();
+            let replacement = replacement.clone();
+            async move {
+                let report = RunningProcess::spawn(spec, ProcessOptions::default())
+                    .await?
+                    .wait()
+                    .await?;
+                // Return the first probe only after the alias names B; the next discovery must stay at A.
+                if retarget {
+                    fs::remove_file(&changed_alias).unwrap();
+                    symlink(&replacement, &changed_alias).unwrap();
+                }
+                Ok(report)
+            }
+        };
+        let output = execution::test_seams::with_operations(handler, async {
+            if adapter == "stop" {
+                let CheckRunOutcome::Ran { outputs, failures } =
+                    checks::run_configured_checks(&alias).await.unwrap()
+                else {
+                    panic!("must run A's configured check, never skip checks")
+                };
+                assert!(failures.is_empty(), "{failures:?}");
+                outputs.join("\n")
+            } else {
+                let result = match adapter {
+                    "mcp" => run_checks_tool(&alias).await,
+                    "command" => run_project_cmd(ProjectCommand::Test, &alias).await,
+                    _ => panic!("unknown adapter: {adapter}"),
+                }
+                .unwrap();
+                assert_eq!(result.is_error, Some(false), "{adapter}");
+                to_value(result).unwrap()["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            }
+        })
+        .await;
+        assert_eq!(
+            alias.canonicalize().unwrap(),
+            second.path().canonicalize().unwrap()
+        );
+        assert!(output.contains("approved-A-data"), "{adapter}: {output}");
+        assert!(!output.contains("UNAPPROVED-B-DATA"), "{adapter}: {output}");
+        fs::remove_file(&alias).unwrap();
+    }
 }
 
 #[tokio::test]
@@ -492,15 +943,26 @@ fn content_contains(result: &rmcp::model::CallToolResult, needle: &str) -> bool 
 
 #[tokio::test]
 async fn test_run_checks_success() {
-    let (temp_dir, _xdg_dir) = setup_project_dir_with_approvals(
-        "[commands]\n[[checks]]\nname = \"ok\"\ncommand = [\"echo\", \"check output\"]\n",
-    )
-    .await;
-    let tool_result = run_checks_tool(temp_dir.path()).await.unwrap();
-    assert_eq!(tool_result.is_error, Some(false));
-    // One content block per check.
-    assert_eq!(tool_result.content.len(), 1);
-    assert!(content_contains(&tool_result, "check output"));
+    let _xdg = setup_isolated_xdg_config();
+    let config = "[commands]\n[[checks]]\nname = \"rel\"\ncommand = [\"./check.sh\"]\n";
+    let (_base, _main, workspace) =
+        setup_jj_main_and_secondary_workspace(config, "check.sh", false);
+    approvals::approve_project_config(&workspace, config)
+        .await
+        .unwrap();
+    let nested = workspace.join("nested");
+    fs::create_dir(&nested).unwrap();
+    create_executable_script(&nested.join("check.sh"), "echo shadow-copy\npwd -P");
+    let cwd = workspace.canonicalize().unwrap();
+    for caller in [&workspace, &nested] {
+        let result = run_checks_tool(caller).await.unwrap();
+        assert_eq!(result.is_error, Some(false));
+        assert_eq!(result.content.len(), 1);
+        let text = &result.content[0].as_text().unwrap().text;
+        assert_workspace_local_copy_ran(text, &workspace);
+        assert!(!text.contains("shadow-copy"));
+        assert!(text.lines().any(|line| Some(line) == cwd.to_str()));
+    }
 }
 
 #[tokio::test]

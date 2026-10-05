@@ -10,6 +10,7 @@ use rustix::{
     process::{Pid, WaitId, WaitIdOptions, waitid},
 };
 use tempfile::TempDir;
+use tokio::time::error::Elapsed;
 
 use super::*;
 use crate::launch::Admission;
@@ -81,7 +82,9 @@ async fn blocked_admission_is_cancellable() {
         let pending = launch::admit(&huge, &token, Instant::now(), &mut hooks);
         tokio::pin!(pending);
         let blocked = timeout(Duration::from_millis(5), &mut pending).await;
-        assert!(blocked.is_err());
+        let _: Elapsed = blocked
+            .err()
+            .expect("admission must remain blocked until cancellation");
         token.cancel();
         assert_eq!(
             within(&mut pending).await.err(),

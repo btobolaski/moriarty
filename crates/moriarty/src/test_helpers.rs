@@ -16,6 +16,21 @@ use tempfile::TempDir;
 use which::which;
 
 use crate::user_config::{BashRule, BashRuleAction, RedirectDirection};
+use process_supervisor::{Capture, Completion, ProcessReport};
+
+/// Report fixtures represent settled streams; uncertain cleanup uses PartialState instead.
+pub(crate) fn test_report(completion: Completion) -> ProcessReport {
+    let capture = || Capture {
+        bytes: Vec::new(),
+        truncated: false,
+        eof: true,
+    };
+    ProcessReport {
+        completion,
+        stdout: capture(),
+        stderr: capture(),
+    }
+}
 
 pub(crate) const PATH_ALIAS_COMMAND: &str =
     "P=/work/project/node_modules/pkg; rg needle $P/output.d.ts | head -5";

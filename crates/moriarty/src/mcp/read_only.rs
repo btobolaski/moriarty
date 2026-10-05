@@ -4,7 +4,9 @@
 //! read-only commands that execute an external binary inside a validated directory.
 //! The validation, process spawning, UTF-8 loss-tolerant output handling, and
 //! error shaping are identical. This module centralizes those concerns so each
-//! server only needs to describe its MCP tool surface.
+//! server only needs to describe its MCP tool surface. Truncated captures fail explicitly: a partial
+//! diff/log/file response must never look complete. Request ownership supplies cancellation; these
+//! commands retain the supervisor's default startup/cleanup budgets and no execution deadline.
 
 // standard library imports
 use std::{
@@ -16,7 +18,9 @@ use std::{
 use rmcp::{ErrorData as McpError, Json, model::ErrorCode};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use tokio::process::Command;
+
+use crate::execution;
+use process_supervisor::ProcessSpec;
 
 /// Result of executing a read-only VCS command.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -97,32 +101,28 @@ where
 {
     let canonical_dir = validate_project_dir(&project_dir)?;
 
-    let mut cmd = Command::new(program);
-    cmd.args(subcommand_args);
-    cmd.current_dir(canonical_dir);
-    cmd.args(args);
-
-    match cmd.output().await {
-        Ok(result) => {
-            // Use lossy UTF-8 conversion to handle potentially invalid encodings
-            // in filenames (e.g., legacy encodings). This prevents server crashes
-            // while allowing output to be displayed with replacement characters (�).
-            // This is acceptable for a read-only tool where we never modify data.
-            let stderr = String::from_utf8_lossy(&result.stderr).to_string();
-            let stdout = String::from_utf8_lossy(&result.stdout).to_string();
-
-            Ok(Json(CommandResult {
-                exit_code: result.status.code().unwrap_or(-1),
-                stderr,
-                stdout,
-            }))
-        }
-        Err(error) => Err(McpError {
-            code: ErrorCode::INTERNAL_ERROR,
-            message: format!("{label} failed: {error:?}").into(),
-            data: None,
-        }),
-    }
+    let spec = ProcessSpec {
+        program: program.into(),
+        args: subcommand_args
+            .into_iter()
+            .map(|arg| arg.as_ref().to_owned())
+            .chain(args.into_iter().map(|arg| arg.as_ref().to_owned()))
+            .collect(),
+        cwd: Some(canonical_dir),
+    };
+    let result = execution::execute(spec).await.and_then(|output| {
+        let status = execution::complete_output(&output)?;
+        Ok(Json(CommandResult {
+            exit_code: status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&output.stdout.bytes).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr.bytes).into_owned(),
+        }))
+    });
+    result.map_err(|error| McpError {
+        code: ErrorCode::INTERNAL_ERROR,
+        message: format!("{label} failed: {error}").into(),
+        data: None,
+    })
 }
 
 /// Test support shared between `git_read_only` and `jj_read_only`.
@@ -136,6 +136,52 @@ where
 /// rejection branch.
 #[cfg(test)]
 pub(crate) mod test_support {
+    use std::{os::unix::process::ExitStatusExt, process::ExitStatus};
+
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::test_helpers::test_report;
+    use process_supervisor::Completion;
+
+    #[tokio::test]
+    async fn incomplete_and_interrupted_vcs_results_are_errors_not_partial_success() {
+        let directory = TempDir::new().unwrap();
+        // Truncation pins this caller's complete-output gate, not just the shared exit mapping.
+        for (expected, completion, truncated) in [
+            (
+                "Incomplete",
+                Completion::Exited(ExitStatus::from_raw(0)),
+                true,
+            ),
+            (
+                "cancelled",
+                Completion::Cancelled(ExitStatus::from_raw(0)),
+                false,
+            ),
+        ] {
+            let mut report = test_report(completion);
+            report.stdout.bytes = b"private child output".to_vec();
+            report.stdout.truncated = truncated;
+            let error = execution::test_seams::with_result(
+                Ok(report),
+                run_read_only_command(
+                    "git",
+                    "diff",
+                    directory.path().to_path_buf(),
+                    ["diff"],
+                    Vec::<String>::new(),
+                ),
+            )
+            .await
+            .err()
+            .expect("incomplete VCS output must be rejected");
+            assert_eq!(error.code, ErrorCode::INTERNAL_ERROR);
+            assert!(!error.message.contains("private child output"));
+            assert!(error.message.contains(expected), "{error}");
+        }
+    }
+
     /// Generates the five path-safety `#[tokio::test]`s against the provided
     /// `$run` closure (async, taking `PathBuf` and `Vec<String>`).
     ///

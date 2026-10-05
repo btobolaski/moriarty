@@ -7,7 +7,8 @@ children and grandchildren that remain in it are included in cleanup. Deliberate
 `setsid`/`setpgid` escape, changed credentials preventing signals, and execution
 delegated to another service are outside the guarantee. Other targets fail at
 compile time. The crate and its tests forbid unsafe code; safe std/rustix APIs own
-the OS boundary. Moriarty's existing callers have **not** been migrated.
+the OS boundary. Moriarty uses this contract for non-installer subprocesses;
+its integration tests cover caller policy and ownership, not duplicate OS cleanup proofs.
 
 # Usage and ownership
 

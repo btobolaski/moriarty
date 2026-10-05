@@ -45,11 +45,16 @@
 //! - Cache files (expendable cached data)
 //! - State files (application state, logs, etc.)
 
-use std::path::PathBuf;
+use std::{io::ErrorKind, path::PathBuf};
 
 use miette::{IntoDiagnostic, WrapErr};
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::task::spawn_blocking;
+
+#[cfg(test)]
+use test_seams as write_io;
+#[cfg(not(test))]
+use tokio::fs as write_io;
 
 /// The type of file being stored
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -154,7 +159,7 @@ impl FileType {
         let serialized = toml::to_string_pretty(&contents)
             .into_diagnostic()
             .context("failed to serialize value")?;
-        tokio::fs::write(path, serialized)
+        write_io::write(path, serialized)
             .await
             .into_diagnostic()
             .context("failed to write file")
@@ -199,17 +204,82 @@ impl FileType {
     where
         T: DeserializeOwned,
     {
+        self.load_with_fallback(file_name, None).await
+    }
+
+    /// Defaults must never mask directory setup, access or parse failures.
+    pub async fn load_or_default<T>(&self, file_name: &'static str) -> miette::Result<T>
+    where
+        T: DeserializeOwned + Default,
+    {
+        self.load_with_fallback(file_name, Some(T::default())).await
+    }
+
+    async fn load_with_fallback<T>(
+        &self,
+        file_name: &'static str,
+        missing: Option<T>,
+    ) -> miette::Result<T>
+    where
+        T: DeserializeOwned,
+    {
         let path = self
             .build_path(file_name)
             .await
             .context("failed to build path for loading")?;
-        let file_contents = tokio::fs::read(&path)
-            .await
-            .into_diagnostic()
-            .context("failed to read from file")?;
+        let file_contents = match (tokio::fs::read(&path).await, missing) {
+            (Err(error), Some(default)) if error.kind() == ErrorKind::NotFound => {
+                return Ok(default);
+            }
+            (contents, _) => contents
+                .into_diagnostic()
+                .context("failed to read from file")?,
+        };
         toml::from_slice(file_contents.as_slice())
             .into_diagnostic()
             .context("failed to parse file contents")
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_seams {
+    use std::{
+        fs, io,
+        path::PathBuf,
+        sync::{Mutex, mpsc},
+    };
+
+    use tokio::{sync::oneshot, task::spawn_blocking};
+
+    static WRITE_GATE: Mutex<Option<(oneshot::Sender<()>, mpsc::Receiver<()>)>> = Mutex::new(None);
+
+    // Nextest isolates this single-use seam; the gate stalls an actual blocking filesystem job.
+    pub(crate) fn gate_next_write() -> (oneshot::Receiver<()>, mpsc::Sender<()>) {
+        let (entered, started) = oneshot::channel();
+        let (release, resumed) = mpsc::channel();
+        assert!(
+            WRITE_GATE
+                .lock()
+                .unwrap()
+                .replace((entered, resumed))
+                .is_none()
+        );
+        (started, release)
+    }
+
+    pub(super) async fn write(path: PathBuf, contents: String) -> io::Result<()> {
+        let gate = WRITE_GATE.lock().unwrap().take();
+        if let Some((entered, resumed)) = gate {
+            spawn_blocking(move || {
+                let _ = entered.send(());
+                resumed.recv().map_err(io::Error::other)?;
+                fs::write(path, contents)
+            })
+            .await
+            .map_err(io::Error::other)?
+        } else {
+            tokio::fs::write(path, contents).await
+        }
     }
 }
 

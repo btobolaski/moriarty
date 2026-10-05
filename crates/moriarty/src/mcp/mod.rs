@@ -17,13 +17,33 @@
 //! moriarty mcp install  # Install all servers to Claude Code
 //! ```
 
-use clap::Subcommand;
+use std::{
+    borrow::Cow,
+    future::Future,
+    io,
+    pin::Pin,
+    sync::{Arc, Mutex},
+    task::{Context, Poll},
+};
 
-use git_read_only::GitReadOnly;
-use jj_read_only::JjReadOnly;
+use clap::Subcommand;
 use miette::IntoDiagnostic;
-use rmcp::{ServiceExt, model::ProtocolVersion, transport::stdio};
-use tool_runner::ToolRunner;
+use rmcp::{
+    ErrorData as McpError, RoleServer, ServerHandler, Service, ServiceExt,
+    model::{
+        ClientNotification, ClientRequest, ContentBlock, ProtocolVersion, ServerInfo, ServerResult,
+    },
+    service::{NotificationContext, QuitReason, RequestContext},
+    transport::stdio,
+};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    task::JoinError,
+};
+use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
+
+use self::{git_read_only::GitReadOnly, jj_read_only::JjReadOnly, tool_runner::ToolRunner};
+use crate::execution::{self, Scope, ShutdownSignals};
 
 // Dependency upgrades must not expand Moriarty's supported MCP revisions.
 const MCP_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V_2025_11_25;
@@ -54,28 +74,260 @@ pub enum McpServers {
 impl McpServers {
     pub async fn run(self) -> miette::Result<()> {
         match self {
-            Self::GitReadOnly => {
-                let server = GitReadOnly;
-                let service = server.serve(stdio()).await.into_diagnostic()?;
-                service.waiting().await.into_diagnostic()?;
-                Ok(())
-            }
-            Self::JjReadOnly => {
-                let server = JjReadOnly;
-                let service = server.serve(stdio()).await.into_diagnostic()?;
-                service.waiting().await.into_diagnostic()?;
-                Ok(())
-            }
-            Self::ProjectTools => {
-                let server = ToolRunner;
-
-                let service = server.serve(stdio()).await.into_diagnostic()?;
-
-                service.waiting().await.into_diagnostic()?;
-                Ok(())
-            }
+            Self::GitReadOnly => serve_owned(GitReadOnly, stdio()).await,
+            Self::JjReadOnly => serve_owned(JjReadOnly, stdio()).await,
+            Self::ProjectTools => serve_owned(ToolRunner, stdio()).await,
             Self::Install => install_mcp_server().await,
         }
+    }
+}
+
+// Wrap Service rather than routers: one owning seam preserves every handler's protocol behavior.
+struct OwnedService<S> {
+    server: S,
+    execution: Arc<Scope>,
+}
+
+impl<S: ServerHandler + Clone> Service<RoleServer> for OwnedService<S> {
+    async fn handle_request(
+        &self,
+        request: ClientRequest,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ServerResult, McpError> {
+        if !matches!(request, ClientRequest::CallToolRequest(_)) {
+            return self.server.handle_request(request, context).await;
+        }
+        let server = self.server.clone();
+        let outcome = self
+            .execution
+            .run(context.ct.clone(), async move {
+                server.handle_request(request, context).await
+            })
+            .await
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        settle_tool_response(outcome.value, outcome.cleanup)
+    }
+
+    async fn handle_notification(
+        &self,
+        notification: ClientNotification,
+        context: NotificationContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        self.server.handle_notification(notification, context).await
+    }
+
+    fn get_info(&self) -> ServerInfo {
+        self.server.get_info()
+    }
+    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+        self.server.supported_protocol_versions()
+    }
+}
+
+fn settle_tool_response(
+    response: Result<ServerResult, McpError>,
+    cleanup: miette::Result<()>,
+) -> Result<ServerResult, McpError> {
+    let Err(cleanup) = cleanup else {
+        return response;
+    };
+    match response {
+        Ok(ServerResult::CallToolResult(mut result)) => {
+            result.is_error = Some(true);
+            result
+                .content
+                .push(ContentBlock::text(format!("Settlement: {cleanup}")));
+            Ok(ServerResult::CallToolResult(result))
+        }
+        Err(primary) => Err(McpError::internal_error(
+            format!("{primary}\nSettlement: {cleanup}"),
+            None,
+        )),
+        Ok(_) => Err(McpError::internal_error(cleanup.to_string(), None)),
+    }
+}
+
+async fn serve_owned<S, R, W>(server: S, transport: (R, W)) -> miette::Result<()>
+where
+    S: ServerHandler + Clone,
+    R: AsyncRead + Send + Unpin + 'static,
+    W: AsyncWrite + Send + Unpin + 'static,
+{
+    let mut signals = ShutdownSignals::new()?;
+    serve_until(server, transport, signals.recv()).await
+}
+
+async fn serve_until<S, R, W>(
+    server: S,
+    (reader, writer): (R, W),
+    stop: impl Future<Output = miette::Result<&'static str>>,
+) -> miette::Result<()>
+where
+    S: ServerHandler + Clone,
+    R: AsyncRead + Send + Unpin + 'static,
+    W: AsyncWrite + Send + Unpin + 'static,
+{
+    let execution = Scope::new();
+    let failures = Arc::new(Mutex::new(None));
+    let service_ct = CancellationToken::new();
+    let transport = (
+        ObservedIo::new(reader, &execution, &failures, &service_ct),
+        ObservedIo::new(writer, &execution, &failures, &service_ct),
+    );
+    tokio::pin!(stop);
+    // Early returns and `?` must exit only this block so admission close, cancellation
+    // and awaited drain below still run.
+    let outcome = async {
+        let server = OwnedService { server, execution: execution.clone() };
+        let service = tokio::select! {
+            biased;
+            reason = &mut stop => {
+                execution.close();
+                service_ct.cancel();
+                return interrupted_host(reason);
+            },
+            result = server.serve_with_ct(transport, service_ct.clone()) => result.into_diagnostic()?,
+        };
+        let waiting = service.waiting();
+        tokio::pin!(waiting);
+        tokio::select! {
+            biased;
+            reason = &mut stop => {
+                execution.close();
+                service_ct.cancel();
+                execution::settled(interrupted_host(reason), service_exit(waiting.await))
+            },
+            result = &mut waiting => service_exit(result),
+        }
+    }.await;
+    execution.close();
+    service_ct.cancel();
+    let outcome = execution::settled(outcome, execution.shutdown().await);
+    let transport_failure = failures.lock().unwrap().take();
+    execution::settled(
+        outcome,
+        transport_failure.map_or(Ok(()), |error| {
+            Err(miette::miette!("MCP transport failed: {error}"))
+        }),
+    )
+}
+
+fn interrupted_host(reason: miette::Result<&'static str>) -> miette::Result<()> {
+    match reason {
+        Ok(reason) => Err(miette::miette!("Interrupted by {reason}")),
+        Err(error) => Err(error),
+    }
+}
+
+fn service_exit(result: Result<QuitReason, JoinError>) -> miette::Result<()> {
+    match result.into_diagnostic()? {
+        QuitReason::Closed | QuitReason::Cancelled => Ok(()),
+        QuitReason::JoinError(error) => Err(error).into_diagnostic(),
+        _ => Err(miette::miette!("Unexpected MCP service termination")),
+    }
+}
+
+// rmcp drains handlers before reporting EOF; cancellation must happen at the I/O boundary.
+// Read errors also look like EOF to rmcp, so retain their metadata outside its service loop.
+struct ObservedIo<T> {
+    inner: T,
+    failure: Arc<Mutex<Option<String>>>,
+    execution: Arc<Scope>,
+    service_ct: CancellationToken,
+    cancelled: Pin<Box<WaitForCancellationFutureOwned>>,
+}
+
+impl<T> ObservedIo<T> {
+    fn new(
+        inner: T,
+        execution: &Arc<Scope>,
+        failure: &Arc<Mutex<Option<String>>>,
+        service_ct: &CancellationToken,
+    ) -> Self {
+        Self {
+            inner,
+            failure: failure.clone(),
+            execution: execution.clone(),
+            cancelled: Box::pin(service_ct.clone().cancelled_owned()),
+            service_ct: service_ct.clone(),
+        }
+    }
+
+    // Writable EOF replies can still drain normally. A parked output has no peer-driven wake,
+    // so cancellation must wake it and abandon delivery rather than hold rmcp's writer mutex.
+    fn observe_output<U>(
+        &mut self,
+        context: &mut Context<'_>,
+        result: Poll<io::Result<U>>,
+    ) -> Poll<io::Result<U>> {
+        if result.is_pending()
+            && (self.service_ct.is_cancelled() || self.cancelled.as_mut().poll(context).is_ready())
+        {
+            self.observe(Poll::Ready(Err(io::ErrorKind::ConnectionAborted.into())))
+        } else {
+            self.observe(result)
+        }
+    }
+
+    fn stop(&self) {
+        self.execution.close();
+        self.service_ct.cancel();
+    }
+
+    fn observe<U>(&self, result: Poll<io::Result<U>>) -> Poll<io::Result<U>> {
+        if let Poll::Ready(Err(error)) = &result {
+            self.failure
+                .lock()
+                .unwrap()
+                .get_or_insert_with(|| error.to_string());
+            self.stop();
+        }
+        result
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for ObservedIo<T> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let before = buffer.filled().len();
+        let available = buffer.remaining();
+        let result = Pin::new(&mut this.inner).poll_read(context, buffer);
+        if available > 0 && matches!(result, Poll::Ready(Ok(()))) && buffer.filled().len() == before
+        {
+            this.stop();
+        }
+        this.observe(result)
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for ObservedIo<T> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let result = Pin::new(&mut this.inner).poll_write(context, bytes);
+        let result = if !bytes.is_empty() && matches!(result, Poll::Ready(Ok(0))) {
+            Poll::Ready(Err(io::ErrorKind::WriteZero.into()))
+        } else {
+            result
+        };
+        this.observe_output(context, result)
+    }
+    fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let result = Pin::new(&mut this.inner).poll_flush(context);
+        this.observe_output(context, result)
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let result = Pin::new(&mut this.inner).poll_shutdown(context);
+        this.observe_output(context, result)
     }
 }
 
@@ -156,426 +408,4 @@ async fn install_single_mcp_server(server_name: &str) -> miette::Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::{collections::BTreeSet, time::Duration};
-
-    use rmcp::{ServerHandler, ServiceExt};
-    use serde_json::{Value, json};
-    use tokio::{
-        io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, ReadHalf, WriteHalf, split},
-        task::JoinHandle,
-        time::timeout,
-    };
-
-    use super::{GitReadOnly, JjReadOnly, ToolRunner};
-    use crate::{
-        project_config::approvals,
-        test_helpers::{setup_isolated_xdg_config, setup_project_dir_with_config},
-    };
-
-    const TEST_TIMEOUT: Duration = Duration::from_secs(5);
-
-    struct TestClient {
-        reader: BufReader<ReadHalf<DuplexStream>>,
-        writer: WriteHalf<DuplexStream>,
-        server_task: JoinHandle<()>,
-    }
-
-    impl TestClient {
-        async fn start<S: ServerHandler>(server: S) -> Self {
-            let (server_io, client_io) = tokio::io::duplex(64 * 1024);
-            let server_task = tokio::spawn(async move {
-                let service = server.serve(server_io).await.unwrap();
-                service.waiting().await.unwrap();
-            });
-            let (reader, writer) = split(client_io);
-
-            Self {
-                reader: BufReader::new(reader),
-                writer,
-                server_task,
-            }
-        }
-
-        async fn send(&mut self, message: Value) {
-            let mut encoded = serde_json::to_vec(&message).unwrap();
-            encoded.push(b'\n');
-            timeout(TEST_TIMEOUT, self.writer.write_all(&encoded))
-                .await
-                .expect("timed out writing MCP message")
-                .unwrap();
-            timeout(TEST_TIMEOUT, self.writer.flush())
-                .await
-                .expect("timed out flushing MCP message")
-                .unwrap();
-        }
-
-        async fn request(&mut self, request: Value) -> Value {
-            self.send(request).await;
-
-            let mut response = String::new();
-            let bytes_read = timeout(TEST_TIMEOUT, self.reader.read_line(&mut response))
-                .await
-                .expect("timed out reading MCP response")
-                .unwrap();
-            assert_ne!(bytes_read, 0, "MCP server closed without a response");
-            serde_json::from_str(&response).unwrap()
-        }
-
-        async fn close(self) {
-            let Self {
-                reader,
-                writer,
-                server_task,
-            } = self;
-            drop(reader);
-            drop(writer);
-            timeout(TEST_TIMEOUT, server_task)
-                .await
-                .expect("MCP server did not stop after client disconnect")
-                .unwrap();
-        }
-    }
-
-    async fn initialize<S: ServerHandler>(
-        server: S,
-        requested_version: &str,
-    ) -> (TestClient, Value) {
-        let mut client = TestClient::start(server).await;
-        let response = client
-            .request(json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": requested_version,
-                    "capabilities": {},
-                    "clientInfo": {
-                        "name": "moriarty-protocol-test",
-                        "version": "0"
-                    }
-                }
-            }))
-            .await;
-        client
-            .send(json!({
-                "jsonrpc": "2.0",
-                "method": "notifications/initialized"
-            }))
-            .await;
-        (client, response)
-    }
-
-    async fn list_tools(client: &mut TestClient) -> Value {
-        client
-            .request(json!({
-                "jsonrpc": "2.0",
-                "id": 2,
-                "method": "tools/list",
-                "params": {}
-            }))
-            .await
-    }
-
-    async fn request_with_newer_protocol(client: &mut TestClient) -> Value {
-        client
-            .request(json!({
-                "jsonrpc": "2.0",
-                "id": 99,
-                "method": "tools/list",
-                "params": {
-                    "_meta": {
-                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-                        "io.modelcontextprotocol/clientCapabilities": {},
-                        "io.modelcontextprotocol/clientInfo": {
-                            "name": "moriarty-protocol-test",
-                            "version": "0"
-                        }
-                    }
-                }
-            }))
-            .await
-    }
-
-    fn assert_newer_protocol_rejected(response: &Value) {
-        assert_eq!(response["error"]["code"], -32022);
-        assert_eq!(response["error"]["data"]["requested"], "2026-07-28");
-        let supported: BTreeSet<_> = response["error"]["data"]["supported"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|version| version.as_str().unwrap())
-            .collect();
-        assert_eq!(
-            supported,
-            ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"]
-                .into_iter()
-                .collect()
-        );
-        assert!(response.get("result").is_none());
-    }
-
-    async fn assert_server_rejects_newer_protocol<S: ServerHandler + Clone>(server: S) {
-        let (mut initialized, response) = initialize(server.clone(), "2025-11-25").await;
-        assert_eq!(response["result"]["protocolVersion"], "2025-11-25");
-        assert_newer_protocol_rejected(&request_with_newer_protocol(&mut initialized).await);
-        initialized.close().await;
-
-        let mut fresh = TestClient::start(server).await;
-        assert_newer_protocol_rejected(&request_with_newer_protocol(&mut fresh).await);
-        fresh.close().await;
-    }
-
-    fn assert_legacy_result_shape(response: &Value) {
-        assert!(
-            response["result"].get("resultType").is_none(),
-            "legacy response unexpectedly contains resultType: {response}"
-        );
-    }
-
-    fn find_tool<'a>(response: &'a Value, name: &str) -> &'a Value {
-        response["result"]["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|tool| tool["name"] == name)
-            .unwrap_or_else(|| panic!("missing tool {name}"))
-    }
-
-    fn assert_tool_contract(response: &Value, expected: &[(&str, &[&str])]) {
-        let tools = response["result"]["tools"].as_array().unwrap();
-        let actual_names: BTreeSet<_> = tools
-            .iter()
-            .map(|tool| tool["name"].as_str().unwrap())
-            .collect();
-        let expected_names: BTreeSet<_> = expected.iter().map(|(name, _)| *name).collect();
-        assert_eq!(actual_names, expected_names);
-
-        for (name, required) in expected {
-            let tool = find_tool(response, name);
-            let actual_required: BTreeSet<_> = tool["inputSchema"]["required"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|field| field.as_str().unwrap())
-                .collect();
-            assert_eq!(actual_required, required.iter().copied().collect());
-        }
-    }
-
-    async fn assert_git_contract(requested_version: &str, expected_version: &str) {
-        let (mut client, response) = initialize(GitReadOnly, requested_version).await;
-        assert_eq!(response["result"]["protocolVersion"], expected_version);
-
-        let tools = list_tools(&mut client).await;
-        assert_tool_contract(
-            &tools,
-            &[
-                ("status", &["project_dir", "args"]),
-                ("diff", &["project_dir", "args"]),
-                ("log", &["project_dir", "args"]),
-                ("show", &["project_dir", "args"]),
-            ],
-        );
-        client.close().await;
-    }
-
-    #[tokio::test]
-    async fn git_transport_preserves_protocol_and_tool_contracts() {
-        assert_git_contract("2025-06-18", "2025-06-18").await;
-        assert_git_contract("2026-07-28", "2025-11-25").await;
-    }
-
-    #[tokio::test]
-    async fn unknown_older_protocol_falls_back_to_ceiling() {
-        assert_git_contract("1999-01-01", "2025-11-25").await;
-    }
-
-    #[tokio::test]
-    async fn git_rejects_newer_request_protocol() {
-        assert_server_rejects_newer_protocol(GitReadOnly).await;
-    }
-
-    #[tokio::test]
-    async fn jj_rejects_newer_request_protocol() {
-        assert_server_rejects_newer_protocol(JjReadOnly).await;
-    }
-
-    #[tokio::test]
-    async fn tool_runner_rejects_newer_request_protocol() {
-        assert_server_rejects_newer_protocol(ToolRunner).await;
-    }
-
-    #[tokio::test]
-    async fn git_legacy_prompt_responses_keep_names_and_roles() {
-        let (mut client, response) = initialize(GitReadOnly, "2025-11-25").await;
-        assert_eq!(response["result"]["protocolVersion"], "2025-11-25");
-
-        let prompts = client
-            .request(json!({
-                "jsonrpc": "2.0",
-                "id": 3,
-                "method": "prompts/list",
-                "params": {}
-            }))
-            .await;
-        assert_legacy_result_shape(&prompts);
-        let prompt_names: BTreeSet<_> = prompts["result"]["prompts"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|prompt| prompt["name"].as_str().unwrap())
-            .collect();
-        assert_eq!(
-            prompt_names,
-            ["status", "diff", "log", "show"].into_iter().collect()
-        );
-
-        let project = tempfile::tempdir().unwrap();
-        let prompt = client
-            .request(json!({
-                "jsonrpc": "2.0",
-                "id": 4,
-                "method": "prompts/get",
-                "params": {
-                    "name": "status",
-                    "arguments": {
-                        "project_dir": project.path().to_string_lossy(),
-                        "args": []
-                    }
-                }
-            }))
-            .await;
-        assert_legacy_result_shape(&prompt);
-        assert_eq!(
-            prompt["result"]["messages"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|message| message["role"].as_str().unwrap())
-                .collect::<Vec<_>>(),
-            ["assistant", "user"]
-        );
-        client.close().await;
-    }
-
-    #[tokio::test]
-    async fn jj_transport_preserves_protocol_and_tool_contracts() {
-        let (mut client, response) = initialize(JjReadOnly, "2025-11-25").await;
-        assert_eq!(response["result"]["protocolVersion"], "2025-11-25");
-
-        let tools = list_tools(&mut client).await;
-        assert_tool_contract(&tools, &[("run", &["project_dir", "command", "args"])]);
-        let command_values: BTreeSet<_> =
-            find_tool(&tools, "run")["inputSchema"]["$defs"]["JjCommand"]["enum"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|value| value.as_str().unwrap())
-                .collect();
-        assert_eq!(
-            command_values,
-            [
-                "status",
-                "diff",
-                "log",
-                "show",
-                "op-log",
-                "file-show",
-                "file-list"
-            ]
-            .into_iter()
-            .collect()
-        );
-        client.close().await;
-    }
-
-    #[tokio::test]
-    async fn tool_runner_transport_preserves_protocol_and_tool_contracts() {
-        let (mut client, response) = initialize(ToolRunner, "2025-11-25").await;
-        assert_eq!(response["result"]["protocolVersion"], "2025-11-25");
-
-        let tools = list_tools(&mut client).await;
-        assert_tool_contract(
-            &tools,
-            &[
-                ("run_lint", &["project_dir"]),
-                ("run_build", &["project_dir"]),
-                ("run_formatter", &["project_dir"]),
-                ("run_tests", &["project_dir"]),
-                ("run_checks", &["project_dir"]),
-            ],
-        );
-        client.close().await;
-    }
-
-    #[tokio::test]
-    async fn tool_runner_legacy_responses_keep_content_and_error_shapes() {
-        let _xdg_dir = setup_isolated_xdg_config();
-        let config = r#"[commands]
-test = ["sh", "-c", "printf success-out; printf success-err >&2"]
-lint = ["sh", "-c", "printf failure-out; printf failure-err >&2; exit 7"]
-"#;
-        let project = setup_project_dir_with_config(config);
-        approvals::approve_project_config(project.path(), config)
-            .await
-            .unwrap();
-        let project_dir = project.path().to_string_lossy();
-        let (mut client, response) = initialize(ToolRunner, "2025-11-25").await;
-        assert_eq!(response["result"]["protocolVersion"], "2025-11-25");
-
-        let success = client
-            .request(json!({
-                "jsonrpc": "2.0",
-                "id": 3,
-                "method": "tools/call",
-                "params": {
-                    "name": "run_tests",
-                    "arguments": { "project_dir": project_dir }
-                }
-            }))
-            .await;
-        assert_legacy_result_shape(&success);
-        assert_eq!(success["result"]["isError"], false);
-        assert_eq!(success["result"]["content"].as_array().unwrap().len(), 2);
-        assert_eq!(success["result"]["content"][0]["type"], "text");
-        assert_eq!(
-            success["result"]["content"][0]["text"],
-            "stdout: \n\n success-out"
-        );
-        assert_eq!(success["result"]["content"][1]["type"], "text");
-        assert_eq!(
-            success["result"]["content"][1]["text"],
-            "stderr: \n\n success-err"
-        );
-
-        let nonzero = client
-            .request(json!({
-                "jsonrpc": "2.0",
-                "id": 4,
-                "method": "tools/call",
-                "params": {
-                    "name": "run_lint",
-                    "arguments": { "project_dir": project_dir }
-                }
-            }))
-            .await;
-        assert_legacy_result_shape(&nonzero);
-        assert_eq!(nonzero["result"]["isError"], true);
-
-        let absent = client
-            .request(json!({
-                "jsonrpc": "2.0",
-                "id": 5,
-                "method": "tools/call",
-                "params": {
-                    "name": "run_build",
-                    "arguments": { "project_dir": project_dir }
-                }
-            }))
-            .await;
-        assert_eq!(absent["error"]["code"], -32002);
-        assert!(absent.get("result").is_none());
-        client.close().await;
-    }
-}
+mod tests;

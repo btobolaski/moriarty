@@ -2,24 +2,40 @@
 
 use std::{
     collections::HashMap,
-    io::Write,
+    ffi::OsStr,
+    fs::{self, OpenOptions},
+    future::pending,
+    io::{ErrorKind, Write},
     path::{Path, PathBuf},
     process::Command,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::{
+    ffi::OsStrExt,
+    fs::{PermissionsExt, symlink},
+};
 
+use fs2::FileExt;
+use futures::poll;
 use miette::{IntoDiagnostic, WrapErr};
 use tempfile::{NamedTempFile, TempDir};
-use tokio::time::{Duration, sleep};
+use tokio::{
+    sync::oneshot,
+    time::{Duration, sleep, timeout},
+};
 
 use crate::{
-    hashing,
+    execution, hashing,
+    persistence::{FileType, test_seams::gate_next_write},
     project_config::config::ProjectConfig,
-    repository,
+    repository::{self, RepositoryRoot, WorkspaceRoot},
     test_helpers::{
-        create_executable_script, run_git_command, setup_git_repo_with_commit,
+        TestEnvVarGuard, create_executable_script, run_git_command, setup_git_repo_with_commit,
         setup_isolated_xdg_config, setup_jj_main_and_secondary_workspace, write_tools_config,
     },
 };
@@ -28,6 +44,109 @@ use super::super::{
     CommandApproval, ProjectApprovals, VerificationResult, is_script, is_within_project,
     is_writable, normalize_path_for_storage, resolve_binary_path_with_original,
 };
+
+#[tokio::test]
+async fn admitted_approval_write_survives_caller_loss_and_drains() {
+    for fails in [false, true] {
+        let _xdg = setup_isolated_xdg_config();
+        let path = FileType::Config
+            .build_path("project_approvals.toml")
+            .await
+            .unwrap();
+        let (started, release) = gate_next_write();
+        let (caller_dropped, gone) = oneshot::channel();
+        let (signal, stopped) = oneshot::channel();
+        let mut host = tokio::spawn(execution::test_seams::run_until(
+            async move {
+                let mut update = Box::pin(ProjectApprovals::update(|approvals| {
+                    approvals.projects.entry("first".into()).or_default();
+                    Ok(())
+                }));
+                tokio::select! {
+                    _ = started => {},
+                    result = &mut update => panic!("gated write completed early: {result:?}"),
+                }
+                drop(update);
+                caller_dropped.send(()).unwrap();
+                pending::<miette::Result<()>>().await
+            },
+            async move {
+                stopped.await.into_diagnostic()?;
+                Ok("SIGTERM")
+            },
+        ));
+        timeout(Duration::from_secs(2), gone)
+            .await
+            .unwrap()
+            .unwrap();
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path.with_extension("lock"))
+            .unwrap();
+        let error = lock
+            .try_lock_exclusive()
+            .expect_err("outstanding I/O must retain the real transaction lock");
+        assert_eq!(error.kind(), ErrorKind::WouldBlock);
+        let entered = Arc::new(AtomicBool::new(false));
+        let observed = entered.clone();
+        let second = if fails {
+            fs::create_dir(&path).unwrap();
+            None
+        } else {
+            Some(tokio::spawn(ProjectApprovals::update(move |approvals| {
+                observed.store(true, Ordering::SeqCst);
+                approvals.projects.entry("second".into()).or_default();
+                Ok(())
+            })))
+        };
+        signal.send(()).unwrap();
+        assert!(
+            poll!(&mut host).is_pending(),
+            "graceful drain must wait for actual I/O"
+        );
+        assert!(!entered.load(Ordering::SeqCst));
+        release.send(()).unwrap();
+        let Err(error) = timeout(Duration::from_secs(2), host)
+            .await
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("cancelled invocation must not report save success")
+        };
+        assert!(error.to_string().contains("SIGTERM"), "{error}");
+        if let Some(second) = second {
+            timeout(Duration::from_secs(2), second)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let approvals = ProjectApprovals::load().await.unwrap();
+            assert!(approvals.projects.contains_key("first"));
+            assert!(approvals.projects.contains_key("second"));
+            assert!(entered.load(Ordering::SeqCst));
+        } else {
+            let cause = fs::write(&path, b"")
+                .expect_err("directory cannot be an approval file")
+                .to_string();
+            assert!(
+                error.to_string().contains("failed to write file"),
+                "{error}"
+            );
+            assert!(
+                error.to_string().contains(&cause),
+                "actual I/O cause {cause:?} must survive: {error}"
+            );
+        }
+    }
+}
+
+async fn detect_roots(dir: &Path) -> (RepositoryRoot, WorkspaceRoot) {
+    (
+        repository::detect_repository_root(dir).await.unwrap(),
+        repository::detect_workspace_root(dir).await.unwrap(),
+    )
+}
 
 /// Builds a `CommandApproval` with stable dummy hash/path fields and `argv: None` (the legacy
 /// shape) for tests that just need a named entry in the approvals map.
@@ -60,21 +179,26 @@ async fn assert_shared_repo_approval(
     config_content: &str,
     label: &str,
 ) {
-    let shared_workspace_root = repository::detect_workspace_root(shared_path).unwrap();
-    let shared_repo_root = repository::detect_repository_root(shared_path).unwrap();
+    let shared_workspace_root = repository::detect_workspace_root(shared_path)
+        .await
+        .unwrap();
+    let shared_repo_root = repository::detect_repository_root(shared_path)
+        .await
+        .unwrap();
     assert_eq!(
-        repo_root, shared_repo_root,
+        repo_root,
+        shared_repo_root.as_path(),
         "Both {label} should resolve to the same repository root"
     );
 
     // The shared workspace must carry the same tools.toml so the workspace-root config load
     // yields the same command array verification matches against.
-    write_tools_config(&shared_workspace_root, config_content);
+    write_tools_config(shared_workspace_root.as_path(), config_content);
 
     let config: ProjectConfig = toml::from_str(config_content).unwrap();
     let approvals = ProjectApprovals::load().await.unwrap();
     let result = approvals
-        .verify_project_for_workspace(repo_root, &shared_workspace_root, &config, "lint")
+        .verify_project_for_workspace(&shared_repo_root, &shared_workspace_root, &config, "lint")
         .await
         .unwrap();
     assert!(
@@ -134,10 +258,12 @@ fn audit_config(arg: &str) -> String {
 /// using the `_for_workspace` API.
 async fn verify_check_result(project_dir: &Path, item: &str) -> VerificationResult {
     let canonical = project_dir.canonicalize().unwrap();
-    let repository_root = repository::detect_repository_root(&canonical).unwrap();
-    let workspace_root = repository::detect_workspace_root(&canonical).unwrap();
+    let repository_root = repository::detect_repository_root(&canonical)
+        .await
+        .unwrap();
+    let workspace_root = repository::detect_workspace_root(&canonical).await.unwrap();
     let config: ProjectConfig = toml::from_str(
-        &std::fs::read_to_string(workspace_root.join(".config/tools.toml")).unwrap(),
+        &std::fs::read_to_string(workspace_root.as_path().join(".config/tools.toml")).unwrap(),
     )
     .unwrap();
     ProjectApprovals::load()
@@ -181,14 +307,16 @@ fn canonical_key(dir: &Path) -> String {
 /// (by value) for further inspection. Entries keep whatever fields the caller supplied
 /// (typically `argv: None` via [`make_command_approval`]); `approve_project` stamps
 /// `approved_at` on insert.
-fn approve_fixture(
+async fn approve_fixture(
     dir: &Path,
     commands: HashMap<String, CommandApproval>,
     checks: HashMap<String, CommandApproval>,
 ) -> (String, ProjectApprovals) {
     let mut approvals = ProjectApprovals::default();
+    let root = repository::detect_repository_root(dir).await.unwrap();
+    let workspace_root = repository::detect_workspace_root(dir).await.unwrap();
     approvals
-        .approve_project(dir.to_path_buf(), commands, checks)
+        .approve_project(workspace_root, root, commands, checks)
         .unwrap();
     let key = canonical_key(dir);
     assert!(approvals.projects.contains_key(&key));
@@ -241,15 +369,18 @@ pub async fn approve_project_config(
         .into_diagnostic()
         .wrap_err("Failed to canonicalize project dir")?;
     // Resolve binaries against the workspace root — the config that runs is the workspace's own.
-    let workspace_root = repository::detect_workspace_root(&canonical)?;
-    let repository_root = repository::detect_repository_root(&workspace_root)?;
+    let workspace_root = repository::detect_workspace_root(&canonical).await?;
+    let repository_root = repository::detect_repository_root(workspace_root.as_path()).await?;
     let config: ProjectConfig = toml::from_str(config_content)
         .into_diagnostic()
         .wrap_err("Failed to parse test config")?;
 
     let mut commands = HashMap::new();
     for (name, cmd_array) in config.commands.all() {
-        commands.insert(name, build_approval(&cmd_array, &workspace_root).await?);
+        commands.insert(
+            name,
+            build_approval(&cmd_array, workspace_root.as_path()).await?,
+        );
     }
 
     let mut checks = HashMap::new();
@@ -257,18 +388,19 @@ pub async fn approve_project_config(
         for check in check_configs {
             checks.insert(
                 check.name,
-                build_approval(&check.command, &workspace_root).await?,
+                build_approval(&check.command, workspace_root.as_path()).await?,
             );
         }
     }
 
     let workspace_root_clone = workspace_root.clone();
+    let root = repository_root.clone();
     ProjectApprovals::update(move |approvals| {
-        approvals.approve_project(workspace_root_clone, commands, checks)
+        approvals.approve_project(workspace_root_clone, root, commands, checks)
     })
     .await?;
 
-    Ok(repository_root)
+    Ok(repository_root.as_path().to_path_buf())
 }
 
 /// Resolves `command[0]` against `workspace_root`, hashes the binary, and builds a
@@ -284,8 +416,8 @@ async fn build_approval(
     Ok(CommandApproval {
         argv: Some(command.to_vec()),
         approved_at: None,
-        original_path: normalize_path_for_storage(&original_path, workspace_root),
-        canonical_path: normalize_path_for_storage(&canonical_path, workspace_root),
+        original_path: normalize_path_for_storage(&original_path, workspace_root)?,
+        canonical_path: normalize_path_for_storage(&canonical_path, workspace_root)?,
         binary_hash,
     })
 }
@@ -325,8 +457,29 @@ fn create_tools_config(repo_path: &Path, config_content: &str) {
 /// Table-driven coverage for `approve_project`: every row supplies a `commands`
 /// and `checks` map, and the test asserts the stored `ProjectApproval` reflects
 /// them verbatim.
-#[test]
-fn test_approve_project_matrix() {
+#[tokio::test]
+async fn interrupted_discovery_cannot_save_an_alternate_approval_key() {
+    let _xdg = setup_isolated_xdg_config();
+    let project = TempDir::new().unwrap();
+    let result = execution::test_seams::with_result(
+        Err("Discovery cancelled; cleanup unconfirmed"),
+        approve_project_config(project.path(), "[commands]\nlint = [\"echo\", \"ok\"]\n"),
+    )
+    .await;
+    let Err(error) = result else {
+        panic!("interrupted discovery must not save approvals")
+    };
+    assert!(execution::is_execution_error(&error));
+    assert!(
+        error
+            .to_string()
+            .contains("Discovery cancelled; cleanup unconfirmed")
+    );
+    assert!(ProjectApprovals::load().await.unwrap().projects.is_empty());
+}
+
+#[tokio::test]
+async fn test_approve_project_matrix() {
     struct Case {
         label: &'static str,
         commands: &'static [(&'static str, &'static str)],
@@ -368,7 +521,8 @@ fn test_approve_project_matrix() {
             })
             .collect();
 
-        let (key, approvals) = approve_fixture(temp_dir.path(), commands.clone(), checks.clone());
+        let (key, approvals) =
+            approve_fixture(temp_dir.path(), commands.clone(), checks.clone()).await;
 
         let approval = &approvals.projects[&key];
         assert_eq!(
@@ -606,7 +760,16 @@ fn test_normalize_path_for_storage_inside_and_outside_workspace() {
         ("/usr/bin/cargo", "/usr/bin/cargo"),
         ("./tool.sh", "./tool.sh"),
     ] {
-        assert_eq!(normalize_path_for_storage(Path::new(path), ws), expected);
+        assert_eq!(
+            normalize_path_for_storage(Path::new(path), ws).unwrap(),
+            expected
+        );
+    }
+    for path in [
+        ws.join(OsStr::from_bytes(b"bin\xff")),
+        Path::new("/external").join(OsStr::from_bytes(b"bin\xfe")),
+    ] {
+        assert!(normalize_path_for_storage(&path, ws).is_err());
     }
 }
 
@@ -823,6 +986,56 @@ async fn verify_check_program_is_original_not_canonical_for_symlink() {
         project.path().canonicalize().unwrap().join("link.sh"),
         "program must be the symlink, not its canonicalized target"
     );
+
+    let (repository_root, workspace_root) = detect_roots(project.path()).await;
+    let parsed: ProjectConfig = toml::from_str(config).unwrap();
+    let store = FileType::Config
+        .build_path("project_approvals.toml")
+        .await
+        .unwrap();
+    let targets = [b"bin\xff", b"bin\xfe"].map(|name| {
+        let dir = project.path().join(OsStr::from_bytes(name));
+        fs::create_dir(&dir).unwrap();
+        let target = dir.join("launcher");
+        create_executable_script(&target, "echo identical-launcher");
+        target.canonicalize().unwrap()
+    });
+    assert_ne!(targets[0], targets[1]);
+    assert_eq!(targets[0].to_string_lossy(), targets[1].to_string_lossy());
+    let hash = hashing::hash_file(&targets[0]).await.unwrap();
+    assert_eq!(hash, hashing::hash_file(&targets[1]).await.unwrap());
+
+    // Reproduce a lossy approval already persisted by an older version, with unchanged argv/hash.
+    let mut legacy = make_command_approval("link.sh", &targets[0].to_string_lossy(), &hash);
+    legacy.argv = Some(vec!["./link.sh".into()]);
+    let (_, approvals) = approve_fixture(
+        project.path(),
+        HashMap::new(),
+        HashMap::from([("c".into(), legacy)]),
+    )
+    .await;
+    approvals.save().await.unwrap();
+    let before = fs::read(&store).unwrap();
+    fs::remove_file(&link).unwrap();
+    symlink(&targets[0], &link).unwrap();
+    assert_eq!(link.canonicalize().unwrap(), targets[0]);
+    // Retargeting changes only the byte-valued canonical identity, not the reviewed link or argv.
+    fs::remove_file(&link).unwrap();
+    symlink(&targets[1], &link).unwrap();
+    let error = approvals
+        .verify_check_for_workspace(&repository_root, &workspace_root, &parsed, "c")
+        .await
+        .expect_err("a lossy approval must never authorize the other target");
+    assert!(format!("{error:#}").contains("Non-UTF-8"), "{error:#}");
+    let error = approve_project_config(project.path(), config)
+        .await
+        .expect_err("unrepresentable executable identities cannot be saved");
+    assert!(format!("{error:#}").contains("Non-UTF-8"), "{error:#}");
+    assert_eq!(
+        fs::read(&store).unwrap(),
+        before,
+        "rejected save changed approvals"
+    );
 }
 
 #[cfg(unix)]
@@ -905,8 +1118,9 @@ async fn test_concurrent_approvals_use_file_locking() {
                 ),
             );
 
+            let (root, workspace_root) = detect_roots(&project_dir).await;
             ProjectApprovals::update(move |approvals| {
-                approvals.approve_project(project_dir, commands, HashMap::new())
+                approvals.approve_project(workspace_root, root, commands, HashMap::new())
             })
             .await
             .expect("Concurrent approval should succeed");
@@ -970,8 +1184,9 @@ async fn test_concurrent_updates_to_same_project() {
                 ),
             );
 
+            let (root, workspace_root) = detect_roots(&project_dir).await;
             ProjectApprovals::update(move |approvals| {
-                approvals.approve_project(project_dir, commands, HashMap::new())
+                approvals.approve_project(workspace_root, root, commands, HashMap::new())
             })
             .await
             .expect("Concurrent update should succeed");
@@ -1018,6 +1233,7 @@ async fn test_file_locking_prevents_read_during_write() {
         .to_string();
     let project_key_clone = project_key.clone();
 
+    let (root, workspace_root) = detect_roots(&project_dir).await;
     // Start a long-running update operation
     let write_handle = tokio::spawn(async move {
         ProjectApprovals::update(|approvals| {
@@ -1035,7 +1251,7 @@ async fn test_file_locking_prevents_read_during_write() {
             );
 
             approvals
-                .approve_project(project_dir, commands, HashMap::new())
+                .approve_project(workspace_root, root, commands, HashMap::new())
                 .unwrap();
 
             // Simulate slow operation
@@ -1089,6 +1305,12 @@ name = "license-check"
 command = ["echo", "check"]
 "#;
     let (_xdg_dir, temp_dir) = isolated_project_with_config(config_content);
+    let store = FileType::Config
+        .build_path("project_approvals.toml")
+        .await
+        .unwrap();
+    assert!(!store.exists());
+    assert!(ProjectApprovals::load().await.unwrap().projects.is_empty());
 
     // Approve the project using the helper
     approve_project_config(temp_dir.path(), config_content)
@@ -1130,6 +1352,54 @@ command = ["echo", "check"]
         Some(["echo".to_string(), "audit".to_string()].as_slice()),
         "argv should be bound to the full command array",
     );
+
+    let malformed = b"[projects.NotFound\n";
+    fs::write(&store, malformed).unwrap();
+    let diagnostic = FileType::Config
+        .load::<ProjectApprovals>("project_approvals.toml")
+        .await
+        .expect_err("fixture must be malformed TOML");
+    assert!(format!("{diagnostic:?}").contains("NotFound"));
+    let loaded = ProjectApprovals::load().await;
+    let entered = Arc::new(AtomicBool::new(false));
+    let observed = entered.clone();
+    let updated = ProjectApprovals::update(move |approvals| {
+        observed.store(true, Ordering::SeqCst);
+        approvals.projects.entry("overwrite".into()).or_default();
+        Ok(())
+    })
+    .await;
+    let unchanged = fs::read(&store).unwrap() == malformed;
+    assert!(
+        loaded.is_err() && updated.is_err() && !entered.load(Ordering::SeqCst) && unchanged,
+        "corrupt store must error without running update or changing bytes: load_ok={}, update_ok={}, entered={}, unchanged={unchanged}",
+        loaded.is_ok(),
+        updated.is_ok(),
+        entered.load(Ordering::SeqCst)
+    );
+
+    fs::remove_file(&store).unwrap();
+    fs::create_dir(&store).unwrap();
+    assert!(
+        ProjectApprovals::load().await.is_err(),
+        "an unreadable store is not absence"
+    );
+    assert!(ProjectApprovals::update(|_| Ok(())).await.is_err());
+    assert!(
+        store.is_dir(),
+        "failed load must not replace the existing store"
+    );
+
+    let config_file = NamedTempFile::new().unwrap();
+    let _config_home = TestEnvVarGuard::set("XDG_CONFIG_HOME", config_file.path());
+    let error = ProjectApprovals::load()
+        .await
+        .expect_err("path-setup failure cannot initialize an empty store");
+    assert!(
+        format!("{error:#}").contains("failed to build path for loading"),
+        "{error:#}"
+    );
+    assert!(config_file.path().is_file());
 }
 
 #[tokio::test]
@@ -1213,12 +1483,12 @@ impl LegacyFixture {
     }
 
     async fn verify(&self, source: &str) -> VerificationResult {
-        let root = self.root();
+        let (repo, workspace) = detect_roots(&self.root()).await;
         let config = toml::from_str(source).unwrap();
         ProjectApprovals::load()
             .await
             .unwrap()
-            .verify_project_for_workspace(&root, &root, &config, "lint")
+            .verify_project_for_workspace(&repo, &workspace, &config, "lint")
             .await
             .unwrap()
     }
@@ -1345,15 +1615,15 @@ async fn test_legacy_binary_change_reapproval_retires_stale_version() {
 async fn test_legacy_absolute_paths_from_other_worktree_fail_closed() {
     let (_base, main, workspace) =
         setup_jj_main_and_secondary_workspace(LEGACY_LINT_CONFIG, "check.sh", true);
-    let repo = repository::detect_repository_root(&main).unwrap();
-    let workspace = repository::detect_workspace_root(&workspace).unwrap();
+    let repo = repository::detect_repository_root(&main).await.unwrap();
+    let workspace = repository::detect_workspace_root(&workspace).await.unwrap();
     let (original, canonical) = resolve_binary_path_with_original("./check.sh", &main).unwrap();
     let hash = hashing::hash_file(&canonical).await.unwrap();
     let original = original.to_string_lossy();
     let canonical = canonical.to_string_lossy();
     let legacy = make_command_approval(&original, &canonical, &hash);
     let commands = HashMap::from([("lint".to_string(), legacy)]);
-    let (_, approvals) = approve_fixture(&main, commands, HashMap::new());
+    let (_, approvals) = approve_fixture(&main, commands, HashMap::new()).await;
     let config = toml::from_str(LEGACY_LINT_CONFIG).unwrap();
     let result = approvals
         .verify_project_for_workspace(&repo, &workspace, &config, "lint")
@@ -1432,8 +1702,7 @@ async fn test_no_argv_change_with_removed_command_stays_approved() {
     // The removed `lint` name is still in approvals but no longer in the config, so verifying it
     // yields ItemNotApproved (the config lookup returns None), not ItemChanged.
     let approvals = ProjectApprovals::load().await.unwrap();
-    let ws = project.path().canonicalize().unwrap();
-    let repo = ws.clone();
+    let (repo, ws) = detect_roots(project.path()).await;
     let config: ProjectConfig = toml::from_str(
         "[commands]\n\n[[checks]]\nname = \"audit\"\ncommand = [\"echo\", \"test\"]\n",
     )

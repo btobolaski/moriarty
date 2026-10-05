@@ -1,8 +1,10 @@
-use std::{env, fs};
+use std::{env, ffi::OsStr, fs, future::pending, os::unix::ffi::OsStrExt};
 
 use super::ApprovalApp;
 use crate::{
     approval_tui::approval_state::{Screen, Section},
+    execution,
+    persistence::FileType,
     test_helpers::{
         TestEnvVarGuard, create_executable_script, run_git_command, setup_isolated_xdg_config,
         setup_project_dir_with_config, write_tools_config,
@@ -100,6 +102,32 @@ async fn test_approval_app_initialization_with_empty_config() {
 }
 
 #[tokio::test]
+async fn empty_configured_argv_is_named_not_owner_loss() {
+    for (name, config) in [
+        ("lint", "[commands]\nlint = []\n"),
+        (
+            "security",
+            "[commands]\n[[checks]]\nname = \"security\"\ncommand = []\n",
+        ),
+    ] {
+        let project = project_with_config(config);
+        let path = project.path().to_path_buf();
+        let error = execution::test_seams::run_until(
+            async move { ApprovalApp::new(path).await.map(|_| ()) },
+            pending(),
+        )
+        .await
+        .expect_err("empty argv must fail initialization");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(name) && message.contains("empty command array"),
+            "{message}"
+        );
+        assert!(!message.contains("owner lost"), "{message}");
+    }
+}
+
+#[tokio::test]
 async fn test_approval_app_initialization_with_missing_config() {
     // Test that missing tools.toml returns an error
     let temp_dir = TempDir::new().unwrap();
@@ -192,7 +220,12 @@ async fn test_save_approvals_validation() {
     let approvals = crate::project_config::ProjectApprovals::load()
         .await
         .unwrap();
-    let project_key = app.state.project_dir.to_string_lossy().to_string();
+    let project_key = app
+        .state
+        .project_dir
+        .as_path()
+        .to_string_lossy()
+        .to_string();
     assert!(
         approvals.projects.contains_key(&project_key),
         "Project should be in approvals"
@@ -302,7 +335,7 @@ async fn test_new_from_nested_subdirectory_loads_workspace_root_config() {
 
     // project_dir is the workspace root (where tools.toml lives), not the nested dir.
     assert_eq!(
-        app.state.project_dir,
+        app.state.project_dir.as_path(),
         temp_dir.path().canonicalize().unwrap(),
         "project_dir should be the workspace root, not the nested invocation dir"
     );
@@ -353,11 +386,11 @@ async fn test_canonical_path_resolution() {
 
         // Project dir should be canonicalized (symlink resolved)
         assert!(
-            app.state.project_dir.is_absolute(),
+            app.state.project_dir.as_path().is_absolute(),
             "Project dir should be absolute"
         );
         assert_eq!(
-            app.state.project_dir,
+            app.state.project_dir.as_path(),
             temp_dir.path().canonicalize().unwrap(),
             "Symlink should be resolved to real path"
         );
@@ -487,6 +520,39 @@ async fn test_save_approvals_requires_all_checks_approved() {
     app.save_approvals()
         .await
         .expect("Should succeed when all items approved");
+
+    let store = FileType::Config
+        .build_path("project_approvals.toml")
+        .await
+        .unwrap();
+    let before = fs::read(&store).unwrap();
+    for (check, canonical) in [(false, false), (false, true), (true, false), (true, true)] {
+        let mut app = new_test_app(&temp_dir).await;
+        for item in app.state.commands.iter_mut().chain(&mut app.state.checks) {
+            item.approved = true;
+        }
+        let item = if check {
+            &mut app.state.checks[0]
+        } else {
+            &mut app.state.commands[0]
+        };
+        let path = if canonical {
+            &mut item.canonical_path
+        } else {
+            &mut item.original_path
+        };
+        *path = temp_dir.path().join(OsStr::from_bytes(b"bin\xff"));
+        let error = app
+            .save_approvals()
+            .await
+            .expect_err("byte-valued identities cannot be saved");
+        assert!(format!("{error:#}").contains("Non-UTF-8"), "{error:#}");
+        assert_eq!(
+            fs::read(&store).unwrap(),
+            before,
+            "rejected TUI save changed approvals"
+        );
+    }
 }
 
 #[tokio::test]

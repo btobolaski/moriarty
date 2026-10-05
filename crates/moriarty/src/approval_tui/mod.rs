@@ -21,7 +21,7 @@ use crate::{
         is_writable, normalize_path_for_storage, read_script_contents,
         resolve_binary_path_with_original,
     },
-    repository::detect_workspace_root,
+    repository::{detect_repository_root, detect_workspace_root},
     tui::event_bus::{Event, UIEvent, input_stream},
 };
 
@@ -69,7 +69,9 @@ impl ApprovalApp {
         command_array: Vec<String>,
         workspace_root: &Path,
     ) -> miette::Result<CommandInfo> {
-        let binary_name = &command_array[0];
+        let binary_name = command_array.first().ok_or_else(|| {
+            miette::miette!("Configured item '{}' has an empty command array", name)
+        })?;
         let (original_path, canonical_path) =
             resolve_binary_path_with_original(binary_name, workspace_root)?;
 
@@ -124,10 +126,10 @@ impl ApprovalApp {
             .into_diagnostic()
             .with_context(|| format!("Failed to canonicalize path: {}", project_dir.display()))?;
 
-        let workspace_root = detect_workspace_root(&canonical_dir)?;
+        let workspace_root = detect_workspace_root(&canonical_dir).await?;
 
         // Load and parse the workspace-root tools.toml — the config that will actually run.
-        let tools_config_path = workspace_root.join(".config/tools.toml");
+        let tools_config_path = workspace_root.as_path().join(".config/tools.toml");
         let tools_config_content = read_to_string(&tools_config_path)
             .await
             .into_diagnostic()
@@ -152,18 +154,17 @@ impl ApprovalApp {
 
         // Load command and check information, resolving binaries against the workspace root so
         // the paths and hashes match what verification will resolve.
-        let command_infos = Self::load_items_info(commands, &workspace_root).await?;
+        let command_infos = Self::load_items_info(commands, workspace_root.as_path()).await?;
 
         let check_items: Vec<(String, Vec<String>)> = checks
             .into_iter()
             .map(|check| (check.name, check.command))
             .collect();
-        let check_infos = Self::load_items_info(check_items, &workspace_root).await?;
+        let check_infos = Self::load_items_info(check_items, workspace_root.as_path()).await?;
 
         Ok(Self {
             state: ApprovalState {
-                // `project_dir` is the workspace root: approvals are keyed by repository root,
-                // which `approve_project` derives from this path.
+                // Retain the validated workspace identity while its binaries are hashed; saving must not reinterpret the root.
                 project_dir: workspace_root,
                 commands: command_infos,
                 checks: check_infos,
@@ -399,12 +400,12 @@ impl ApprovalApp {
                     approved_at: None,
                     original_path: normalize_path_for_storage(
                         &cmd_info.original_path,
-                        &self.state.project_dir,
-                    ),
+                        self.state.project_dir.as_path(),
+                    )?,
                     canonical_path: normalize_path_for_storage(
                         &cmd_info.canonical_path,
-                        &self.state.project_dir,
-                    ),
+                        self.state.project_dir.as_path(),
+                    )?,
                     binary_hash: cmd_info.binary_hash.clone(),
                 },
             );
@@ -419,23 +420,23 @@ impl ApprovalApp {
                     approved_at: None,
                     original_path: normalize_path_for_storage(
                         &check_info.original_path,
-                        &self.state.project_dir,
-                    ),
+                        self.state.project_dir.as_path(),
+                    )?,
                     canonical_path: normalize_path_for_storage(
                         &check_info.canonical_path,
-                        &self.state.project_dir,
-                    ),
+                        self.state.project_dir.as_path(),
+                    )?,
                     binary_hash: check_info.binary_hash.clone(),
                 },
             );
         }
 
         let project_dir = self.state.project_dir.clone();
+        let repository_root = detect_repository_root(project_dir.as_path()).await?;
 
-        // Atomically update approvals with file locking. `approve_project` derives the
-        // repository-root key from `project_dir` (the workspace root) and stamps `approved_at`.
+        // Resolve the key before the locked transaction: async discovery must never block its worker.
         ProjectApprovals::update(move |approvals| {
-            approvals.approve_project(project_dir, commands, checks)
+            approvals.approve_project(project_dir, repository_root, commands, checks)
         })
         .await
     }
