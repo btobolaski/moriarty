@@ -7,10 +7,16 @@ security hooks for command validation.
 
 - **API pricing analyzer**: Analyzes Claude API usage from log directories and generates detailed cost or token reports
 - **Pi cost analyzer**: Analyzes pi session logs and generates daily or per-conversation cost or token reports grouped
-  by provider and model
+  by provider and model. Nonzero recorded charges are preserved; zero-cost usage (including subscription calls) is
+  estimated from `~/.pi/agent/models-store.json`, with `models.json` price overrides. `PI_CODING_AGENT_DIR` overrides
+  that directory. Estimates use current cached dollars-per-million-token rates, including prompt-size tiers and 1h cache
+  writes, not historical prices. No network requests are made; missing prices warn and leave usage at zero. Configure
+  explicit prices in `models.json` or refresh pi's catalog when rates are missing. Auxiliary `usage` records contribute
+  cost/tokens but no agent turns.
 - **Terminal graphs**: Renders chart-focused stacked summaries for Claude/API and pi usage via `moriarty graphs all`,
   `moriarty graphs claude`, and `moriarty graphs pi`. For `moriarty graphs all`, cost mode uses local pricing tables for
-  Claude values and prices recorded in pi logs for pi values; token mode combines homogeneous token counts.
+  Claude values and the same recorded-price/zero-cost-estimate policy for pi values; token mode combines homogeneous
+  token counts without consulting pricing.
 - **MCP servers**: Provides Model Context Protocol servers for read-only git operations, read-only jj operations, and
   project tools
 - **Tool call permissioning**: Security hooks that control which tools and commands Claude Code can execute

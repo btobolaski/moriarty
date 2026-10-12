@@ -3,13 +3,14 @@ use std::{collections::BTreeMap, path::Path};
 use chrono::{DateTime, NaiveDate, Utc};
 use rust_decimal::prelude::ToPrimitive;
 
-use super::pricing::PiModelMetricsMap;
+use super::{catalog::PricingCatalog, pricing::PiModelMetricsMap};
 use crate::cost_report::{
     CostComponents, DateTimezone, MetricComponents, MetricTotal, ReportMode, ReportTotals,
     TimeRangeFilter, TokenCounts,
 };
 use cost_analyzer::{
     AnalyzableLog, LineWithCost, LlmCost, TokenType, analyze_directory as cost_analyze_directory,
+    logs::pi_billable_usage,
 };
 use pi_logs::{PiLogLine, RoleMessage};
 
@@ -77,8 +78,6 @@ impl SessionMetrics {
     }
 }
 
-/// Pi logs already carry money totals, so cost mode only needs to bridge
-/// `cost_analyzer`'s Decimal values into the table layer's `f64` helpers.
 fn cost_components_from_llm_cost(cost: &LlmCost) -> miette::Result<CostComponents> {
     Ok(CostComponents::new(
         cost.input
@@ -142,24 +141,60 @@ async fn load_billable_lines(
     let result = cost_analyze_directory::<PiLogLine>(dir.to_path_buf()).await;
     let mut entries = Vec::new();
 
-    for line in result.lines {
-        if let Some(metrics) = billable_entry(&line, filter, report_mode)? {
-            entries.push((line, metrics));
+    let mut catalog = None;
+    for mut line in result.lines {
+        if !filter.contains(&line.timestamp) {
+            continue;
         }
+        if report_mode == ReportMode::Cost {
+            estimate_zero_cost(&mut line, &mut catalog)?;
+        }
+        let metrics = metric_components(&line, report_mode)?;
+        entries.push((line, metrics));
     }
 
     Ok((entries, result.had_errors))
 }
 
-fn billable_entry(
-    line: &LineWithCost<PiLogLine>,
-    filter: &TimeRangeFilter,
-    report_mode: ReportMode,
-) -> miette::Result<Option<MetricComponents>> {
-    if !filter.contains(&line.timestamp) {
-        return Ok(None);
+fn estimate_zero_cost(
+    line: &mut LineWithCost<PiLogLine>,
+    catalog: &mut Option<PricingCatalog>,
+) -> miette::Result<()> {
+    let Some(usage) = pi_billable_usage(&line.log) else {
+        return Ok(());
+    };
+    // Nonzero recorded charges remain authoritative, even if the provider's
+    // total differs from its component estimates. Reasoning is part of output.
+    // cacheWrite1h is a subset of cacheWrite, not extra billable usage.
+    // ponytail: empty counts with a corrupt 1h breakdown stay unpriced; add
+    // normalization only if pi begins reporting standalone 1h usage.
+    if [
+        usage.cost.total,
+        usage.cost.input,
+        usage.cost.output,
+        usage.cost.cache_read,
+        usage.cost.cache_write,
+    ]
+    .iter()
+    .any(|cost| !cost.is_zero())
+        || [
+            usage.input,
+            usage.output,
+            usage.cache_read,
+            usage.cache_write,
+        ]
+        .iter()
+        .all(|tokens| *tokens == 0)
+    {
+        return Ok(());
     }
-    Ok(Some(metric_components(line, report_mode)?))
+    if let Some(cost) = catalog
+        .get_or_insert_with(PricingCatalog::load)
+        .estimate(&line.model, usage)?
+    {
+        line.cost = cost;
+    }
+    Ok(())
 }
 
 pub async fn analyze_directory(
@@ -267,7 +302,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::cost_report::MetricPayload;
+    use crate::{cost_report::MetricPayload, test_helpers::TestEnvVarGuard};
     use pi_logs::Provider;
 
     fn write_log(dir: &Path, name: &str, lines: &[Value]) {
@@ -488,6 +523,103 @@ mod tests {
                 (pi_model.provider == provider && pi_model.model == model).then_some(costs)
             })
             .expect("model bucket present")
+    }
+
+    /// Keep the returned (log directory, agent catalog directory, environment
+    /// guard) alive until the report finishes; the guard restores PI_CODING_AGENT_DIR.
+    fn zero_cost_catalog_and_log(model: &str) -> (TempDir, TempDir, TestEnvVarGuard) {
+        let dir = TempDir::new().unwrap();
+        let agent = TempDir::new().unwrap();
+        let guard = TestEnvVarGuard::set("PI_CODING_AGENT_DIR", agent.path());
+        fs::write(
+            agent.path().join("models-store.json"),
+            json!({"openai":{"models":[{"id":"gpt-example","cost":{
+            "input":2,"output":12,"cacheRead":0.2,"cacheWrite":2.5}}]}})
+            .to_string(),
+        )
+        .unwrap();
+        let date = timestamp(2026, 4, 16, 0, 0);
+        let auxiliary = json!({
+            "type":"usage","id":"usage1","parentId":"a1","timestamp":date.to_rfc3339(),
+            "kind":"web_access.openai_search","provider":"openai-codex","model":model,
+            "usage":{"input":9065,"output":383,"cacheRead":3584,"cacheWrite":0,"reasoning":68,"totalTokens":13032,
+                "cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}}
+        });
+        write_log(
+            dir.path(),
+            "pi.jsonl",
+            &[
+                session_line("019dc252-e50e-766c-8182-d654b46881b0", date),
+                auxiliary,
+                openai_line("paid", date, model, "1", "2", "0", "0"),
+            ],
+        );
+        (dir, agent, guard)
+    }
+
+    #[tokio::test]
+    async fn zero_cost_usage_is_estimated_without_extra_turns() {
+        let (dir, _agent, _guard) = zero_cost_catalog_and_log("gpt-example");
+        let (lines, had_errors) =
+            load_billable_lines(dir.path(), &unrestricted_filter(), ReportMode::Cost)
+                .await
+                .unwrap();
+        assert!(!had_errors);
+        let costs: BTreeMap<_, _> = lines
+            .into_iter()
+            .map(|(line, metrics)| (line.id, (line.cost.total(), metrics.agent_turns())))
+            .collect();
+        assert_eq!(costs["usage1"], (Decimal::new(234428, 7), 0));
+        assert_eq!(costs["paid"], (Decimal::from(3), 1));
+    }
+
+    #[tokio::test]
+    async fn empty_token_usage_skips_pricing_even_with_a_cache_write_anomaly() {
+        let (dir, _agent, _guard) = zero_cost_catalog_and_log("gpt-example");
+        let empty = json!({
+            "type":"usage","id":"empty","parentId":null,"timestamp":timestamp(2026, 4, 16, 0, 0).to_rfc3339(),
+            "kind":"cache_warm","provider":"openai-codex","model":"gpt-example",
+            "usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"cacheWrite1h":1,"totalTokens":0,
+                "cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}}
+        });
+        write_log(dir.path(), "pi.jsonl", &[empty]);
+        let (lines, _) = load_billable_lines(dir.path(), &unrestricted_filter(), ReportMode::Cost)
+            .await
+            .unwrap();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].0.cost.total(), Decimal::ZERO);
+    }
+
+    #[tokio::test]
+    async fn token_mode_ignores_invalid_pricing_catalog() {
+        let (dir, agent, _guard) = zero_cost_catalog_and_log("gpt-example");
+        fs::write(
+            agent.path().join("models-store.json"),
+            json!({"openai":{"models":[{"id":"gpt-example","cost":{
+            "input":-2,"output":12,"cacheRead":0.2,"cacheWrite":2.5}}]}})
+            .to_string(),
+        )
+        .unwrap();
+        let (lines, _) =
+            load_billable_lines(dir.path(), &unrestricted_filter(), ReportMode::Tokens)
+                .await
+                .unwrap();
+        let usage = lines.iter().find(|(line, _)| line.id == "usage1").unwrap();
+        assert_eq!(usage.0.cost.total(), Decimal::ZERO);
+        assert_eq!(
+            usage.1.payload,
+            MetricPayload::Tokens(TokenCounts::new(9065, 383, 0, 3584))
+        );
+    }
+
+    #[tokio::test]
+    async fn unpriced_models_stay_zero() {
+        let (dir, _agent, _guard) = zero_cost_catalog_and_log("unknown");
+        let (lines, _) = load_billable_lines(dir.path(), &unrestricted_filter(), ReportMode::Cost)
+            .await
+            .unwrap();
+        let usage = lines.iter().find(|(line, _)| line.id == "usage1").unwrap();
+        assert_eq!(usage.0.cost.total(), Decimal::ZERO);
     }
 
     #[tokio::test]

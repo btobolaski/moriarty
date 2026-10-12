@@ -5398,6 +5398,139 @@ fn tool_result_details_route_current_shapes() {
 }
 
 #[test]
+fn legacy_directory_sweeps_round_trip_without_outcome_fields() {
+    for (tool, fixture) in [
+        ("lens_diagnostics", "lens-directory"),
+        ("lsp_diagnostics", "lsp-directory"),
+    ] {
+        let legacy = route_fixture(fixture);
+        let message = tool_result_with_details(tool, legacy.clone());
+        assert_eq!(
+            serde_json::to_value(message.details.unwrap()).unwrap(),
+            legacy,
+            "{tool}"
+        );
+    }
+}
+
+#[test]
+fn diagnostics_sweeps_accept_outcomes_and_navigation_only_files() {
+    for (tool, mut value) in [
+        ("lens_diagnostics", route_fixture("lens-directory")),
+        ("lsp_diagnostics", lsp_batch_details()),
+    ] {
+        let outcomes = json!([{ "file": "/tmp/example.rs", "outcome": "inconclusive" }]);
+        let counts = json!({"clean":0,"findings":0,"unsupported":0,"unavailable":0,"failed":0,"too_large":0,"inconclusive":1});
+        value["outcomes"] = outcomes.clone();
+        value["outcomeCounts"] = counts.clone();
+        value["navigationOnlyFiles"] = json!(1);
+        let message = tool_result_with_details(tool, value);
+        let serialized = serde_json::to_value(message.details.unwrap()).unwrap();
+        assert_eq!(serialized["outcomes"], outcomes, "{tool}");
+        assert_eq!(serialized["outcomeCounts"], counts, "{tool}");
+        assert_eq!(serialized["navigationOnlyFiles"], 1, "{tool}");
+    }
+}
+
+#[test]
+fn directory_outcomes_reject_half_pairs_and_unknown_fields() {
+    for (tool, value) in [
+        ("lens_diagnostics", route_fixture("lens-directory")),
+        ("lsp_diagnostics", route_fixture("lsp-directory")),
+    ] {
+        for (fields, expected) in [
+            (json!({"outcomes": []}), "must occur together"),
+            (json!({"unexpected": true}), "unknown field `unexpected`"),
+        ] {
+            let mut invalid = value.clone();
+            invalid
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            let error = parse_tool_result_details(tool, invalid).unwrap_err();
+            assert!(error.to_string().contains(expected), "{tool}: {error}");
+        }
+    }
+}
+
+#[test]
+fn usage_entries_preserve_auxiliary_usage_and_optional_fields() {
+    let mut value = json!({
+        "type":"usage", "id":"usage1", "parentId":null, "timestamp":FIXED_TIMESTAMP,
+        "kind":"web_access.openai_search", "provider":"openai-codex", "model":"gpt-5.6-terra",
+        "usage":{"input":9065,"output":383,"cacheRead":3584,"cacheWrite":0,"reasoning":68,"totalTokens":13032,
+            "cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},
+        "note":"ChatGPT subscription: dollar cost and quota bucket are not reported."
+    });
+    let PiLogLine::Usage(line) = parse(value.clone()) else {
+        panic!("expected usage")
+    };
+    assert_eq!(line.provider, Provider::OpenAiCodex);
+    assert_eq!(line.usage.reasoning, 68);
+    assert!(line.parent_id.is_none());
+    assert!(line.note.is_some());
+    value.as_object_mut().unwrap().remove("note");
+    value["usage"].as_object_mut().unwrap().remove("reasoning");
+    value["usage"]["cacheWrite1h"] = json!(0);
+    value["usage"]["cost"]["source"] = json!("provider");
+    let PiLogLine::Usage(line) = parse(value.clone()) else {
+        panic!("expected usage")
+    };
+    assert_eq!(line.usage.reasoning, 0);
+    assert_eq!(line.usage.cache_write1h, Some(0));
+    assert_eq!(line.usage.cost.source.as_deref(), Some("provider"));
+    assert!(line.note.is_none());
+    value["unexpected"] = json!(true);
+    assert!(
+        parse_err(value)
+            .to_string()
+            .contains("unknown field `unexpected`")
+    );
+}
+
+#[test]
+fn shepard_journal_preserves_accepted_and_bound_payloads() {
+    let accepted = json!({"kind":"accepted","parentSessionId":SESSION_ID,"subagentId":"child","runId":"run",
+        "contract":{"name":"reader","revision":"hash","configuration":{"tools":["read"]},"outputSchema":{"type":"string"}},
+        "prompt":"Read README.md", "cwd":"/tmp"});
+    for payload in [
+        accepted.clone(),
+        json!({"kind":"bound","accepted":accepted,"parentEntryId":"entry","childSessionId":"child-session"}),
+    ] {
+        let data = json!({"version":1,"eventId":"event","writerSessionId":SESSION_ID,"timestamp":FIXED_TIMESTAMP,"payload":payload});
+        let parsed = parse_custom_payload("shepard.v1", data.clone());
+        let CustomPayload::ShepardV1(journal) = parsed else {
+            panic!("expected shepard journal")
+        };
+        assert_eq!(journal.version, 1);
+        assert_eq!(serde_json::to_value(journal).unwrap(), data);
+        let mut invalid = custom_json("shepard.v1", data);
+        invalid["data"]["unexpected"] = json!(true);
+        assert!(
+            parse_err(invalid)
+                .to_string()
+                .contains("unknown field `unexpected`")
+        );
+    }
+}
+
+#[test]
+fn shepard_notice_parses_native_error_details() {
+    let payload = parse_custom_message_payload(
+        "needs attention",
+        "shepard.notice",
+        Some(json!({
+            "subagentId":"child","runId":"run","noticeId":"notice","error":{"code":"runtime_error","message":"failed"}
+        })),
+    );
+    let CustomMessagePayload::ShepardNotice(notice) = payload else {
+        panic!("expected native notice")
+    };
+    assert_eq!(notice.notice_id, "notice");
+    assert_eq!(notice.error.code, "runtime_error");
+}
+
+#[test]
 fn lens_diagnostics_file_preserves_lens_metadata() {
     let Some(ToolResultDetails::LensDiagnostics(LensDiagnosticsDetails::File(details))) =
         tool_result_with_details(
@@ -5669,6 +5802,19 @@ fn empty_success_tool_result_details_stay_strict() {
         ),
         &["did not match any variant", "required field", "blockIds"],
     );
+}
+
+#[test]
+fn get_search_content_preserves_paginated_result_breadcrumbs() {
+    let value = json!({"url":"https://example.com","title":"Example","contentLength":128406,
+        "offset":70000,"limit":30000,"returnedChars":30000,"nextOffset":100000,"truncated":true});
+    let tool = tool_result_with_details("get_search_content", value.clone());
+    let Some(ToolResultDetails::GetSearchContent(GetSearchContentDetails::Success(details))) =
+        tool.details
+    else {
+        panic!("expected success")
+    };
+    assert_eq!(serde_json::to_value(details).unwrap(), value);
 }
 
 #[test]
@@ -6269,6 +6415,54 @@ fn custom_message_shepard_roster_has_no_details() {
         ),
         CustomMessagePayload::ShepardRoster
     ));
+}
+
+#[test]
+fn shepard_receipts_parse_strictly() {
+    assert!(matches!(
+        tool_result_with_details("shepard_complete", json!({})).details,
+        Some(ToolResultDetails::Empty(_))
+    ));
+    for (name, details) in [
+        (
+            "shepard_start",
+            json!({"ok":true,"subagentId":"child","runId":"run","status":"queued"}),
+        ),
+        ("shepard_complete", json!({"ok":true,"runId":"run"})),
+        (
+            "shepard_start",
+            json!({"ok":false,"error":{"code":"runtime_error","message":"failed"}}),
+        ),
+    ] {
+        let tool = tool_result_with_details(name, details.clone());
+        let Some(ToolResultDetails::ShepardReceipt(receipt)) = tool.details else {
+            panic!("expected receipt")
+        };
+        assert_eq!(serde_json::to_value(receipt).unwrap(), details);
+    }
+    for invalid in [
+        json!({"ok":true,"runId":"run","unexpected":true}),
+        json!({"ok":true,"subagentId":"child"}),
+        json!({"ok":true,"runId":"run","error":{"code":"runtime_error","message":"failed"}}),
+    ] {
+        let error = serde_json::from_value::<ShepardReceipt>(invalid).unwrap_err();
+        assert!(error.to_string().contains("untagged enum ShepardReceipt"));
+    }
+}
+
+#[test]
+fn native_shepard_assignment_parse() {
+    let parsed = parse_custom_message_payload(
+        "Read README.md",
+        "shepard.assignment",
+        Some(json!({
+            "parentSessionId":SESSION_ID,"subagentId":"child","runId":"run","messageId":"message"
+        })),
+    );
+    let CustomMessagePayload::ShepardAssignmentV1(assignment) = parsed else {
+        panic!("expected assignment")
+    };
+    assert_eq!(assignment.message_id, "message");
 }
 
 #[test]
@@ -7819,11 +8013,12 @@ fn mcp_tool_result_accepts_initialization_error() {
 
 #[test]
 fn mcp_details_sessions_only_shape_rejects_unknown_fields() {
-    serde_json::from_value::<McpDetails>(json!({
+    let error = serde_json::from_value::<McpDetails>(json!({
         "sessions": 3,
         "unexpected": true
     }))
     .expect_err("sessions-only shape should reject unknown fields");
+    assert!(error.is_data());
 }
 
 #[test]
@@ -7871,26 +8066,29 @@ fn mcp_details_rejects_fields_from_other_modes() {
         }),
         json!({"mode": "search", "error": "unsafe_pattern"}),
     ] {
-        serde_json::from_value::<McpDetails>(details)
+        let error = serde_json::from_value::<McpDetails>(details)
             .expect_err("mode-specific fields should be rejected");
+        assert!(error.is_data());
     }
 }
 
 #[test]
 fn mcp_details_normal_mode_rejects_unknown_fields() {
-    serde_json::from_value::<McpDetails>(json!({
+    let error = serde_json::from_value::<McpDetails>(json!({
         "mode": "call",
         "garbage": true
     }))
     .expect_err("mode-based shape should reject unknown fields");
+    assert!(error.is_data());
 }
 
 #[test]
 fn mcp_details_missing_mode_without_sessions_is_rejected() {
-    serde_json::from_value::<McpDetails>(json!({
+    let error = serde_json::from_value::<McpDetails>(json!({
         "server": "git"
     }))
     .expect_err("no-mode no-sessions shape should be rejected");
+    assert!(error.is_data());
 }
 
 /// Pins the routed async-only fields on subagent results.
@@ -10799,19 +10997,21 @@ fn intercom_result_accepts_supervisor_status_payload() {
 /// details.
 #[test]
 fn intercom_result_rejects_half_present_status() {
-    serde_json::from_value::<IntercomResultDetails>(json!({
+    let error = serde_json::from_value::<IntercomResultDetails>(json!({
         "active": true,
         "pending": 0
     }))
     .expect_err("half-present supervisor status payload must be rejected");
+    assert!(error.is_data());
 }
 
 /// A `pending` value matching neither shape (not an items list, not a
 /// count) must fail loudly instead of silently defaulting.
 #[test]
 fn intercom_result_rejects_unknown_pending_shape() {
-    serde_json::from_value::<IntercomResultDetails>(json!({"pending": "many"}))
+    let error = serde_json::from_value::<IntercomResultDetails>(json!({"pending": "many"}))
         .expect_err("pending matching neither shape must be rejected");
+    assert!(error.is_data());
 }
 
 #[test]

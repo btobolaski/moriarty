@@ -245,21 +245,28 @@ siblings stay `String`), and an `imagePasteIds` field on both user and assistant
 
 **`pi_cost/`** - Pi session cost analysis:
 
-- Aggregates either pre-priced `LlmCost` values or raw token counts from `cost_analyzer` into daily buckets or
-  per-conversation buckets keyed by normalized session ID
+- Aggregates recorded `LlmCost` values or raw token counts from `cost_analyzer` into daily buckets or per-conversation
+  buckets keyed by normalized session ID. Cost mode estimates only all-zero recorded usage from pi's
+  `models-store.json`, then applies `models.json` price overrides (`PI_CODING_AGENT_DIR`, else `~/.pi/agent`); nonzero
+  recorded charges remain unchanged. The catalog is loaded lazily once per report, without network requests or
+  credential execution. Decimal estimates follow pi's prompt-size tiers and 1h cache-write pricing. Missing prices warn
+  and retain zero; invalid rates fail the report. These are current catalog estimates, not historical prices; token mode
+  never reads pricing files
 - Uses raw pi `(provider, model)` pairs for row grouping, with deterministic ordering from a
   `BTreeMap<PiModel, MetricComponents>` accumulator inside `PiModelMetricsMap`
 - Conversation mode depends on `cost_analyzer::LineWithCost.session_id`, which is attached during the single-pass parse
   from either Claude assistant lines or pi `SessionLine` headers
 - Agent turns count assistant messages only; billable compaction and branch-summary summarization calls contribute cost
-  and tokens under the active model but zero turns
+  and tokens under the active model but zero turns. Auxiliary `usage` records contribute under their explicit model,
+  with zero turns, and do not change the active model used by subsequent summaries
 - Also prepares provider/model `ChartBucket` data for `graphs pi`, reusing the same analyzer output while keeping the
   existing detailed table report unchanged
 - Entry points: `pi cost` and `graphs pi` subcommands in `main.rs`
 
 **`combined_graphs/`** - Concurrently analyzes Claude/API and pi logs, merges typed date/session series, and prefixes
-segment labels by source. Cost mode mixes Claude's local pricing with pi's recorded prices; missing defaults are skipped
-with warnings, while explicit missing paths and having no available source are errors.
+segment labels by source. Cost mode mixes Claude's local pricing with pi's recorded prices plus zero-cost catalog
+estimates; missing defaults are skipped with warnings, while explicit missing paths and having no available source are
+errors.
 
 **`pi_logs/`** - Pi session log parsing:
 
@@ -346,6 +353,20 @@ with warnings, while explicit missing paths and having no available source are e
 - `lens_diagnostics` full responses gained an optional `partialRunners` sibling of `coldRunners`
   (`LensDiagnosticsFullDetails.partial_runners`; runners that answered with partial coverage, absent on older logs),
   plus opaque optional `analysisRootValidation` metadata whose detail shape is owned by pi-lens
+- `UsageLine` parses pi's model-attributed auxiliary calls (`type: "usage"`, e.g. web access or cache warming), reusing
+  `AssistantUsage` including optional `cacheWrite1h`. Shepard's `shepard.v1` custom records retain a strict journal
+  envelope and an opaque extension-owned lifecycle payload; they are metadata, not another billable response.
+- Native shepard custom messages retain structured `details`: `shepard.notice` carries subagent/run/notice ids and an
+  error code/message, while `shepard.assignment` carries parent-session/subagent/run/message ids. The dotted native
+  assignment is distinct from the older `shepard-assignment` unit marker whose instruction lives only in `content`.
+- `shepard_start`/`shepard_complete` tool results route by name to the strict untagged `ShepardReceipt` enum
+  (`Started` with `ok`/`subagentId`/`runId`/`status`, `Completed` with `ok`/`runId`, and `Failed` with `ok`/`error`),
+  requiring each shape's co-occurring fields. Legacy empty `{}` successes reuse `ToolResultDetails::Empty` rather than
+  weakening receipt validation.
+- Lens/lsp batch and directory diagnostics accept optional `navigationOnlyFiles` so older sweeps still parse;
+  directory `outcomes`/`outcomeCounts` are grouped in `DirectoryOutcomes`, rejecting half-present pairs.
+- `GetSearchContentSuccessDetails` retains optional `offset`/`limit`/`returnedChars`/`nextOffset`/`truncated` pagination
+  breadcrumbs alongside `url`/`title`/`contentLength`; older unpaginated results omit them.
 - `CompactionLine` and `BranchSummaryLine` carry an optional `usage: Option<AssistantUsage>` recording the cost/tokens
   of the summarization call pi made to produce them (pi added this field after the initial compaction schema, so it is
   `#[serde(default)]` for backward compatibility); the lines record no provider/model of their own, so attribution is
@@ -904,7 +925,9 @@ the on-disk protocol exactly, even when that means snake_case fields like `GitRe
    because the inner tag appears at the outer level and serde does not register it as claimed; a strict outer struct
    then rejects it at runtime. `WebSearchResultsData` keeps that wire shape but restores strict outer-key validation
    with a manual deserializer. The same limitation applies to `McpSearchDetails`' flattened `McpPagination`: its custom
-   deserializer rejects every flattened key except `hasMore` and `nextOffset`. *Adjacently* tagged flatten targets
+   deserializer rejects every flattened key except `hasMore` and `nextOffset`. The directory diagnostic envelopes
+   similarly flatten `DirectoryOutcomes`, which rejects unknown keys and requires `outcomes`/`outcomeCounts` together
+   while retaining the legacy state with neither field. *Adjacently* tagged flatten targets
    (those with both `tag` and `content`) do not hit this collision, so structs like `CustomLine` and `CustomMessageLine`
    keep derived `deny_unknown_fields` handling. Each exception must carry an inline comment naming the limitation.
 2. **Corrupt-stream tolerance**: tool-argument structs (e.g. `EditArgs`, `EditReplacement`, `GrepArgs`, and now

@@ -585,11 +585,11 @@ fn pi_assistant_message(line: &PiLogLine) -> Option<&AssistantMessage> {
     }
 }
 
-/// Usage for any billable pi line. Assistant turns always carry it; compaction
-/// and branch-summary lines carry it only on logs new enough to record the
-/// summarization call's cost, and neither records a provider/model of its own.
-fn pi_billable_usage(line: &PiLogLine) -> Option<&PiAssistantUsage> {
+/// Summaries need the reader's active-model fallback; auxiliary usage instead
+/// carries its own model and must not change the conversation's active model.
+pub fn pi_billable_usage(line: &PiLogLine) -> Option<&PiAssistantUsage> {
     match line {
+        PiLogLine::Usage(usage) => Some(&usage.usage),
         PiLogLine::Compaction(compaction) => compaction.usage.as_ref(),
         PiLogLine::BranchSummary(branch_summary) => branch_summary.usage.as_ref(),
         _ => pi_assistant_message(line).map(|assistant| &assistant.usage),
@@ -626,6 +626,7 @@ impl AnalyzableLog for PiLogLine {
             PiLogLine::CustomMessage(message) => message.id.clone(),
             PiLogLine::Message(message) => message.id.clone(),
             PiLogLine::ModelChange(model_change) => model_change.id.clone(),
+            PiLogLine::Usage(usage) => usage.id.clone(),
             PiLogLine::Session(session) => session.id.to_string(),
             PiLogLine::SessionInfo(session_info) => session_info.id.clone(),
             PiLogLine::ThinkingLevelChange(thinking_level) => thinking_level.id.clone(),
@@ -633,24 +634,29 @@ impl AnalyzableLog for PiLogLine {
     }
 
     fn model(&self) -> Option<PiModel> {
-        pi_assistant_message(self).map(|assistant| PiModel {
-            model: assistant.model.clone(),
-            provider: assistant.provider,
-        })
+        match self {
+            PiLogLine::Usage(usage) => Some(PiModel {
+                model: usage.model.clone(),
+                provider: usage.provider,
+            }),
+            _ => pi_assistant_message(self).map(|assistant| PiModel {
+                model: assistant.model.clone(),
+                provider: assistant.provider,
+            }),
+        }
     }
 
     fn active_model(&self) -> Option<PiModel> {
-        // An assistant turn establishes its own model; an explicit model switch
-        // establishes the new one even though it carries no cost. Compaction and
-        // branch-summary lines carry no model, so they leave the active model
-        // unchanged and instead inherit it as a fallback in `from_log`.
-        self.model().or_else(|| match self {
+        // Auxiliary usage may use a different model (e.g. web search), but the
+        // next compaction still belongs to the conversation's selected model.
+        match self {
             PiLogLine::ModelChange(model_change) => Some(PiModel {
                 model: model_change.model_id.clone(),
                 provider: model_change.provider,
             }),
-            _ => None,
-        })
+            PiLogLine::Usage(_) => None,
+            _ => self.model(),
+        }
     }
 
     fn timestamp(&self) -> DateTime<Utc> {
@@ -662,6 +668,7 @@ impl AnalyzableLog for PiLogLine {
             PiLogLine::CustomMessage(message) => message.timestamp,
             PiLogLine::Message(message) => message.timestamp,
             PiLogLine::ModelChange(model_change) => model_change.timestamp,
+            PiLogLine::Usage(usage) => usage.timestamp,
             PiLogLine::Session(session) => session.timestamp,
             PiLogLine::SessionInfo(session_info) => session_info.timestamp,
             PiLogLine::ThinkingLevelChange(thinking_level) => thinking_level.timestamp,

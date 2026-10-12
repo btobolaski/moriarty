@@ -740,7 +740,12 @@ mod tests {
             .await,
             "test locality evaluation",
         );
-        assert!(evaluation.is_err());
+        let error = evaluation.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Blocking hook evaluation timed out during test locality evaluation")
+        );
     }
 
     #[tokio::test]
@@ -754,7 +759,13 @@ mod tests {
             ),
             "test locality evaluation",
         );
-        assert!(evaluation.is_err());
+        let error = evaluation.unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message
+                .contains("Blocking hook evaluation task failed during test locality evaluation")
+        );
+        assert!(message.contains("simulated locality evaluator failure"));
     }
 
     #[test]
