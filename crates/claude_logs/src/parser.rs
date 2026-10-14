@@ -455,6 +455,9 @@ pub struct LastPrompt {
     /// `leaf_uuid` alone without storing the prompt text.
     pub last_prompt: Option<String>,
     pub leaf_uuid: Option<Uuid>,
+    /// Only observed `true`, alongside the nil `leaf_uuid` and no prompt text. Added in Claude Code
+    /// 2.1.296+.
+    pub explicit: Option<bool>,
     pub session_id: Uuid,
 }
 
@@ -559,6 +562,7 @@ struct AttachmentLogLineWire {
     rendered: Option<Vec<RenderedAttachment>>,
     rendered_in_human_turn: Option<Vec<RenderedAttachment>>,
     rendered_role: Option<RenderedRole>,
+    rendered_beside_tool_result: Option<bool>,
     #[serde(rename = "session_id")]
     session_id_snake: Option<Uuid>,
     session_kind: Option<SessionKind>,
@@ -568,21 +572,23 @@ impl TryFrom<AttachmentLogLineWire> for AttachmentLogLine {
     type Error = String;
 
     fn try_from(wire: AttachmentLogLineWire) -> Result<Self, Self::Error> {
-        let rendering = match (
-            wire.rendered,
-            wire.rendered_in_human_turn,
-            wire.rendered_role,
-        ) {
-            (Some(rendered), rendered_in_human_turn, rendered_role) => Some(AttachmentRendering {
+        let rendering = match wire.rendered {
+            Some(rendered) => Some(AttachmentRendering {
                 rendered,
-                rendered_in_human_turn,
-                rendered_role,
+                rendered_in_human_turn: wire.rendered_in_human_turn,
+                rendered_role: wire.rendered_role,
+                rendered_beside_tool_result: wire.rendered_beside_tool_result,
             }),
-            (None, None, None) => None,
-            (None, Some(_), _) => {
+            None if wire.rendered_in_human_turn.is_some() => {
                 return Err("`renderedInHumanTurn` requires `rendered`".to_string());
             }
-            (None, None, Some(_)) => return Err("`renderedRole` requires `rendered`".to_string()),
+            None if wire.rendered_role.is_some() => {
+                return Err("`renderedRole` requires `rendered`".to_string());
+            }
+            None if wire.rendered_beside_tool_result.is_some() => {
+                return Err("`renderedBesideToolResult` requires `rendered`".to_string());
+            }
+            None => None,
         };
         Ok(Self {
             parent_uuid: wire.parent_uuid,
@@ -613,6 +619,10 @@ pub struct AttachmentRendering {
     pub rendered_in_human_turn: Option<Vec<RenderedAttachment>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rendered_role: Option<RenderedRole>,
+    /// Marks a rendering injected next to a tool result rather than as its own turn content.
+    /// Added in Claude Code 2.1.296+.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rendered_beside_tool_result: Option<bool>,
 }
 
 /// The message role an attachment's rendering was injected under. Strict so a newly observed role
@@ -2671,6 +2681,21 @@ pub struct UserLogLine {
     /// classification, the object-shaped counterpart of `classifier_meta_lines`. Absent on older
     /// lines, hence `Option`. Added in Claude Code 2.1.278+.
     pub server_classifier_context: Option<ServerClassifierContext>,
+    /// How the tool call this turn's result answers was permitted; present only on tool-result
+    /// turns. Added in Claude Code 2.1.296+.
+    pub permission_decision: Option<PermissionDecision>,
+}
+
+/// Fields stay `String` rather than strict enums because their vocabularies are undocumented and
+/// nothing downstream reads them.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct PermissionDecision {
+    pub decision: String,
+    pub source: String,
+    /// Present on hook decisions and some config ones, absent on user decisions.
+    pub reason_type: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2859,6 +2884,9 @@ pub struct MessageOrigin {
     pub body: Option<String>,
     /// Marks the message as a subagent's final report to the agent that delegated to it.
     pub handback: Option<bool>,
+    /// The background task run that a `task-notification` origin reports on. Added in Claude Code
+    /// 2.1.296+.
+    pub run_id: Option<String>,
 }
 
 /// Why Claude Code denied a tool call. Modeled as a strict enum (not a free `String`) so a new
@@ -3142,6 +3170,24 @@ pub struct AssistantLogLine {
     /// [`ModelRefusalFallback`]'s `retracted_message_uuids` when the request was retried on the
     /// fallback model. Added in Claude Code 2.1.270+.
     pub supersedes_uuids: Option<Vec<Uuid>>,
+    /// Added in Claude Code 2.1.296+, together with `thinking_display`.
+    pub thinking_duration_ms: Option<u64>,
+    /// Added in Claude Code 2.1.296+.
+    pub thinking_display: Option<ThinkingDisplay>,
+    /// The model id the user selected, which can differ from `message.model` by a capability
+    /// decoration such as `[1m]`. Pricing keeps reading `message.model`, the model that actually
+    /// served the turn. Added in Claude Code 2.1.296+.
+    pub requested_model: Option<Model>,
+}
+
+/// How thinking blocks were returned to the client. A strict enum because the API documents a
+/// closed set (`summarized`/`omitted`), so a new mode surfaces as a parse error. Added in Claude
+/// Code 2.1.296+.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ThinkingDisplay {
+    Summarized,
+    Omitted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]

@@ -7219,6 +7219,16 @@ fn test_parse_last_prompt_log_line() {
     }
 }
 
+// Claude Code 2.1.296+ emits an `explicit` marker with a nil leaf and no prompt text.
+#[test]
+fn test_parse_last_prompt_log_line_explicit() {
+    let json = r#"{"type":"last-prompt","leafUuid":"00000000-0000-0000-0000-000000000000","explicit":true,"sessionId":"3e2185a7-6bf9-4c7d-851e-9bef8acd3d52"}"#;
+    let LogLine::LastPrompt(lp) = serde_json::from_str(json).unwrap() else {
+        panic!("Expected LastPrompt");
+    };
+    assert_eq!(lp.explicit, Some(true));
+}
+
 #[test]
 fn test_parse_last_prompt_log_line_with_leaf_uuid() {
     let json = r#"{"type":"last-prompt","leafUuid":"4629e822-f089-4f87-aa1f-7d93ebe10d81","sessionId":"d1226c8d-4fe8-441b-95a0-bbfa8aae1a59"}"#;
@@ -9930,12 +9940,14 @@ fn test_parse_attachment_environment_without_scratchpad_directory() {
 }
 
 // Claude Code 2.1.270+ records the prose an attachment was rendered into, optionally with the
-// distinct rendering delivered alongside the user's turn.
+// distinct rendering delivered alongside the user's turn; 2.1.296+ also marks renderings injected
+// beside a tool result.
 #[test]
 fn test_parse_attachment_line_rendered() {
     let mut json = environment_json(None);
     json["rendered"] = serde_json::json!([{"content": "<system-reminder>env</system-reminder>"}]);
     json["renderedInHumanTurn"] = serde_json::json!([{"content": "queued"}]);
+    json["renderedBesideToolResult"] = serde_json::json!(true);
     let line = parse_attachment_line(json);
     assert_eq!(
         line.rendering
@@ -9959,6 +9971,11 @@ fn test_parse_attachment_line_rendered() {
             .as_slice()
         )
     );
+    assert_eq!(
+        line.rendering
+            .and_then(|rendering| rendering.rendered_beside_tool_result),
+        Some(true)
+    );
 }
 
 #[test]
@@ -9969,6 +9986,7 @@ fn test_parse_attachment_line_rejects_rendering_siblings_without_rendering() {
             serde_json::json!([{"content": "queued"}]),
         ),
         ("renderedRole", serde_json::json!("system")),
+        ("renderedBesideToolResult", serde_json::json!(true)),
     ] {
         let mut json = environment_json(None);
         json[key] = value;
@@ -10423,6 +10441,7 @@ fn test_parse_attachment_queued_command_with_origin() {
             sender_task_id: None,
             body: None,
             handback: None,
+            run_id: None,
         })
     );
     assert_eq!(
@@ -10511,6 +10530,7 @@ fn test_parse_attachment_queued_command_peer_handback() {
                 sender_task_id: Some("a089663affe364877".to_string()),
                 body: Some("report".to_string()),
                 handback: Some(true),
+                run_id: None,
             }),
             Some(true),
             Some("1d87a9185b328afe")
@@ -11377,6 +11397,7 @@ fn test_parse_user_log_line_task_notification_metadata() {
                 sender_task_id: None,
                 body: None,
                 handback: None,
+                run_id: None,
             }),
             Some(TurnPosition {
                 prompt_index: 0,
@@ -11384,6 +11405,49 @@ fn test_parse_user_log_line_task_notification_metadata() {
             })
         )
     );
+}
+
+// Claude Code 2.1.296+ names the background task run a task-notification origin reports on.
+#[test]
+fn test_parse_user_log_line_task_notification_run_id() {
+    let json = user_log_line_json(serde_json::json!({
+        "origin": {
+            "kind": "task-notification",
+            "producer": "session-task",
+            "runId": "0mv8m4wds-0b27a2b7"
+        }
+    }));
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(
+        line.origin.and_then(|origin| origin.run_id).as_deref(),
+        Some("0mv8m4wds-0b27a2b7")
+    );
+}
+
+// Claude Code 2.1.296+ records how the tool call a result answers was permitted; `reasonType`
+// appears on hook decisions but not on user ones.
+#[test]
+fn test_parse_user_log_line_permission_decision() {
+    for (payload, reason_type) in [
+        (
+            serde_json::json!({"decision": "accept", "source": "hook", "reasonType": "hook"}),
+            Some("hook"),
+        ),
+        (
+            serde_json::json!({"decision": "accept", "source": "user_temporary"}),
+            None,
+        ),
+    ] {
+        let json = user_log_line_json(serde_json::json!({"permissionDecision": payload}));
+        let line: UserLogLine = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            line.permission_decision
+                .expect("permissionDecision present")
+                .reason_type
+                .as_deref(),
+            reason_type
+        );
+    }
 }
 
 #[test]
@@ -11992,5 +12056,22 @@ fn test_parse_assistant_supersedes_uuids() {
                 .parse()
                 .expect("valid uuid")
         ])
+    );
+}
+
+// Claude Code 2.1.296+ records how long the turn thought, how thinking was displayed, and the
+// user-selected model id (which can carry a `[1m]` decoration absent from `message.model`).
+#[test]
+fn test_parse_assistant_thinking_and_requested_model() {
+    let line = parse_assistant_log_line(assistant_log_line_json(serde_json::json!({
+        "thinkingDurationMs": 6244,
+        "thinkingDisplay": "summarized",
+        "requestedModel": "claude-opus-5-5[1m]"
+    })));
+    assert_eq!(line.thinking_duration_ms, Some(6244));
+    assert_eq!(line.thinking_display, Some(ThinkingDisplay::Summarized));
+    assert_eq!(
+        line.requested_model.as_ref().map(Model::raw),
+        Some("claude-opus-5-5[1m]")
     );
 }

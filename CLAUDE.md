@@ -204,7 +204,13 @@ siblings stay `String`), and an `imagePasteIds` field on both user and assistant
   messages such as a subagent hand-back; independent `Option`s because only the hand-back shape has been observed) plus
   `isMeta`/`reminderId` on `queued_command` attachments, and a
   `fallback_credit` on `AssistantUsage`, typed `Option<()>` because only `null` has been observed and a real credit
-  could change a response's cost, so its shape must surface as a parse error
+  could change a response's cost, so its shape must surface as a parse error, and, in Claude Code 2.1.296+,
+  `thinkingDurationMs`, `thinkingDisplay` (the strict `ThinkingDisplay` enum, the API's documented
+  `summarized`/`omitted` set), and `requestedModel` (the user-selected `Model`, which can carry a `[1m]` decoration
+  absent from `message.model`; pricing still reads `message.model`) on assistant turns, a `permissionDecision` on user
+  turns (`PermissionDecision`, `decision`/`source` plus an optional `reasonType`, all kept `String` because their
+  vocabularies are undocumented), a `runId` on `MessageOrigin`, a `renderedBesideToolResult` flag folded into
+  `AttachmentRendering` so it cannot appear without `rendered`, and an `explicit` flag on `last-prompt` records
 - Also owns the structured view of the raw `model` string via `model::Model { family, version }` plus `ModelFamily` and
   `ModelVersion`. Both `cost_analyzer` (for pricing) and `moriarty::api_pricing` (for grouping/display) consume this one
   parser so family/version classification is not duplicated across crates. The parser preserves capability-decorated raw
