@@ -31,6 +31,10 @@ pub struct QueueOperation {
     /// The queued command the operation acted on. Added in Claude Code 2.1.285+.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command_uuid: Option<Uuid>,
+    /// Links this record to the `queued_command` attachment it delivered, which carries the same id
+    /// as snake_case `delivery_id`. Added in Claude Code 2.1.296+.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery_id: Option<DeliveryId>,
 }
 
 /// Progress events from Claude Code 2.1+.
@@ -1664,6 +1668,11 @@ pub struct QueuedCommand {
     /// as snake_case unlike its camelCase siblings, so the rename is spelled out here.
     #[serde(rename = "source_uuid")]
     pub source_uuid: Option<Uuid>,
+    /// Links this attachment to the `queue-operation` record that delivered it, which carries the
+    /// same id as camelCase `deliveryId`. Added in Claude Code 2.1.296+, snake_case like
+    /// `source_uuid`.
+    #[serde(rename = "delivery_id")]
+    pub delivery_id: Option<DeliveryId>,
     pub command_mode: String,
     /// Who queued the command (e.g. `{"kind":"human"}`); absent in logs before Claude Code
     /// 2.1.197. Reuses [`MessageOrigin`] since both carry the same `kind` discriminator.
@@ -1683,6 +1692,9 @@ pub struct QueuedCommand {
     /// The id of the `<system-reminder id=...>` frame the command was rendered into, linking it to
     /// the attachment line's rendered text. Added in Claude Code 2.1.285+.
     pub reminder_id: Option<String>,
+    /// The background task run a `task-notification` command reports on, matching
+    /// [`MessageOrigin::run_id`]. Added in Claude Code 2.1.296+.
+    pub run_id: Option<RunId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1993,6 +2005,18 @@ pub struct LocalCommandLog {
     pub is_meta: bool,
     /// Entry point that started the session (e.g., "cli"). Added in Claude Code 2.1.104+.
     pub entrypoint: Option<String>,
+    /// The slash command whose output `content` records, structured rather than parsed out of the
+    /// rendered text. Added in Claude Code 2.1.296+.
+    pub command_run: Option<LocalCommandRun>,
+}
+
+/// Observed with `command` lacking its leading slash (e.g. `rename`) and `args` as the raw,
+/// unsplit argument string.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalCommandRun {
+    pub command: String,
+    pub args: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -2335,6 +2359,18 @@ pub struct MicrocompactMetadata {
 #[serde(transparent)]
 pub struct ScheduledTaskId(pub String);
 
+/// Shared by [`MessageOrigin::run_id`] and [`QueuedCommand::run_id`] so the link between a
+/// task-notification turn and the queued command that delivered it is visible in the types.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RunId(pub String);
+
+/// Shared by [`QueueOperation::delivery_id`] and [`QueuedCommand::delivery_id`] so the link between
+/// a queue removal and the attachment it delivered is visible in the types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct DeliveryId(pub Uuid);
+
 /// `taskId`/`cron`/`prompt`/`taskKind`/`cronKind` are always emitted together on the wire (first
 /// observed in Claude Code 2.1.280; older records omit all of them), so they are grouped into one
 /// type rather than sibling `Option` fields, which would make a half-present payload
@@ -2642,9 +2678,9 @@ pub struct UserLogLine {
     /// Present only on user turns that deliver an MCP tool result; absent on ordinary turns and on
     /// built-in (non-MCP) tool results, hence `Option`. Added in Claude Code 2.1.158+.
     pub mcp_meta: Option<McpMeta>,
-    /// Why Claude Code denied the tool call this turn responds to; present only on the user turn
-    /// carrying a denied tool's error `tool_result`, absent otherwise, hence `Option`. Added in
-    /// Claude Code 2.1.201+.
+    /// Why the tool call this turn responds to produced no normal result (a denial or an
+    /// interruption); present only on the user turn carrying that call's error `tool_result`,
+    /// absent otherwise, hence `Option`. Added in Claude Code 2.1.201+.
     pub tool_denial_kind: Option<ToolDenialKind>,
     /// Preserved despite not driving analysis so a feedback-bearing denial does not make strict
     /// deserialization discard the whole turn. Added in Claude Code 2.1.219+.
@@ -2656,6 +2692,10 @@ pub struct UserLogLine {
     /// alongside it (observed on injected task notifications). Only `true` has been observed, so
     /// `Option` doubles as the absent/false case. Added in Claude Code 2.1.257+.
     pub queue_skip_attachments: Option<bool>,
+    /// Marks a queued turn recorded only in the transcript (observed on a task notification
+    /// replayed after a restart). Only `true` has been observed, so `Option` doubles as the
+    /// absent/false case. Added in Claude Code 2.1.296+.
+    pub queue_transcript_only: Option<bool>,
     /// Marks a meta turn that accompanies the turn it was injected alongside (e.g. a skill's
     /// instructions carried with the prompt that invoked it) rather than standing on its own.
     /// Added in Claude Code 2.1.238+.
@@ -2886,12 +2926,13 @@ pub struct MessageOrigin {
     pub handback: Option<bool>,
     /// The background task run that a `task-notification` origin reports on. Added in Claude Code
     /// 2.1.296+.
-    pub run_id: Option<String>,
+    pub run_id: Option<RunId>,
 }
 
-/// Why Claude Code denied a tool call. Modeled as a strict enum (not a free `String`) so a new
-/// denial kind surfaces as a parse error to be handled, matching the parser's fail-on-unknown
-/// stance. Added in Claude Code 2.1.201+.
+/// Why a tool call produced no normal result: one of several denials, or (despite the wire name)
+/// an interruption. Modeled as a strict enum (not a free `String`) so a new kind surfaces as a
+/// parse error to be handled, matching the parser's fail-on-unknown stance. Added in Claude Code
+/// 2.1.201+.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ToolDenialKind {
@@ -2903,6 +2944,9 @@ pub enum ToolDenialKind {
     /// temporarily unavailable, so the call was denied rather than approved. Added in Claude Code
     /// 2.1.201+.
     AutomodeUnavailable,
+    /// The session ended before the tool call's result was recorded, so its outcome is unknown.
+    /// Added in Claude Code 2.1.296+.
+    Interrupted,
 }
 
 /// Scheduling priority for a prompt queued while Claude Code was busy. Modeled as a strict enum

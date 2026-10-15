@@ -4937,9 +4937,8 @@ fn test_parse_compact_metadata_rejects_unknown_fields() {
     );
 }
 
-#[test]
-fn test_parse_local_command() {
-    let json = serde_json::json!({
+fn local_command_json() -> serde_json::Value {
+    serde_json::json!({
         "parentUuid": null,
         "isSidechain": false,
         "userType": "external",
@@ -4955,10 +4954,13 @@ fn test_parse_local_command() {
         "timestamp": "2025-01-01T00:00:00Z",
         "uuid": "550e8400-e29b-41d4-a716-446655440002",
         "isMeta": false
-    });
+    })
+}
 
-    let line: LogLine =
-        serde_json::from_value(json).expect("Failed to parse local_command system message");
+#[test]
+fn test_parse_local_command() {
+    let line: LogLine = serde_json::from_value(local_command_json())
+        .expect("Failed to parse local_command system message");
 
     match line {
         LogLine::System(SystemLogLine::LocalCommand(command)) => {
@@ -4970,6 +4972,25 @@ fn test_parse_local_command() {
         }
         _ => panic!("Expected System(LocalCommand) variant"),
     }
+}
+
+// `commandRun` (Claude Code 2.1.296+) records the slash command behind a `local_command` output.
+#[test]
+fn test_parse_local_command_with_command_run() {
+    let mut json = local_command_json();
+    json["commandRun"] = serde_json::json!({"command": "rename", "args": "pr 755"});
+
+    let line: LogLine = serde_json::from_value(json).expect("Failed to parse commandRun");
+    let LogLine::System(SystemLogLine::LocalCommand(command)) = line else {
+        panic!("Expected System(LocalCommand) variant");
+    };
+    assert_eq!(
+        command.command_run,
+        Some(LocalCommandRun {
+            command: "rename".to_string(),
+            args: "pr 755".to_string(),
+        })
+    );
 }
 
 #[test]
@@ -6086,6 +6107,17 @@ fn test_parse_user_log_line_with_automode_unavailable_tool_denial_kind() {
         line.tool_denial_kind,
         Some(ToolDenialKind::AutomodeUnavailable)
     );
+}
+
+#[test]
+fn test_parse_user_log_line_with_interrupted_tool_denial_kind() {
+    // Claude Code 2.1.296 marks a tool call whose session ended before its result was recorded.
+    let json = user_log_line_json(serde_json::json!({
+        "version": "2.1.296",
+        "toolDenialKind": "interrupted"
+    }));
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(line.tool_denial_kind, Some(ToolDenialKind::Interrupted));
 }
 
 #[test]
@@ -10451,7 +10483,7 @@ fn test_parse_attachment_queued_command_with_origin() {
 }
 
 #[test]
-fn test_parse_attachment_queued_command_with_source_uuid() {
+fn test_parse_attachment_queued_command_with_source_uuid_and_delivery_id() {
     let json = serde_json::json!({
         "type": "attachment",
         "parentUuid": null,
@@ -10460,6 +10492,7 @@ fn test_parse_attachment_queued_command_with_source_uuid() {
             "type": "queued_command",
             "prompt": "queued while busy",
             "source_uuid": "1f438c56-2f6c-4cf8-a2a5-d0c13f1e5ff2",
+            "delivery_id": "754492fb-ba5f-4959-b54c-b5667f660f31",
             "commandMode": "prompt",
             "origin": {"kind": "human"},
             "timestamp": "2026-08-24T18:50:38.260Z"
@@ -10482,6 +10515,12 @@ fn test_parse_attachment_queued_command_with_source_uuid() {
                 .parse::<Uuid>()
                 .unwrap()
         )
+    );
+    assert_eq!(
+        cmd.delivery_id,
+        Some(DeliveryId(
+            Uuid::parse_str("754492fb-ba5f-4959-b54c-b5667f660f31").unwrap()
+        ))
     );
 }
 
@@ -10539,12 +10578,13 @@ fn test_parse_attachment_queued_command_peer_handback() {
 }
 
 #[test]
-fn test_parse_attachment_queued_command_with_usage() {
+fn test_parse_attachment_queued_command_with_usage_and_run_id() {
     let json = attachment_line_json(serde_json::json!({
         "type": "queued_command",
         "prompt": "<task-notification>...</task-notification>",
         "commandMode": "task-notification",
-        "usage": {"totalTokens": 198551, "toolUses": 19, "durationMs": 588282}
+        "usage": {"totalTokens": 198551, "toolUses": 19, "durationMs": 588282},
+        "runId": "0mv9qqvyq-9e23da23"
     }));
     let AttachmentData::QueuedCommand(cmd) = parse_attachment(json) else {
         panic!("Expected QueuedCommand");
@@ -10557,6 +10597,7 @@ fn test_parse_attachment_queued_command_with_usage() {
             duration_ms: 588282
         })
     );
+    assert_eq!(cmd.run_id, Some(RunId("0mv9qqvyq-9e23da23".to_string())));
 }
 
 #[test]
@@ -11419,8 +11460,8 @@ fn test_parse_user_log_line_task_notification_run_id() {
     }));
     let line: UserLogLine = serde_json::from_value(json).unwrap();
     assert_eq!(
-        line.origin.and_then(|origin| origin.run_id).as_deref(),
-        Some("0mv8m4wds-0b27a2b7")
+        line.origin.and_then(|origin| origin.run_id),
+        Some(RunId("0mv8m4wds-0b27a2b7".to_string()))
     );
 }
 
@@ -11702,10 +11743,11 @@ fn test_parse_assistant_log_line_with_null_entrypoint() {
     assert_eq!(line.entrypoint, None);
 }
 
-// `reason` (Claude Code 2.1.257+) and `commandUuid` (2.1.285+) on a `queue-operation` record why
-// the entry left the queue and which queued command it was.
+// `reason` (Claude Code 2.1.257+), `commandUuid` (2.1.285+), and `deliveryId` (2.1.296+) on a
+// `queue-operation` record why the entry left the queue, which queued command it was, and which
+// delivery absorbed it.
 #[test]
-fn test_parse_queue_operation_with_reason_and_command_uuid() {
+fn test_parse_queue_operation_with_reason_command_uuid_and_delivery_id() {
     let json = serde_json::json!({
         "type": "queue-operation",
         "operation": "remove",
@@ -11713,7 +11755,8 @@ fn test_parse_queue_operation_with_reason_and_command_uuid() {
         "content": "Likely it is missing a rule to egress to traefik.",
         "sessionId": "fa4fd201-5dac-417e-b2d2-bae37c14f350",
         "reason": "absorbed_mid_turn",
-        "commandUuid": "dfe8d71e-0e1c-4eb4-9dca-e4a030808e46"
+        "commandUuid": "dfe8d71e-0e1c-4eb4-9dca-e4a030808e46",
+        "deliveryId": "754492fb-ba5f-4959-b54c-b5667f660f31"
     });
 
     let line: LogLine =
@@ -11725,14 +11768,21 @@ fn test_parse_queue_operation_with_reason_and_command_uuid() {
                 op.command_uuid,
                 Some(Uuid::parse_str("dfe8d71e-0e1c-4eb4-9dca-e4a030808e46").unwrap())
             );
+            assert_eq!(
+                op.delivery_id,
+                Some(DeliveryId(
+                    Uuid::parse_str("754492fb-ba5f-4959-b54c-b5667f660f31").unwrap()
+                ))
+            );
         }
         _ => panic!("Expected QueueOperation variant"),
     }
 }
 
-// `queueSkipAttachments` (Claude Code 2.1.257+) marks a queued turn injected without attachments.
+// `queueSkipAttachments` (Claude Code 2.1.257+) marks a queued turn injected without attachments,
+// and `queueTranscriptOnly` (2.1.296+) one recorded only in the transcript.
 #[test]
-fn test_parse_user_with_queue_skip_attachments() {
+fn test_parse_user_with_queue_skip_attachments_and_transcript_only() {
     let json = serde_json::json!({
         "parentUuid": "ff9f560a-f665-4117-9f13-324af54a8527",
         "isSidechain": false,
@@ -11741,6 +11791,7 @@ fn test_parse_user_with_queue_skip_attachments() {
         "timestamp": "2026-09-02T18:27:29.921Z",
         "message": {"role": "user", "content": "<task-notification>done</task-notification>"},
         "queueSkipAttachments": true,
+        "queueTranscriptOnly": true,
         "userType": "external",
         "entrypoint": "cli",
         "cwd": "/test",
@@ -11752,7 +11803,10 @@ fn test_parse_user_with_queue_skip_attachments() {
     let line: LogLine =
         serde_json::from_value(json).expect("Failed to parse user with queueSkipAttachments");
     match line {
-        LogLine::User(user) => assert_eq!(user.queue_skip_attachments, Some(true)),
+        LogLine::User(user) => {
+            assert_eq!(user.queue_skip_attachments, Some(true));
+            assert_eq!(user.queue_transcript_only, Some(true));
+        }
         _ => panic!("Expected User variant"),
     }
 }
