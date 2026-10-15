@@ -5856,10 +5856,79 @@ fn get_search_content_tool_result_accepts_find_details() {
     else {
         panic!("expected GetSearchContent find details")
     };
-    assert_eq!(details.find_mode, "case-insensitive");
+    assert_eq!(details.find_mode, FindMode::CaseInsensitive);
     assert_eq!(details.match_count, 0);
     assert_eq!(details.query_results.len(), 1);
     assert_eq!(details.query_results[0].match_count, 0);
+}
+
+#[test]
+fn get_search_content_tool_result_accepts_provider_query_find_details() {
+    let value = json!({
+        "responseId": "mv06vdknwxc0uk",
+        "query": "site:example.com availabilityType zone",
+        "resultCount": 5,
+        "contentLength": 3007,
+        "findMode": "case-insensitive",
+        "matchCount": 15,
+        "returnedMatches": 15,
+        "queryResults": [{"query": "zone", "matchCount": 15}]
+    });
+    let tool_result = tool_result_with_details("get_search_content", value.clone());
+    let Some(ToolResultDetails::GetSearchContent(GetSearchContentDetails::QueryFind(details))) =
+        tool_result.details
+    else {
+        panic!("expected provider-query find details")
+    };
+    assert_eq!(serde_json::to_value(details).unwrap(), value);
+}
+
+#[test]
+fn get_search_content_tool_result_rejects_unknown_find_mode() {
+    let _ = parse_err(tool_result_message_json(
+        "get_search_content",
+        vec![json!({"type": "text", "text": "matches"})],
+        false,
+        Some(json!({
+            "responseId": "response_1",
+            "query": "query",
+            "resultCount": 1,
+            "contentLength": 10,
+            "findMode": "approximate",
+            "matchCount": 1,
+            "returnedMatches": 1,
+            "queryResults": []
+        })),
+    ));
+}
+
+#[test]
+fn web_enable_tool_result_accepts_enabled_capabilities() {
+    let tool_result = tool_result_with_details("web_enable", json!({"enabled": ["web_search"]}));
+    let Some(ToolResultDetails::WebEnable(WebEnableDetails::Enabled(details))) =
+        tool_result.details
+    else {
+        panic!("expected WebEnable success details")
+    };
+    assert_eq!(
+        serde_json::to_value(details).unwrap(),
+        json!({"enabled": ["web_search"]})
+    );
+}
+
+#[test]
+fn web_enable_tool_result_accepts_failure_details() {
+    for value in [
+        json!({"unavailable": ["web_search"]}),
+        json!({"missing": ["OPENAI_API_KEY"]}),
+        json!({"error": "web access is unavailable"}),
+    ] {
+        let tool_result = tool_result_with_details("web_enable", value.clone());
+        let Some(ToolResultDetails::WebEnable(details)) = tool_result.details else {
+            panic!("expected WebEnable failure details")
+        };
+        assert_eq!(serde_json::to_value(details).unwrap(), value);
+    }
 }
 
 #[test]

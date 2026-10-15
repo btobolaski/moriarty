@@ -2358,6 +2358,7 @@ fn parse_tool_result_details(
         }
         "symbol_search" => serde_json::from_value(details).map(ToolResultDetails::SymbolSearch),
         "todo" => serde_json::from_value(details).map(ToolResultDetails::Todo),
+        "web_enable" => serde_json::from_value(details).map(ToolResultDetails::WebEnable),
         "web_search" => parse_web_search_details(details),
         "workspace_session_summaries" => {
             serde_json::from_value(details).map(ToolResultDetails::WorkspaceSessionSummaries)
@@ -2513,18 +2514,19 @@ pub enum ToolResultDetails {
     // FetchContent has no shape overlap with anything above (it declares
     // `urls`, `urlCount`, ... that no other variant carries).
     //
-    // GetSearchContent is triple-shape: its Success arm is uniquely
-    // identified by `{url, title, contentLength}`, its Error arm is
-    // `{error}` with an optional `url`, and its Find arm (a text-match
-    // replay) is identified by `findMode` beside the success breadcrumb. Earlier variants that also declare
-    // an `error` field (CodeSearchDetails, McpDetails, TodoDetails,
-    // SubagentResultDetails-via-Subagent, WebSearchDetails) all require
-    // additional discriminator fields (e.g. `query`+`maxTokens`,
-    // `mode`, `action`+`params`+`nextId`, `mode`+`results`,
-    // `queryCount`+`successfulQueries`+...), so either error shape cannot
-    // be absorbed by any of them and safely falls through here.
+    // GetSearchContent has four strict shapes: cached-page success/error,
+    // cached-page text matches, and provider-query text matches. The two
+    // find forms differ by URL/title versus responseId/query breadcrumbs.
+    // Earlier variants that also declare an `error` field (CodeSearchDetails,
+    // McpDetails, TodoDetails, SubagentResultDetails-via-Subagent,
+    // WebSearchDetails) all require additional discriminator fields (e.g.
+    // `query`+`maxTokens`, `mode`, `action`+`params`+`nextId`,
+    // `mode`+`results`, `queryCount`+`successfulQueries`+...), so either
+    // error shape cannot be absorbed by any of them and safely falls through here.
     FetchContent(FetchContentDetails),
     GetSearchContent(GetSearchContentDetails),
+    // Keep after GetSearchContent so bare `{error}` retains its existing direct fallback.
+    WebEnable(WebEnableDetails),
     McpInitializationError(McpInitializationError),
     // Hermes `memory` and `skill` are intentionally parsed by `tool_name`
     // first because their error shapes can collapse to `{}` or a bare
@@ -4062,9 +4064,10 @@ pub struct FetchContentDetails {
 
 /// Replaying a single previously-fetched URL via `get_search_content`
 /// emits a small breadcrumb describing which URL was returned and how
-/// large the cached body is. Failed retrievals may instead repeat the
+/// large the cached body is. Text-match results have separate cached-page
+/// and provider-query forms. Failed retrievals may instead repeat the
 /// requested URL beside the error message, so the error variant retains that
-/// breadcrumb while keeping both wire shapes strict.
+/// breadcrumb while keeping all wire shapes strict.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum GetSearchContentDetails {
@@ -4073,6 +4076,9 @@ pub enum GetSearchContentDetails {
     /// A text-match replay over a cached page: pi reports per-query match
     /// counts beside the usual success breadcrumb.
     Find(GetSearchContentFindDetails),
+    /// Search-provider text matches use response/query breadcrumbs instead
+    /// of the cached-page URL/title fields above.
+    QueryFind(GetSearchContentQueryFindDetails),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -4099,12 +4105,34 @@ pub struct GetSearchContentFindDetails {
     pub url: String,
     pub title: String,
     pub content_length: u64,
-    /// e.g. "case-insensitive"; the vocabulary belongs to pi's own text
-    /// matching, so it stays a raw `String`.
-    pub find_mode: String,
+    pub find_mode: FindMode,
     pub match_count: u64,
     pub returned_matches: u64,
     pub query_results: Vec<FindQueryResult>,
+}
+
+/// Provider-query matches lack cached-page URL/title fields, so their separate
+/// strict envelope preserves validation across both result producers.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GetSearchContentQueryFindDetails {
+    pub response_id: String,
+    pub query: String,
+    pub result_count: u64,
+    pub content_length: u64,
+    pub find_mode: FindMode,
+    pub match_count: u64,
+    pub returned_matches: u64,
+    pub query_results: Vec<FindQueryResult>,
+}
+
+/// Matching modes the web-access producer supports for text results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FindMode {
+    Exact,
+    CaseInsensitive,
+    Fuzzy,
 }
 
 /// Per-query match counts from a `get_search_content` text-match replay.
@@ -5391,6 +5419,42 @@ pub struct PiLensActivateToolsDetails {
     pub matches: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub added: Vec<String>,
+}
+
+/// `web_enable` returns one strict success or failure outcome.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum WebEnableDetails {
+    Enabled(WebEnableEnabledDetails),
+    Unavailable(WebEnableUnavailableDetails),
+    Missing(WebEnableMissingDetails),
+    Error(WebEnableErrorDetails),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebEnableEnabledDetails {
+    pub enabled: Vec<String>,
+}
+
+// Failure payloads are extension-owned; retain their values without accepting
+// unrelated top-level detail fields.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebEnableUnavailableDetails {
+    pub unavailable: JsonBlob,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebEnableMissingDetails {
+    pub missing: JsonBlob,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebEnableErrorDetails {
+    pub error: JsonBlob,
 }
 
 /// Results from `ast_grep_replace` come in two success shapes (the

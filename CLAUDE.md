@@ -341,8 +341,10 @@ errors.
   url/title/error/contentLength/mimeType/status) beside the legacy `urls` plus an optional `fetchCache`
   (`WebFetchCache`), search queries gain `providers`, `web_search` details gain `queryProviders` and
   truncated/originalChars/returnedChars/omittedChars, `fetch_content` details gain the raw-mode
-  mode/mimeType/status/totalBytes/totalLines/shownBytes/shownLines breadcrumbs, and `get_search_content`
-  gains a third `Find` variant (`GetSearchContentFindDetails`). `ast_grep_replace`/`ast_grep_search` are routed
+  mode/mimeType/status/totalBytes/totalLines/shownBytes/shownLines breadcrumbs. `get_search_content` distinguishes
+  success, error, cached-page `Find` (`GetSearchContentFindDetails`), and provider-query `QueryFind`
+  (`GetSearchContentQueryFindDetails`, with `responseId`/`query` breadcrumbs); `web_enable` results use strict
+  success/unavailable/missing/error `WebEnableDetails` variants. `ast_grep_replace`/`ast_grep_search` are routed
   to all-optional detail structs because each tool emits several partially-overlapping shapes (structural-rule vs
   pattern success, validation, stale-preview) with no shared required field; their empty error sentinels drop to `None`
   before routing (the tools are not in `preserves_empty_error_details`, unlike `memory`/`skill`) and only a non-error
