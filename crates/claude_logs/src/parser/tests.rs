@@ -10471,6 +10471,7 @@ fn test_parse_attachment_queued_command_with_origin() {
             producer: None,
             from: None,
             sender_task_id: None,
+            sender_agent_type: None,
             body: None,
             handback: None,
             run_id: None,
@@ -10538,8 +10539,8 @@ fn test_parse_attachment_queued_command_with_human_turn() {
     assert_eq!(cmd.human_turn, Some(true));
 }
 
-// A Claude Code 2.1.285 subagent hand-back, queued as a peer message rendered into a system
-// reminder.
+// A Claude Code subagent hand-back, queued as a peer message rendered into a system reminder.
+// `name` (the sender's agent type) was added in 2.1.296.
 #[test]
 fn test_parse_attachment_queued_command_peer_handback() {
     let json = attachment_line_json(serde_json::json!({
@@ -10550,6 +10551,7 @@ fn test_parse_attachment_queued_command_peer_handback() {
             "kind": "peer",
             "from": "a089663affe364877",
             "senderTaskId": "a089663affe364877",
+            "name": "openspec-verifier",
             "body": "report",
             "handback": true
         },
@@ -10567,6 +10569,7 @@ fn test_parse_attachment_queued_command_peer_handback() {
                 producer: None,
                 from: Some("a089663affe364877".to_string()),
                 sender_task_id: Some("a089663affe364877".to_string()),
+                sender_agent_type: Some("openspec-verifier".to_string()),
                 body: Some("report".to_string()),
                 handback: Some(true),
                 run_id: None,
@@ -11436,6 +11439,7 @@ fn test_parse_user_log_line_task_notification_metadata() {
                 producer: Some(MessageProducer::SessionTask),
                 from: None,
                 sender_task_id: None,
+                sender_agent_type: None,
                 body: None,
                 handback: None,
                 run_id: None,

@@ -2920,6 +2920,10 @@ pub struct MessageOrigin {
     /// The sending agent's address, as used in the `<agent-message from=...>` frame.
     pub from: Option<String>,
     pub sender_task_id: Option<String>,
+    /// The sending agent's type (e.g. `openspec-verifier`), unlike `from`, which is its instance
+    /// address. Added in Claude Code 2.1.296+.
+    #[serde(rename = "name")]
+    pub sender_agent_type: Option<String>,
     /// The peer's message text, without the system-reminder framing the prompt wraps it in.
     pub body: Option<String>,
     /// Marks the message as a subagent's final report to the agent that delegated to it.

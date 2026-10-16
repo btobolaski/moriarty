@@ -209,7 +209,7 @@ siblings stay `String`), and an `imagePasteIds` field on both user and assistant
   `summarized`/`omitted` set), and `requestedModel` (the user-selected `Model`, which can carry a `[1m]` decoration
   absent from `message.model`; pricing still reads `message.model`) on assistant turns, a `permissionDecision` on user
   turns (`PermissionDecision`, `decision`/`source` plus an optional `reasonType`, all kept `String` because their
-  vocabularies are undocumented), a `runId` on `MessageOrigin`, a `renderedBesideToolResult` flag folded into
+  vocabularies are undocumented), `runId` and `name` (a peer sender's agent type, `sender_agent_type` in Rust) on `MessageOrigin`, a `renderedBesideToolResult` flag folded into
   `AttachmentRendering` so it cannot appear without `rendered`, an `explicit` flag on `last-prompt` records, and a
   delivery id linking each `queue-operation` record (`deliveryId`) to the `queued_command` attachment it delivered
   (`delivery_id`, snake_case like its `source_uuid` sibling; both typed as the shared `DeliveryId` newtype), plus a `runId` on `queued_command` attachments matching
