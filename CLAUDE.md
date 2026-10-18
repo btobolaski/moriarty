@@ -332,7 +332,10 @@ errors.
   of them, the
   all-mode findings summary gained an optional `totalAdvisories` (absent on older logs), `lens_diagnostics` distinguishes
   file/delta/all/batch/directory/full (including unavailable) responses — per-file responses retain the typed
-  severity/source/scope fields, and the directory sweep shares the lsp_diagnostics
+  severity/source/scope fields and gained the producer's discriminated `outcome` verdict (strict
+  `LensDiagnosticsOutcome`; observed `too_large`, whose response omits the per-server counts and confirmation flags
+  entirely, so those now default) plus optional `tooLargeReason`/`unavailable`/`skipReason`/`dispositionSuppressed`/
+  `navigationOnlyFiles`/`lspHealth`/`waitMs` breadcrumbs, and the directory sweep shares the lsp_diagnostics
   directory shape but keeps lens's typed severity/source/scope enums, with the same optional sibling fields as the
   lens batch envelope (`dispositionSuppressed`, timeouts, health warnings, wait) — `lsp_diagnostics` distinguishes file/batch/directory responses,
   `lens_diagnostic_mark` keeps typed dispositions and nonzero lines, and `module_report` accepts optional callback
@@ -342,8 +345,11 @@ errors.
   (`WebFetchCache`), search queries gain `providers`, `web_search` details gain `queryProviders` and
   truncated/originalChars/returnedChars/omittedChars, `fetch_content` details gain the raw-mode
   mode/mimeType/status/totalBytes/totalLines/shownBytes/shownLines breadcrumbs. `get_search_content` distinguishes
-  success, error, cached-page `Find` (`GetSearchContentFindDetails`), and provider-query `QueryFind`
-  (`GetSearchContentQueryFindDetails`, with `responseId`/`query` breadcrumbs); `web_enable` results use strict
+  success, error, cached-page `Find` (`GetSearchContentFindDetails`), provider-query `QueryFind`
+  (`GetSearchContentQueryFindDetails`, with `responseId`/`query` breadcrumbs), and character-slice replays of stored
+  provider results (`SearchSlice`, `responseId`/`query` breadcrumbs plus `offset`/`limit`/`returnedChars`/
+  `nextOffset`/`truncated` pagination); the error shape also carries optional `offset`/`limit`/`maxLimit`/
+  `contentLength` argument-validation bounds; `web_enable` results use strict
   success/unavailable/missing/error `WebEnableDetails` variants. `ast_grep_replace`/`ast_grep_search` are routed
   to all-optional detail structs because each tool emits several partially-overlapping shapes (structural-rule vs
   pattern success, validation, stale-preview) with no shared required field; their empty error sentinels drop to `None`
@@ -374,7 +380,13 @@ errors.
 - `shepard_start`/`shepard_complete` tool results route by name to the strict untagged `ShepardReceipt` enum
   (`Started` with `ok`/`subagentId`/`runId`/`status`, `Completed` with `ok`/`runId`, and `Failed` with `ok`/`error`),
   requiring each shape's co-occurring fields. Legacy empty `{}` successes reuse `ToolResultDetails::Empty` rather than
-  weakening receipt validation.
+  weakening receipt validation. The remaining native shepard tools route by name to untagged success/failure unions:
+  `shepard_ask` (`ShepardAskDetails`), `shepard_wait` (`ShepardWaitDetails`, with
+  `ShepardRunInspection`/`ShepardWaitRun` run rows), `shepard_reply` (`ShepardReplyDetails`), `shepard_send`
+  (`ShepardSendDetails`), `shepard_inspect` (`ShepardInspectDetails`), and `shepard_interrupt`/`shepard_stop`
+  (`ShepardInterruptDetails`); the closed `ShepardWaitReason`/`ShepardRunStatus`/`ShepardRunKind` vocabularies
+  fail loudly on new values while the caller-owned contract `configuration`/`outputSchema` and completion `result`
+  stay opaque `JsonBlob`s.
 - Lens/lsp batch and directory diagnostics accept optional `navigationOnlyFiles` so older sweeps still parse;
   directory `outcomes`/`outcomeCounts` are grouped in `DirectoryOutcomes`, rejecting half-present pairs.
 - `GetSearchContentSuccessDetails` retains optional `offset`/`limit`/`returnedChars`/`nextOffset`/`truncated` pagination

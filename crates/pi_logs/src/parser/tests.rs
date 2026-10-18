@@ -8,6 +8,7 @@
 use std::{error::Error as _, path::PathBuf};
 
 use chrono::{DateTime, Utc};
+use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 use super::*;
@@ -302,6 +303,23 @@ fn tool_result_with_details(tool_name: &str, details: Value) -> ToolResultMessag
         false,
         Some(details),
     ))
+}
+
+/// Pins a shepard tool's routed details two ways: the routed variant must
+/// re-parse into the expected union type (its disjoint required fields make
+/// a misrouting fail), and the union must serialize back to the wire value.
+fn assert_shepard_round_trip<T: Serialize + DeserializeOwned>(
+    tool_name: &str,
+    payload: Value,
+    label: &str,
+) {
+    let tool = tool_result_with_details(tool_name, payload.clone());
+    let Some(details) = tool.details else {
+        panic!("{label}: no details")
+    };
+    let parsed: T = serde_json::from_value(serde_json::to_value(&details).unwrap())
+        .unwrap_or_else(|error| panic!("{label}: {error}"));
+    assert_eq!(serde_json::to_value(parsed).unwrap(), payload, "{label}");
 }
 
 fn lens_full_details(summary: Value) -> Value {
@@ -5550,7 +5568,9 @@ fn lens_diagnostics_file_preserves_lens_metadata() {
                 "truncated": false,
                 "unconfirmed": true,
                 "timedOut": false,
-                "unconfirmedServerIds": ["opengrep", "typos"]
+                "unconfirmedServerIds": ["opengrep", "typos"],
+                "unavailable": "rust-analyzer not running",
+                "waitMs": 1200
             }),
         )
         .details
@@ -5566,6 +5586,45 @@ fn lens_diagnostics_file_preserves_lens_metadata() {
         details.unconfirmed_server_ids.as_deref(),
         Some(["opengrep".to_string(), "typos".to_string()].as_slice())
     );
+    assert_eq!(
+        details.unavailable.as_deref(),
+        Some("rust-analyzer not running")
+    );
+    assert_eq!(details.wait_ms, Some(1200));
+}
+
+// Pinned from a production line (the parse failure that motivated the
+// relaxation): the per-file too-large response omits the per-server counts
+// and confirmation flags and instead carries the discriminated outcome.
+#[test]
+fn lens_diagnostics_file_accepts_too_large_outcome() {
+    let value = json!({
+        "mode": "file",
+        "filePath": "/home/brendan/src/moriarty/crates/pi_logs/src/parser.rs",
+        "severity": "all",
+        "serverScope": "all",
+        "outcome": "too_large",
+        "tooLargeReason": "file too large for LSP diagnostics (6718 lines > 5000 limit)",
+        "diagnostics": [],
+        "totalDiagnostics": 0,
+        "source": "lsp",
+        "scope": "paths"
+    });
+    let Some(ToolResultDetails::LensDiagnostics(LensDiagnosticsDetails::File(details))) =
+        tool_result_with_details("lens_diagnostics", value.clone()).details
+    else {
+        panic!("expected lens file details")
+    };
+    // Defaults serialize back and the mode tag is consumed by routing, so
+    // the round-trip matches the payload with those keys adjusted.
+    let mut expected = value.clone();
+    let object = expected.as_object_mut().unwrap();
+    object.remove("mode");
+    object.insert("primaryDiagnosticsCount".into(), 0.into());
+    object.insert("auxiliaryDiagnosticsCount".into(), 0.into());
+    object.insert("truncated".into(), false.into());
+    object.insert("unconfirmed".into(), false.into());
+    assert_eq!(serde_json::to_value(details).unwrap(), expected);
 }
 
 #[test]
@@ -5985,6 +6044,68 @@ fn get_search_content_tool_result_accepts_error_details_with_response_id() {
     };
     assert_eq!(details.error, "Not found");
     assert_eq!(details.response_id.as_deref(), Some("m011"));
+}
+
+// Pinned from a production line (the parse failure that motivated the
+// variant): a character-slice replay of a stored provider search result
+// carries response/query breadcrumbs with pagination, and no URL/title or
+// find-match fields.
+#[test]
+fn get_search_content_tool_result_accepts_search_slice_details() {
+    let value = json!({
+        "responseId": "mva3sanuue2viv",
+        "query": "POSIX printf %b backslash octal specification",
+        "resultCount": 5,
+        "contentLength": 3489u64,
+        "offset": 0u64,
+        "limit": 20000u64,
+        "returnedChars": 3489u64,
+        "nextOffset": null,
+        "truncated": false
+    });
+    // nextOffset serializes only when present, matching the other
+    // pagination breadcrumbs.
+    let mut expected = value.clone();
+    expected.as_object_mut().unwrap().remove("nextOffset");
+    let tool = tool_result_with_details("get_search_content", value);
+    let Some(ToolResultDetails::GetSearchContent(GetSearchContentDetails::SearchSlice(details))) =
+        tool.details
+    else {
+        panic!("expected search-slice details")
+    };
+    assert_eq!(serde_json::to_value(details).unwrap(), expected);
+
+    // Mid-slice continuations carry a populated nextOffset.
+    let mut continuation = expected.as_object().unwrap().clone();
+    continuation.insert("nextOffset".into(), 100000u64.into());
+    continuation.insert("truncated".into(), true.into());
+    let Some(ToolResultDetails::GetSearchContent(GetSearchContentDetails::SearchSlice(details))) =
+        tool_result_with_details("get_search_content", Value::Object(continuation)).details
+    else {
+        panic!("expected search-slice details")
+    };
+    assert_eq!(details.next_offset, Some(100000));
+    assert!(details.truncated);
+}
+
+// The stored-search slice path reports invalid offset/limit arguments
+// beside the error message; those bounds must not be dropped.
+#[test]
+fn get_search_content_tool_result_accepts_error_details_with_argument_bounds() {
+    let tool = tool_result_with_details(
+        "get_search_content",
+        json!({"error": "Invalid limit", "limit": 0u64, "maxLimit": 20000u64}),
+    );
+    let Some(ToolResultDetails::GetSearchContent(GetSearchContentDetails::Error(details))) =
+        tool.details
+    else {
+        panic!("expected error details")
+    };
+    assert_eq!(details.error, "Invalid limit");
+    assert_eq!(details.limit, Some(0));
+    assert_eq!(details.max_limit, Some(20000));
+    assert!(details.offset.is_none());
+    assert!(details.content_length.is_none());
 }
 
 // Pins the strict-variant invariant of GetSearchContentDetails: a payload
@@ -6517,6 +6638,251 @@ fn shepard_receipts_parse_strictly() {
         let error = serde_json::from_value::<ShepardReceipt>(invalid).unwrap_err();
         assert!(error.to_string().contains("untagged enum ShepardReceipt"));
     }
+}
+
+fn shepard_inspection_run_json() -> Value {
+    // Populated completed shape so the optional observation fields, the
+    // nested pending-question and notice structs, and the completion result
+    // are pinned by a round-trip, not only by production lines.
+    json!({
+        "kind": "agent",
+        "parentSessionId": SESSION_ID,
+        "subagentId": "7410072a-9a92-4e2d-9fdb-89e1348c7698",
+        "runId": "7498a03c-8a6e-4ff3-92fa-8e528e8cfe82",
+        "contract": {
+            "name": "stage1-reader",
+            "configuration": {"model": {"provider": "openrouter", "id": "z-ai/glm-5.3-flash"}, "tools": ["read"]},
+            "outputSchema": {"type": "string"},
+            "revision": "a00819f94d40a623"
+        },
+        "prompt": "Bounded read-only control proof.",
+        "cwd": "/home/brendan/src/pi-shepard",
+        "createdAt": "2026-10-16T17:21:51.780Z",
+        "updatedAt": "2026-10-16T17:21:51.906Z",
+        "pendingPermissions": ["bash"],
+        "observationError": {"code": "busy", "message": "native observation unavailable"},
+        "pendingQuestion": {"questionId": "question", "question": "LIVE_CTRL_GATE_ONE"},
+        "controls": [{"controlId": "control", "operation": "interrupt", "state": "requested"}],
+        "notices": [{
+            "noticeId": "notice",
+            "timestamp": "2026-10-16T17:21:52.123Z",
+            "error": {"code": "runtime_error", "message": "notice"}
+        }],
+        "status": "completed",
+        "result": {"answer": "done"}
+    })
+}
+
+// Pinned from production lines (the parse failures that motivated these
+// variants): shepard_ask answers and shepard_wait timeout rows were
+// previously unrouted, so every such tool result failed to parse.
+
+/// Per-union success payloads shared by the round-trip and rejection tests.
+fn shepard_success_payload(tool: &str) -> Value {
+    match tool {
+        "shepard_ask" => json!({
+            "ok": true,
+            "questionId": "7498a03c-8a6e-4ff3-92fa-8e528e8cfe82/6811fc3f-ea58-4422-806f-2825188eeb29",
+            "answer": "Proceed to LIVE_CTRL_GATE_TWO; keep work unfinished."
+        }),
+        "shepard_wait" => json!({
+            "ok": true,
+            "reason": "timeout",
+            "runs": [shepard_inspection_run_json()]
+        }),
+        "shepard_reply" => json!({
+            "ok": true,
+            "questionId": "question",
+            "subagentId": "child",
+            "runId": "run",
+            "accepted": true
+        }),
+        "shepard_send" => json!({
+            "ok": true,
+            "messageId": "message",
+            "runId": "run",
+            "disposition": "queued"
+        }),
+        "shepard_inspect" => json!({"ok": true, "run": shepard_inspection_run_json()}),
+        "shepard_interrupt" => json!({
+            "ok": true,
+            "subagentId": "7410072a-9a92-4e2d-9fdb-89e1348c7698",
+            "runId": "7498a03c-8a6e-4ff3-92fa-8e528e8cfe82",
+            "controlId": "b9671b25",
+            "state": "requested"
+        }),
+        _ => unreachable!("unknown shepard tool {tool}"),
+    }
+}
+
+#[test]
+fn shepard_ask_results_parse_strictly() {
+    assert_shepard_round_trip::<ShepardAskDetails>(
+        "shepard_ask",
+        shepard_success_payload("shepard_ask"),
+        "ask answer",
+    );
+}
+
+/// Routes a shared failure receipt through each tool name and asserts the
+/// union's `Failed` variant; these arms have no production pin yet, so a
+/// routing mistake would otherwise ship silently.
+macro_rules! assert_failed_receipt {
+    ($tool:literal, $outer:ident, $inner:ident) => {
+        let tool = tool_result_with_details(
+            $tool,
+            json!({"ok": false, "error": {"code": "busy", "message": "failed"}}),
+        );
+        assert!(
+            matches!(tool.details, Some(ToolResultDetails::$outer($inner::Failed { .. }))),
+            $tool
+        );
+    };
+}
+
+#[test]
+fn shepard_failure_receipts_route_to_failed_variants() {
+    // Failures keep whichever known ids were resolvable.
+    let failed_reply = tool_result_with_details(
+        "shepard_reply",
+        json!({
+            "ok": false,
+            "error": {"code": "question_closed", "message": "failed"},
+            "questionId": "q"
+        }),
+    );
+    let Some(ToolResultDetails::ShepardReply(details)) = failed_reply.details else {
+        panic!("expected reply failure")
+    };
+    let ShepardReplyDetails::Failed {
+        question_id: Some(ref question_id),
+        ..
+    } = details
+    else {
+        panic!("expected populated question id")
+    };
+    assert_eq!(question_id, "q");
+
+    assert_failed_receipt!("shepard_ask", ShepardAsk, ShepardAskDetails);
+    assert_failed_receipt!("shepard_wait", ShepardWait, ShepardWaitDetails);
+    assert_failed_receipt!("shepard_reply", ShepardReply, ShepardReplyDetails);
+    assert_failed_receipt!("shepard_send", ShepardSend, ShepardSendDetails);
+    assert_failed_receipt!("shepard_inspect", ShepardInspect, ShepardInspectDetails);
+    assert_failed_receipt!(
+        "shepard_interrupt",
+        ShepardInterrupt,
+        ShepardInterruptDetails
+    );
+}
+
+#[test]
+fn shepard_wait_rows_parse_strictly() {
+    let wait_value = shepard_success_payload("shepard_wait");
+    let wait = tool_result_with_details("shepard_wait", wait_value.clone());
+    let Some(ToolResultDetails::ShepardWait(details)) = wait.details else {
+        panic!("expected shepard_wait row")
+    };
+    let ShepardWaitDetails::Waited { reason, runs, .. } = details else {
+        panic!("expected waited receipt")
+    };
+    assert_eq!(reason, ShepardWaitReason::Timeout);
+    assert_eq!(serde_json::to_value(runs).unwrap(), wait_value["runs"]);
+}
+
+#[test]
+fn shepard_wait_unavailable_rows_parse_strictly() {
+    // Per-run inspection failures keep only the run id.
+    let wait = tool_result_with_details(
+        "shepard_wait",
+        json!({
+            "ok": true,
+            "reason": "finished",
+            "runs": [{"runId": "run", "error": {"code": "not_found", "message": "gone"}}]
+        }),
+    );
+    let Some(ToolResultDetails::ShepardWait(details)) = wait.details else {
+        panic!("expected shepard_wait row")
+    };
+    let ShepardWaitDetails::Waited { runs, .. } = details else {
+        panic!("expected waited receipt")
+    };
+    assert!(matches!(runs.as_slice(), [ShepardWaitRun::Unavailable(_)]));
+}
+
+// Success shapes without production pins yet; the round-trip helper pins
+// each tool's routing arm and its serialization.
+#[test]
+fn remaining_shepard_tool_results_parse_strictly() {
+    assert_shepard_round_trip::<ShepardReplyDetails>(
+        "shepard_reply",
+        shepard_success_payload("shepard_reply"),
+        "reply acceptance",
+    );
+    assert_shepard_round_trip::<ShepardSendDetails>(
+        "shepard_send",
+        shepard_success_payload("shepard_send"),
+        "send queued",
+    );
+    assert_shepard_round_trip::<ShepardInspectDetails>(
+        "shepard_inspect",
+        shepard_success_payload("shepard_inspect"),
+        "inspect run",
+    );
+    assert_shepard_round_trip::<ShepardInterruptDetails>(
+        "shepard_interrupt",
+        shepard_success_payload("shepard_interrupt"),
+        "interrupt requested",
+    );
+    assert_shepard_round_trip::<ShepardInterruptDetails>(
+        "shepard_stop",
+        json!({"ok": true, "subagentId": "child", "runId": "run", "state": "already_finished"}),
+        "stop already finished",
+    );
+}
+
+// Each new union must reject mixed success+error and unknown-field
+// payloads. The mixed payload pins that the Failed variant cannot absorb a
+// success sibling; the complete-success-plus-unknown-key payload pins
+// `deny_unknown_fields` itself — every required field is present, so only
+// the unknown-key rejection can make it fail.
+macro_rules! assert_rejects_mixed_and_unknown {
+    ($ty:ty, $success:expr) => {{
+        // The Failed variant must not absorb a success sibling.
+        let mixed = json!({
+            "ok": true,
+            "answer": "answer",
+            "error": {"code": "busy", "message": "failed"}
+        });
+        assert!(serde_json::from_value::<$ty>(mixed).is_err(), stringify!($ty));
+
+        // With every required field present, only `deny_unknown_fields`
+        // can reject the injected unknown key.
+        let mut success = $success;
+        success
+            .as_object_mut()
+            .unwrap()
+            .insert("unexpected".into(), true.into());
+        assert!(serde_json::from_value::<$ty>(success).is_err(), stringify!($ty));
+    }};
+}
+
+#[test]
+fn new_shepard_unions_reject_mixed_and_unknown_payloads() {
+    assert_rejects_mixed_and_unknown!(ShepardAskDetails, shepard_success_payload("shepard_ask"));
+    assert_rejects_mixed_and_unknown!(ShepardWaitDetails, shepard_success_payload("shepard_wait"));
+    assert_rejects_mixed_and_unknown!(
+        ShepardReplyDetails,
+        shepard_success_payload("shepard_reply")
+    );
+    assert_rejects_mixed_and_unknown!(ShepardSendDetails, shepard_success_payload("shepard_send"));
+    assert_rejects_mixed_and_unknown!(
+        ShepardInspectDetails,
+        shepard_success_payload("shepard_inspect")
+    );
+    assert_rejects_mixed_and_unknown!(
+        ShepardInterruptDetails,
+        shepard_success_payload("shepard_interrupt")
+    );
 }
 
 #[test]

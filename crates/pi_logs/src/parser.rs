@@ -1948,6 +1948,262 @@ pub enum ShepardReceipt {
     },
 }
 
+// Remaining native shepard tool results: each tool's output schema is a
+// union of one success shape plus the shared `{ok: false, error}` failure
+// receipt (sometimes carrying optional known-id siblings), so each is
+// modeled as an untagged enum whose variants reject the other shape's
+// required fields.
+
+/// `shepard_ask` blocks a child until the parent answers; the result is the
+/// correlated answer. Failures carry no ids.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(untagged, rename_all_fields = "camelCase", deny_unknown_fields)]
+pub enum ShepardAskDetails {
+    Answered {
+        ok: bool,
+        question_id: String,
+        answer: String,
+    },
+    Failed {
+        ok: bool,
+        error: ShepardNoticeError,
+    },
+}
+
+/// Why a `shepard_wait` returned. Closed vocabulary from the extension's
+/// wait output schema; a new reason must surface as a parse error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShepardWaitReason {
+    Finished,
+    Attention,
+    Timeout,
+}
+
+/// One `shepard_wait` run row: either a live run inspection or a per-run
+/// inspection failure carrying only the run id.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ShepardWaitRun {
+    // Boxed because ShepardRunInspection dwarfs the unavailable row.
+    Inspection(Box<ShepardRunInspection>),
+    Unavailable(ShepardRunUnavailable),
+}
+
+/// Per-run `shepard_wait` inspection failure carrying only the run id.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ShepardRunUnavailable {
+    pub run_id: String,
+    pub error: ShepardNoticeError,
+}
+
+/// `shepard_wait` blocks until child runs resolve; the receipt pairs the
+/// wake reason with per-run inspection rows (or per-run inspection
+/// failures).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(untagged, rename_all_fields = "camelCase", deny_unknown_fields)]
+pub enum ShepardWaitDetails {
+    Waited {
+        ok: bool,
+        reason: ShepardWaitReason,
+        runs: Vec<ShepardWaitRun>,
+    },
+    Failed {
+        ok: bool,
+        error: ShepardNoticeError,
+    },
+}
+
+/// Live native run inspection shared by `shepard_wait` run rows and
+/// `shepard_inspect`. The contract's sampling configuration and the
+/// completion result are caller-owned JSON, so they stay opaque; the
+/// remaining fields are pinned by shepard's own run schema.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ShepardRunInspection {
+    pub kind: ShepardRunKind,
+    pub parent_session_id: String,
+    pub subagent_id: String,
+    pub run_id: String,
+    pub contract: ShepardContract,
+    pub prompt: String,
+    pub cwd: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_permissions: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation_error: Option<ShepardNoticeError>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_question: Option<ShepardPendingQuestion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controls: Option<Vec<ShepardRunControl>>,
+    pub notices: Vec<ShepardRunNotice>,
+    pub status: ShepardRunStatus,
+    /// Present only on `completed` inspections; shape is caller-owned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<JsonBlob>,
+}
+
+/// Closed stage-1 run vocabulary pinned by the extension's inspection
+/// schema; only `completed` inspections carry a `result`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShepardRunStatus {
+    Queued,
+    Running,
+    Completed,
+}
+
+/// Only agent-kind runs are inspected today; a new kind must surface as a
+/// parse error rather than being silently dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShepardRunKind {
+    Agent,
+}
+
+/// Schema-derived agent contract pinned by shepard's journal acceptance;
+/// configuration and output schema are caller-owned JSON.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ShepardContract {
+    pub name: String,
+    pub revision: String,
+    pub configuration: JsonBlob,
+    pub output_schema: JsonBlob,
+}
+
+/// A child's question awaiting the parent's reply, from the run-inspection
+/// schema.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ShepardPendingQuestion {
+    pub question_id: String,
+    pub question: String,
+}
+
+/// A queued-message delivery failure recorded on the run's inspection.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ShepardRunNotice {
+    pub notice_id: String,
+    pub timestamp: DateTime<Utc>,
+    pub error: ShepardNoticeError,
+}
+
+/// One pending cancellation request in a run's `controls` list. The
+/// operation/state vocabularies are extension-owned, so they stay open
+/// `String`s like [`ShepardInterruptDetails`]'s `state` fields.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ShepardRunControl {
+    pub control_id: String,
+    pub operation: String,
+    pub state: String,
+}
+
+/// `shepard_reply` answers a child's question; failures keep whichever known
+/// ids were resolvable when the reply failed.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(untagged, rename_all_fields = "camelCase", deny_unknown_fields)]
+pub enum ShepardReplyDetails {
+    Accepted {
+        ok: bool,
+        question_id: String,
+        subagent_id: String,
+        run_id: String,
+        accepted: bool,
+    },
+    Failed {
+        ok: bool,
+        error: ShepardNoticeError,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        question_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subagent_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+    },
+}
+
+/// `shepard_send` queues guidance to a running child; failures keep whatever
+/// ids were resolvable when the send failed.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(untagged, rename_all_fields = "camelCase", deny_unknown_fields)]
+pub enum ShepardSendDetails {
+    Queued {
+        ok: bool,
+        message_id: String,
+        run_id: String,
+        /// Wire pin today is "queued"; kept open like
+        /// `ShepardReceipt::Started::status` because the disposition
+        /// vocabulary is extension-owned and nothing downstream reads it.
+        disposition: String,
+    },
+    Failed {
+        ok: bool,
+        error: ShepardNoticeError,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subagent_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+    },
+}
+
+/// `shepard_inspect` returns one run's status/result view.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(untagged, rename_all_fields = "camelCase", deny_unknown_fields)]
+pub enum ShepardInspectDetails {
+    // Boxed for the same size reason as ShepardWaitRun::Inspection.
+    Run {
+        ok: bool,
+        run: Box<ShepardRunInspection>,
+    },
+    Failed {
+        ok: bool,
+        error: ShepardNoticeError,
+    },
+}
+
+/// `shepard_interrupt`/`shepard_stop` control receipts. Only a requested
+/// interruption carries a control id, so a stop of an already-finished run
+/// is its own shape; failures keep whatever ids were resolvable.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(untagged, rename_all_fields = "camelCase", deny_unknown_fields)]
+pub enum ShepardInterruptDetails {
+    Requested {
+        ok: bool,
+        subagent_id: String,
+        run_id: String,
+        control_id: String,
+        /// Requested pins "requested" and AlreadyFinished pins
+        /// "already_finished"; the control-lifecycle vocabulary is
+        /// extension-owned, so the states stay open `String`s.
+        state: String,
+    },
+    AlreadyFinished {
+        ok: bool,
+        subagent_id: String,
+        run_id: String,
+        /// Same open-vocabulary reason as `Requested::state`.
+        state: String,
+    },
+    Failed {
+        ok: bool,
+        error: ShepardNoticeError,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subagent_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        control_id: Option<String>,
+    },
+}
+
 /// Persists the source range so observation extraction can resume after compaction.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -2348,6 +2604,14 @@ fn parse_tool_result_details(
             // Early shepard_complete successes emitted {} rather than a receipt.
             empty_or(details, ToolResultDetails::ShepardReceipt)
         }
+        "shepard_ask" => serde_json::from_value(details).map(ToolResultDetails::ShepardAsk),
+        "shepard_wait" => serde_json::from_value(details).map(ToolResultDetails::ShepardWait),
+        "shepard_reply" => serde_json::from_value(details).map(ToolResultDetails::ShepardReply),
+        "shepard_send" => serde_json::from_value(details).map(ToolResultDetails::ShepardSend),
+        "shepard_inspect" => serde_json::from_value(details).map(ToolResultDetails::ShepardInspect),
+        "shepard_interrupt" | "shepard_stop" => {
+            serde_json::from_value(details).map(ToolResultDetails::ShepardInterrupt)
+        }
         "shepard_contact" | "shepard_contact_parent" => {
             serde_json::from_value(details).map(ToolResultDetails::ShepardContact)
         }
@@ -2470,6 +2734,14 @@ pub enum ToolResultDetails {
     // extension tools.
     ShepardContact(ShepardEventId),
     ShepardReceipt(ShepardReceipt),
+    // Remaining native shepard tools, each routed by tool name above; their
+    // success/failure unions are pinned by the extension's own output schemas.
+    ShepardAsk(ShepardAskDetails),
+    ShepardWait(ShepardWaitDetails),
+    ShepardReply(ShepardReplyDetails),
+    ShepardSend(ShepardSendDetails),
+    ShepardInspect(ShepardInspectDetails),
+    ShepardInterrupt(ShepardInterruptDetails),
     WebSearch(WebSearchDetails),
     // Grep precedes Read for direct `ToolResultDetails` shape matching
     // because both accept `{matchLimitReached, linesTruncated}` and
@@ -4079,6 +4351,10 @@ pub enum GetSearchContentDetails {
     /// Search-provider text matches use response/query breadcrumbs instead
     /// of the cached-page URL/title fields above.
     QueryFind(GetSearchContentQueryFindDetails),
+    /// A character-slice replay of a stored provider-search response:
+    /// response/query breadcrumbs with pagination instead of the find
+    /// envelopes' match counts.
+    SearchSlice(GetSearchContentSearchSliceDetails),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -4126,6 +4402,23 @@ pub struct GetSearchContentQueryFindDetails {
     pub query_results: Vec<FindQueryResult>,
 }
 
+/// Character-slice retrieval of one stored provider-search query's results.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GetSearchContentSearchSliceDetails {
+    pub response_id: String,
+    pub query: String,
+    pub result_count: u64,
+    pub content_length: u64,
+    pub offset: u64,
+    pub limit: u64,
+    pub returned_chars: u64,
+    /// Null once the slice reaches the end of the stored results.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<u64>,
+    pub truncated: bool,
+}
+
 /// Matching modes the web-access producer supports for text results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -4144,17 +4437,23 @@ pub struct FindQueryResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GetSearchContentErrorDetails {
     pub error: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        rename = "responseId"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_id: Option<String>,
+    /// Argument-validation failures of the stored-search slice path report
+    /// the offending offset/limit bounds beside the error message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_limit: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_length: Option<u64>,
 }
 
 /// Either of `matchLimitReached` / `linesTruncated` may be present when
@@ -4967,16 +5266,57 @@ pub struct LensDiagnosticsFile {
     pub scope: LensDiagnosticsScope,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub primary_server_id: Option<String>,
+    // The too-large response omits the per-server counts and confirmation
+    // flags entirely, so they default instead of failing the whole line.
+    #[serde(default)]
     pub primary_diagnostics_count: u32,
+    #[serde(default)]
     pub auxiliary_diagnostics_count: u32,
     pub diagnostics: Vec<JsonValue>,
     pub total_diagnostics: u32,
+    #[serde(default)]
     pub truncated: bool,
+    #[serde(default)]
     pub unconfirmed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timed_out: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unconfirmed_server_ids: Option<Vec<String>>,
+    /// Discriminated per-file verdict; only the too-large response carries
+    /// it today, and the closed vocabulary comes from the producer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<LensDiagnosticsOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub too_large_reason: Option<String>,
+    /// Remaining optional breadcrumbs the producer emits only on the paths
+    /// that produce them (unavailable servers, skipped probes, suppressed
+    /// findings, navigation-only runs, health/wait metadata).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disposition_suppressed: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub navigation_only_files: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lsp_health: Option<JsonValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_ms: Option<u64>,
+}
+
+/// Closed per-file verdict vocabulary shared with the producer's batch
+/// outcomes; a new verdict must surface as a parse error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LensDiagnosticsOutcome {
+    Clean,
+    Findings,
+    Unsupported,
+    Unavailable,
+    Failed,
+    TooLarge,
+    Inconclusive,
 }
 
 /// The lens batch envelope carries its producer and requested scope, unlike the
