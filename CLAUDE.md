@@ -298,6 +298,8 @@ errors.
 - `context_edit` records (`ContextEditLine`) change an earlier entry's model-context contribution: null `replacement`
   hides it, otherwise only its content changes. They do not revise the original response's billable usage, so
   `cost_analyzer` treats them as non-billable metadata
+- Assistant and tool-result `durationMs` are optional `Decimal`s: pi times both with a sub-millisecond clock, so the
+  field legitimately carries a fractional part that a plain integer type would reject. Neither is billable.
 - Assistant `thinkingLevel` is optional and reuses the strict `ThinkingLevel` enum. Tool-result `nestedCalls` keeps
   core nested-call statuses and omission metadata typed, while call arguments stay an opaque `JsonBlob` because a
   failed call can carry a bare-string argument (the model-emitted JSON is not validated tool-side); it is execution

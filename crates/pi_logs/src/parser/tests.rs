@@ -296,6 +296,26 @@ fn tool_result_message_json(
     message_line_json("r1", "a1", message)
 }
 
+/// Pi times tool execution with the same sub-millisecond clock as assistant
+/// turns, so the fractional value must not fail the result.
+#[test]
+fn tool_result_duration_ms_is_optional_and_fractional() {
+    let base = tool_result_message_json(
+        "todo",
+        vec![json!({"type": "text", "text": "ok"})],
+        false,
+        None,
+    );
+    let mut value = base.clone();
+    value["message"]["durationMs"] = json!(99.5_f64);
+    let result = parse_tool_result_message(value);
+    assert_eq!(
+        result.duration_ms,
+        Some(Decimal::from_str_exact("99.5").unwrap())
+    );
+    assert_eq!(parse_tool_result_message(base).duration_ms, None);
+}
+
 fn tool_result_with_details(tool_name: &str, details: Value) -> ToolResultMessage {
     parse_tool_result_message(tool_result_message_json(
         tool_name,
@@ -2189,6 +2209,34 @@ fn assistant_raw_stop_reason_kept_beside_normalized_stop_reason() {
 
     assert_eq!(assistant.stop_reason, AssistantStopReason::ToolUse);
     assert_eq!(assistant.raw_stop_reason.as_deref(), Some("completed"));
+}
+
+/// Pi times each assistant turn with a sub-millisecond clock, so the field is
+/// fractional and often present; neither may cost the turn's billable usage.
+#[test]
+fn assistant_duration_ms_is_optional_and_fractional() {
+    let base = assistant_message_json(
+        vec![],
+        AssistantFixture::new(
+            "openai-completions",
+            "openrouter",
+            "z-ai/glm-5.3-flash",
+            "stop",
+        ),
+    );
+    let mut value = base.clone();
+    value["message"]["durationMs"] = json!(127.75_f64);
+    let RoleMessage::Assistant(assistant) = parse_role_message(value) else {
+        panic!("expected Assistant")
+    };
+    assert_eq!(
+        assistant.duration_ms,
+        Some(Decimal::from_str_exact("127.75").unwrap())
+    );
+    let RoleMessage::Assistant(assistant) = parse_role_message(base) else {
+        panic!("expected Assistant")
+    };
+    assert_eq!(assistant.duration_ms, None);
 }
 
 #[test]

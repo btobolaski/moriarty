@@ -681,6 +681,11 @@ pub struct AssistantMessage {
     /// construction. Only some providers emit it, hence `Option`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_stop_reason: Option<String>,
+    /// Wall-clock duration of the turn. Pi measures it with a sub-millisecond
+    /// clock, so it carries a fractional part; `Decimal` keeps that exact
+    /// rather than rejecting or lossily rounding an ordinary turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<Decimal>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_level: Option<ThinkingLevel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -726,6 +731,10 @@ pub struct ToolResultMessage {
     pub content: Vec<ToolResultContentItem>,
     pub is_error: bool,
     pub timestamp: i64,
+    /// Tool execution time, measured with pi's sub-millisecond clock, so it
+    /// carries a fractional part; `Decimal` keeps that exact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<Decimal>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<ToolResultDetails>,
     /// Tools the model gained mid-turn (e.g. `contact_supervisor` after a
@@ -847,6 +856,8 @@ struct RawToolResultMessage {
     pub content: Vec<ToolResultContentItem>,
     pub is_error: bool,
     pub timestamp: i64,
+    #[serde(default)]
+    pub duration_ms: Option<Decimal>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -894,6 +905,7 @@ impl<'de> Deserialize<'de> for ToolResultMessage {
             content,
             is_error,
             timestamp,
+            duration_ms,
             details: raw_details,
             added_tool_names,
             usage,
@@ -907,6 +919,7 @@ impl<'de> Deserialize<'de> for ToolResultMessage {
             content,
             is_error,
             timestamp,
+            duration_ms,
             details,
             added_tool_names,
             usage,
