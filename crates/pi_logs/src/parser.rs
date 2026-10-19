@@ -305,6 +305,12 @@ pub struct CompactionDetailsV2 {
     pub previous_summary_used: bool,
     #[serde(rename = "om.folded")]
     pub om_folded: OmFolded,
+    #[serde(
+        rename = "om.preserveSourceHistory",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub om_preserve_source_history: Option<bool>,
     /// Retained-tool-output bookkeeping pi added to compactions that preserve
     /// parts of large tool results. Optional for backward compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -399,6 +405,8 @@ pub enum CustomPayload {
     IntercomSent(IntercomSentData),
     #[serde(rename = "om.observations.recorded")]
     OmObservationsRecorded(OmObservationsRecordedData),
+    #[serde(rename = "om.observations.coverage")]
+    OmObservationsCoverage(OmObservationsCoverageData),
     #[serde(rename = "om.reflections.recorded")]
     OmReflectionsRecorded(OmReflectionsRecordedData),
     #[serde(rename = "om.observations.dropped")]
@@ -2246,6 +2254,18 @@ fn deserialize_complete<'de, D: Deserializer<'de>>(deserializer: D) -> Result<bo
 pub struct OmObservationsRecordedData {
     pub observations: Vec<ObservationEntry>,
     pub covers_up_to_id: String,
+    /// Legacy observation records predate explicit range starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub covers_from_id: Option<String>,
+}
+
+/// The om extension records coverage without observations when no new memory
+/// was extracted, so an empty observation list is not required on this payload.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OmObservationsCoverageData {
+    pub covers_from_id: String,
+    pub covers_up_to_id: String,
 }
 
 /// Emitted by the om extension when it records reflections synthesized
@@ -2267,6 +2287,8 @@ pub struct ObservationEntry {
     pub relevance: String,
     pub source_entry_ids: Vec<String>,
     pub token_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -2276,6 +2298,11 @@ pub struct ReflectionEntry {
     pub content: String,
     pub supporting_observation_ids: Vec<String>,
     pub token_count: u64,
+    /// Older reflection records omit the extension's wall-clock timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

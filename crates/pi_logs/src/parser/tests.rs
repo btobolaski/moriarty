@@ -1318,6 +1318,7 @@ fn compaction_line_v2() {
             "sections": ["Session Goal", "Files And Changes"],
             "sourceMessageCount": 42,
             "previousSummaryUsed": true,
+            "om.preserveSourceHistory": true,
             "om.folded": {
                 "type": "om.folded",
                 "version": 1,
@@ -1351,6 +1352,7 @@ fn compaction_line_v2() {
             assert_eq!(details.sections, vec!["Session Goal", "Files And Changes"]);
             assert_eq!(details.source_message_count, 42);
             assert!(details.previous_summary_used);
+            assert_eq!(details.om_preserve_source_history, Some(true));
             assert_eq!(details.om_folded.typ, "om.folded");
             assert_eq!(details.om_folded.version, 1);
             assert!(!details.om_folded.full_fold);
@@ -1403,6 +1405,7 @@ fn compaction_line_v2_minimal() {
             assert_eq!(details.sections.len(), 0);
             assert_eq!(details.source_message_count, 0);
             assert!(!details.previous_summary_used);
+            assert_eq!(details.om_preserve_source_history, None);
             assert_eq!(details.om_folded.observations.len(), 1);
             assert_eq!(details.om_folded.reflections.len(), 2);
         }
@@ -4617,6 +4620,7 @@ fn custom_om_observations_recorded() {
     ) {
         CustomPayload::OmObservationsRecorded(data) => {
             assert_eq!(data.covers_up_to_id, "entry-99");
+            assert_eq!(data.covers_from_id, None);
             assert_eq!(data.observations.len(), 1);
             let obs = &data.observations[0];
             assert_eq!(obs.id, "obs-1");
@@ -4625,8 +4629,43 @@ fn custom_om_observations_recorded() {
             assert_eq!(obs.relevance, "high");
             assert_eq!(obs.source_entry_ids, vec!["e1", "e2"]);
             assert_eq!(obs.token_count, 54);
+            assert_eq!(obs.supersedes, None);
         }
         other => panic!("expected OmObservationsRecorded, got {other:?}"),
+    }
+}
+
+#[test]
+fn custom_om_observation_ranges() {
+    for (kind, data) in [
+        (
+            "om.observations.recorded",
+            json!({"observations": [], "coversFromId": "e1", "coversUpToId": "e2"}),
+        ),
+        (
+            "om.observations.coverage",
+            json!({"coversFromId": "e1", "coversUpToId": "e2"}),
+        ),
+    ] {
+        let payload = parse_custom_payload(kind, data.clone());
+        match &payload {
+            CustomPayload::OmObservationsRecorded(recorded) => {
+                assert_eq!(recorded.covers_from_id.as_deref(), Some("e1"));
+                assert_eq!(recorded.covers_up_to_id, "e2");
+            }
+            CustomPayload::OmObservationsCoverage(coverage) => {
+                assert_eq!(coverage.covers_from_id, "e1");
+                assert_eq!(coverage.covers_up_to_id, "e2");
+            }
+            other => panic!("expected observation range, got {other:?}"),
+        }
+        assert_eq!(serde_json::to_value(payload).unwrap()["data"], data);
+        let mut unknown = data;
+        unknown["unexpected"] = json!(true);
+        parse_err(custom_json(kind, unknown));
+    }
+    for data in [json!({"coversUpToId": "e2"}), json!({"coversFromId": "e1"})] {
+        parse_err(custom_json("om.observations.coverage", data));
     }
 }
 
@@ -4652,8 +4691,42 @@ fn custom_om_reflections_recorded() {
             assert_eq!(refl.content, "Reflection content");
             assert_eq!(refl.supporting_observation_ids, vec!["obs-1"]);
             assert_eq!(refl.token_count, 57);
+            assert_eq!(refl.timestamp, None);
+            assert_eq!(refl.supersedes, None);
         }
         other => panic!("expected OmReflectionsRecorded, got {other:?}"),
+    }
+}
+
+#[test]
+fn custom_om_entry_metadata() {
+    for (kind, data) in [
+        (
+            "om.observations.recorded",
+            json!({
+                "observations": [{
+                    "id": "obs-2", "content": "Updated observation",
+                    "timestamp": "2026-10-19 04:06", "relevance": "medium",
+                    "sourceEntryIds": ["e1"], "tokenCount": 10,
+                    "supersedes": ["obs-1"]
+                }],
+                "coversUpToId": "e2"
+            }),
+        ),
+        (
+            "om.reflections.recorded",
+            json!({
+                "reflections": [{
+                    "id": "ref-1", "content": "Reflection",
+                    "supportingObservationIds": ["obs-2"], "tokenCount": 5,
+                    "timestamp": "2026-10-19 04:32", "supersedes": ["ref-0"]
+                }],
+                "coversUpToId": "e2"
+            }),
+        ),
+    ] {
+        let payload = parse_custom_payload(kind, data.clone());
+        assert_eq!(serde_json::to_value(payload).unwrap()["data"], data);
     }
 }
 
