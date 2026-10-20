@@ -5079,6 +5079,36 @@ fn tool_call_partial_json_preserved() {
 }
 
 #[test]
+fn tool_call_arguments_error_preserved() {
+    // pi records malformed model-emitted arguments as `{}` plus a report whose
+    // tail is the raw arguments text, so the value is multi-line.
+    let content = parse_first_assistant_content(
+        json!({
+            "type": "toolCall",
+            "id": "call_1",
+            "name": "bash",
+            "arguments": {},
+            "argumentsError": "Unterminated string in JSON at position 18\n\nReceived arguments:\n{\"command\": \"ls",
+        }),
+        AssistantFixture::new(
+            "anthropic-messages",
+            "anthropic",
+            "claude-sonnet-4-5",
+            "toolUse",
+        ),
+    );
+    let AssistantContentItem::ToolCall(tool_call) = content else {
+        panic!("expected ToolCall")
+    };
+    assert_eq!(
+        tool_call.arguments_error.as_deref(),
+        Some(
+            "Unterminated string in JSON at position 18\n\nReceived arguments:\n{\"command\": \"ls"
+        )
+    );
+}
+
+#[test]
 fn parse_file_rewrites_lone_surrogate_escapes() {
     // `parse_file` must apply the same surrogate retry as `parse_line`, not
     // just the plain serde path; the sanitization content itself is pinned

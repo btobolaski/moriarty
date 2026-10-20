@@ -281,9 +281,11 @@ errors.
 **`pi_logs/`** - Pi session log parsing:
 
 - Independent workspace crate for parsing pi session JSONL logs into strongly typed serde models
-- `ToolCallContent` keeps the outer tool-call envelope typed (`id`, `name`, `partial_json`) but preserves `arguments` as
-  a raw `BTreeMap<String, JsonBlob>` because pi logs the model-emitted JSON object before tool-side validation; typed
-  tool-argument structs are optional post-parse helpers, not the parser's source of truth
+- `ToolCallContent` keeps the outer tool-call envelope typed (`id`, `name`, `partial_json`, plus `arguments_error`,
+  pi's parse-error report when the model's arguments were not valid JSON and `arguments` was therefore stored as `{}`;
+  the report ends with the raw arguments text after a `Received arguments:` separator; added in newer pi versions)
+  but preserves `arguments` as a raw `BTreeMap<String, JsonBlob>` because pi logs the model-emitted JSON object before
+  tool-side validation; typed tool-argument structs are optional post-parse helpers, not the parser's source of truth
 - Tool names are raw `String` fields — pi does not validate tool names at the protocol level, so the parser accepts any
   string (including model-invented names like `task` or `remove`) rather than rejecting unknown tools. Tool-specific
   result parsing still routes known tool names by string to their typed result-structs where structured post-parse

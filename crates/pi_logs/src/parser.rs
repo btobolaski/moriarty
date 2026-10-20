@@ -1027,6 +1027,12 @@ pub struct ToolCallContent {
     pub arguments: ToolCallArguments,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partial_json: Option<String>,
+    /// Set when the model's arguments text was not valid JSON; `arguments` is
+    /// then `{}` and this carries pi's parse-error report, which ends with the
+    /// raw arguments text after a `Received arguments:` separator. It is
+    /// therefore not replayable as arguments text on its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arguments_error: Option<String>,
 }
 
 impl ToolCallContent {
