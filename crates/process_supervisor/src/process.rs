@@ -208,6 +208,20 @@ mod platform {
         operation()
     }
 
+    // Darwin skips zombies in group signaling and can return EPERM when no
+    // live member remains. NOWAIT keeps identity pinned; subsequent reaping
+    // and an ESRCH group probe are still required before reporting success.
+    fn darwin_signal_result(
+        result: rustix::io::Result<()>,
+        observe: impl FnOnce() -> rustix::io::Result<bool>,
+    ) -> rustix::io::Result<()> {
+        if result == Err(Errno::PERM) && observe() == Ok(true) {
+            Ok(())
+        } else {
+            result
+        }
+    }
+
     #[derive(Default)]
     pub(crate) struct System;
 
@@ -221,11 +235,22 @@ mod platform {
         }
 
         fn group_absent(&self, group: Pid) -> rustix::io::Result<()> {
-            bounded_retry(|| test_kill_process_group(group))
+            let result = bounded_retry(|| test_kill_process_group(group));
+            // Darwin's zombie-only groups return EPERM, which is presence, not absence.
+            #[cfg(target_os = "macos")]
+            if result == Err(Errno::PERM) {
+                return Ok(());
+            }
+            result
         }
 
         fn signal(&self, group: Pid, signal: Signal) -> rustix::io::Result<()> {
-            kill_process_group(group, signal)
+            let result = kill_process_group(group, signal);
+            if cfg!(target_os = "macos") {
+                darwin_signal_result(result, || self.observe(group))
+            } else {
+                result
+            }
         }
 
         fn reap(&self, child: &mut Child) -> io::Result<Option<ExitStatus>> {
@@ -534,6 +559,38 @@ mod platform {
                 "host-group-rejected",
             )
             .unwrap();
+        }
+
+        #[test]
+        fn darwin_eperm_requires_confirmed_leader_exit() {
+            for (signal, observation, expected, observes) in [
+                (Err(Errno::PERM), Ok(true), Ok(()), true),
+                (Err(Errno::PERM), Ok(false), Err(Errno::PERM), true),
+                (Err(Errno::PERM), Err(Errno::CHILD), Err(Errno::PERM), true),
+                (Err(Errno::PERM), Err(Errno::INTR), Err(Errno::PERM), true),
+                (Err(Errno::ACCESS), Ok(true), Err(Errno::ACCESS), false),
+                (Err(Errno::SRCH), Ok(true), Err(Errno::SRCH), false),
+                (Ok(()), Err(Errno::IO), Ok(()), false),
+            ] {
+                let mut observed = false;
+                let result = darwin_signal_result(signal, || {
+                    observed = true;
+                    observation
+                });
+                assert_eq!(result, expected);
+                assert_eq!(observed, observes);
+            }
+        }
+
+        #[test]
+        fn exited_leader_group_signaling_still_requires_reaping_and_absence() {
+            let mut owner = exited_owner();
+            assert!(!owner.group_absent().unwrap());
+            owner.term().unwrap();
+            owner.final_kill().unwrap();
+            assert!(!owner.group_absent().unwrap());
+            assert!(owner.disarm().reap().unwrap().unwrap().success());
+            assert!(owner.group_absent().unwrap());
         }
 
         #[test]

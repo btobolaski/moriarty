@@ -102,7 +102,12 @@ the grace, then a final group KILL is attempted. Exit during TERM does not chang
 cause; observation failure remains an error. This is observation-order precedence,
 not recovery of the kernel's exit timestamp: delayed polling can observe an exit that
 occurred after the nominal deadline. A successful
-signal is not proof of death. Finalization shares **one** post-KILL budget across
+signal is not proof of death. On macOS, group signaling can return `EPERM` for a
+zombie-only group. That result is tolerated only after a non-reaping observation
+confirms leader exit; it does not establish cleanup. A signal-0 `EPERM` probe means
+the group is still present, never absent. Successful cleanup still requires reaping
+and an `ESRCH` group probe, so unsignalable live descendants cannot produce success.
+Finalization shares **one** post-KILL budget across
 reaping, signal-0 group-absence probes and settling both pipes (genuine EOF for success,
 or a closed failed reader for errors). Total cancellation latency
 is TERM grace plus post-KILL grace, plus scheduler/syscall latency, not hard real time.

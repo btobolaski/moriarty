@@ -23,6 +23,7 @@ use std::os::unix::{
 use fs2::FileExt;
 use futures::poll;
 use miette::{IntoDiagnostic, WrapErr};
+use rustix::io::Errno;
 use tempfile::{NamedTempFile, TempDir};
 use tokio::{
     sync::oneshot,
@@ -993,9 +994,21 @@ async fn verify_check_program_is_original_not_canonical_for_symlink() {
         .build_path("project_approvals.toml")
         .await
         .unwrap();
-    let targets = [b"bin\xff", b"bin\xfe"].map(|name| {
-        let dir = project.path().join(OsStr::from_bytes(name));
-        fs::create_dir(&dir).unwrap();
+    let directories =
+        [b"bin\xff", b"bin\xfe"].map(|name| project.path().join(OsStr::from_bytes(name)));
+    for dir in &directories {
+        if let Err(error) = fs::create_dir(dir) {
+            // Darwin may reject byte-valued filenames before symlink retargeting
+            // is possible; the original-program assertions above still run.
+            assert!(
+                cfg!(target_os = "macos")
+                    && error.raw_os_error() == Some(Errno::ILSEQ.raw_os_error()),
+                "{error}"
+            );
+            return;
+        }
+    }
+    let targets = directories.map(|dir| {
         let target = dir.join("launcher");
         create_executable_script(&target, "echo identical-launcher");
         target.canonicalize().unwrap()

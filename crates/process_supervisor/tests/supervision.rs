@@ -156,7 +156,7 @@ async fn gone(pid: Pid) {
         loop {
             match test_kill_process_group(pid) {
                 Err(Errno::SRCH) => break,
-                Ok(()) => sleep(Duration::from_millis(5)).await,
+                Ok(()) | Err(Errno::PERM) => sleep(Duration::from_millis(5)).await,
                 Err(error) => panic!("group probe: {error}"),
             }
         }
@@ -323,6 +323,32 @@ async fn host_dropping_owners() {
     fs::write("lifecycle.completed", "host_dropping_owners").unwrap();
 }
 
+fn watchdog_read_timeout(socket: &UnixStream, budget: Duration) -> io::Result<()> {
+    let result = socket.set_read_timeout(Some(budget));
+    #[cfg(target_os = "macos")]
+    if result
+        .as_ref()
+        .is_err_and(|error| error.raw_os_error() == Some(Errno::INVAL.raw_os_error()))
+    {
+        // Darwin rejects SO_RCVTIMEO after peer disconnect. Nonblocking reads
+        // still drain buffered registration bytes and observe genuine EOF.
+        return socket.set_nonblocking(true);
+    }
+    result
+}
+
+#[test]
+fn disconnected_watchdog_preserves_buffered_data_and_eof() {
+    let (mut reader, mut writer) = UnixStream::pair().unwrap();
+    writer.write_all(b"group").unwrap();
+    drop(writer);
+    watchdog_read_timeout(&reader, Duration::from_millis(100)).unwrap();
+    let mut bytes = [0; 5];
+    reader.read_exact(&mut bytes).unwrap();
+    assert_eq!(&bytes, b"group");
+    assert_eq!(reader.read(&mut [0]).unwrap(), 0);
+}
+
 // Each fixture holds membership in the group it signals. Closing a socket asks that
 // live member to kill its own group, never a potentially recycled externally saved PGID.
 fn fixture_watchdog() {
@@ -337,9 +363,7 @@ fn fixture_watchdog() {
                 unreachable!()
             }
         };
-        socket
-            .set_read_timeout(Some(Duration::from_secs(20)))
-            .unwrap();
+        watchdog_read_timeout(&socket, Duration::from_secs(20)).unwrap();
         socket.write_all(&group.as_raw_pid().to_ne_bytes()).unwrap();
         thread::spawn(move || {
             let _ = socket.read(&mut [0]);
@@ -396,7 +420,7 @@ impl Host {
             loop {
                 match listener.accept() {
                     Ok((mut peer, _)) => {
-                        peer.set_read_timeout(Some(Duration::from_millis(100)))?;
+                        watchdog_read_timeout(&peer, Duration::from_millis(100))?;
                         let mut raw = [0; 4];
                         peer.read_exact(&mut raw)?;
                         let group = Pid::from_raw(i32::from_ne_bytes(raw)).expect("fixture group");
@@ -434,7 +458,7 @@ impl Host {
             if remaining.is_zero() {
                 return Err(io::ErrorKind::TimedOut.into());
             }
-            peer.set_read_timeout(Some(remaining))?;
+            watchdog_read_timeout(peer, remaining)?;
             if peer.read(&mut [0])? != 0 {
                 return Err(io::Error::other("unexpected watchdog response"));
             }

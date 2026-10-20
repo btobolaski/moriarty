@@ -393,6 +393,7 @@ mod tests {
         process::ExitStatus,
     };
 
+    use rustix::io::Errno;
     use tempfile::TempDir;
 
     use super::*;
@@ -449,16 +450,28 @@ mod tests {
             .entry(first.to_string_lossy().into_owned())
             .or_default();
         for root in [&first, &second] {
-            fs::create_dir(root).unwrap();
-            for repository in [false, true] {
-                let error = if repository {
-                    detect_repository_root(root).await.map(|_| ())
-                } else {
-                    detect_workspace_root(root).await.map(|_| ())
+            match fs::create_dir(root) {
+                Ok(()) => {
+                    for repository in [false, true] {
+                        let error = if repository {
+                            detect_repository_root(root).await.map(|_| ())
+                        } else {
+                            detect_workspace_root(root).await.map(|_| ())
+                        }
+                        .expect_err("unrepresentable roots must fail discovery");
+                        assert!(execution::is_execution_error(&error));
+                        assert!(error.to_string().contains("Non-UTF-8"), "{error}");
+                    }
                 }
-                .expect_err("unrepresentable roots must fail discovery");
-                assert!(execution::is_execution_error(&error));
-                assert!(error.to_string().contains("Non-UTF-8"), "{error}");
+                Err(error) => {
+                    // Darwin filesystems may reject these names before discovery can run;
+                    // the filesystem-independent identity/approval checks still run below.
+                    assert!(
+                        cfg!(target_os = "macos")
+                            && error.raw_os_error() == Some(Errno::ILSEQ.raw_os_error()),
+                        "{error}"
+                    );
+                }
             }
             for (repository, workspace) in [
                 (root.as_path(), directory.path()),

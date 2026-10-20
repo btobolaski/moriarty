@@ -242,6 +242,10 @@ absence, and settlement of both captures. Signal success SHALL NOT be treated as
 evidence cannot be established by budget expiry, the supervisor SHALL close its remaining capture resources, stop
 waiting, and return an explicit cleanup-unconfirmed error with available bounded partial evidence.
 
+On macOS, a group-signaling `EPERM` result MAY be tolerated only after a non-reaping observation confirms direct-child
+exit; it SHALL NOT establish cleanup. A signal-0 group probe returning `EPERM` SHALL mean the group is still present,
+not absent. Successful cleanup SHALL still require direct-child reaping and an `ESRCH` group probe.
+
 #### Scenario: Unkillable or unconfirmable child
 
 - **WHEN** SIGKILL fails, a child remains uninterruptible, or direct-child reaping/group absence cannot be confirmed by

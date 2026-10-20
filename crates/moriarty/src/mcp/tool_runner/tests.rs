@@ -1,10 +1,8 @@
 use std::{
-    env,
-    ffi::OsString,
-    fs,
+    env, fs,
     future::ready,
     io::ErrorKind,
-    os::unix::{ffi::OsStringExt, fs::symlink, process::ExitStatusExt},
+    os::unix::{fs::symlink, process::ExitStatusExt},
     process::{Command, ExitStatus},
 };
 
@@ -175,11 +173,7 @@ async fn unset_path_matches_native_git_lookup_without_inventing_absence() {
         .current_dir(project.path())
         .output();
     match native {
-        Ok(output) => {
-            assert!(
-                output.status.success(),
-                "native Git must find the fixture repository"
-            );
+        Ok(output) if output.status.success() => {
             assert_eq!(
                 detect_workspace_root(project.path())
                     .await
@@ -187,6 +181,17 @@ async fn unset_path_matches_native_git_lookup_without_inventing_absence() {
                     .as_path(),
                 project.path().canonicalize().unwrap()
             );
+        }
+        Ok(output) => {
+            let error = detect_workspace_root(project.path())
+                .await
+                .expect_err("native Git failure must not become repository absence");
+            assert!(execution::is_execution_error(&error), "{error}");
+            let expected = format!(
+                "Git root discovery (--show-toplevel) failed with {}",
+                output.status
+            );
+            assert!(error.to_string().contains(&expected), "{error}");
         }
         Err(error) => {
             assert_eq!(error.kind(), ErrorKind::NotFound);
@@ -466,11 +471,7 @@ async fn root_identity_policy_reaches_stop_and_mcp_checks() {
     let _xdg = setup_isolated_xdg_config();
     for invalid in [false, true] {
         let project = TempDir::new().unwrap();
-        let root = project.path().join(if invalid {
-            OsString::from_vec(b"root\xff".to_vec())
-        } else {
-            OsString::from(" whitespace root ")
-        });
+        let root = project.path().join(" whitespace root ");
         fs::create_dir(&root).unwrap();
         setup_git_repo_with_commit(&root);
         let nested = root.join("nested");
@@ -481,18 +482,36 @@ async fn root_identity_policy_reaches_stop_and_mcp_checks() {
             "[commands]\n[[checks]]\nname = \"root-only\"\ncommand = [\"echo\", \"ok\"]\n",
         )
         .unwrap();
-        let expected = if invalid { "Non-UTF-8" } else { "root-only" };
-        let CheckRunOutcome::Blocked(reason) =
-            checks::run_configured_checks(&nested).await.unwrap()
-        else {
-            panic!("root policy must never skip configured checks")
+        let work = async {
+            let expected = if invalid { "Non-UTF-8" } else { "root-only" };
+            let CheckRunOutcome::Blocked(reason) =
+                checks::run_configured_checks(&nested).await.unwrap()
+            else {
+                panic!("root policy must never skip configured checks")
+            };
+            let result = ToolRunner::run_checks_impl(run_args(&nested))
+                .await
+                .unwrap();
+            assert_eq!(result.is_error, Some(true));
+            assert_eq!(to_value(result).unwrap()["content"][0]["text"], reason);
+            assert!(reason.contains(expected), "{reason}");
         };
-        let result = ToolRunner::run_checks_impl(run_args(&nested))
-            .await
-            .unwrap();
-        assert_eq!(result.is_error, Some(true));
-        assert_eq!(to_value(result).unwrap()["content"][0]["text"], reason);
-        assert!(reason.contains(expected), "{reason}");
+        if invalid {
+            // Inject Git's raw root bytes so filesystems that reject these names
+            // still exercise the policy through both callers, rather than skip it.
+            execution::test_seams::with_operations(
+                |spec, _| {
+                    assert_eq!(spec.args.last().unwrap(), "--git-common-dir");
+                    let mut report = test_report(Completion::Exited(ExitStatus::from_raw(0)));
+                    report.stdout.bytes = b"/root\xff/.git\n".to_vec();
+                    ready(Ok(report))
+                },
+                work,
+            )
+            .await;
+        } else {
+            work.await;
+        }
     }
 }
 
