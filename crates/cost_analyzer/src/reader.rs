@@ -310,7 +310,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        logs::{ClaudeModelPricing, ClaudeTokenCounts, LlmCost, PiModel, parse_json_line},
+        logs::{
+            ClaudeModelPricing, ClaudeTokenCounts, LlmCost, PiModel, TokenType, parse_json_line,
+        },
         test_support::{
             CLAUDE_SESSION_ID, CLAUDE_TIMESTAMP, claude_assistant_json, claude_usage_json,
         },
@@ -831,6 +833,43 @@ mod tests {
         let compaction = line_by_id(&lines, "cmp1");
         assert_eq!(compaction.model, sonnet_model());
         assert_eq!(compaction.cost.total(), Decimal::new(7, 0));
+    }
+
+    #[tokio::test]
+    async fn auxiliary_usage_is_billable_without_changing_the_active_model() {
+        let temp_dir = temp_dir();
+        let path = temp_dir.path().join("pi.jsonl");
+        let usage = json!({
+            "type":"usage","id":"usage1","parentId":"a1","timestamp":CLAUDE_TIMESTAMP,
+            "kind":"web_access.page_answer","provider":"openrouter","model":"z-ai/glm-5.3-flash",
+            "usage":{"input":10,"output":5,"cacheRead":2,"cacheWrite":1,"totalTokens":18,
+                "cost":{"input":1,"output":2,"cacheRead":3,"cacheWrite":4,"total":10}}
+        });
+        let journal = json!({
+            "type":"custom","customType":"shepard.v1","id":"journal1","parentId":"usage1","timestamp":CLAUDE_TIMESTAMP,
+            "data":{"version":1,"eventId":"event","writerSessionId":PI_SESSION_ID,"timestamp":CLAUDE_TIMESTAMP,
+                "payload":{"kind":"completed","result":"done"}}
+        });
+        let contents = format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n",
+            pi_session_log(PI_SESSION_ID, CLAUDE_TIMESTAMP),
+            pi_assistant_log("a1", CLAUDE_TIMESTAMP),
+            usage,
+            journal,
+            pi_compaction_log("cmp1", CLAUDE_TIMESTAMP),
+            pi_branch_summary_log("bs1", CLAUDE_TIMESTAMP)
+        );
+        write(&path, contents).await.unwrap();
+        let lines = parse_file::<PiLogLine>(path).await.unwrap();
+        assert_eq!(lines.len(), 4);
+        let auxiliary = line_by_id(&lines, "usage1");
+        assert_eq!(auxiliary.model.provider, Provider::OpenRouter);
+        assert_eq!(auxiliary.model.model, "z-ai/glm-5.3-flash");
+        assert_eq!(auxiliary.session_id.as_deref(), Some(PI_SESSION_ID));
+        assert_eq!(auxiliary.cost.total(), Decimal::new(10, 0));
+        assert_eq!(auxiliary.log.token_count(TokenType::CacheRead), Some(2));
+        assert_eq!(line_by_id(&lines, "cmp1").model, sonnet_model());
+        assert_eq!(line_by_id(&lines, "bs1").model, sonnet_model());
     }
 
     #[tokio::test]

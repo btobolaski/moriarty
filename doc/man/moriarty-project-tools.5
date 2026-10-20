@@ -1,0 +1,200 @@
+.\" Copyright (c) 2026 Moriarty contributors
+.\" SPDX-License-Identifier: GPL-3.0-only
+.Dd October 3, 2026
+.Dt MORIARTY\-PROJECT\-TOOLS 5
+.Os
+.Sh NAME
+.Nm moriarty\-project\-tools
+.Nd project commands and checks configuration for moriarty
+.Sh DESCRIPTION
+The project file
+.Pa .config/tools.toml
+configures commands for the project\-tools MCP server and checks for that server
+and the Claude Code Stop hook.
+It is distinct from
+.Pa ~/.config/moriarty/tool_rules.toml ,
+which controls tool call permissions rather than defining project commands.
+.Pp
+Create the file in the workspace root, then review and approve its commands with
+.Bd -literal -offset indent
+moriarty approve\-project .
+.Ed
+Approval is required before configured commands or checks execute.
+The file does not install tools; its programs must already be available.
+.Sh CONFIGURATION
+The file uses TOML.
+The
+.Ic [commands]
+table is required, even for a checks\-only configuration, where it may be empty.
+Each command is optional; omitted commands are unavailable rather than given a
+default.
+The
+.Ic [[checks]]
+array of tables is optional.
+.Pp
+Command values are non\-empty arrays of strings.
+The first string names the executable; remaining strings are separate arguments.
+Moriarty executes the program directly, not through a shell:
+quoting, variable expansion, pipelines, and redirects inside arguments are not
+interpreted.
+Use an executable script for multi\-step operations.
+.Ss Commands
+The four supported keys in
+.Ic [commands]
+map to fixed MCP tools:
+.Bl -tag -width Ds
+.It Ic lint
+Runs through
+.Cm run_lint .
+.It Ic test
+Runs through
+.Cm run_tests .
+.It Ic build
+Runs through
+.Cm run_build .
+.It Ic format
+Runs through
+.Cm run_formatter .
+.El
+.Pp
+Arbitrary command keys do not define new MCP tools.
+Unknown configuration keys are currently ignored, so check spelling carefully.
+.Ss Checks
+Each
+.Ic [[checks]]
+entry requires:
+.Bl -tag -width Ds
+.It Ic name
+A string identifying the check in results and approvals.
+Names must be unique across checks; duplicate names reject the configuration.
+.It Ic command
+A non\-empty executable\-and\-arguments array, using the same format as
+command values.
+.El
+.Pp
+Checks are independent of commands: defining
+.Ic commands.test
+does not automatically run it at the Stop hook.
+Add a check explicitly for each validation that should run there.
+There are no per\-check environment, working\-directory, or timeout fields.
+.Sh EXECUTION
+.Ss Configuration and Program Paths
+The configuration is loaded from the invoking workspace root:
+the nearest ancestor containing
+.Pa .jj/repo ,
+otherwise the git worktree root, otherwise the canonical project directory.
+Each jj secondary workspace or git worktree therefore uses its own file.
+This project\-relative path does not follow
+.Ev XDG_CONFIG_HOME .
+.Pp
+Absolute program paths are used as given.
+Relative program paths containing a slash, such as
+.Pa ./scripts/check\-policy.sh ,
+are resolved against the workspace root.
+Bare program names are looked up through
+.Ev PATH .
+Execution uses the resolved program path verified during approval;
+other relative arguments are interpreted by the program in its execution
+directory.
+.Ss MCP Commands and CLI Tests
+Start the MCP server with
+.Cm moriarty mcp project\-tools .
+Its tools accept an optional
+.Ic project_dir
+argument, defaulting to the server's current directory.
+The four command tools execute in the caller's canonical project directory.
+.Pp
+.Cm moriarty test project\-tools Op Ar project_dir
+runs all configured commands;
+.Cm moriarty test checks Op Ar project_dir
+runs all configured checks.
+Both default to the current directory and execute there after canonicalization.
+These CLI runners and the four MCP command tools verify
+.Em all
+configured commands and checks before execution, even when running only one
+command.
+Parallel CLI runs allow at most four simultaneous processes, with no timeout
+or output caps.
+.Ss Stop Hook and MCP Checks
+The Stop hook and the MCP
+.Cm run_checks
+tool share a checks\-only runner.
+They verify checks, not the four commands, and execute at the workspace root.
+Checks run with at most four simultaneous processes, a five\-minute timeout for
+the entire run, a 1 MiB output limit per check, and a 10 MiB aggregate output
+limit.
+These limits are built in, not configurable in this file.
+.Pp
+A failed check, execution error, approval failure, or exceeded limit blocks
+the run.
+No checks means no validation is performed.
+A missing or otherwise unusable configuration also skips validation, except that
+duplicate check names explicitly block it.
+The MCP command tools and CLI test runners instead report configuration
+loading errors.
+.Sh APPROVALS
+Run
+.Cm moriarty approve\-project Ar workspace_root
+after adding or changing commands or checks.
+The TUI reviews configured items, their resolved programs, and security details;
+approvals are saved separately in
+.Pa ~/.config/moriarty/project_approvals.toml
+.Pq under Ev XDG_CONFIG_HOME No when set .
+.Pp
+Approvals bind each item's argument array, original and canonical program paths,
+and program SHA\-256 hash.
+An item may have multiple approved versions; its current definition must match
+an approved version.
+A new name, changed arguments, changed program path, or changed binary requires
+approval when no stored version matches.
+Cosmetic TOML changes and removing items do not require re\-approval.
+.Pp
+Approvals are keyed by the shared repository root, not the workspace directory.
+Workspace\-local program paths are stored relative to the workspace root, so
+byte\-identical tools with identical arguments in another worktree can share
+approval.
+The file and binaries still come from that worktree, not the main workspace.
+.Pp
+Approval verifies the executable, not every file it might read or run.
+For example, approving a shell interpreter does not hash a script passed as an
+argument.
+Prefer a directly executable script when its contents should be bound to
+approval.
+.Sh FILES
+.Bl -tag -width Ds
+.It Pa <workspace>/.config/tools.toml
+Project commands and checks.
+.It Pa ~/.config/moriarty/project_approvals.toml
+User approval state, respecting
+.Ev XDG_CONFIG_HOME .
+.El
+.Sh EXAMPLES
+A project with all four commands and two Stop\-hook checks:
+.Bd -literal -offset indent
+[commands]
+lint = ["cargo", "clippy", "\-\-all\-targets", "\-\-", "\-D", "warnings"]
+test = ["cargo", "nextest", "run"]
+build = ["cargo", "build"]
+format = ["cargo", "fmt"]
+
+[[checks]]
+name = "format"
+command = ["cargo", "fmt", "\-\-", "\-\-check"]
+
+[[checks]]
+name = "tests"
+command = ["cargo", "nextest", "run"]
+.Ed
+.Pp
+A checks\-only configuration using a workspace\-local executable script:
+.Bd -literal -offset indent
+[commands]
+
+[[checks]]
+name = "policy"
+command = ["./scripts/check\-policy.sh"]
+.Ed
+.Sh SEE ALSO
+.Xr moriarty 1 ,
+.Xr moriarty\-bash\-rules 5 ,
+.Xr moriarty\-tool\-rules 5

@@ -745,7 +745,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("timed out during test locality evaluation")
+                .contains("Blocking hook evaluation timed out during test locality evaluation")
         );
     }
 
@@ -761,11 +761,12 @@ mod tests {
             "test locality evaluation",
         );
         let error = evaluation.expect_err("locality task failure must fail closed");
+        let message = format!("{error:#}");
         assert!(
-            error
-                .to_string()
-                .contains("task failed during test locality evaluation")
+            message
+                .contains("Blocking hook evaluation task failed during test locality evaluation")
         );
+        assert!(message.contains("simulated locality evaluator failure"));
     }
 
     #[test]

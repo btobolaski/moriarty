@@ -1,6 +1,6 @@
 .\" Copyright (c) 2025 Moriarty contributors
 .\" SPDX-License-Identifier: GPL-3.0-only
-.Dd September 13, 2026
+.Dd October 3, 2026
 .Dt MORIARTY 1
 .Os
 .Sh NAME
@@ -179,6 +179,20 @@ subcommand analyzes pi session logs and generates either cost reports
 or token-count reports using the same date and conversation grouping options
 as
 .Cm api\-pricing .
+Nonzero recorded pi charges are preserved. Zero-cost usage, including subscription
+calls, is estimated from current cached rates in
+.Pa ~/.pi/agent/models-store.json
+with price overrides from
+.Pa ~/.pi/agent/models.json ;
+.Ev PI_CODING_AGENT_DIR
+selects an alternative catalog directory.
+Estimates include prompt-size tiers and 1h cache writes, not historical prices.
+No network requests are made; missing prices warn and leave usage at zero.
+Configure explicit prices in
+.Pa models.json
+in the selected catalog directory, or refresh pi's catalog to supply missing rates.
+Auxiliary usage contributes cost and tokens but no agent turns.
+Token reports do not read pricing files.
 .Bl -tag -width Ds
 .It Fl d , Fl \-dir Ar dir
 Directory to analyze for pi session usage.
@@ -234,8 +248,8 @@ Render source-labelled combined graphs, defaulting to
 .Pa ~/.claude/projects
 and
 .Pa ~/.pi/agent/sessions .
-Cost mode uses local Claude pricing and prices recorded in pi logs; token mode
-combines homogeneous counts.
+Cost mode uses local Claude pricing and the same recorded-charge/zero-cost-estimate
+policy as pi cost. Token mode combines homogeneous counts without reading pricing files.
 Missing defaults warn and are skipped; explicit missing paths and having no
 available source are errors.
 .El
@@ -244,6 +258,22 @@ The
 .Cm mcp
 subcommand runs one of the built\-in Model Context Protocol servers
 for read\-only git operations, read\-only jj operations, and project tools.
+The project\-tools server maps the
+.Ic lint , test , build ,
+and
+.Ic format
+keys in the workspace's
+.Pa .config/tools.toml
+.Ic [commands]
+table to its four command tools; its
+.Cm run_checks
+tool runs the file's
+.Ic [[checks]]
+entries.
+See
+.Xr moriarty\-project\-tools 5
+for the configuration format, examples, execution directories,
+and approval requirements.
 .Ss Process Execution
 Moriarty requires Linux or macOS; the entire binary depends on the platform-specific
 process supervisor.
@@ -641,6 +671,13 @@ Defaults to
 .El
 .Sh FILES
 .Bl -tag -width Ds
+.It Pa <workspace>/.config/tools.toml
+Project commands and checks configuration.
+See
+.Xr moriarty\-project\-tools 5 .
+.It Pa ~/.config/moriarty/project_approvals.toml
+Per\-item project command and check approvals, respecting
+.Ev XDG_CONFIG_HOME .
 .It Pa ~/.config/moriarty/tool_rules.toml
 Tool and bash rules configuration file.
 See
@@ -653,4 +690,5 @@ Hook execution log directory (JSON lines, daily-rotated).
 .Sh SEE ALSO
 .Xr moriarty\-test\-rules 1 ,
 .Xr moriarty\-bash\-rules 5 ,
+.Xr moriarty\-project\-tools 5 ,
 .Xr moriarty\-tool\-rules 5

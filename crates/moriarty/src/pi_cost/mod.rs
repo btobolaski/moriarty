@@ -1,4 +1,5 @@
 mod analyzer;
+mod catalog;
 mod pricing;
 
 use std::{collections::BTreeMap, path::Path};

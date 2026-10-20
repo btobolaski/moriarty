@@ -21,6 +21,7 @@ use std::{
     borrow::Cow,
     future::Future,
     io,
+    path::PathBuf,
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context, Poll},
@@ -31,10 +32,11 @@ use miette::IntoDiagnostic;
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler, Service, ServiceExt,
     model::{
-        ClientNotification, ClientRequest, ContentBlock, ProtocolVersion, ServerInfo, ServerResult,
+        ClientJsonRpcMessage, ClientNotification, ClientRequest, ContentBlock, GetMeta,
+        ProtocolVersion, ServerInfo, ServerJsonRpcMessage, ServerResult,
     },
     service::{NotificationContext, QuitReason, RequestContext},
-    transport::stdio,
+    transport::{IntoTransport, Transport, stdio},
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
@@ -58,6 +60,57 @@ pub mod git_read_only;
 pub mod jj_read_only;
 pub mod read_only;
 pub mod tool_runner;
+
+// rmcp 3.2 commits a non-initialize opener to the inline lifecycle even when
+// discovery fails. Reject unsupported probes before that happens so a client
+// can fall back to the legacy handshake on the same connection.
+struct DiscoveryFallbackTransport<T>(T);
+
+impl<T: Transport<RoleServer>> Transport<RoleServer> for DiscoveryFallbackTransport<T> {
+    type Error = T::Error;
+
+    fn send(
+        &mut self,
+        message: ServerJsonRpcMessage,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
+        self.0.send(message)
+    }
+
+    async fn receive(&mut self) -> Option<ClientJsonRpcMessage> {
+        loop {
+            let message = self.0.receive().await?;
+            if let ClientJsonRpcMessage::Request(request) = &message
+                && matches!(request.request, ClientRequest::DiscoverRequest(_))
+                && let Some(version) = request.request.get_meta().protocol_version()
+                && !MCP_SUPPORTED_PROTOCOL_VERSIONS.contains(&version)
+            {
+                let error = McpError::unsupported_protocol_version(
+                    version,
+                    MCP_SUPPORTED_PROTOCOL_VERSIONS,
+                );
+                if let Err(error) = self
+                    .0
+                    .send(ServerJsonRpcMessage::error(error, Some(request.id.clone())))
+                    .await
+                {
+                    tracing::warn!(%error, "failed to reject MCP discovery probe");
+                    return None;
+                }
+                continue;
+            }
+            return Some(message);
+        }
+    }
+
+    fn close(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        self.0.close()
+    }
+}
+
+// Resolving `.` at use time keeps omitted project directories relative to the server's cwd.
+fn default_project_dir() -> PathBuf {
+    PathBuf::from(".")
+}
 
 #[derive(Debug, Subcommand)]
 pub enum McpServers {
@@ -170,9 +223,12 @@ where
     let execution = Scope::new();
     let failures = Arc::new(Mutex::new(None));
     let service_ct = CancellationToken::new();
-    let transport = (
-        ObservedIo::new(reader, &execution, &failures, &service_ct),
-        ObservedIo::new(writer, &execution, &failures, &service_ct),
+    let transport = DiscoveryFallbackTransport(
+        (
+            ObservedIo::new(reader, &execution, &failures, &service_ct),
+            ObservedIo::new(writer, &execution, &failures, &service_ct),
+        )
+            .into_transport(),
     );
     tokio::pin!(stop);
     // Early returns and `?` must exit only this block so admission close, cancellation

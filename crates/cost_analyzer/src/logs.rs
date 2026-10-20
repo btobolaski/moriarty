@@ -13,7 +13,7 @@ use claude_logs::{
 };
 use pi_logs::{
     AssistantMessage, AssistantUsage as PiAssistantUsage, PiLogLine, Provider, RoleMessage,
-    parser::is_subagent_transcript_artifact,
+    parser::{is_subagent_transcript_artifact, parse_json_with_surrogate_retry},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -56,7 +56,10 @@ pub(crate) fn parse_json_line<T: DeserializeOwned>(
     value: &str,
     context: &'static str,
 ) -> miette::Result<T> {
-    serde_json::from_str(value)
+    // Log lines can contain `\uXXXX` escapes for lone UTF-16 surrogates; the
+    // retry lives in pi_logs' parser (where the pi wire quirk is owned) and
+    // is inherited by every pi_logs consumer, not just this crate.
+    parse_json_with_surrogate_retry(value)
         .into_diagnostic()
         .context(context)
 }
@@ -406,6 +409,10 @@ fn claude_system_fields(system: &ClaudeSystemLogLine) -> ClaudeSystemFields {
             timestamp: line.timestamp,
             uuid: line.uuid,
         },
+        ClaudeSystemLogLine::ModelRefusalNoFallback(line) => ClaudeSystemFields {
+            timestamp: line.timestamp,
+            uuid: line.uuid,
+        },
         ClaudeSystemLogLine::ModelConsentFallback(line) => ClaudeSystemFields {
             timestamp: line.timestamp,
             uuid: line.uuid,
@@ -578,11 +585,11 @@ fn pi_assistant_message(line: &PiLogLine) -> Option<&AssistantMessage> {
     }
 }
 
-/// Usage for any billable pi line. Assistant turns always carry it; compaction
-/// and branch-summary lines carry it only on logs new enough to record the
-/// summarization call's cost, and neither records a provider/model of its own.
-fn pi_billable_usage(line: &PiLogLine) -> Option<&PiAssistantUsage> {
+/// Summaries need the reader's active-model fallback; auxiliary usage instead
+/// carries its own model and must not change the conversation's active model.
+pub fn pi_billable_usage(line: &PiLogLine) -> Option<&PiAssistantUsage> {
     match line {
+        PiLogLine::Usage(usage) => Some(&usage.usage),
         PiLogLine::Compaction(compaction) => compaction.usage.as_ref(),
         PiLogLine::BranchSummary(branch_summary) => branch_summary.usage.as_ref(),
         _ => pi_assistant_message(line).map(|assistant| &assistant.usage),
@@ -614,10 +621,12 @@ impl AnalyzableLog for PiLogLine {
         match self {
             PiLogLine::BranchSummary(branch_summary) => branch_summary.id.clone(),
             PiLogLine::Compaction(compaction) => compaction.id.clone(),
+            PiLogLine::ContextEdit(edit) => edit.id.clone(),
             PiLogLine::Custom(custom) => custom.id.clone(),
             PiLogLine::CustomMessage(message) => message.id.clone(),
             PiLogLine::Message(message) => message.id.clone(),
             PiLogLine::ModelChange(model_change) => model_change.id.clone(),
+            PiLogLine::Usage(usage) => usage.id.clone(),
             PiLogLine::Session(session) => session.id.to_string(),
             PiLogLine::SessionInfo(session_info) => session_info.id.clone(),
             PiLogLine::ThinkingLevelChange(thinking_level) => thinking_level.id.clone(),
@@ -625,34 +634,41 @@ impl AnalyzableLog for PiLogLine {
     }
 
     fn model(&self) -> Option<PiModel> {
-        pi_assistant_message(self).map(|assistant| PiModel {
-            model: assistant.model.clone(),
-            provider: assistant.provider,
-        })
+        match self {
+            PiLogLine::Usage(usage) => Some(PiModel {
+                model: usage.model.clone(),
+                provider: usage.provider,
+            }),
+            _ => pi_assistant_message(self).map(|assistant| PiModel {
+                model: assistant.model.clone(),
+                provider: assistant.provider,
+            }),
+        }
     }
 
     fn active_model(&self) -> Option<PiModel> {
-        // An assistant turn establishes its own model; an explicit model switch
-        // establishes the new one even though it carries no cost. Compaction and
-        // branch-summary lines carry no model, so they leave the active model
-        // unchanged and instead inherit it as a fallback in `from_log`.
-        self.model().or_else(|| match self {
+        // Auxiliary usage may use a different model (e.g. web search), but the
+        // next compaction still belongs to the conversation's selected model.
+        match self {
             PiLogLine::ModelChange(model_change) => Some(PiModel {
                 model: model_change.model_id.clone(),
                 provider: model_change.provider,
             }),
-            _ => None,
-        })
+            PiLogLine::Usage(_) => None,
+            _ => self.model(),
+        }
     }
 
     fn timestamp(&self) -> DateTime<Utc> {
         match self {
             PiLogLine::BranchSummary(branch_summary) => branch_summary.timestamp,
             PiLogLine::Compaction(compaction) => compaction.timestamp,
+            PiLogLine::ContextEdit(edit) => edit.timestamp,
             PiLogLine::Custom(custom) => custom.timestamp,
             PiLogLine::CustomMessage(message) => message.timestamp,
             PiLogLine::Message(message) => message.timestamp,
             PiLogLine::ModelChange(model_change) => model_change.timestamp,
+            PiLogLine::Usage(usage) => usage.timestamp,
             PiLogLine::Session(session) => session.timestamp,
             PiLogLine::SessionInfo(session_info) => session_info.timestamp,
             PiLogLine::ThinkingLevelChange(thinking_level) => thinking_level.timestamp,
@@ -715,6 +731,7 @@ mod tests {
     const CLAUDE_SYSTEM_STOP_HOOK_SUMMARY_UUID: &str = "13131313-1313-4313-8313-131313131313";
     const CLAUDE_SYSTEM_TURN_DURATION_UUID: &str = "14141414-1414-4414-8414-141414141414";
     const CLAUDE_SYSTEM_CONSENT_FALLBACK_UUID: &str = "17171717-1717-4717-8717-171717171717";
+    const CLAUDE_SYSTEM_REFUSAL_NO_FALLBACK_UUID: &str = "20202020-2020-4020-8020-202020202020";
     const CLAUDE_SYSTEM_AWAY_SUMMARY_UUID: &str = "18181818-1818-4818-8818-181818181818";
     const CLAUDE_SYSTEM_AGENTS_KILLED_UUID: &str = "19191919-1919-4919-8919-191919191919";
     const CLAUDE_SYSTEM_LOGICAL_PARENT_UUID: &str = "15151515-1515-4515-8515-151515151515";
@@ -1312,6 +1329,30 @@ mod tests {
         serde_json::Value::Object(metadata)
     }
 
+    fn claude_system_refusal_no_fallback_json() -> serde_json::Value {
+        let mut metadata = claude_system_json(
+            "model_refusal_no_fallback",
+            Some(CLAUDE_PARENT_UUID),
+            CLAUDE_SYSTEM_REFUSAL_NO_FALLBACK_UUID,
+        );
+        metadata.remove("slug");
+        metadata.insert("content".to_string(), json!(""));
+        metadata.insert("level".to_string(), json!("warning"));
+        metadata.insert("originalModel".to_string(), json!("claude-opus-5"));
+        metadata.insert("requestId".to_string(), json!("req-refusal"));
+        metadata.insert(
+            "apiRefusalCategory".to_string(),
+            json!("reasoning_extraction"),
+        );
+        metadata.insert("apiRefusalExplanation".to_string(), json!("refusal"));
+        metadata.insert(
+            "refusedUserMessageUuid".to_string(),
+            json!(CLAUDE_USER_UUID),
+        );
+        metadata.insert("isMeta".to_string(), json!(false));
+        serde_json::Value::Object(metadata)
+    }
+
     fn claude_queue_operation_json() -> serde_json::Value {
         json!({
             "type": "queue-operation",
@@ -1485,6 +1526,13 @@ mod tests {
 
     #[test]
     fn line_with_cost_parse_returns_none_for_non_assistant_messages() {
+        let context_edit = json!({
+            "type": "context_edit", "id": "edit-1", "parentId": "p1", "timestamp": CLAUDE_TIMESTAMP,
+            "targetId": "a1", "replacement": null
+        });
+        let log = parse_pi_log(context_edit.clone());
+        assert_eq!(log.identifier(), "edit-1");
+        assert_eq!(log.timestamp(), timestamp());
         let cases = [
             user_message_json(),
             tool_result_message_json(),
@@ -1494,6 +1542,25 @@ mod tests {
             branch_summary_json(),
             custom_json(),
             custom_message_json(),
+            context_edit,
+            json!({
+                "type": "message", "id": "system-1", "parentId": "p1", "timestamp": CLAUDE_TIMESTAMP,
+                "message": {
+                    "role": "system", "content": "Instructions", "timestamp": 1_700_000_000,
+                    "sections": {"preamble": "Base"},
+                    "toolsAdded": [{"name": "read", "description": "Read", "parameters": {}}]
+                }
+            }),
+            json!({
+                "type": "custom", "id": "job-1", "parentId": "p1", "timestamp": CLAUDE_TIMESTAMP,
+                "customType": "om.observer.catch-up.job",
+                "data": {"version": 1, "compactionId": "c1", "fromId": "e1", "throughId": "e2"}
+            }),
+            json!({
+                "type": "custom", "id": "progress-1", "parentId": "p1", "timestamp": CLAUDE_TIMESTAMP,
+                "customType": "om.observer.catch-up.progress",
+                "data": {"version": 1, "compactionId": "c1", "complete": true}
+            }),
         ];
 
         for (index, value) in cases.into_iter().enumerate() {
@@ -2113,6 +2180,12 @@ mod tests {
                 expected_id: CLAUDE_SYSTEM_CONSENT_FALLBACK_UUID.to_string(),
             },
             ClaudeNonBillableCase {
+                name: "system refusal without fallback",
+                value: claude_system_refusal_no_fallback_json,
+                expected_timestamp: ExpectedClaudeTimestamp::Real,
+                expected_id: CLAUDE_SYSTEM_REFUSAL_NO_FALLBACK_UUID.to_string(),
+            },
+            ClaudeNonBillableCase {
                 name: "queue operation",
                 value: claude_queue_operation_json,
                 expected_timestamp: ExpectedClaudeTimestamp::Real,
@@ -2298,5 +2371,27 @@ mod tests {
 
             assert_eq!(line.identifier(), case.expected_id, "case {}", case.name);
         }
+    }
+
+    #[test]
+    fn failing_sanitized_line_reports_the_raw_line_error() {
+        // The lone surrogate makes the sanitizer rewrite the line, but the
+        // truncated JSON still fails: the surfaced failure must be the raw
+        // line's error (the hex escape serde stopped on), not the sanitized
+        // retry's (whose rewrite turns the same truncation into an EOF
+        // error). Comparing against a reference chain built from the raw
+        // error keeps the assertion free of serde's wording.
+        let raw = r#"{"type":"custom","data":"\ud800""#;
+        let error = <PiLogLine as AnalyzableLog>::parse(raw).expect_err("truncated line must fail");
+        let expected = serde_json::from_str::<PiLogLine>(raw)
+            .into_diagnostic()
+            .context(LOG_LINE_PARSE_CONTEXT)
+            .unwrap_err();
+        assert_eq!(format!("{error:?}"), format!("{expected:?}"));
+    }
+
+    #[test]
+    fn unrelated_parse_failure_still_fails() {
+        assert!(<PiLogLine as AnalyzableLog>::parse(r#"{"type":"custom""#).is_err());
     }
 }

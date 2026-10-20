@@ -28,6 +28,13 @@ pub struct QueueOperation {
     /// kept a raw `String` for the same reason as `operation` above. Added in Claude Code 2.1.257+.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// The queued command the operation acted on. Added in Claude Code 2.1.285+.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command_uuid: Option<Uuid>,
+    /// Links this record to the `queued_command` attachment it delivered, which carries the same id
+    /// as snake_case `delivery_id`. Added in Claude Code 2.1.296+.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery_id: Option<DeliveryId>,
 }
 
 /// Progress events from Claude Code 2.1+.
@@ -452,6 +459,9 @@ pub struct LastPrompt {
     /// `leaf_uuid` alone without storing the prompt text.
     pub last_prompt: Option<String>,
     pub leaf_uuid: Option<Uuid>,
+    /// Only observed `true`, alongside the nil `leaf_uuid` and no prompt text. Added in Claude Code
+    /// 2.1.296+.
+    pub explicit: Option<bool>,
     pub session_id: Uuid,
 }
 
@@ -555,6 +565,8 @@ struct AttachmentLogLineWire {
     slug: Option<String>,
     rendered: Option<Vec<RenderedAttachment>>,
     rendered_in_human_turn: Option<Vec<RenderedAttachment>>,
+    rendered_role: Option<RenderedRole>,
+    rendered_beside_tool_result: Option<bool>,
     #[serde(rename = "session_id")]
     session_id_snake: Option<Uuid>,
     session_kind: Option<SessionKind>,
@@ -564,13 +576,23 @@ impl TryFrom<AttachmentLogLineWire> for AttachmentLogLine {
     type Error = String;
 
     fn try_from(wire: AttachmentLogLineWire) -> Result<Self, Self::Error> {
-        let rendering = match (wire.rendered, wire.rendered_in_human_turn) {
-            (Some(rendered), rendered_in_human_turn) => Some(AttachmentRendering {
+        let rendering = match wire.rendered {
+            Some(rendered) => Some(AttachmentRendering {
                 rendered,
-                rendered_in_human_turn,
+                rendered_in_human_turn: wire.rendered_in_human_turn,
+                rendered_role: wire.rendered_role,
+                rendered_beside_tool_result: wire.rendered_beside_tool_result,
             }),
-            (None, None) => None,
-            (None, Some(_)) => return Err("`renderedInHumanTurn` requires `rendered`".to_string()),
+            None if wire.rendered_in_human_turn.is_some() => {
+                return Err("`renderedInHumanTurn` requires `rendered`".to_string());
+            }
+            None if wire.rendered_role.is_some() => {
+                return Err("`renderedRole` requires `rendered`".to_string());
+            }
+            None if wire.rendered_beside_tool_result.is_some() => {
+                return Err("`renderedBesideToolResult` requires `rendered`".to_string());
+            }
+            None => None,
         };
         Ok(Self {
             parent_uuid: wire.parent_uuid,
@@ -599,6 +621,22 @@ pub struct AttachmentRendering {
     pub rendered: Vec<RenderedAttachment>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rendered_in_human_turn: Option<Vec<RenderedAttachment>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rendered_role: Option<RenderedRole>,
+    /// Marks a rendering injected next to a tool result rather than as its own turn content.
+    /// Added in Claude Code 2.1.296+.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rendered_beside_tool_result: Option<bool>,
+}
+
+/// The message role an attachment's rendering was injected under. Strict so a newly observed role
+/// surfaces as a parse error rather than being silently misattributed. Added in Claude Code
+/// 2.1.285+.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RenderedRole {
+    System,
+    User,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -625,6 +663,7 @@ pub enum AttachmentData {
     CommandPermissions(CommandPermissions),
     CompactFileReference(CompactFileReference),
     ContextTip(ContextTip),
+    CredentialOrg(CredentialOrg),
     Date(DateAttachment),
     DateChange(DateChange),
     DeferredToolsDelta(DeferredToolsDelta),
@@ -662,6 +701,14 @@ pub enum AttachmentData {
     TotalTokensReminder(TotalTokensReminder),
 }
 
+/// The organization the session's credentials belong to. Added in Claude Code 2.1.285+.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct CredentialOrg {
+    pub organization_uuid: Uuid,
+}
+
 /// The agent (subagent) analogue of `deferred_tools_delta`. Added in Claude Code 2.1.175+.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -669,6 +716,9 @@ pub enum AttachmentData {
 pub struct AgentListingDelta {
     pub added_types: Vec<String>,
     pub added_lines: Vec<String>,
+    /// The agent types that ship with Claude Code rather than coming from user or project agent
+    /// definitions; absent on older logs, hence `Option`. Added in Claude Code 2.1.285+.
+    pub built_in_types: Option<Vec<String>>,
     pub removed_types: Vec<String>,
     pub is_initial: bool,
     pub show_concurrency_note: bool,
@@ -809,7 +859,9 @@ pub struct DateAttachment {
     pub changed: Option<bool>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+/// `Hash`/`Ord` are not derived because [`Self::surfaced_definitions`] reaches
+/// [`PromptToolSchema::input_schema`], an opaque map that implements neither.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct DeferredToolsDelta {
@@ -820,8 +872,11 @@ pub struct DeferredToolsDelta {
     pub readded_names: Vec<String>,
     #[serde(default)]
     pub pending_mcp_servers: Vec<String>,
+    /// Unlike its bare-id siblings, each failed server arrives as an object. The bare-id element
+    /// type this field previously carried was an unverified assumption copied from those siblings
+    /// and has never been observed on the wire, so no string form is accepted.
     #[serde(default)]
-    pub failed_mcp_servers: Vec<String>,
+    pub failed_mcp_servers: Vec<FailedMcpServer>,
     /// Servers which deferred tools require authentication for. The wire payload currently names
     /// only their server ids, so the element type matches the other server lists.
     #[serde(default)]
@@ -834,6 +889,54 @@ pub struct DeferredToolsDelta {
     /// narrower than `added_names` when a tool is added without being announced.
     #[serde(default)]
     pub surfaced_names: Vec<String>,
+    /// Full definitions of the tools in [`Self::surfaced_names`]. Every observed record names the
+    /// same set in both, but they are not cross-checked because nothing downstream reads either.
+    /// Added in Claude Code 2.1.285+.
+    #[serde(default)]
+    pub surfaced_definitions: Vec<SurfacedToolDefinition>,
+}
+
+/// Reuses [`PromptToolSchema`] rather than [`DeferredToolSchema`] because surfaced definitions
+/// carry no `defer_loading` key. The wire repeats the tool name beside `definition`; deserializing
+/// via `SurfacedToolDefinitionWire` rejects a mismatch and keeps only `definition.name`, as
+/// [`PromptSnapshotTool::Defined`] does.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "SurfacedToolDefinitionWire")]
+pub struct SurfacedToolDefinition {
+    /// An opaque hex digest identifying the listing entry the definition was surfaced from.
+    pub listing: String,
+    pub definition: PromptToolSchema,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SurfacedToolDefinitionWire {
+    name: String,
+    listing: String,
+    definition: PromptToolSchema,
+}
+
+impl TryFrom<SurfacedToolDefinitionWire> for SurfacedToolDefinition {
+    type Error = String;
+
+    fn try_from(wire: SurfacedToolDefinitionWire) -> Result<Self, Self::Error> {
+        if wire.name != wire.definition.name {
+            return Err("surfaced tool definition must match its name".to_string());
+        }
+        Ok(Self {
+            listing: wire.listing,
+            definition: wire.definition,
+        })
+    }
+}
+
+/// A server whose connection failed, carried as an object rather than a bare id so Claude Code can
+/// attach failure detail to it later; strict so any such addition surfaces instead of being dropped.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct FailedMcpServer {
+    pub name: String,
 }
 
 /// The full definitions of the deferred tools whose schemas were loaded into the turn, the
@@ -843,6 +946,23 @@ pub struct DeferredToolsDelta {
 #[serde(deny_unknown_fields)]
 pub struct DeferredToolsRecord {
     pub entries: Vec<DeferredToolSchema>,
+    /// Absent on older logs, hence `Option`. Added in Claude Code 2.1.285+.
+    pub tool_input_copies: Option<Vec<ToolInputCopy>>,
+}
+
+/// Which copy of the input was recorded for the `tool_use` call named by `id`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolInputCopy {
+    pub id: String,
+    pub copy: ToolInputCopyKind,
+}
+
+/// Strict so a new kind of copy surfaces as a parse error; only `wire` has been observed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ToolInputCopyKind {
+    Wire,
 }
 
 /// Editor diagnostics Claude Code attaches after a file changed, so the model sees the errors its
@@ -928,6 +1048,32 @@ pub struct PromptSnapshot {
     pub system_prompt: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<PromptSnapshotTool>>,
+    // Prompt-shaping flags added in Claude Code 2.1.285+. They stay independent `Option`s rather
+    // than one grouped struct because snapshots carry different subsets: every observed 2.1.285
+    // snapshot has `reminderFold`/`echoWireToolInputs`/`contextRendering`, but only some have
+    // `systemTurns`/`keptReminders` and fewer still `toolChangeHeader`/`inlineTools`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reminder_fold: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_turns: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_change_header: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inline_tools: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kept_reminders: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub echo_wire_tool_inputs: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_rendering: Option<ContextRendering>,
+}
+
+/// How injected context is rendered. Strict so a new mode surfaces as a parse error; only
+/// `announced` has been observed. Added in Claude Code 2.1.285+.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ContextRendering {
+    Announced,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1030,7 +1176,7 @@ impl<'de> Deserialize<'de> for PromptSnapshotTool {
 }
 
 /// A tool definition as sent to the API, shared by `prompt_snapshot`'s tool roster and
-/// `deferred_tools_record`'s entries. Wire keys are snake_case here, unlike the camelCase log
+/// `deferred_tools_delta`'s surfaced definitions. Wire keys are snake_case here, unlike the camelCase log
 /// envelope around them, because this is the API's own tool shape carried through verbatim.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1472,6 +1618,10 @@ pub struct NestedMemoryContent {
     // type does not enforce that pairing — it is an upstream protocol invariant.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_content: Option<String>,
+    /// The memory file whose import pulled this one in (observed: a `CLAUDE.md` importing an
+    /// `AGENTS.md`); absent for files loaded directly. Added in Claude Code 2.1.285+.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
 }
 
 /// Plan file surfaced into the conversation with its full text inlined in `plan_content`; the
@@ -1518,12 +1668,42 @@ pub struct QueuedCommand {
     /// as snake_case unlike its camelCase siblings, so the rename is spelled out here.
     #[serde(rename = "source_uuid")]
     pub source_uuid: Option<Uuid>,
+    /// Links this attachment to the `queue-operation` record that delivered it, which carries the
+    /// same id as camelCase `deliveryId`. Added in Claude Code 2.1.296+, snake_case like
+    /// `source_uuid`.
+    #[serde(rename = "delivery_id")]
+    pub delivery_id: Option<DeliveryId>,
     pub command_mode: String,
     /// Who queued the command (e.g. `{"kind":"human"}`); absent in logs before Claude Code
     /// 2.1.197. Reuses [`MessageOrigin`] since both carry the same `kind` discriminator.
     pub origin: Option<MessageOrigin>,
     /// When the command was queued; absent in logs before Claude Code 2.1.197.
     pub timestamp: Option<DateTime<Utc>>,
+    /// Undocumented flag first observed (as `true`, on a human-originated `prompt` command) in
+    /// Claude Code 2.1.280; its meaning relative to `origin` is unknown. `Option` because earlier
+    /// logs omit it.
+    pub human_turn: Option<bool>,
+    /// Resource totals of the background task a `task-notification` command reports on. Observed
+    /// in Claude Code 2.1.280+; other command modes omit it.
+    pub usage: Option<QueuedCommandUsage>,
+    /// Observed (as `true`) on a peer hand-back command, which is injected as a system reminder
+    /// rather than typed by the user. Added in Claude Code 2.1.285+.
+    pub is_meta: Option<bool>,
+    /// The id of the `<system-reminder id=...>` frame the command was rendered into, linking it to
+    /// the attachment line's rendered text. Added in Claude Code 2.1.285+.
+    pub reminder_id: Option<String>,
+    /// The background task run a `task-notification` command reports on, matching
+    /// [`MessageOrigin::run_id`]. Added in Claude Code 2.1.296+.
+    pub run_id: Option<RunId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct QueuedCommandUsage {
+    pub total_tokens: u64,
+    pub tool_uses: u64,
+    pub duration_ms: u64,
 }
 
 /// Preserves the warning Claude Code emits when `Read` returns only part of an oversized result,
@@ -1648,6 +1828,7 @@ pub enum SystemLogLine {
     StopHookSummary(StopHookSummary),
     TurnDuration(TurnDuration),
     ModelRefusalFallback(ModelRefusalFallback),
+    ModelRefusalNoFallback(ModelRefusalNoFallback),
     ModelConsentFallback(ModelConsentFallback),
     AwaySummary(AwaySummary),
     AgentsKilled(AgentsKilled),
@@ -1754,6 +1935,10 @@ pub struct ModelRefusalFallback {
     /// Only `"refusal"` has been observed; raw `String` for the same
     /// forward-compatibility reason as `direction`.
     pub trigger: String,
+    /// How far the fallback applies (observed: `"session"`); raw `String` for the same
+    /// forward-compatibility reason as `direction`, and `Option` because pre-2.1.270 records
+    /// omit it. Added in Claude Code 2.1.270+.
+    pub scope: Option<String>,
     pub original_model: Model,
     pub fallback_model: Model,
     pub request_id: String,
@@ -1772,6 +1957,32 @@ pub struct ModelRefusalFallback {
     /// The user message whose request was refused; `null` when Claude Code recorded none.
     /// Added in Claude Code 2.1.201+.
     pub refused_user_message_uuid: Option<Uuid>,
+}
+
+/// Records a refusal when Claude Code has no fallback model to retry with. Its distinct subtype
+/// carries no retry direction, fallback model, or retracted-turn list. Added in Claude Code 2.1.270+.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct ModelRefusalNoFallback {
+    pub parent_uuid: Option<Uuid>,
+    pub is_sidechain: bool,
+    pub user_type: String,
+    pub cwd: String,
+    pub session_id: Uuid,
+    pub version: String,
+    pub git_branch: String,
+    pub content: String,
+    pub level: String,
+    pub original_model: Model,
+    pub request_id: String,
+    pub api_refusal_category: Option<String>,
+    pub api_refusal_explanation: Option<String>,
+    pub refused_user_message_uuid: Option<Uuid>,
+    pub is_meta: bool,
+    pub timestamp: DateTime<Utc>,
+    pub uuid: Uuid,
+    pub entrypoint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1794,6 +2005,18 @@ pub struct LocalCommandLog {
     pub is_meta: bool,
     /// Entry point that started the session (e.g., "cli"). Added in Claude Code 2.1.104+.
     pub entrypoint: Option<String>,
+    /// The slash command whose output `content` records, structured rather than parsed out of the
+    /// rendered text. Added in Claude Code 2.1.296+.
+    pub command_run: Option<LocalCommandRun>,
+}
+
+/// Observed with `command` lacking its leading slash (e.g. `rename`) and `args` as the raw,
+/// unsplit argument string.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalCommandRun {
+    pub command: String,
+    pub args: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -2130,9 +2353,54 @@ pub struct MicrocompactMetadata {
     pub cleared_attachment_uuids: Vec<Uuid>,
 }
 
+/// Shared by [`ScheduledTaskInfo`] and [`UserLogLine::scheduled_task_id`] so the link from a
+/// scheduled turn back to the task that fired it is visible in the types.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ScheduledTaskId(pub String);
+
+/// Shared by [`MessageOrigin::run_id`] and [`QueuedCommand::run_id`] so the link between a
+/// task-notification turn and the queued command that delivered it is visible in the types.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RunId(pub String);
+
+/// Shared by [`QueueOperation::delivery_id`] and [`QueuedCommand::delivery_id`] so the link between
+/// a queue removal and the attachment it delivered is visible in the types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct DeliveryId(pub Uuid);
+
+/// `taskId`/`cron`/`prompt`/`taskKind`/`cronKind` are always emitted together on the wire (first
+/// observed in Claude Code 2.1.280; older records omit all of them), so they are grouped into one
+/// type rather than sibling `Option` fields, which would make a half-present payload
+/// representable.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
+pub struct ScheduledTaskInfo {
+    pub task_id: ScheduledTaskId,
+    pub cron: String,
+    pub prompt: String,
+    pub task_kind: ScheduledTaskKind,
+    pub cron_kind: ScheduledTaskKind,
+}
+
+/// Kind of scheduled task (`taskKind`) and of its schedule (`cronKind`); both carry the same
+/// vocabulary on the wire. Only `loop` has been observed, but it is a strict enum (like
+/// [`SessionKind`]) so a new kind surfaces as a parse error rather than being accepted silently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ScheduledTaskKind {
+    Loop,
+}
+
+/// Deserializes via `ScheduledTaskFireWire` because the [`ScheduledTaskInfo`] fields are wire-level
+/// siblings of the envelope rather than a nested object, and `#[serde(flatten)]` cannot be combined
+/// with `#[serde(deny_unknown_fields)]` on this struct directly.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(try_from = "ScheduledTaskFireWire")]
 pub struct ScheduledTaskFire {
     pub parent_uuid: Option<Uuid>,
     pub is_sidechain: bool,
@@ -2149,6 +2417,80 @@ pub struct ScheduledTaskFire {
     pub is_meta: bool,
     /// Entry point that started the session (e.g., "cli"). Added in Claude Code 2.1.104+.
     pub entrypoint: Option<String>,
+    #[serde(flatten)]
+    pub task: Option<ScheduledTaskInfo>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+struct ScheduledTaskFireWire {
+    parent_uuid: Option<Uuid>,
+    is_sidechain: bool,
+    user_type: String,
+    cwd: String,
+    session_id: Uuid,
+    version: String,
+    git_branch: String,
+    slug: Option<String>,
+    content: String,
+    timestamp: DateTime<Utc>,
+    uuid: Uuid,
+    is_meta: bool,
+    entrypoint: Option<String>,
+    task_id: Option<ScheduledTaskId>,
+    cron: Option<String>,
+    prompt: Option<String>,
+    task_kind: Option<ScheduledTaskKind>,
+    cron_kind: Option<ScheduledTaskKind>,
+}
+
+impl TryFrom<ScheduledTaskFireWire> for ScheduledTaskFire {
+    type Error = String;
+
+    fn try_from(wire: ScheduledTaskFireWire) -> Result<Self, Self::Error> {
+        let task = match (
+            wire.task_id,
+            wire.cron,
+            wire.prompt,
+            wire.task_kind,
+            wire.cron_kind,
+        ) {
+            (Some(task_id), Some(cron), Some(prompt), Some(task_kind), Some(cron_kind)) => {
+                Some(ScheduledTaskInfo {
+                    task_id,
+                    cron,
+                    prompt,
+                    task_kind,
+                    cron_kind,
+                })
+            }
+            (None, None, None, None, None) => None,
+            _ => {
+                return Err(
+                    "`taskId`, `cron`, `prompt`, `taskKind`, and `cronKind` must all be present \
+                     or all be absent"
+                        .to_string(),
+                );
+            }
+        };
+        Ok(Self {
+            parent_uuid: wire.parent_uuid,
+            is_sidechain: wire.is_sidechain,
+            user_type: wire.user_type,
+            cwd: wire.cwd,
+            session_id: wire.session_id,
+            version: wire.version,
+            git_branch: wire.git_branch,
+            slug: wire.slug,
+            content: wire.content,
+            timestamp: wire.timestamp,
+            uuid: wire.uuid,
+            is_meta: wire.is_meta,
+            entrypoint: wire.entrypoint,
+            task,
+        })
+    }
 }
 
 /// Duration of a single turn (user message → assistant response cycle).
@@ -2310,6 +2652,17 @@ pub struct UserLogLine {
     pub prompt_id: Option<Uuid>,
     /// How the prompt was submitted (e.g., "typed"). Added in Claude Code 2.1.170+.
     pub prompt_source: Option<String>,
+    /// Whether the turn originated from a human or another source; preserved because strict
+    /// deserialization would otherwise discard the entire conversation record. Added in 2.1.278+.
+    pub turn_origin: Option<String>,
+    /// Where this turn sits in the session's prompt/turn sequence. Added in Claude Code 2.1.285+.
+    pub turn_position: Option<TurnPosition>,
+    /// The scheduled task that produced this turn. Present only on scheduled turns. Observed in
+    /// Claude Code 2.1.280+.
+    pub scheduled_task_id: Option<ScheduledTaskId>,
+    /// The `uuid` of the `scheduled_task_fire` record that produced this turn. Present only on
+    /// scheduled turns. Observed in Claude Code 2.1.280+.
+    pub scheduled_fire_id: Option<Uuid>,
     /// Current permission mode. Added in Claude Code 2.1.77+.
     pub permission_mode: Option<PermissionMode>,
     /// Plan content when in plan mode. Added in Claude Code 2.1.77+.
@@ -2325,9 +2678,9 @@ pub struct UserLogLine {
     /// Present only on user turns that deliver an MCP tool result; absent on ordinary turns and on
     /// built-in (non-MCP) tool results, hence `Option`. Added in Claude Code 2.1.158+.
     pub mcp_meta: Option<McpMeta>,
-    /// Why Claude Code denied the tool call this turn responds to; present only on the user turn
-    /// carrying a denied tool's error `tool_result`, absent otherwise, hence `Option`. Added in
-    /// Claude Code 2.1.201+.
+    /// Why the tool call this turn responds to produced no normal result (a denial or an
+    /// interruption); present only on the user turn carrying that call's error `tool_result`,
+    /// absent otherwise, hence `Option`. Added in Claude Code 2.1.201+.
     pub tool_denial_kind: Option<ToolDenialKind>,
     /// Preserved despite not driving analysis so a feedback-bearing denial does not make strict
     /// deserialization discard the whole turn. Added in Claude Code 2.1.219+.
@@ -2339,6 +2692,10 @@ pub struct UserLogLine {
     /// alongside it (observed on injected task notifications). Only `true` has been observed, so
     /// `Option` doubles as the absent/false case. Added in Claude Code 2.1.257+.
     pub queue_skip_attachments: Option<bool>,
+    /// Marks a queued turn recorded only in the transcript (observed on a task notification
+    /// replayed after a restart). Only `true` has been observed, so `Option` doubles as the
+    /// absent/false case. Added in Claude Code 2.1.296+.
+    pub queue_transcript_only: Option<bool>,
     /// Marks a meta turn that accompanies the turn it was injected alongside (e.g. a skill's
     /// instructions carried with the prompt that invoked it) rather than standing on its own.
     /// Added in Claude Code 2.1.238+.
@@ -2360,6 +2717,137 @@ pub struct UserLogLine {
     /// and the `image` content blocks carrying the data. Logged as `null` on turns with no paste, so
     /// `Option` covers both the null and the absent case. Added in Claude Code 2.1.257+.
     pub image_paste_ids: Option<Vec<u32>>,
+    /// Structured environment context Claude Code sends alongside the request for server-side
+    /// classification, the object-shaped counterpart of `classifier_meta_lines`. Absent on older
+    /// lines, hence `Option`. Added in Claude Code 2.1.278+.
+    pub server_classifier_context: Option<ServerClassifierContext>,
+    /// How the tool call this turn's result answers was permitted; present only on tool-result
+    /// turns. Added in Claude Code 2.1.296+.
+    pub permission_decision: Option<PermissionDecision>,
+}
+
+/// Fields stay `String` rather than strict enums because their vocabularies are undocumented and
+/// nothing downstream reads them.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct PermissionDecision {
+    pub decision: String,
+    pub source: String,
+    /// Present on hook decisions and some config ones, absent on user decisions.
+    pub reason_type: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerClassifierContext {
+    pub request: Uuid,
+    pub context: ClassifierEnvironment,
+}
+
+/// Wire keys are snake_case, unlike the camelCase log envelope around them.
+///
+/// `platform` stays a `String` because its vocabulary (observed: `macos`) is undocumented and
+/// nothing downstream reads it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClassifierEnvironment {
+    pub git_state: ClassifierGitState,
+    pub live_cwd: String,
+    pub platform: String,
+}
+
+/// Untagged over the two shapes Claude Code emits, for the same reason as [`AutoModeExit`]: sibling
+/// `Option` fields could represent a half-collected snapshot the wire format never produces.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ClassifierGitState {
+    Collected(Box<CollectedGitState>),
+    Pending(PendingGitState),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CollectedGitState {
+    pub cwd: String,
+    pub root: String,
+    pub branch: String,
+    pub default_branch: Option<String>,
+    pub status: ClassifierGitStatus,
+    pub visibility: ClassifierGitVisibility,
+}
+
+/// Logged while Claude Code is still collecting git state: the collected keys are present but
+/// always `null`, so they are `()` fields (serde reads `null` into `()`) that reject any value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PendingGitState {
+    pub cwd: String,
+    pub root: (),
+    pub branch: (),
+    pub default_branch: (),
+    pub status: (),
+    pub visibility: (),
+    pub error: GitStateError,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitStateError {
+    Pending,
+}
+
+/// Only `null` has been observed for `porcelain`, so it is `()` like [`PendingGitState`]'s null
+/// keys: the first non-null payload fails to parse and exposes the real shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClassifierGitStatus {
+    pub clean: bool,
+    pub counts: ClassifierGitCounts,
+    pub porcelain: (),
+    pub truncated: bool,
+}
+
+/// `untracked` has only been observed `null` alongside a populated `untracked_normal`, so it is
+/// `Option` while its sibling counts are required.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClassifierGitCounts {
+    pub staged: u64,
+    pub modified: u64,
+    pub untracked: Option<u64>,
+    pub untracked_normal: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClassifierGitVisibility {
+    /// `null` in a repository with no remotes.
+    pub origin: Option<ClassifierRemoteVisibility>,
+    pub push_remote: Option<String>,
+    pub remotes: Vec<ClassifierNamedRemote>,
+    pub visibility_cache: Vec<ClassifierRemoteVisibility>,
+}
+
+/// `visibility` stays a `String` because its vocabulary (observed: `private`, `unknown`) is
+/// undocumented and nothing downstream reads it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClassifierRemoteVisibility {
+    pub host: String,
+    pub remote: String,
+    pub visibility: String,
+}
+
+/// Repeats [`ClassifierRemoteVisibility`]'s fields rather than flattening it because
+/// `serde(flatten)` cannot be combined with `deny_unknown_fields`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClassifierNamedRemote {
+    pub name: String,
+    pub host: String,
+    pub remote: String,
+    pub visibility: String,
 }
 
 /// Summarization metadata on a compact-summary user turn. Added in Claude Code 2.1.214+.
@@ -2397,17 +2885,58 @@ pub struct McpMeta {
     pub meta: Option<HashMap<String, serde_json::Value>>,
 }
 
+/// Strict so a new producer surfaces as a parse error; only `session-task` (on a task
+/// notification) has been observed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MessageProducer {
+    SessionTask,
+}
+
+/// Observed with `promptIndex` 0 on a system-injected task notification and 1 on the first typed
+/// prompt, so a zero index does not mean "first prompt". Added in Claude Code 2.1.285+.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct TurnPosition {
+    pub prompt_index: u32,
+    pub turn_index: u32,
+}
+
 /// Origin metadata for a message. Added in Claude Code 2.1.104+.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct MessageOrigin {
     pub kind: String,
+    /// What produced the message; absent on origins without a producer, hence `Option`. Added in
+    /// Claude Code 2.1.285+.
+    pub producer: Option<MessageProducer>,
+    /// The remaining fields are observed only on `peer` origins (a message from another agent in the
+    /// same session, e.g. a subagent hand-back). They stay independent `Option`s because only the
+    /// hand-back shape has been observed, so which of them a plain peer message carries is unknown.
+    /// Added in Claude Code 2.1.285+.
+    ///
+    /// The sending agent's address, as used in the `<agent-message from=...>` frame.
+    pub from: Option<String>,
+    pub sender_task_id: Option<String>,
+    /// The sending agent's type (e.g. `openspec-verifier`), unlike `from`, which is its instance
+    /// address. Added in Claude Code 2.1.296+.
+    #[serde(rename = "name")]
+    pub sender_agent_type: Option<String>,
+    /// The peer's message text, without the system-reminder framing the prompt wraps it in.
+    pub body: Option<String>,
+    /// Marks the message as a subagent's final report to the agent that delegated to it.
+    pub handback: Option<bool>,
+    /// The background task run that a `task-notification` origin reports on. Added in Claude Code
+    /// 2.1.296+.
+    pub run_id: Option<RunId>,
 }
 
-/// Why Claude Code denied a tool call. Modeled as a strict enum (not a free `String`) so a new
-/// denial kind surfaces as a parse error to be handled, matching the parser's fail-on-unknown
-/// stance. Added in Claude Code 2.1.201+.
+/// Why a tool call produced no normal result: one of several denials, or (despite the wire name)
+/// an interruption. Modeled as a strict enum (not a free `String`) so a new kind surfaces as a
+/// parse error to be handled, matching the parser's fail-on-unknown stance. Added in Claude Code
+/// 2.1.201+.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ToolDenialKind {
@@ -2419,6 +2948,9 @@ pub enum ToolDenialKind {
     /// temporarily unavailable, so the call was denied rather than approved. Added in Claude Code
     /// 2.1.201+.
     AutomodeUnavailable,
+    /// The session ended before the tool call's result was recorded, so its outcome is unknown.
+    /// Added in Claude Code 2.1.296+.
+    Interrupted,
 }
 
 /// Scheduling priority for a prompt queued while Claude Code was busy. Modeled as a strict enum
@@ -2610,6 +3142,9 @@ pub struct AssistantLogLine {
     pub slug: Option<String>,
     pub message: AssistantLogMessage,
     pub request_id: Option<String>,
+    /// Opaque identifiers/metadata that do not affect usage attribution.
+    pub server_classifier_request: Option<String>,
+    pub advisor_model: Option<String>,
     pub uuid: Uuid,
     pub timestamp: DateTime<Utc>,
     pub is_api_error_message: Option<bool>,
@@ -2679,6 +3214,28 @@ pub struct AssistantLogLine {
     /// The working directory each tool call was issued against, keyed by tool_use id like
     /// [`Self::wire_tool_inputs`]. Added in Claude Code 2.1.270+.
     pub wire_ingest_context: Option<HashMap<String, WireIngestContext>>,
+    /// Assistant turns this one replaces, e.g. the refused turns listed in the preceding
+    /// [`ModelRefusalFallback`]'s `retracted_message_uuids` when the request was retried on the
+    /// fallback model. Added in Claude Code 2.1.270+.
+    pub supersedes_uuids: Option<Vec<Uuid>>,
+    /// Added in Claude Code 2.1.296+, together with `thinking_display`.
+    pub thinking_duration_ms: Option<u64>,
+    /// Added in Claude Code 2.1.296+.
+    pub thinking_display: Option<ThinkingDisplay>,
+    /// The model id the user selected, which can differ from `message.model` by a capability
+    /// decoration such as `[1m]`. Pricing keeps reading `message.model`, the model that actually
+    /// served the turn. Added in Claude Code 2.1.296+.
+    pub requested_model: Option<Model>,
+}
+
+/// How thinking blocks were returned to the client. A strict enum because the API documents a
+/// closed set (`summarized`/`omitted`), so a new mode surfaces as a parse error. Added in Claude
+/// Code 2.1.296+.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ThinkingDisplay {
+    Summarized,
+    Omitted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -2729,6 +3286,8 @@ pub struct AssistantLogMessage {
     /// Diagnostic details from Claude Code about the request (e.g., cache miss reason).
     /// Added in Claude Code 2.1.141+.
     pub diagnostics: Option<Diagnostics>,
+    /// Provider-managed data is unused by reports and can evolve independently.
+    pub input_transformations: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -2802,6 +3361,10 @@ pub struct AssistantUsage {
     pub iterations: Option<Vec<Iteration>>,
     /// Speed setting for the response. Added in Claude Code 2.1.77+.
     pub speed: Option<Speed>,
+    /// Only ever observed `null`. Typed as `Option<()>` so any populated payload fails to parse:
+    /// a credit could change what a response costs, so its real shape must be modeled rather than
+    /// silently discarded. Added in Claude Code 2.1.285+.
+    pub fallback_credit: Option<()>,
 }
 
 /// Added in Claude Code 2.1.238+. `thinking_tokens` is required because every observed payload

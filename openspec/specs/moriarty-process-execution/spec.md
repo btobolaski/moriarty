@@ -417,8 +417,8 @@ that identifies the affected item and configuration problem rather than a panic 
 
 Lifecycle diagnostics SHALL NOT interpolate captured child output. Configuration, verification, and execution
 diagnostics SHALL preserve available contextual source causes using output-excluding presentation. Safe error-chain
-presentation SHALL NOT interpolate captured child output or debug-print supervisor reports or partial captures. Existing
-MCP error envelopes and tool schemas SHALL remain unchanged.
+presentation SHALL NOT interpolate captured child output or debug-print supervisor reports or partial captures.
+Diagnostic changes SHALL NOT alter MCP error envelopes or tool schemas.
 
 #### Scenario: Malformed configuration retains its source diagnostic
 

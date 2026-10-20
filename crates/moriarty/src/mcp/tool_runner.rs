@@ -94,12 +94,13 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::{MCP_PROTOCOL_VERSION, MCP_SUPPORTED_PROTOCOL_VERSIONS};
+use super::{MCP_PROTOCOL_VERSION, MCP_SUPPORTED_PROTOCOL_VERSIONS, default_project_dir};
 use crate::{checks::CheckRunOutcome, project_config::runner::verify_and_load_project};
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RunArgs {
-    /// The project directory containing `.config/tools.toml`
+    /// The project directory containing `.config/tools.toml`; defaults to the server's cwd.
+    #[serde(default = "default_project_dir")]
     pub project_dir: PathBuf,
 }
 

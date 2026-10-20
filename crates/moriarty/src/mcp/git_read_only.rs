@@ -26,30 +26,38 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    MCP_PROTOCOL_VERSION, MCP_SUPPORTED_PROTOCOL_VERSIONS,
+    MCP_PROTOCOL_VERSION, MCP_SUPPORTED_PROTOCOL_VERSIONS, default_project_dir,
     read_only::{CommandResult, run_read_only_command},
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct StatusArgs {
+    /// Defaults to the MCP server's working directory when omitted.
+    #[serde(default = "default_project_dir")]
     pub project_dir: PathBuf,
     pub args: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DiffArgs {
+    /// Defaults to the MCP server's working directory when omitted.
+    #[serde(default = "default_project_dir")]
     pub project_dir: PathBuf,
     pub args: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct LogArgs {
+    /// Defaults to the MCP server's working directory when omitted.
+    #[serde(default = "default_project_dir")]
     pub project_dir: PathBuf,
     pub args: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ShowArgs {
+    /// Defaults to the MCP server's working directory when omitted.
+    #[serde(default = "default_project_dir")]
     pub project_dir: PathBuf,
     pub args: Vec<String>,
 }

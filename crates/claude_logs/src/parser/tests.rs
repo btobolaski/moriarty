@@ -69,6 +69,43 @@ fn assistant_log_line_json(extra: serde_json::Value) -> serde_json::Value {
     json
 }
 
+fn model_refusal_fallback_json(extra: serde_json::Value) -> serde_json::Value {
+    let mut json = serde_json::json!({
+        "type": "system",
+        "subtype": "model_refusal_fallback",
+        "parentUuid": "9528e913-20fc-42ea-9e4c-5fb080b07c04",
+        "isSidechain": false,
+        "direction": "retry",
+        "content": "Fable 5's safeguards flagged this message. Switched to Opus 4.8.",
+        "level": "warning",
+        "trigger": "refusal",
+        "originalModel": "claude-fable-5",
+        "fallbackModel": "claude-opus-4-8",
+        "requestId": "req_011Ccmjmo1wkFV3JyX6W34NT",
+        "apiRefusalCategory": "cyber",
+        "apiRefusalExplanation": null,
+        "isMeta": false,
+        "timestamp": "2026-07-07T00:19:18.167Z",
+        "uuid": "5eba741a-e6a1-449a-adbe-4d29aaa8468a",
+        "retractedMessageUuids": ["490b7142-41ad-4667-8166-469606129093"],
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "/test",
+        "sessionId": "583790a4-8207-4478-92ee-ebb9538b54dd",
+        "version": "2.1.201",
+        "gitBranch": "HEAD"
+    });
+    merge_json(&mut json, extra);
+    json
+}
+
+fn parse_model_refusal_fallback(json: serde_json::Value) -> ModelRefusalFallback {
+    match serde_json::from_value::<LogLine>(json).expect("Failed to parse model_refusal_fallback") {
+        LogLine::System(SystemLogLine::ModelRefusalFallback(fallback)) => fallback,
+        other => panic!("Expected System(ModelRefusalFallback), got {other:?}"),
+    }
+}
+
 fn merge_json(target: &mut serde_json::Value, overlay: serde_json::Value) {
     match (target, overlay) {
         (serde_json::Value::Object(target), serde_json::Value::Object(overlay)) => {
@@ -1383,6 +1420,25 @@ fn test_parse_assistant_with_web_fetch_and_context_management() {
     }
 }
 
+#[test]
+fn test_parse_assistant_with_request_transformations_and_advisor_metadata() {
+    let assistant = parse_assistant_log_line(assistant_log_line_json(serde_json::json!({
+        "message": {"input_transformations": []},
+        "serverClassifierRequest": "eaa2d39a-7616-47a4-9dd0-2b2ffcdde685",
+        "advisorModel": "claude-opus-5"
+    })));
+
+    assert_eq!(
+        assistant.message.input_transformations,
+        Some(serde_json::json!([]))
+    );
+    assert_eq!(
+        assistant.server_classifier_request.as_deref(),
+        Some("eaa2d39a-7616-47a4-9dd0-2b2ffcdde685")
+    );
+    assert_eq!(assistant.advisor_model.as_deref(), Some("claude-opus-5"));
+}
+
 // Synthetic API-error assistant turn (Claude Code 2.1.158) carrying error type + HTTP status.
 #[test]
 fn test_parse_assistant_api_error_message_with_status() {
@@ -1775,9 +1831,10 @@ fn test_parse_assistant_without_web_fetch_requests() {
     }
 }
 
-#[test]
-fn test_parse_scheduled_task_fire() {
-    let json = serde_json::json!({
+/// Overlays `extra` onto a pre-2.1.280 `scheduled_task_fire` record, so a case states only the
+/// keys it is about.
+fn scheduled_task_fire_json(extra: serde_json::Value) -> serde_json::Value {
+    let mut json = serde_json::json!({
         "parentUuid": "eee9f696-e699-4606-873c-3134cfe5a284",
         "isSidechain": false,
         "type": "system",
@@ -1794,40 +1851,70 @@ fn test_parse_scheduled_task_fire() {
         "gitBranch": "HEAD",
         "slug": "we-need-to-build-mutable-hamming"
     });
+    merge_json(&mut json, extra);
+    json
+}
 
-    let line: LogLine =
-        serde_json::from_value(json).expect("Failed to parse scheduled_task_fire system message");
+fn parse_scheduled_task_fire(json: serde_json::Value) -> ScheduledTaskFire {
+    let LogLine::System(SystemLogLine::ScheduledTaskFire(fire)) =
+        serde_json::from_value(json).expect("Failed to parse scheduled_task_fire system message")
+    else {
+        panic!("Expected System(ScheduledTaskFire) variant");
+    };
+    fire
+}
 
-    match line {
-        LogLine::System(SystemLogLine::ScheduledTaskFire(fire)) => {
-            assert_eq!(fire.content, "Claude resuming /loop wakeup (Jun 1 10:45am)");
-            assert_eq!(fire.entrypoint.as_deref(), Some("cli"));
-            assert!(!fire.is_meta);
-        }
-        _ => panic!("Expected System(ScheduledTaskFire) variant"),
-    }
+#[test]
+fn test_parse_scheduled_task_fire() {
+    let fire = parse_scheduled_task_fire(scheduled_task_fire_json(serde_json::json!({})));
+    assert_eq!(fire.content, "Claude resuming /loop wakeup (Jun 1 10:45am)");
+    assert_eq!(fire.entrypoint.as_deref(), Some("cli"));
+    assert!(!fire.is_meta);
+    assert!(fire.task.is_none());
+}
+
+#[test]
+fn test_parse_scheduled_task_fire_with_task_metadata() {
+    let fire = parse_scheduled_task_fire(scheduled_task_fire_json(serde_json::json!({
+        "version": "2.1.280",
+        "taskId": "b160e32d",
+        "cron": "57 18 * * *",
+        "prompt": "Fix all of the parsing issues.",
+        "taskKind": "loop",
+        "cronKind": "loop"
+    })));
+    assert_eq!(
+        fire.task,
+        Some(ScheduledTaskInfo {
+            task_id: ScheduledTaskId("b160e32d".to_string()),
+            cron: "57 18 * * *".to_string(),
+            prompt: "Fix all of the parsing issues.".to_string(),
+            task_kind: ScheduledTaskKind::Loop,
+            cron_kind: ScheduledTaskKind::Loop,
+        })
+    );
+}
+
+#[test]
+fn test_parse_scheduled_task_fire_rejects_partial_task_metadata() {
+    let json = scheduled_task_fire_json(serde_json::json!({
+        "taskId": "b160e32d",
+        "cron": "57 18 * * *"
+    }));
+    let err_msg = serde_json::from_value::<LogLine>(json)
+        .expect_err("a partial task metadata set must be rejected")
+        .to_string();
+    assert!(
+        err_msg.contains("must all be present or all be absent"),
+        "unexpected error: {err_msg}"
+    );
 }
 
 #[test]
 fn test_parse_scheduled_task_fire_rejects_unknown_fields() {
-    let json = serde_json::json!({
-        "parentUuid": "eee9f696-e699-4606-873c-3134cfe5a284",
-        "isSidechain": false,
-        "type": "system",
-        "subtype": "scheduled_task_fire",
-        "content": "Claude resuming /loop wakeup (Jun 1 10:45am)",
-        "isMeta": false,
-        "timestamp": "2026-06-01T15:45:52.142Z",
-        "uuid": "ac7c4318-679d-45c7-8d86-3ca6934f8611",
-        "userType": "external",
-        "entrypoint": "cli",
-        "cwd": "/Users/brendan/src/switchboard-jj",
-        "sessionId": "2883cea4-f496-44b6-a291-354d7e39bdc6",
-        "version": "2.1.141",
-        "gitBranch": "HEAD",
-        "slug": "we-need-to-build-mutable-hamming",
+    let json = scheduled_task_fire_json(serde_json::json!({
         "unknownField": "should be rejected"
-    });
+    }));
 
     let err_msg = serde_json::from_value::<LogLine>(json)
         .expect_err("Should reject unknown fields due to deny_unknown_fields")
@@ -2245,32 +2332,11 @@ fn test_parse_stop_hook_summary_with_mixed_error_formats() {
 
 #[test]
 fn test_parse_model_refusal_fallback() {
-    let json = serde_json::json!({
-        "type": "system",
-        "subtype": "model_refusal_fallback",
-        "parentUuid": "77502799-98d4-4548-b903-ed5d6f797e41",
-        "isSidechain": false,
-        "direction": "retry",
-        "content": "Fable 5's safety measures flagged this message. Switched to Opus 4.8.",
-        "level": "warning",
-        "trigger": "refusal",
-        "originalModel": "claude-fable-5",
-        "fallbackModel": "claude-opus-4-8",
-        "requestId": "req_011CbtEUxmnDLZxNhMjZT5dt",
+    let json = model_refusal_fallback_json(serde_json::json!({
         "apiRefusalCategory": null,
         "apiRefusalExplanation": null,
-        "isMeta": false,
-        "timestamp": "2026-06-09T19:24:49.832Z",
-        "uuid": "6e45b19e-8f68-4144-9eac-c1577fe3737e",
-        "retractedMessageUuids": ["6102750b-5a74-4578-bf67-d42e5b5f85ee"],
-        "userType": "external",
-        "entrypoint": "cli",
-        "cwd": "/test",
-        "sessionId": "f671f20e-5ef4-41d5-bfe5-aa4b87a2bd54",
-        "version": "2.1.170",
-        "gitBranch": "HEAD",
-        "slug": "i-need-to-run-hashed-stroustrup"
-    });
+        "version": "2.1.170"
+    }));
 
     let line: LogLine =
         serde_json::from_value(json).expect("Failed to parse model_refusal_fallback");
@@ -2292,32 +2358,58 @@ fn test_parse_model_refusal_fallback() {
 }
 
 #[test]
-fn test_parse_model_refusal_fallback_with_populated_refusal_details() {
+fn test_parse_model_refusal_no_fallback() {
     let json = serde_json::json!({
         "type": "system",
-        "subtype": "model_refusal_fallback",
-        "parentUuid": "77502799-98d4-4548-b903-ed5d6f797e41",
+        "subtype": "model_refusal_no_fallback",
+        "parentUuid": "a9892cbf-754d-460d-ab2d-425e09af0c6a",
         "isSidechain": false,
-        "direction": "retry",
-        "content": "Switched to Opus 4.8.",
+        "content": "",
         "level": "warning",
-        "trigger": "refusal",
-        "originalModel": "claude-fable-5",
-        "fallbackModel": "claude-opus-4-8",
-        "requestId": "req_011CbtEUxmnDLZxNhMjZT5dt",
-        "apiRefusalCategory": "cyber",
-        "apiRefusalExplanation": "Flagged for cybersecurity topics.",
+        "originalModel": "claude-opus-5",
+        "requestId": "req_011CfHQQDVawJmF8rb41V1nb",
+        "apiRefusalCategory": "reasoning_extraction",
+        "apiRefusalExplanation": "This request was blocked.",
+        "refusedUserMessageUuid": "a668db4b-29bc-4fb1-9021-4a0f397d390b",
         "isMeta": false,
-        "timestamp": "2026-06-09T19:24:49.832Z",
-        "uuid": "6e45b19e-8f68-4144-9eac-c1577fe3737e",
-        "retractedMessageUuids": [],
+        "uuid": "dfa790ed-a82d-4318-82e4-9c7f63b9ecaa",
+        "timestamp": "2026-09-21T22:52:07.251Z",
         "userType": "external",
         "entrypoint": "cli",
         "cwd": "/test",
-        "sessionId": "f671f20e-5ef4-41d5-bfe5-aa4b87a2bd54",
-        "version": "2.1.170",
+        "sessionId": "ed3786e4-913f-4fd2-9925-d22703da5845",
+        "version": "2.1.270",
         "gitBranch": "HEAD"
     });
+
+    match serde_json::from_value::<LogLine>(json)
+        .expect("Failed to parse model_refusal_no_fallback")
+    {
+        LogLine::System(SystemLogLine::ModelRefusalNoFallback(refusal)) => {
+            assert_eq!(refusal.original_model.raw(), "claude-opus-5");
+            assert_eq!(
+                refusal.api_refusal_category.as_deref(),
+                Some("reasoning_extraction")
+            );
+            assert_eq!(
+                refusal.api_refusal_explanation.as_deref(),
+                Some("This request was blocked.")
+            );
+            assert_eq!(
+                refusal.refused_user_message_uuid,
+                Some("a668db4b-29bc-4fb1-9021-4a0f397d390b".parse().unwrap())
+            );
+        }
+        other => panic!("Expected System(ModelRefusalNoFallback), got {other:?}"),
+    }
+}
+
+#[test]
+fn test_parse_model_refusal_fallback_with_populated_refusal_details() {
+    let json = model_refusal_fallback_json(serde_json::json!({
+        "apiRefusalExplanation": "Flagged for cybersecurity topics.",
+        "retractedMessageUuids": []
+    }));
 
     match serde_json::from_value::<LogLine>(json)
         .expect("Failed to parse model_refusal_fallback with populated refusal details")
@@ -2337,32 +2429,9 @@ fn test_parse_model_refusal_fallback_with_populated_refusal_details() {
 
 #[test]
 fn test_parse_model_refusal_fallback_with_refused_user_message_uuid() {
-    let json = serde_json::json!({
-        "type": "system",
-        "subtype": "model_refusal_fallback",
-        "parentUuid": "9528e913-20fc-42ea-9e4c-5fb080b07c04",
-        "isSidechain": false,
-        "direction": "retry",
-        "content": "Fable 5's safeguards flagged this message. Switched to Opus 4.8.",
-        "level": "warning",
-        "trigger": "refusal",
-        "originalModel": "claude-fable-5",
-        "fallbackModel": "claude-opus-4-8",
-        "requestId": "req_011Ccmjmo1wkFV3JyX6W34NT",
-        "apiRefusalCategory": "cyber",
-        "apiRefusalExplanation": null,
-        "isMeta": false,
-        "timestamp": "2026-07-07T00:19:18.167Z",
-        "uuid": "5eba741a-e6a1-449a-adbe-4d29aaa8468a",
-        "retractedMessageUuids": ["490b7142-41ad-4667-8166-469606129093"],
-        "refusedUserMessageUuid": "490b7142-41ad-4667-8166-469606129093",
-        "userType": "external",
-        "entrypoint": "cli",
-        "cwd": "/test",
-        "sessionId": "583790a4-8207-4478-92ee-ebb9538b54dd",
-        "version": "2.1.201",
-        "gitBranch": "HEAD"
-    });
+    let json = model_refusal_fallback_json(serde_json::json!({
+        "refusedUserMessageUuid": "490b7142-41ad-4667-8166-469606129093"
+    }));
 
     match serde_json::from_value::<LogLine>(json)
         .expect("Failed to parse model_refusal_fallback with refusedUserMessageUuid")
@@ -2381,36 +2450,25 @@ fn test_parse_model_refusal_fallback_with_refused_user_message_uuid() {
     }
 }
 
+// Claude Code 2.1.270+ records how far the fallback applies; pre-2.1.270 records omit the key.
+#[test]
+fn test_parse_model_refusal_fallback_scope() {
+    let with_scope = parse_model_refusal_fallback(model_refusal_fallback_json(serde_json::json!({
+        "scope": "session"
+    })));
+    assert_eq!(with_scope.scope.as_deref(), Some("session"));
+
+    let without_scope =
+        parse_model_refusal_fallback(model_refusal_fallback_json(serde_json::json!({})));
+    assert_eq!(without_scope.scope, None);
+}
+
 #[test]
 fn test_parse_model_refusal_fallback_with_null_refused_user_message_uuid() {
-    // The real 2.1.201 shape records the key present but JSON-null (Claude Code noted no refused
-    // user message), distinct from the absent-key path the base fixtures cover.
-    let json = serde_json::json!({
-        "type": "system",
-        "subtype": "model_refusal_fallback",
-        "parentUuid": "9528e913-20fc-42ea-9e4c-5fb080b07c04",
-        "isSidechain": false,
-        "direction": "retry",
-        "content": "Fable 5's safeguards flagged this message. Switched to Opus 4.8.",
-        "level": "warning",
-        "trigger": "refusal",
-        "originalModel": "claude-fable-5",
-        "fallbackModel": "claude-opus-4-8",
-        "requestId": "req_011Ccmjmo1wkFV3JyX6W34NT",
-        "apiRefusalCategory": "cyber",
-        "apiRefusalExplanation": null,
-        "isMeta": false,
-        "timestamp": "2026-07-07T00:19:18.167Z",
-        "uuid": "5eba741a-e6a1-449a-adbe-4d29aaa8468a",
-        "retractedMessageUuids": ["490b7142-41ad-4667-8166-469606129093"],
-        "refusedUserMessageUuid": null,
-        "userType": "external",
-        "entrypoint": "cli",
-        "cwd": "/test",
-        "sessionId": "583790a4-8207-4478-92ee-ebb9538b54dd",
-        "version": "2.1.201",
-        "gitBranch": "HEAD"
-    });
+    // JSON null is distinct from the absent-key path covered by the base fixture.
+    let json = model_refusal_fallback_json(serde_json::json!({
+        "refusedUserMessageUuid": null
+    }));
 
     match serde_json::from_value::<LogLine>(json)
         .expect("Failed to parse model_refusal_fallback with null refusedUserMessageUuid")
@@ -2424,32 +2482,9 @@ fn test_parse_model_refusal_fallback_with_null_refused_user_message_uuid() {
 
 #[test]
 fn test_parse_model_refusal_fallback_rejects_unknown_fields() {
-    let json = serde_json::json!({
-        "type": "system",
-        "subtype": "model_refusal_fallback",
-        "parentUuid": "77502799-98d4-4548-b903-ed5d6f797e41",
-        "isSidechain": false,
-        "direction": "retry",
-        "content": "Switched to Opus 4.8.",
-        "level": "warning",
-        "trigger": "refusal",
-        "originalModel": "claude-fable-5",
-        "fallbackModel": "claude-opus-4-8",
-        "requestId": "req_011CbtEUxmnDLZxNhMjZT5dt",
-        "apiRefusalCategory": null,
-        "apiRefusalExplanation": null,
-        "isMeta": false,
-        "timestamp": "2026-06-09T19:24:49.832Z",
-        "uuid": "6e45b19e-8f68-4144-9eac-c1577fe3737e",
-        "retractedMessageUuids": [],
-        "userType": "external",
-        "entrypoint": "cli",
-        "cwd": "/test",
-        "sessionId": "f671f20e-5ef4-41d5-bfe5-aa4b87a2bd54",
-        "version": "2.1.170",
-        "gitBranch": "HEAD",
+    let json = model_refusal_fallback_json(serde_json::json!({
         "unknownField": "should be rejected"
-    });
+    }));
 
     let err_msg = serde_json::from_value::<LogLine>(json)
         .expect_err("Should reject unknown fields due to deny_unknown_fields")
@@ -4902,9 +4937,8 @@ fn test_parse_compact_metadata_rejects_unknown_fields() {
     );
 }
 
-#[test]
-fn test_parse_local_command() {
-    let json = serde_json::json!({
+fn local_command_json() -> serde_json::Value {
+    serde_json::json!({
         "parentUuid": null,
         "isSidechain": false,
         "userType": "external",
@@ -4920,10 +4954,13 @@ fn test_parse_local_command() {
         "timestamp": "2025-01-01T00:00:00Z",
         "uuid": "550e8400-e29b-41d4-a716-446655440002",
         "isMeta": false
-    });
+    })
+}
 
-    let line: LogLine =
-        serde_json::from_value(json).expect("Failed to parse local_command system message");
+#[test]
+fn test_parse_local_command() {
+    let line: LogLine = serde_json::from_value(local_command_json())
+        .expect("Failed to parse local_command system message");
 
     match line {
         LogLine::System(SystemLogLine::LocalCommand(command)) => {
@@ -4935,6 +4972,25 @@ fn test_parse_local_command() {
         }
         _ => panic!("Expected System(LocalCommand) variant"),
     }
+}
+
+// `commandRun` (Claude Code 2.1.296+) records the slash command behind a `local_command` output.
+#[test]
+fn test_parse_local_command_with_command_run() {
+    let mut json = local_command_json();
+    json["commandRun"] = serde_json::json!({"command": "rename", "args": "pr 755"});
+
+    let line: LogLine = serde_json::from_value(json).expect("Failed to parse commandRun");
+    let LogLine::System(SystemLogLine::LocalCommand(command)) = line else {
+        panic!("Expected System(LocalCommand) variant");
+    };
+    assert_eq!(
+        command.command_run,
+        Some(LocalCommandRun {
+            command: "rename".to_string(),
+            args: "pr 755".to_string(),
+        })
+    );
 }
 
 #[test]
@@ -5603,6 +5659,19 @@ fn test_parse_assistant_usage_with_inference_geo() {
     );
 }
 
+// Claude Code 2.1.285+ emits `fallback_credit`; only `null` has been observed, so any populated
+// value, even an empty object, must still fail to parse.
+#[test]
+fn test_parse_assistant_usage_rejects_populated_fallback_credit() {
+    let json = assistant_log_line_json(serde_json::json!({
+        "message": {"usage": {"fallback_credit": {}}}
+    }));
+    let err = serde_json::from_value::<AssistantLogLine>(json)
+        .expect_err("a populated fallback_credit must surface its unmodeled shape")
+        .to_string();
+    assert!(err.contains("expected unit"), "unexpected error: {err}");
+}
+
 #[test]
 fn test_parse_assistant_usage_with_null_inference_geo() {
     let json = serde_json::json!({
@@ -6041,6 +6110,17 @@ fn test_parse_user_log_line_with_automode_unavailable_tool_denial_kind() {
 }
 
 #[test]
+fn test_parse_user_log_line_with_interrupted_tool_denial_kind() {
+    // Claude Code 2.1.296 marks a tool call whose session ended before its result was recorded.
+    let json = user_log_line_json(serde_json::json!({
+        "version": "2.1.296",
+        "toolDenialKind": "interrupted"
+    }));
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(line.tool_denial_kind, Some(ToolDenialKind::Interrupted));
+}
+
+#[test]
 fn test_parse_user_log_line_without_tool_denial_kind() {
     // The field is absent on ordinary user turns, so it must default to None.
     let json = user_log_line_json(serde_json::json!({
@@ -6209,6 +6289,110 @@ fn test_parse_user_log_line_with_image_paste_ids() {
     }));
     let line: UserLogLine = serde_json::from_value(json).unwrap();
     assert_eq!(line.image_paste_ids, Some(vec![1]));
+}
+
+fn classifier_git_state_line(git_state: serde_json::Value) -> serde_json::Value {
+    user_log_line_json(serde_json::json!({
+        "version": "2.1.280",
+        "serverClassifierContext": {
+            "request": "eb3b6cbc-983e-4e58-b358-cf4355106ea2",
+            "context": {"git_state": git_state, "live_cwd": "/repo", "platform": "macos"}
+        }
+    }))
+}
+
+fn parse_classifier_git_state(git_state: serde_json::Value) -> ClassifierGitState {
+    let line: UserLogLine = serde_json::from_value(classifier_git_state_line(git_state)).unwrap();
+    line.server_classifier_context.unwrap().context.git_state
+}
+
+fn collected_git_status_json() -> serde_json::Value {
+    serde_json::json!({
+        "clean": false,
+        "counts": {"staged": 40, "modified": 2, "untracked": null, "untracked_normal": 0},
+        "porcelain": null,
+        "truncated": false
+    })
+}
+
+fn parse_collected_git_state(visibility: serde_json::Value) -> Box<CollectedGitState> {
+    let git_state = parse_classifier_git_state(serde_json::json!({
+        "cwd": "/repo",
+        "root": "/repo",
+        "branch": "HEAD",
+        "default_branch": null,
+        "status": collected_git_status_json(),
+        "visibility": visibility
+    }));
+    let ClassifierGitState::Collected(collected) = git_state else {
+        panic!("expected collected git state, got {git_state:?}");
+    };
+    collected
+}
+
+#[test]
+fn test_parse_user_log_line_with_server_classifier_context() {
+    let collected = parse_collected_git_state(serde_json::json!({
+        "origin": {"host": "github.com", "remote": "github.com/org/repo", "visibility": "private"},
+        "push_remote": "github.com/org/repo",
+        "remotes": [{
+            "name": "origin",
+            "host": "github.com",
+            "remote": "github.com/org/repo",
+            "visibility": "private"
+        }],
+        "visibility_cache": [
+            {"host": "github.com", "remote": "github.com/org/repo", "visibility": "private"}
+        ]
+    }));
+    assert_eq!(collected.status.counts.untracked, None);
+    assert_eq!(collected.visibility.remotes[0].name, "origin");
+}
+
+#[test]
+fn test_parse_server_classifier_context_with_null_origin() {
+    // Observed in a repository with no remotes: `push_remote` still names the default remote
+    // even though nothing backs it.
+    let collected = parse_collected_git_state(serde_json::json!({
+        "origin": null,
+        "push_remote": "origin",
+        "remotes": [],
+        "visibility_cache": []
+    }));
+    assert_eq!(collected.visibility.origin, None);
+}
+
+fn pending_git_state_json(status: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "cwd": "/repo",
+        "root": null,
+        "branch": null,
+        "default_branch": null,
+        "status": status,
+        "visibility": null,
+        "error": "pending"
+    })
+}
+
+#[test]
+fn test_parse_user_log_line_with_pending_server_classifier_git_state() {
+    let git_state = parse_classifier_git_state(pending_git_state_json(serde_json::Value::Null));
+    let ClassifierGitState::Pending(pending) = git_state else {
+        panic!("expected pending git state, got {git_state:?}");
+    };
+    assert_eq!(pending.error, GitStateError::Pending);
+}
+
+#[test]
+fn test_parse_user_log_line_rejects_pending_git_state_with_collected_status() {
+    // A pending marker alongside collected data matches neither untagged variant.
+    let json = classifier_git_state_line(pending_git_state_json(collected_git_status_json()));
+    let err = serde_json::from_value::<UserLogLine>(json)
+        .expect_err("Should reject a pending git state carrying collected status");
+    assert!(
+        err.to_string().contains("did not match any variant"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]
@@ -7067,6 +7251,16 @@ fn test_parse_last_prompt_log_line() {
     }
 }
 
+// Claude Code 2.1.296+ emits an `explicit` marker with a nil leaf and no prompt text.
+#[test]
+fn test_parse_last_prompt_log_line_explicit() {
+    let json = r#"{"type":"last-prompt","leafUuid":"00000000-0000-0000-0000-000000000000","explicit":true,"sessionId":"3e2185a7-6bf9-4c7d-851e-9bef8acd3d52"}"#;
+    let LogLine::LastPrompt(lp) = serde_json::from_str(json).unwrap() else {
+        panic!("Expected LastPrompt");
+    };
+    assert_eq!(lp.explicit, Some(true));
+}
+
 #[test]
 fn test_parse_last_prompt_log_line_with_leaf_uuid() {
     let json = r#"{"type":"last-prompt","leafUuid":"4629e822-f089-4f87-aa1f-7d93ebe10d81","sessionId":"d1226c8d-4fe8-441b-95a0-bbfa8aae1a59"}"#;
@@ -7375,6 +7569,7 @@ fn test_parse_attachment_agent_listing_delta() {
             "type": "agent_listing_delta",
             "addedTypes": ["claude", "Explore"],
             "addedLines": ["- claude: catch-all", "- Explore: read-only search"],
+            "builtInTypes": ["Explore"],
             "removedTypes": [],
             "isInitial": true,
             "showConcurrencyNote": true
@@ -7385,7 +7580,7 @@ fn test_parse_attachment_agent_listing_delta() {
         "entrypoint": "cli",
         "cwd": "/test",
         "sessionId": "550e8400-e29b-41d4-a716-446655440001",
-        "version": "2.1.175",
+        "version": "2.1.285",
         "gitBranch": "main",
         "slug": null
     });
@@ -7397,6 +7592,7 @@ fn test_parse_attachment_agent_listing_delta() {
         delta.added_lines,
         vec!["- claude: catch-all", "- Explore: read-only search"]
     );
+    assert_eq!(delta.built_in_types, Some(vec!["Explore".to_string()]));
     assert!(delta.removed_types.is_empty());
     assert!(delta.is_initial);
     assert!(delta.show_concurrency_note);
@@ -7431,6 +7627,7 @@ fn test_parse_attachment_agent_listing_delta_non_initial() {
     };
     assert_eq!(delta.added_types, vec!["new-agent"]);
     assert_eq!(delta.added_lines, vec!["- new-agent: added mid-session"]);
+    assert_eq!(delta.built_in_types, None);
     assert_eq!(delta.removed_types, vec!["old-agent"]);
     assert!(!delta.is_initial);
     assert!(!delta.show_concurrency_note);
@@ -7482,7 +7679,7 @@ fn test_parse_attachment_deferred_tools_delta_with_readded_and_pending() {
             "removedNames": ["OldTool"],
             "readdedNames": ["PreviouslyRemoved"],
             "pendingMcpServers": ["server-a", "server-b"],
-            "failedMcpServers": ["server-c"],
+            "failedMcpServers": [{"name": "server-c"}],
             "needsAuthMcpServers": ["server-d"],
             "wireHiddenNames": ["HiddenTool"],
             "surfacedNames": ["WebFetch"]
@@ -7503,10 +7700,71 @@ fn test_parse_attachment_deferred_tools_delta_with_readded_and_pending() {
     assert_eq!(delta.removed_names, vec!["OldTool"]);
     assert_eq!(delta.readded_names, vec!["PreviouslyRemoved"]);
     assert_eq!(delta.pending_mcp_servers, vec!["server-a", "server-b"]);
-    assert_eq!(delta.failed_mcp_servers, vec!["server-c"]);
+    assert_eq!(
+        delta.failed_mcp_servers,
+        vec![FailedMcpServer {
+            name: "server-c".to_string()
+        }]
+    );
     assert_eq!(delta.needs_auth_mcp_servers, vec!["server-d"]);
     assert_eq!(delta.wire_hidden_names, vec!["HiddenTool"]);
     assert_eq!(delta.surfaced_names, vec!["WebFetch"]);
+}
+
+/// A `deferred_tools_delta` carrying `surfacedDefinitions` (Claude Code 2.1.285+), whose entry
+/// names the tool both beside and inside `definition`.
+fn surfaced_definitions_json(outer_name: &str) -> serde_json::Value {
+    let mut json = attachment_line_json(serde_json::json!({
+        "type": "deferred_tools_delta",
+        "addedNames": ["WebFetch"],
+        "addedLines": ["WebFetch"],
+        "removedNames": [],
+        "surfacedNames": ["WebFetch"],
+        "surfacedDefinitions": [{
+            "name": outer_name,
+            "listing": "b18caec4513bd82d",
+            "definition": {
+                "name": "WebFetch",
+                "description": "Fetch a URL.",
+                "input_schema": {"type": "object"},
+                "eager_input_streaming": true
+            }
+        }]
+    }));
+    json["version"] = serde_json::json!("2.1.285");
+    json
+}
+
+#[test]
+fn test_parse_attachment_deferred_tools_delta_with_surfaced_definitions() {
+    let AttachmentData::DeferredToolsDelta(delta) =
+        parse_attachment(surfaced_definitions_json("WebFetch"))
+    else {
+        panic!("Expected DeferredToolsDelta");
+    };
+    assert_eq!(
+        delta.surfaced_definitions,
+        vec![SurfacedToolDefinition {
+            listing: "b18caec4513bd82d".to_string(),
+            definition: PromptToolSchema {
+                name: "WebFetch".to_string(),
+                description: "Fetch a URL.".to_string(),
+                eager_input_streaming: true,
+                input_schema: HashMap::from([("type".to_string(), serde_json::json!("object"))]),
+            },
+        }]
+    );
+}
+
+#[test]
+fn test_parse_attachment_deferred_tools_delta_rejects_mismatched_surfaced_definition() {
+    let err = serde_json::from_value::<LogLine>(surfaced_definitions_json("OtherTool"))
+        .expect_err("surfaced definition must match its outer name")
+        .to_string();
+    assert!(
+        err.contains("surfaced tool definition must match its name"),
+        "got: {err}"
+    );
 }
 
 #[test]
@@ -9714,12 +9972,14 @@ fn test_parse_attachment_environment_without_scratchpad_directory() {
 }
 
 // Claude Code 2.1.270+ records the prose an attachment was rendered into, optionally with the
-// distinct rendering delivered alongside the user's turn.
+// distinct rendering delivered alongside the user's turn; 2.1.296+ also marks renderings injected
+// beside a tool result.
 #[test]
 fn test_parse_attachment_line_rendered() {
     let mut json = environment_json(None);
     json["rendered"] = serde_json::json!([{"content": "<system-reminder>env</system-reminder>"}]);
     json["renderedInHumanTurn"] = serde_json::json!([{"content": "queued"}]);
+    json["renderedBesideToolResult"] = serde_json::json!(true);
     let line = parse_attachment_line(json);
     assert_eq!(
         line.rendering
@@ -9743,18 +10003,138 @@ fn test_parse_attachment_line_rendered() {
             .as_slice()
         )
     );
+    assert_eq!(
+        line.rendering
+            .and_then(|rendering| rendering.rendered_beside_tool_result),
+        Some(true)
+    );
 }
 
 #[test]
-fn test_parse_attachment_line_rejects_human_turn_rendering_without_rendering() {
+fn test_parse_attachment_line_rejects_rendering_siblings_without_rendering() {
+    for (key, value) in [
+        (
+            "renderedInHumanTurn",
+            serde_json::json!([{"content": "queued"}]),
+        ),
+        ("renderedRole", serde_json::json!("system")),
+        ("renderedBesideToolResult", serde_json::json!(true)),
+    ] {
+        let mut json = environment_json(None);
+        json[key] = value;
+        let err = serde_json::from_value::<LogLine>(json)
+            .expect_err("rendering siblings must require rendered")
+            .to_string();
+        assert!(
+            err.contains(&format!("`{key}` requires `rendered`")),
+            "unexpected error for {key}: {err}"
+        );
+    }
+}
+
+// Attachment payloads and fields first observed in Claude Code 2.1.285, each fixture trimmed from
+// a real log line.
+#[test]
+fn test_parse_attachment_payloads_added_in_2_1_285() {
+    let cases = [
+        (
+            "credential_org",
+            serde_json::json!({
+                "type": "credential_org",
+                "organizationUuid": "53b79fff-9628-4879-adba-b68e8d80e9eb"
+            }),
+            AttachmentData::CredentialOrg(CredentialOrg {
+                organization_uuid: "53b79fff-9628-4879-adba-b68e8d80e9eb".parse().unwrap(),
+            }),
+        ),
+        (
+            "prompt_snapshot shaping flags",
+            serde_json::json!({
+                "type": "prompt_snapshot",
+                "systemPrompt": [],
+                "reminderFold": false,
+                "systemTurns": true,
+                "toolChangeHeader": true,
+                "inlineTools": true,
+                "keptReminders": true,
+                "echoWireToolInputs": true,
+                "contextRendering": "announced"
+            }),
+            AttachmentData::PromptSnapshot(PromptSnapshot {
+                cli_prefix: None,
+                system_prompt: vec![],
+                tools: None,
+                reminder_fold: Some(false),
+                system_turns: Some(true),
+                tool_change_header: Some(true),
+                inline_tools: Some(true),
+                kept_reminders: Some(true),
+                echo_wire_tool_inputs: Some(true),
+                context_rendering: Some(ContextRendering::Announced),
+            }),
+        ),
+        (
+            "nested_memory parent",
+            serde_json::json!({
+                "type": "nested_memory",
+                "path": "/abs/AGENTS.md",
+                "content": {
+                    "path": "/abs/AGENTS.md",
+                    "type": "Project",
+                    "content": "# Agents",
+                    "contentDiffersFromDisk": false,
+                    "parent": "/abs/CLAUDE.md"
+                },
+                "displayPath": "AGENTS.md"
+            }),
+            AttachmentData::NestedMemory(NestedMemory {
+                path: "/abs/AGENTS.md".to_string(),
+                content: NestedMemoryContent {
+                    path: "/abs/AGENTS.md".to_string(),
+                    r#type: "Project".to_string(),
+                    content: "# Agents".to_string(),
+                    content_differs_from_disk: false,
+                    raw_content: None,
+                    parent: Some("/abs/CLAUDE.md".to_string()),
+                },
+                display_path: "AGENTS.md".to_string(),
+            }),
+        ),
+        (
+            "deferred_tools_record toolInputCopies",
+            serde_json::json!({
+                "type": "deferred_tools_record",
+                "entries": [],
+                "toolInputCopies": [{"id": "toolu_01VuxS7meykZdAaGNjfg7JMj", "copy": "wire"}]
+            }),
+            AttachmentData::DeferredToolsRecord(DeferredToolsRecord {
+                entries: vec![],
+                tool_input_copies: Some(vec![ToolInputCopy {
+                    id: "toolu_01VuxS7meykZdAaGNjfg7JMj".to_string(),
+                    copy: ToolInputCopyKind::Wire,
+                }]),
+            }),
+        ),
+    ];
+    for (label, payload, expected) in cases {
+        assert_eq!(
+            parse_attachment(attachment_line_json(payload)),
+            expected,
+            "{label}"
+        );
+    }
+}
+
+// Claude Code 2.1.285+ records the role an attachment's rendering was injected under.
+#[test]
+fn test_parse_attachment_line_rendered_role() {
     let mut json = environment_json(None);
-    json["renderedInHumanTurn"] = serde_json::json!([{"content": "queued"}]);
-    let error = serde_json::from_value::<LogLine>(json)
-        .expect_err("renderedInHumanTurn must require rendered");
-    assert!(
-        error
-            .to_string()
-            .contains("`renderedInHumanTurn` requires `rendered`")
+    json["rendered"] = serde_json::json!([{"content": "env"}]);
+    json["renderedRole"] = serde_json::json!("system");
+    let line = parse_attachment_line(json);
+    assert_eq!(
+        line.rendering.and_then(|rendering| rendering.rendered_role),
+        Some(RenderedRole::System)
     );
 }
 
@@ -10087,7 +10467,14 @@ fn test_parse_attachment_queued_command_with_origin() {
     assert_eq!(
         cmd.origin,
         Some(MessageOrigin {
-            kind: "human".to_string()
+            kind: "human".to_string(),
+            producer: None,
+            from: None,
+            sender_task_id: None,
+            sender_agent_type: None,
+            body: None,
+            handback: None,
+            run_id: None,
         })
     );
     assert_eq!(
@@ -10097,7 +10484,7 @@ fn test_parse_attachment_queued_command_with_origin() {
 }
 
 #[test]
-fn test_parse_attachment_queued_command_with_source_uuid() {
+fn test_parse_attachment_queued_command_with_source_uuid_and_delivery_id() {
     let json = serde_json::json!({
         "type": "attachment",
         "parentUuid": null,
@@ -10106,6 +10493,7 @@ fn test_parse_attachment_queued_command_with_source_uuid() {
             "type": "queued_command",
             "prompt": "queued while busy",
             "source_uuid": "1f438c56-2f6c-4cf8-a2a5-d0c13f1e5ff2",
+            "delivery_id": "754492fb-ba5f-4959-b54c-b5667f660f31",
             "commandMode": "prompt",
             "origin": {"kind": "human"},
             "timestamp": "2026-08-24T18:50:38.260Z"
@@ -10129,6 +10517,90 @@ fn test_parse_attachment_queued_command_with_source_uuid() {
                 .unwrap()
         )
     );
+    assert_eq!(
+        cmd.delivery_id,
+        Some(DeliveryId(
+            Uuid::parse_str("754492fb-ba5f-4959-b54c-b5667f660f31").unwrap()
+        ))
+    );
+}
+
+#[test]
+fn test_parse_attachment_queued_command_with_human_turn() {
+    let json = attachment_line_json(serde_json::json!({
+        "type": "queued_command",
+        "prompt": "queued while busy",
+        "commandMode": "prompt",
+        "humanTurn": true
+    }));
+    let AttachmentData::QueuedCommand(cmd) = parse_attachment(json) else {
+        panic!("Expected QueuedCommand");
+    };
+    assert_eq!(cmd.human_turn, Some(true));
+}
+
+// A Claude Code subagent hand-back, queued as a peer message rendered into a system reminder.
+// `name` (the sender's agent type) was added in 2.1.296.
+#[test]
+fn test_parse_attachment_queued_command_peer_handback() {
+    let json = attachment_line_json(serde_json::json!({
+        "type": "queued_command",
+        "prompt": "<agent-message from=\"a089663affe364877\">report</agent-message>",
+        "commandMode": "prompt",
+        "origin": {
+            "kind": "peer",
+            "from": "a089663affe364877",
+            "senderTaskId": "a089663affe364877",
+            "name": "openspec-verifier",
+            "body": "report",
+            "handback": true
+        },
+        "isMeta": true,
+        "reminderId": "1d87a9185b328afe"
+    }));
+    let AttachmentData::QueuedCommand(cmd) = parse_attachment(json) else {
+        panic!("Expected QueuedCommand");
+    };
+    assert_eq!(
+        (cmd.origin, cmd.is_meta, cmd.reminder_id.as_deref()),
+        (
+            Some(MessageOrigin {
+                kind: "peer".to_string(),
+                producer: None,
+                from: Some("a089663affe364877".to_string()),
+                sender_task_id: Some("a089663affe364877".to_string()),
+                sender_agent_type: Some("openspec-verifier".to_string()),
+                body: Some("report".to_string()),
+                handback: Some(true),
+                run_id: None,
+            }),
+            Some(true),
+            Some("1d87a9185b328afe")
+        )
+    );
+}
+
+#[test]
+fn test_parse_attachment_queued_command_with_usage_and_run_id() {
+    let json = attachment_line_json(serde_json::json!({
+        "type": "queued_command",
+        "prompt": "<task-notification>...</task-notification>",
+        "commandMode": "task-notification",
+        "usage": {"totalTokens": 198551, "toolUses": 19, "durationMs": 588282},
+        "runId": "0mv9qqvyq-9e23da23"
+    }));
+    let AttachmentData::QueuedCommand(cmd) = parse_attachment(json) else {
+        panic!("Expected QueuedCommand");
+    };
+    assert_eq!(
+        cmd.usage,
+        Some(QueuedCommandUsage {
+            total_tokens: 198551,
+            tool_uses: 19,
+            duration_ms: 588282
+        })
+    );
+    assert_eq!(cmd.run_id, Some(RunId("0mv9qqvyq-9e23da23".to_string())));
 }
 
 #[test]
@@ -10940,6 +11412,112 @@ fn test_parse_user_log_line_with_origin() {
 }
 
 #[test]
+fn test_parse_user_log_line_with_turn_origin() {
+    let json = user_log_line_json(serde_json::json!({
+        "version": "2.1.278",
+        "turnOrigin": "human"
+    }));
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(line.turn_origin.as_deref(), Some("human"));
+}
+
+// A Claude Code 2.1.285 task-notification turn, which carries both the origin's producer and the
+// turn's position.
+#[test]
+fn test_parse_user_log_line_task_notification_metadata() {
+    let json = user_log_line_json(serde_json::json!({
+        "version": "2.1.285",
+        "origin": {"kind": "task-notification", "producer": "session-task"},
+        "turnPosition": {"promptIndex": 0, "turnIndex": 1}
+    }));
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(
+        (line.origin, line.turn_position),
+        (
+            Some(MessageOrigin {
+                kind: "task-notification".to_string(),
+                producer: Some(MessageProducer::SessionTask),
+                from: None,
+                sender_task_id: None,
+                sender_agent_type: None,
+                body: None,
+                handback: None,
+                run_id: None,
+            }),
+            Some(TurnPosition {
+                prompt_index: 0,
+                turn_index: 1,
+            })
+        )
+    );
+}
+
+// Claude Code 2.1.296+ names the background task run a task-notification origin reports on.
+#[test]
+fn test_parse_user_log_line_task_notification_run_id() {
+    let json = user_log_line_json(serde_json::json!({
+        "origin": {
+            "kind": "task-notification",
+            "producer": "session-task",
+            "runId": "0mv8m4wds-0b27a2b7"
+        }
+    }));
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(
+        line.origin.and_then(|origin| origin.run_id),
+        Some(RunId("0mv8m4wds-0b27a2b7".to_string()))
+    );
+}
+
+// Claude Code 2.1.296+ records how the tool call a result answers was permitted; `reasonType`
+// appears on hook decisions but not on user ones.
+#[test]
+fn test_parse_user_log_line_permission_decision() {
+    for (payload, reason_type) in [
+        (
+            serde_json::json!({"decision": "accept", "source": "hook", "reasonType": "hook"}),
+            Some("hook"),
+        ),
+        (
+            serde_json::json!({"decision": "accept", "source": "user_temporary"}),
+            None,
+        ),
+    ] {
+        let json = user_log_line_json(serde_json::json!({"permissionDecision": payload}));
+        let line: UserLogLine = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            line.permission_decision
+                .expect("permissionDecision present")
+                .reason_type
+                .as_deref(),
+            reason_type
+        );
+    }
+}
+
+#[test]
+fn test_parse_user_log_line_with_scheduled_task_ids() {
+    let json = user_log_line_json(serde_json::json!({
+        "version": "2.1.280",
+        "scheduledTaskId": "b160e32d",
+        "scheduledFireId": "1dafc7d8-e39e-4e17-8250-e66dd45b5ad4"
+    }));
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(
+        line.scheduled_task_id,
+        Some(ScheduledTaskId("b160e32d".to_string()))
+    );
+    assert_eq!(
+        line.scheduled_fire_id,
+        Some(
+            "1dafc7d8-e39e-4e17-8250-e66dd45b5ad4"
+                .parse::<Uuid>()
+                .unwrap()
+        )
+    );
+}
+
+#[test]
 fn test_parse_user_log_line_with_null_origin() {
     let json = user_log_line_json(serde_json::json!({
         "version": "2.1.104",
@@ -11169,16 +11747,20 @@ fn test_parse_assistant_log_line_with_null_entrypoint() {
     assert_eq!(line.entrypoint, None);
 }
 
-// `reason` on a `queue-operation` (Claude Code 2.1.257+) records why the entry left the queue.
+// `reason` (Claude Code 2.1.257+), `commandUuid` (2.1.285+), and `deliveryId` (2.1.296+) on a
+// `queue-operation` record why the entry left the queue, which queued command it was, and which
+// delivery absorbed it.
 #[test]
-fn test_parse_queue_operation_with_reason() {
+fn test_parse_queue_operation_with_reason_command_uuid_and_delivery_id() {
     let json = serde_json::json!({
         "type": "queue-operation",
         "operation": "remove",
         "timestamp": "2026-09-02T18:27:29.921Z",
         "content": "Likely it is missing a rule to egress to traefik.",
         "sessionId": "fa4fd201-5dac-417e-b2d2-bae37c14f350",
-        "reason": "absorbed_mid_turn"
+        "reason": "absorbed_mid_turn",
+        "commandUuid": "dfe8d71e-0e1c-4eb4-9dca-e4a030808e46",
+        "deliveryId": "754492fb-ba5f-4959-b54c-b5667f660f31"
     });
 
     let line: LogLine =
@@ -11186,14 +11768,25 @@ fn test_parse_queue_operation_with_reason() {
     match line {
         LogLine::QueueOperation(op) => {
             assert_eq!(op.reason.as_deref(), Some("absorbed_mid_turn"));
+            assert_eq!(
+                op.command_uuid,
+                Some(Uuid::parse_str("dfe8d71e-0e1c-4eb4-9dca-e4a030808e46").unwrap())
+            );
+            assert_eq!(
+                op.delivery_id,
+                Some(DeliveryId(
+                    Uuid::parse_str("754492fb-ba5f-4959-b54c-b5667f660f31").unwrap()
+                ))
+            );
         }
         _ => panic!("Expected QueueOperation variant"),
     }
 }
 
-// `queueSkipAttachments` (Claude Code 2.1.257+) marks a queued turn injected without attachments.
+// `queueSkipAttachments` (Claude Code 2.1.257+) marks a queued turn injected without attachments,
+// and `queueTranscriptOnly` (2.1.296+) one recorded only in the transcript.
 #[test]
-fn test_parse_user_with_queue_skip_attachments() {
+fn test_parse_user_with_queue_skip_attachments_and_transcript_only() {
     let json = serde_json::json!({
         "parentUuid": "ff9f560a-f665-4117-9f13-324af54a8527",
         "isSidechain": false,
@@ -11202,6 +11795,7 @@ fn test_parse_user_with_queue_skip_attachments() {
         "timestamp": "2026-09-02T18:27:29.921Z",
         "message": {"role": "user", "content": "<task-notification>done</task-notification>"},
         "queueSkipAttachments": true,
+        "queueTranscriptOnly": true,
         "userType": "external",
         "entrypoint": "cli",
         "cwd": "/test",
@@ -11213,7 +11807,10 @@ fn test_parse_user_with_queue_skip_attachments() {
     let line: LogLine =
         serde_json::from_value(json).expect("Failed to parse user with queueSkipAttachments");
     match line {
-        LogLine::User(user) => assert_eq!(user.queue_skip_attachments, Some(true)),
+        LogLine::User(user) => {
+            assert_eq!(user.queue_skip_attachments, Some(true));
+            assert_eq!(user.queue_transcript_only, Some(true));
+        }
         _ => panic!("Expected User variant"),
     }
 }
@@ -11462,6 +12059,7 @@ fn test_parse_attachment_deferred_tools_record() {
         Some(&serde_json::json!("object"))
     );
     assert!(entry.defer_loading);
+    assert_eq!(record.tool_input_copies, None);
 }
 
 // Claude Code 2.1.270+ records the effort a single turn was raised to, distinct from the session's
@@ -11499,5 +12097,39 @@ fn test_parse_assistant_wire_tool_metadata() {
                 cwd: "/test".to_string(),
             }
         )]))
+    );
+}
+
+// Claude Code 2.1.270+ lists the turns a retry replaces, matching the preceding
+// `model_refusal_fallback`'s `retractedMessageUuids`.
+#[test]
+fn test_parse_assistant_supersedes_uuids() {
+    let line = parse_assistant_log_line(assistant_log_line_json(serde_json::json!({
+        "supersedesUuids": ["3ac8f110-d2de-4a71-8313-83bf5301c7b5"]
+    })));
+    assert_eq!(
+        line.supersedes_uuids,
+        Some(vec![
+            "3ac8f110-d2de-4a71-8313-83bf5301c7b5"
+                .parse()
+                .expect("valid uuid")
+        ])
+    );
+}
+
+// Claude Code 2.1.296+ records how long the turn thought, how thinking was displayed, and the
+// user-selected model id (which can carry a `[1m]` decoration absent from `message.model`).
+#[test]
+fn test_parse_assistant_thinking_and_requested_model() {
+    let line = parse_assistant_log_line(assistant_log_line_json(serde_json::json!({
+        "thinkingDurationMs": 6244,
+        "thinkingDisplay": "summarized",
+        "requestedModel": "claude-opus-5-5[1m]"
+    })));
+    assert_eq!(line.thinking_duration_ms, Some(6244));
+    assert_eq!(line.thinking_display, Some(ThinkingDisplay::Summarized));
+    assert_eq!(
+        line.requested_model.as_ref().map(Model::raw),
+        Some("claude-opus-5-5[1m]")
     );
 }

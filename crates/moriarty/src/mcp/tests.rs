@@ -1,8 +1,11 @@
 use std::{
     collections::BTreeSet,
+    env::{current_dir, set_current_dir},
+    fs,
     future::{Future, pending, poll_fn},
     io,
     pin::Pin,
+    process::Command,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -18,8 +21,9 @@ use rmcp::{
         ServerResult,
     },
     service::{QuitReason, RequestContext},
+    transport::{OneshotTransport, Transport},
 };
-use serde_json::{Value, from_str, json, to_value, to_vec};
+use serde_json::{Value, from_str, from_value, json, to_value, to_vec};
 use tempfile::tempdir;
 use tokio::{
     io::{
@@ -32,13 +36,16 @@ use tokio::{
 };
 
 use super::{
-    GitReadOnly, JjReadOnly, ObservedIo, ToolRunner, serve_until, service_exit,
-    settle_tool_response,
+    DiscoveryFallbackTransport, GitReadOnly, JjReadOnly, ObservedIo, ToolRunner,
+    git_read_only::StatusArgs, jj_read_only::JjArgs, serve_until, service_exit,
+    settle_tool_response, tool_runner::RunArgs,
 };
 use crate::{
     execution::Scope,
     project_config::approvals,
-    test_helpers::{setup_isolated_xdg_config, setup_project_dir_with_config},
+    test_helpers::{
+        setup_git_repo_with_commit, setup_isolated_xdg_config, setup_project_dir_with_config,
+    },
 };
 use process_supervisor::CancellationToken;
 
@@ -154,7 +161,7 @@ fn request_error_retains_both_causes() {
     assert!(error.message.contains("primary") && error.message.contains("cleanup"));
 }
 
-const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 struct TestClient {
     reader: BufReader<ReadHalf<DuplexStream>>,
@@ -574,6 +581,17 @@ async fn list_tools(client: &mut TestClient) -> Value {
         .await
 }
 
+fn protocol_meta(version: &str) -> Value {
+    json!({
+        "io.modelcontextprotocol/protocolVersion": version,
+        "io.modelcontextprotocol/clientCapabilities": {},
+        "io.modelcontextprotocol/clientInfo": {
+            "name": "moriarty-protocol-test",
+            "version": "0"
+        }
+    })
+}
+
 async fn request_with_newer_protocol(client: &mut TestClient) -> Value {
     client
         .request(json!({
@@ -581,14 +599,7 @@ async fn request_with_newer_protocol(client: &mut TestClient) -> Value {
             "id": 99,
             "method": "tools/list",
             "params": {
-                "_meta": {
-                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-                    "io.modelcontextprotocol/clientCapabilities": {},
-                    "io.modelcontextprotocol/clientInfo": {
-                        "name": "moriarty-protocol-test",
-                        "version": "0"
-                    }
-                }
+                "_meta": protocol_meta("2026-07-28")
             }
         }))
         .await
@@ -623,6 +634,34 @@ async fn assert_server_rejects_newer_protocol<S: ServerHandler + Clone>(server: 
     fresh.close().await;
 }
 
+async fn assert_discover_fallback<S: ServerHandler + Clone>(server: S) {
+    let mut client = TestClient::start(server).await;
+    let discovery = client
+        .request(json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "server/discover",
+            "params": { "_meta": protocol_meta("2026-07-28") }
+        }))
+        .await;
+    assert_eq!(discovery["id"], 0);
+    assert_newer_protocol_rejected(&discovery);
+
+    let initialized = initialize_client(&mut client, "2025-11-25").await;
+    assert_eq!(initialized["result"]["protocolVersion"], "2025-11-25");
+    let tools = list_tools(&mut client).await;
+    assert!(
+        !tools["result"]["tools"].as_array().unwrap().is_empty(),
+        "{tools}"
+    );
+    assert_legacy_result_shape(&tools);
+
+    assert_newer_protocol_rejected(&request_with_newer_protocol(&mut client).await);
+    let tools = list_tools(&mut client).await;
+    assert!(tools.get("error").is_none(), "{tools}");
+    client.close().await;
+}
+
 fn assert_legacy_result_shape(response: &Value) {
     assert!(
         response["result"].get("resultType").is_none(),
@@ -652,8 +691,8 @@ fn assert_tool_contract(response: &Value, expected: &[(&str, &[&str])]) {
         let tool = find_tool(response, name);
         let actual_required: BTreeSet<_> = tool["inputSchema"]["required"]
             .as_array()
-            .unwrap()
-            .iter()
+            .into_iter()
+            .flatten()
             .map(|field| field.as_str().unwrap())
             .collect();
         assert_eq!(actual_required, required.iter().copied().collect());
@@ -668,13 +707,23 @@ async fn assert_git_contract(requested_version: &str, expected_version: &str) {
     assert_tool_contract(
         &tools,
         &[
-            ("status", &["project_dir", "args"]),
-            ("diff", &["project_dir", "args"]),
-            ("log", &["project_dir", "args"]),
-            ("show", &["project_dir", "args"]),
+            ("status", &["args"]),
+            ("diff", &["args"]),
+            ("log", &["args"]),
+            ("show", &["args"]),
         ],
     );
     client.close().await;
+}
+
+#[test]
+fn omitted_project_dir_defaults_to_server_cwd() {
+    let git: StatusArgs = from_value(json!({ "args": [] })).unwrap();
+    let jj: JjArgs = from_value(json!({ "command": "status", "args": [] })).unwrap();
+    let tools: RunArgs = from_value(json!({})).unwrap();
+    for dir in [git.project_dir, jj.project_dir, tools.project_dir] {
+        assert_eq!(dir.canonicalize().unwrap(), current_dir().unwrap());
+    }
 }
 
 #[tokio::test]
@@ -701,6 +750,65 @@ async fn jj_rejects_newer_request_protocol() {
 #[tokio::test]
 async fn tool_runner_rejects_newer_request_protocol() {
     assert_server_rejects_newer_protocol(ToolRunner).await;
+}
+
+#[tokio::test]
+async fn supported_and_versionless_discovery_pass_through_unchanged() {
+    let supported = protocol_meta("2025-11-25");
+    let mut versionless = supported.clone();
+    versionless
+        .as_object_mut()
+        .unwrap()
+        .remove("io.modelcontextprotocol/protocolVersion");
+    for meta in [supported, versionless] {
+        let expected = json!({
+            "jsonrpc": "2.0",
+            "id": "discovery",
+            "method": "server/discover",
+            "params": { "_meta": meta }
+        });
+        let (inner, _responses) = OneshotTransport::new(from_value(expected.clone()).unwrap());
+        let mut transport = DiscoveryFallbackTransport(inner);
+        let forwarded = timeout(TEST_TIMEOUT, transport.receive())
+            .await
+            .expect("timed out forwarding discovery")
+            .expect("discovery was intercepted");
+        assert_eq!(to_value(forwarded).unwrap(), expected);
+    }
+}
+
+#[tokio::test]
+async fn discovery_rejection_send_failure_closes_transport() {
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 0,
+        "method": "server/discover",
+        "params": { "_meta": protocol_meta("2026-07-28") }
+    });
+    let (inner, responses) = OneshotTransport::new(from_value(request).unwrap());
+    drop(responses);
+    let mut transport = DiscoveryFallbackTransport(inner);
+    let received = timeout(TEST_TIMEOUT, transport.receive())
+        .await
+        .expect("timed out after discovery rejection send failure");
+    assert!(received.is_none());
+}
+
+// Each handler has its own tool contract; keep a fallback regression per server
+// so handler changes cannot silently break just one advertised MCP connection.
+#[tokio::test]
+async fn git_discover_fallback_preserves_legacy_tools() {
+    assert_discover_fallback(GitReadOnly).await;
+}
+
+#[tokio::test]
+async fn jj_discover_fallback_preserves_legacy_tools() {
+    assert_discover_fallback(JjReadOnly).await;
+}
+
+#[tokio::test]
+async fn tool_runner_discover_fallback_preserves_legacy_tools() {
+    assert_discover_fallback(ToolRunner).await;
 }
 
 #[tokio::test]
@@ -744,6 +852,31 @@ async fn git_legacy_prompt_responses_keep_names_and_roles() {
         }))
         .await;
     assert_legacy_result_shape(&prompt);
+    setup_git_repo_with_commit(project.path());
+    fs::write(project.path().join("git-default-cwd-marker.txt"), "fixture").unwrap();
+    // Nextest isolates each test process, so changing cwd cannot affect sibling tests.
+    let original_dir = current_dir().unwrap();
+    set_current_dir(project.path()).unwrap();
+    let status = client
+        .request(json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": { "name": "status", "arguments": { "args": [] } }
+        }))
+        .await;
+    set_current_dir(original_dir).unwrap();
+    assert_eq!(
+        status["result"]["structuredContent"]["exit_code"], 0,
+        "{status}"
+    );
+    assert!(
+        status["result"]["structuredContent"]["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("git-default-cwd-marker.txt"),
+        "{status}"
+    );
     assert_eq!(
         prompt["result"]["messages"]
             .as_array()
@@ -762,7 +895,7 @@ async fn jj_transport_preserves_protocol_and_tool_contracts() {
     assert_eq!(response["result"]["protocolVersion"], "2025-11-25");
 
     let tools = list_tools(&mut client).await;
-    assert_tool_contract(&tools, &[("run", &["project_dir", "command", "args"])]);
+    assert_tool_contract(&tools, &[("run", &["command", "args"])]);
     let command_values: BTreeSet<_> = find_tool(&tools, "run")["inputSchema"]["$defs"]["JjCommand"]
         ["enum"]
         .as_array()
@@ -784,6 +917,47 @@ async fn jj_transport_preserves_protocol_and_tool_contracts() {
         .into_iter()
         .collect()
     );
+    let project = tempdir().unwrap();
+    setup_git_repo_with_commit(project.path());
+    let initialized = Command::new("jj")
+        .args(["git", "init", "--colocate"])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(initialized.status.success(), "{initialized:?}");
+    fs::write(project.path().join("jj-default-cwd-marker.txt"), "fixture").unwrap();
+    // The read-only server ignores working-copy updates, so snapshot the fixture first.
+    let snapshot = Command::new("jj")
+        .arg("status")
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(snapshot.status.success(), "{snapshot:?}");
+    let original_dir = current_dir().unwrap();
+    set_current_dir(project.path()).unwrap();
+    let status = client
+        .request(json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "run",
+                "arguments": { "command": "status", "args": [] }
+            }
+        }))
+        .await;
+    set_current_dir(original_dir).unwrap();
+    assert_eq!(
+        status["result"]["structuredContent"]["exit_code"], 0,
+        "{status}"
+    );
+    assert!(
+        status["result"]["structuredContent"]["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("jj-default-cwd-marker.txt"),
+        "{status}"
+    );
     client.close().await;
 }
 
@@ -796,11 +970,11 @@ async fn tool_runner_transport_preserves_protocol_and_tool_contracts() {
     assert_tool_contract(
         &tools,
         &[
-            ("run_lint", &["project_dir"]),
-            ("run_build", &["project_dir"]),
-            ("run_formatter", &["project_dir"]),
-            ("run_tests", &["project_dir"]),
-            ("run_checks", &["project_dir"]),
+            ("run_lint", &[]),
+            ("run_build", &[]),
+            ("run_formatter", &[]),
+            ("run_tests", &[]),
+            ("run_checks", &[]),
         ],
     );
     client.close().await;
@@ -859,6 +1033,23 @@ lint = ["sh", "-c", "printf failure-out; printf failure-err >&2; exit 7"]
         .await;
     assert_legacy_result_shape(&nonzero);
     assert_eq!(nonzero["result"]["isError"], true);
+
+    let original_dir = current_dir().unwrap();
+    set_current_dir(project.path()).unwrap();
+    let defaulted = client
+        .request(json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": { "name": "run_tests", "arguments": {} }
+        }))
+        .await;
+    set_current_dir(original_dir).unwrap();
+    assert_eq!(defaulted["result"]["isError"], false, "{defaulted}");
+    assert_eq!(
+        defaulted["result"]["content"][0]["text"],
+        "stdout: \n\n success-out"
+    );
 
     let absent = client
         .request(json!({

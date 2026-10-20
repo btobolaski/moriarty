@@ -164,9 +164,11 @@ pub enum PiLogLine {
     Session(SessionLine),
     SessionInfo(SessionInfoLine),
     ModelChange(ModelChangeLine),
+    Usage(UsageLine),
     ThinkingLevelChange(ThinkingLevelChangeLine),
     Compaction(CompactionLine),
     BranchSummary(BranchSummaryLine),
+    ContextEdit(ContextEditLine),
     Custom(CustomLine),
     CustomMessage(Box<CustomMessageLine>),
     Message(MessageLine),
@@ -214,6 +216,21 @@ pub struct ModelChangeLine {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UsageLine {
+    pub id: String,
+    pub parent_id: Option<String>,
+    pub timestamp: DateTime<Utc>,
+    // Extensions own the category vocabulary (e.g. web_access.page_answer).
+    pub kind: String,
+    pub provider: Provider,
+    pub model: String,
+    pub usage: AssistantUsage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ThinkingLevelChangeLine {
     pub id: String,
     pub parent_id: Option<String>,
@@ -237,6 +254,8 @@ pub struct CompactionLine {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<AssistantUsage>,
     pub from_hook: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_message: Option<SystemMessageSnapshot>,
 }
 
 /// Branch summaries snapshot the detour taken on another conversation branch
@@ -286,6 +305,12 @@ pub struct CompactionDetailsV2 {
     pub previous_summary_used: bool,
     #[serde(rename = "om.folded")]
     pub om_folded: OmFolded,
+    #[serde(
+        rename = "om.preserveSourceHistory",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub om_preserve_source_history: Option<bool>,
     /// Retained-tool-output bookkeeping pi added to compactions that preserve
     /// parts of large tool results. Optional for backward compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -330,6 +355,24 @@ pub struct OmFolded {
 // `deny_unknown_fields` and catch any unknown sibling keys.
 // ---------------------------------------------------------------------------
 
+/// Context edits change what the model sees, not the original billable response.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ContextEditLine {
+    pub id: String,
+    pub parent_id: String,
+    pub timestamp: DateTime<Utc>,
+    pub target_id: String,
+    pub replacement: Option<ContextEditReplacement>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextEditReplacement {
+    /// The target may be a user, assistant, tool result, or extension-defined custom message.
+    pub content: JsonBlob,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CustomLine {
@@ -342,6 +385,9 @@ pub struct CustomLine {
 
 /// Adjacently tagged enum selected by `customType` with the typed body living
 /// under `data`.
+// TodoDetails dwarfs the other custom payloads; boxing this public variant
+// would change its payload type.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "customType", content = "data")]
 pub enum CustomPayload {
@@ -349,6 +395,8 @@ pub enum CustomPayload {
     Plannotator(PlannotatorData),
     #[serde(rename = "dcp-state")]
     DcpState(DcpStateData),
+    #[serde(rename = "codemode-store")]
+    CodemodeStore(CodemodeStoreData),
     #[serde(rename = "web-search-results")]
     WebSearchResults(WebSearchResultsData),
     #[serde(rename = "plannotator-execute")]
@@ -357,12 +405,18 @@ pub enum CustomPayload {
     IntercomSent(IntercomSentData),
     #[serde(rename = "om.observations.recorded")]
     OmObservationsRecorded(OmObservationsRecordedData),
+    #[serde(rename = "om.observations.coverage")]
+    OmObservationsCoverage(OmObservationsCoverageData),
     #[serde(rename = "om.reflections.recorded")]
     OmReflectionsRecorded(OmReflectionsRecordedData),
     #[serde(rename = "om.observations.dropped")]
     OmObservationsDropped(OmObservationsDroppedData),
     #[serde(rename = "om.reflections.dropped")]
     OmReflectionsDropped(OmReflectionsDroppedData),
+    #[serde(rename = "om.observer.catch-up.job")]
+    OmObserverCatchUpJob(OmObserverCatchUpJobData),
+    #[serde(rename = "om.observer.catch-up.progress")]
+    OmObserverCatchUpProgress(OmObserverCatchUpProgressData),
     /// Name-provenance record emitted by the firstpick session-summary
     /// extension: whether the session's summary name was set explicitly by
     /// the user or derived.
@@ -376,6 +430,30 @@ pub enum CustomPayload {
     /// parent replies through `subagent_supervisor`. Added in newer pi versions.
     #[serde(rename = "subagent_supervisor_reply")]
     SubagentSupervisorReply(SubagentSupervisorReplyData),
+    /// Seen-acknowledgement from the shepard extension recording that a
+    /// queued message reached the child.
+    #[serde(rename = "shepard-seen")]
+    ShepardSeen(ShepardEventId),
+    /// Native shepard lifecycle facts use a versioned journal envelope; the
+    /// extension owns the payload schema, so cost analysis retains it opaquely.
+    #[serde(rename = "shepard.v1")]
+    ShepardV1(ShepardJournalData),
+    /// Emitted by the rpiv-todo extension whenever the todo list changes;
+    /// the payload is the same shape the `todo` tool's result details use.
+    #[serde(rename = "rpiv-todo-snapshot")]
+    RpivTodoSnapshot(TodoDetails),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ShepardJournalData {
+    pub version: u32,
+    pub event_id: String,
+    pub writer_session_id: String,
+    pub timestamp: DateTime<Utc>,
+    /// Shepard owns its versioned lifecycle, agent configuration, and result schemas;
+    /// none of this metadata is billable usage or interpreted by cost analysis.
+    pub payload: JsonBlob,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -398,6 +476,15 @@ pub struct CustomMessageLine {
 pub enum CustomMessagePayload {
     #[serde(rename = "pi-loaded-tools")]
     PiLoadedTools(PiLoadedToolsDetails),
+    /// Native shepard notices associate outer rendered content with a run and
+    /// structured error details, unlike the content-only live-test markers.
+    #[serde(rename = "shepard.notice")]
+    ShepardNotice(ShepardNoticeDetails),
+    /// The dotted native assignment needs routing ids in addition to its outer
+    /// instruction content. V1 names this initial structured schema, not a wire
+    /// version field; the hyphenated shepard-assignment remains a unit marker.
+    #[serde(rename = "shepard.assignment")]
+    ShepardAssignmentV1(ShepardAssignmentDetails),
     /// Marker emitted by the plannotator extension when planning finishes;
     /// the human-readable summary lives in the outer `content` field and no
     /// structured `details` payload is attached.
@@ -468,6 +555,21 @@ pub enum CustomMessagePayload {
     /// field, which is observed empty for these state records.
     #[serde(rename = "firstpick:session-summary-rpc")]
     FirstPickSessionSummaryRpc(FirstPickSessionSummaryRpcDetails),
+    /// Live-test assignment message from the shepard extension: the task
+    /// text lives in the outer `content` field and no structured `details`
+    /// payload is attached.
+    #[serde(rename = "shepard-assignment")]
+    ShepardAssignment,
+    /// Delegation-roster announcement from the shepard extension; the
+    /// rendered roster text lives in the outer `content` field and no
+    /// structured `details` payload is attached.
+    #[serde(rename = "shepard-roster")]
+    ShepardRoster,
+    /// Progress-event relay from the shepard extension; the rendered text
+    /// lives in the outer `content` field and `details` carries the same
+    /// composite event id as `shepard-seen` acknowledgements.
+    #[serde(rename = "shepard-event")]
+    ShepardEvent(ShepardEventId),
 }
 
 // ---------------------------------------------------------------------------
@@ -486,6 +588,8 @@ pub struct MessageLine {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "camelCase")]
 pub enum RoleMessage {
+    #[serde(rename = "system")]
+    System(Box<SystemMessage>),
     #[serde(rename = "user")]
     User(UserMessage),
     #[serde(rename = "assistant")]
@@ -501,6 +605,58 @@ pub enum RoleMessage {
 pub struct UserMessage {
     pub content: Vec<UserContentItem>,
     pub timestamp: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SystemMessage {
+    pub content: SystemContent,
+    pub timestamp: i64,
+    /// Section names are extension-defined; null removes a previously declared section.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sections: Option<BTreeMap<String, Option<String>>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools_added: Option<Vec<SystemTool>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools_removed: Option<Vec<SystemToolReference>>,
+}
+
+/// A compaction snapshot carries the role tag but cannot contain a billable message.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(tag = "role", rename_all = "lowercase")]
+pub enum SystemMessageSnapshot {
+    System(Box<SystemMessage>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SystemContent {
+    Text(String),
+    Blocks(Vec<SystemContentItem>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum SystemContentItem {
+    Text(TextAssistantContent),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SystemTool {
+    pub name: String,
+    pub description: String,
+    /// Pi tool schemas require an object, but their keywords and values are tool-owned.
+    pub parameters: BTreeMap<String, JsonBlob>,
+    /// Provider-side sampling controls are preserved without interpreting them for costing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constrained_sampling: Option<JsonBlob>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SystemToolReference {
+    pub name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -525,6 +681,13 @@ pub struct AssistantMessage {
     /// construction. Only some providers emit it, hence `Option`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_stop_reason: Option<String>,
+    /// Wall-clock duration of the turn. Pi measures it with a sub-millisecond
+    /// clock, so it carries a fractional part; `Decimal` keeps that exact
+    /// rather than rejecting or lossily rounding an ordinary turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<Decimal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_level: Option<ThinkingLevel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
     /// Provider diagnostics attached when the assistant turn fails due to
@@ -568,6 +731,10 @@ pub struct ToolResultMessage {
     pub content: Vec<ToolResultContentItem>,
     pub is_error: bool,
     pub timestamp: i64,
+    /// Tool execution time, measured with pi's sub-millisecond clock, so it
+    /// carries a fractional part; `Decimal` keeps that exact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<Decimal>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<ToolResultDetails>,
     /// Tools the model gained mid-turn (e.g. `contact_supervisor` after a
@@ -583,6 +750,102 @@ pub struct ToolResultMessage {
     /// would double-count (the same reasoning as Claude's `cost-state`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<AssistantUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nested_calls: Option<NestedToolCalls>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NestedToolCalls {
+    pub calls: Vec<NestedToolCall>,
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "RawNestedToolCall", into = "RawNestedToolCall")]
+pub struct NestedToolCall {
+    pub id: String,
+    pub name: String,
+    pub status: NestedToolCallStatus,
+    pub arguments: Option<NestedCallArguments>,
+    pub duration_ms: Option<u64>,
+    pub error: Option<String>,
+}
+
+/// Size-limit omission metadata cannot coexist with the arguments it replaces.
+/// Arguments are the model-emitted JSON, which is not validated tool-side and
+/// is therefore not always an object (a failed call can carry a bare string);
+/// nothing downstream reads the payload, so it stays opaque.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum NestedCallArguments {
+    Inline(JsonBlob),
+    Omitted { arguments_bytes: u64 },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RawNestedToolCall {
+    id: String,
+    name: String,
+    status: NestedToolCallStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    arguments: Option<JsonBlob>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    arguments_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+impl TryFrom<RawNestedToolCall> for NestedToolCall {
+    type Error = &'static str;
+
+    fn try_from(raw: RawNestedToolCall) -> Result<Self, Self::Error> {
+        let arguments = match (raw.arguments, raw.arguments_bytes) {
+            (Some(_), Some(_)) => {
+                return Err("nested call cannot contain both arguments and argumentsBytes");
+            }
+            (Some(arguments), None) => Some(NestedCallArguments::Inline(arguments)),
+            (None, Some(arguments_bytes)) => Some(NestedCallArguments::Omitted { arguments_bytes }),
+            (None, None) => None,
+        };
+        Ok(Self {
+            id: raw.id,
+            name: raw.name,
+            status: raw.status,
+            arguments,
+            duration_ms: raw.duration_ms,
+            error: raw.error,
+        })
+    }
+}
+
+impl From<NestedToolCall> for RawNestedToolCall {
+    fn from(call: NestedToolCall) -> Self {
+        let (arguments, arguments_bytes) = match call.arguments {
+            Some(NestedCallArguments::Inline(arguments)) => (Some(arguments), None),
+            Some(NestedCallArguments::Omitted { arguments_bytes }) => (None, Some(arguments_bytes)),
+            None => (None, None),
+        };
+        Self {
+            id: call.id,
+            name: call.name,
+            status: call.status,
+            arguments,
+            arguments_bytes,
+            duration_ms: call.duration_ms,
+            error: call.error,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NestedToolCallStatus {
+    Ok,
+    Error,
+    Unfinished,
 }
 
 #[derive(Debug, Deserialize)]
@@ -593,12 +856,15 @@ struct RawToolResultMessage {
     pub content: Vec<ToolResultContentItem>,
     pub is_error: bool,
     pub timestamp: i64,
+    #[serde(default)]
+    pub duration_ms: Option<Decimal>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub added_tool_names: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<AssistantUsage>,
+    pub nested_calls: Option<NestedToolCalls>,
 }
 
 /// Pi can emit `null` or omit `details` entirely when no structured result is
@@ -639,9 +905,11 @@ impl<'de> Deserialize<'de> for ToolResultMessage {
             content,
             is_error,
             timestamp,
+            duration_ms,
             details: raw_details,
             added_tool_names,
             usage,
+            nested_calls,
         } = RawToolResultMessage::deserialize(deserializer)?;
         let resolved = resolve_tool_result_details(raw_details, &tool_name, is_error);
         let details = resolved.map_err(de::Error::custom)?;
@@ -651,9 +919,11 @@ impl<'de> Deserialize<'de> for ToolResultMessage {
             content,
             is_error,
             timestamp,
+            duration_ms,
             details,
             added_tool_names,
             usage,
+            nested_calls,
         })
     }
 }
@@ -757,6 +1027,12 @@ pub struct ToolCallContent {
     pub arguments: ToolCallArguments,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partial_json: Option<String>,
+    /// Set when the model's arguments text was not valid JSON; `arguments` is
+    /// then `{}` and this carries pi's parse-error report, which ends with the
+    /// raw arguments text after a `Received arguments:` separator. It is
+    /// therefore not replayable as arguments text on its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arguments_error: Option<String>,
 }
 
 impl ToolCallContent {
@@ -771,12 +1047,39 @@ impl ToolCallContent {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ShepardAssignmentDetails {
+    pub parent_session_id: String,
+    pub subagent_id: String,
+    pub run_id: String,
+    pub message_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ShepardNoticeDetails {
+    pub subagent_id: String,
+    pub run_id: String,
+    pub notice_id: String,
+    pub error: ShepardNoticeError,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShepardNoticeError {
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AssistantUsage {
     pub input: u64,
     pub output: u64,
     pub cache_read: u64,
     pub cache_write: u64,
     pub total_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write1h: Option<u64>,
     /// Reasoning tokens (e.g. from DeepSeek-V4-Pro, GLM-5.2).
     /// Pi added this field later; optional for backward compatibility.
     #[serde(default)]
@@ -1641,12 +1944,346 @@ pub struct IntercomSentData {
     pub subagent: Option<JsonBlob>,
 }
 
+/// Composite `<child run id>:<event id>` shared by shepard's
+/// seen-acknowledgement and progress-event records and by the
+/// `shepard_contact`/`shepard_contact_parent` tool results, which all
+/// identify a queued message by this one id field.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ShepardEventId {
+    pub id: String,
+}
+
+// Start, completion, and failure receipts require different co-occurring fields;
+// independent Options would accept half-present or mixed success/error states.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(untagged, rename_all_fields = "camelCase", deny_unknown_fields)]
+pub enum ShepardReceipt {
+    Started {
+        ok: bool,
+        subagent_id: String,
+        run_id: String,
+        status: String,
+    },
+    Completed {
+        ok: bool,
+        run_id: String,
+    },
+    Failed {
+        ok: bool,
+        error: ShepardNoticeError,
+    },
+}
+
+// Remaining native shepard tool results: each tool's output schema is a
+// union of one success shape plus the shared `{ok: false, error}` failure
+// receipt (sometimes carrying optional known-id siblings), so each is
+// modeled as an untagged enum whose variants reject the other shape's
+// required fields.
+
+/// `shepard_ask` blocks a child until the parent answers; the result is the
+/// correlated answer. Failures carry no ids.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(untagged, rename_all_fields = "camelCase", deny_unknown_fields)]
+pub enum ShepardAskDetails {
+    Answered {
+        ok: bool,
+        question_id: String,
+        answer: String,
+    },
+    Failed {
+        ok: bool,
+        error: ShepardNoticeError,
+    },
+}
+
+/// Why a `shepard_wait` returned. Closed vocabulary from the extension's
+/// wait output schema; a new reason must surface as a parse error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShepardWaitReason {
+    Finished,
+    Attention,
+    Timeout,
+}
+
+/// One `shepard_wait` run row: either a live run inspection or a per-run
+/// inspection failure carrying only the run id.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ShepardWaitRun {
+    // Boxed because ShepardRunInspection dwarfs the unavailable row.
+    Inspection(Box<ShepardRunInspection>),
+    Unavailable(ShepardRunUnavailable),
+}
+
+/// Per-run `shepard_wait` inspection failure carrying only the run id.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ShepardRunUnavailable {
+    pub run_id: String,
+    pub error: ShepardNoticeError,
+}
+
+/// `shepard_wait` blocks until child runs resolve; the receipt pairs the
+/// wake reason with per-run inspection rows (or per-run inspection
+/// failures).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(untagged, rename_all_fields = "camelCase", deny_unknown_fields)]
+pub enum ShepardWaitDetails {
+    Waited {
+        ok: bool,
+        reason: ShepardWaitReason,
+        runs: Vec<ShepardWaitRun>,
+    },
+    Failed {
+        ok: bool,
+        error: ShepardNoticeError,
+    },
+}
+
+/// Live native run inspection shared by `shepard_wait` run rows and
+/// `shepard_inspect`. The contract's sampling configuration and the
+/// completion result are caller-owned JSON, so they stay opaque; the
+/// remaining fields are pinned by shepard's own run schema.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ShepardRunInspection {
+    pub kind: ShepardRunKind,
+    pub parent_session_id: String,
+    pub subagent_id: String,
+    pub run_id: String,
+    pub contract: ShepardContract,
+    pub prompt: String,
+    pub cwd: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_permissions: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation_error: Option<ShepardNoticeError>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_question: Option<ShepardPendingQuestion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controls: Option<Vec<ShepardRunControl>>,
+    pub notices: Vec<ShepardRunNotice>,
+    pub status: ShepardRunStatus,
+    /// Present only on `completed` inspections; shape is caller-owned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<JsonBlob>,
+}
+
+/// Closed stage-1 run vocabulary pinned by the extension's inspection
+/// schema; only `completed` inspections carry a `result`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShepardRunStatus {
+    Queued,
+    Running,
+    Completed,
+}
+
+/// Only agent-kind runs are inspected today; a new kind must surface as a
+/// parse error rather than being silently dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShepardRunKind {
+    Agent,
+}
+
+/// Schema-derived agent contract pinned by shepard's journal acceptance;
+/// configuration and output schema are caller-owned JSON.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ShepardContract {
+    pub name: String,
+    pub revision: String,
+    pub configuration: JsonBlob,
+    pub output_schema: JsonBlob,
+}
+
+/// A child's question awaiting the parent's reply, from the run-inspection
+/// schema.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ShepardPendingQuestion {
+    pub question_id: String,
+    pub question: String,
+}
+
+/// A queued-message delivery failure recorded on the run's inspection.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ShepardRunNotice {
+    pub notice_id: String,
+    pub timestamp: DateTime<Utc>,
+    pub error: ShepardNoticeError,
+}
+
+/// One pending cancellation request in a run's `controls` list. The
+/// operation/state vocabularies are extension-owned, so they stay open
+/// `String`s like [`ShepardInterruptDetails`]'s `state` fields.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ShepardRunControl {
+    pub control_id: String,
+    pub operation: String,
+    pub state: String,
+}
+
+/// `shepard_reply` answers a child's question; failures keep whichever known
+/// ids were resolvable when the reply failed.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(untagged, rename_all_fields = "camelCase", deny_unknown_fields)]
+pub enum ShepardReplyDetails {
+    Accepted {
+        ok: bool,
+        question_id: String,
+        subagent_id: String,
+        run_id: String,
+        accepted: bool,
+    },
+    Failed {
+        ok: bool,
+        error: ShepardNoticeError,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        question_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subagent_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+    },
+}
+
+/// `shepard_send` queues guidance to a running child; failures keep whatever
+/// ids were resolvable when the send failed.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(untagged, rename_all_fields = "camelCase", deny_unknown_fields)]
+pub enum ShepardSendDetails {
+    Queued {
+        ok: bool,
+        message_id: String,
+        run_id: String,
+        /// Wire pin today is "queued"; kept open like
+        /// `ShepardReceipt::Started::status` because the disposition
+        /// vocabulary is extension-owned and nothing downstream reads it.
+        disposition: String,
+    },
+    Failed {
+        ok: bool,
+        error: ShepardNoticeError,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subagent_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+    },
+}
+
+/// `shepard_inspect` returns one run's status/result view.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(untagged, rename_all_fields = "camelCase", deny_unknown_fields)]
+pub enum ShepardInspectDetails {
+    // Boxed for the same size reason as ShepardWaitRun::Inspection.
+    Run {
+        ok: bool,
+        run: Box<ShepardRunInspection>,
+    },
+    Failed {
+        ok: bool,
+        error: ShepardNoticeError,
+    },
+}
+
+/// `shepard_interrupt`/`shepard_stop` control receipts. Only a requested
+/// interruption carries a control id, so a stop of an already-finished run
+/// is its own shape; failures keep whatever ids were resolvable.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(untagged, rename_all_fields = "camelCase", deny_unknown_fields)]
+pub enum ShepardInterruptDetails {
+    Requested {
+        ok: bool,
+        subagent_id: String,
+        run_id: String,
+        control_id: String,
+        /// Requested pins "requested" and AlreadyFinished pins
+        /// "already_finished"; the control-lifecycle vocabulary is
+        /// extension-owned, so the states stay open `String`s.
+        state: String,
+    },
+    AlreadyFinished {
+        ok: bool,
+        subagent_id: String,
+        run_id: String,
+        /// Same open-vocabulary reason as `Requested::state`.
+        state: String,
+    },
+    Failed {
+        ok: bool,
+        error: ShepardNoticeError,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subagent_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        control_id: Option<String>,
+    },
+}
+
+/// Persists the source range so observation extraction can resume after compaction.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OmObserverCatchUpJobData {
+    pub version: u32,
+    pub compaction_id: String,
+    pub from_id: String,
+    pub through_id: String,
+}
+
+/// Progress either names the next source or marks completion, never both.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(untagged, rename_all_fields = "camelCase", deny_unknown_fields)]
+pub enum OmObserverCatchUpProgressData {
+    Pending {
+        version: u32,
+        compaction_id: String,
+        next_source_id: String,
+    },
+    Complete {
+        version: u32,
+        compaction_id: String,
+        #[serde(deserialize_with = "deserialize_complete")]
+        complete: bool,
+    },
+}
+
+fn deserialize_complete<'de, D: Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    if bool::deserialize(deserializer)? {
+        Ok(true)
+    } else {
+        Err(de::Error::custom("observer completion flag must be true"))
+    }
+}
+
 /// Emitted by the om extension when it records observations extracted
 /// during a session.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OmObservationsRecordedData {
     pub observations: Vec<ObservationEntry>,
+    pub covers_up_to_id: String,
+    /// Legacy observation records predate explicit range starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub covers_from_id: Option<String>,
+}
+
+/// The om extension records coverage without observations when no new memory
+/// was extracted, so an empty observation list is not required on this payload.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OmObservationsCoverageData {
+    pub covers_from_id: String,
     pub covers_up_to_id: String,
 }
 
@@ -1669,6 +2306,8 @@ pub struct ObservationEntry {
     pub relevance: String,
     pub source_entry_ids: Vec<String>,
     pub token_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -1678,6 +2317,11 @@ pub struct ReflectionEntry {
     pub content: String,
     pub supporting_observation_ids: Vec<String>,
     pub token_count: u64,
+    /// Older reflection records omit the extension's wall-clock timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -1945,11 +2589,15 @@ fn parse_tool_result_details(
         "ast_grep_search" => empty_or(details, ToolResultDetails::AstGrepSearch),
         "bash" => serde_json::from_value(details).map(ToolResultDetails::Bash),
         "code_search" => serde_json::from_value(details).map(ToolResultDetails::CodeSearch),
+        "codemode" => empty_or(details, ToolResultDetails::Codemode),
         "compress" => serde_json::from_value(details).map(ToolResultDetails::Compress),
         "contact_supervisor" => {
             serde_json::from_value(details).map(ToolResultDetails::ContactSupervisor)
         }
         "edit" => serde_json::from_value(details).map(ToolResultDetails::Edit),
+        "effective_config" => {
+            serde_json::from_value(details).map(ToolResultDetails::EffectiveConfig)
+        }
         "fetch_content" => serde_json::from_value(details).map(ToolResultDetails::FetchContent),
         "fact_list" | "instinct_list" => {
             serde_json::from_value(details).map(ToolResultDetails::Count)
@@ -1998,6 +2646,21 @@ fn parse_tool_result_details(
         "read" => serde_json::from_value(details).map(ToolResultDetails::Read),
         "read_enclosing" => serde_json::from_value(details).map(ToolResultDetails::ReadEnclosing),
         "read_symbol" => serde_json::from_value(details).map(ToolResultDetails::ReadSymbol),
+        "shepard_start" | "shepard_complete" => {
+            // Early shepard_complete successes emitted {} rather than a receipt.
+            empty_or(details, ToolResultDetails::ShepardReceipt)
+        }
+        "shepard_ask" => serde_json::from_value(details).map(ToolResultDetails::ShepardAsk),
+        "shepard_wait" => serde_json::from_value(details).map(ToolResultDetails::ShepardWait),
+        "shepard_reply" => serde_json::from_value(details).map(ToolResultDetails::ShepardReply),
+        "shepard_send" => serde_json::from_value(details).map(ToolResultDetails::ShepardSend),
+        "shepard_inspect" => serde_json::from_value(details).map(ToolResultDetails::ShepardInspect),
+        "shepard_interrupt" | "shepard_stop" => {
+            serde_json::from_value(details).map(ToolResultDetails::ShepardInterrupt)
+        }
+        "shepard_contact" | "shepard_contact_parent" => {
+            serde_json::from_value(details).map(ToolResultDetails::ShepardContact)
+        }
         "skill" => empty_or(details, ToolResultDetails::Skill),
         "bg_wait" | "subagent" | "subagent_wait" => parse_subagent_result_details(details),
         "subagent_supervisor" => {
@@ -2005,6 +2668,7 @@ fn parse_tool_result_details(
         }
         "symbol_search" => serde_json::from_value(details).map(ToolResultDetails::SymbolSearch),
         "todo" => serde_json::from_value(details).map(ToolResultDetails::Todo),
+        "web_enable" => serde_json::from_value(details).map(ToolResultDetails::WebEnable),
         "web_search" => parse_web_search_details(details),
         "workspace_session_summaries" => {
             serde_json::from_value(details).map(ToolResultDetails::WorkspaceSessionSummaries)
@@ -2066,6 +2730,11 @@ fn parse_web_search_details(details: Value) -> Result<ToolResultDetails, serde_j
             cancelled: lean.cancelled.unwrap_or(false),
             error: lean.error,
             cancel_reason: lean.cancel_reason,
+            query_providers: None,
+            truncated: false,
+            original_chars: 0,
+            returned_chars: 0,
+            omitted_chars: 0,
         }))
     } else {
         serde_json::from_value(details).map(ToolResultDetails::WebSearch)
@@ -2106,6 +2775,19 @@ pub enum ToolResultDetails {
     AskUser(AskUserDetails),
     CodeSearch(CodeSearchDetails),
     ContactSupervisor(ContactSupervisorResultDetails),
+    // `shepard_contact`/`shepard_contact_parent` results carry only the
+    // composite queued-event id; routed by tool name like the other
+    // extension tools.
+    ShepardContact(ShepardEventId),
+    ShepardReceipt(ShepardReceipt),
+    // Remaining native shepard tools, each routed by tool name above; their
+    // success/failure unions are pinned by the extension's own output schemas.
+    ShepardAsk(ShepardAskDetails),
+    ShepardWait(ShepardWaitDetails),
+    ShepardReply(ShepardReplyDetails),
+    ShepardSend(ShepardSendDetails),
+    ShepardInspect(ShepardInspectDetails),
+    ShepardInterrupt(ShepardInterruptDetails),
     WebSearch(WebSearchDetails),
     // Grep precedes Read for direct `ToolResultDetails` shape matching
     // because both accept `{matchLimitReached, linesTruncated}` and
@@ -2125,6 +2807,7 @@ pub enum ToolResultDetails {
     Intercom(IntercomResultDetails),
     Mcp(McpDetails),
     McpScript(McpScriptDetails),
+    Codemode(CodemodeDetails),
     McpToolResult(McpToolResult),
     Bash(BashDetails),
     PlannotatorSubmitPlan(PlannotatorSubmitPlanDetails),
@@ -2149,17 +2832,19 @@ pub enum ToolResultDetails {
     // FetchContent has no shape overlap with anything above (it declares
     // `urls`, `urlCount`, ... that no other variant carries).
     //
-    // GetSearchContent is dual-shape: its Success arm is uniquely
-    // identified by `{url, title, contentLength}`, and its Error arm is
-    // `{error}` with an optional `url`. Earlier variants that also declare
-    // an `error` field (CodeSearchDetails, McpDetails, TodoDetails,
-    // SubagentResultDetails-via-Subagent, WebSearchDetails) all require
-    // additional discriminator fields (e.g. `query`+`maxTokens`,
-    // `mode`, `action`+`params`+`nextId`, `mode`+`results`,
-    // `queryCount`+`successfulQueries`+...), so either error shape cannot
-    // be absorbed by any of them and safely falls through here.
+    // GetSearchContent has four strict shapes: cached-page success/error,
+    // cached-page text matches, and provider-query text matches. The two
+    // find forms differ by URL/title versus responseId/query breadcrumbs.
+    // Earlier variants that also declare an `error` field (CodeSearchDetails,
+    // McpDetails, TodoDetails, SubagentResultDetails-via-Subagent,
+    // WebSearchDetails) all require additional discriminator fields (e.g.
+    // `query`+`maxTokens`, `mode`, `action`+`params`+`nextId`,
+    // `mode`+`results`, `queryCount`+`successfulQueries`+...), so either
+    // error shape cannot be absorbed by any of them and safely falls through here.
     FetchContent(FetchContentDetails),
     GetSearchContent(GetSearchContentDetails),
+    // Keep after GetSearchContent so bare `{error}` retains its existing direct fallback.
+    WebEnable(WebEnableDetails),
     McpInitializationError(McpInitializationError),
     // Hermes `memory` and `skill` are intentionally parsed by `tool_name`
     // first because their error shapes can collapse to `{}` or a bare
@@ -2179,9 +2864,11 @@ pub enum ToolResultDetails {
     LensDiagnosticMark(LensDiagnosticMarkDetails),
     LensDiagnostics(LensDiagnosticsDetails),
     LspDiagnostics(LspDiagnosticsDetails),
-    // Pi-lens owns this evolving envelope and no caller reads its fields;
-    // tool-name routing retains it without making unrelated untagged shapes
-    // deserialize as navigation details.
+    // Pi-lens owns these evolving envelopes and cost analysis does not read
+    // their fields; explicit tool-name routing preserves them without letting
+    // arbitrary objects absorb unrelated untagged details.
+    #[serde(skip_deserializing)]
+    EffectiveConfig(JsonBlob),
     #[serde(skip_deserializing)]
     LspNavigation(JsonBlob),
     ModuleReport(ModuleReportDetails),
@@ -2233,6 +2920,12 @@ pub struct ContactSupervisorResultDetails {
     pub error: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivered: Option<bool>,
+    /// The schema-conforming structured reply pi-subagents returned alongside
+    /// the prose answer (observed on `interview_request` replies). Kept opaque
+    /// because its shape is whatever the requesting tool's schema asked for
+    /// and nothing downstream reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_reply: Option<JsonBlob>,
 }
 
 /// `ls` tool results are either a plain listing (no `details`), a lean-ctx
@@ -2550,6 +3243,10 @@ pub struct SubagentWaitCompletionResult {
     /// Error message for a failed child run; absent on success.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Why pi-subagents interrupted a child and the files it had changed.
+    /// The termination and report-status vocabularies are extension-owned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_recovery: Option<SubagentTimeoutRecovery>,
     /// The child run's own token/cost usage. Present on newer workflow
     /// completions; absent on older entries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2566,6 +3263,49 @@ pub struct SubagentWaitCompletionResult {
     /// inline `structured_output` payload by newer workflow completions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub structured_output_path: Option<PathBuf>,
+}
+
+/// Whether pi-subagents ended the child by timeout or explicit stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SubagentTimeoutTermination {
+    TimedOut,
+    Stopped,
+}
+
+/// State of the requested report output: `Missing` means it was not written, while `Unknown` means
+/// its status could not be determined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SubagentTimeoutReportStatus {
+    Missing,
+    Written,
+    NotRequested,
+    Unknown,
+}
+
+/// Why a timed-out child needs review because it changed files without its requested report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SubagentTimeoutRecoveryReason {
+    TimedOutWithDirtyWorktree,
+}
+
+/// Timeout recovery is extension-owned run metadata, projected to this bounded
+/// subset by pi-subagents before it is recorded in a wait result.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SubagentTimeoutRecovery {
+    pub termination: SubagentTimeoutTermination,
+    pub changed_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_needed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<SubagentTimeoutRecoveryReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report_status: Option<SubagentTimeoutReportStatus>,
 }
 
 /// Wait completions record either the saved output path alone or the full
@@ -3329,6 +4069,13 @@ pub struct SubagentSupervisorRequestDetails {
     /// answer this request. Added in newer pi versions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_hint: Option<String>,
+    /// Structured interview payload on `interview_request` requests.
+    /// pi-subagents deliberately types this as an extension-defined opaque
+    /// object (its own supervisor UI only re-serializes it), so it stays a
+    /// raw JSON blob rather than a shape that breaks on every interview
+    /// evolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interview: Option<JsonBlob>,
 }
 
 /// Payload for the `subagent_supervisor_reply` custom line: the parent's answer
@@ -3496,6 +4243,28 @@ pub struct WebSearchDetails {
     /// Reason a search curation was cancelled (e.g. "stale").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cancel_reason: Option<String>,
+    /// Newer pi versions record which provider answered each query;
+    /// older payloads omit the whole list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_providers: Option<Vec<QueryProviderInfo>>,
+    /// Content-size accounting for bounded-result searches; older payloads
+    /// omit these.
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub original_chars: u64,
+    #[serde(default)]
+    pub returned_chars: u64,
+    #[serde(default)]
+    pub omitted_chars: u64,
+}
+
+/// Newer pi versions record which provider answered each search query.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct QueryProviderInfo {
+    pub query: String,
+    pub providers: Vec<String>,
 }
 
 /// `read` emits two sub-shapes for `details` that classify here: a plain
@@ -3593,18 +4362,45 @@ pub struct FetchContentDetails {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<String>,
+    /// Raw-mode single-URL fetches record these breadcrumbs; older payloads
+    /// and other modes omit them entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_lines: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shown_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shown_lines: Option<u64>,
 }
 
 /// Replaying a single previously-fetched URL via `get_search_content`
 /// emits a small breadcrumb describing which URL was returned and how
-/// large the cached body is. Failed retrievals may instead repeat the
+/// large the cached body is. Text-match results have separate cached-page
+/// and provider-query forms. Failed retrievals may instead repeat the
 /// requested URL beside the error message, so the error variant retains that
-/// breadcrumb while keeping both wire shapes strict.
+/// breadcrumb while keeping all wire shapes strict.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum GetSearchContentDetails {
     Success(GetSearchContentSuccessDetails),
     Error(GetSearchContentErrorDetails),
+    /// A text-match replay over a cached page: pi reports per-query match
+    /// counts beside the usual success breadcrumb.
+    Find(GetSearchContentFindDetails),
+    /// Search-provider text matches use response/query breadcrumbs instead
+    /// of the cached-page URL/title fields above.
+    QueryFind(GetSearchContentQueryFindDetails),
+    /// A character-slice replay of a stored provider-search response:
+    /// response/query breadcrumbs with pagination instead of the find
+    /// envelopes' match counts.
+    SearchSlice(GetSearchContentSearchSliceDetails),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -3613,20 +4409,97 @@ pub struct GetSearchContentSuccessDetails {
     pub url: String,
     pub title: String,
     pub content_length: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub returned_chars: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GetSearchContentFindDetails {
+    pub url: String,
+    pub title: String,
+    pub content_length: u64,
+    pub find_mode: FindMode,
+    pub match_count: u64,
+    pub returned_matches: u64,
+    pub query_results: Vec<FindQueryResult>,
+}
+
+/// Provider-query matches lack cached-page URL/title fields, so their separate
+/// strict envelope preserves validation across both result producers.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GetSearchContentQueryFindDetails {
+    pub response_id: String,
+    pub query: String,
+    pub result_count: u64,
+    pub content_length: u64,
+    pub find_mode: FindMode,
+    pub match_count: u64,
+    pub returned_matches: u64,
+    pub query_results: Vec<FindQueryResult>,
+}
+
+/// Character-slice retrieval of one stored provider-search query's results.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GetSearchContentSearchSliceDetails {
+    pub response_id: String,
+    pub query: String,
+    pub result_count: u64,
+    pub content_length: u64,
+    pub offset: u64,
+    pub limit: u64,
+    pub returned_chars: u64,
+    /// Null once the slice reaches the end of the stored results.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<u64>,
+    pub truncated: bool,
+}
+
+/// Matching modes the web-access producer supports for text results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FindMode {
+    Exact,
+    CaseInsensitive,
+    Fuzzy,
+}
+
+/// Per-query match counts from a `get_search_content` text-match replay.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FindQueryResult {
+    pub query: String,
+    pub match_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GetSearchContentErrorDetails {
     pub error: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        rename = "responseId"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_id: Option<String>,
+    /// Argument-validation failures of the stored-search slice path report
+    /// the offending offset/limit bounds beside the error message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_limit: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_length: Option<u64>,
 }
 
 /// Either of `matchLimitReached` / `linesTruncated` may be present when
@@ -3945,6 +4818,26 @@ pub struct McpSessionsDetails {
     pub sessions: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_guard: Option<JsonBlob>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CodemodeStoreData {
+    /// Store keys and values belong to caller scripts, not the extension protocol.
+    pub set: BTreeMap<String, JsonBlob>,
+    pub delete: Vec<String>,
+}
+
+/// Empty success details reuse ToolResultDetails::Empty rather than a codemode-only state;
+/// non-empty payloads require calls. Error sentinels are dropped before this routing.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CodemodeDetails {
+    /// Extension call breadcrumbs vary independently of core nestedCalls metadata,
+    /// including JSON-string args and fractional durationMs; costing reads neither.
+    pub calls: Vec<JsonBlob>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_output_path: Option<PathBuf>,
 }
 
 /// Results from the adapter's `mcpScript` batch tool carry `mode: "script"`
@@ -4362,12 +5255,241 @@ impl<'de> Deserialize<'de> for JsonValue {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "camelCase", deny_unknown_fields)]
 pub enum LensDiagnosticsDetails {
+    #[serde(rename = "file")]
+    File(LensDiagnosticsFile),
     #[serde(rename = "delta")]
     Delta(LensDiagnosticsDelta),
     #[serde(rename = "all")]
     All(LensDiagnosticsSummary),
+    #[serde(rename = "batch")]
+    Batch(LensDiagnosticsBatch),
+    #[serde(rename = "directory")]
+    Directory(LensDiagnosticsDirectory),
     #[serde(rename = "full")]
     Full(LensDiagnosticsFull),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LensDiagnosticsSource {
+    Lsp,
+    Session,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LensDiagnosticsScope {
+    Paths,
+    Workspace,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LensDiagnosticsSeverity {
+    Error,
+    Warning,
+    Information,
+    Hint,
+    All,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LensDiagnosticsServerScope {
+    Primary,
+    All,
+}
+
+/// Per-file lens results retain typed severity, server, source, and scope
+/// values instead of sharing the less-specific `lsp_diagnostics` response.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LensDiagnosticsFile {
+    pub file_path: PathBuf,
+    pub severity: LensDiagnosticsSeverity,
+    pub server_scope: LensDiagnosticsServerScope,
+    pub source: LensDiagnosticsSource,
+    pub scope: LensDiagnosticsScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_server_id: Option<String>,
+    // The too-large response omits the per-server counts and confirmation
+    // flags entirely, so they default instead of failing the whole line.
+    #[serde(default)]
+    pub primary_diagnostics_count: u32,
+    #[serde(default)]
+    pub auxiliary_diagnostics_count: u32,
+    pub diagnostics: Vec<JsonValue>,
+    pub total_diagnostics: u32,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub unconfirmed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timed_out: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unconfirmed_server_ids: Option<Vec<String>>,
+    /// Discriminated per-file verdict; only the too-large response carries
+    /// it today, and the closed vocabulary comes from the producer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<LensDiagnosticsOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub too_large_reason: Option<String>,
+    /// Remaining optional breadcrumbs the producer emits only on the paths
+    /// that produce them (unavailable servers, skipped probes, suppressed
+    /// findings, navigation-only runs, health/wait metadata).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disposition_suppressed: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub navigation_only_files: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lsp_health: Option<JsonValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_ms: Option<u64>,
+}
+
+/// Closed per-file verdict vocabulary shared with the producer's batch
+/// outcomes; a new verdict must surface as a parse error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LensDiagnosticsOutcome {
+    Clean,
+    Findings,
+    Unsupported,
+    Unavailable,
+    Failed,
+    TooLarge,
+    Inconclusive,
+}
+
+/// The lens batch envelope carries its producer and requested scope, unlike the
+/// similarly shaped `lsp_diagnostics` batch response, so the two stay strict.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LensDiagnosticsBatch {
+    pub files_checked: u32,
+    pub concurrency: NonZeroUsize,
+    pub severity: LensDiagnosticsSeverity,
+    pub server_scope: LensDiagnosticsServerScope,
+    pub source: LensDiagnosticsSource,
+    pub scope: LensDiagnosticsScope,
+    pub diagnostics: Vec<JsonValue>,
+    pub primary_diagnostics_count: u32,
+    pub auxiliary_diagnostics_count: u32,
+    pub total_diagnostics: u32,
+    pub truncated: bool,
+    pub clean_files: u32,
+    pub unconfirmed_files: u32,
+    pub outcomes: Vec<JsonValue>,
+    pub outcome_counts: JsonValue,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub navigation_only_files: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disposition_suppressed: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lsp_health_warnings: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timed_out_files: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incomplete_files: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_errors: Option<Vec<String>>,
+}
+
+/// Older sweeps omit both outcome fields. Capturing their flattened remainder
+/// also restores strict outer-key validation, which serde's flatten cannot
+/// combine with deny_unknown_fields (the same approach as McpPagination).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DirectoryOutcomes {
+    None,
+    PerFile {
+        outcomes: Vec<JsonValue>,
+        outcome_counts: JsonValue,
+    },
+}
+
+impl Serialize for DirectoryOutcomes {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(None)?;
+        if let Self::PerFile {
+            outcomes,
+            outcome_counts,
+        } = self
+        {
+            map.serialize_entry("outcomes", outcomes)?;
+            map.serialize_entry("outcomeCounts", outcome_counts)?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for DirectoryOutcomes {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let object = Map::<String, Value>::deserialize(deserializer)?;
+        reject_unknown_object_fields(&object, &["outcomes", "outcomeCounts"])
+            .map_err(de::Error::custom)?;
+        match (
+            object.contains_key("outcomes"),
+            object.contains_key("outcomeCounts"),
+        ) {
+            (false, false) => Ok(Self::None),
+            (true, true) => Ok(Self::PerFile {
+                outcomes: object_field(&object, "outcomes").map_err(de::Error::custom)?,
+                outcome_counts: object_field(&object, "outcomeCounts")
+                    .map_err(de::Error::custom)?,
+            }),
+            _ => Err(de::Error::custom(
+                "outcomes and outcomeCounts must occur together",
+            )),
+        }
+    }
+}
+
+/// The flattened DirectoryOutcomes validates unclaimed keys because serde
+/// cannot combine flatten with deny_unknown_fields.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LensDiagnosticsDirectory {
+    pub file_path: PathBuf,
+    pub severity: LensDiagnosticsSeverity,
+    pub server_scope: LensDiagnosticsServerScope,
+    pub source: LensDiagnosticsSource,
+    pub scope: LensDiagnosticsScope,
+    pub files_scanned: u32,
+    pub capped: bool,
+    pub diagnostics: Vec<JsonValue>,
+    pub primary_diagnostics_count: u32,
+    pub auxiliary_diagnostics_count: u32,
+    pub total_diagnostics: u32,
+    pub truncated: bool,
+    pub clean_files: u32,
+    pub unconfirmed_files: u32,
+    #[serde(flatten)]
+    pub per_file_outcomes: DirectoryOutcomes,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub navigation_only_files: Option<u32>,
+    pub concurrency: NonZeroUsize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disposition_suppressed: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timed_out_files: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_errors: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lsp_health_warnings: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -4396,7 +5518,23 @@ pub struct LensDiagnosticsDeltaFindings {
 #[serde(untagged)]
 pub enum LensDiagnosticsSummary {
     Clean(LensDiagnosticsClean),
-    Findings(LensDiagnosticsFindings),
+    Findings(LensDiagnosticsSummaryFindings),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LensDiagnosticsSummaryFindings {
+    pub files_with_issues: NonZeroUsize,
+    pub total_blocking: u32,
+    pub total_errors: u32,
+    pub total_warnings: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_advisories: Option<u32>,
+    pub stale_dropped: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disposition_suppressed: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -4413,6 +5551,10 @@ pub struct LensDiagnosticsFindings {
     pub total_blocking: u32,
     pub total_errors: u32,
     pub total_warnings: u32,
+    /// Hint/info advisories, reported separately from warnings by newer
+    /// pi-lens builds; absent on summaries recorded by older ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_advisories: Option<u32>,
     pub stale_dropped: u32,
 }
 
@@ -4443,6 +5585,10 @@ pub struct LensDiagnosticsFullDetails<S> {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_diagnostics_delta: Option<LensProjectDiagnosticsDelta>,
     pub cold_runners: Vec<String>,
+    /// Runners that answered with partial coverage (newer pi-lens builds);
+    /// absent on older logs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial_runners: Option<Vec<String>>,
     pub cold_reasons: BTreeMap<String, String>,
     pub failed_analyzers: Vec<LensAnalyzerFailure>,
     pub analyzer_timings_ms: BTreeMap<String, u64>,
@@ -4452,6 +5598,10 @@ pub struct LensDiagnosticsFullDetails<S> {
     pub analyzers_aborted: bool,
     pub analyzers_aborted_ids: Vec<String>,
     pub analyzers_unsafe_root: bool,
+    /// Pi-lens owns the validation detail shape and this report does not
+    /// interpret it, so retain new validation metadata without guessing fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analysis_root_validation: Option<JsonBlob>,
     pub project_walk_unsafe_root: bool,
     pub lsp_files_confirmed: u32,
     pub lsp_files_unconfirmed: u32,
@@ -4581,6 +5731,8 @@ pub struct LspDiagnosticsBatch {
     pub outcomes: Vec<JsonValue>,
     pub outcome_counts: JsonValue,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub navigation_only_files: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lsp_health_warnings: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait_ms: Option<u64>,
@@ -4593,7 +5745,9 @@ pub struct LspDiagnosticsBatch {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+// DirectoryOutcomes rejects unknown flattened keys; deny_unknown_fields
+// cannot be combined with flatten here.
+#[serde(rename_all = "camelCase")]
 pub struct LspDiagnosticsDirectory {
     pub file_path: PathBuf,
     pub severity: String,
@@ -4607,6 +5761,10 @@ pub struct LspDiagnosticsDirectory {
     pub truncated: bool,
     pub clean_files: u32,
     pub unconfirmed_files: u32,
+    #[serde(flatten)]
+    pub per_file_outcomes: DirectoryOutcomes,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub navigation_only_files: Option<u32>,
     pub concurrency: NonZeroUsize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timed_out_files: Option<u32>,
@@ -4647,6 +5805,42 @@ pub struct PiLensActivateToolsDetails {
     pub matches: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub added: Vec<String>,
+}
+
+/// `web_enable` returns one strict success or failure outcome.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum WebEnableDetails {
+    Enabled(WebEnableEnabledDetails),
+    Unavailable(WebEnableUnavailableDetails),
+    Missing(WebEnableMissingDetails),
+    Error(WebEnableErrorDetails),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebEnableEnabledDetails {
+    pub enabled: Vec<String>,
+}
+
+// Failure payloads are extension-owned; retain their values without accepting
+// unrelated top-level detail fields.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebEnableUnavailableDetails {
+    pub unavailable: JsonBlob,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebEnableMissingDetails {
+    pub missing: JsonBlob,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebEnableErrorDetails {
+    pub error: JsonBlob,
 }
 
 /// Results from `ast_grep_replace` come in two success shapes (the
@@ -5043,6 +6237,11 @@ pub struct PlannotatorData {
     /// framing delivery.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub framing_delivered: bool,
+    /// True while the plannotator extension still owes the user an idle
+    /// notice. Defaults false because older records predate idle-notice
+    /// tracking.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub idle_notice_pending: bool,
 }
 
 /// Payload of a `subagent-wait-subscription` custom message. Emitted when a
@@ -5209,6 +6408,16 @@ pub struct WebSearchResultsData {
     pub payload: WebSearchResultsPayload,
 }
 
+const FETCH_FIELDS: [&str; 3] = ["urls", "urlMetadata", "fetchCache"];
+const FETCH_EXPECTED_FIELDS: [&str; 6] = [
+    "id",
+    "timestamp",
+    "type",
+    FETCH_FIELDS[0],
+    FETCH_FIELDS[1],
+    FETCH_FIELDS[2],
+];
+
 impl<'de> Deserialize<'de> for WebSearchResultsData {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -5226,7 +6435,7 @@ impl<'de> Deserialize<'de> for WebSearchResultsData {
 
         let expected_fields = match kind {
             "search" => &["id", "timestamp", "type", "queries"][..],
-            "fetch" => &["id", "timestamp", "type", "urls"][..],
+            "fetch" => &FETCH_EXPECTED_FIELDS,
             other => {
                 return Err(de::Error::unknown_variant(other, &["search", "fetch"]));
             }
@@ -5240,9 +6449,17 @@ impl<'de> Deserialize<'de> for WebSearchResultsData {
             "search" => WebSearchResultsPayload::Search(WebSearchResultsSearch {
                 queries: object_field(object, "queries").map_err(de::Error::custom)?,
             }),
-            "fetch" => WebSearchResultsPayload::Fetch(WebSearchResultsFetch {
-                urls: object_field(object, "urls").map_err(de::Error::custom)?,
-            }),
+            "fetch" => {
+                let fetch_object = object
+                    .iter()
+                    .filter(|(key, _)| FETCH_FIELDS.contains(&key.as_str()))
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect();
+                WebSearchResultsPayload::Fetch(
+                    serde_json::from_value(Value::Object(fetch_object))
+                        .map_err(de::Error::custom)?,
+                )
+            }
             _ => unreachable!("kind validated above"),
         };
 
@@ -5298,9 +6515,66 @@ pub struct WebSearchResultsSearch {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase", try_from = "WebSearchResultsFetchWire")]
 pub struct WebSearchResultsFetch {
-    pub urls: Vec<WebFetchResult>,
+    /// Legacy fetch shape: full result bodies. Newer pi versions record only
+    /// [`WebUrlMetadata`] entries instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub urls: Option<Vec<WebFetchResult>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url_metadata: Option<Vec<WebUrlMetadata>>,
+    /// Newer pi versions record where the fetch result was cached on disk.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fetch_cache: Option<WebFetchCache>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WebSearchResultsFetchWire {
+    urls: Option<Vec<WebFetchResult>>,
+    url_metadata: Option<Vec<WebUrlMetadata>>,
+    fetch_cache: Option<WebFetchCache>,
+}
+
+impl TryFrom<WebSearchResultsFetchWire> for WebSearchResultsFetch {
+    type Error = &'static str;
+
+    fn try_from(wire: WebSearchResultsFetchWire) -> Result<Self, Self::Error> {
+        if wire.urls.is_none() && wire.url_metadata.is_none() {
+            return Err("fetch payload must contain `urls` or `urlMetadata`");
+        }
+        Ok(Self {
+            urls: wire.urls,
+            url_metadata: wire.url_metadata,
+            fetch_cache: wire.fetch_cache,
+        })
+    }
+}
+
+/// Newer fetch payloads describe each URL without carrying its body content.
+/// `contentLength` is nullable: `null` or absence means the length was
+/// unknown.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WebUrlMetadata {
+    pub url: String,
+    pub title: String,
+    #[serde(deserialize_with = "deserialize_required_nullable_string")]
+    pub error: Option<String>,
+    pub content_length: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+}
+
+/// Newer pi versions record where a fetch result was cached on disk.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WebFetchCache {
+    pub version: i64,
+    pub key: String,
+    pub stored_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -5315,6 +6589,10 @@ pub struct WebSearchQueryResult {
     /// aborted"`) can be recorded before the provider was selected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+    /// Newer pi versions list every provider that contributed results;
+    /// older payloads carry only the singular `provider`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub providers: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -5413,10 +6691,101 @@ pub enum ParseError {
 }
 
 pub fn parse_line(raw: &str) -> Result<PiLogLine, ParseError> {
-    serde_json::from_str::<PiLogLine>(raw).map_err(|source| ParseError::SingleLine {
+    parse_json_with_surrogate_retry::<PiLogLine>(raw).map_err(|source| ParseError::SingleLine {
         content: raw.to_owned(),
         source,
     })
+}
+
+/// Shared retry orchestration for every pi log line parse: parse once, and on
+/// failure retry once with lone UTF-16 surrogate escapes rewritten to U+FFFD
+/// (JSON.stringify's serialization of ill-formed provider strings, which
+/// serde_json's well-formed-UTF-8 validation rejects). On a retry failure the
+/// ORIGINAL error is returned so reported positions refer to the raw line.
+pub fn parse_json_with_surrogate_retry<T: DeserializeOwned>(
+    raw: &str,
+) -> Result<T, serde_json::Error> {
+    match serde_json::from_str(raw) {
+        Ok(parsed) => Ok(parsed),
+        Err(original) => {
+            serde_json::from_str(&replace_lone_surrogate_escapes(raw)).map_err(|_| original)
+        }
+    }
+}
+
+/// Rewrites `\uXXXX` escapes for unpaired UTF-16 surrogates to U+FFFD so the
+/// line parses under serde_json's well-formed UTF-8 validation. Paired
+/// surrogate escapes are left untouched for serde_json to combine.
+fn replace_lone_surrogate_escapes(line: &str) -> String {
+    let bytes = line.as_bytes();
+    let mut out = String::with_capacity(line.len());
+    // Start of the plain-text run not yet copied into `out`. Escape-free
+    // regions are copied in slices, so all cut points stay at ASCII escape
+    // boundaries and the input's UTF-8 encoding is preserved verbatim.
+    let mut plain_start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'\\' {
+            i += 1;
+            continue;
+        }
+        // Only a `\uXXXX` escape is a surrogate-escape candidate. Any other
+        // escape (`\n`, `\\`, ...) is skipped as-is: without this `u` check,
+        // an ordinary escape followed by four hex-looking text characters
+        // (e.g. `\n` then the literal text `d800`) would be misread as a
+        // unicode escape and corrupted, and an escaped backslash could start
+        // a phantom `\u` escape. Skipping (rather than copying) keeps every
+        // slice cut point at an escape start; a bare i += 2 may land mid
+        // multi-byte character, which is safe because that content stays
+        // inside the plain run copied whole below.
+        if bytes.get(i + 1) != Some(&b'u') {
+            i += 2;
+            continue;
+        }
+        let Some(hex) = decode_hex_escape(bytes, i + 2) else {
+            // `\u` without four hex digits is not a unicode escape; skip the
+            // two bytes and let serde_json report the malformed escape.
+            i += 2;
+            continue;
+        };
+        match hex {
+            // A leading surrogate is paired only when immediately followed by
+            // a `\uDC00..=\uDFFF` escape; anything else is what serde_json
+            // rejects. A valid pair is skipped past WHOLE (both escapes) so
+            // its trailing half is not re-scanned as a lone trailing
+            // surrogate.
+            0xD800..=0xDBFF if is_trailing_escape(bytes, i + 6) => i += 12,
+            0xD800..=0xDFFF => {
+                out.push_str(&line[plain_start..i]);
+                out.push_str("\\uFFFD");
+                i += 6;
+                plain_start = i;
+            }
+            // Verbatim non-surrogate escapes stay in the plain run for
+            // serde_json to handle.
+            _ => i += 6,
+        }
+    }
+    out.push_str(&line[plain_start..]);
+    out
+}
+
+/// Whether the bytes at `start` begin a `\uDC00..=\uDFFF` escape.
+fn is_trailing_escape(bytes: &[u8], start: usize) -> bool {
+    bytes.get(start) == Some(&b'\\')
+        && bytes.get(start + 1) == Some(&b'u')
+        && matches!(decode_hex_escape(bytes, start + 2), Some(0xDC00..=0xDFFF))
+}
+
+/// Decodes the 4 hex digits at `digits_start`, if present and all hex.
+fn decode_hex_escape(bytes: &[u8], digits_start: usize) -> Option<u16> {
+    let digits = bytes.get(digits_start..digits_start + 4)?;
+    let mut value: u16 = 0;
+    for &digit in digits {
+        // Four hex digits max out at 0xFFFF; no overflow is possible.
+        value = value * 16 + (digit as char).to_digit(16)? as u16;
+    }
+    Some(value)
 }
 
 /// Errors carry the file path and 1-based line number of the offending line
@@ -5438,13 +6807,14 @@ pub fn parse_file(path: impl AsRef<Path>) -> Result<Vec<PiLogLine>, ParseError> 
         if line.trim().is_empty() {
             continue;
         }
-        let parsed =
-            serde_json::from_str::<PiLogLine>(&line).map_err(|source| ParseError::LineParse {
+        let parsed = parse_json_with_surrogate_retry::<PiLogLine>(&line).map_err(|source| {
+            ParseError::LineParse {
                 path: path.to_path_buf(),
                 line: idx + 1,
                 content: line.clone(),
                 source,
-            })?;
+            }
+        })?;
         out.push(parsed);
     }
 

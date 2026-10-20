@@ -30,7 +30,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    MCP_PROTOCOL_VERSION, MCP_SUPPORTED_PROTOCOL_VERSIONS,
+    MCP_PROTOCOL_VERSION, MCP_SUPPORTED_PROTOCOL_VERSIONS, default_project_dir,
     read_only::{CommandResult, run_read_only_command},
 };
 
@@ -77,6 +77,8 @@ impl JjCommand {
 /// Arguments for executing jj commands.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct JjArgs {
+    /// Defaults to the MCP server's working directory when omitted.
+    #[serde(default = "default_project_dir")]
     pub project_dir: PathBuf,
     pub command: JjCommand,
     pub args: Vec<String>,

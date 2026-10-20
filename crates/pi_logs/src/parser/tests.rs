@@ -5,17 +5,19 @@
 //! assert on the typed result, while others pin serialization behavior or
 //! shape-routing assumptions that the parser relies on.
 
-use std::{fmt::Debug, path::PathBuf};
+use std::{error::Error as _, path::PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
-use serde_json::{Value, error::Category, json};
+use serde_json::{Value, json};
 
 use super::*;
 
 const FIXED_TIMESTAMP: &str = "2026-04-25T01:48:25.742Z";
 const MESSAGE_TIMESTAMP: i64 = 1_700_000_000;
 const SESSION_ID: &str = "019dc252-e50e-766c-8182-d654b46881af";
+const SHEPARD_EVENT_ID: &str =
+    "76ab74cd-3905-4229-a11f-ca7f27da111f:0001790380837905-de004eec-5f0a-4e21-8b4b-57653972c41e";
 
 #[derive(Clone, Copy)]
 struct AssistantFixture<'a> {
@@ -294,6 +296,26 @@ fn tool_result_message_json(
     message_line_json("r1", "a1", message)
 }
 
+/// Pi times tool execution with the same sub-millisecond clock as assistant
+/// turns, so the fractional value must not fail the result.
+#[test]
+fn tool_result_duration_ms_is_optional_and_fractional() {
+    let base = tool_result_message_json(
+        "todo",
+        vec![json!({"type": "text", "text": "ok"})],
+        false,
+        None,
+    );
+    let mut value = base.clone();
+    value["message"]["durationMs"] = json!(99.5_f64);
+    let result = parse_tool_result_message(value);
+    assert_eq!(
+        result.duration_ms,
+        Some(Decimal::from_str_exact("99.5").unwrap())
+    );
+    assert_eq!(parse_tool_result_message(base).duration_ms, None);
+}
+
 fn tool_result_with_details(tool_name: &str, details: Value) -> ToolResultMessage {
     parse_tool_result_message(tool_result_message_json(
         tool_name,
@@ -303,6 +325,23 @@ fn tool_result_with_details(tool_name: &str, details: Value) -> ToolResultMessag
     ))
 }
 
+/// Pins a shepard tool's routed details two ways: the routed variant must
+/// re-parse into the expected union type (its disjoint required fields make
+/// a misrouting fail), and the union must serialize back to the wire value.
+fn assert_shepard_round_trip<T: Serialize + DeserializeOwned>(
+    tool_name: &str,
+    payload: Value,
+    label: &str,
+) {
+    let tool = tool_result_with_details(tool_name, payload.clone());
+    let Some(details) = tool.details else {
+        panic!("{label}: no details")
+    };
+    let parsed: T = serde_json::from_value(serde_json::to_value(&details).unwrap())
+        .unwrap_or_else(|error| panic!("{label}: {error}"));
+    assert_eq!(serde_json::to_value(parsed).unwrap(), payload, "{label}");
+}
+
 fn lens_full_details(summary: Value) -> Value {
     let mut details = json!({"mode":"full","lspFilesChecked":4,"partial":false,"projectDiagnostics":{"tier":"cheap","filesScanned":4,"diagnostics":2,"runners":["tree-sitter"]},"projectDiagnosticsDelta":{"diagnostics":1,"sources":["knip"],"turnIndex":4},"coldRunners":["trivy"],"coldReasons":{"trivy":"not configured"},"failedAnalyzers":[{"id":"knip","summary":"timed out"}],"analyzerTimingsMs":{"knip":8},"dispositionSuppressed":1,"dispositionSuppressedByLane":{"knip":1},"analyzersCachedAgeMs":{"test-runner":500},"analyzersAborted":false,"analyzersAbortedIds":[],"analyzersUnsafeRoot":false,"projectWalkUnsafeRoot":false,"lspFilesConfirmed":3,"lspFilesUnconfirmed":1,"lspFilesPartiallyCovered":1,"unconfirmedLspServerIds":["yaml"],"unconfirmedLspFiles":["/tmp/example.yaml"],"lspServerBreakdown":{"typescript":{"confirmed":3,"total":4}},"lspPrimaryDiagnosticsCount":1,"lspAuxiliaryDiagnosticsCount":2,"projectScanTruncated":false,"projectGeneratedFileSkips":1,"projectGeneratedNameOnlySkips":2,"projectGeneratedDirSkips":3,"timedOut":true});
     details
@@ -310,6 +349,14 @@ fn lens_full_details(summary: Value) -> Value {
         .expect("lens details object")
         .extend(summary.as_object().expect("lens summary object").clone());
     details
+}
+
+fn lsp_batch_details() -> Value {
+    serde_json::from_str(r#"{"mode":"batch","filesChecked":2,"concurrency":8,"severity":"error","serverScope":"primary","diagnostics":[],"primaryDiagnosticsCount":0,"auxiliaryDiagnosticsCount":0,"totalDiagnostics":0,"truncated":false,"cleanFiles":1,"unconfirmedFiles":0,"outcomes":[],"outcomeCounts":{"clean":1},"waitMs":2000,"timedOutFiles":2,"incompleteFiles":1,"fileErrors":["read failed"]}"#).expect("valid lsp batch fixture")
+}
+
+fn lens_batch_details() -> Value {
+    serde_json::from_str(r#"{"mode":"batch","filesChecked":1,"concurrency":8,"severity":"warning","serverScope":"all","source":"lsp","scope":"paths","diagnostics":[],"primaryDiagnosticsCount":0,"auxiliaryDiagnosticsCount":0,"totalDiagnostics":0,"truncated":false,"cleanFiles":1,"unconfirmedFiles":0,"outcomes":[],"outcomeCounts":{"clean":1},"dispositionSuppressed":13,"waitMs":3000,"timedOutFiles":1}"#).expect("valid lens batch fixture")
 }
 
 fn bash_execution_message_json(
@@ -489,8 +536,15 @@ fn parse_tool_result_message(value: Value) -> ToolResultMessage {
 }
 
 fn parse_subagent_wait_completions(completions: Value) -> Vec<SubagentWaitCompletion> {
+    parse_subagent_wait_completions_for_tool("subagent_wait", completions)
+}
+
+fn parse_subagent_wait_completions_for_tool(
+    tool_name: &str,
+    completions: Value,
+) -> Vec<SubagentWaitCompletion> {
     let tool_result = parse_tool_result_message(tool_result_message_json(
-        "subagent_wait",
+        tool_name,
         vec![json!({"type": "text", "text": "done"})],
         false,
         Some(json!({"mode": "management", "results": [], "completions": completions})),
@@ -550,11 +604,6 @@ fn parse_custom_message_payload(
     custom_message.payload
 }
 
-fn assert_untagged_rejection<T: DeserializeOwned + Debug>(value: Value) {
-    let error = serde_json::from_value::<T>(value).expect_err("invalid shape must be rejected");
-    assert_eq!(error.classify(), Category::Data, "{error}");
-}
-
 fn assert_parse_error_contains_any(name: &str, value: Value, expected_fragments: &[&str]) {
     let msg = format!("{}", parse_err(value));
     assert!(
@@ -573,6 +622,133 @@ fn assert_parse_error_contains_all(name: &str, value: Value, expected_fragments:
             "case {name} expected error to mention {fragment:?}: {msg}"
         );
     }
+}
+
+/// Raw wire form of a line whose text carries lone UTF-16 surrogate escapes
+/// (the JSON.stringify ill-formed-provider-string shape); shared by the
+/// `parse_line` and `parse_file` retry tests.
+const SURROGATE_LINE: &str = r#"{"type":"message","id":"x","parentId":"y","timestamp":"2026-04-25T01:48:25.742Z","message":{"role":"assistant","content":[{"type":"text","text":"regex /[\ud800-\udbff]/ guard"}],"api":"openai-completions","provider":"openrouter","model":"z-ai/glm-5.3-flash","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"reasoning":0,"totalTokens":2,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0,"source":"provider"}},"stopReason":"stop","timestamp":1700000000}}"#;
+
+/// Assistant line carrying `text` verbatim (JSON-escaped by serde) so the
+/// sanitizer's escape-arm behavior can be exercised through `parse_line`.
+fn pi_line_with_raw_text(text: &str) -> String {
+    let fixture = AssistantFixture::new(
+        "openai-completions",
+        "openrouter",
+        "z-ai/glm-5.3-flash",
+        "stop",
+    );
+    let line =
+        assistant_message_json(vec![json!({"type": "text", "text": "hello"})], fixture).to_string();
+    line.replace("\"hello\"", &format!("\"{text}\""))
+}
+
+/// Parses a raw message line and returns its first assistant text block.
+fn surrogate_line_text(raw: &str) -> String {
+    let Ok(PiLogLine::Message(line)) = parse_line(raw) else {
+        panic!("expected Message line")
+    };
+    let RoleMessage::Assistant(assistant) = &line.message else {
+        panic!("expected Assistant message")
+    };
+    let AssistantContentItem::Text(text) = &assistant.content[0] else {
+        panic!("expected text block")
+    };
+    text.text.clone()
+}
+
+#[test]
+fn parse_line_rewrites_lone_surrogate_escapes() {
+    // serde_json reports "unexpected end of hex escape" for this shape; the
+    // retry must surface it as U+FFFD replacements around the literal text.
+    assert_eq!(
+        surrogate_line_text(SURROGATE_LINE),
+        "regex /[\u{FFFD}-\u{FFFD}]/ guard"
+    );
+}
+
+#[test]
+fn surrogate_retries_replace_lone_leading_and_trailing_escapes() {
+    assert_eq!(
+        surrogate_line_text(&pi_line_with_raw_text("a \\ud800 b")),
+        "a \u{FFFD} b"
+    );
+    assert_eq!(
+        surrogate_line_text(&pi_line_with_raw_text("a \\udd23")),
+        "a \u{FFFD}"
+    );
+}
+
+#[test]
+fn surrogate_retries_keep_valid_pairs_whole() {
+    // The lone surrogate forces the retry and proves the valid pair is
+    // skipped whole: its trailing half must not be re-scanned as a lone
+    // trailing surrogate.
+    assert_eq!(
+        surrogate_line_text(&pi_line_with_raw_text("\\ud800 \\ud83d\\ude00")),
+        "\u{FFFD} \u{1F600}"
+    );
+}
+
+#[test]
+fn surrogate_retries_do_not_misread_adjacent_escapes() {
+    // Regression: `\n` followed by the literal text `dc00` must not be
+    // misread as a `\udc00` escape; only real `\u` escapes are rewritten.
+    assert_eq!(
+        surrogate_line_text(&pi_line_with_raw_text("x \\ud800 y \\ndc00 z")),
+        "x \u{FFFD} y \ndc00 z"
+    );
+    assert_eq!(
+        surrogate_line_text(&pi_line_with_raw_text("\\ud800\\u0041")),
+        "\u{FFFD}A"
+    );
+    assert_eq!(
+        surrogate_line_text(&pi_line_with_raw_text("regex \\\\uD800-\\\\uDBFF")),
+        "regex \\uD800-\\uDBFF"
+    );
+}
+
+#[test]
+fn consecutive_lone_leading_surrogates_become_replacements() {
+    assert_eq!(
+        surrogate_line_text(&pi_line_with_raw_text("\\ud800\\ud801")),
+        "\u{FFFD}\u{FFFD}"
+    );
+}
+
+#[test]
+fn replace_lone_surrogate_escapes_backslash_before_multibyte_char_does_not_panic() {
+    // Malformed JSON: serde_json rejects `\中` as an invalid escape, and
+    // the sanitizer must skip it without slicing mid-character.
+    let raw = "{\"type\":\"custom\",\"data\":\"x\\中y\"}";
+    assert_eq!(replace_lone_surrogate_escapes(raw), raw);
+    assert!(parse_line(raw).is_err());
+}
+
+#[test]
+fn replace_lone_surrogate_escapes_too_few_hex_digits_stays_unparsed() {
+    // The None arm must leave the line byte-identical so the raw error
+    // surfaces instead of a sanitized-retry error.
+    let raw = r#"{"type":"custom","data":"x \u0z"}"#;
+    assert_eq!(replace_lone_surrogate_escapes(raw), raw);
+    assert!(parse_line(raw).is_err());
+}
+
+#[test]
+fn failing_sanitized_line_reports_the_raw_line_error() {
+    // The lone surrogate makes the sanitizer rewrite the line, but the
+    // truncated JSON still fails: the surfaced failure must be the raw
+    // line's error (the hex escape serde stopped on), not the sanitized
+    // retry's (whose rewrite turns the same truncation into an EOF
+    // error). Comparing against a reference chain built from the raw
+    // error keeps the assertion free of serde's wording.
+    let raw = r#"{"type":"custom","data":"\ud800""#;
+    let error = parse_line(raw).expect_err("truncated line must fail");
+    let expected = serde_json::from_str::<PiLogLine>(raw).unwrap_err();
+    assert_eq!(
+        error.source().map(|e| e.to_string()),
+        Some(expected.to_string())
+    );
 }
 
 #[test]
@@ -984,12 +1160,44 @@ fn compaction_line_with_usage() {
 }
 
 #[test]
+fn compaction_preserves_system_snapshot() {
+    let mut value = compaction_json(false);
+    value["systemMessage"] = json!({
+        "role": "system", "content": "", "timestamp": MESSAGE_TIMESTAMP,
+        "sections": {"preamble": "Base prompt"}, "toolsAdded": []
+    });
+    let parsed = parse(value.clone());
+    assert_eq!(serde_json::to_value(&parsed).unwrap(), value);
+    value["systemMessage"]["role"] = json!("assistant");
+    parse_err(value);
+}
+
+#[test]
 fn compaction_line_from_hook() {
     let line = parse(compaction_json(true));
 
     match line {
         PiLogLine::Compaction(compaction) => assert!(compaction.from_hook),
         other => panic!("expected Compaction, got {other:?}"),
+    }
+}
+
+#[test]
+fn context_edit_preserves_nullable_replacement() {
+    let mut value = json!({
+        "type": "context_edit", "id": "edit1", "parentId": "p1",
+        "timestamp": FIXED_TIMESTAMP, "targetId": "a1", "replacement": null
+    });
+    for replacement in [Value::Null, json!({"content": "New context"})] {
+        value["replacement"] = replacement.clone();
+        let PiLogLine::ContextEdit(edit) = parse(value.clone()) else {
+            panic!("expected ContextEdit")
+        };
+        assert_eq!(edit.target_id, "a1");
+        assert_eq!(
+            edit.replacement.map(|r| r.content.0),
+            replacement.get("content").cloned()
+        );
     }
 }
 
@@ -1130,6 +1338,7 @@ fn compaction_line_v2() {
             "sections": ["Session Goal", "Files And Changes"],
             "sourceMessageCount": 42,
             "previousSummaryUsed": true,
+            "om.preserveSourceHistory": true,
             "om.folded": {
                 "type": "om.folded",
                 "version": 1,
@@ -1163,6 +1372,7 @@ fn compaction_line_v2() {
             assert_eq!(details.sections, vec!["Session Goal", "Files And Changes"]);
             assert_eq!(details.source_message_count, 42);
             assert!(details.previous_summary_used);
+            assert_eq!(details.om_preserve_source_history, Some(true));
             assert_eq!(details.om_folded.typ, "om.folded");
             assert_eq!(details.om_folded.version, 1);
             assert!(!details.om_folded.full_fold);
@@ -1215,6 +1425,7 @@ fn compaction_line_v2_minimal() {
             assert_eq!(details.sections.len(), 0);
             assert_eq!(details.source_message_count, 0);
             assert!(!details.previous_summary_used);
+            assert_eq!(details.om_preserve_source_history, None);
             assert_eq!(details.om_folded.observations.len(), 1);
             assert_eq!(details.om_folded.reflections.len(), 2);
         }
@@ -1275,6 +1486,96 @@ fn compaction_line_v2_with_retained_tool_output() {
             assert!(projection.omissions.is_empty());
         }
         other => panic!("expected Compaction, got {other:?}"),
+    }
+}
+
+#[test]
+fn system_message_preserves_sections_and_tool_changes() {
+    let value = message_line_json(
+        "s1",
+        "p1",
+        json!({
+            "role": "system",
+            "content": "",
+            "timestamp": MESSAGE_TIMESTAMP,
+            "sections": {"preamble": "Instructions", "extension-section": null},
+            "toolsAdded": [{
+                "name": "read", "description": "Read a file",
+                "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+                "constrainedSampling": {"type": "json_schema", "strict": "prefer"}
+            }],
+            "toolsRemoved": [{"name": "old-tool"}]
+        }),
+    );
+    let RoleMessage::System(system) = parse_role_message(value.clone()) else {
+        panic!("expected System")
+    };
+    assert_eq!(system.sections.as_ref().unwrap()["extension-section"], None);
+    assert_eq!(
+        serde_json::to_value(RoleMessage::System(system)).unwrap(),
+        value["message"]
+    );
+}
+
+#[test]
+fn system_message_accepts_text_and_blocks_without_optional_metadata() {
+    for content in [
+        json!("Base prompt"),
+        json!([{"type": "text", "text": "Update", "textSignature": "sig"}]),
+    ] {
+        let value = message_line_json(
+            "s1",
+            "p1",
+            json!({
+                "role": "system", "content": content, "timestamp": MESSAGE_TIMESTAMP
+            }),
+        );
+        let parsed = parse(value.clone());
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), value);
+    }
+}
+
+#[test]
+fn new_metadata_rejects_unknown_fields() {
+    for (mut value, pointer) in [
+        (
+            json!({
+                "type": "context_edit", "id": "edit1", "parentId": "p1",
+                "timestamp": FIXED_TIMESTAMP, "targetId": "a1", "replacement": null
+            }),
+            "",
+        ),
+        (
+            message_line_json(
+                "s1",
+                "p1",
+                json!({
+                    "role": "system", "content": "", "timestamp": MESSAGE_TIMESTAMP
+                }),
+            ),
+            "/message",
+        ),
+        (
+            tool_result_message_json("codemode", vec![], false, Some(json!({"calls": []}))),
+            "/message/details",
+        ),
+        (
+            custom_json("codemode-store", json!({"set": {}, "delete": []})),
+            "/data",
+        ),
+        (
+            custom_json(
+                "om.observer.catch-up.job",
+                json!({
+                    "version": 1, "compactionId": "c1", "fromId": "e1", "throughId": "e2"
+                }),
+            ),
+            "/data",
+        ),
+    ] {
+        parse(value.clone());
+        value.pointer_mut(pointer).unwrap()["unexpected"] = json!(true);
+        parse_err(value);
     }
 }
 
@@ -1910,6 +2211,57 @@ fn assistant_raw_stop_reason_kept_beside_normalized_stop_reason() {
     assert_eq!(assistant.raw_stop_reason.as_deref(), Some("completed"));
 }
 
+/// Pi times each assistant turn with a sub-millisecond clock, so the field is
+/// fractional and often present; neither may cost the turn's billable usage.
+#[test]
+fn assistant_duration_ms_is_optional_and_fractional() {
+    let base = assistant_message_json(
+        vec![],
+        AssistantFixture::new(
+            "openai-completions",
+            "openrouter",
+            "z-ai/glm-5.3-flash",
+            "stop",
+        ),
+    );
+    let mut value = base.clone();
+    value["message"]["durationMs"] = json!(127.75_f64);
+    let RoleMessage::Assistant(assistant) = parse_role_message(value) else {
+        panic!("expected Assistant")
+    };
+    assert_eq!(
+        assistant.duration_ms,
+        Some(Decimal::from_str_exact("127.75").unwrap())
+    );
+    let RoleMessage::Assistant(assistant) = parse_role_message(base) else {
+        panic!("expected Assistant")
+    };
+    assert_eq!(assistant.duration_ms, None);
+}
+
+#[test]
+fn assistant_thinking_level_is_optional() {
+    let base = assistant_message_json(
+        vec![],
+        AssistantFixture::new(
+            "openai-completions",
+            "openrouter",
+            "z-ai/glm-5.3-flash",
+            "stop",
+        ),
+    );
+    let mut value = base.clone();
+    value["message"]["thinkingLevel"] = json!("high");
+    let RoleMessage::Assistant(assistant) = parse_role_message(value) else {
+        panic!("expected Assistant")
+    };
+    assert_eq!(assistant.thinking_level, Some(ThinkingLevel::High));
+    let RoleMessage::Assistant(assistant) = parse_role_message(base) else {
+        panic!("expected Assistant")
+    };
+    assert_eq!(assistant.thinking_level, None);
+}
+
 #[test]
 fn assistant_thinking_opaque_signature() {
     let signature = parse_assistant_thinking_signature(
@@ -2415,6 +2767,59 @@ fn contact_supervisor_tool_result_accepts_error_flag() {
 }
 
 #[test]
+fn contact_supervisor_tool_result_accepts_structured_reply() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "contact_supervisor",
+        vec![json!({
+            "type": "text",
+            "text": "**Reply from supervisor:**\n{\"challenge\":\"test\"}"
+        })],
+        false,
+        Some(json!({
+            "requestId": "c8262d7c-32d6-430a-96e2-a515bf6c6085",
+            "reason": "interview_request",
+            "structuredReply": {"challenge": "test"}
+        })),
+    ));
+
+    let Some(ToolResultDetails::ContactSupervisor(details)) = tool_result.details else {
+        panic!("expected ContactSupervisor details")
+    };
+
+    assert_eq!(details.reason.as_deref(), Some("interview_request"));
+    assert_eq!(
+        details.structured_reply,
+        Some(JsonBlob::from(json!({"challenge": "test"})))
+    );
+}
+
+#[test]
+fn lens_diagnostics_full_accepts_partial_runners_and_analysis_root_validation() {
+    let mut full = lens_full_details(route_fixture("lens-summary"));
+    full["partialRunners"] = json!(["opengrep", "typos"]);
+    full["analysisRootValidation"] = json!({"state": "safe", "root": "/tmp/project"});
+
+    let Some(ToolResultDetails::LensDiagnostics(LensDiagnosticsDetails::Full(
+        LensDiagnosticsFull::Findings(details),
+    ))) = tool_result_with_details("lens_diagnostics", full).details
+    else {
+        panic!("expected lens full findings details")
+    };
+
+    assert_eq!(
+        details.partial_runners,
+        Some(vec!["opengrep".to_string(), "typos".to_string()])
+    );
+    assert_eq!(
+        details
+            .analysis_root_validation
+            .expect("expected validation")
+            .0,
+        json!({"state": "safe", "root": "/tmp/project"})
+    );
+}
+
+#[test]
 fn mcp_tool_result_accepts_call_result() {
     let details = parse_mcp_call_success(
         vec![json!({
@@ -2743,7 +3148,12 @@ fn web_search_tool_result_accepts_details() {
             "totalResults": 3,
             "includeContent": true,
             "queries": ["rust serde deny_unknown_fields", "pi log parser"],
-            "fetchUrls": ["https://example.com/page1", "https://example.com/page2"]
+            "fetchUrls": ["https://example.com/page1", "https://example.com/page2"],
+            "queryProviders": [{"query": "rust serde deny_unknown_fields", "providers": ["exa"]}],
+            "truncated": false,
+            "originalChars": 12007u64,
+            "returnedChars": 12007u64,
+            "omittedChars": 0u64
         })),
     ));
 
@@ -2763,6 +3173,19 @@ fn web_search_tool_result_accepts_details() {
     assert!(!details.cancelled);
     assert_eq!(details.error, None);
     assert_eq!(details.cancel_reason, None);
+    assert_eq!(
+        details.query_providers.as_deref(),
+        Some(
+            &[QueryProviderInfo {
+                query: "rust serde deny_unknown_fields".to_string(),
+                providers: vec!["exa".to_string()],
+            }][..]
+        )
+    );
+    assert_eq!(details.original_chars, 12007);
+    assert_eq!(details.returned_chars, 12007);
+    assert_eq!(details.omitted_chars, 0);
+    assert!(!details.truncated);
     assert_eq!(
         details.fetch_urls.as_deref(),
         Some(
@@ -3476,6 +3899,75 @@ fn tool_result_with_edit_details() {
 }
 
 #[test]
+fn tool_result_preserves_nested_calls() {
+    let nested = json!({"calls": [
+        {"id": "call_1/1", "name": "read", "status": "ok", "arguments": {"path": "src/lib.rs"}, "durationMs": 12},
+        {"id": "call_1/2", "name": "bash", "status": "error", "argumentsBytes": 2048, "error": "Failed"},
+        {"id": "call_1/3", "name": "ls", "status": "error", "arguments": "crates", "durationMs": 2, "error": "Validation failed"},
+        {"id": "call_1/4", "name": "read", "status": "unfinished"}
+    ], "complete": false});
+    let mut value = tool_result_message_json("codemode", vec![], false, None);
+    value["message"]["nestedCalls"] = nested.clone();
+    let tool = parse_tool_result_message(value);
+    assert_eq!(
+        serde_json::to_value(tool.nested_calls.unwrap()).unwrap(),
+        nested
+    );
+}
+
+#[test]
+fn nested_call_rejects_conflicting_arguments() {
+    let mut value = tool_result_message_json("codemode", vec![], false, None);
+    value["message"]["nestedCalls"] = json!({"calls": [{
+        "id": "call_1/1", "name": "read", "status": "ok", "arguments": {}, "argumentsBytes": 42
+    }], "complete": false});
+    assert_parse_error_contains_all(
+        "nested call arguments",
+        value,
+        &["both arguments and argumentsBytes"],
+    );
+}
+
+#[test]
+fn codemode_nonempty_details_require_calls() {
+    assert_parse_error_contains_all(
+        "codemode required calls",
+        tool_result_message_json(
+            "codemode",
+            vec![],
+            false,
+            Some(json!({"fullOutputPath": "/tmp/x"})),
+        ),
+        &["missing field", "calls"],
+    );
+}
+
+#[test]
+fn codemode_tool_result_accepts_empty_details() {
+    assert!(matches!(
+        tool_result_with_details("codemode", json!({})).details,
+        Some(ToolResultDetails::Empty(_))
+    ));
+}
+
+#[test]
+fn codemode_details_preserve_extension_call_breadcrumbs() {
+    let details = json!({"calls": [{
+        "id": "call_1/1", "name": "read", "args": "{\"path\":\"src/lib.rs\"}",
+        "status": "ok", "durationMs": 123.789
+    }], "fullOutputPath": "/tmp/pi-codemode.txt"});
+    let tool = tool_result_with_details("codemode", details.clone());
+    let Some(ToolResultDetails::Codemode(parsed)) = tool.details else {
+        panic!("expected Codemode")
+    };
+    assert_eq!(parsed.calls[0].0, details["calls"][0]);
+    assert_eq!(
+        parsed.full_output_path,
+        Some(PathBuf::from("/tmp/pi-codemode.txt"))
+    );
+}
+
+#[test]
 fn tool_result_without_details() {
     let tool_result = parse_tool_result_message(tool_result_message_json(
         "bash",
@@ -3718,6 +4210,7 @@ fn custom_plannotator_defaults_phase_added_tools_when_omitted() {
         CustomPayload::Plannotator(details) => {
             assert!(details.phase_added_tools.is_empty());
             assert!(!details.framing_delivered);
+            assert!(!details.idle_notice_pending);
         }
         other => panic!("expected Plannotator, got {other:?}"),
     }
@@ -3739,7 +4232,8 @@ fn custom_web_search_results() {
                     "url": "https://serde.rs",
                     "snippet": "deny_unknown_fields"
                 }],
-                "provider": "exa"
+                "provider": "exa",
+                "providers": ["exa"]
             }]
         }),
     ) {
@@ -3749,6 +4243,7 @@ fn custom_web_search_results() {
             };
             assert_eq!(search.queries.len(), 1);
             assert_eq!(search.queries[0].provider.as_deref(), Some("exa"));
+            assert_eq!(search.queries[0].providers, vec!["exa".to_string()]);
         }
         other => panic!("expected WebSearchResults, got {other:?}"),
     }
@@ -3774,12 +4269,74 @@ fn custom_web_search_results_fetch() {
             let WebSearchResultsPayload::Fetch(fetch) = &results.payload else {
                 panic!("expected Fetch payload, got {:?}", results.payload);
             };
-            assert_eq!(fetch.urls.len(), 1);
-            assert_eq!(fetch.urls[0].url, "https://example.com");
-            assert_eq!(fetch.urls[0].error, None);
+            let urls = fetch.urls.as_ref().expect("expected legacy urls");
+            assert_eq!(urls.len(), 1);
+            assert_eq!(urls[0].url, "https://example.com");
+            assert_eq!(urls[0].error, None);
         }
         other => panic!("expected WebSearchResults, got {other:?}"),
     }
+}
+
+#[test]
+fn custom_web_search_results_fetch_url_metadata() {
+    match parse_custom_payload(
+        "web-search-results",
+        json!({
+            "id": "muswx43ctksmun",
+            "timestamp": MESSAGE_TIMESTAMP,
+            "type": "fetch",
+            "urlMetadata": [{
+                "url": "https://example.com/CHANGELOG.md",
+                "title": "CHANGELOG.md",
+                "error": null,
+                "contentLength": 14,
+                "mimeType": "text/plain",
+                "status": 404
+            }],
+            "fetchCache": {
+                "version": 1,
+                "key": "muswx43ctksmun.json",
+                "storedAt": 1791063425787i64
+            }
+        }),
+    ) {
+        CustomPayload::WebSearchResults(results) => {
+            let WebSearchResultsPayload::Fetch(fetch) = &results.payload else {
+                panic!("expected Fetch payload, got {:?}", results.payload);
+            };
+            assert_eq!(fetch.urls, None);
+            let metadata = fetch.url_metadata.as_ref().expect("expected urlMetadata");
+            assert_eq!(metadata.len(), 1);
+            let metadata = &metadata[0];
+            assert_eq!(metadata.error, None);
+            assert_eq!(metadata.content_length, Some(14));
+            assert_eq!(metadata.mime_type.as_deref(), Some("text/plain"));
+            assert_eq!(metadata.status, Some(404));
+            let cache = fetch.fetch_cache.as_ref().expect("expected fetchCache");
+            assert_eq!(cache.version, 1);
+            assert_eq!(cache.key, "muswx43ctksmun.json");
+            assert_eq!(cache.stored_at, 1791063425787);
+        }
+        other => panic!("expected WebSearchResults, got {other:?}"),
+    }
+}
+
+#[test]
+fn web_search_results_fetch_validates_its_own_shape() {
+    let err = serde_json::from_value::<WebSearchResultsFetch>(json!({
+        "fetchCache": {"version": 1, "key": "fetch.json", "storedAt": 1}
+    }))
+    .expect_err("fetchCache alone is not a fetch result list")
+    .to_string();
+    assert!(
+        err.contains("must contain `urls` or `urlMetadata`"),
+        "{err}"
+    );
+
+    let empty_urls = serde_json::from_value::<WebSearchResultsFetch>(json!({"urls": []}))
+        .expect("an explicitly empty result list is valid");
+    assert_eq!(empty_urls.urls, Some(Vec::new()));
 }
 
 #[test]
@@ -3799,6 +4356,7 @@ fn web_search_results_data_serializes_and_roundtrips() {
                     }],
                     error: None,
                     provider: Some("exa".to_string()),
+                    providers: Vec::new(),
                 }],
             }),
         },
@@ -3806,12 +4364,34 @@ fn web_search_results_data_serializes_and_roundtrips() {
             id: "fetch_1".to_string(),
             timestamp: MESSAGE_TIMESTAMP,
             payload: WebSearchResultsPayload::Fetch(WebSearchResultsFetch {
-                urls: vec![WebFetchResult {
+                urls: Some(vec![WebFetchResult {
                     url: "https://example.com".to_string(),
                     title: "Example".to_string(),
                     content: "Body".to_string(),
                     error: None,
-                }],
+                }]),
+                url_metadata: None,
+                fetch_cache: None,
+            }),
+        },
+        WebSearchResultsData {
+            id: "fetch_2".to_string(),
+            timestamp: MESSAGE_TIMESTAMP,
+            payload: WebSearchResultsPayload::Fetch(WebSearchResultsFetch {
+                urls: None,
+                url_metadata: Some(vec![WebUrlMetadata {
+                    url: "https://example.com/CHANGELOG.md".to_string(),
+                    title: "CHANGELOG.md".to_string(),
+                    error: None,
+                    content_length: Some(14),
+                    mime_type: Some("text/plain".to_string()),
+                    status: Some(404),
+                }]),
+                fetch_cache: Some(WebFetchCache {
+                    version: 1,
+                    key: "fetch_2.json".to_string(),
+                    stored_at: 1791063425787,
+                }),
             }),
         },
     ] {
@@ -3939,7 +4519,7 @@ fn custom_web_search_results_rejects_wrong_variant_keys_or_missing_payload() {
                 "timestamp": MESSAGE_TIMESTAMP,
                 "type": "fetch"
             }),
-            vec!["missing field", "urls"],
+            vec!["must contain `urls` or `urlMetadata`"],
         ),
     ] {
         assert_parse_error_contains_all(
@@ -4020,6 +4600,57 @@ fn custom_plannotator_execute() {
 }
 
 #[test]
+fn custom_codemode_store_preserves_script_defined_values() {
+    let CustomPayload::CodemodeStore(store) = parse_custom_payload(
+        "codemode-store",
+        json!({
+            "set": {"files": ["src/lib.rs"], "count": 3, "nested": {"ready": true}, "empty": null},
+            "delete": ["old-key"]
+        }),
+    ) else {
+        panic!("expected CodemodeStore")
+    };
+    assert_eq!(store.set["files"].0, json!(["src/lib.rs"]));
+    assert_eq!(store.delete, ["old-key"]);
+}
+
+#[test]
+fn custom_om_observer_catch_up_job() {
+    let CustomPayload::OmObserverCatchUpJob(job) = parse_custom_payload(
+        "om.observer.catch-up.job",
+        json!({
+            "version": 1, "compactionId": "c1", "fromId": "e1", "throughId": "e2"
+        }),
+    ) else {
+        panic!("expected catch-up job")
+    };
+    assert_eq!(job.from_id, "e1");
+}
+
+#[test]
+fn custom_om_observer_catch_up_progress() {
+    for extra in [json!({"nextSourceId": "e3"}), json!({"complete": true})] {
+        let mut data = json!({"version": 1, "compactionId": "c1"});
+        data.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let CustomPayload::OmObserverCatchUpProgress(progress) =
+            parse_custom_payload("om.observer.catch-up.progress", data.clone())
+        else {
+            panic!("expected catch-up progress")
+        };
+        assert_eq!(serde_json::to_value(progress).unwrap(), data);
+    }
+    for data in [
+        json!({"version": 1, "compactionId": "c1"}),
+        json!({"version": 1, "compactionId": "c1", "complete": true, "nextSourceId": "e3"}),
+        json!({"version": 1, "compactionId": "c1", "complete": false}),
+    ] {
+        parse_err(custom_json("om.observer.catch-up.progress", data));
+    }
+}
+
+#[test]
 fn custom_om_observations_recorded() {
     match parse_custom_payload(
         "om.observations.recorded",
@@ -4037,6 +4668,7 @@ fn custom_om_observations_recorded() {
     ) {
         CustomPayload::OmObservationsRecorded(data) => {
             assert_eq!(data.covers_up_to_id, "entry-99");
+            assert_eq!(data.covers_from_id, None);
             assert_eq!(data.observations.len(), 1);
             let obs = &data.observations[0];
             assert_eq!(obs.id, "obs-1");
@@ -4045,8 +4677,43 @@ fn custom_om_observations_recorded() {
             assert_eq!(obs.relevance, "high");
             assert_eq!(obs.source_entry_ids, vec!["e1", "e2"]);
             assert_eq!(obs.token_count, 54);
+            assert_eq!(obs.supersedes, None);
         }
         other => panic!("expected OmObservationsRecorded, got {other:?}"),
+    }
+}
+
+#[test]
+fn custom_om_observation_ranges() {
+    for (kind, data) in [
+        (
+            "om.observations.recorded",
+            json!({"observations": [], "coversFromId": "e1", "coversUpToId": "e2"}),
+        ),
+        (
+            "om.observations.coverage",
+            json!({"coversFromId": "e1", "coversUpToId": "e2"}),
+        ),
+    ] {
+        let payload = parse_custom_payload(kind, data.clone());
+        match &payload {
+            CustomPayload::OmObservationsRecorded(recorded) => {
+                assert_eq!(recorded.covers_from_id.as_deref(), Some("e1"));
+                assert_eq!(recorded.covers_up_to_id, "e2");
+            }
+            CustomPayload::OmObservationsCoverage(coverage) => {
+                assert_eq!(coverage.covers_from_id, "e1");
+                assert_eq!(coverage.covers_up_to_id, "e2");
+            }
+            other => panic!("expected observation range, got {other:?}"),
+        }
+        assert_eq!(serde_json::to_value(payload).unwrap()["data"], data);
+        let mut unknown = data;
+        unknown["unexpected"] = json!(true);
+        parse_err(custom_json(kind, unknown));
+    }
+    for data in [json!({"coversUpToId": "e2"}), json!({"coversFromId": "e1"})] {
+        parse_err(custom_json("om.observations.coverage", data));
     }
 }
 
@@ -4072,8 +4739,42 @@ fn custom_om_reflections_recorded() {
             assert_eq!(refl.content, "Reflection content");
             assert_eq!(refl.supporting_observation_ids, vec!["obs-1"]);
             assert_eq!(refl.token_count, 57);
+            assert_eq!(refl.timestamp, None);
+            assert_eq!(refl.supersedes, None);
         }
         other => panic!("expected OmReflectionsRecorded, got {other:?}"),
+    }
+}
+
+#[test]
+fn custom_om_entry_metadata() {
+    for (kind, data) in [
+        (
+            "om.observations.recorded",
+            json!({
+                "observations": [{
+                    "id": "obs-2", "content": "Updated observation",
+                    "timestamp": "2026-10-19 04:06", "relevance": "medium",
+                    "sourceEntryIds": ["e1"], "tokenCount": 10,
+                    "supersedes": ["obs-1"]
+                }],
+                "coversUpToId": "e2"
+            }),
+        ),
+        (
+            "om.reflections.recorded",
+            json!({
+                "reflections": [{
+                    "id": "ref-1", "content": "Reflection",
+                    "supportingObservationIds": ["obs-2"], "tokenCount": 5,
+                    "timestamp": "2026-10-19 04:32", "supersedes": ["ref-0"]
+                }],
+                "coversUpToId": "e2"
+            }),
+        ),
+    ] {
+        let payload = parse_custom_payload(kind, data.clone());
+        assert_eq!(serde_json::to_value(payload).unwrap()["data"], data);
     }
 }
 
@@ -4378,6 +5079,55 @@ fn tool_call_partial_json_preserved() {
 }
 
 #[test]
+fn tool_call_arguments_error_preserved() {
+    // pi records malformed model-emitted arguments as `{}` plus a report whose
+    // tail is the raw arguments text, so the value is multi-line.
+    let content = parse_first_assistant_content(
+        json!({
+            "type": "toolCall",
+            "id": "call_1",
+            "name": "bash",
+            "arguments": {},
+            "argumentsError": "Unterminated string in JSON at position 18\n\nReceived arguments:\n{\"command\": \"ls",
+        }),
+        AssistantFixture::new(
+            "anthropic-messages",
+            "anthropic",
+            "claude-sonnet-4-5",
+            "toolUse",
+        ),
+    );
+    let AssistantContentItem::ToolCall(tool_call) = content else {
+        panic!("expected ToolCall")
+    };
+    assert_eq!(
+        tool_call.arguments_error.as_deref(),
+        Some(
+            "Unterminated string in JSON at position 18\n\nReceived arguments:\n{\"command\": \"ls"
+        )
+    );
+}
+
+#[test]
+fn parse_file_rewrites_lone_surrogate_escapes() {
+    // `parse_file` must apply the same surrogate retry as `parse_line`, not
+    // just the plain serde path; the sanitization content itself is pinned
+    // by the `parse_line` retry tests.
+    let tmp = std::env::temp_dir().join(format!("pi_logs_surr_{}.jsonl", uuid::Uuid::new_v4()));
+    std::fs::write(
+        &tmp,
+        format!("{}\n{}\n", session_json("/tmp"), SURROGATE_LINE),
+    )
+    .unwrap();
+
+    let parsed = parse_file(&tmp).expect("expected surrogate line to parse after retry");
+    let _ = std::fs::remove_file(&tmp);
+
+    assert_eq!(parsed.len(), 2);
+    assert!(matches!(&parsed[1], PiLogLine::Message(_)));
+}
+
+#[test]
 fn parse_file_reports_path_and_line() {
     let tmp = std::env::temp_dir().join(format!("pi_logs_test_{}.jsonl", uuid::Uuid::new_v4()));
     let good = session_json("/tmp").to_string();
@@ -4649,7 +5399,14 @@ fn fetch_content_tool_result_accepts_details() {
             "hasImage": false,
             "imageCount": 0,
             "prompt": "Summarize this page",
-            "timestamp": "0"
+            "timestamp": "0",
+            "mode": "raw",
+            "mimeType": "text/plain",
+            "status": 200,
+            "totalBytes": 12000u64,
+            "totalLines": 300u64,
+            "shownBytes": 8000u64,
+            "shownLines": 200u64
         })),
     ));
     let Some(ToolResultDetails::FetchContent(details)) = tool_result.details else {
@@ -4666,6 +5423,13 @@ fn fetch_content_tool_result_accepts_details() {
     assert_eq!(details.image_count, 0);
     assert_eq!(details.prompt.as_deref(), Some("Summarize this page"));
     assert_eq!(details.timestamp.as_deref(), Some("0"));
+    assert_eq!(details.mode.as_deref(), Some("raw"));
+    assert_eq!(details.mime_type.as_deref(), Some("text/plain"));
+    assert_eq!(details.status, Some(200));
+    assert_eq!(details.total_bytes, Some(12000));
+    assert_eq!(details.total_lines, Some(300));
+    assert_eq!(details.shown_bytes, Some(8000));
+    assert_eq!(details.shown_lines, Some(200));
 }
 
 #[test]
@@ -4723,154 +5487,369 @@ fn fetch_content_tool_result_accepts_top_level_error_summary() {
     assert_eq!(details.error.as_deref(), Some("fetch failed"));
 }
 
-#[test]
-fn pi_lens_tool_result_details_route_current_shapes() {
-    let kind = |tool_name, details| match tool_result_with_details(tool_name, details).details {
-        Some(ToolResultDetails::LspDiagnostics(LspDiagnosticsDetails::File(_))) => "lsp-file",
-        Some(ToolResultDetails::LspDiagnostics(LspDiagnosticsDetails::Batch(_))) => "lsp-batch",
-        Some(ToolResultDetails::LspDiagnostics(LspDiagnosticsDetails::Directory(_))) => {
-            "lsp-directory"
-        }
-        Some(ToolResultDetails::ModuleReport(details)) => match details.callback_support {
-            None => "module-none",
-            Some(CallbackSupport::Tuned) => "module-tuned",
-            Some(CallbackSupport::Generic) => "module-generic",
-        },
-        Some(ToolResultDetails::LensDiagnosticMark(details)) => match details.disposition {
-            LensDiagnosticDisposition::FalsePositive => "mark-false-positive",
-            LensDiagnosticDisposition::Suppress => "mark-suppress",
-            LensDiagnosticDisposition::Defer => "mark-defer",
-            LensDiagnosticDisposition::Flagged => "mark-flagged",
-        },
-        Some(ToolResultDetails::LensDiagnostics(LensDiagnosticsDetails::Delta(_))) => "lens-delta",
-        Some(ToolResultDetails::LensDiagnostics(LensDiagnosticsDetails::All(_))) => "lens-all",
-        Some(ToolResultDetails::LensDiagnostics(LensDiagnosticsDetails::Full(
-            LensDiagnosticsFull::Findings(_),
-        ))) => "lens-full",
-        Some(ToolResultDetails::LensDiagnostics(LensDiagnosticsDetails::Full(
-            LensDiagnosticsFull::Unavailable(_),
-        ))) => "lens-unavailable",
-        Some(ToolResultDetails::AstGrepReplace(details)) => {
-            if details.stale_preview == Some(true) {
-                "ast-replace-stale"
-            } else if details.total_matches.is_some() {
-                "ast-replace"
-            } else {
-                "ast-replace-rule"
-            }
-        }
-        Some(ToolResultDetails::AstGrepSearch(details)) => {
-            if details.validate_only == Some(true) {
-                "ast-search-validate"
-            } else {
-                "ast-search"
-            }
-        }
-        Some(ToolResultDetails::McpScript(details)) => {
-            if details.error.is_some() {
-                "mcp-script-error"
-            } else {
-                "mcp-script"
-            }
-        }
-        Some(ToolResultDetails::Empty(_)) => "empty",
-        other => panic!("unexpected tool details: {other:?}"),
+// Keep fixture rows compact so the labeled routing matrix remains easy to scan.
+#[rustfmt::skip]
+fn route_fixture(name: &str) -> Value {
+    let raw = match name {
+        "lsp-file" => r#"{"mode":"file","filePath":"/tmp/example.rs","severity":"error","serverScope":"primary","primaryDiagnosticsCount":0,"auxiliaryDiagnosticsCount":0,"diagnostics":[],"totalDiagnostics":0,"truncated":false,"unconfirmed":true,"timedOut":true}"#,
+        "lsp-directory" => r#"{"mode":"directory","filePath":"/tmp","severity":"error","serverScope":"primary","filesScanned":2,"capped":false,"diagnostics":[],"primaryDiagnosticsCount":0,"auxiliaryDiagnosticsCount":0,"totalDiagnostics":0,"truncated":false,"cleanFiles":2,"unconfirmedFiles":0,"concurrency":8}"#,
+        "module-report" => r#"{"available":false,"staleness":"unavailable","symbols":0,"exports":0,"callbacks":0,"callbackSupport":"tuned","view":"default"}"#,
+        "lens-mark" => r#"{"anchor":"ddw:de888769f455","disposition":"suppress","line":11}"#,
+        "lens-delta" => r#"{"mode":"delta","warnings":0,"carriedOverFiles":1}"#,
+        "lens-all" => r#"{"mode":"all","filesChecked":4,"staleDropped":0}"#,
+        "lens-all-findings" => r#"{"mode":"all","filesWithIssues":1,"totalBlocking":3,"totalErrors":3,"totalWarnings":1,"totalAdvisories":0,"staleDropped":0,"dispositionSuppressed":0,"waitMs":0}"#,
+        "lens-directory" => r#"{"mode":"directory","filePath":"/tmp","severity":"error","serverScope":"all","filesScanned":100,"capped":true,"diagnostics":[],"primaryDiagnosticsCount":0,"auxiliaryDiagnosticsCount":0,"totalDiagnostics":0,"truncated":false,"cleanFiles":1,"unconfirmedFiles":99,"concurrency":8,"source":"lsp","scope":"paths"}"#,
+        "lens-summary" => r#"{"filesWithIssues":2,"totalBlocking":1,"totalErrors":1,"totalWarnings":3,"staleDropped":0}"#,
+        "lens-unavailable" => r#"{"mode":"full","filesChecked":0,"lspUnavailable":true}"#,
+        "ast-replace" => r#"{"matchCount":8,"totalMatches":8,"truncated":false,"applied":true}"#,
+        "ast-structural" => r#"{"matchCount":2,"applied":true}"#,
+        "ast-empty" => r#"{}"#,
+        "ast-search" => r#"{"matchCount":0,"totalMatches":0,"truncated":false,"hasMore":false,"skip":0,"groupByFile":false,"searchReads":[],"matchLocations":[],"suggestedDump":{"tool":"ast_grep_dump"}}"#,
+        "mcp-script" => r#"{"mode":"script","timeoutMs":3600000,"calls":[{"operation":"call","path":"project-tools_run_tests","ok":true,"durationMs":20022}]}"#,
+        "mcp-error" => r#"{"mode":"script","error":"not_initialized"}"#,
+        _ => panic!("unknown route fixture {name}"),
     };
-    let module = |support| json!({"available":false,"staleness":"unavailable","symbols":0,"exports":0,"callbacks":0,"callbackSupport":support,"view":"default"});
-    let mark =
-        |disposition| json!({"anchor":"ddw:de888769f455","disposition":disposition,"line":11});
-    let mut full = lens_full_details(
-        json!({"filesWithIssues":2,"totalBlocking":1,"totalErrors":1,"totalWarnings":3,"staleDropped":0}),
-    );
+    serde_json::from_str(raw).expect("valid route fixture")
+}
+
+// One-line patterns keep each routing contract visible beside its fixture.
+#[rustfmt::skip]
+macro_rules! route_pattern {
+    (LspFile) => { ToolResultDetails::LspDiagnostics(LspDiagnosticsDetails::File(_)) };
+    (LspBatch) => { ToolResultDetails::LspDiagnostics(LspDiagnosticsDetails::Batch(_)) };
+    (LspDirectory) => { ToolResultDetails::LspDiagnostics(LspDiagnosticsDetails::Directory(_)) };
+    (ModuleReport) => { ToolResultDetails::ModuleReport(ModuleReportDetails { callback_support: Some(CallbackSupport::Tuned), .. }) };
+    (LensMark) => { ToolResultDetails::LensDiagnosticMark(LensDiagnosticMarkDetails { disposition: LensDiagnosticDisposition::Suppress, .. }) };
+    (LensDelta) => { ToolResultDetails::LensDiagnostics(LensDiagnosticsDetails::Delta(_)) };
+    (LensAll) => { ToolResultDetails::LensDiagnostics(LensDiagnosticsDetails::All(_)) };
+    (LensBatch) => { ToolResultDetails::LensDiagnostics(LensDiagnosticsDetails::Batch(_)) };
+    (LensDirectory) => { ToolResultDetails::LensDiagnostics(LensDiagnosticsDetails::Directory(LensDiagnosticsDirectory { clean_files: 1, unconfirmed_files: 99, .. })) };
+    (LensFindings) => { ToolResultDetails::LensDiagnostics(LensDiagnosticsDetails::Full(LensDiagnosticsFull::Findings(_))) };
+    (LensUnavailable) => { ToolResultDetails::LensDiagnostics(LensDiagnosticsDetails::Full(LensDiagnosticsFull::Unavailable(_))) };
+    (AstReplace) => { ToolResultDetails::AstGrepReplace(AstGrepReplaceDetails { total_matches: Some(8), .. }) };
+    (AstStructural) => { ToolResultDetails::AstGrepReplace(AstGrepReplaceDetails { match_count: Some(2), .. }) };
+    (AstEmpty) => { ToolResultDetails::Empty(_) };
+    (AstSearch) => { ToolResultDetails::AstGrepSearch(AstGrepSearchDetails { total_matches: Some(0), .. }) };
+    (McpScript) => { ToolResultDetails::McpScript(McpScriptDetails { calls: Some(_), error: None, .. }) };
+    (McpError) => { ToolResultDetails::McpScript(McpScriptDetails { error: Some(_), .. }) };
+}
+
+#[rustfmt::skip]
+macro_rules! assert_routes {
+    ($(($label:literal, $tool_name:expr, $details:expr, $pattern:ident)),+ $(,)?) => { $(assert!(matches!(tool_result_with_details($tool_name, $details).details, Some(route_pattern!($pattern))), "route {}", $label);)+ };
+}
+
+#[test]
+// Keep one row per routing contract; rustfmt otherwise obscures the matrix with wrapping.
+#[rustfmt::skip]
+fn tool_result_details_route_current_shapes() {
+    let mut full = lens_full_details(route_fixture("lens-summary"));
     full["projectDiagnostics"]["tier"] = json!("all");
-    for (tool_name, details, expected) in [
-        (
-            "lsp_diagnostics",
-            json!({"mode":"file","filePath":"/tmp/example.rs","severity":"error","serverScope":"primary","primaryDiagnosticsCount":0,"auxiliaryDiagnosticsCount":0,"diagnostics":[],"totalDiagnostics":0,"truncated":false,"unconfirmed":true,"waitMs":3000,"timedOut":true,"unconfirmedServerIds":["ast-grep"]}),
-            "lsp-file",
-        ),
-        (
-            "lsp_diagnostics",
-            json!({"mode":"batch","filesChecked":2,"concurrency":8,"severity":"error","serverScope":"primary","diagnostics":[],"primaryDiagnosticsCount":0,"auxiliaryDiagnosticsCount":0,"totalDiagnostics":0,"truncated":false,"cleanFiles":1,"unconfirmedFiles":0,"outcomes":[],"outcomeCounts":{"clean":1},"waitMs":2000,"timedOutFiles":2,"incompleteFiles":1,"fileErrors":["read failed"]}),
-            "lsp-batch",
-        ),
-        (
-            "lsp_diagnostics",
-            json!({"mode":"directory","filePath":"/tmp","severity":"error","serverScope":"primary","filesScanned":2,"capped":false,"diagnostics":[],"primaryDiagnosticsCount":0,"auxiliaryDiagnosticsCount":0,"totalDiagnostics":0,"truncated":false,"cleanFiles":2,"unconfirmedFiles":0,"concurrency":8,"waitMs":1000}),
-            "lsp-directory",
-        ),
-        (
-            "module_report",
-            json!({"available":false,"staleness":"unavailable","symbols":0,"exports":0,"callbacks":0,"view":"default"}),
-            "module-none",
-        ),
-        ("module_report", module("tuned"), "module-tuned"),
-        ("module_report", module("generic"), "module-generic"),
-        (
-            "lens_diagnostic_mark",
-            mark("false-positive"),
-            "mark-false-positive",
-        ),
-        ("lens_diagnostic_mark", mark("suppress"), "mark-suppress"),
-        ("lens_diagnostic_mark", mark("defer"), "mark-defer"),
-        ("lens_diagnostic_mark", mark("flagged"), "mark-flagged"),
-        ("lens_diagnostic_mark", json!({}), "empty"),
-        (
-            "lens_diagnostics",
-            json!({"mode":"delta","warnings":0,"carriedOverFiles":1}),
-            "lens-delta",
-        ),
-        (
-            "lens_diagnostics",
-            json!({"mode":"all","filesChecked":4,"staleDropped":0}),
-            "lens-all",
-        ),
-        ("lens_diagnostics", full, "lens-full"),
-        (
-            "lens_diagnostics",
-            json!({"mode":"full","filesChecked":0,"lspUnavailable":true}),
-            "lens-unavailable",
-        ),
-        (
-            "ast_grep_replace",
-            json!({"matchCount":8,"totalMatches":8,"truncated":false,"applied":true}),
-            "ast-replace",
-        ),
-        (
-            "ast_grep_replace",
-            json!({"matchCount":2,"applied":true}),
-            "ast-replace-rule",
-        ),
-        (
-            "ast_grep_replace",
-            json!({"stalePreview":true}),
-            "ast-replace-stale",
-        ),
-        ("ast_grep_replace", json!({}), "empty"),
-        (
-            "ast_grep_search",
-            json!({"matchCount":0,"totalMatches":0,"truncated":false,"hasMore":false,"skip":0,"groupByFile":false,"searchReads":[],"matchLocations":[],"suggestedDump":{"tool":"ast_grep_dump"}}),
-            "ast-search",
-        ),
-        (
-            "ast_grep_search",
-            json!({"valid":false,"validateOnly":true}),
-            "ast-search-validate",
-        ),
-        ("ast_grep_search", json!({}), "empty"),
-        (
-            "mcpScript",
-            json!({"mode":"script","timeoutMs":3600000,"calls":[{"operation":"call","path":"project-tools_run_tests","ok":true,"durationMs":20022},{"operation":"call","path":"project-tools_run_lint","ok":false,"error":"tool_error","durationMs":12289}]}),
-            "mcp-script",
-        ),
-        (
-            "mcpScript",
-            json!({"mode":"script","error":"not_initialized"}),
-            "mcp-script-error",
-        ),
+    assert_routes!(
+        ("lsp file", "lsp_diagnostics", route_fixture("lsp-file"), LspFile),
+        ("lsp batch", "lsp_diagnostics", lsp_batch_details(), LspBatch),
+        ("lsp directory", "lsp_diagnostics", route_fixture("lsp-directory"), LspDirectory),
+        ("module report", "module_report", route_fixture("module-report"), ModuleReport),
+        ("lens mark", "lens_diagnostic_mark", route_fixture("lens-mark"), LensMark),
+        ("lens delta", "lens_diagnostics", route_fixture("lens-delta"), LensDelta),
+        ("lens all", "lens_diagnostics", route_fixture("lens-all"), LensAll),
+        ("lens batch", "lens_diagnostics", lens_batch_details(), LensBatch),
+        ("lens directory", "lens_diagnostics", route_fixture("lens-directory"), LensDirectory),
+        ("lens findings", "lens_diagnostics", full, LensFindings),
+        ("lens unavailable", "lens_diagnostics", route_fixture("lens-unavailable"), LensUnavailable),
+        ("ast replace", "ast_grep_replace", route_fixture("ast-replace"), AstReplace),
+        ("ast structural rule", "ast_grep_replace", route_fixture("ast-structural"), AstStructural),
+        ("ast empty", "ast_grep_replace", route_fixture("ast-empty"), AstEmpty),
+        ("ast search", "ast_grep_search", route_fixture("ast-search"), AstSearch),
+        ("mcp script", "mcpScript", route_fixture("mcp-script"), McpScript),
+        ("mcp error", "mcpScript", route_fixture("mcp-error"), McpError)
+    );
+}
+
+#[test]
+fn legacy_directory_sweeps_round_trip_without_outcome_fields() {
+    for (tool, fixture) in [
+        ("lens_diagnostics", "lens-directory"),
+        ("lsp_diagnostics", "lsp-directory"),
     ] {
-        assert_eq!(kind(tool_name, details), expected);
+        let legacy = route_fixture(fixture);
+        let message = tool_result_with_details(tool, legacy.clone());
+        assert_eq!(
+            serde_json::to_value(message.details.unwrap()).unwrap(),
+            legacy,
+            "{tool}"
+        );
     }
+}
+
+#[test]
+fn diagnostics_sweeps_accept_outcomes_and_navigation_only_files() {
+    for (tool, mut value) in [
+        ("lens_diagnostics", route_fixture("lens-directory")),
+        ("lsp_diagnostics", lsp_batch_details()),
+    ] {
+        let outcomes = json!([{ "file": "/tmp/example.rs", "outcome": "inconclusive" }]);
+        let counts = json!({"clean":0,"findings":0,"unsupported":0,"unavailable":0,"failed":0,"too_large":0,"inconclusive":1});
+        value["outcomes"] = outcomes.clone();
+        value["outcomeCounts"] = counts.clone();
+        value["navigationOnlyFiles"] = json!(1);
+        let message = tool_result_with_details(tool, value);
+        let serialized = serde_json::to_value(message.details.unwrap()).unwrap();
+        assert_eq!(serialized["outcomes"], outcomes, "{tool}");
+        assert_eq!(serialized["outcomeCounts"], counts, "{tool}");
+        assert_eq!(serialized["navigationOnlyFiles"], 1, "{tool}");
+    }
+}
+
+#[test]
+fn directory_outcomes_reject_half_pairs_and_unknown_fields() {
+    for (tool, value) in [
+        ("lens_diagnostics", route_fixture("lens-directory")),
+        ("lsp_diagnostics", route_fixture("lsp-directory")),
+    ] {
+        for (fields, expected) in [
+            (json!({"outcomes": []}), "must occur together"),
+            (json!({"unexpected": true}), "unknown field `unexpected`"),
+        ] {
+            let mut invalid = value.clone();
+            invalid
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            let error = parse_tool_result_details(tool, invalid).unwrap_err();
+            assert!(error.to_string().contains(expected), "{tool}: {error}");
+        }
+    }
+}
+
+#[test]
+fn usage_entries_preserve_auxiliary_usage_and_optional_fields() {
+    let mut value = json!({
+        "type":"usage", "id":"usage1", "parentId":null, "timestamp":FIXED_TIMESTAMP,
+        "kind":"web_access.openai_search", "provider":"openai-codex", "model":"gpt-5.6-terra",
+        "usage":{"input":9065,"output":383,"cacheRead":3584,"cacheWrite":0,"reasoning":68,"totalTokens":13032,
+            "cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},
+        "note":"ChatGPT subscription: dollar cost and quota bucket are not reported."
+    });
+    let PiLogLine::Usage(line) = parse(value.clone()) else {
+        panic!("expected usage")
+    };
+    assert_eq!(line.provider, Provider::OpenAiCodex);
+    assert_eq!(line.usage.reasoning, 68);
+    assert!(line.parent_id.is_none());
+    assert!(line.note.is_some());
+    value.as_object_mut().unwrap().remove("note");
+    value["usage"].as_object_mut().unwrap().remove("reasoning");
+    value["usage"]["cacheWrite1h"] = json!(0);
+    value["usage"]["cost"]["source"] = json!("provider");
+    let PiLogLine::Usage(line) = parse(value.clone()) else {
+        panic!("expected usage")
+    };
+    assert_eq!(line.usage.reasoning, 0);
+    assert_eq!(line.usage.cache_write1h, Some(0));
+    assert_eq!(line.usage.cost.source.as_deref(), Some("provider"));
+    assert!(line.note.is_none());
+    value["unexpected"] = json!(true);
+    assert!(
+        parse_err(value)
+            .to_string()
+            .contains("unknown field `unexpected`")
+    );
+}
+
+#[test]
+fn shepard_journal_preserves_accepted_and_bound_payloads() {
+    let accepted = json!({"kind":"accepted","parentSessionId":SESSION_ID,"subagentId":"child","runId":"run",
+        "contract":{"name":"reader","revision":"hash","configuration":{"tools":["read"]},"outputSchema":{"type":"string"}},
+        "prompt":"Read README.md", "cwd":"/tmp"});
+    for payload in [
+        accepted.clone(),
+        json!({"kind":"bound","accepted":accepted,"parentEntryId":"entry","childSessionId":"child-session"}),
+    ] {
+        let data = json!({"version":1,"eventId":"event","writerSessionId":SESSION_ID,"timestamp":FIXED_TIMESTAMP,"payload":payload});
+        let parsed = parse_custom_payload("shepard.v1", data.clone());
+        let CustomPayload::ShepardV1(journal) = parsed else {
+            panic!("expected shepard journal")
+        };
+        assert_eq!(journal.version, 1);
+        assert_eq!(serde_json::to_value(journal).unwrap(), data);
+        let mut invalid = custom_json("shepard.v1", data);
+        invalid["data"]["unexpected"] = json!(true);
+        assert!(
+            parse_err(invalid)
+                .to_string()
+                .contains("unknown field `unexpected`")
+        );
+    }
+}
+
+#[test]
+fn shepard_notice_parses_native_error_details() {
+    let payload = parse_custom_message_payload(
+        "needs attention",
+        "shepard.notice",
+        Some(json!({
+            "subagentId":"child","runId":"run","noticeId":"notice","error":{"code":"runtime_error","message":"failed"}
+        })),
+    );
+    let CustomMessagePayload::ShepardNotice(notice) = payload else {
+        panic!("expected native notice")
+    };
+    assert_eq!(notice.notice_id, "notice");
+    assert_eq!(notice.error.code, "runtime_error");
+}
+
+#[test]
+fn lens_diagnostics_file_preserves_lens_metadata() {
+    let Some(ToolResultDetails::LensDiagnostics(LensDiagnosticsDetails::File(details))) =
+        tool_result_with_details(
+            "lens_diagnostics",
+            json!({
+                "mode": "file",
+                "filePath": "/tmp/example.py",
+                "severity": "all",
+                "serverScope": "all",
+                "source": "lsp",
+                "scope": "workspace",
+                "primaryServerId": "python",
+                "primaryDiagnosticsCount": 0,
+                "auxiliaryDiagnosticsCount": 0,
+                "diagnostics": [],
+                "totalDiagnostics": 0,
+                "truncated": false,
+                "unconfirmed": true,
+                "timedOut": false,
+                "unconfirmedServerIds": ["opengrep", "typos"],
+                "unavailable": "rust-analyzer not running",
+                "waitMs": 1200
+            }),
+        )
+        .details
+    else {
+        panic!("expected lens file details")
+    };
+    assert_eq!(details.source, LensDiagnosticsSource::Lsp);
+    assert_eq!(details.scope, LensDiagnosticsScope::Workspace);
+    assert_eq!(details.severity, LensDiagnosticsSeverity::All);
+    assert_eq!(details.primary_server_id.as_deref(), Some("python"));
+    assert_eq!(details.timed_out, Some(false));
+    assert_eq!(
+        details.unconfirmed_server_ids.as_deref(),
+        Some(["opengrep".to_string(), "typos".to_string()].as_slice())
+    );
+    assert_eq!(
+        details.unavailable.as_deref(),
+        Some("rust-analyzer not running")
+    );
+    assert_eq!(details.wait_ms, Some(1200));
+}
+
+// Pinned from a production line (the parse failure that motivated the
+// relaxation): the per-file too-large response omits the per-server counts
+// and confirmation flags and instead carries the discriminated outcome.
+#[test]
+fn lens_diagnostics_file_accepts_too_large_outcome() {
+    let value = json!({
+        "mode": "file",
+        "filePath": "/home/brendan/src/moriarty/crates/pi_logs/src/parser.rs",
+        "severity": "all",
+        "serverScope": "all",
+        "outcome": "too_large",
+        "tooLargeReason": "file too large for LSP diagnostics (6718 lines > 5000 limit)",
+        "diagnostics": [],
+        "totalDiagnostics": 0,
+        "source": "lsp",
+        "scope": "paths"
+    });
+    let Some(ToolResultDetails::LensDiagnostics(LensDiagnosticsDetails::File(details))) =
+        tool_result_with_details("lens_diagnostics", value.clone()).details
+    else {
+        panic!("expected lens file details")
+    };
+    // Defaults serialize back and the mode tag is consumed by routing, so
+    // the round-trip matches the payload with those keys adjusted.
+    let mut expected = value.clone();
+    let object = expected.as_object_mut().unwrap();
+    object.remove("mode");
+    object.insert("primaryDiagnosticsCount".into(), 0.into());
+    object.insert("auxiliaryDiagnosticsCount".into(), 0.into());
+    object.insert("truncated".into(), false.into());
+    object.insert("unconfirmed".into(), false.into());
+    assert_eq!(serde_json::to_value(details).unwrap(), expected);
+}
+
+#[test]
+fn lens_diagnostics_batch_preserves_lens_metadata() {
+    let Some(ToolResultDetails::LensDiagnostics(LensDiagnosticsDetails::Batch(details))) =
+        tool_result_with_details("lens_diagnostics", lens_batch_details()).details
+    else {
+        panic!("expected lens batch details")
+    };
+    assert_eq!(details.source, LensDiagnosticsSource::Lsp);
+    assert_eq!(details.scope, LensDiagnosticsScope::Paths);
+    assert_eq!(details.severity, LensDiagnosticsSeverity::Warning);
+    assert_eq!(details.server_scope, LensDiagnosticsServerScope::All);
+    assert_eq!(details.disposition_suppressed, Some(13));
+    assert_eq!(details.timed_out_files, Some(1));
+}
+
+#[test]
+fn lens_diagnostics_all_preserves_optional_findings_metadata() {
+    let Some(ToolResultDetails::LensDiagnostics(LensDiagnosticsDetails::All(
+        LensDiagnosticsSummary::Findings(details),
+    ))) = tool_result_with_details("lens_diagnostics", route_fixture("lens-all-findings")).details
+    else {
+        panic!("expected lens all findings details")
+    };
+    assert_eq!(details.total_advisories, Some(0));
+    assert_eq!(details.disposition_suppressed, Some(0));
+    assert_eq!(details.wait_ms, Some(0));
+
+    let mut legacy = route_fixture("lens-summary");
+    legacy["mode"] = json!("all");
+    let Some(ToolResultDetails::LensDiagnostics(LensDiagnosticsDetails::All(
+        LensDiagnosticsSummary::Findings(details),
+    ))) = tool_result_with_details("lens_diagnostics", legacy).details
+    else {
+        panic!("expected legacy lens all findings details")
+    };
+    assert_eq!(
+        (
+            details.total_advisories,
+            details.disposition_suppressed,
+            details.wait_ms
+        ),
+        (None, None, None)
+    );
+}
+
+#[test]
+fn lens_and_lsp_batch_shapes_remain_strictly_distinct() {
+    assert!(serde_json::from_value::<LensDiagnosticsDetails>(lsp_batch_details()).is_err());
+    assert!(serde_json::from_value::<LspDiagnosticsDetails>(lens_batch_details()).is_err());
+
+    for (field, value) in [("severity", "debug"), ("serverScope", "secondary")] {
+        let mut details = lens_batch_details();
+        details[field] = json!(value);
+        assert!(serde_json::from_value::<LensDiagnosticsDetails>(details).is_err());
+    }
+}
+
+#[test]
+fn effective_config_tool_result_preserves_evolving_details() {
+    let details = json!({
+        "summary": "effective_config ~/repo/config.yaml — 0 config file(s) · 4 server(s) selected · 6 tool(s)",
+        "documents": 0,
+        "provenance": 0,
+        "file": "~/repo/config.yaml",
+        "selectedServers": 4,
+        "futureMetadata": {"enabled": true}
+    });
+    let tool_result = tool_result_with_details("effective_config", details.clone());
+    let Some(ToolResultDetails::EffectiveConfig(JsonBlob(parsed))) = tool_result.details else {
+        panic!("expected effective_config details")
+    };
+    assert_eq!(parsed, details);
 }
 
 #[test]
@@ -5036,6 +6015,19 @@ fn empty_success_tool_result_details_stay_strict() {
 }
 
 #[test]
+fn get_search_content_preserves_paginated_result_breadcrumbs() {
+    let value = json!({"url":"https://example.com","title":"Example","contentLength":128406,
+        "offset":70000,"limit":30000,"returnedChars":30000,"nextOffset":100000,"truncated":true});
+    let tool = tool_result_with_details("get_search_content", value.clone());
+    let Some(ToolResultDetails::GetSearchContent(GetSearchContentDetails::Success(details))) =
+        tool.details
+    else {
+        panic!("expected success")
+    };
+    assert_eq!(serde_json::to_value(details).unwrap(), value);
+}
+
+#[test]
 fn get_search_content_tool_result_accepts_success_details() {
     let tool_result = parse_tool_result_message(tool_result_message_json(
         "get_search_content",
@@ -5051,6 +6043,102 @@ fn get_search_content_tool_result_accepts_success_details() {
     assert_eq!(details.url, "https://example.com");
     assert_eq!(details.title, "Example");
     assert_eq!(details.content_length, 4096);
+}
+
+#[test]
+fn get_search_content_tool_result_accepts_find_details() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "get_search_content",
+        vec![json!({"type": "text", "text": "no matches"})],
+        false,
+        Some(json!({
+            "url": "https://example.com",
+            "title": "Example",
+            "contentLength": 2088693u64,
+            "findMode": "case-insensitive",
+            "matchCount": 0u64,
+            "returnedMatches": 0u64,
+            "queryResults": [{"query": "[\"throughput\", \"latency_\"]", "matchCount": 0u64}]
+        })),
+    ));
+    let Some(ToolResultDetails::GetSearchContent(GetSearchContentDetails::Find(details))) =
+        tool_result.details
+    else {
+        panic!("expected GetSearchContent find details")
+    };
+    assert_eq!(details.find_mode, FindMode::CaseInsensitive);
+    assert_eq!(details.match_count, 0);
+    assert_eq!(details.query_results.len(), 1);
+    assert_eq!(details.query_results[0].match_count, 0);
+}
+
+#[test]
+fn get_search_content_tool_result_accepts_provider_query_find_details() {
+    let value = json!({
+        "responseId": "mv06vdknwxc0uk",
+        "query": "site:example.com availabilityType zone",
+        "resultCount": 5,
+        "contentLength": 3007,
+        "findMode": "case-insensitive",
+        "matchCount": 15,
+        "returnedMatches": 15,
+        "queryResults": [{"query": "zone", "matchCount": 15}]
+    });
+    let tool_result = tool_result_with_details("get_search_content", value.clone());
+    let Some(ToolResultDetails::GetSearchContent(GetSearchContentDetails::QueryFind(details))) =
+        tool_result.details
+    else {
+        panic!("expected provider-query find details")
+    };
+    assert_eq!(serde_json::to_value(details).unwrap(), value);
+}
+
+#[test]
+fn get_search_content_tool_result_rejects_unknown_find_mode() {
+    let _ = parse_err(tool_result_message_json(
+        "get_search_content",
+        vec![json!({"type": "text", "text": "matches"})],
+        false,
+        Some(json!({
+            "responseId": "response_1",
+            "query": "query",
+            "resultCount": 1,
+            "contentLength": 10,
+            "findMode": "approximate",
+            "matchCount": 1,
+            "returnedMatches": 1,
+            "queryResults": []
+        })),
+    ));
+}
+
+#[test]
+fn web_enable_tool_result_accepts_enabled_capabilities() {
+    let tool_result = tool_result_with_details("web_enable", json!({"enabled": ["web_search"]}));
+    let Some(ToolResultDetails::WebEnable(WebEnableDetails::Enabled(details))) =
+        tool_result.details
+    else {
+        panic!("expected WebEnable success details")
+    };
+    assert_eq!(
+        serde_json::to_value(details).unwrap(),
+        json!({"enabled": ["web_search"]})
+    );
+}
+
+#[test]
+fn web_enable_tool_result_accepts_failure_details() {
+    for value in [
+        json!({"unavailable": ["web_search"]}),
+        json!({"missing": ["OPENAI_API_KEY"]}),
+        json!({"error": "web access is unavailable"}),
+    ] {
+        let tool_result = tool_result_with_details("web_enable", value.clone());
+        let Some(ToolResultDetails::WebEnable(details)) = tool_result.details else {
+            panic!("expected WebEnable failure details")
+        };
+        assert_eq!(serde_json::to_value(details).unwrap(), value);
+    }
 }
 
 #[test]
@@ -5107,6 +6195,68 @@ fn get_search_content_tool_result_accepts_error_details_with_response_id() {
     };
     assert_eq!(details.error, "Not found");
     assert_eq!(details.response_id.as_deref(), Some("m011"));
+}
+
+// Pinned from a production line (the parse failure that motivated the
+// variant): a character-slice replay of a stored provider search result
+// carries response/query breadcrumbs with pagination, and no URL/title or
+// find-match fields.
+#[test]
+fn get_search_content_tool_result_accepts_search_slice_details() {
+    let value = json!({
+        "responseId": "mva3sanuue2viv",
+        "query": "POSIX printf %b backslash octal specification",
+        "resultCount": 5,
+        "contentLength": 3489u64,
+        "offset": 0u64,
+        "limit": 20000u64,
+        "returnedChars": 3489u64,
+        "nextOffset": null,
+        "truncated": false
+    });
+    // nextOffset serializes only when present, matching the other
+    // pagination breadcrumbs.
+    let mut expected = value.clone();
+    expected.as_object_mut().unwrap().remove("nextOffset");
+    let tool = tool_result_with_details("get_search_content", value);
+    let Some(ToolResultDetails::GetSearchContent(GetSearchContentDetails::SearchSlice(details))) =
+        tool.details
+    else {
+        panic!("expected search-slice details")
+    };
+    assert_eq!(serde_json::to_value(details).unwrap(), expected);
+
+    // Mid-slice continuations carry a populated nextOffset.
+    let mut continuation = expected.as_object().unwrap().clone();
+    continuation.insert("nextOffset".into(), 100000u64.into());
+    continuation.insert("truncated".into(), true.into());
+    let Some(ToolResultDetails::GetSearchContent(GetSearchContentDetails::SearchSlice(details))) =
+        tool_result_with_details("get_search_content", Value::Object(continuation)).details
+    else {
+        panic!("expected search-slice details")
+    };
+    assert_eq!(details.next_offset, Some(100000));
+    assert!(details.truncated);
+}
+
+// The stored-search slice path reports invalid offset/limit arguments
+// beside the error message; those bounds must not be dropped.
+#[test]
+fn get_search_content_tool_result_accepts_error_details_with_argument_bounds() {
+    let tool = tool_result_with_details(
+        "get_search_content",
+        json!({"error": "Invalid limit", "limit": 0u64, "maxLimit": 20000u64}),
+    );
+    let Some(ToolResultDetails::GetSearchContent(GetSearchContentDetails::Error(details))) =
+        tool.details
+    else {
+        panic!("expected error details")
+    };
+    assert_eq!(details.error, "Invalid limit");
+    assert_eq!(details.limit, Some(0));
+    assert_eq!(details.max_limit, Some(20000));
+    assert!(details.offset.is_none());
+    assert!(details.content_length.is_none());
 }
 
 // Pins the strict-variant invariant of GetSearchContentDetails: a payload
@@ -5578,6 +6728,377 @@ fn custom_message_firstpick_session_summary_rpc() {
         }
         other => panic!("expected FirstPickSessionSummaryRpc, got {other:?}"),
     }
+}
+
+#[test]
+fn custom_message_shepard_assignment_has_no_details() {
+    // Pinned from a production line (the parse failure that motivated the
+    // variant): shepard live-test assignments carry only outer `content`.
+    assert!(matches!(
+        parse_custom_message_payload(
+            "Perform this one live test: ...",
+            "shepard-assignment",
+            None,
+        ),
+        CustomMessagePayload::ShepardAssignment
+    ));
+}
+
+#[test]
+fn custom_message_shepard_roster_has_no_details() {
+    // Pinned from a production line (the parse failure that motivated the
+    // variant): shepard roster announcements carry only outer `content`.
+    assert!(matches!(
+        parse_custom_message_payload(
+            "Delegation records: /home/brendan/.pi/agent/shepard/<session>\n0 runs.",
+            "shepard-roster",
+            None,
+        ),
+        CustomMessagePayload::ShepardRoster
+    ));
+}
+
+#[test]
+fn shepard_receipts_parse_strictly() {
+    assert!(matches!(
+        tool_result_with_details("shepard_complete", json!({})).details,
+        Some(ToolResultDetails::Empty(_))
+    ));
+    for (name, details) in [
+        (
+            "shepard_start",
+            json!({"ok":true,"subagentId":"child","runId":"run","status":"queued"}),
+        ),
+        ("shepard_complete", json!({"ok":true,"runId":"run"})),
+        (
+            "shepard_start",
+            json!({"ok":false,"error":{"code":"runtime_error","message":"failed"}}),
+        ),
+    ] {
+        let tool = tool_result_with_details(name, details.clone());
+        let Some(ToolResultDetails::ShepardReceipt(receipt)) = tool.details else {
+            panic!("expected receipt")
+        };
+        assert_eq!(serde_json::to_value(receipt).unwrap(), details);
+    }
+    for invalid in [
+        json!({"ok":true,"runId":"run","unexpected":true}),
+        json!({"ok":true,"subagentId":"child"}),
+        json!({"ok":true,"runId":"run","error":{"code":"runtime_error","message":"failed"}}),
+    ] {
+        let error = serde_json::from_value::<ShepardReceipt>(invalid).unwrap_err();
+        assert!(error.to_string().contains("untagged enum ShepardReceipt"));
+    }
+}
+
+fn shepard_inspection_run_json() -> Value {
+    // Populated completed shape so the optional observation fields, the
+    // nested pending-question and notice structs, and the completion result
+    // are pinned by a round-trip, not only by production lines.
+    json!({
+        "kind": "agent",
+        "parentSessionId": SESSION_ID,
+        "subagentId": "7410072a-9a92-4e2d-9fdb-89e1348c7698",
+        "runId": "7498a03c-8a6e-4ff3-92fa-8e528e8cfe82",
+        "contract": {
+            "name": "stage1-reader",
+            "configuration": {"model": {"provider": "openrouter", "id": "z-ai/glm-5.3-flash"}, "tools": ["read"]},
+            "outputSchema": {"type": "string"},
+            "revision": "a00819f94d40a623"
+        },
+        "prompt": "Bounded read-only control proof.",
+        "cwd": "/home/brendan/src/pi-shepard",
+        "createdAt": "2026-10-16T17:21:51.780Z",
+        "updatedAt": "2026-10-16T17:21:51.906Z",
+        "pendingPermissions": ["bash"],
+        "observationError": {"code": "busy", "message": "native observation unavailable"},
+        "pendingQuestion": {"questionId": "question", "question": "LIVE_CTRL_GATE_ONE"},
+        "controls": [{"controlId": "control", "operation": "interrupt", "state": "requested"}],
+        "notices": [{
+            "noticeId": "notice",
+            "timestamp": "2026-10-16T17:21:52.123Z",
+            "error": {"code": "runtime_error", "message": "notice"}
+        }],
+        "status": "completed",
+        "result": {"answer": "done"}
+    })
+}
+
+// Pinned from production lines (the parse failures that motivated these
+// variants): shepard_ask answers and shepard_wait timeout rows were
+// previously unrouted, so every such tool result failed to parse.
+
+/// Per-union success payloads shared by the round-trip and rejection tests.
+fn shepard_success_payload(tool: &str) -> Value {
+    match tool {
+        "shepard_ask" => json!({
+            "ok": true,
+            "questionId": "7498a03c-8a6e-4ff3-92fa-8e528e8cfe82/6811fc3f-ea58-4422-806f-2825188eeb29",
+            "answer": "Proceed to LIVE_CTRL_GATE_TWO; keep work unfinished."
+        }),
+        "shepard_wait" => json!({
+            "ok": true,
+            "reason": "timeout",
+            "runs": [shepard_inspection_run_json()]
+        }),
+        "shepard_reply" => json!({
+            "ok": true,
+            "questionId": "question",
+            "subagentId": "child",
+            "runId": "run",
+            "accepted": true
+        }),
+        "shepard_send" => json!({
+            "ok": true,
+            "messageId": "message",
+            "runId": "run",
+            "disposition": "queued"
+        }),
+        "shepard_inspect" => json!({"ok": true, "run": shepard_inspection_run_json()}),
+        "shepard_interrupt" => json!({
+            "ok": true,
+            "subagentId": "7410072a-9a92-4e2d-9fdb-89e1348c7698",
+            "runId": "7498a03c-8a6e-4ff3-92fa-8e528e8cfe82",
+            "controlId": "b9671b25",
+            "state": "requested"
+        }),
+        _ => unreachable!("unknown shepard tool {tool}"),
+    }
+}
+
+#[test]
+fn shepard_ask_results_parse_strictly() {
+    assert_shepard_round_trip::<ShepardAskDetails>(
+        "shepard_ask",
+        shepard_success_payload("shepard_ask"),
+        "ask answer",
+    );
+}
+
+/// Routes a shared failure receipt through each tool name and asserts the
+/// union's `Failed` variant; these arms have no production pin yet, so a
+/// routing mistake would otherwise ship silently.
+macro_rules! assert_failed_receipt {
+    ($tool:literal, $outer:ident, $inner:ident) => {
+        let tool = tool_result_with_details(
+            $tool,
+            json!({"ok": false, "error": {"code": "busy", "message": "failed"}}),
+        );
+        assert!(
+            matches!(tool.details, Some(ToolResultDetails::$outer($inner::Failed { .. }))),
+            $tool
+        );
+    };
+}
+
+#[test]
+fn shepard_failure_receipts_route_to_failed_variants() {
+    // Failures keep whichever known ids were resolvable.
+    let failed_reply = tool_result_with_details(
+        "shepard_reply",
+        json!({
+            "ok": false,
+            "error": {"code": "question_closed", "message": "failed"},
+            "questionId": "q"
+        }),
+    );
+    let Some(ToolResultDetails::ShepardReply(details)) = failed_reply.details else {
+        panic!("expected reply failure")
+    };
+    let ShepardReplyDetails::Failed {
+        question_id: Some(ref question_id),
+        ..
+    } = details
+    else {
+        panic!("expected populated question id")
+    };
+    assert_eq!(question_id, "q");
+
+    assert_failed_receipt!("shepard_ask", ShepardAsk, ShepardAskDetails);
+    assert_failed_receipt!("shepard_wait", ShepardWait, ShepardWaitDetails);
+    assert_failed_receipt!("shepard_reply", ShepardReply, ShepardReplyDetails);
+    assert_failed_receipt!("shepard_send", ShepardSend, ShepardSendDetails);
+    assert_failed_receipt!("shepard_inspect", ShepardInspect, ShepardInspectDetails);
+    assert_failed_receipt!(
+        "shepard_interrupt",
+        ShepardInterrupt,
+        ShepardInterruptDetails
+    );
+}
+
+#[test]
+fn shepard_wait_rows_parse_strictly() {
+    let wait_value = shepard_success_payload("shepard_wait");
+    let wait = tool_result_with_details("shepard_wait", wait_value.clone());
+    let Some(ToolResultDetails::ShepardWait(details)) = wait.details else {
+        panic!("expected shepard_wait row")
+    };
+    let ShepardWaitDetails::Waited { reason, runs, .. } = details else {
+        panic!("expected waited receipt")
+    };
+    assert_eq!(reason, ShepardWaitReason::Timeout);
+    assert_eq!(serde_json::to_value(runs).unwrap(), wait_value["runs"]);
+}
+
+#[test]
+fn shepard_wait_unavailable_rows_parse_strictly() {
+    // Per-run inspection failures keep only the run id.
+    let wait = tool_result_with_details(
+        "shepard_wait",
+        json!({
+            "ok": true,
+            "reason": "finished",
+            "runs": [{"runId": "run", "error": {"code": "not_found", "message": "gone"}}]
+        }),
+    );
+    let Some(ToolResultDetails::ShepardWait(details)) = wait.details else {
+        panic!("expected shepard_wait row")
+    };
+    let ShepardWaitDetails::Waited { runs, .. } = details else {
+        panic!("expected waited receipt")
+    };
+    assert!(matches!(runs.as_slice(), [ShepardWaitRun::Unavailable(_)]));
+}
+
+// Success shapes without production pins yet; the round-trip helper pins
+// each tool's routing arm and its serialization.
+#[test]
+fn remaining_shepard_tool_results_parse_strictly() {
+    assert_shepard_round_trip::<ShepardReplyDetails>(
+        "shepard_reply",
+        shepard_success_payload("shepard_reply"),
+        "reply acceptance",
+    );
+    assert_shepard_round_trip::<ShepardSendDetails>(
+        "shepard_send",
+        shepard_success_payload("shepard_send"),
+        "send queued",
+    );
+    assert_shepard_round_trip::<ShepardInspectDetails>(
+        "shepard_inspect",
+        shepard_success_payload("shepard_inspect"),
+        "inspect run",
+    );
+    assert_shepard_round_trip::<ShepardInterruptDetails>(
+        "shepard_interrupt",
+        shepard_success_payload("shepard_interrupt"),
+        "interrupt requested",
+    );
+    assert_shepard_round_trip::<ShepardInterruptDetails>(
+        "shepard_stop",
+        json!({"ok": true, "subagentId": "child", "runId": "run", "state": "already_finished"}),
+        "stop already finished",
+    );
+}
+
+// Each new union must reject mixed success+error and unknown-field
+// payloads. The mixed payload pins that the Failed variant cannot absorb a
+// success sibling; the complete-success-plus-unknown-key payload pins
+// `deny_unknown_fields` itself — every required field is present, so only
+// the unknown-key rejection can make it fail.
+macro_rules! assert_rejects_mixed_and_unknown {
+    ($ty:ty, $success:expr) => {{
+        // The Failed variant must not absorb a success sibling.
+        let mixed = json!({
+            "ok": true,
+            "answer": "answer",
+            "error": {"code": "busy", "message": "failed"}
+        });
+        assert!(serde_json::from_value::<$ty>(mixed).is_err(), stringify!($ty));
+
+        // With every required field present, only `deny_unknown_fields`
+        // can reject the injected unknown key.
+        let mut success = $success;
+        success
+            .as_object_mut()
+            .unwrap()
+            .insert("unexpected".into(), true.into());
+        assert!(serde_json::from_value::<$ty>(success).is_err(), stringify!($ty));
+    }};
+}
+
+#[test]
+fn new_shepard_unions_reject_mixed_and_unknown_payloads() {
+    assert_rejects_mixed_and_unknown!(ShepardAskDetails, shepard_success_payload("shepard_ask"));
+    assert_rejects_mixed_and_unknown!(ShepardWaitDetails, shepard_success_payload("shepard_wait"));
+    assert_rejects_mixed_and_unknown!(
+        ShepardReplyDetails,
+        shepard_success_payload("shepard_reply")
+    );
+    assert_rejects_mixed_and_unknown!(ShepardSendDetails, shepard_success_payload("shepard_send"));
+    assert_rejects_mixed_and_unknown!(
+        ShepardInspectDetails,
+        shepard_success_payload("shepard_inspect")
+    );
+    assert_rejects_mixed_and_unknown!(
+        ShepardInterruptDetails,
+        shepard_success_payload("shepard_interrupt")
+    );
+}
+
+#[test]
+fn native_shepard_assignment_parse() {
+    let parsed = parse_custom_message_payload(
+        "Read README.md",
+        "shepard.assignment",
+        Some(json!({
+            "parentSessionId":SESSION_ID,"subagentId":"child","runId":"run","messageId":"message"
+        })),
+    );
+    let CustomMessagePayload::ShepardAssignmentV1(assignment) = parsed else {
+        panic!("expected assignment")
+    };
+    assert_eq!(assignment.message_id, "message");
+}
+
+#[test]
+fn shepard_contact_tool_results_parse() {
+    for tool_name in ["shepard_contact", "shepard_contact_parent"] {
+        let tool_result = tool_result_with_details(tool_name, json!({"id": SHEPARD_EVENT_ID}));
+        let Some(ToolResultDetails::ShepardContact(details)) = tool_result.details else {
+            panic!("expected ShepardContact details for {tool_name}")
+        };
+        assert_eq!(details.id, SHEPARD_EVENT_ID);
+    }
+}
+
+#[test]
+fn custom_shepard_seen_parses() {
+    assert!(matches!(
+        parse_custom_payload("shepard-seen", json!({"id": SHEPARD_EVENT_ID})),
+        CustomPayload::ShepardSeen(_)
+    ));
+}
+
+#[test]
+fn custom_rpiv_todo_snapshot_parses() {
+    let payload = parse_custom_payload(
+        "rpiv-todo-snapshot",
+        json!({
+            "action": "create",
+            "params": {"action": "create", "subject": "Do the thing", "status": "pending"},
+            "tasks": [{"id": 1, "subject": "Do the thing", "status": "pending"}],
+            "nextId": 2
+        }),
+    );
+    let CustomPayload::RpivTodoSnapshot(details) = payload else {
+        panic!("expected RpivTodoSnapshot")
+    };
+    assert_eq!(details.action, "create");
+    assert_eq!(details.next_id, 2);
+    assert_eq!(details.tasks.len(), 1);
+}
+
+#[test]
+fn custom_message_shepard_event_parses() {
+    assert!(matches!(
+        parse_custom_message_payload(
+            "Shepard progress\nRun ID (id): 76ab74cd",
+            "shepard-event",
+            Some(json!({"id": SHEPARD_EVENT_ID})),
+        ),
+        CustomMessagePayload::ShepardEvent(_)
+    ));
 }
 
 #[test]
@@ -7078,10 +8599,12 @@ fn mcp_tool_result_accepts_initialization_error() {
 
 #[test]
 fn mcp_details_sessions_only_shape_rejects_unknown_fields() {
-    assert_untagged_rejection::<McpDetails>(json!({
+    let error = serde_json::from_value::<McpDetails>(json!({
         "sessions": 3,
         "unexpected": true
-    }));
+    }))
+    .expect_err("sessions-only shape should reject unknown fields");
+    assert!(error.is_data());
 }
 
 #[test]
@@ -7129,23 +8652,29 @@ fn mcp_details_rejects_fields_from_other_modes() {
         }),
         json!({"mode": "search", "error": "unsafe_pattern"}),
     ] {
-        assert_untagged_rejection::<McpDetails>(details);
+        let error = serde_json::from_value::<McpDetails>(details)
+            .expect_err("mode-specific fields should be rejected");
+        assert!(error.is_data());
     }
 }
 
 #[test]
 fn mcp_details_normal_mode_rejects_unknown_fields() {
-    assert_untagged_rejection::<McpDetails>(json!({
+    let error = serde_json::from_value::<McpDetails>(json!({
         "mode": "call",
         "garbage": true
-    }));
+    }))
+    .expect_err("mode-based shape should reject unknown fields");
+    assert!(error.is_data());
 }
 
 #[test]
 fn mcp_details_missing_mode_without_sessions_is_rejected() {
-    assert_untagged_rejection::<McpDetails>(json!({
+    let error = serde_json::from_value::<McpDetails>(json!({
         "server": "git"
-    }));
+    }))
+    .expect_err("no-mode no-sessions shape should be rejected");
+    assert!(error.is_data());
 }
 
 /// Pins the routed async-only fields on subagent results.
@@ -8656,7 +10185,7 @@ fn subagent_supervisor_request_accepts_async_correlation_fields() {
         "display": false,
         "details": {
             "id": "req-9",
-            "reason": "progress_update",
+            "reason": "interview_request",
             "expectsReply": false,
             "runId": "run-7",
             "agent": "researcher",
@@ -8664,7 +10193,11 @@ fn subagent_supervisor_request_accepts_async_correlation_fields() {
             "requestId": "00e190ab-4d82-413a-b79d-9390544ac39c",
             "childTarget": "subagent-researcher-run-7-1",
             "requestBody": "UPDATE: research complete",
-            "replyHint": "subagent_supervisor({ action: \"reply\", replyTo: \"req-9\" })"
+            "replyHint": "subagent_supervisor({ action: \"reply\", replyTo: \"req-9\" })",
+            "interview": {
+                "blocking_issue": "All mcp tool calls are rejected by auto-approval",
+                "questions": [{"question": "Retry the diff call?"}],
+            },
         },
         "id": "cm-9",
         "parentId": "msg-9",
@@ -8691,6 +10224,16 @@ fn subagent_supervisor_request_accepts_async_correlation_fields() {
     assert_eq!(
         req.reply_hint.as_deref(),
         Some("subagent_supervisor({ action: \"reply\", replyTo: \"req-9\" })")
+    );
+    // The interview payload is extension-defined (pi-subagents types it
+    // `unknown`), so it must round-trip untouched rather than being
+    // shape-checked.
+    assert_eq!(
+        req.interview,
+        Some(JsonBlob(json!({
+            "blocking_issue": "All mcp tool calls are rejected by auto-approval",
+            "questions": [{"question": "Retry the diff call?"}],
+        })))
     );
 }
 
@@ -8818,40 +10361,54 @@ fn bg_wait_rejects_completed_and_early_return_outcomes() {
 }
 
 #[test]
+fn subagent_timeout_recovery_rejects_unknown_statuses() {
+    let base = json!({"termination": "stopped", "changedFiles": []});
+    serde_json::from_value::<SubagentTimeoutRecovery>(base.clone())
+        .expect("optional recovery fields may be absent");
+
+    let mut with_status = base.clone();
+    with_status["reportStatus"] = json!("not-requested");
+    serde_json::from_value::<SubagentTimeoutRecovery>(with_status)
+        .expect("not-requested report status should parse");
+
+    for (field, value) in [("termination", "expired"), ("reportStatus", "pending")] {
+        let mut invalid = base.clone();
+        invalid[field] = json!(value);
+        assert!(serde_json::from_value::<SubagentTimeoutRecovery>(invalid).is_err());
+    }
+}
+
+#[test]
 fn subagent_wait_completion_accepts_workflow_and_usage_fields() {
-    let tool_result = parse_tool_result_message(tool_result_message_json(
+    let completions = parse_subagent_wait_completions_for_tool(
         "bg_wait",
-        vec![json!({"type": "text", "text": "Waited 4m12s; done."})],
-        false,
-        Some(json!({
-            "mode": "management",
-            "results": [],
-            "completions": [{
-                "runId": "f077ede7",
-                "agent": "workflow",
-                "mode": "workflow",
-                "workflowReceiptPath": "/tmp/run/workflow-receipt.json",
-                "workflowChildren": {"version": 1, "children": []},
-                "state": "complete",
+        json!([{
+            "runId": "f077ede7",
+            "agent": "workflow",
+            "mode": "workflow",
+            "workflowReceiptPath": "/tmp/run/workflow-receipt.json",
+            "workflowChildren": {"version": 1, "children": []},
+            "state": "complete",
+            "success": true,
+            "results": [{
+                "agent": "strong_worker",
+                "runId": "a0d3ac26",
                 "success": true,
-                "results": [{
-                    "agent": "strong_worker",
-                    "runId": "a0d3ac26",
-                    "success": true,
-                    "outputState": "present",
-                    "usage": {"input": 83806, "output": 8008, "cacheRead": 923392, "cacheWrite": 0, "cost": "2.161852", "turns": 17},
-                    "sessionFile": "/sessions/a0d3ac26/run-0/session.jsonl",
-                    "structuredOutput": {"verdict": "pass"}
-                }]
+                "outputState": "present",
+                "usage": {"input": 83806, "output": 8008, "cacheRead": 923392, "cacheWrite": 0, "cost": "2.161852", "turns": 17},
+                "sessionFile": "/sessions/a0d3ac26/run-0/session.jsonl",
+                "structuredOutput": {"verdict": "pass"},
+                "timeoutRecovery": {
+                    "termination": "timed-out",
+                    "changedFiles": ["/tmp/changed.rs"],
+                    "truncated": true,
+                    "recoveryNeeded": true,
+                    "reason": "timed-out-with-dirty-worktree",
+                    "reportStatus": "missing"
+                }
             }]
-        })),
-    ));
-    let Some(ToolResultDetails::Subagent(details)) = tool_result.details else {
-        panic!("expected Subagent details")
-    };
-    let Some(SubagentWaitOutcome::Completed(completions)) = details.wait_outcome() else {
-        panic!("expected completed wait outcome")
-    };
+        }]),
+    );
     let [completion] = completions.as_slice() else {
         panic!("expected exactly one completion")
     };
@@ -8873,6 +10430,17 @@ fn subagent_wait_completion_accepts_workflow_and_usage_fields() {
     assert_eq!(
         child.structured_output.as_deref().map(|blob| &blob.0),
         Some(&json!({"verdict": "pass"}))
+    );
+    assert_eq!(
+        child.timeout_recovery,
+        Some(SubagentTimeoutRecovery {
+            termination: SubagentTimeoutTermination::TimedOut,
+            changed_files: vec!["/tmp/changed.rs".into()],
+            truncated: Some(true),
+            recovery_needed: Some(true),
+            reason: Some(SubagentTimeoutRecoveryReason::TimedOutWithDirtyWorktree),
+            report_status: Some(SubagentTimeoutReportStatus::Missing),
+        })
     );
 }
 
@@ -10015,17 +11583,21 @@ fn intercom_result_accepts_supervisor_status_payload() {
 /// details.
 #[test]
 fn intercom_result_rejects_half_present_status() {
-    assert_untagged_rejection::<IntercomResultDetails>(json!({
+    let error = serde_json::from_value::<IntercomResultDetails>(json!({
         "active": true,
         "pending": 0
-    }));
+    }))
+    .expect_err("half-present supervisor status payload must be rejected");
+    assert!(error.is_data());
 }
 
 /// A `pending` value matching neither shape (not an items list, not a
 /// count) must fail loudly instead of silently defaulting.
 #[test]
 fn intercom_result_rejects_unknown_pending_shape() {
-    assert_untagged_rejection::<IntercomResultDetails>(json!({"pending": "many"}));
+    let error = serde_json::from_value::<IntercomResultDetails>(json!({"pending": "many"}))
+        .expect_err("pending matching neither shape must be rejected");
+    assert!(error.is_data());
 }
 
 #[test]
@@ -10104,6 +11676,20 @@ fn custom_plannotator_accepts_framing_delivered() {
     ) {
         CustomPayload::Plannotator(details) => {
             assert!(details.framing_delivered);
+        }
+        other => panic!("expected Plannotator, got {other:?}"),
+    }
+}
+
+#[test]
+fn custom_plannotator_accepts_idle_notice_pending() {
+    // Emitted by the plannotator extension alongside framingDelivered.
+    match parse_custom_payload(
+        "plannotator",
+        json!({"phase": "idle", "idleNoticePending": true}),
+    ) {
+        CustomPayload::Plannotator(details) => {
+            assert!(details.idle_notice_pending);
         }
         other => panic!("expected Plannotator, got {other:?}"),
     }
