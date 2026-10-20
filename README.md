@@ -109,7 +109,8 @@ boundary.
 
 ## Development
 
-See [CLAUDE.md](./CLAUDE.md) for detailed development instructions.
+See the [development reference](doc/development.md) for build, run, test, and benchmark commands. [AGENTS.md](AGENTS.md)
+contains agent guidelines and a topic-based documentation map.
 
 # GitHub Mirror
 

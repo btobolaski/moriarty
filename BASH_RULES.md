@@ -1182,6 +1182,7 @@ For regex-syntax questions, online testers like [regex101.com](https://regex101.
 
 ## Further Reading
 
+- [Hook and rule-engine internals](doc/hooks.md) - Implementation reference for evaluation, redirects, and reporting
 - [Rust Regex Syntax](https://docs.rs/regex/latest/regex/#syntax) - Detailed regex syntax documentation
 - [TOML Specification](https://toml.io/) - Configuration file format
 - `~/.local/state/moriarty/hooks/` - Moriarty logs showing rule evaluation

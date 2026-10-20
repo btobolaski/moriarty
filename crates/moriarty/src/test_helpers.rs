@@ -143,7 +143,7 @@ fn apply_test_env_var(key: &OsStr, value: Option<&OsStr>) {
     // SAFETY: This crate's tests must be run with `cargo nextest`, not
     // `cargo test`. nextest executes each test in a separate process, so these
     // process-global environment mutations cannot race with other tests in the
-    // same process. See CLAUDE.md and README.md for the project test contract.
+    // same process. See AGENTS.md and README.md for the project test contract.
     unsafe {
         match value {
             Some(value) => std::env::set_var(key, value),
