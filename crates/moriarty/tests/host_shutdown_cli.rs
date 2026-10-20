@@ -33,12 +33,71 @@ const LIMIT: Duration = Duration::from_secs(3);
 
 #[test]
 fn mcp_open_input_does_not_block_signal_shutdown() {
-    for server in ["git-read-only", "jj-read-only", "project-tools"] {
+    for modern in [false, true] {
+        for server in ["git-read-only", "jj-read-only", "project-tools"] {
+            for (signal, label) in [(Signal::INT, "SIGINT"), (Signal::TERM, "SIGTERM")] {
+                let root = TempDir::new().unwrap();
+                let mut launch = command(root.path(), Path::new(env!("CARGO_BIN_EXE_moriarty")));
+                launch
+                    .args(["mcp", server])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                let mut host = Host(launch.spawn().unwrap());
+                let stdout = output(host.0.stdout.take().unwrap());
+                let stderr = output(host.0.stderr.take().unwrap());
+                let mut input = host.0.stdin.take().unwrap();
+                if modern {
+                    input.write_all(br#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}
+"#).unwrap();
+                } else {
+                    input.write_all(br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"host-test","version":"1"}}}
+"#).unwrap();
+                    until_text(&stdout, "\"id\":1");
+                    input
+                        .write_all(
+                            br#"{"jsonrpc":"2.0","method":"notifications/initialized"}
+{"jsonrpc":"2.0","id":2,"method":"ping"}
+"#,
+                        )
+                        .unwrap();
+                }
+                until_text(&stdout, "\"id\":2");
+                host.signal(signal);
+                assert_eq!(host.wait().code(), Some(1), "{server} {label}");
+                until_text(&stderr, label);
+                drop(input);
+            }
+        }
+    }
+}
+
+#[test]
+fn mcp_response_backpressure_does_not_block_signal_shutdown() {
+    for modern in [false, true] {
         for (signal, label) in [(Signal::INT, "SIGINT"), (Signal::TERM, "SIGTERM")] {
             let root = TempDir::new().unwrap();
+            fs::write(root.path().join("tracked"), "baseline\n").unwrap();
+            for args in [["init", "--quiet"].as_slice(), &["add", "tracked"]] {
+                let result = command(root.path(), Path::new("git"))
+                    .args(args)
+                    .output()
+                    .unwrap();
+                assert!(
+                    result.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+            }
+            // The index supplies a baseline without a commit, and the response stays below the VCS capture cap.
+            fs::write(
+                root.path().join("tracked"),
+                "unread-response-line\n".repeat(24_000),
+            )
+            .unwrap();
             let mut launch = command(root.path(), Path::new(env!("CARGO_BIN_EXE_moriarty")));
             launch
-                .args(["mcp", server])
+                .args(["mcp", "git-read-only"])
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
@@ -46,75 +105,30 @@ fn mcp_open_input_does_not_block_signal_shutdown() {
             let stdout = output(host.0.stdout.take().unwrap());
             let stderr = output(host.0.stderr.take().unwrap());
             let mut input = host.0.stdin.take().unwrap();
-            input.write_all(br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"host-test","version":"1"}}}
+            if modern {
+                input.write_all(br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"diff","arguments":{"project_dir":".","args":[]},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}
 "#).unwrap();
-            until_text(&stdout, "\"id\":1");
-            input
-                .write_all(
-                    br#"{"jsonrpc":"2.0","method":"notifications/initialized"}
-{"jsonrpc":"2.0","id":2,"method":"ping"}
-"#,
-                )
-                .unwrap();
-            until_text(&stdout, "\"id\":2");
-            host.signal(signal);
-            assert_eq!(host.wait().code(), Some(1), "{server} {label}");
-            until_text(&stderr, label);
-            drop(input);
-        }
-    }
-}
-
-#[test]
-fn mcp_response_backpressure_does_not_block_signal_shutdown() {
-    for (signal, label) in [(Signal::INT, "SIGINT"), (Signal::TERM, "SIGTERM")] {
-        let root = TempDir::new().unwrap();
-        fs::write(root.path().join("tracked"), "baseline\n").unwrap();
-        for args in [["init", "--quiet"].as_slice(), &["add", "tracked"]] {
-            let result = command(root.path(), Path::new("git"))
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(
-                result.status.success(),
-                "{}",
-                String::from_utf8_lossy(&result.stderr)
-            );
-        }
-        // The index supplies a baseline without a commit, and the response stays below the VCS capture cap.
-        fs::write(
-            root.path().join("tracked"),
-            "unread-response-line\n".repeat(24_000),
-        )
-        .unwrap();
-        let mut launch = command(root.path(), Path::new(env!("CARGO_BIN_EXE_moriarty")));
-        launch
-            .args(["mcp", "git-read-only"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut host = Host(launch.spawn().unwrap());
-        let stdout = output(host.0.stdout.take().unwrap());
-        let stderr = output(host.0.stderr.take().unwrap());
-        let mut input = host.0.stdin.take().unwrap();
-        input.write_all(br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"backpressure-test","version":"1"}}}
+            } else {
+                input.write_all(br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"backpressure-test","version":"1"}}}
 "#).unwrap();
-        until_text(&stdout, "\"id\":1");
-        input.write_all(br#"{"jsonrpc":"2.0","method":"notifications/initialized"}
+                until_text(&stdout, "\"id\":1");
+                input.write_all(br#"{"jsonrpc":"2.0","method":"notifications/initialized"}
 {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"diff","arguments":{"project_dir":".","args":[]}}}
 "#).unwrap();
-        until_text(&stdout, "diff --git");
-        // A response prefix proves the owned Git operation settled. Keep both pipes open and stop consuming output.
-        assert!(host.0.try_wait().unwrap().is_none());
-        host.signal(signal);
-        assert_eq!(
-            host.wait().code(),
-            Some(1),
-            "{label}: a partially delivered response is not success"
-        );
-        until_text(&stderr, label);
-        drop(input);
-        drop(stdout);
+            }
+            until_text(&stdout, "diff --git");
+            // A response prefix proves the owned Git operation settled. Keep both pipes open and stop consuming output.
+            assert!(host.0.try_wait().unwrap().is_none());
+            host.signal(signal);
+            assert_eq!(
+                host.wait().code(),
+                Some(1),
+                "{label}: a partially delivered response is not success"
+            );
+            until_text(&stderr, label);
+            drop(input);
+            drop(stdout);
+        }
     }
 }
 

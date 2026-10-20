@@ -19,6 +19,7 @@
 
 use std::{
     borrow::Cow,
+    fmt::Display,
     future::Future,
     io,
     path::PathBuf,
@@ -28,32 +29,40 @@ use std::{
 };
 
 use clap::Subcommand;
-use miette::IntoDiagnostic;
+use futures::poll;
+use miette::{IntoDiagnostic, WrapErr};
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler, Service, ServiceExt,
     model::{
         ClientJsonRpcMessage, ClientNotification, ClientRequest, ContentBlock, GetMeta,
-        ProtocolVersion, ServerInfo, ServerJsonRpcMessage, ServerResult,
+        PingRequestMethod, ProtocolVersion, RequestMetaObject, ServerConfig, ServerJsonRpcMessage,
+        ServerResult,
     },
     service::{NotificationContext, QuitReason, RequestContext},
     transport::{IntoTransport, Transport, stdio},
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
-    task::JoinError,
+    sync::mpsc,
+    task::{JoinError, JoinHandle},
 };
-use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
+use tokio_util::{
+    sync::{CancellationToken, WaitForCancellationFutureOwned},
+    task::TaskTracker,
+};
 
 use self::{git_read_only::GitReadOnly, jj_read_only::JjReadOnly, tool_runner::ToolRunner};
 use crate::execution::{self, Scope, ShutdownSignals};
 
 // Dependency upgrades must not expand Moriarty's supported MCP revisions.
-const MCP_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V_2025_11_25;
+const MCP_LEGACY_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V_2025_11_25;
+const MCP_MODERN_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V_2026_07_28;
 const MCP_SUPPORTED_PROTOCOL_VERSIONS: &[ProtocolVersion] = &[
     ProtocolVersion::V_2024_11_05,
     ProtocolVersion::V_2025_03_26,
     ProtocolVersion::V_2025_06_18,
-    MCP_PROTOCOL_VERSION,
+    MCP_LEGACY_PROTOCOL_VERSION,
+    MCP_MODERN_PROTOCOL_VERSION,
 ];
 
 pub mod git_read_only;
@@ -61,40 +70,168 @@ pub mod jj_read_only;
 pub mod read_only;
 pub mod tool_runner;
 
-// rmcp 3.2 commits a non-initialize opener to the inline lifecycle even when
-// discovery fails. Reject unsupported probes before that happens so a client
-// can fall back to the legacy handshake on the same connection.
-struct DiscoveryFallbackTransport<T>(T);
+const MAX_PENDING_REJECTIONS: usize = 64;
+type RejectionSend<E> = Pin<Box<dyn Future<Output = Result<(), E>> + Send>>;
 
-impl<T: Transport<RoleServer>> Transport<RoleServer> for DiscoveryFallbackTransport<T> {
+// rmcp 3.6 skips bootstrap ping validation and checks discovery completeness first.
+// Intercept unsupported discovery and unsupported/modern-context ping without choosing
+// a lifecycle. Supported legacy-version ping passes through even with context keys;
+// context-free ping (including empty/extension-only metadata) also stays upstream-owned.
+struct ProtocolGuardTransport<T: Transport<RoleServer>> {
+    inner: T,
+    rejections: Option<mpsc::Sender<RejectionSend<T::Error>>>,
+    rejection_tasks: TaskTracker,
+    execution: Arc<Scope>,
+    failures: Arc<Mutex<Option<String>>>,
+    service_ct: CancellationToken,
+}
+
+impl<T: Transport<RoleServer>> ProtocolGuardTransport<T> {
+    fn new(
+        inner: T,
+        execution: &Arc<Scope>,
+        failures: &Arc<Mutex<Option<String>>>,
+        service_ct: &CancellationToken,
+    ) -> (Self, JoinHandle<()>) {
+        let (sender, mut receiver) =
+            mpsc::channel::<RejectionSend<T::Error>>(MAX_PENDING_REJECTIONS);
+        // rmcp close needs a cancellable wait; the host also retains the join handle
+        // to settle failed/cancelled startup and report sender panics.
+        let rejection_tasks = TaskTracker::new();
+        let task = rejection_tasks.spawn({
+            let execution = execution.clone();
+            let failures = failures.clone();
+            let service_ct = service_ct.clone();
+            async move {
+                let _cancel_on_exit = service_ct.clone().drop_guard();
+                while let Some(reply) = receiver.recv().await {
+                    if let Err(error) = reply.await {
+                        rejection_failed(&execution, &failures, &service_ct, error);
+                        break;
+                    }
+                }
+            }
+        });
+        rejection_tasks.close();
+        (
+            Self {
+                inner,
+                rejections: Some(sender),
+                rejection_tasks,
+                execution: execution.clone(),
+                failures: failures.clone(),
+                service_ct: service_ct.clone(),
+            },
+            task,
+        )
+    }
+}
+
+fn rejection_failed(
+    execution: &Scope,
+    failures: &Mutex<Option<String>>,
+    service_ct: &CancellationToken,
+    error: impl Display,
+) {
+    tracing::warn!(%error, "failed to reject MCP request");
+    failures
+        .lock()
+        .unwrap()
+        .get_or_insert_with(|| error.to_string());
+    execution.close();
+    service_ct.cancel();
+}
+
+impl<T: Transport<RoleServer>> Transport<RoleServer> for ProtocolGuardTransport<T> {
     type Error = T::Error;
 
     fn send(
         &mut self,
         message: ServerJsonRpcMessage,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
-        self.0.send(message)
+        self.inner.send(message)
     }
 
     async fn receive(&mut self) -> Option<ClientJsonRpcMessage> {
         loop {
-            let message = self.0.receive().await?;
+            let message = tokio::select! {
+                biased;
+                () = self.rejection_tasks.wait() => return None,
+                message = self.inner.receive() => message?,
+            };
             if let ClientJsonRpcMessage::Request(request) = &message
-                && matches!(request.request, ClientRequest::DiscoverRequest(_))
-                && let Some(version) = request.request.get_meta().protocol_version()
-                && !MCP_SUPPORTED_PROTOCOL_VERSIONS.contains(&version)
+                && matches!(
+                    request.request,
+                    ClientRequest::PingRequest(_) | ClientRequest::DiscoverRequest(_)
+                )
             {
-                let error = McpError::unsupported_protocol_version(
-                    version,
-                    MCP_SUPPORTED_PROTOCOL_VERSIONS,
+                let meta = request.request.get_meta();
+                let error = match meta.protocol_version() {
+                    // A revision outside our policy is rejected even if its context is incomplete.
+                    Some(version) if !MCP_SUPPORTED_PROTOCOL_VERSIONS.contains(&version) => {
+                        McpError::unsupported_protocol_version(
+                            version,
+                            MCP_SUPPORTED_PROTOCOL_VERSIONS,
+                        )
+                    }
+                    _ if matches!(request.request, ClientRequest::DiscoverRequest(_)) => {
+                        return Some(message);
+                    }
+                    Some(version) if version.has_initialize() => return Some(message),
+                    // rmcp's RequestMetaObject keeps META_KEY_CLIENT_INFO and
+                    // META_KEY_LOG_LEVEL private. Mirror them so optional-only modern
+                    // context cannot bypass required metadata validation.
+                    _ if !RequestMetaObject::DRAFT_REQUIRED_KEYS
+                        .into_iter()
+                        .chain([
+                            "io.modelcontextprotocol/clientInfo",
+                            "io.modelcontextprotocol/logLevel",
+                        ])
+                        .any(|key| meta.contains_key(key)) =>
+                    {
+                        return Some(message);
+                    }
+                    _ => {
+                        let missing = meta.missing_required_keys(&MCP_MODERN_PROTOCOL_VERSION);
+                        if missing.is_empty() {
+                            McpError::method_not_found::<PingRequestMethod>()
+                        } else {
+                            // Keep ping errors consistent with rmcp's private
+                            // service::server::missing_request_metadata_error.
+                            McpError::invalid_params(
+                                format!(
+                                    "request _meta is missing or has malformed required fields: {}",
+                                    missing.join(", ")
+                                ),
+                                None,
+                            )
+                        }
+                    }
+                };
+                let mut reply = Box::pin(
+                    self.inner
+                        .send(ServerJsonRpcMessage::error(error, Some(request.id.clone()))),
                 );
-                if let Err(error) = self
-                    .0
-                    .send(ServerJsonRpcMessage::error(error, Some(request.id.clone())))
-                    .await
-                {
-                    tracing::warn!(%error, "failed to reject MCP discovery probe");
-                    return None;
+                // Preserve immediate write failures before forwarding another request.
+                // A parked send moves, still pinned, to the host-owned bounded sender
+                // before another await; cancellation of receive cannot drop the reply.
+                match poll!(reply.as_mut()) {
+                    Poll::Ready(Ok(())) => {}
+                    Poll::Ready(Err(error)) => {
+                        rejection_failed(&self.execution, &self.failures, &self.service_ct, error);
+                        return None;
+                    }
+                    Poll::Pending => {
+                        if let Err(error) = self.rejections.as_ref()?.try_send(reply) {
+                            rejection_failed(
+                                &self.execution,
+                                &self.failures,
+                                &self.service_ct,
+                                format!("MCP rejection queue failed: {error}"),
+                            );
+                            return None;
+                        }
+                    }
                 }
                 continue;
             }
@@ -102,8 +239,12 @@ impl<T: Transport<RoleServer>> Transport<RoleServer> for DiscoveryFallbackTransp
         }
     }
 
-    fn close(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        self.0.close()
+    async fn close(&mut self) -> Result<(), Self::Error> {
+        self.execution.close();
+        self.service_ct.cancel();
+        self.rejections.take();
+        self.rejection_tasks.wait().await;
+        self.inner.close().await
     }
 }
 
@@ -169,7 +310,7 @@ impl<S: ServerHandler + Clone> Service<RoleServer> for OwnedService<S> {
         self.server.handle_notification(notification, context).await
     }
 
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         self.server.get_info()
     }
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
@@ -207,28 +348,31 @@ where
     W: AsyncWrite + Send + Unpin + 'static,
 {
     let mut signals = ShutdownSignals::new()?;
-    serve_until(server, transport, signals.recv()).await
+    serve_until(server, transport, signals.recv(), Scope::new()).await
 }
 
 async fn serve_until<S, R, W>(
     server: S,
     (reader, writer): (R, W),
     stop: impl Future<Output = miette::Result<&'static str>>,
+    execution: Arc<Scope>,
 ) -> miette::Result<()>
 where
     S: ServerHandler + Clone,
     R: AsyncRead + Send + Unpin + 'static,
     W: AsyncWrite + Send + Unpin + 'static,
 {
-    let execution = Scope::new();
     let failures = Arc::new(Mutex::new(None));
     let service_ct = CancellationToken::new();
-    let transport = DiscoveryFallbackTransport(
+    let (transport, rejection_task) = ProtocolGuardTransport::new(
         (
             ObservedIo::new(reader, &execution, &failures, &service_ct),
             ObservedIo::new(writer, &execution, &failures, &service_ct),
         )
             .into_transport(),
+        &execution,
+        &failures,
+        &service_ct,
     );
     tokio::pin!(stop);
     // Early returns and `?` must exit only this block so admission close, cancellation
@@ -258,6 +402,13 @@ where
     }.await;
     execution.close();
     service_ct.cancel();
+    let outcome = execution::settled(
+        outcome,
+        rejection_task
+            .await
+            .into_diagnostic()
+            .wrap_err("MCP rejection sender failed"),
+    );
     let outcome = execution::settled(outcome, execution.shutdown().await);
     let transport_failure = failures.lock().unwrap().take();
     execution::settled(

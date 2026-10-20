@@ -94,7 +94,7 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::{MCP_PROTOCOL_VERSION, MCP_SUPPORTED_PROTOCOL_VERSIONS, default_project_dir};
+use super::{MCP_LEGACY_PROTOCOL_VERSION, MCP_SUPPORTED_PROTOCOL_VERSIONS, default_project_dir};
 use crate::{checks::CheckRunOutcome, project_config::runner::verify_and_load_project};
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -272,9 +272,9 @@ impl ToolRunner {
 
 #[tool_handler]
 impl ServerHandler for ToolRunner {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_protocol_version(MCP_PROTOCOL_VERSION)
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            .with_protocol_version(MCP_LEGACY_PROTOCOL_VERSION)
             .with_server_info(Implementation::new(
                 env!("CARGO_CRATE_NAME"),
                 env!("CARGO_PKG_VERSION"),

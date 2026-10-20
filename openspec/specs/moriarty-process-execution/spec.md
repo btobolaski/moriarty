@@ -156,10 +156,10 @@ checks, and VCS execution SHALL receive no new execution deadline.
 
 ### Requirement: Existing MCP cancellation and graceful shutdown settle owned work
 
-Moriarty SHALL connect existing MCP request cancellation to the affected operation only. Client disconnect and graceful
-SIGINT/SIGTERM shutdown SHALL stop admission of new migrated work, cancel all affected active operations before awaiting
-any one operation, and await their terminal outcomes concurrently while the async runtime remains available. An already
-cancelled operation SHALL NOT launch additional work.
+For every supported MCP lifecycle, Moriarty SHALL connect request cancellation to the affected operation only. Client
+disconnect and graceful SIGINT/SIGTERM shutdown SHALL stop admission of new migrated work, cancel all affected active
+operations before awaiting any one operation, and await their terminal outcomes concurrently while the async runtime
+remains available. An already cancelled operation SHALL NOT launch additional work.
 
 #### Scenario: Cancel one request without stopping another
 
@@ -179,6 +179,20 @@ cancelled operation SHALL NOT launch additional work.
 - **WHEN** the MCP transport disconnects or Moriarty receives SIGINT/SIGTERM with active migrated operations
 - **THEN** Moriarty stops admitting work, requests cancellation for all affected operations, and waits for their reports
   or errors before normal runtime destruction
+
+#### Scenario: First modern tool request is cancellable
+
+- **WHEN** a valid `2026-07-28` tool call is the first request on a stdio connection and the client sends
+  `notifications/cancelled` with that request's `requestId` while it is running
+- **THEN** the operation stops admitting work and its owned operations settle without requiring a discovery request or
+  initialization handshake; cancellation does not affect an unrelated request
+
+#### Scenario: Modern disconnect and backpressure retain settlement
+
+- **WHEN** a modern client disconnects during its first tool call, or graceful shutdown occurs while response delivery
+  is blocked
+- **THEN** the server cancels and awaits owned work before host return without requiring more client input or resumed
+  response reads, and retains transport failure or cleanup uncertainty rather than claiming successful delivery
 
 ### Requirement: Cleanup ownership survives caller loss
 
@@ -259,20 +273,28 @@ settlement obligations. SIGKILL remains outside cooperative cleanup and persiste
 
 ### Requirement: Cancellation does not change MCP protocol support
 
-Moriarty SHALL retain its current 2025-11-25 MCP ceiling and the supported revisions 2024-11-05, 2025-03-26, 2025-06-18,
-and 2025-11-25. Request cancellation SHALL use existing protocol facilities without adding task-management tools,
-capabilities, cancellation APIs from newer revisions, or accepting newer per-request metadata.
+Moriarty SHALL explicitly support `2024-11-05`, `2025-03-26`, `2025-06-18`, `2025-11-25`, and `2026-07-28`, as defined
+by `mcp-protocol-support`. Cancellation integration and dependency defaults SHALL NOT expand this set or introduce
+task-management tools or capabilities. Request cancellation SHALL use the supported lifecycle's protocol facilities;
+modern per-request metadata SHALL be accepted only for supported revisions.
 
 #### Scenario: Existing request cancellation
 
-- **WHEN** a client sends `notifications/cancelled` for an in-flight request under a currently supported revision
-- **THEN** Moriarty connects that existing request cancellation to execution without changing negotiation or exposing
-  task-management APIs
+- **WHEN** a client sends `notifications/cancelled` for an in-flight request under a supported revision
+- **THEN** Moriarty connects that request cancellation to execution without changing the declared supported revisions or
+  exposing task-management APIs
 
 #### Scenario: Unsupported protocol remains unsupported
 
-- **WHEN** a client requests an unsupported MCP revision or sends newer per-request metadata
-- **THEN** Moriarty preserves its existing negotiation fallback and metadata rejection behavior
+- **WHEN** a client requests an unsupported MCP revision through initialization or per-request metadata
+- **THEN** legacy initialization falls back to `2025-11-25`, while unsupported per-request metadata is rejected with
+  `-32022`; neither path implicitly enables the unsupported revision
+
+#### Scenario: Modern protocol support does not enable Tasks
+
+- **WHEN** a client uses supported `2026-07-28` request metadata
+- **THEN** Moriarty accepts the modern core lifecycle while keeping tool work request-owned and task-management
+  capabilities unavailable
 
 ### Requirement: Truthful execution outcomes
 

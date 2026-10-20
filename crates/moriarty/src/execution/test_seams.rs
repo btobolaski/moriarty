@@ -38,6 +38,24 @@ where
     F: FnMut(ProcessSpec, CancellationToken) -> Fut + Send + 'static,
     Fut: Future<Output = miette::Result<ProcessReport>> + Send + 'static,
 {
+    let scope = scope_with_operations(handler);
+    let value = SUBMISSION.scope(scope.clone(), work).await;
+    // Injected failures belong to the caller-policy assertion, not this fixture's return type.
+    let _ = scope.shutdown().await;
+    value
+}
+
+/// Exposes the request-local owner so transport tests can verify cancellation and admission.
+pub(crate) fn current_scope() -> Arc<Scope> {
+    SUBMISSION.with(Clone::clone)
+}
+
+/// Lets transport tests replace process outcomes without replacing their host/request ownership.
+pub(crate) fn scope_with_operations<F, Fut>(handler: F) -> Arc<Scope>
+where
+    F: FnMut(ProcessSpec, CancellationToken) -> Fut + Send + 'static,
+    Fut: Future<Output = miette::Result<ProcessReport>> + Send + 'static,
+{
     let mut scope = Scope::new();
     let handler = Arc::new(Mutex::new(handler));
     Arc::get_mut(&mut scope).unwrap().process = Arc::new(move |spec, cancellation| {
@@ -47,8 +65,5 @@ where
         };
         Box::pin(outcome)
     });
-    let value = SUBMISSION.scope(scope.clone(), work).await;
-    // Injected failures belong to the caller-policy assertion, not this fixture's return type.
-    let _ = scope.shutdown().await;
-    value
+    scope
 }

@@ -29,7 +29,7 @@ rustix = { version = "1", features = ["process", "pty", "termios"] }
 serde = { version = "1", features = ["alloc", "derive", "rc"] }
 serde_core = { version = "1", default-features = false, features = ["alloc", "rc", "result", "std"] }
 serde_json = { version = "1", features = ["alloc"] }
-tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "parking_lot", "process", "rt-multi-thread", "signal", "test-util"] }
+tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "parking_lot", "process", "rt-multi-thread", "signal", "test-util"] }
 tokio-util = { version = "0.7", features = ["codec", "rt"] }
 tracing-core = { version = "0.1" }
 zerocopy = { version = "0.8", default-features = false, features = ["derive", "simd"] }

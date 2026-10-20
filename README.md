@@ -78,8 +78,12 @@ program spelling and each entry point's existing cwd policy are preserved. This 
   require SIGKILL; no output-write timeout or graceful signal exit is promised in that condition. This exception does
   not apply to MCP transport shutdown or relax cancellation/admission and owned-work settlement obligations. Forceful
   termination proves neither owned-child cleanup nor completed approval persistence.
-- **Compatibility:** MCP remains capped at 2025-11-25, supporting 2024-11-05, 2025-03-26, 2025-06-18, and 2025-11-25
-  without task-management APIs. `moriarty mcp install` is excluded and retains inherited terminal streams and behavior.
+- **Compatibility:** All three stdio MCP servers support exactly 2024-11-05, 2025-03-26, 2025-06-18, 2025-11-25, and
+  2026-07-28. Modern requests need no handshake: each carries `_meta` entries `io.modelcontextprotocol/protocolVersion`
+  and `io.modelcontextprotocol/clientCapabilities`; client info and discovery are optional. Legacy clients retain
+  `initialize`/`notifications/initialized`; modern or unknown initialization revisions fall back to 2025-11-25. Tasks is
+  neither advertised nor implemented, even for task-capable clients; tools remain ordinary request/response operations.
+  `moriarty mcp install` is excluded from supervision and retains inherited terminal streams and behavior.
 
 ## Requirements
 

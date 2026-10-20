@@ -26,7 +26,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    MCP_PROTOCOL_VERSION, MCP_SUPPORTED_PROTOCOL_VERSIONS, default_project_dir,
+    MCP_LEGACY_PROTOCOL_VERSION, MCP_SUPPORTED_PROTOCOL_VERSIONS, default_project_dir,
     read_only::{CommandResult, run_read_only_command},
 };
 
@@ -238,14 +238,14 @@ impl GitReadOnly {
 #[tool_handler]
 #[prompt_handler]
 impl ServerHandler for GitReadOnly {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_prompts()
                 .enable_tools()
                 .build(),
         )
-        .with_protocol_version(MCP_PROTOCOL_VERSION)
+        .with_protocol_version(MCP_LEGACY_PROTOCOL_VERSION)
         .with_server_info(Implementation::new(
             env!("CARGO_CRATE_NAME"),
             env!("CARGO_PKG_VERSION"),
@@ -268,8 +268,10 @@ impl Default for GitReadOnly {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tempfile::TempDir;
+
+    use super::*;
+    use crate::mcp::tests::EXPECTED_PROTOCOL_VERSIONS;
 
     async fn setup_git_repo() -> TempDir {
         let temp_dir = TempDir::new().unwrap();
@@ -604,7 +606,7 @@ mod tests {
                 .iter()
                 .map(ProtocolVersion::as_str)
                 .collect::<Vec<_>>(),
-            ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"]
+            EXPECTED_PROTOCOL_VERSIONS
         );
         assert!(
             info.capabilities.tools.is_some(),

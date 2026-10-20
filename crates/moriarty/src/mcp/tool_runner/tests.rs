@@ -13,6 +13,7 @@ use super::*;
 use crate::{
     checks::{self, CheckRunOutcome},
     execution,
+    mcp::tests::EXPECTED_PROTOCOL_VERSIONS,
     project_config::approvals,
     repository::{detect_repository_root, detect_workspace_root},
     test_helpers::{
@@ -924,7 +925,7 @@ fn test_get_info_metadata() {
             .iter()
             .map(ProtocolVersion::as_str)
             .collect::<Vec<_>>(),
-        ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"]
+        EXPECTED_PROTOCOL_VERSIONS
     );
     assert!(
         info.capabilities.tools.is_some(),

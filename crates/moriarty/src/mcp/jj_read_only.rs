@@ -30,7 +30,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    MCP_PROTOCOL_VERSION, MCP_SUPPORTED_PROTOCOL_VERSIONS, default_project_dir,
+    MCP_LEGACY_PROTOCOL_VERSION, MCP_SUPPORTED_PROTOCOL_VERSIONS, default_project_dir,
     read_only::{CommandResult, run_read_only_command},
 };
 
@@ -167,9 +167,9 @@ impl JjReadOnly {
 
 #[tool_handler]
 impl ServerHandler for JjReadOnly {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_protocol_version(MCP_PROTOCOL_VERSION)
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            .with_protocol_version(MCP_LEGACY_PROTOCOL_VERSION)
             .with_server_info(Implementation::new(
                 env!("CARGO_CRATE_NAME"),
                 env!("CARGO_PKG_VERSION"),
@@ -199,6 +199,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::mcp::tests::EXPECTED_PROTOCOL_VERSIONS;
 
     fn run_jj(path: &Path, args: &[&str]) {
         let status = std::process::Command::new("jj")
@@ -556,7 +557,7 @@ mod tests {
                 .iter()
                 .map(ProtocolVersion::as_str)
                 .collect::<Vec<_>>(),
-            ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"]
+            EXPECTED_PROTOCOL_VERSIONS
         );
         assert!(
             info.capabilities.tools.is_some(),

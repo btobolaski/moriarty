@@ -9,6 +9,8 @@ binary entry point is `crates/moriarty/src/main.rs`; `my-workspace-hack` is mana
 - [Process-supervision specification](../openspec/specs/process-supervision/spec.md): standalone OS lifecycle contract.
 - [Moriarty process-execution specification](../openspec/specs/moriarty-process-execution/spec.md): integration,
   cancellation, and authorization requirements.
+- [MCP protocol-support specification](../openspec/specs/mcp-protocol-support/spec.md): explicit revisions,
+  modern/legacy stdio interoperability, and exclusion of Tasks.
 - [Supervisor crate rustdoc source](../crates/process_supervisor/src/lib.rs): public API contract and assurance limits.
 - [Project-tools configuration manual](man/moriarty-project-tools.5): command/check configuration and approvals.
 
@@ -230,8 +232,8 @@ Private Moriarty execution ownership.
   Moriarty's dev dependencies. Keep these tests at the integration boundary, not supervisor OS fault seams.
 - Keep OS cleanup assurance in the supervisor crate. Moriarty tests cover authorization, output policy, cancellation
   routing, and awaited ownership. Graceful drain needs a live runtime; SIGKILL/crashes and stalled creation's
-  late-cleanup uncertainty retain the supervisor contract's limits. MCP revisions remain 2024-11-05 through the
-  2025-11-25 ceiling, without task-management capabilities.
+  late-cleanup uncertainty retain the supervisor contract's limits. Both legacy and modern MCP tool calls, including a
+  first-message modern call, use the same request-token bridge and awaited ownership; Tasks remains disabled.
 
 ### `tui/`
 
@@ -247,13 +249,37 @@ Model Context Protocol servers.
 
 - Three MCP servers: `git_read_only` (status, diff, log, show), `jj_read_only` (status, diff, log, show, op log, file
   show, file list), and `tool_runner` (lint, test, build, format, checks)
-- Moriarty explicitly caps MCP support at `2025-11-25` while retaining `2024-11-05`, `2025-03-26`, and `2025-06-18`.
-  Each handler sets both its initialization fallback and supported-version list; upgrading rmcp must not implicitly opt
-  into newer revisions. Initialization requests for unknown versions fall back to the ceiling, so unknown older strings
-  are no longer echoed; newer per-request metadata is rejected. Upstream `discover` remains available but advertises
-  only this restricted list. Every stdio server rejects unsupported-version `server/discover` probes at the transport
-  boundary, before rmcp selects its inline lifecycle, so clients can fall back to legacy `initialize` on the same
-  connection.
+- All three servers explicitly support exactly `2024-11-05`, `2025-03-26`, `2025-06-18`, `2025-11-25`, and `2026-07-28`.
+  Each handler sets its legacy initialization fallback to `2025-11-25` separately from the supported list; dependency
+  defaults must not widen either policy. Legacy `initialize` echoes supported legacy revisions, but modern or unknown
+  revisions fall back to `2025-11-25`, followed by `notifications/initialized`.
+- Modern `2026-07-28` requests need neither initialization nor discovery. Each modern request carries `_meta` entries
+  `io.modelcontextprotocol/protocolVersion` and `io.modelcontextprotocol/clientCapabilities`; client info is optional.
+  For ordinary modern requests, rmcp validates context per request: missing/malformed required metadata returns
+  `-32602`; unsupported revisions return `-32022` with `requested`/`supported` data.
+- rmcp 3.6 owns lifecycle-neutral `server/discover` routing and recovery, with the local revision-precedence guard
+  below. Successful discovery, unsupported discovery, and malformed opening requests do not prevent subsequent legacy
+  initialization or modern work on the same connection. Modern complete results carry `resultType: "complete"`;
+  discovery, tool lists, and Git prompt lists also carry result-level `ttlMs` and `cacheScope` (SDK defaults suffice; no
+  application cache). Legacy tool/prompt wire shapes stay unchanged. Only Git advertises prompts; jj and project-tools
+  remain tools-only.
+- Tasks (`io.modelcontextprotocol/tasks`) is neither advertised nor implemented, even for clients advertising it.
+  `tasks/get`, `tasks/update`, and `tasks/cancel` return `-32601`; tools remain ordinary request/response operations,
+  not background task results. No HTTP/SSE, subscriptions, or new server-to-client interactions are introduced.
+- `ProtocolGuardTransport` rejects unsupported-version or modern-context ping before rmcp's unconditional bootstrap fast
+  path. Supported legacy-version ping passes through even with context keys, as does context-free ping (including
+  empty/extension-only metadata). Modern ping returns `-32601`; missing/malformed modern context returns `-32602`.
+  Parseable unsupported ping and discovery revisions return `-32022` with revision data before checking other required
+  metadata, even when those fields are missing or malformed. Other discovery validation and lifecycle recovery remain
+  upstream-owned; the guard uses SDK metadata validation and never selects a lifecycle.
+- Guarded rejections that cannot finish immediately move to one tracked sender with at most 64 queued sends plus one
+  active send, rather than blocking input or living in a cancellable receive future. Send failure or queue exhaustion
+  closes admission and retains a host-visible transport error. Transport close cancels blocked output and awaits the
+  sender before closing the SDK transport; `serve_until` also awaits its join handle on every exit, including failed or
+  cancelled startup. No per-rejection tasks are detached.
+- Moriarty retains `OwnedService`/`Scope` for request-owned execution and `ObservedIo` for admission closure, retained
+  transport failures, and cancellation of blocked response writes. SDK EOF cancellation does not prove owned-process
+  settlement or replace this application boundary.
 - All MCP tools accept an optional `project_dir`. Omitted values default to `.` and resolve against the server's current
   working directory at use time.
 - `read_only`: Shared infrastructure used by both `git_read_only` and `jj_read_only`. Provides `CommandResult`,
