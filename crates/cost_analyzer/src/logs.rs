@@ -480,6 +480,9 @@ impl AnalyzableLog for ClaudeLogLine {
             ClaudeLogLine::ArtifactCommentMonitor(_) => claude_timestamp_sentinel(),
             ClaudeLogLine::ArtifactAutoreactLedger(_) => claude_timestamp_sentinel(),
             ClaudeLogLine::CostState(_) => claude_timestamp_sentinel(),
+            ClaudeLogLine::ApiRequestShape(line) => line.timestamp,
+            ClaudeLogLine::ApiRequestBlob(_) => claude_timestamp_sentinel(),
+            ClaudeLogLine::ApiRequest(line) => line.timestamp,
         }
     }
 
@@ -539,6 +542,16 @@ impl AnalyzableLog for ClaudeLogLine {
             }
             // Also a whole-session snapshot rewritten in place, so the session alone identifies it.
             ClaudeLogLine::CostState(line) => format!("cost-state:{}", line.session_id),
+            // The hash identifies the shape, so a session re-sending one it already recorded
+            // collapses onto the earlier entry.
+            ClaudeLogLine::ApiRequestShape(line) => {
+                format!("api-request-shape:{}:{}", line.session_id, line.shape_hash)
+            }
+            // Blobs are content-addressed, so the hash dedups the same way.
+            ClaudeLogLine::ApiRequestBlob(line) => {
+                format!("api-request-blob:{}:{}", line.session_id, line.hash)
+            }
+            ClaudeLogLine::ApiRequest(line) => format!("api-request:{}", line.id),
         }
     }
 
@@ -1103,6 +1116,56 @@ mod tests {
                     "threads": [],
                 },
             },
+        })
+    }
+
+    const CLAUDE_SHAPE_HASH: &str =
+        "081e1739158c13b56687b19b4f43153f7b32954926bd21c7b81bd3e42b850950";
+    const CLAUDE_BLOB_HASH: &str =
+        "d43ab0e0b8ec9db790a6459cb2f4bc4ffce02825ca05063162023be60912ced9";
+
+    fn claude_api_request_shape_json() -> serde_json::Value {
+        json!({
+            "type": "api-request-shape",
+            "sessionId": CLAUDE_SESSION_ID,
+            "shapeHash": CLAUDE_SHAPE_HASH,
+            "timestamp": CLAUDE_TIMESTAMP,
+            "version": "2.1.302",
+            "shape": {"system": [], "tools": []},
+        })
+    }
+
+    fn claude_api_request_blob_json() -> serde_json::Value {
+        json!({
+            "type": "api-request-blob",
+            "sessionId": CLAUDE_SESSION_ID,
+            "hash": CLAUDE_BLOB_HASH,
+            "message": {"role": "user", "content": "hello"},
+        })
+    }
+
+    fn claude_api_request_json() -> serde_json::Value {
+        json!({
+            "type": "api-request",
+            "sessionId": CLAUDE_SESSION_ID,
+            "id": "99694e12-7b7f-46d6-a2db-3b07ffc352e6",
+            "timestamp": CLAUDE_TIMESTAMP,
+            "version": "2.1.302",
+            "querySource": "repl_main_thread",
+            "shapeHash": CLAUDE_SHAPE_HASH,
+            "params": {
+                "model": "claude-opus-5-5",
+                "betas": [],
+                "max_tokens": 128_000u32,
+                "thinking": {"type": "adaptive", "display": "summarized"},
+                "context_management": {"edits": []},
+                "safeguards": [],
+                "output_config": {"effort": "medium"},
+            },
+            "keep": 0u32,
+            "tail": [],
+            "cacheControl": [],
+            "requestDigest": CLAUDE_BLOB_HASH,
         })
     }
 
@@ -2273,6 +2336,26 @@ mod tests {
                 value: claude_cost_state_json,
                 expected_timestamp: ExpectedClaudeTimestamp::Sentinel,
                 expected_id: claude_metadata_identifier("cost-state"),
+            },
+            ClaudeNonBillableCase {
+                name: "api request shape",
+                value: claude_api_request_shape_json,
+                expected_timestamp: ExpectedClaudeTimestamp::Real,
+                expected_id: format!("api-request-shape:{CLAUDE_SESSION_ID}:{CLAUDE_SHAPE_HASH}"),
+            },
+            ClaudeNonBillableCase {
+                name: "api request blob",
+                value: claude_api_request_blob_json,
+                expected_timestamp: ExpectedClaudeTimestamp::Sentinel,
+                expected_id: format!("api-request-blob:{CLAUDE_SESSION_ID}:{CLAUDE_BLOB_HASH}"),
+            },
+            ClaudeNonBillableCase {
+                name: "api request",
+                value: claude_api_request_json,
+                // Carries `params.model`, but the request is not a priced turn: its assistant
+                // response is.
+                expected_timestamp: ExpectedClaudeTimestamp::Real,
+                expected_id: "api-request:99694e12-7b7f-46d6-a2db-3b07ffc352e6".to_string(),
             },
         ];
 

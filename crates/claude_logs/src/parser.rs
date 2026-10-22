@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 #[cfg(test)]
 use std::path::Path;
 
@@ -259,6 +260,12 @@ pub enum LogLine {
     ArtifactAutoreactLedger(ArtifactAutoreactLedger),
     #[serde(rename = "cost-state")]
     CostState(CostState),
+    #[serde(rename = "api-request-shape")]
+    ApiRequestShape(ApiRequestShape),
+    #[serde(rename = "api-request-blob")]
+    ApiRequestBlob(ApiRequestBlob),
+    #[serde(rename = "api-request")]
+    ApiRequest(Box<ApiRequest>),
 }
 
 /// Session-scoped bookkeeping for the comment threads Claude Code has already reacted to on each
@@ -279,11 +286,15 @@ pub struct ArtifactAutoreactLedger {
 #[serde(deny_unknown_fields)]
 pub struct AutoreactedArtifact {
     pub saved_at: u64,
-    /// Null until the session has stamped a thread; typed as a millisecond timestamp to match its
-    /// `saved_at` sibling.
-    pub stamp_high_water: Option<u64>,
+    /// Null until the session has stamped a thread. Unlike its millisecond `saved_at` sibling, this
+    /// is an RFC 3339 string.
+    pub stamp_high_water: Option<DateTime<Utc>>,
     pub ever_baselined: bool,
     pub ever_had_threads: bool,
+    /// Only `true` has been observed; the key is absent otherwise. An explicit `false` would parse
+    /// but serialize back as an absent key.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub interrupted: bool,
     pub turn_timestamps: Vec<u64>,
     /// Only empty arrays have been observed, so the element shape is unknown; an empty strict
     /// struct surfaces the real shape as a parse error rather than silently discarding it.
@@ -430,6 +441,302 @@ pub struct CostStateModelUsage {
     pub web_search_requests: u64,
     #[serde(rename = "costUSD")]
     pub cost_usd: f64,
+}
+
+/// The system prompt and tool roster Claude Code sent with an API request, referenced from
+/// [`ApiRequest::shape_hash`]. Added in Claude Code 2.1.302+.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct ApiRequestShape {
+    pub session_id: Uuid,
+    /// Absent on some main-session records and explicitly null on others.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    pub shape_hash: ContentHash,
+    pub timestamp: DateTime<Utc>,
+    pub version: String,
+    pub shape: RequestShape,
+}
+
+/// A SHA-256 hex digest by which the `api-request*` records reference one another. Validated so a
+/// truncated or malformed reference fails to parse instead of silently dangling.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "String")]
+pub struct ContentHash(String);
+
+impl TryFrom<String> for ContentHash {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        if value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            Ok(Self(value))
+        } else {
+            Err(format!(
+                "content hash must be 64 lowercase hex characters, got `{value}`"
+            ))
+        }
+    }
+}
+
+impl fmt::Display for ContentHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Wire keys are snake_case, unlike the camelCase envelope, because this is the API request's own
+/// shape carried through verbatim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestShape {
+    pub system: Vec<RequestSystemBlock>,
+    pub tools: Vec<RequestShapeTool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
+pub enum RequestSystemBlock {
+    Text { text: String },
+}
+
+/// The roster's tool kinds share no discriminator, so they are matched structurally on their
+/// differing required fields, as [`SystemErrorBody`] is: only deferred tools carry
+/// `defer_loading` alongside a `description`, and only server tools carry `model`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RequestShapeTool {
+    Deferred(DeferredToolSchema),
+    Eager(PromptToolSchema),
+    Server(RequestServerTool),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestServerTool {
+    #[serde(rename = "type")]
+    pub tool_type: ServerToolType,
+    pub name: String,
+    pub model: Model,
+    pub defer_loading: bool,
+}
+
+/// Strict so a new server tool surfaces as a parse error; only the advisor has been observed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum ServerToolType {
+    #[serde(rename = "advisor_20260301")]
+    Advisor20260301,
+}
+
+/// One message of an API request, stored once per content hash so the request can be
+/// reconstructed. Unlike [`ApiRequestShape`] it carries no timestamp. Added in Claude Code
+/// 2.1.302+.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct ApiRequestBlob {
+    pub session_id: Uuid,
+    /// Absent on some main-session records and explicitly null on others.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    pub hash: ContentHash,
+    pub message: RequestBlobMessage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestBlobMessage {
+    pub role: RequestBlobRole,
+    pub content: RequestBlobContent,
+    /// Present only on some `system` messages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_config: Option<RequestOutputConfig>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestBlobRole {
+    User,
+    Assistant,
+    System,
+}
+
+pub type RequestBlobContent = MessageContent<RequestBlobBlock>;
+
+/// Request messages carry the same blocks as logged messages plus request-only ones. The
+/// request-only blocks stay out of [`LogMessageTaggedContent`] so logged user and assistant
+/// messages keep rejecting them. The cost of the untagged split is diagnostics: an unknown block
+/// type reports that no variant matched rather than naming the tag.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RequestBlobBlock {
+    Message(LogMessageTaggedContent),
+    RequestOnly(RequestOnlyBlock),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
+pub enum RequestOnlyBlock {
+    /// Announces a tool that joined the roster mid-session.
+    ToolAddition { tool: AddedTool },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
+pub enum AddedTool {
+    ToolDefinition { definition: PromptToolSchema },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestOutputConfig {
+    pub effort: ReasoningEffort,
+}
+
+/// One API request, recorded as a delta: the first `keep` messages of the `base` request followed
+/// by the [`ApiRequestBlob`] hashes in `tail`, sent with the [`ApiRequestShape`] named by
+/// `shape_hash`. Added in Claude Code 2.1.302+.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct ApiRequest {
+    pub session_id: Uuid,
+    /// Absent on some main-session records and explicitly null on others.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    pub id: Uuid,
+    pub timestamp: DateTime<Utc>,
+    pub version: String,
+    /// Free-form origin label (`repl_main_thread`, `agent:custom:<name>`), so kept as a `String`.
+    pub query_source: String,
+    pub shape_hash: ContentHash,
+    pub params: RequestParams,
+    /// Absent or null on a session's first request, which has no earlier request to build on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base: Option<Uuid>,
+    /// `0` when `base` is absent. The pairing is not enforced because nothing reads either field.
+    pub keep: u32,
+    pub tail: Vec<ContentHash>,
+    pub cache_control: Vec<CacheControlMarker>,
+    pub request_digest: ContentHash,
+}
+
+/// Wire keys are snake_case for the same reason as [`RequestShape`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestParams {
+    pub model: Model,
+    /// Kept as strings: beta names are dated, change most releases, and nothing reads them.
+    pub betas: Vec<String>,
+    pub max_tokens: u32,
+    pub thinking: RequestThinking,
+    pub context_management: RequestContextManagement,
+    pub safeguards: Vec<RequestSafeguard>,
+    pub output_config: RequestOutputConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestThinking {
+    #[serde(rename = "type")]
+    pub thinking_type: RequestThinkingType,
+    pub display: ThinkingDisplay,
+}
+
+/// Strict so a new thinking mode surfaces as a parse error; only `adaptive` has been observed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestThinkingType {
+    Adaptive,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestContextManagement {
+    pub edits: Vec<ContextEdit>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "type")]
+#[serde(deny_unknown_fields)]
+pub enum ContextEdit {
+    #[serde(rename = "clear_thinking_20251015")]
+    ClearThinking20251015 { keep: ClearThinkingKeep },
+}
+
+/// Strict so a bounded keep policy surfaces as a parse error; only `all` has been observed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClearThinkingKeep {
+    All,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
+pub enum RequestSafeguard {
+    DangerousToolUse {
+        /// Kept opaque: this is Claude Code's internal snapshot of permission rules, trusted
+        /// directories, git state, and artifact session state for the safety classifier. It is
+        /// keyed partly by local paths and artifact ids and reshapes between releases, and
+        /// nothing downstream reads it.
+        classifier_context: HashMap<String, serde_json::Value>,
+    },
+}
+
+/// Marks where a `cache_control` breakpoint was placed in the reconstructed request.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CacheControlMarker {
+    /// A JSON path into the request, such as `["messages", 4, "content"]`.
+    pub path: Vec<RequestPathSegment>,
+    pub value: CacheControl,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RequestPathSegment {
+    Key(String),
+    Index(u32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CacheControl {
+    #[serde(rename = "type")]
+    pub cache_type: CacheControlType,
+    /// Absent means the API's default five-minute TTL.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<CacheTtl>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<CacheScope>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheControlType {
+    Ephemeral,
+}
+
+/// Strict so a new TTL surfaces as a parse error; only `1h` has been observed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum CacheTtl {
+    #[serde(rename = "1h")]
+    OneHour,
+}
+
+/// Strict so a new scope surfaces as a parse error; only `global` has been observed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheScope {
+    Global,
 }
 
 /// AI-generated conversation title. Added in Claude Code 2.1.141+ alongside the existing
@@ -1175,8 +1482,9 @@ impl<'de> Deserialize<'de> for PromptSnapshotTool {
     }
 }
 
-/// A tool definition as sent to the API, shared by `prompt_snapshot`'s tool roster and
-/// `deferred_tools_delta`'s surfaced definitions. Wire keys are snake_case here, unlike the camelCase log
+/// A tool definition as sent to the API, shared by `prompt_snapshot`'s tool roster,
+/// `deferred_tools_delta`'s surfaced definitions, and the eagerly loaded tools of an
+/// [`ApiRequestShape`] and [`AddedTool`]. Wire keys are snake_case here, unlike the camelCase log
 /// envelope around them, because this is the API's own tool shape carried through verbatim.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1194,7 +1502,10 @@ pub struct PromptToolSchema {
 pub struct DeferredToolSchema {
     pub name: String,
     pub description: String,
-    pub eager_input_streaming: bool,
+    /// Optional because some [`ApiRequestShape`] deferred tools omit it; the schema is shared with
+    /// `deferred_tools_delta`, so its absence is accepted there too.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eager_input_streaming: Option<bool>,
     pub input_schema: HashMap<String, serde_json::Value>,
     pub defer_loading: bool,
 }
@@ -3030,12 +3341,16 @@ pub struct LogMessage {
     pub content: LogMessageContent,
 }
 
+pub type LogMessageContent = MessageContent<LogMessageTaggedContent>;
+
+/// Message content is either a bare string or a list of blocks; generic over the block type so
+/// logged messages and [`RequestBlobMessage`] share the envelope while accepting different blocks.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[serde(untagged)]
-pub enum LogMessageContent {
+pub enum MessageContent<B> {
     String(String),
-    Vec(Vec<LogMessageTaggedContent>),
+    Vec(Vec<B>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3142,6 +3457,9 @@ pub struct AssistantLogLine {
     pub slug: Option<String>,
     pub message: AssistantLogMessage,
     pub request_id: Option<String>,
+    /// The [`ApiRequest::id`] of the recorded request that produced this turn. Added in Claude Code
+    /// 2.1.302+.
+    pub request_ref: Option<Uuid>,
     /// Opaque identifiers/metadata that do not affect usage attribution.
     pub server_classifier_request: Option<String>,
     pub advisor_model: Option<String>,

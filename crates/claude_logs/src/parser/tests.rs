@@ -125,6 +125,12 @@ fn parse_assistant_log_line(json: serde_json::Value) -> AssistantLogLine {
     *assistant
 }
 
+fn assert_log_line_round_trips(json: serde_json::Value) -> LogLine {
+    let parsed: LogLine = serde_json::from_value(json.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&parsed).unwrap(), json);
+    parsed
+}
+
 /// `target` selects the object the extra field is inserted into, so a caller can exercise a nested
 /// payload's strictness (an artifact entry) as well as the line's own.
 fn assert_log_line_rejects_extra_field(
@@ -429,9 +435,10 @@ fn artifact_autoreact_ledger_json() -> serde_json::Value {
         "artifacts": {
             "453110f4-9db6-4428-ad3c-9df991340402": {
                 "savedAt": 1788190028700u64,
-                "stampHighWater": null,
+                "stampHighWater": "2026-10-16T22:04:54.269Z",
                 "everBaselined": true,
                 "everHadThreads": false,
+                "interrupted": true,
                 "turnTimestamps": [],
                 "threads": []
             }
@@ -442,7 +449,7 @@ fn artifact_autoreact_ledger_json() -> serde_json::Value {
 #[test]
 fn test_parse_artifact_autoreact_ledger_log_line() {
     let LogLine::ArtifactAutoreactLedger(ledger) =
-        serde_json::from_value(artifact_autoreact_ledger_json()).unwrap()
+        assert_log_line_round_trips(artifact_autoreact_ledger_json())
     else {
         panic!("expected an artifact-autoreact-ledger log line");
     };
@@ -461,9 +468,13 @@ fn test_parse_artifact_autoreact_ledger_log_line() {
         )
         .expect("fixture has one ledger artifact");
     assert_eq!(artifact.saved_at, 1788190028700);
-    assert_eq!(artifact.stamp_high_water, None);
+    assert_eq!(
+        artifact.stamp_high_water,
+        Some("2026-10-16T22:04:54.269Z".parse().unwrap())
+    );
     assert!(artifact.ever_baselined);
     assert!(!artifact.ever_had_threads);
+    assert!(artifact.interrupted);
     assert!(artifact.turn_timestamps.is_empty());
     assert!(artifact.threads.is_empty());
 }
@@ -473,6 +484,177 @@ fn test_parse_artifact_autoreact_ledger_rejects_unknown_artifact_fields() {
     assert_log_line_rejects_extra_field(artifact_autoreact_ledger_json(), |json| {
         &mut json["artifacts"]["453110f4-9db6-4428-ad3c-9df991340402"]
     });
+}
+
+fn api_request_shape_json() -> serde_json::Value {
+    serde_json::json!({
+        "type": "api-request-shape",
+        "sessionId": "22ecb27c-b06e-438e-ad21-03f8798d236e",
+        "shapeHash": "081e1739158c13b56687b19b4f43153f7b32954926bd21c7b81bd3e42b850950",
+        "timestamp": "2026-10-19T22:45:51.317Z",
+        "version": "2.1.302",
+        "shape": {
+            "system": [{"type": "text", "text": "You are Claude Code."}],
+            "tools": [
+                {
+                    "name": "WebFetch",
+                    "description": "Fetches a URL.",
+                    "input_schema": {"type": "object"},
+                    "defer_loading": true
+                },
+                {
+                    "name": "Read",
+                    "description": "Reads a file.",
+                    "input_schema": {"type": "object"},
+                    "eager_input_streaming": true
+                },
+                {
+                    "type": "advisor_20260301",
+                    "name": "advisor",
+                    "model": "claude-opus-5-5",
+                    "defer_loading": true
+                }
+            ]
+        }
+    })
+}
+
+#[test]
+fn test_api_request_shape_round_trips_and_dispatches_tool_kinds() {
+    let LogLine::ApiRequestShape(line) = assert_log_line_round_trips(api_request_shape_json())
+    else {
+        panic!("expected an api-request-shape log line");
+    };
+    let [
+        RequestShapeTool::Deferred(_),
+        RequestShapeTool::Eager(_),
+        RequestShapeTool::Server(_),
+    ] = line.shape.tools.as_slice()
+    else {
+        panic!(
+            "expected deferred, eager, then server tools, got {:?}",
+            line.shape.tools
+        );
+    };
+}
+
+#[test]
+fn test_content_hash_rejects_malformed_digests() {
+    for (name, value) in [
+        ("truncated", "081e1739".to_string()),
+        ("uppercase", "A".repeat(64)),
+        ("non-hex", "g".repeat(64)),
+    ] {
+        let err = ContentHash::try_from(value.clone()).expect_err(name);
+        assert!(
+            err.contains(&value),
+            "{name}: error should name the rejected value, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn test_parse_api_request_shape_rejects_unknown_shape_fields() {
+    assert_log_line_rejects_extra_field(api_request_shape_json(), |json| &mut json["shape"]);
+}
+
+fn tool_addition_block_json() -> serde_json::Value {
+    serde_json::json!({
+        "type": "tool_addition",
+        "tool": {
+            "type": "tool_definition",
+            "definition": {
+                "name": "mcp__docs__update",
+                "description": "Edit a doc.",
+                "eager_input_streaming": true,
+                "input_schema": {"type": "object"}
+            }
+        }
+    })
+}
+
+#[test]
+fn test_api_request_blob_round_trips_and_dispatches_request_only_blocks() {
+    let json = serde_json::json!({
+        "type": "api-request-blob",
+        "sessionId": "22ecb27c-b06e-438e-ad21-03f8798d236e",
+        "hash": "d43ab0e0b8ec9db790a6459cb2f4bc4ffce02825ca05063162023be60912ced9",
+        "message": {
+            "role": "system",
+            "content": [
+                {"type": "text", "text": "New tools are available."},
+                tool_addition_block_json()
+            ],
+            "output_config": {"effort": "medium"}
+        }
+    });
+    let LogLine::ApiRequestBlob(blob) = assert_log_line_round_trips(json) else {
+        panic!("expected an api-request-blob log line");
+    };
+    let RequestBlobContent::Vec(blocks) = &blob.message.content else {
+        panic!("expected block content");
+    };
+    let [
+        RequestBlobBlock::Message(LogMessageTaggedContent::Text { .. }),
+        RequestBlobBlock::RequestOnly(RequestOnlyBlock::ToolAddition { .. }),
+    ] = blocks.as_slice()
+    else {
+        panic!("expected a text block then a tool addition, got {blocks:?}");
+    };
+}
+
+#[test]
+fn test_parse_assistant_rejects_request_only_tool_addition_block() {
+    let json = assistant_log_line_json(serde_json::json!({
+        "message": {"content": [tool_addition_block_json()]}
+    }));
+    let err = serde_json::from_value::<LogLine>(json)
+        .expect_err("Logged messages should reject request-only blocks");
+    // The overlay replaces the fixture's content with the tool_addition block alone, so it is the
+    // only possible cause; the untagged `MessageContent` envelope reports it as a generic mismatch.
+    assert!(
+        err.to_string().contains("did not match any variant"),
+        "Error should report that no content shape matched, got: {err}"
+    );
+}
+
+fn api_request_json() -> serde_json::Value {
+    serde_json::json!({
+        "type": "api-request",
+        "sessionId": "f1757339-c07c-4f0c-ab40-9d0e0aa6ee9f",
+        "id": "99694e12-7b7f-46d6-a2db-3b07ffc352e6",
+        "timestamp": "2026-10-22T22:08:53.858Z",
+        "version": "2.1.302",
+        "querySource": "repl_main_thread",
+        "shapeHash": "5335f245bf00778a0481085f827e9277180dee66a4e91e2626693180d98bd2f7",
+        "params": {
+            "model": "claude-opus-5-5",
+            "betas": [],
+            "max_tokens": 128000,
+            "thinking": {"type": "adaptive", "display": "summarized"},
+            "context_management": {
+                "edits": [{"type": "clear_thinking_20251015", "keep": "all"}]
+            },
+            "safeguards": [{
+                "type": "dangerous_tool_use",
+                "classifier_context": {"v": 1, "permission_mode": "auto"}
+            }],
+            "output_config": {"effort": "medium"}
+        },
+        "base": "a5b4174c-ffb5-4c92-9457-ee8e8961237a",
+        "keep": 2,
+        "tail": ["fec9b2e69bf5f3232fd3fb5038abec09753017df1d2910d8d4107b69316a77eb"],
+        "cacheControl": [{
+            "path": ["messages", 4, "content"],
+            "value": {"type": "ephemeral", "ttl": "1h", "scope": "global"}
+        }],
+        "requestDigest": "5b94ff15eddcc1506e2000e80793e7dc972f7bc290ed74067877e1e733dc0d98"
+    })
+}
+
+#[test]
+fn test_api_request_round_trips() {
+    assert_log_line_round_trips(api_request_json());
 }
 
 #[test]
@@ -1583,6 +1765,19 @@ fn test_parse_assistant_with_is_aborted_mid_stream() {
     assert_eq!(assistant.is_aborted_mid_stream, Some(true));
 }
 
+#[test]
+fn test_parse_assistant_with_request_ref() {
+    let assistant = parse_assistant_log_line(assistant_log_line_json(serde_json::json!({
+        "version": "2.1.302",
+        "requestRef": "a5b4174c-ffb5-4c92-9457-ee8e8961237a"
+    })));
+
+    assert_eq!(
+        assistant.request_ref,
+        Some("a5b4174c-ffb5-4c92-9457-ee8e8961237a".parse().unwrap())
+    );
+}
+
 // Older assistant records omit the fields later Claude Code versions added, so each stays `None`.
 #[test]
 fn test_parse_assistant_without_later_optional_fields() {
@@ -1595,6 +1790,7 @@ fn test_parse_assistant_without_later_optional_fields() {
     assert_eq!(assistant.is_aborted_mid_stream, None);
     assert_eq!(assistant.session_id_snake, None);
     assert_eq!(assistant.quota_limits, None);
+    assert_eq!(assistant.request_ref, None);
 }
 
 // The effort enum is strict so a genuinely new level surfaces as a parse error rather than being
@@ -12053,7 +12249,7 @@ fn test_parse_attachment_deferred_tools_record() {
     };
     assert_eq!(entry.name, "WebFetch");
     assert_eq!(entry.description, "Fetches a URL.");
-    assert!(entry.eager_input_streaming);
+    assert_eq!(entry.eager_input_streaming, Some(true));
     assert_eq!(
         entry.input_schema.get("type"),
         Some(&serde_json::json!("object"))
