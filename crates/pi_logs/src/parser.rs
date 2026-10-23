@@ -2585,6 +2585,9 @@ fn parse_tool_result_details(
 ) -> Result<ToolResultDetails, serde_json::Error> {
     match tool_name {
         "ask_user" => serde_json::from_value(details).map(ToolResultDetails::AskUser),
+        "ast_grep_outline" => {
+            serde_json::from_value(details).map(ToolResultDetails::AstGrepOutline)
+        }
         "ast_grep_replace" => empty_or(details, ToolResultDetails::AstGrepReplace),
         "ast_grep_search" => empty_or(details, ToolResultDetails::AstGrepSearch),
         "bash" => serde_json::from_value(details).map(ToolResultDetails::Bash),
@@ -2853,14 +2856,17 @@ pub enum ToolResultDetails {
     Empty(EmptyDetails),
     Memory(MemoryDetails),
     Skill(SkillDetails),
-    // pi-lens/pi-lsp tool results; each tool has its own typed detail struct
-    // routed explicitly by `parse_tool_result_details`.
+    // pi-lens/pi-lsp tool results are routed explicitly by
+    // `parse_tool_result_details` so their evolving envelopes cannot absorb unrelated details.
     // ast_grep_replace precedes ast_grep_search because their untagged shapes
     // overlap on {matchCount, totalMatches, truncated}: tool-name routing
     // does the real disambiguation and this only keeps direct enum
     // deserialization deterministic.
     AstGrepReplace(AstGrepReplaceDetails),
     AstGrepSearch(AstGrepSearchDetails),
+    // pi-lens owns this evolving envelope; cost analysis does not inspect it.
+    #[serde(skip_deserializing)]
+    AstGrepOutline(JsonBlob),
     LensDiagnosticMark(LensDiagnosticMarkDetails),
     LensDiagnostics(LensDiagnosticsDetails),
     LspDiagnostics(LspDiagnosticsDetails),

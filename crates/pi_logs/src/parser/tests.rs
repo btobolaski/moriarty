@@ -5540,6 +5540,17 @@ macro_rules! assert_routes {
 }
 
 #[test]
+fn ast_grep_outline_tool_result_preserves_details() {
+    let expected = json!({"files": 1, "items": 0, "syntaxOnly": true});
+    let result = tool_result_with_details("ast_grep_outline", expected.clone());
+
+    assert_eq!(
+        serde_json::to_value(result.details.unwrap()).unwrap(),
+        expected
+    );
+}
+
+#[test]
 // Keep one row per routing contract; rustfmt otherwise obscures the matrix with wrapping.
 #[rustfmt::skip]
 fn tool_result_details_route_current_shapes() {
