@@ -13,9 +13,13 @@
 //! serde cannot express strictly with a derive alone, for specific
 //! corrupt-stream patterns observed in real logs, or for protocol fields
 //! whose values come from provider-specific namespaces that must be
-//! preserved rather than rejected. The authoritative detail lives in
-//! `parser.rs`; this crate-level overview stays intentionally brief so
-//! those rules are described in one place only.
+//! preserved rather than rejected. Tool-name routing also normalizes a few
+//! documented lean error shapes (for example a `fetch_content` or
+//! `web_search` failure carrying only `{error}`) into empty breadcrumb values,
+//! while the helper structs accepting them stay strict about the keys they do
+//! allow. The authoritative detail lives in `parser.rs`; this crate-level
+//! overview stays intentionally brief so those rules are described in one
+//! place only.
 
 pub mod parser;
 

@@ -5487,6 +5487,47 @@ fn fetch_content_tool_result_accepts_top_level_error_summary() {
     assert_eq!(details.error.as_deref(), Some("fetch failed"));
 }
 
+#[test]
+fn fetch_content_tool_result_accepts_bare_error_without_breadcrumbs() {
+    // Real-world case: an invalid option combination fails before any fetch
+    // happens, so details carry only `{error}` while pi still reports
+    // isError:false. It must parse rather than surface a missing-`urls` error.
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "fetch_content",
+        vec![json!({
+            "type": "text",
+            "text": "Error: mode raw cannot be combined with forceClone."
+        })],
+        false,
+        Some(json!({"error": "Incompatible raw mode options"})),
+    ));
+    let Some(ToolResultDetails::FetchContent(details)) = tool_result.details else {
+        panic!("expected FetchContent details")
+    };
+    assert!(details.urls.is_empty());
+    assert_eq!(details.url_count, 0);
+    assert_eq!(details.successful, 0);
+    assert!(details.response_id.is_empty());
+    assert_eq!(
+        details.error.as_deref(),
+        Some("Incompatible raw mode options")
+    );
+}
+
+#[test]
+fn fetch_content_bare_error_path_stays_strict() {
+    assert_parse_error_contains_any(
+        "fetch_content rejects extra keys beside a bare error",
+        tool_result_message_json(
+            "fetch_content",
+            vec![json!({"type": "text", "text": "Error: fetch failed"})],
+            false,
+            Some(json!({"error": "fetch failed", "unexpected": true})),
+        ),
+        &["unexpected", "unknown field"],
+    );
+}
+
 // Keep fixture rows compact so the labeled routing matrix remains easy to scan.
 #[rustfmt::skip]
 fn route_fixture(name: &str) -> Value {

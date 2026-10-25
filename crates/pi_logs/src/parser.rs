@@ -2601,7 +2601,7 @@ fn parse_tool_result_details(
         "effective_config" => {
             serde_json::from_value(details).map(ToolResultDetails::EffectiveConfig)
         }
-        "fetch_content" => serde_json::from_value(details).map(ToolResultDetails::FetchContent),
+        "fetch_content" => parse_fetch_content_details(details),
         "fact_list" | "instinct_list" => {
             serde_json::from_value(details).map(ToolResultDetails::Count)
         }
@@ -2742,6 +2742,33 @@ fn parse_web_search_details(details: Value) -> Result<ToolResultDetails, serde_j
     } else {
         serde_json::from_value(details).map(ToolResultDetails::WebSearch)
     }
+}
+
+/// Handles the `fetch_content` lean case where a failed call records only
+/// `{error}` in `details` and no fetch breadcrumbs. A small strict helper
+/// preserves `deny_unknown_fields` and type validation; the normal (serde)
+/// path keeps `FetchContentDetails` breadcrumbs required, which preserves the
+/// dispatch invariant documented on the untagged `ToolResultDetails` enum
+/// that `FetchContentDetails` cannot absorb a bare `{error}` payload.
+fn parse_fetch_content_details(details: Value) -> Result<ToolResultDetails, serde_json::Error> {
+    let is_lean = details.get("urls").is_none() && details.get("error").is_some();
+    if is_lean {
+        let lean: FetchContentLeanDetails = serde_json::from_value(details)?;
+        Ok(ToolResultDetails::FetchContent(FetchContentDetails {
+            error: Some(lean.error),
+            ..Default::default()
+        }))
+    } else {
+        serde_json::from_value(details).map(ToolResultDetails::FetchContent)
+    }
+}
+
+/// Failed `fetch_content` calls that never reached a fetch record only the
+/// error summary, so the lean shape carries nothing else.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FetchContentLeanDetails {
+    error: String,
 }
 
 /// Strict helper for web_search results that omit the query-count fields:
@@ -4344,8 +4371,12 @@ pub struct FindDetails {
 /// Summary metadata recorded by the `fetch_content` tool. Newer failed
 /// fetches can still emit the same breadcrumb shape with an added top-level
 /// error summary, so the field stays optional to preserve compatibility with
-/// both older success payloads and newer partial / failed runs.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+/// both older success payloads and newer partial / failed runs. Failures that
+/// never reached a fetch carry only `{error}` and are normalized by
+/// `parse_fetch_content_details` into the `Default` breadcrumb values (empty
+/// `urls`, zero counts, empty `response_id`); treat `error` plus empty `urls`
+/// as "no fetch record" rather than as a real zero-length fetch.
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FetchContentDetails {
     pub urls: Vec<String>,
