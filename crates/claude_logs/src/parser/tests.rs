@@ -658,6 +658,13 @@ fn test_api_request_round_trips() {
 }
 
 #[test]
+fn test_api_request_without_safeguards_round_trips() {
+    let mut json = api_request_json();
+    json["params"].as_object_mut().unwrap().remove("safeguards");
+    assert_log_line_round_trips(json);
+}
+
+#[test]
 fn test_parse_fork_context_ref_log_line() {
     let json = serde_json::json!({
         "type": "fork-context-ref",
@@ -1660,6 +1667,20 @@ fn test_parse_assistant_api_error_message_with_error_details() {
             "429 {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"This request would exceed your account's monthly spend limit. Please try again later.\"},\"request_id\":\"req_011CcoWaJyfmubPDDPN2iUDU\"}"
         )
     );
+}
+
+// Claude Code 2.1.310 categorizes client-side failures (e.g. TLS) in `apiError`.
+#[test]
+fn test_parse_assistant_api_error_message_with_api_error() {
+    let assistant = parse_assistant_log_line(assistant_log_line_json(serde_json::json!({
+        "message": {"model": "<synthetic>"},
+        "apiError": "tls_untrusted_ca",
+        "error": "server_error",
+        "isApiErrorMessage": true,
+        "version": "2.1.310"
+    })));
+
+    assert_eq!(assistant.api_error.as_deref(), Some("tls_untrusted_ca"));
 }
 
 // Claude Code 2.1.206 began repeating the session id under the snake_case key `session_id`
@@ -3308,9 +3329,9 @@ fn test_parse_system_error_connection_ssl_and_unknown_fields() {
     );
 }
 
-#[test]
-fn test_parse_system_log_informational_without_git_branch() {
-    let json = serde_json::json!({
+/// A minimal informational system record without `gitBranch`; tests overlay single keys on it.
+fn informational_json() -> serde_json::Value {
+    serde_json::json!({
         "type": "system",
         "subtype": "informational",
         "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
@@ -3324,19 +3345,32 @@ fn test_parse_system_log_informational_without_git_branch() {
         "level": "info",
         "timestamp": "2025-01-01T00:00:00Z",
         "uuid": "550e8400-e29b-41d4-a716-446655440002"
-    });
+    })
+}
 
+fn parse_informational(json: serde_json::Value) -> SystemLogInformational {
     let line: LogLine =
         serde_json::from_value(json).expect("Failed to parse informational system message");
+    let LogLine::System(SystemLogLine::Informational(info)) = line else {
+        panic!("Expected System(Informational) variant, got {line:?}");
+    };
+    info
+}
 
-    match line {
-        LogLine::System(SystemLogLine::Informational(info)) => {
-            assert_eq!(info.git_branch, None);
-            assert_eq!(info.content, "Session started");
-            assert!(!info.is_meta);
-        }
-        _ => panic!("Expected System(Informational) variant"),
-    }
+#[test]
+fn test_parse_system_log_informational_without_git_branch() {
+    let info = parse_informational(informational_json());
+    assert_eq!(info.git_branch, None);
+    assert_eq!(info.content, "Session started");
+    assert!(!info.is_meta);
+}
+
+// Claude Code 2.1.310 writes plugin notices before any conversation message, so `parentUuid` is null.
+#[test]
+fn test_parse_system_log_informational_with_null_parent_uuid() {
+    let mut json = informational_json();
+    json["parentUuid"] = serde_json::Value::Null;
+    assert_eq!(parse_informational(json).parent_uuid, None);
 }
 
 fn away_summary_json() -> serde_json::Value {
@@ -3499,31 +3533,7 @@ fn test_parse_system_log_api_error_rejects_unknown_fields() {
 
 #[test]
 fn test_parse_system_log_informational_rejects_unknown_fields() {
-    let json = serde_json::json!({
-        "type": "system",
-        "subtype": "informational",
-        "parentUuid": "550e8400-e29b-41d4-a716-446655440000",
-        "isSidechain": false,
-        "userType": "external",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
-        "version": "2.0.0",
-        "content": "Session started",
-        "isMeta": false,
-        "level": "info",
-        "timestamp": "2025-01-01T00:00:00Z",
-        "uuid": "550e8400-e29b-41d4-a716-446655440002",
-        "unknownField": "should be rejected"
-    });
-
-    let err_msg = serde_json::from_value::<LogLine>(json)
-        .expect_err("Should reject unknown fields in SystemLogInformational")
-        .to_string();
-    assert!(
-        err_msg.contains("unknown field") || err_msg.contains("unknownField"),
-        "Error should mention unknown field, got: {}",
-        err_msg
-    );
+    assert_log_line_rejects_extra_field(informational_json(), |json| json);
 }
 
 #[test]
@@ -4583,9 +4593,16 @@ fn test_parse_nested_mcp_progress_in_agent() {
     }
 }
 
-#[test]
-fn test_parse_compact_boundary() {
-    let json = serde_json::json!({
+/// Builds a minimal compact_boundary record whose `compactMetadata` is the required
+/// `{trigger: manual, preTokens: 1}` with `metadata`'s keys merged over it, so a case states only
+/// the keys it is about.
+fn compact_boundary_json(metadata: serde_json::Value) -> serde_json::Value {
+    let serde_json::Value::Object(overrides) = metadata else {
+        panic!("metadata overrides are a JSON object");
+    };
+    let mut compact_metadata = serde_json::json!({"trigger": "manual", "preTokens": 1});
+    compact_metadata.as_object_mut().unwrap().extend(overrides);
+    serde_json::json!({
         "parentUuid": null,
         "logicalParentUuid": "550e8400-e29b-41d4-a716-446655440000",
         "isSidechain": false,
@@ -4602,360 +4619,190 @@ fn test_parse_compact_boundary() {
         "timestamp": "2025-01-01T00:00:00Z",
         "uuid": "550e8400-e29b-41d4-a716-446655440002",
         "level": "info",
-        "compactMetadata": {
-            "trigger": "manual",
-            "preTokens": 100000
-        }
-    });
+        "compactMetadata": compact_metadata
+    })
+}
 
-    let line: LogLine =
-        serde_json::from_value(json).expect("Failed to parse compact_boundary system message");
+fn parse_compact_boundary(json: serde_json::Value) -> CompactBoundary {
+    let line: LogLine = serde_json::from_value(json).expect("Failed to parse compact_boundary");
+    let LogLine::System(SystemLogLine::CompactBoundary(boundary)) = line else {
+        panic!("Expected System(CompactBoundary) variant, got {line:?}");
+    };
+    boundary
+}
 
-    match line {
-        LogLine::System(SystemLogLine::CompactBoundary(boundary)) => {
-            assert!(boundary.parent_uuid.is_none());
-            assert_eq!(
-                boundary.logical_parent_uuid,
-                Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap()
-            );
-            assert_eq!(boundary.content, "Compacted");
-            assert_eq!(boundary.is_meta, Some(false));
-            assert_eq!(boundary.compact_metadata.trigger, "manual");
-            assert_eq!(boundary.compact_metadata.pre_tokens, 100000);
-            // Pre-2.1.158 logs omit the preserved-segment metadata entirely.
-            assert_eq!(boundary.compact_metadata.post_tokens, None);
-            assert_eq!(boundary.compact_metadata.duration_ms, None);
-            assert_eq!(boundary.compact_metadata.pre_compact_discovered_tools, None);
-            assert_eq!(boundary.compact_metadata.preserved_segment, None);
-            assert_eq!(boundary.compact_metadata.preserved_messages, None);
-            assert_eq!(boundary.compact_metadata.cumulative_dropped_tokens, None);
-            assert_eq!(boundary.compact_metadata.messages_summarized, None);
-            assert_eq!(boundary.slug.as_deref(), Some("noble-floating-lemon"));
-        }
-        _ => panic!("Expected System(CompactBoundary) variant"),
+/// The parsed form of [`compact_boundary_json`]'s default metadata, a baseline for whole-struct
+/// comparisons. Pre-2.1.158 logs carry only `trigger` and `preTokens`.
+fn minimal_compact_metadata() -> CompactMetadata {
+    CompactMetadata {
+        trigger: "manual".to_string(),
+        pre_tokens: 1,
+        post_tokens: None,
+        duration_ms: None,
+        pre_compact_discovered_tools: None,
+        preserved_segment: None,
+        preserved_messages: None,
+        cumulative_dropped_tokens: None,
+        messages_summarized: None,
+        pre_compact_artifact_read_versions: None,
     }
 }
 
 #[test]
+fn test_parse_compact_boundary() {
+    let boundary = parse_compact_boundary(compact_boundary_json(serde_json::json!({})));
+
+    assert!(boundary.parent_uuid.is_none());
+    assert_eq!(
+        boundary.logical_parent_uuid,
+        Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap()
+    );
+    assert_eq!(boundary.content, "Compacted");
+    assert_eq!(boundary.is_meta, Some(false));
+    assert_eq!(boundary.compact_metadata, minimal_compact_metadata());
+    assert_eq!(boundary.slug.as_deref(), Some("noble-floating-lemon"));
+}
+
+#[test]
 fn test_parse_compact_boundary_with_preserved_metadata() {
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "logicalParentUuid": "6315c98b-3b35-4963-b061-a33490298c1e",
-        "isSidechain": false,
-        "userType": "external",
-        "cwd": "/test",
-        "sessionId": "897f641d-35f9-4a70-8b47-f3c8f3d9e308",
-        "version": "2.1.158",
-        "gitBranch": "HEAD",
-        "slug": "synchronous-sparking-scone",
-        "type": "system",
-        "subtype": "compact_boundary",
-        "content": "Conversation compacted",
-        "isMeta": false,
-        "timestamp": "2026-06-05T07:38:03.902Z",
-        "uuid": "dbec8794-4cb6-421b-8952-7dd0ac346d4f",
-        "level": "info",
-        "compactMetadata": {
-            "trigger": "manual",
-            "preTokens": 808766,
-            "durationMs": 96146,
-            "preCompactDiscoveredTools": ["TaskCreate", "TaskList", "TaskUpdate", "WebFetch"],
-            "preservedSegment": {
-                "headUuid": "f6a42fbc-3b1e-4588-8ad8-97b38b2db1b0",
-                "anchorUuid": "a48a8d61-431a-4c7a-9aa7-c986f0683bfc",
-                "tailUuid": "6315c98b-3b35-4963-b061-a33490298c1e"
-            },
-            "preservedMessages": {
-                "anchorUuid": "a48a8d61-431a-4c7a-9aa7-c986f0683bfc",
-                "uuids": ["f6a42fbc-3b1e-4588-8ad8-97b38b2db1b0", "6315c98b-3b35-4963-b061-a33490298c1e"],
-                "allUuids": ["f6a42fbc-3b1e-4588-8ad8-97b38b2db1b0", "4333f766-0f94-4bac-8e2a-f04908a7cb23", "6315c98b-3b35-4963-b061-a33490298c1e"]
-            },
-            "postTokens": 8676
-        }
-    });
+    let [head, anchor, mid, tail] = [
+        "f6a42fbc-3b1e-4588-8ad8-97b38b2db1b0",
+        "a48a8d61-431a-4c7a-9aa7-c986f0683bfc",
+        "4333f766-0f94-4bac-8e2a-f04908a7cb23",
+        "6315c98b-3b35-4963-b061-a33490298c1e",
+    ]
+    .map(|s| Uuid::parse_str(s).unwrap());
+    let boundary = parse_compact_boundary(compact_boundary_json(serde_json::json!({
+        "durationMs": 96146,
+        "preCompactDiscoveredTools": ["TaskCreate", "WebFetch"],
+        "preservedSegment": {"headUuid": head, "anchorUuid": anchor, "tailUuid": tail},
+        "preservedMessages": {
+            "anchorUuid": anchor,
+            "uuids": [head, tail],
+            "allUuids": [head, mid, tail]
+        },
+        "postTokens": 8676
+    })));
 
-    let line: LogLine = serde_json::from_value(json)
-        .expect("Failed to parse compact_boundary with preserved metadata");
-
-    match line {
-        LogLine::System(SystemLogLine::CompactBoundary(boundary)) => {
-            let meta = boundary.compact_metadata;
-            assert_eq!(meta.trigger, "manual");
-            assert_eq!(meta.pre_tokens, 808766);
-            assert_eq!(meta.post_tokens, Some(8676));
-            assert_eq!(meta.duration_ms, Some(96146));
-            assert_eq!(
-                meta.pre_compact_discovered_tools,
-                Some(vec![
-                    "TaskCreate".to_string(),
-                    "TaskList".to_string(),
-                    "TaskUpdate".to_string(),
-                    "WebFetch".to_string(),
-                ])
-            );
-
-            let segment = meta.preserved_segment.expect("preserved_segment present");
-            assert_eq!(
-                segment.head_uuid,
-                Uuid::parse_str("f6a42fbc-3b1e-4588-8ad8-97b38b2db1b0").unwrap()
-            );
-            assert_eq!(
-                segment.anchor_uuid,
-                Uuid::parse_str("a48a8d61-431a-4c7a-9aa7-c986f0683bfc").unwrap()
-            );
-            assert_eq!(
-                segment.tail_uuid,
-                Uuid::parse_str("6315c98b-3b35-4963-b061-a33490298c1e").unwrap()
-            );
-
-            let messages = meta.preserved_messages.expect("preserved_messages present");
-            assert_eq!(
-                messages.anchor_uuid,
-                Uuid::parse_str("a48a8d61-431a-4c7a-9aa7-c986f0683bfc").unwrap()
-            );
-            assert_eq!(
-                messages.uuids,
-                vec![
-                    Uuid::parse_str("f6a42fbc-3b1e-4588-8ad8-97b38b2db1b0").unwrap(),
-                    Uuid::parse_str("6315c98b-3b35-4963-b061-a33490298c1e").unwrap(),
-                ]
-            );
-            // allUuids is a distinct superset of uuids, so this catches a uuids/allUuids swap.
-            assert_eq!(
-                messages.all_uuids,
-                vec![
-                    Uuid::parse_str("f6a42fbc-3b1e-4588-8ad8-97b38b2db1b0").unwrap(),
-                    Uuid::parse_str("4333f766-0f94-4bac-8e2a-f04908a7cb23").unwrap(),
-                    Uuid::parse_str("6315c98b-3b35-4963-b061-a33490298c1e").unwrap(),
-                ]
-            );
-        }
-        _ => panic!("Expected System(CompactBoundary) variant"),
-    }
+    let meta = boundary.compact_metadata;
+    assert_eq!(meta.post_tokens, Some(8676));
+    assert_eq!(meta.duration_ms, Some(96146));
+    assert_eq!(
+        meta.pre_compact_discovered_tools,
+        Some(vec!["TaskCreate".to_string(), "WebFetch".to_string()])
+    );
+    assert_eq!(
+        meta.preserved_segment,
+        Some(PreservedSegment {
+            head_uuid: head,
+            anchor_uuid: anchor,
+            tail_uuid: tail,
+        })
+    );
+    // allUuids is a distinct superset of uuids, so this catches a uuids/allUuids swap.
+    assert_eq!(
+        meta.preserved_messages,
+        Some(PreservedMessages {
+            anchor_uuid: anchor,
+            uuids: vec![head, tail],
+            all_uuids: vec![head, mid, tail],
+        })
+    );
 }
 
 #[test]
 fn test_parse_compact_boundary_with_partial_preserved_metadata() {
     // An intermediate log shape: some 2.1.158 fields present, others absent. Each new field is
     // independently optional, so a partial mix must parse with the absent fields as None.
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "logicalParentUuid": "6315c98b-3b35-4963-b061-a33490298c1e",
-        "isSidechain": false,
-        "userType": "external",
-        "cwd": "/test",
-        "sessionId": "897f641d-35f9-4a70-8b47-f3c8f3d9e308",
-        "version": "2.1.158",
-        "gitBranch": "HEAD",
-        "slug": null,
-        "type": "system",
-        "subtype": "compact_boundary",
-        "content": "Conversation compacted",
-        "isMeta": false,
-        "timestamp": "2026-06-05T07:38:03.902Z",
-        "uuid": "dbec8794-4cb6-421b-8952-7dd0ac346d4f",
-        "level": "info",
-        "compactMetadata": {
-            "trigger": "auto",
-            "preTokens": 808766,
-            "postTokens": 8676,
-            "durationMs": 96146
-        }
-    });
+    let boundary = parse_compact_boundary(compact_boundary_json(serde_json::json!({
+        "trigger": "auto",
+        "postTokens": 8676,
+        "durationMs": 96146
+    })));
 
-    let line: LogLine = serde_json::from_value(json)
-        .expect("Failed to parse compact_boundary with partial preserved metadata");
-
-    match line {
-        LogLine::System(SystemLogLine::CompactBoundary(boundary)) => {
-            let meta = boundary.compact_metadata;
-            assert_eq!(meta.trigger, "auto");
-            assert_eq!(meta.pre_tokens, 808766);
-            assert_eq!(meta.post_tokens, Some(8676));
-            assert_eq!(meta.duration_ms, Some(96146));
-            assert_eq!(meta.pre_compact_discovered_tools, None);
-            assert_eq!(meta.preserved_segment, None);
-            assert_eq!(meta.preserved_messages, None);
-            assert_eq!(meta.cumulative_dropped_tokens, None);
-            assert_eq!(meta.messages_summarized, None);
+    assert_eq!(
+        boundary.compact_metadata,
+        CompactMetadata {
+            trigger: "auto".to_string(),
+            post_tokens: Some(8676),
+            duration_ms: Some(96146),
+            ..minimal_compact_metadata()
         }
-        _ => panic!("Expected System(CompactBoundary) variant"),
-    }
+    );
+}
+
+#[test]
+fn test_parse_artifact_read_version_rejects_unknown_fields() {
+    assert_log_line_rejects_extra_field(
+        compact_boundary_json(serde_json::json!({
+            "preCompactArtifactReadVersions": [{"slug": "s", "ver": "v"}]
+        })),
+        |json| &mut json["compactMetadata"]["preCompactArtifactReadVersions"][0],
+    );
 }
 
 #[test]
 fn test_parse_compact_boundary_with_session_kind() {
     // A backgrounded session's system records carry sessionKind too, so the shared boundary macro
     // must accept it alongside the conversation records.
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "logicalParentUuid": "1d6ea6ce-23d1-47d4-bf8a-65a9b884dc89",
-        "isSidechain": false,
-        "userType": "external",
-        "cwd": "/test",
-        "sessionId": "538faf26-5f15-48a0-be20-20876e5f4f29",
-        "version": "2.1.238",
-        "gitBranch": "HEAD",
-        "type": "system",
-        "subtype": "compact_boundary",
-        "content": "Conversation compacted",
-        "sessionKind": "bg",
-        "timestamp": "2026-08-31T15:48:03.553Z",
-        "uuid": "c7486d00-8c13-4665-acb0-0c3e5e812cd2",
-        "level": "info",
-        "compactMetadata": {
-            "trigger": "manual",
-            "preTokens": 468607,
-            "postTokens": 7737
-        }
-    });
+    let mut json = compact_boundary_json(serde_json::json!({}));
+    json["sessionKind"] = "bg".into();
 
-    let line: LogLine =
-        serde_json::from_value(json).expect("Failed to parse compact_boundary with sessionKind");
-
-    match line {
-        LogLine::System(SystemLogLine::CompactBoundary(boundary)) => {
-            assert_eq!(boundary.session_kind, Some(SessionKind::Bg));
-        }
-        other => panic!("Expected compact_boundary, got {other:?}"),
-    }
+    assert_eq!(
+        parse_compact_boundary(json).session_kind,
+        Some(SessionKind::Bg)
+    );
 }
 
 #[test]
 fn test_parse_compact_boundary_with_cumulative_dropped_tokens() {
     // Claude Code 2.1.197 added cumulativeDroppedTokens to compactMetadata.
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "logicalParentUuid": "1d6ea6ce-23d1-47d4-bf8a-65a9b884dc89",
-        "isSidechain": false,
-        "userType": "external",
-        "cwd": "/test",
-        "sessionId": "538faf26-5f15-48a0-be20-20876e5f4f29",
-        "version": "2.1.197",
-        "gitBranch": "HEAD",
-        "slug": "spicy-snuggling-ocean",
-        "type": "system",
-        "subtype": "compact_boundary",
-        "content": "Conversation compacted",
-        "isMeta": false,
-        "timestamp": "2026-07-06T15:48:03.553Z",
-        "uuid": "c7486d00-8c13-4665-acb0-0c3e5e812cd2",
-        "level": "info",
-        "compactMetadata": {
-            "trigger": "manual",
-            "preTokens": 922398,
-            "durationMs": 172092,
-            "preCompactDiscoveredTools": ["Monitor", "WebFetch", "WebSearch"],
-            "preservedSegment": {
-                "headUuid": "e6cd3a07-837a-4be6-ae4c-ee54fb79bc12",
-                "anchorUuid": "0421d5ff-507b-42bb-b799-b434c78f73f8",
-                "tailUuid": "1d6ea6ce-23d1-47d4-bf8a-65a9b884dc89"
-            },
-            "preservedMessages": {
-                "anchorUuid": "0421d5ff-507b-42bb-b799-b434c78f73f8",
-                "uuids": ["e6cd3a07-837a-4be6-ae4c-ee54fb79bc12", "1d6ea6ce-23d1-47d4-bf8a-65a9b884dc89"],
-                "allUuids": ["e6cd3a07-837a-4be6-ae4c-ee54fb79bc12", "1d6ea6ce-23d1-47d4-bf8a-65a9b884dc89"]
-            },
-            "postTokens": 14546,
-            "cumulativeDroppedTokens": 907852
-        }
-    });
+    let boundary = parse_compact_boundary(compact_boundary_json(serde_json::json!({
+        "cumulativeDroppedTokens": 907852
+    })));
 
-    let line: LogLine = serde_json::from_value(json)
-        .expect("Failed to parse compact_boundary with cumulativeDroppedTokens");
-
-    match line {
-        LogLine::System(SystemLogLine::CompactBoundary(boundary)) => {
-            let meta = boundary.compact_metadata;
-            assert_eq!(meta.pre_tokens, 922398);
-            assert_eq!(meta.post_tokens, Some(14546));
-            assert_eq!(meta.cumulative_dropped_tokens, Some(907852));
-        }
-        _ => panic!("Expected System(CompactBoundary) variant"),
-    }
+    assert_eq!(
+        boundary.compact_metadata.cumulative_dropped_tokens,
+        Some(907852)
+    );
 }
 
 #[test]
 fn test_parse_compact_boundary_with_messages_summarized() {
     // Claude Code 2.1.214 added messagesSummarized to compactMetadata.
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "logicalParentUuid": "fe41433a-9ce4-4f68-9a00-decd968be064",
-        "isSidechain": false,
-        "userType": "external",
-        "cwd": "/test",
-        "sessionId": "d7dc9685-4671-4982-8ebc-6bd9d79ad6b0",
-        "version": "2.1.214",
-        "gitBranch": "HEAD",
-        "slug": "partitioned-plotting-firefly",
-        "type": "system",
-        "subtype": "compact_boundary",
-        "content": "Conversation compacted",
-        "isMeta": false,
-        "timestamp": "2026-07-23T23:53:20.901Z",
-        "uuid": "94709d97-84f4-4579-8b95-6b6757672a2f",
-        "level": "info",
-        "compactMetadata": {
-            "trigger": "manual",
-            "preTokens": 847997,
-            "messagesSummarized": 703,
-            "durationMs": 222556,
-            "postTokens": 384048,
-            "cumulativeDroppedTokens": 463949
-        }
-    });
+    let boundary = parse_compact_boundary(compact_boundary_json(serde_json::json!({
+        "messagesSummarized": 703
+    })));
 
-    let line: LogLine = serde_json::from_value(json)
-        .expect("Failed to parse compact_boundary with messagesSummarized");
+    assert_eq!(boundary.compact_metadata.messages_summarized, Some(703));
+}
 
-    match line {
-        LogLine::System(SystemLogLine::CompactBoundary(boundary)) => {
-            let meta = boundary.compact_metadata;
-            assert_eq!(meta.pre_tokens, 847997);
-            assert_eq!(meta.post_tokens, Some(384048));
-            assert_eq!(meta.messages_summarized, Some(703));
-        }
-        _ => panic!("Expected System(CompactBoundary) variant"),
-    }
+#[test]
+fn test_parse_compact_boundary_with_artifact_read_versions() {
+    // Claude Code 2.1.302 added preCompactArtifactReadVersions to compactMetadata.
+    let boundary = parse_compact_boundary(compact_boundary_json(serde_json::json!({
+        "preCompactArtifactReadVersions": [
+            {"slug": "f2f87c14-ceed-4e17-9d54-cb79a6f4bdd1", "ver": "1792695947-e6cc"}
+        ]
+    })));
+
+    assert_eq!(
+        boundary.compact_metadata.pre_compact_artifact_read_versions,
+        Some(vec![ArtifactReadVersion {
+            slug: "f2f87c14-ceed-4e17-9d54-cb79a6f4bdd1".to_string(),
+            ver: "1792695947-e6cc".to_string(),
+        }])
+    );
 }
 
 // Claude Code 2.1.214 stopped emitting `isMeta` on compact_boundary records, so it must parse when
 // the field is absent.
 #[test]
 fn test_parse_compact_boundary_without_is_meta() {
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "logicalParentUuid": "f0d71e01-ae8d-49a7-8fe3-45171353e8d0",
-        "isSidechain": false,
-        "userType": "external",
-        "entrypoint": "cli",
-        "cwd": "/test",
-        "sessionId": "33479dd1-b321-4619-b4d1-3c1ebaacb0ca",
-        "version": "2.1.214",
-        "gitBranch": "HEAD",
-        "slug": "binary-skipping-mango",
-        "type": "system",
-        "subtype": "compact_boundary",
-        "content": "Conversation compacted",
-        "timestamp": "2026-07-21T17:41:54.339Z",
-        "uuid": "bf589097-56a7-45fa-9f80-bf6990bff0e7",
-        "level": "info",
-        "compactMetadata": {
-            "trigger": "manual",
-            "preTokens": 997403,
-            "postTokens": 7407,
-            "cumulativeDroppedTokens": 989996
-        }
-    });
+    let mut json = compact_boundary_json(serde_json::json!({}));
+    json.as_object_mut().unwrap().remove("isMeta");
 
-    let line: LogLine =
-        serde_json::from_value(json).expect("Failed to parse compact_boundary without isMeta");
-    match line {
-        LogLine::System(SystemLogLine::CompactBoundary(boundary)) => {
-            assert_eq!(boundary.is_meta, None);
-        }
-        _ => panic!("Expected System(CompactBoundary) variant"),
-    }
+    assert_eq!(parse_compact_boundary(json).is_meta, None);
 }
 
 #[test]
@@ -5065,72 +4912,14 @@ fn test_parse_preserved_messages_rejects_unknown_fields() {
 
 #[test]
 fn test_parse_compact_boundary_rejects_unknown_fields() {
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "logicalParentUuid": "550e8400-e29b-41d4-a716-446655440000",
-        "isSidechain": false,
-        "userType": "external",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
-        "version": "2.0.0",
-        "gitBranch": "main",
-        "type": "system",
-        "subtype": "compact_boundary",
-        "content": "Compacted",
-        "isMeta": false,
-        "timestamp": "2025-01-01T00:00:00Z",
-        "uuid": "550e8400-e29b-41d4-a716-446655440002",
-        "level": "info",
-        "compactMetadata": {
-            "trigger": "manual",
-            "preTokens": 100000
-        },
-        "extraField": "should be rejected"
-    });
-
-    let err_msg = serde_json::from_value::<LogLine>(json)
-        .expect_err("Should reject unknown fields in CompactBoundary")
-        .to_string();
-    assert!(
-        err_msg.contains("unknown field") || err_msg.contains("extraField"),
-        "Error should mention unknown field, got: {}",
-        err_msg
-    );
+    assert_log_line_rejects_extra_field(compact_boundary_json(serde_json::json!({})), |json| json);
 }
 
 #[test]
 fn test_parse_compact_metadata_rejects_unknown_fields() {
-    let json = serde_json::json!({
-        "parentUuid": null,
-        "logicalParentUuid": "550e8400-e29b-41d4-a716-446655440000",
-        "isSidechain": false,
-        "userType": "external",
-        "cwd": "/test",
-        "sessionId": "550e8400-e29b-41d4-a716-446655440001",
-        "version": "2.0.0",
-        "gitBranch": "main",
-        "type": "system",
-        "subtype": "compact_boundary",
-        "content": "Compacted",
-        "isMeta": false,
-        "timestamp": "2025-01-01T00:00:00Z",
-        "uuid": "550e8400-e29b-41d4-a716-446655440002",
-        "level": "info",
-        "compactMetadata": {
-            "trigger": "manual",
-            "preTokens": 100000,
-            "extraField": "should be rejected"
-        }
+    assert_log_line_rejects_extra_field(compact_boundary_json(serde_json::json!({})), |json| {
+        &mut json["compactMetadata"]
     });
-
-    let err_msg = serde_json::from_value::<LogLine>(json)
-        .expect_err("Should reject unknown fields in CompactMetadata")
-        .to_string();
-    assert!(
-        err_msg.contains("unknown field") || err_msg.contains("extraField"),
-        "Error should mention unknown field, got: {}",
-        err_msg
-    );
 }
 
 fn local_command_json() -> serde_json::Value {
@@ -7766,6 +7555,7 @@ fn test_parse_attachment_agent_listing_delta() {
             "addedTypes": ["claude", "Explore"],
             "addedLines": ["- claude: catch-all", "- Explore: read-only search"],
             "builtInTypes": ["Explore"],
+            "builtInPluginTypes": [],
             "removedTypes": [],
             "isInitial": true,
             "showConcurrencyNote": true
@@ -7776,7 +7566,7 @@ fn test_parse_attachment_agent_listing_delta() {
         "entrypoint": "cli",
         "cwd": "/test",
         "sessionId": "550e8400-e29b-41d4-a716-446655440001",
-        "version": "2.1.285",
+        "version": "2.1.310",
         "gitBranch": "main",
         "slug": null
     });
@@ -7784,6 +7574,7 @@ fn test_parse_attachment_agent_listing_delta() {
         panic!("Expected AgentListingDelta");
     };
     assert_eq!(delta.added_types, vec!["claude", "Explore"]);
+    assert_eq!(delta.built_in_plugin_types, Some(vec![]));
     assert_eq!(
         delta.added_lines,
         vec!["- claude: catch-all", "- Explore: read-only search"]
@@ -7875,7 +7666,14 @@ fn test_parse_attachment_deferred_tools_delta_with_readded_and_pending() {
             "removedNames": ["OldTool"],
             "readdedNames": ["PreviouslyRemoved"],
             "pendingMcpServers": ["server-a", "server-b"],
-            "failedMcpServers": [{"name": "server-c"}],
+            "failedMcpServers": [
+                {"name": "server-c"},
+                {
+                    "name": "server-e",
+                    "errorCode": "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+                    "error": "unable to get local issuer certificate"
+                }
+            ],
             "needsAuthMcpServers": ["server-d"],
             "wireHiddenNames": ["HiddenTool"],
             "surfacedNames": ["WebFetch"]
@@ -7898,9 +7696,18 @@ fn test_parse_attachment_deferred_tools_delta_with_readded_and_pending() {
     assert_eq!(delta.pending_mcp_servers, vec!["server-a", "server-b"]);
     assert_eq!(
         delta.failed_mcp_servers,
-        vec![FailedMcpServer {
-            name: "server-c".to_string()
-        }]
+        vec![
+            FailedMcpServer {
+                name: "server-c".to_string(),
+                error_code: None,
+                error: None,
+            },
+            FailedMcpServer {
+                name: "server-e".to_string(),
+                error_code: Some("UNABLE_TO_GET_ISSUER_CERT_LOCALLY".to_string()),
+                error: Some("unable to get local issuer certificate".to_string()),
+            },
+        ]
     );
     assert_eq!(delta.needs_auth_mcp_servers, vec!["server-d"]);
     assert_eq!(delta.wire_hidden_names, vec!["HiddenTool"]);
@@ -8410,7 +8217,8 @@ fn test_parse_attachment_skill_listing_with_names() {
             "content": "- a: does a\n- b: does b",
             "skillCount": 2,
             "isInitial": true,
-            "names": ["a", "b"]
+            "names": ["a", "b"],
+            "digests": ["0b31aeb2b3ffab38", "3c40134d0b720d06"]
         },
         "uuid": "550e8400-e29b-41d4-a716-446655440000",
         "timestamp": "2026-05-28T00:00:00Z",
@@ -8418,7 +8226,7 @@ fn test_parse_attachment_skill_listing_with_names() {
         "entrypoint": "cli",
         "cwd": "/test",
         "sessionId": "550e8400-e29b-41d4-a716-446655440001",
-        "version": "2.1.141",
+        "version": "2.1.310",
         "gitBranch": "main",
         "slug": null
     });
@@ -8428,6 +8236,13 @@ fn test_parse_attachment_skill_listing_with_names() {
     assert_eq!(listing.skill_count, 2);
     assert!(listing.is_initial);
     assert_eq!(listing.names, Some(vec!["a".to_string(), "b".to_string()]));
+    assert_eq!(
+        listing.digests,
+        Some(vec![
+            "0b31aeb2b3ffab38".to_string(),
+            "3c40134d0b720d06".to_string()
+        ])
+    );
 }
 
 // Older Claude Code logs emit `skill_listing` without `names`; the field must stay optional so those
@@ -11689,6 +11504,30 @@ fn test_parse_user_log_line_permission_decision() {
             reason_type
         );
     }
+}
+
+#[test]
+fn test_parse_user_log_line_sandboxed() {
+    let json = user_log_line_json(serde_json::json!({"version": "2.1.310", "sandboxed": false}));
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(line.sandboxed, Some(false));
+}
+
+// Claude Code 2.1.310 adds `grantScope` and `reasonCode` to user decisions.
+#[test]
+fn test_parse_user_log_line_permission_decision_with_grant_scope() {
+    let json = user_log_line_json(serde_json::json!({"permissionDecision": {
+        "decision": "accept",
+        "source": "user_temporary",
+        "grantScope": "once",
+        "reasonCode": "unknown"
+    }}));
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    let decision = line
+        .permission_decision
+        .expect("permissionDecision present");
+    assert_eq!(decision.grant_scope.as_deref(), Some("once"));
+    assert_eq!(decision.reason_code.as_deref(), Some("unknown"));
 }
 
 #[test]

@@ -638,7 +638,9 @@ pub struct RequestParams {
     pub max_tokens: u32,
     pub thinking: RequestThinking,
     pub context_management: RequestContextManagement,
-    pub safeguards: Vec<RequestSafeguard>,
+    /// Absent on some Claude Code 2.1.310 requests.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub safeguards: Option<Vec<RequestSafeguard>>,
     pub output_config: RequestOutputConfig,
 }
 
@@ -1026,6 +1028,9 @@ pub struct AgentListingDelta {
     /// The agent types that ship with Claude Code rather than coming from user or project agent
     /// definitions; absent on older logs, hence `Option`. Added in Claude Code 2.1.285+.
     pub built_in_types: Option<Vec<String>>,
+    /// Only ever observed empty, so the element type is assumed to match `built_in_types`. Added
+    /// in Claude Code 2.1.310+.
+    pub built_in_plugin_types: Option<Vec<String>>,
     pub removed_types: Vec<String>,
     pub is_initial: bool,
     pub show_concurrency_note: bool,
@@ -1238,12 +1243,17 @@ impl TryFrom<SurfacedToolDefinitionWire> for SurfacedToolDefinition {
 }
 
 /// A server whose connection failed, carried as an object rather than a bare id so Claude Code can
-/// attach failure detail to it later; strict so any such addition surfaces instead of being dropped.
+/// attach failure detail to it; strict so further additions surface instead of being dropped.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct FailedMcpServer {
     pub name: String,
+    /// Machine-readable failure code (e.g. `UNABLE_TO_GET_ISSUER_CERT_LOCALLY`); kept as a string
+    /// because it mirrors arbitrary Node/OpenSSL error codes. Added in Claude Code 2.1.310+.
+    pub error_code: Option<String>,
+    /// Human-readable failure message. Added in Claude Code 2.1.310+.
+    pub error: Option<String>,
 }
 
 /// The full definitions of the deferred tools whose schemas were loaded into the turn, the
@@ -2075,6 +2085,8 @@ pub struct SkillListing {
     /// Skill names summarized in `content`; absent in older Claude Code logs that listed only
     /// `content`. Added in Claude Code 2.1.158+.
     pub names: Option<Vec<String>>,
+    /// Opaque 16-hex-digit digests; nothing downstream reads them. Added in Claude Code 2.1.310+.
+    pub digests: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2167,8 +2179,8 @@ pub struct AgentsKilled {
 }
 
 /// The recap Claude Code writes while the user is away from the session (suppressible via
-/// `/config`). Shaped like [`SystemLogInformational`] minus its `level`. Added in Claude Code
-/// 2.1.238+.
+/// `/config`). Like [`SystemLogInformational`] but without `level`, with a required `parentUuid`,
+/// and with `sessionKind`. Added in Claude Code 2.1.238+.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
@@ -2583,7 +2595,9 @@ define_boundary_log! {
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct SystemLogInformational {
-    pub parent_uuid: Uuid,
+    /// `null` when the notice is written before any conversation message exists (e.g. a plugin
+    /// hook-skip notice at session start). Observed in Claude Code 2.1.310.
+    pub parent_uuid: Option<Uuid>,
     pub is_sidechain: bool,
     pub git_branch: Option<String>,
     /// Session slug identifier (e.g., "noble-floating-lemon"). Added in Claude Code 2.0.51.
@@ -2602,8 +2616,9 @@ pub struct SystemLogInformational {
 }
 
 /// `trigger` and `pre_tokens` are the only fields present before Claude Code 2.1.158; the
-/// preserved-segment fields arrived in 2.1.158, `cumulative_dropped_tokens` in 2.1.197, and
-/// `messages_summarized` in 2.1.214. All stay `Option` so older records still parse.
+/// preserved-segment fields arrived in 2.1.158, `cumulative_dropped_tokens` in 2.1.197,
+/// `messages_summarized` in 2.1.214, and `pre_compact_artifact_read_versions` in 2.1.302. All stay
+/// `Option` so older records still parse.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
@@ -2620,6 +2635,16 @@ pub struct CompactMetadata {
     pub cumulative_dropped_tokens: Option<usize>,
     /// Count of messages folded into the summary by this compaction. Added in Claude Code 2.1.214+.
     pub messages_summarized: Option<usize>,
+    /// Added in Claude Code 2.1.302+.
+    pub pre_compact_artifact_read_versions: Option<Vec<ArtifactReadVersion>>,
+}
+
+/// `ver` is an opaque version token (e.g. `1792695947-e6cc`), so it stays a raw string.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactReadVersion {
+    pub slug: String,
+    pub ver: String,
 }
 
 /// Added in Claude Code 2.1.158+.
@@ -2949,6 +2974,9 @@ pub struct UserLogLine {
     pub summarize_metadata: Option<SummarizeMetadata>,
     /// Todo list from Claude Code 2.0.47+. Contains tasks being tracked in the conversation.
     pub todos: Option<Vec<Todo>>,
+    /// Whether the tool call this result answers ran in Claude Code's sandbox. Added in Claude
+    /// Code 2.1.310+.
+    pub sandboxed: Option<bool>,
     /// UUID of the assistant message that triggered the tool use. Added in Claude Code 2.0.51+.
     #[serde(rename = "sourceToolAssistantUUID")]
     pub source_tool_assistant_uuid: Option<Uuid>,
@@ -3047,6 +3075,10 @@ pub struct PermissionDecision {
     pub source: String,
     /// Present on hook decisions and some config ones, absent on user decisions.
     pub reason_type: Option<String>,
+    /// How long the grant lasts (observed: `once`). Added in Claude Code 2.1.310+.
+    pub grant_scope: Option<String>,
+    /// Observed only as `unknown`. Added in Claude Code 2.1.310+.
+    pub reason_code: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3476,6 +3508,9 @@ pub struct AssistantLogLine {
     /// Claude Code logged rather than a parsed struct because it is the provider's opaque payload.
     /// Added in Claude Code 2.1.201+.
     pub error_details: Option<String>,
+    /// Client-side failure category for an API-error message (e.g. `tls_untrusted_ca`), more
+    /// specific than `error`. Added in Claude Code 2.1.310+.
+    pub api_error: Option<String>,
     /// Entry point that started the session (e.g., "cli"). Added in Claude Code 2.1.104+.
     pub entrypoint: Option<String>,
     /// Named subagent attributed with producing this message (e.g., "code-quality-reviewer").
