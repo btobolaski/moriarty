@@ -59,6 +59,10 @@
 //!   server status call) and the normal mode-based shape (with `mode`
 //!   required). Keeping their fields in separate derived structs preserves
 //!   strict unknown-field rejection without mirroring the common shape.
+//!   [`AskUserDetails`] likewise branches between the single-question payload
+//!   and the newer `questions` batch payload (`kind: "batch"`), whose
+//!   index-aligned `answers` replace the single `response`; its batch variant
+//!   validates through a private strict wire mirror before conversion.
 //!
 //! * **Forward-compatible protocol schemas** — structs representing
 //!   server-defined or runtime-defined protocol envelopes whose field
@@ -4164,9 +4168,20 @@ pub struct SubagentArtifacts {
     pub files: Vec<SubagentArtifactPaths>,
 }
 
+/// `ask_user` results have two wire shapes: one prompt per call, and the
+/// newer `questions` batch whose answers are index-aligned with its questions.
+/// Both keep strict unknown-field rejection inside their own variant.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum AskUserDetails {
+    Batch(AskUserBatchDetails),
+    Single(AskUserSingleDetails),
+}
+
+/// One-prompt `ask_user` result, the shape emitted before `questions` batches.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct AskUserDetails {
+pub struct AskUserSingleDetails {
     pub question: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<String>,
@@ -4174,6 +4189,73 @@ pub struct AskUserDetails {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response: Option<AskUserResponse>,
     pub cancelled: bool,
+}
+
+/// `ask_user` batch result. `Deserialize` runs through the strict
+/// `AskUserBatchDetailsWire` mirror, which rejects a misaligned answers list.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", try_from = "AskUserBatchDetailsWire")]
+pub struct AskUserBatchDetails {
+    pub kind: AskUserBatchKind,
+    pub questions: Vec<AskUserBatchQuestion>,
+    /// Index-aligned with `questions`. Pi emits an empty list while waiting or
+    /// after cancellation; a non-empty list must answer every question.
+    pub answers: Vec<AskUserBatchAnswer>,
+    pub cancelled: bool,
+}
+
+/// Wire mirror for [`AskUserBatchDetails`]: serde parses the fields strictly,
+/// then the alignment check runs before the public type exists.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AskUserBatchDetailsWire {
+    kind: AskUserBatchKind,
+    questions: Vec<AskUserBatchQuestion>,
+    answers: Vec<AskUserBatchAnswer>,
+    cancelled: bool,
+}
+
+impl TryFrom<AskUserBatchDetailsWire> for AskUserBatchDetails {
+    type Error = &'static str;
+
+    fn try_from(wire: AskUserBatchDetailsWire) -> Result<Self, Self::Error> {
+        // Pi emits either no answers (waiting/cancelled) or one outcome per
+        // question; a partial non-empty list is not a real wire state.
+        if !wire.answers.is_empty() && wire.answers.len() != wire.questions.len() {
+            return Err("ask_user batch answers must be empty or match questions");
+        }
+        Ok(Self {
+            kind: wire.kind,
+            questions: wire.questions,
+            answers: wire.answers,
+            cancelled: wire.cancelled,
+        })
+    }
+}
+
+/// Wire tag that identifies the `questions` batch shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AskUserBatchKind {
+    Batch,
+}
+
+/// One prompt in a batch; answers are index-aligned with these entries.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AskUserBatchQuestion {
+    pub question: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+    pub options: Vec<AskUserOption>,
+}
+
+/// Per-question outcome in a batch.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "camelCase", deny_unknown_fields)]
+pub enum AskUserBatchAnswer {
+    Answered { response: AskUserResponse },
+    Skipped {},
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

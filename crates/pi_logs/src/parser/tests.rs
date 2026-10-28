@@ -2690,8 +2690,9 @@ fn ask_user_tool_result_accepts_selection_response() {
         })),
     ));
 
-    let Some(ToolResultDetails::AskUser(details)) = tool_result.details else {
-        panic!("expected AskUser details")
+    let Some(ToolResultDetails::AskUser(AskUserDetails::Single(details))) = tool_result.details
+    else {
+        panic!("expected single AskUser details")
     };
 
     assert_eq!(
@@ -6459,8 +6460,9 @@ fn ask_user_tool_result_accepts_freeform_response() {
             "cancelled": false
         })),
     ));
-    let Some(ToolResultDetails::AskUser(details)) = tool_result.details else {
-        panic!("expected AskUser details")
+    let Some(ToolResultDetails::AskUser(AskUserDetails::Single(details))) = tool_result.details
+    else {
+        panic!("expected single AskUser details")
     };
     match details.response {
         Some(AskUserResponse::Freeform { text }) => assert_eq!(text, "helix"),
@@ -9073,13 +9075,125 @@ fn ask_user_tool_result_accepts_cancelled() {
             "cancelled": true
         })),
     ));
-    let Some(ToolResultDetails::AskUser(details)) = tool_result.details else {
-        panic!("expected AskUser details")
+    let Some(ToolResultDetails::AskUser(AskUserDetails::Single(details))) = tool_result.details
+    else {
+        panic!("expected single AskUser details")
     };
     assert!(details.cancelled);
     assert!(details.response.is_none());
     assert!(details.context.is_none());
     assert_eq!(details.options.len(), 2);
+}
+
+fn ask_user_batch_json(questions: Value, answers: Value) -> Value {
+    json!({
+        "kind": "batch",
+        "questions": questions,
+        "answers": answers,
+        "cancelled": false
+    })
+}
+
+fn ask_user_batch_one_question_json(answers: Value) -> Value {
+    ask_user_batch_json(json!([{"question": "Continue?", "options": []}]), answers)
+}
+
+/// The `questions` batch shape replaces `question`/`options`/`response` with
+/// per-question entries and index-aligned answers. Real sessions hit this
+/// shape; without a variant for it the whole log line failed to parse.
+#[test]
+fn ask_user_tool_result_accepts_question_batch() {
+    let tool_result = parse_tool_result_message(tool_result_message_json(
+        "ask_user",
+        vec![json!({
+            "type": "text",
+            "text": "User answered 2 of 2 questions"
+        })],
+        false,
+        Some(ask_user_batch_json(
+            json!([
+                {"question": "Where should I write the review?", "options": []},
+                {
+                    "question": "Which file location do you prefer?",
+                    "options": [{"title": "Repo: reviews/", "description": "Adds an untracked file"}]
+                }
+            ]),
+            json!([
+                {
+                    "status": "answered",
+                    "response": {"kind": "freeform", "text": "./reviews"}
+                },
+                {"status": "skipped"}
+            ]),
+        )),
+    ));
+
+    let Some(ToolResultDetails::AskUser(AskUserDetails::Batch(details))) = tool_result.details
+    else {
+        panic!("expected batch AskUser details")
+    };
+    assert_eq!(details.questions.len(), 2);
+    assert!(details.questions[0].options.is_empty());
+    assert_eq!(details.questions[1].options.len(), 1);
+    assert_eq!(details.answers.len(), 2);
+    assert!(matches!(
+        details.answers[0],
+        AskUserBatchAnswer::Answered { .. }
+    ));
+    assert!(matches!(
+        details.answers[1],
+        AskUserBatchAnswer::Skipped { .. }
+    ));
+    assert!(!details.cancelled);
+}
+
+#[test]
+fn ask_user_batch_accepts_empty_answers() {
+    let details: AskUserBatchDetails =
+        serde_json::from_value(ask_user_batch_one_question_json(json!([])))
+            .expect("batch with empty answers should parse");
+    assert!(details.answers.is_empty());
+}
+
+#[test]
+fn ask_user_batch_rejects_unknown_fields() {
+    let base = || ask_user_batch_one_question_json(json!([]));
+    let mut cases = [base(), base(), base(), base()];
+    cases[0]["unexpected"] = json!(true);
+    cases[1]["questions"][0]["unexpected"] = json!(true);
+    cases[2]["answers"] = json!([{
+        "status": "answered",
+        "response": {"kind": "freeform", "text": "yes"},
+        "unexpected": true
+    }]);
+    cases[3]["answers"] = json!([{"status": "skipped", "unexpected": true}]);
+
+    for details in cases {
+        let error = serde_json::from_value::<AskUserBatchDetails>(details)
+            .expect_err("batch shapes should reject unknown fields");
+        assert!(
+            error.to_string().contains("unexpected"),
+            "expected unknown-field error, got: {error}"
+        );
+    }
+}
+
+#[test]
+fn ask_user_batch_rejects_misaligned_answers() {
+    let error = serde_json::from_value::<AskUserBatchDetails>(ask_user_batch_json(
+        json!([
+            {"question": "Continue?", "options": []},
+            {"question": "Stop?", "options": []}
+        ]),
+        json!([{"status": "answered", "response": {"kind": "freeform", "text": "yes"}}]),
+    ))
+    .expect_err("alignment must be enforced by the type's own deserializer");
+    assert!(
+        error
+            .to_string()
+            .contains("must be empty or match questions"),
+        "expected index-alignment error, got: {error}"
+    );
 }
 
 #[test]
