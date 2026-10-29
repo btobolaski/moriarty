@@ -5,7 +5,7 @@
 //! assert on the typed result, while others pin serialization behavior or
 //! shape-routing assumptions that the parser relies on.
 
-use std::{error::Error as _, path::PathBuf};
+use std::{cmp::Ordering, error::Error as _, path::PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
@@ -441,6 +441,16 @@ fn parse_assistant_message(content: Vec<Value>, fixture: AssistantFixture<'_>) -
         panic!("expected Assistant")
     };
 
+    *assistant
+}
+
+fn parse_assistant_with_diagnostics(diagnostics: Value) -> AssistantMessage {
+    let fixture = AssistantFixture::new("openai-responses", "openai", "gpt-5.4", "stop");
+    let mut value = assistant_message_json(Vec::new(), fixture);
+    value["message"]["diagnostics"] = diagnostics;
+    let RoleMessage::Assistant(assistant) = parse_role_message(value) else {
+        panic!("expected Assistant")
+    };
     *assistant
 }
 
@@ -2063,54 +2073,88 @@ fn assistant_error_stop_reason_with_error_message() {
 
 #[test]
 fn assistant_message_parses_provider_diagnostics() {
-    let mut line = assistant_message_json(
-        vec![json!({"type": "thinking", "thinking": "..."})],
-        AssistantFixture::new("openai-codex-responses", "openai-codex", "gpt-5.5", "error")
-            .with_response_id("resp_1")
-            .with_error_message("WebSocket error"),
-    );
-
-    line["message"]["diagnostics"] = json!([{
+    let details = json!({
+        "configuredTransport": "auto",
+        "eventsEmitted": true,
+        "phase": "after_message_stream_start",
+        "requestBytes": 383050
+    });
+    let assistant = parse_assistant_with_diagnostics(json!([{
         "type": "provider_transport_failure",
         "timestamp": 1780972201664_i64,
         "error": {
             "name": "Error",
             "message": "WebSocket error",
-            "stack": "Error: WebSocket error\n    at foo"
+            "stack": "Error: WebSocket error\n    at foo",
+            "code": 1006
         },
-        "details": {
-            "configuredTransport": "auto",
-            "eventsEmitted": true,
-            "phase": "after_message_stream_start",
-            "requestBytes": 383050
-        }
-    }]);
-
-    let PiLogLine::Message(message) = parse(line) else {
-        panic!("expected message line");
-    };
-    let RoleMessage::Assistant(assistant) = message.message else {
-        panic!("expected assistant message");
-    };
-
-    assert_eq!(assistant.stop_reason, AssistantStopReason::Error);
-    assert_eq!(assistant.error_message.as_deref(), Some("WebSocket error"));
-    assert_eq!(assistant.diagnostics.len(), 1);
-    let d = &assistant.diagnostics[0];
-    assert_eq!(d.kind, "provider_transport_failure");
-    assert_eq!(d.timestamp, 1780972201664_i64);
-    assert_eq!(d.error.name, "Error");
-    assert_eq!(d.error.message, "WebSocket error");
-    assert!(d.error.stack.contains("Error: WebSocket error"));
+        "details": details.clone()
+    }]));
+    let diagnostic = &assistant.diagnostics[0];
     assert_eq!(
-        d.details.0,
-        json!({
-            "configuredTransport": "auto",
-            "eventsEmitted": true,
-            "phase": "after_message_stream_start",
-            "requestBytes": 383050
-        })
+        (diagnostic.kind.as_str(), diagnostic.timestamp),
+        ("provider_transport_failure", 1780972201664_i64)
     );
+    let error = diagnostic.error.as_ref().unwrap();
+    assert_eq!(error.name.as_deref(), Some("Error"));
+    assert_eq!(error.message, "WebSocket error");
+    assert_eq!(
+        error.stack.as_deref(),
+        Some("Error: WebSocket error\n    at foo")
+    );
+    let code = error.code.as_ref().unwrap();
+    assert_eq!(code, &DiagnosticErrorCode::Number(Number::from(1006_i64)));
+    assert_eq!(
+        serde_json::from_value::<DiagnosticErrorCode>(serde_json::to_value(code).unwrap()).unwrap(),
+        *code
+    );
+    assert_eq!(
+        diagnostic.details.as_ref().map(|value| &value.0),
+        Some(&details)
+    );
+}
+
+#[test]
+fn assistant_message_parses_diagnostic_without_error() {
+    let details = json!({"transformations": [{
+        "type": "thinking_dropped",
+        "path": "messages.212.content.0",
+        "reason": "prefix_binding_mismatch"
+    }]});
+    let assistant = parse_assistant_with_diagnostics(json!([
+        {"type": "anthropic_input_transformations", "timestamp": 1793292736946_i64, "details": details.clone()},
+        {"type": "provider_notice", "timestamp": 1793292736947_i64}
+    ]));
+
+    let [transformation, notice] = assistant.diagnostics.as_slice() else {
+        panic!("expected two diagnostics");
+    };
+    assert_eq!(transformation.kind, "anthropic_input_transformations");
+    assert!(transformation.error.is_none());
+    assert_eq!(
+        transformation.details.as_ref().map(|value| &value.0),
+        Some(&details)
+    );
+    assert_eq!(notice.details, None);
+}
+
+#[test]
+fn diagnostic_error_requires_message_and_accepts_string_code() {
+    let error: DiagnosticError = serde_json::from_value(json!({
+        "message": "provider request failed",
+        "code": "ERR_PROVIDER"
+    }))
+    .unwrap();
+    assert_eq!(
+        (error.name, error.message.as_str(), error.stack, error.code),
+        (
+            None,
+            "provider request failed",
+            None,
+            Some(DiagnosticErrorCode::Text("ERR_PROVIDER".into()))
+        )
+    );
+    assert!(serde_json::from_value::<DiagnosticError>(json!({"code": 1006})).is_err());
 }
 
 #[test]
@@ -2165,6 +2209,31 @@ fn diagnostic_error_rejects_unknown_field() {
     }]);
 
     assert_parse_error_contains_any("rejects unknown diagnostic error field", line, &["bogus"]);
+}
+
+#[test]
+fn diagnostic_error_code_order_is_total() {
+    let codes = [
+        DiagnosticErrorCode::Text("ERR_A".into()),
+        DiagnosticErrorCode::Text("ERR_B".into()),
+        DiagnosticErrorCode::Number(Number::from(1)),
+        DiagnosticErrorCode::Number(Number::from(1)),
+        DiagnosticErrorCode::Number(Number::from_f64(-0.0).unwrap()),
+        DiagnosticErrorCode::Number(Number::from_f64(0.0).unwrap()),
+        DiagnosticErrorCode::Number(Number::from_f64(-1.0).unwrap()),
+    ];
+
+    for left in &codes {
+        for right in &codes {
+            assert_eq!(left.cmp(right), right.cmp(left).reverse());
+            assert_eq!(left.cmp(right) == Ordering::Equal, left == right);
+            for third in &codes {
+                if left <= right && right <= third {
+                    assert!(left <= third);
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -2240,26 +2309,34 @@ fn assistant_duration_ms_is_optional_and_fractional() {
 }
 
 #[test]
-fn assistant_thinking_level_is_optional() {
-    let base = assistant_message_json(
-        vec![],
-        AssistantFixture::new(
-            "openai-completions",
-            "openrouter",
-            "z-ai/glm-5.3-flash",
-            "stop",
-        ),
-    );
-    let mut value = base.clone();
-    value["message"]["thinkingLevel"] = json!("high");
-    let RoleMessage::Assistant(assistant) = parse_role_message(value) else {
-        panic!("expected Assistant")
-    };
-    assert_eq!(assistant.thinking_level, Some(ThinkingLevel::High));
-    let RoleMessage::Assistant(assistant) = parse_role_message(base) else {
-        panic!("expected Assistant")
-    };
-    assert_eq!(assistant.thinking_level, None);
+fn assistant_thinking_levels_are_optional_and_preserve_provider_value() {
+    let fixture = AssistantFixture::new("openai-completions", "openrouter", "gpt-5.5", "stop");
+    let base = assistant_message_json(vec![], fixture);
+    for (label, thinking, provider_thinking) in [
+        ("omitted", None, None),
+        ("provider value", Some("high"), Some("provider-adaptive")),
+    ] {
+        let mut value = base.clone();
+        if let Some(level) = thinking {
+            value["message"]["thinkingLevel"] = json!(level);
+        }
+        if let Some(level) = provider_thinking {
+            value["message"]["providerThinkingLevel"] = json!(level);
+        }
+        let RoleMessage::Assistant(assistant) = parse_role_message(value) else {
+            panic!("expected Assistant")
+        };
+        assert_eq!(
+            assistant.thinking_level,
+            thinking.map(|_| ThinkingLevel::High),
+            "{label}"
+        );
+        assert_eq!(
+            assistant.provider_thinking_level.as_deref(),
+            provider_thinking,
+            "{label}"
+        );
+    }
 }
 
 #[test]

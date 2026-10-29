@@ -103,7 +103,7 @@ use serde::{
     de::{self, DeserializeOwned},
     ser::SerializeMap,
 };
-use serde_json::{Map, Value};
+use serde_json::{Map, Number, Value};
 use uuid::Uuid;
 
 #[cfg(test)]
@@ -692,39 +692,77 @@ pub struct AssistantMessage {
     pub duration_ms: Option<Decimal>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_level: Option<ThinkingLevel>,
+    /// Provider-native effort strings use a provider-owned vocabulary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_thinking_level: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
-    /// Provider diagnostics attached when the assistant turn fails due to
-    /// a transport error, rate limit, or similar provider-side issue.
+    /// Provider/runtime diagnostics such as transport failures and input transformations.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<DiagnosticItem>,
 }
 
+/// Pi's diagnostic envelope allows `error` and `details` to be absent; details vary by `type`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DiagnosticItem {
     #[serde(rename = "type")]
     pub kind: String,
     pub timestamp: i64,
-    pub error: DiagnosticError,
-    /// Provider-specific diagnostic payload whose shape varies by the
-    /// diagnostic `type`:
-    /// * `provider_transport_failure` — `{configuredTransport, eventsEmitted, phase, requestBytes}`
-    pub details: JsonBlob,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<DiagnosticError>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<JsonBlob>,
 }
 
-/// Standard JavaScript Error shape embedded in provider diagnostics.
+/// Pi requires only the message in a provider error; names and stacks may be absent.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DiagnosticError {
-    pub name: String,
-    pub message: String,
-    pub stack: String,
-    /// WebSocket close code when the transport error is a socket-level
-    /// close (e.g. `1000` for normal closure). Absent for non-WebSocket
-    /// transport failures.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub code: Option<u16>,
+    pub name: Option<String>,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stack: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<DiagnosticErrorCode>,
+}
+
+/// Providers report diagnostic codes as either strings or numbers.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum DiagnosticErrorCode {
+    Text(String),
+    Number(Number),
+}
+
+impl PartialOrd for DiagnosticErrorCode {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for DiagnosticErrorCode {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (self, other) {
+            (Self::Text(left), Self::Text(right)) => left.cmp(right),
+            (Self::Number(left), Self::Number(right)) if left == right => Ordering::Equal,
+            (Self::Number(left), Self::Number(right)) => {
+                diagnostic_number_key(left).cmp(&diagnostic_number_key(right))
+            }
+            (Self::Text(_), Self::Number(_)) => Ordering::Less,
+            (Self::Number(_), Self::Text(_)) => Ordering::Greater,
+        }
+    }
+}
+
+fn diagnostic_number_key(number: &Number) -> String {
+    // Number equality treats signed float zeroes as equal, so their ordering keys must match too.
+    if number.is_f64() && number.as_f64() == Some(0.0) {
+        "0.0".to_owned()
+    } else {
+        number.to_string()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
