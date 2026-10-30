@@ -5813,6 +5813,71 @@ fn shepard_journal_preserves_accepted_and_bound_payloads() {
     }
 }
 
+/// Base task-protocol snapshot shared by the custom-payload and tool-result
+/// fixtures.
+fn shepard_task_snapshot_json() -> Value {
+    json!({
+        "taskId":"a5a04a2f-d13b-4bd6-a04d-4e94c94fb0bf",
+        "kind":"child",
+        "parentSessionId":"shp-smoke-e95d16ce-c760-410f-8737-8c34fbfbfd5a",
+        "status":"queued",
+        "activity":"unknown",
+        "connection":"unknown",
+        "children":[],
+        "questions":[],
+        "progress":[],
+        "agent":"shepard-smoke-20261029",
+        "model":"openai-codex/gpt-6.1-sol",
+        "cwd":"/home/brendan/src/pi-shepard",
+        "sessionId":SESSION_ID
+    })
+}
+
+/// Pinned from a production line (the parse failure that motivated the
+/// variant): the task protocol announces task state as an extension-owned
+/// snapshot, which the parser must retain without modeling it.
+#[test]
+fn shepard_task_snapshot_is_preserved_opaque() {
+    let data = shepard_task_snapshot_json();
+    let parsed = parse_custom_payload("shepard.task.v1", data.clone());
+    let CustomPayload::ShepardTaskV1(snapshot) = parsed else {
+        panic!("expected shepard task snapshot")
+    };
+    assert_eq!(serde_json::to_value(snapshot).unwrap(), data);
+}
+
+/// Pinned from a production line (the parse failure that motivated the
+/// variant): task-protocol notifications nest task/question/progress records
+/// that shepard owns, so the envelope stays opaque.
+#[test]
+fn shepard_task_notification_is_preserved_opaque() {
+    let details = json!({
+        "taskId":"a5a04a2f-d13b-4bd6-a04d-4e94c94fb0bf",
+        "status":"running",
+        "question":{
+            "taskId":"a5a04a2f-d13b-4bd6-a04d-4e94c94fb0bf",
+            "questionId":"question",
+            "question":"Smoke ready",
+            "postTask":false,
+            "state":"pending"
+        },
+        "progress":{
+            "taskId":"a5a04a2f-d13b-4bd6-a04d-4e94c94fb0bf",
+            "message":"smoke-start",
+            "postTask":false
+        }
+    });
+    let payload = parse_custom_message_payload(
+        "notification",
+        "shepard.notification",
+        Some(details.clone()),
+    );
+    let CustomMessagePayload::ShepardNotification(blob) = payload else {
+        panic!("expected shepard task notification")
+    };
+    assert_eq!(serde_json::to_value(blob).unwrap(), details);
+}
+
 #[test]
 fn shepard_notice_parses_native_error_details() {
     let payload = parse_custom_message_payload(
@@ -6901,6 +6966,11 @@ fn shepard_receipts_parse_strictly() {
             json!({"ok":true,"subagentId":"child","runId":"run","status":"queued"}),
         ),
         ("shepard_complete", json!({"ok":true,"runId":"run"})),
+        ("shepard_start", json!({"taskId":"task"})),
+        (
+            "shepard_complete",
+            json!({"taskId":"task","status":"completed"}),
+        ),
         (
             "shepard_start",
             json!({"ok":false,"error":{"code":"runtime_error","message":"failed"}}),
@@ -6985,6 +7055,13 @@ fn shepard_success_payload(tool: &str) -> Value {
             "runId": "run",
             "disposition": "queued"
         }),
+        "shepard_send_task" => json!({"taskId": "task", "submitted": true}),
+        "shepard_reply_task" => json!({
+            "taskId": "task",
+            "questionId": "question",
+            "replied": true
+        }),
+        "shepard_inspect_task" => json!({"taskId": "task", "status": "completed"}),
         "shepard_inspect" => json!({"ok": true, "run": shepard_inspection_run_json()}),
         "shepard_interrupt" => json!({
             "ok": true,
@@ -7004,6 +7081,31 @@ fn shepard_ask_results_parse_strictly() {
         shepard_success_payload("shepard_ask"),
         "ask answer",
     );
+    assert_shepard_round_trip::<ShepardAskDetails>(
+        "shepard_ask",
+        json!({
+            "taskId": "task",
+            "questionId": "question",
+            "reply": "reply",
+            "postTask": false
+        }),
+        "task ask reply",
+    );
+}
+
+/// Pinned from production lines (the parse failures that motivated the
+/// variants): the shepard task protocol reports progress and completion
+/// with task ids instead of the older run receipts.
+#[test]
+fn shepard_task_protocol_results_parse_strictly() {
+    assert_shepard_round_trip::<ShepardProgressDetails>(
+        "shepard_progress",
+        json!({"taskId": "task", "postTask": true}),
+        "task progress",
+    );
+    // A snapshot without its task identity cannot be mistaken for one, which
+    // is what keeps the opaque task shape out of the untagged global union.
+    assert!(serde_json::from_value::<ShepardTaskSnapshot>(json!({"status":"running"})).is_err());
 }
 
 /// Routes a shared failure receipt through each tool name and asserts the
@@ -7071,6 +7173,39 @@ fn shepard_wait_rows_parse_strictly() {
     assert_eq!(serde_json::to_value(runs).unwrap(), wait_value["runs"]);
 }
 
+/// Pinned from a production line (the parse failure that motivated the
+/// variant): the task protocol pairs a wake reason with opaque task
+/// snapshots, not run inspections.
+#[test]
+fn shepard_task_wait_parses_opaque_snapshots() {
+    let mut task = shepard_task_snapshot_json();
+    task.as_object_mut().unwrap().extend(
+        json!({
+            "status":"running",
+            "activity":"waiting_for_parent",
+            "connection":"connected",
+            "questions":[{
+                "taskId":"a5a04a2f-d13b-4bd6-a04d-4e94c94fb0bf",
+                "questionId":"question",
+                "question":"Smoke ready",
+                "postTask":false,
+                "state":"pending"
+            }],
+            "paneId":"w9:p18",
+            "paneOpen":true,
+            "sessionFile":"/home/brendan/.pi/agent/sessions/child.jsonl"
+        })
+        .as_object()
+        .unwrap()
+        .clone(),
+    );
+    assert_shepard_round_trip::<ShepardWaitDetails>(
+        "shepard_wait",
+        json!({"reason":"question","tasks":[task]}),
+        "task wait",
+    );
+}
+
 #[test]
 fn shepard_wait_unavailable_rows_parse_strictly() {
     // Per-run inspection failures keep only the run id.
@@ -7109,6 +7244,22 @@ fn remaining_shepard_tool_results_parse_strictly() {
         "shepard_inspect",
         shepard_success_payload("shepard_inspect"),
         "inspect run",
+    );
+    // Task-protocol acknowledgements: same tools, task ids instead of runs.
+    assert_shepard_round_trip::<ShepardSendDetails>(
+        "shepard_send",
+        shepard_success_payload("shepard_send_task"),
+        "task send submitted",
+    );
+    assert_shepard_round_trip::<ShepardReplyDetails>(
+        "shepard_reply",
+        shepard_success_payload("shepard_reply_task"),
+        "task reply replied",
+    );
+    assert_shepard_round_trip::<ShepardInspectDetails>(
+        "shepard_inspect",
+        shepard_success_payload("shepard_inspect_task"),
+        "inspect task snapshot",
     );
     assert_shepard_round_trip::<ShepardInterruptDetails>(
         "shepard_interrupt",
@@ -9020,11 +9171,28 @@ fn session_line_with_parent_session() {
     }
 }
 
+/// Pinned from a production line (the parse failure that motivated the
+/// change): herdr/shepard launches pass a non-UUID session id.
+#[test]
+fn session_line_accepts_non_uuid_session_id() {
+    let line = parse(json!({
+        "type": "session",
+        "version": 3,
+        "id": "shp-smoke-e95d16ce-c760-410f-8737-8c34fbfbfd5a",
+        "timestamp": FIXED_TIMESTAMP,
+        "cwd": "/home/brendan/src/pi-shepard"
+    }));
+    let PiLogLine::Session(session) = line else {
+        panic!("expected Session, got {line:?}")
+    };
+    assert_eq!(session.id, "shp-smoke-e95d16ce-c760-410f-8737-8c34fbfbfd5a");
+}
+
 #[test]
 fn session_line_serializes_parent_session_as_camel_case() {
     let value = serde_json::to_value(SessionLine {
         version: 1,
-        id: uuid::Uuid::parse_str(SESSION_ID).expect("valid session id"),
+        id: SESSION_ID.to_owned(),
         timestamp: FIXED_TIMESTAMP.parse().expect("valid timestamp"),
         cwd: PathBuf::from("/home/brendan/src/moriarty"),
         parent_session: Some(PathBuf::from("/home/brendan/.flk/sessions/parent.jsonl")),

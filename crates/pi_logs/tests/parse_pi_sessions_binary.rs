@@ -56,7 +56,9 @@ fn parse_pi_sessions_binary_reports_failures() {
     write_jsonl(
         &bad,
         &[
-            r#"{"type":"session","version":1,"id":"not-a-uuid","timestamp":"2026-05-04T20:00:00Z","cwd":"/tmp/moriarty"}"#,
+            // Not a session id check: pi accepts opaque ids, so the failure
+            // must come from a genuinely malformed line.
+            r#"{"type":"session","id":"019dc252-e50e-766c-8182-d654b46881af"}"#,
         ],
     );
 
@@ -77,7 +79,5 @@ fn parse_pi_sessions_binary_reports_failures() {
     assert!(stdout.contains("scanning 2 *.jsonl file(s) under"));
     assert!(stdout.contains("FAIL "));
     assert!(stdout.contains("parsed 1 line(s) across 2 file(s); 1 failure(s)"));
-    assert!(
-        stderr.contains("invalid character") || stderr.contains("UUID") || stderr.contains("uuid")
-    );
+    assert!(stderr.contains("missing field"));
 }

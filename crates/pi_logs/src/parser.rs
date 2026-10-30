@@ -72,6 +72,9 @@
 //!   These structs omit `deny_unknown_fields` at the struct level and use
 //!   `#[serde(default)]` on every field, so unrecognized fields are
 //!   silently accepted rather than rejecting the whole log line.
+//!   [`ShepardTaskSnapshot`] takes the same approach further: its custom
+//!   deserializer validates only the `taskId` identity every snapshot must
+//!   carry and retains the remaining fields as opaque JSON.
 //!
 //! * **Versioned payloads** — [`CompactionDetails`] uses `#[serde(untagged)]`
 //!   to accept two structurally incompatible wire formats: a legacy shape
@@ -104,7 +107,6 @@ use serde::{
     ser::SerializeMap,
 };
 use serde_json::{Map, Number, Value};
-use uuid::Uuid;
 
 #[cfg(test)]
 mod tests;
@@ -186,7 +188,9 @@ pub enum PiLogLine {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SessionLine {
     pub version: u32,
-    pub id: Uuid,
+    /// Pi accepts an operator-supplied session id (e.g. shepard's
+    /// `shp-smoke-<uuid>`), so the id is an opaque string, not a UUID.
+    pub id: String,
     pub timestamp: DateTime<Utc>,
     pub cwd: PathBuf,
     /// Path to the parent session jsonl when this session was spawned as a
@@ -197,7 +201,7 @@ pub struct SessionLine {
 
 /// Child subagent session logs now emit a short `session_info` banner after
 /// the root `session` header so parents can label nested runs without reusing
-/// the UUID-shaped top-level session payload.
+/// the generated top-level session id.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SessionInfoLine {
@@ -442,6 +446,12 @@ pub enum CustomPayload {
     /// extension owns the payload schema, so cost analysis retains it opaquely.
     #[serde(rename = "shepard.v1")]
     ShepardV1(ShepardJournalData),
+    /// Task snapshot from shepard's newer task protocol. Shepard owns the
+    /// evolving task-state schema (statuses, activity, children, questions)
+    /// and nothing downstream inspects it, so it stays opaque like
+    /// [`CustomPayload::ShepardV1`]'s journal payload.
+    #[serde(rename = "shepard.task.v1")]
+    ShepardTaskV1(JsonBlob),
     /// Emitted by the rpiv-todo extension whenever the todo list changes;
     /// the payload is the same shape the `todo` tool's result details use.
     #[serde(rename = "rpiv-todo-snapshot")]
@@ -574,6 +584,11 @@ pub enum CustomMessagePayload {
     /// composite event id as `shepard-seen` acknowledgements.
     #[serde(rename = "shepard-event")]
     ShepardEvent(ShepardEventId),
+    /// Task-protocol notification announcing a state or progress change.
+    /// Shepard owns this evolving envelope (it nests task, question, and
+    /// progress records) and nothing downstream inspects it.
+    #[serde(rename = "shepard.notification")]
+    ShepardNotification(JsonBlob),
 }
 
 // ---------------------------------------------------------------------------
@@ -1996,6 +2011,37 @@ pub struct ShepardEventId {
     pub id: String,
 }
 
+/// `shepard_progress` results under the task protocol report the task they
+/// belong to plus whether they arrived after the task's terminal outcome;
+/// they carry no run receipt.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ShepardProgressDetails {
+    pub task_id: String,
+    pub post_task: bool,
+}
+
+/// Task-protocol task snapshot. Shepard owns this evolving state schema
+/// (status, activity, children, questions, progress), so the payload stays
+/// opaque; requiring `taskId` still keeps the untagged shepard result unions
+/// from absorbing unrelated payloads.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct ShepardTaskSnapshot(JsonBlob);
+
+impl<'de> Deserialize<'de> for ShepardTaskSnapshot {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        if value.get("taskId").and_then(Value::as_str).is_none() {
+            return Err(de::Error::custom("task snapshot requires taskId"));
+        }
+        Ok(Self(JsonBlob(value)))
+    }
+}
+
 // Start, completion, and failure receipts require different co-occurring fields;
 // independent Options would accept half-present or mixed success/error states.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -2011,6 +2057,16 @@ pub enum ShepardReceipt {
         ok: bool,
         run_id: String,
     },
+    /// The task protocol starts by returning just the task id.
+    TaskStarted {
+        task_id: String,
+    },
+    /// The task protocol completes with the task id and terminal status
+    /// instead of the run receipt's `ok`/`runId` pair.
+    TaskCompleted {
+        task_id: String,
+        status: String,
+    },
     Failed {
         ok: bool,
         error: ShepardNoticeError,
@@ -2018,13 +2074,15 @@ pub enum ShepardReceipt {
 }
 
 // Remaining native shepard tool results: each tool's output schema is a
-// union of one success shape plus the shared `{ok: false, error}` failure
-// receipt (sometimes carrying optional known-id siblings), so each is
-// modeled as an untagged enum whose variants reject the other shape's
+// union of one or more success shapes (the run receipt and, in newer
+// shepard versions, the task protocol) plus the shared `{ok: false, error}`
+// failure receipt (sometimes carrying optional known-id siblings), so each
+// is modeled as an untagged enum whose variants reject the other shapes'
 // required fields.
 
-/// `shepard_ask` blocks a child until the parent answers; the result is the
-/// correlated answer. Failures carry no ids.
+/// `shepard_ask` blocks a child until the parent answers. The run protocol
+/// returns the correlated answer; the task protocol returns the reply with
+/// its task identity. Failures carry no ids.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(untagged, rename_all_fields = "camelCase", deny_unknown_fields)]
 pub enum ShepardAskDetails {
@@ -2033,14 +2091,24 @@ pub enum ShepardAskDetails {
         question_id: String,
         answer: String,
     },
+    /// The task protocol answers with the task identity, the reply text, and
+    /// the post-task flag instead of the `ok`/`answer` receipt.
+    Replied {
+        task_id: String,
+        question_id: String,
+        reply: String,
+        post_task: bool,
+    },
     Failed {
         ok: bool,
         error: ShepardNoticeError,
     },
 }
 
-/// Why a `shepard_wait` returned. Closed vocabulary from the extension's
-/// wait output schema; a new reason must surface as a parse error.
+/// Why a run-based `shepard_wait` returned. Closed vocabulary from the
+/// extension's wait output schema; a new run-reason must surface as a parse
+/// error. Task-protocol waits carry an open reason string instead (see
+/// [`ShepardWaitDetails::TaskWaited`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ShepardWaitReason {
@@ -2067,9 +2135,9 @@ pub struct ShepardRunUnavailable {
     pub error: ShepardNoticeError,
 }
 
-/// `shepard_wait` blocks until child runs resolve; the receipt pairs the
-/// wake reason with per-run inspection rows (or per-run inspection
-/// failures).
+/// `shepard_wait` blocks until child runs (or task-protocol tasks) resolve;
+/// the receipt pairs the wake reason with per-run inspection rows or
+/// per-run inspection failures, or with opaque task snapshots.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(untagged, rename_all_fields = "camelCase", deny_unknown_fields)]
 pub enum ShepardWaitDetails {
@@ -2077,6 +2145,13 @@ pub enum ShepardWaitDetails {
         ok: bool,
         reason: ShepardWaitReason,
         runs: Vec<ShepardWaitRun>,
+    },
+    /// The task protocol waits on task ids rather than runs, so it reports
+    /// opacity-preserved task snapshots (the `shepard.task.v1` schema) and
+    /// an extension-owned wake reason instead of the closed run vocabulary.
+    TaskWaited {
+        reason: String,
+        tasks: Vec<ShepardTaskSnapshot>,
     },
     Failed {
         ok: bool,
@@ -2185,6 +2260,13 @@ pub enum ShepardReplyDetails {
         run_id: String,
         accepted: bool,
     },
+    /// The task protocol acknowledges a reply with the task identity and a
+    /// replied flag instead of the run receipt ids.
+    TaskReplied {
+        task_id: String,
+        question_id: String,
+        replied: bool,
+    },
     Failed {
         ok: bool,
         error: ShepardNoticeError,
@@ -2211,6 +2293,9 @@ pub enum ShepardSendDetails {
         /// vocabulary is extension-owned and nothing downstream reads it.
         disposition: String,
     },
+    /// The task protocol acknowledges guidance with the task id and a
+    /// submission flag instead of the run id and disposition.
+    TaskSubmitted { task_id: String, submitted: bool },
     Failed {
         ok: bool,
         error: ShepardNoticeError,
@@ -2223,7 +2308,9 @@ pub enum ShepardSendDetails {
     },
 }
 
-/// `shepard_inspect` returns one run's status/result view.
+/// `shepard_inspect` returns either one run's status/result view or, under
+/// the task protocol, an opaque task snapshot. Failures carry the shared
+/// error receipt.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(untagged, rename_all_fields = "camelCase", deny_unknown_fields)]
 pub enum ShepardInspectDetails {
@@ -2236,6 +2323,9 @@ pub enum ShepardInspectDetails {
         ok: bool,
         error: ShepardNoticeError,
     },
+    /// The task protocol inspects task ids and returns the task snapshot
+    /// (the `shepard.task.v1` schema) without the run receipt's `ok`.
+    Task(ShepardTaskSnapshot),
 }
 
 /// `shepard_interrupt`/`shepard_stop` control receipts. Only a requested
@@ -2695,6 +2785,9 @@ fn parse_tool_result_details(
             // Early shepard_complete successes emitted {} rather than a receipt.
             empty_or(details, ToolResultDetails::ShepardReceipt)
         }
+        "shepard_progress" => {
+            serde_json::from_value(details).map(ToolResultDetails::ShepardProgress)
+        }
         "shepard_ask" => serde_json::from_value(details).map(ToolResultDetails::ShepardAsk),
         "shepard_wait" => serde_json::from_value(details).map(ToolResultDetails::ShepardWait),
         "shepard_reply" => serde_json::from_value(details).map(ToolResultDetails::ShepardReply),
@@ -2852,6 +2945,7 @@ pub enum ToolResultDetails {
     // extension tools.
     ShepardContact(ShepardEventId),
     ShepardReceipt(ShepardReceipt),
+    ShepardProgress(ShepardProgressDetails),
     // Remaining native shepard tools, each routed by tool name above; their
     // success/failure unions are pinned by the extension's own output schemas.
     ShepardAsk(ShepardAskDetails),
