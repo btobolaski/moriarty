@@ -219,8 +219,8 @@ fn classify_family(model_lower: &str) -> Option<ModelFamily> {
     } else if model_lower.contains("fable") {
         Some(ModelFamily::Fable)
     } else if model_lower.contains("opus") {
-        // Opus 3 and Opus 4.x share the same family; the version major
-        // drives the pricing tier in `ClaudeModelPricing::for_model`.
+        // Opus releases share a family; pricing uses the full parsed version
+        // to distinguish tiers, including the Opus 5.5 threshold.
         Some(ModelFamily::Opus)
     } else {
         None
@@ -314,8 +314,6 @@ mod tests {
 
     #[test]
     fn from_model_string_classifies_all_opus_versions_as_opus_family() {
-        // Opus 3 and Opus 4.x share `ModelFamily::Opus`; the pricing tier
-        // (OPUS vs OPUS_4) is resolved later from the parsed version major.
         for id in [
             "claude-3-opus-20240229",
             "claude-opus-4",

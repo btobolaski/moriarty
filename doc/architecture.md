@@ -109,8 +109,16 @@ Generic cost-analysis library.
 - Concrete implementations currently support `pi_logs::PiLogLine` and `claude_logs::LogLine`. Claude log costs are
   calculated in `cost_analyzer` with local Decimal-based Claude pricing helpers (`ClaudeModelPricing::for_model`) that
   consume `&claude_logs::Model`; the family enum itself lives in `claude_logs` so the parser and pricing layer agree on
-  classification without depending on `moriarty::api_pricing` internals. Opus 3 vs Opus 4.x share `ModelFamily::Opus`
-  and the pricing dispatch reads the parsed `version.major` to pick the OPUS or OPUS_4 tier; `ModelFamily::Fable`
+  classification without depending on `moriarty::api_pricing` internals. `ModelFamily::Opus` dispatch compares the full
+  parsed version to select OPUS_5_5 for 5.5 and later ($4 input / $20 output / $5 short cache write / $0.20 cache read per
+  million tokens), retaining OPUS_4 for earlier major versions >= 4 and OPUS for older or versionless ids. Claude cache
+  writes split the aggregate creation count into the recorded 1-hour subset
+  (`cache_creation.ephemeral_1h_input_tokens`, priced at twice input) and the remainder (5-minute rate); token totals
+  still count that subset only once. Claude can retain earlier-iteration duration metadata on fallback and zeroed
+  content records, so the pricing adapter caps the 1-hour count at the authoritative top-level creation count rather than
+  rejecting the record or billing extra tokens. The pricing helper rejects inconsistent programmatically constructed
+  counts; the parser continues to accept these Claude-written records.
+  Rates: [Anthropic pricing](https://platform.claude.com/docs/en/about-claude/pricing). `ModelFamily::Fable`
   compares the full parsed `ModelVersion` against 5.1 to pick FABLE (Fable 5 and versionless ids) or FABLE_5_1 (5.1 and
   later, which differs only in its reduced cache-read rate).
 - `moriarty::api_pricing` and `moriarty::pi_cost` both delegate all log loading, deduplication, pricing, and raw token

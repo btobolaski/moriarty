@@ -714,10 +714,12 @@ mod tests {
     }
 
     fn expected_claude_dedup_cost() -> LlmCost {
-        ClaudeModelPricing::SONNET.calculate_cost(&ClaudeTokenCounts {
-            input_tokens: 2_000_000,
-            ..Default::default()
-        })
+        ClaudeModelPricing::SONNET
+            .calculate_cost(&ClaudeTokenCounts {
+                input_tokens: 2_000_000,
+                ..Default::default()
+            })
+            .unwrap()
     }
 
     async fn assert_claude_dedup_case(case: ClaudeDedupCase<'_>) {
@@ -753,6 +755,68 @@ mod tests {
             "case {}",
             case.name
         );
+    }
+
+    #[tokio::test]
+    async fn claude_stale_cache_metadata_does_not_discard_a_session() {
+        let mut fallback = claude_usage_json(2, 9_673, 0, 543_961);
+        fallback["cache_creation"]["ephemeral_1h_input_tokens"] = json!(603);
+        fallback["iterations"] = json!([
+            {"type":"message", "model":"claude-fable-5", "cache_creation_input_tokens":603,
+             "cache_creation":{"ephemeral_1h_input_tokens":603,"ephemeral_5m_input_tokens":0}},
+            {"type":"fallback_message", "model":"claude-opus-4-8", "cache_creation_input_tokens":0,
+             "cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0}}
+        ]);
+        let mut zeroed = claude_usage_json(0, 0, 0, 0);
+        zeroed["cache_creation"]["ephemeral_1h_input_tokens"] = json!(634);
+        zeroed["iterations"] = json!([
+            {"type":"message", "input_tokens":2, "output_tokens":112,
+             "cache_read_input_tokens":335709, "cache_creation_input_tokens":634,
+             "cache_creation":{"ephemeral_1h_input_tokens":634,"ephemeral_5m_input_tokens":0}}
+        ]);
+        for (model, usage, expected) in [
+            ("claude-opus-4-8", fallback, Decimal::new(5_138_155, 7)),
+            ("claude-opus-5-5", zeroed, Decimal::ZERO),
+        ] {
+            let dir = temp_dir();
+            let stale = claude_assistant_json(
+                None,
+                Some("req-stale"),
+                "msg-stale",
+                "22222222-2222-4222-8222-222222222222",
+                model,
+                usage,
+            );
+            let billed = claude_assistant_json(
+                None,
+                Some("req-billed"),
+                "msg-billed",
+                "33333333-3333-4333-8333-333333333333",
+                "claude-opus-5-5",
+                claude_usage_json(1_000_000, 0, 0, 0),
+            );
+            write_log_files(
+                dir.path(),
+                &[("session.jsonl", format!("{stale}\n{billed}\n"))],
+            )
+            .await;
+            let result = analyze_directory::<ClaudeLogLine>(dir.path().to_path_buf()).await;
+            assert!(!result.had_errors, "{model}");
+            assert_eq!(result.lines.len(), 2);
+            let stale = result
+                .lines
+                .iter()
+                .find(|line| line.id == "req-stale")
+                .unwrap();
+            assert_eq!(stale.cost.total(), expected);
+            assert_eq!(stale.cost.cache_write, Decimal::ZERO);
+            let billed = result
+                .lines
+                .iter()
+                .find(|line| line.id == "req-billed")
+                .unwrap();
+            assert_eq!(billed.cost.total(), Decimal::new(4, 0));
+        }
     }
 
     #[tokio::test]

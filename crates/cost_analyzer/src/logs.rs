@@ -4,6 +4,7 @@ use chrono::{DateTime, Utc};
 use miette::{Context, IntoDiagnostic};
 use rust_decimal::Decimal;
 use serde::de::DeserializeOwned;
+use tracing::error;
 use uuid::Uuid;
 
 use claude_logs::{
@@ -172,7 +173,7 @@ pub struct ClaudeModelPricing {
     pub input: Decimal,
     /// Price per million output tokens.
     pub output: Decimal,
-    /// Price per million prompt cache write tokens.
+    /// Base 5-minute rate; 1-hour writes use twice the input rate.
     pub cache_write: Decimal,
     /// Price per million prompt cache read tokens.
     pub cache_read: Decimal,
@@ -215,6 +216,19 @@ impl ClaudeModelPricing {
         cache_read: decimal_rate(50, 2),
     };
 
+    /// Opus 5.5's cache reads are $0.20/MTok, not the older 0.1x-input rate.
+    pub const OPUS_5_5: Self = Self {
+        input: decimal_rate(4, 0),
+        output: decimal_rate(20, 0),
+        cache_write: decimal_rate(5, 0),
+        cache_read: decimal_rate(2, 1),
+    };
+
+    const OPUS_5_5_FIRST_VERSION: ClaudeModelVersion = ClaudeModelVersion {
+        major: 5,
+        minor: Some(5),
+    };
+
     /// Pricing for Fable 5 (effective as of 2026-05-26).
     /// Applies to `claude-fable-*` model strings below version 5.1. Anthropic
     /// publishes only the input/output rates for Fable 5; the cache rates
@@ -246,23 +260,27 @@ impl ClaudeModelPricing {
         minor: Some(1),
     };
 
-    pub fn calculate_cost(&self, usage: &ClaudeTokenCounts) -> LlmCost {
-        LlmCost {
+    /// Reject inconsistent subsets rather than charging for unreported cache-write tokens.
+    pub fn calculate_cost(&self, usage: &ClaudeTokenCounts) -> miette::Result<LlmCost> {
+        let short_write = usage.cache_write_5m_tokens()?;
+        Ok(LlmCost {
             input: per_million_token_cost(usage.input_tokens, self.input),
-            cache_write: per_million_token_cost(usage.cache_write_tokens, self.cache_write),
+            cache_write: per_million_token_cost(short_write, self.cache_write)
+                + per_million_token_cost(
+                    usage.cache_write_1h_tokens,
+                    self.input * Decimal::from(2),
+                ),
             cache_read: per_million_token_cost(usage.cache_read_tokens, self.cache_read),
             output: per_million_token_cost(usage.output_tokens, self.output),
-        }
+        })
     }
 
     /// Returns `None` only for the `Synthetic` family — harness-fabricated
     /// assistant turns have no real usage to bill.
     ///
-    /// Opus pricing is version-tiered: ids whose major version is `>= 4` use
-    /// the Opus 4 rate (`$5/$25`); the rest, including bare/versionless
-    /// `"OPUS"` inputs, default to the Opus 3 rate (`$15/$75`) because that
-    /// is the only historical Opus pricing tier without explicit version
-    /// digits in the wire id.
+    /// Opus 5.5 and later use `$4/$20` with reduced cache reads. Earlier ids
+    /// with major version `>= 4` retain the `$5/$25` tier; older and
+    /// versionless ids retain the Opus 3 tier (`$15/$75`).
     ///
     /// Fable is version-tiered too: `5.1` and later use the reduced
     /// cache-read rate; `5` and versionless ids stay on the launch tier.
@@ -274,8 +292,9 @@ impl ClaudeModelPricing {
                 Some(version) if version >= Self::FABLE_5_1_FIRST_VERSION => Self::FABLE_5_1,
                 _ => Self::FABLE,
             }),
-            ClaudeModelFamily::Opus => Some(match model.version.map(|v| v.major) {
-                Some(major) if major >= 4 => Self::OPUS_4,
+            ClaudeModelFamily::Opus => Some(match model.version {
+                Some(version) if version >= Self::OPUS_5_5_FIRST_VERSION => Self::OPUS_5_5,
+                Some(version) if version.major >= 4 => Self::OPUS_4,
                 _ => Self::OPUS,
             }),
             ClaudeModelFamily::Synthetic => None,
@@ -288,7 +307,21 @@ pub struct ClaudeTokenCounts {
     pub input_tokens: usize,
     pub output_tokens: usize,
     pub cache_write_tokens: usize,
+    /// Subset of `cache_write_tokens`, not additional tokens.
+    pub cache_write_1h_tokens: usize,
     pub cache_read_tokens: usize,
+}
+
+impl ClaudeTokenCounts {
+    fn cache_write_5m_tokens(&self) -> miette::Result<usize> {
+        self.cache_write_tokens
+            .checked_sub(self.cache_write_1h_tokens)
+            .ok_or_else(|| {
+                miette::miette!(
+                    "Claude 1-hour cache-write tokens exceed aggregate cache-write tokens"
+                )
+            })
+    }
 }
 
 fn per_million_token_cost(token_count: usize, price_per_million_tokens: Decimal) -> Decimal {
@@ -307,6 +340,12 @@ fn claude_token_counts_from_usage(usage: &ClaudeAssistantUsage) -> ClaudeTokenCo
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
         cache_write_tokens: usage.cache_creation_input_tokens,
+        // Claude can retain earlier iteration cache metadata on fallback or zeroed
+        // content records. Only the top-level aggregate contributes billable tokens.
+        cache_write_1h_tokens: usage
+            .cache_creation
+            .ephemeral_1h_input_tokens
+            .min(usage.cache_creation_input_tokens),
         cache_read_tokens: usage.cache_read_input_tokens,
     }
 }
@@ -447,7 +486,10 @@ impl AnalyzableLog for ClaudeLogLine {
     fn cost(&self) -> Option<LlmCost> {
         let (assistant, pricing) = priced_claude_assistant(self)?;
         let token_counts = claude_token_counts_from_usage(&assistant.message.usage);
-        Some(pricing.calculate_cost(&token_counts))
+        pricing
+            .calculate_cost(&token_counts)
+            .inspect_err(|error| error!(%error, "invalid Claude token counts"))
+            .ok()
     }
 
     fn token_count(&self, token_type: TokenType) -> Option<u64> {
@@ -1850,13 +1892,17 @@ mod tests {
             ("claude-opus-3-5-20241022", ClaudeModelPricing::OPUS),
             ("claude-opus-4-20250514", ClaudeModelPricing::OPUS_4),
             ("claude-opus-4-7", ClaudeModelPricing::OPUS_4),
+            ("claude-opus-5", ClaudeModelPricing::OPUS_4),
+            ("claude-opus-5-4", ClaudeModelPricing::OPUS_4),
+            ("claude-opus-5-5", ClaudeModelPricing::OPUS_5_5),
+            ("claude-opus-5-5[1m]", ClaudeModelPricing::OPUS_5_5),
+            ("claude-opus-5-6", ClaudeModelPricing::OPUS_5_5),
+            ("claude-opus-6", ClaudeModelPricing::OPUS_5_5),
             ("claude-fable-5", ClaudeModelPricing::FABLE),
             ("claude-fable-5-1", ClaudeModelPricing::FABLE_5_1),
             // The `[1m]` context-window suffix is stripped before version
             // parsing, so it must not knock a 5.1 id back to the launch tier.
             ("claude-fable-5-1[1m]", ClaudeModelPricing::FABLE_5_1),
-            // Later Fable releases inherit the newest tier, mirroring how
-            // Opus `major >= 4` resolves to OPUS_4.
             ("claude-fable-6", ClaudeModelPricing::FABLE_5_1),
         ];
         for (id, expected) in cases {
@@ -1892,36 +1938,135 @@ mod tests {
     }
 
     #[test]
-    fn claude_pricing_constants_use_decimal_rates() {
-        assert_eq!(ClaudeModelPricing::SONNET.input, Decimal::new(3, 0));
-        assert_eq!(ClaudeModelPricing::SONNET.output, Decimal::new(15, 0));
-        assert_eq!(ClaudeModelPricing::SONNET.cache_write, Decimal::new(375, 2));
-        assert_eq!(ClaudeModelPricing::SONNET.cache_read, Decimal::new(30, 2));
-        assert_eq!(ClaudeModelPricing::HAIKU.cache_read, Decimal::new(1, 1));
-        assert_eq!(ClaudeModelPricing::OPUS.input, Decimal::new(15, 0));
-        assert_eq!(ClaudeModelPricing::OPUS_4.cache_write, Decimal::new(625, 2));
-        assert_eq!(ClaudeModelPricing::FABLE.input, Decimal::new(10, 0));
-        assert_eq!(ClaudeModelPricing::FABLE.output, Decimal::new(50, 0));
-        assert_eq!(ClaudeModelPricing::FABLE.cache_write, Decimal::new(125, 1));
-        assert_eq!(ClaudeModelPricing::FABLE.cache_read, Decimal::new(1, 0));
+    fn claude_pricing_zero_tokens_produces_zero_cost() {
+        let cost = ClaudeModelPricing::SONNET
+            .calculate_cost(&ClaudeTokenCounts::default())
+            .unwrap();
+
+        assert_eq!(cost, integer_cost(0, 0, 0, 0));
     }
 
     #[test]
-    fn claude_pricing_zero_tokens_produces_zero_cost() {
-        let cost = ClaudeModelPricing::SONNET.calculate_cost(&ClaudeTokenCounts::default());
+    fn claude_cache_write_pricing_respects_duration_without_extra_tokens() {
+        for (model, expected) in [
+            (
+                "claude-opus-5-5",
+                [decimal_rate(5, 0), decimal_rate(65, 1), decimal_rate(8, 0)],
+            ),
+            (
+                "claude-sonnet-4-5",
+                [
+                    decimal_rate(375, 2),
+                    decimal_rate(4875, 3),
+                    decimal_rate(6, 0),
+                ],
+            ),
+            (
+                "claude-fable-5-1",
+                [
+                    decimal_rate(125, 1),
+                    decimal_rate(1625, 2),
+                    decimal_rate(20, 0),
+                ],
+            ),
+        ] {
+            for (long_write, expected_cost) in [0, 500_000, 1_000_000].into_iter().zip(expected) {
+                let mut usage = claude_usage_json(11, 13, 1_000_000, 17);
+                usage["cache_creation"] = json!({
+                    "ephemeral_5m_input_tokens": 1_000_000 - long_write,
+                    "ephemeral_1h_input_tokens": long_write,
+                });
+                let parsed = parse_claude_line_with_cost(claude_assistant_json(
+                    None,
+                    Some("req-duration"),
+                    "msg-duration",
+                    CLAUDE_ASSISTANT_UUID,
+                    model,
+                    usage,
+                ));
+                assert_eq!(
+                    parsed.cost.cache_write, expected_cost,
+                    "{model}, 1h={long_write}"
+                );
+                for (token_type, expected_count) in [
+                    (TokenType::Input, 11),
+                    (TokenType::Output, 13),
+                    (TokenType::CacheWrite, 1_000_000),
+                    (TokenType::CacheRead, 17),
+                ] {
+                    assert_eq!(parsed.log.token_count(token_type), Some(expected_count));
+                }
+            }
+        }
+    }
 
-        assert_eq!(cost, integer_cost(0, 0, 0, 0));
+    #[test]
+    fn claude_cache_duration_metadata_cannot_add_billable_tokens() {
+        for (total, long_write) in [(0, 1), (1, 2)] {
+            let counts = ClaudeTokenCounts {
+                cache_write_tokens: total,
+                cache_write_1h_tokens: long_write,
+                ..Default::default()
+            };
+            assert!(
+                ClaudeModelPricing::OPUS_5_5
+                    .calculate_cost(&counts)
+                    .is_err()
+            );
+            let mut usage = claude_usage_json(0, 0, total, 0);
+            usage["cache_creation"]["ephemeral_1h_input_tokens"] = json!(long_write);
+            let value = claude_assistant_json(
+                None,
+                Some("req-invalid-cache"),
+                "msg-invalid-cache",
+                CLAUDE_ASSISTANT_UUID,
+                "claude-opus-5-5",
+                usage,
+            );
+            let parsed = parse_claude_line_with_cost(value);
+            assert_eq!(
+                parsed.log.token_count(TokenType::CacheWrite),
+                Some(total as u64)
+            );
+            assert_eq!(
+                parsed.cost.cache_write,
+                per_million_token_cost(total, decimal_rate(8, 0))
+            );
+        }
+    }
+
+    #[test]
+    fn opus_5_5_reported_usage_has_correct_cost() {
+        let mut usage = claude_usage_json(1_622, 492_805, 5_954_715, 161_722_051);
+        usage["cache_creation"] = json!({
+            "ephemeral_5m_input_tokens": 846_158,
+            "ephemeral_1h_input_tokens": 5_108_557,
+        });
+        let parsed = parse_claude_line_with_cost(claude_assistant_json(
+            None,
+            Some("req-opus-5-5"),
+            "msg-opus-5-5",
+            CLAUDE_ASSISTANT_UUID,
+            "claude-opus-5-5",
+            usage,
+        ));
+        assert_eq!(
+            parsed.cost,
+            LlmCost {
+                input: decimal_rate(6_488, 6),
+                output: decimal_rate(98_561, 4),
+                cache_write: decimal_rate(45_099_246, 6),
+                cache_read: decimal_rate(323_444_102, 7),
+            }
+        );
+        assert_eq!(parsed.cost.total(), decimal_rate(873_062_442, 7));
     }
 
     #[derive(Clone, Copy)]
     struct ClaudePricedAssistantCase<'a> {
         name: &'a str,
-        request_id: Option<&'a str>,
-        message_id: &'a str,
-        uuid: &'a str,
         model: &'a str,
         usage: (usize, usize, usize, usize),
-        expected_id: &'a str,
         expected_cost: LlmCost,
     }
 
@@ -1929,9 +2074,9 @@ mod tests {
         let (input_tokens, output_tokens, cache_write_tokens, cache_read_tokens) = case.usage;
         let parsed = parse_claude_line_with_cost(claude_assistant_json(
             Some(CLAUDE_PARENT_UUID),
-            case.request_id,
-            case.message_id,
-            case.uuid,
+            Some("req-pricing"),
+            "msg-pricing",
+            CLAUDE_ASSISTANT_UUID,
             case.model,
             claude_usage_json(
                 input_tokens,
@@ -1941,7 +2086,7 @@ mod tests {
             ),
         ));
 
-        assert_eq!(parsed.id, case.expected_id, "case {}", case.name);
+        assert_eq!(parsed.id, "req-pricing", "case {}", case.name);
         assert_eq!(parsed.model.raw(), case.model, "case {}", case.name);
         assert_eq!(parsed.timestamp, timestamp(), "case {}", case.name);
         assert_eq!(parsed.cost, case.expected_cost, "case {}", case.name);
@@ -2012,12 +2157,8 @@ mod tests {
         let cases = [
             ClaudePricedAssistantCase {
                 name: "sonnet multimillion usage",
-                request_id: Some("req-1"),
-                message_id: "msg_1",
-                uuid: CLAUDE_ASSISTANT_UUID,
                 model: "claude-sonnet-4-20250514",
                 usage: (1_000_000, 2_000_000, 3_000_000, 4_000_000),
-                expected_id: "req-1",
                 expected_cost: LlmCost {
                     input: Decimal::new(3, 0),
                     cache_write: Decimal::new(1125, 2),
@@ -2027,12 +2168,8 @@ mod tests {
             },
             ClaudePricedAssistantCase {
                 name: "raw model id is preserved",
-                request_id: Some("req-model"),
-                message_id: "msg_model",
-                uuid: CLAUDE_ASSISTANT_UUID,
                 model: "claude-3-5-sonnet-20241022",
                 usage: (1, 1, 1, 1),
-                expected_id: "req-model",
                 expected_cost: LlmCost {
                     input: Decimal::new(3, 6),
                     cache_write: Decimal::new(375, 8),
@@ -2042,12 +2179,8 @@ mod tests {
             },
             ClaudePricedAssistantCase {
                 name: "haiku single-token costs stay exact",
-                request_id: Some("req-decimal"),
-                message_id: "msg_decimal",
-                uuid: CLAUDE_ASSISTANT_UUID,
                 model: "claude-3-haiku-20240307",
                 usage: (1, 1, 1, 1),
-                expected_id: "req-decimal",
                 expected_cost: LlmCost {
                     input: Decimal::new(1, 6),
                     cache_write: Decimal::new(125, 8),
@@ -2057,12 +2190,8 @@ mod tests {
             },
             ClaudePricedAssistantCase {
                 name: "haiku million-token pricing",
-                request_id: Some("req-haiku-million"),
-                message_id: "msg_haiku_million",
-                uuid: CLAUDE_ASSISTANT_UUID,
                 model: "claude-3-haiku-20240307",
                 usage: (1_000_000, 1_000_000, 1_000_000, 1_000_000),
-                expected_id: "req-haiku-million",
                 expected_cost: LlmCost {
                     input: Decimal::new(1, 0),
                     cache_write: Decimal::new(125, 2),
@@ -2072,12 +2201,8 @@ mod tests {
             },
             ClaudePricedAssistantCase {
                 name: "opus pricing path",
-                request_id: Some("req-opus"),
-                message_id: "msg_opus",
-                uuid: CLAUDE_ASSISTANT_UUID,
                 model: "claude-3-opus-20240229",
                 usage: (1_000_000, 1_000_000, 1_000_000, 1_000_000),
-                expected_id: "req-opus",
                 expected_cost: LlmCost {
                     input: Decimal::new(15, 0),
                     cache_write: Decimal::new(1875, 2),
@@ -2087,12 +2212,8 @@ mod tests {
             },
             ClaudePricedAssistantCase {
                 name: "opus 4 pricing path",
-                request_id: Some("req-opus4"),
-                message_id: "msg_opus4",
-                uuid: CLAUDE_ASSISTANT_UUID,
                 model: "claude-opus-4-20250514",
                 usage: (1_000_000, 1_000_000, 1_000_000, 1_000_000),
-                expected_id: "req-opus4",
                 expected_cost: LlmCost {
                     input: Decimal::new(5, 0),
                     cache_write: Decimal::new(625, 2),
@@ -2101,13 +2222,20 @@ mod tests {
                 },
             },
             ClaudePricedAssistantCase {
+                name: "opus 5.5 pricing path",
+                model: "claude-opus-5-5",
+                usage: (1_000_000, 1_000_000, 1_000_000, 1_000_000),
+                expected_cost: LlmCost {
+                    input: Decimal::new(4, 0),
+                    cache_write: Decimal::new(5, 0),
+                    cache_read: Decimal::new(2, 1),
+                    output: Decimal::new(20, 0),
+                },
+            },
+            ClaudePricedAssistantCase {
                 name: "fable pricing path",
-                request_id: Some("req-fable"),
-                message_id: "msg_fable",
-                uuid: CLAUDE_ASSISTANT_UUID,
                 model: "claude-fable-5",
                 usage: (1_000_000, 1_000_000, 1_000_000, 1_000_000),
-                expected_id: "req-fable",
                 expected_cost: LlmCost {
                     input: Decimal::new(10, 0),
                     cache_write: Decimal::new(125, 1),
@@ -2117,12 +2245,8 @@ mod tests {
             },
             ClaudePricedAssistantCase {
                 name: "fable 5.1 reduced cache-read pricing",
-                request_id: Some("req-fable-5-1"),
-                message_id: "msg_fable_5_1",
-                uuid: CLAUDE_ASSISTANT_UUID,
                 model: "claude-fable-5-1",
                 usage: (1_000_000, 1_000_000, 1_000_000, 1_000_000),
-                expected_id: "req-fable-5-1",
                 expected_cost: LlmCost {
                     input: Decimal::new(10, 0),
                     cache_write: Decimal::new(125, 1),
