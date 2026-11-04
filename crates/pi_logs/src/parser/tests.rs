@@ -1924,6 +1924,23 @@ fn usage_cost_omits_source_when_absent() {
 }
 
 #[test]
+fn usage_cost_accepts_total_from_provider_flag() {
+    // Pi marks provider-billed totals `true` and catalog-estimated totals
+    // `false` on every cost object.
+    let line = r#"{"type":"message","id":"m1","parentId":"root","timestamp":"2026-04-25T01:48:25.742Z","message":{"role":"assistant","content":[{"type":"text","text":"ok"}],"api":"anthropic-messages","provider":"anthropic","model":"claude-sonnet-4-5","usage":{"input":10,"output":20,"cacheRead":0,"cacheWrite":0,"totalTokens":30,"cost":{"input":0.001,"output":0.002,"cacheRead":0,"cacheWrite":0,"total":0.003,"totalFromProvider":true}},"stopReason":"stop","timestamp":1700000000}}"#;
+    let parsed: PiLogLine = serde_json::from_str(line).unwrap();
+    match parsed {
+        PiLogLine::Message(m) => match &m.message {
+            RoleMessage::Assistant(msg) => {
+                assert!(msg.usage.cost.total_from_provider);
+            }
+            other => panic!("expected Assistant, got {other:?}"),
+        },
+        other => panic!("expected Message, got {other:?}"),
+    }
+}
+
+#[test]
 fn edit_details_accepts_patch_field() {
     // Ni emits a `patch` field alongside `diff` in edit tool results.
     let line = r#"{"type":"message","id":"m1","parentId":"root","timestamp":"2026-04-25T01:48:25.742Z","message":{"role":"toolResult","toolCallId":"tc1","toolName":"edit","content":[{"type":"text","text":"ok"}],"details":{"diff":"--- a\n+++ b\n@@ -1 +1 @@\n-old\n+new\n","patch":"--- a\n+++ b\n@@ -1 +1 @@\n-foo\n+bar\n","firstChangedLine":1},"isError":false,"timestamp":1700000000}}"#;

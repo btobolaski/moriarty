@@ -1156,6 +1156,12 @@ pub struct UsageCost {
     /// optional for backward compatibility with older log files that lack it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// `true` when `total` is the billed cost reported by the provider, `false`
+    /// when it is estimated from the model's catalog rates. Pi writes this on
+    /// every cost object it computes; logs recorded before the field existed
+    /// omit it, and absent also means `false`.
+    #[serde(default)]
+    pub total_from_provider: bool,
 }
 
 // ---------------------------------------------------------------------------
