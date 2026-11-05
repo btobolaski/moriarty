@@ -264,6 +264,8 @@ never authorize commands and are not shadowed by an earlier command rule.
 ```toml
 # Optional trusted shell variables eligible for conservative path-alias analysis.
 bash_path_aliases = ["P"]
+# Optional: deny other eligible leading path-alias declarations (default: false).
+bash_path_aliases_deny_unconfigured = true
 
 [[bash_rules]]
 name = "descriptive-name"
@@ -307,6 +309,8 @@ Moriarty can statically expand selected variables before matching Bash rules:
 
 ```toml
 bash_path_aliases = ["P"]
+# Optional: deny other eligible leading path-alias declarations (default: false).
+bash_path_aliases_deny_unconfigured = true
 ```
 
 ```bash
@@ -324,11 +328,31 @@ rules, out-of-cwd paths remain absolute, and a path containing `..` is not prese
 
 `bash_path_aliases` is an opt-in top-level allow-list. Names must match `[A-Za-z_][A-Za-z0-9_]*`; duplicates are removed
 and names are stored in canonical order. Moriarty rejects these shell-control variables at configuration-load time:
-`PATH`, `IFS`, `CDPATH`, `GLOBIGNORE`, `BASH_ENV`, `ENV`, `SHELLOPTS`, `BASHOPTS`, `FPATH`, `PS4`, and `PROMPT_COMMAND`.
+`PATH`, `HOME`, `IFS`, `CDPATH`, `GLOBIGNORE`, `BASH_ENV`, `ENV`, `SHELLOPTS`, `BASHOPTS`, `FPATH`, `PS4`, and
+`PROMPT_COMMAND`.
 
 **Security warning:** configured names are trusted policy. Do not configure variables that change application or tool
 behavior, such as compiler flags, package-manager settings, credentials, or configuration-file selectors. Moriarty only
 rejects the fixed shell-control set; it cannot know the semantics of every program's environment variables.
+
+With `bash_path_aliases_deny_unconfigured = true`, an otherwise-supported leading declaration whose name is not
+configured is denied, even if unused. For example, `Q=/work/project; rg x $Q/file` reports:
+`Unconfigured path alias 'Q'. Supported path-alias variable names: P.` The complete supported-name list is sorted and
+deduplicated. An empty alias list rejects every eligible declaration and reports
+`No path-alias variable names are supported.`
+
+This reuses the declaration and literal grammar below except the name-membership condition, including single-component
+relative values: with a recorded cwd, `DEBUG=1; rg x file` qualifies and is denied unless DEBUG is configured.
+Command-scoped `DEBUG=1 rg x file`, ordinary references such as `rg x "$HOME/file"` or `rg x $Q/file`, unsupported
+declaration forms, and assignments after the leading prefix are unchanged. Approved names still grant no command
+permission; unsupported configured-alias forms retain the Allow-to-Ask cap. A recognized unconfigured-name denial
+survives a later analysis bailout and takes precedence over Bash-rule actions. Parse errors that prevent recognition
+retain existing fail-safe behavior.
+
+Tool rules still run first: a matching Bash tool Allow, Ask, or Deny bypasses this Bash-only check. When Bash analysis
+is reached, the enabled policy applies in every permission mode, even without Bash rules; without a violation, empty
+Bash rules still Ask. Remove the setting or set it to false to restore previous behavior and the previous effective
+configuration hash; omitted and false serialize identically, while true changes the hash.
 
 ### Supported v1 Form
 
@@ -351,7 +375,8 @@ ordinary double quotes. Supported forms include `$P/output.d.ts`, `--file=$P/inp
 not match `P`. Localized `$"…"`, command, arithmetic, process, indirect, length, default-value, transform, and
 multiple-expansion forms are not treated as known aliases. Other quoting or escaping in an alias-expanded word is also
 unsupported and caps an otherwise-allowed leaf at Ask. A consumed declaration becomes analysis metadata and is not
-matched as an executable leaf. An unused declaration remains a leaf requiring confirmation.
+matched as an executable leaf. An unused configured-alias declaration remains a leaf requiring confirmation; the enabled
+unconfigured-name policy Denies eligible leading declarations of unconfigured names even when unused.
 
 Unsupported configured-alias assignments or references do **not** make Moriarty abandon all leaf analysis. The affected
 leaf is matched normally, but an Allow is capped at Ask; a Deny still applies, including a Deny on a dangerous later
@@ -384,6 +409,18 @@ not use. Explain adds diagnostics without evaluating policy again. With `--json`
 array uses the `redirects` key. A matched endpoint has a typed `decision` of `allowed` or `denied`; `failure` is
 reserved for resolution failures and endpoints with no eligible allow rule, while a denied endpoint's configured reason
 appears in `matched.action_summary`.
+
+For a policy with P configured, the deny setting enabled, and `^rg x src/file$` allowed:
+
+```bash
+moriarty test bash-rules --cwd /work/project --explain 'P=src; rg x $P/file' # Allow
+moriarty test bash-rules --cwd /work/project --explain 'Q=src; rg x $Q/file' # Deny, with supported names
+moriarty test bash-rules --cwd /work/project --explain 'rg x "$HOME/file"' # No alias-name Deny
+```
+
+These are Bash-only tests; unlike the live hook, they do not evaluate tool rules first. Replay remains divergence-only:
+changed Deny rows include the computed `rule` attribution and `reason` in JSON and text, including supported-name
+feedback. Unchanged decisions remain omitted.
 
 ## Permission Modes
 
@@ -423,17 +460,18 @@ Use `moriarty test bash-rules --mode plan '<command>'` to simulate a mode. Omitt
 mode-less test evaluation; `--mode` works with `--explain` and `--json` too.
 
 Current completion logs always record the required mode. They retain the compatibility `rule` field for the primary or
-deciding rule and add `rules`, a JSON-encoded ordered contributor list. `hooks report` emits both and groups rows by the
-exact contributor list; historical records with missing or malformed `rules` fall back to their non-empty singular
-`rule`. `rules replay` evaluates each internal row under its recorded mode and includes the mode on divergences.
-`rules suggest` tags generated rules with the canonical union of contributing known modes; if any contributing record is
-mode-less, the suggestion is unrestricted because its original mode cannot be reconstructed. Historical rows without a
-recorded cwd are excluded from replay and suggestion mining, with the excluded count reported, because filesystem policy
-cannot be reproduced safely without the original base directory. Historical logs do not record HOME, so replay and
-suggestion mining resolve tilde targets against the current process HOME and live filesystem. Strict lint warns on
-`modes = []`, missing mode-overlapping redirect policy, and shadowing between same-domain rules whose mode eligibility
-overlaps. A redirect rule is shadowed only when the earlier rule covers every direction and locality class the later
-rule could match; partial overlap is not reported as unreachable.
+deciding rule or the synthetic `bash_path_aliases_deny_unconfigured` policy attribution, and add `rules`, a JSON-encoded
+ordered contributor list. `hooks report` emits both and groups rows by the exact contributor list; historical records
+with missing or malformed `rules` fall back to their non-empty singular `rule`. `rules replay` evaluates each internal
+row under its recorded mode and includes the mode on divergences. `rules suggest` tags generated rules with the
+canonical union of contributing known modes; if any contributing record is mode-less, the suggestion is unrestricted
+because its original mode cannot be reconstructed. Historical rows without a recorded cwd are excluded from replay and
+suggestion mining, with the excluded count reported, because filesystem policy cannot be reproduced safely without the
+original base directory. Historical logs do not record HOME, so replay and suggestion mining resolve tilde targets
+against the current process HOME and live filesystem. Strict lint warns on `modes = []`, missing mode-overlapping
+redirect policy, and shadowing between same-domain rules whose mode eligibility overlaps. A redirect rule is shadowed
+only when the earlier rule covers every direction and locality class the later rule could match; partial overlap is not
+reported as unreachable.
 
 ## Rule Actions
 
@@ -548,8 +586,10 @@ them prompts instead. Unanalyzable rewrites follow the fail-closed check below. 
 is checked: a denied endpoint blocks, while an unresolved or unauthorized endpoint prompts. If the rewritten command
 contains a construct the splitter cannot analyze, it also prompts when no redirect is apparent because Moriarty cannot
 prove that no endpoint will be opened. Alias or shell-state uncertainty in a rewritten leaf has the same fail-closed
-result. **Security Warning**: Modify actions use unescaped capture group replacement. Avoid patterns like `^docker (.*)`
-that capture arbitrary input. Use specific patterns like `^(docker\\s+system\\s+prune)$` instead.
+result. The enabled `bash_path_aliases_deny_unconfigured` policy instead Denies a replacement declaring an eligible
+unconfigured alias name (see [Path Alias Analysis](#path-alias-analysis)); ArgumentFilter replacement checks enforce the
+same policy. **Security Warning**: Modify actions use unescaped capture group replacement. Avoid patterns like
+`^docker (.*)` that capture arbitrary input. Use specific patterns like `^(docker\\s+system\\s+prune)$` instead.
 
 ### Ask
 
@@ -915,8 +955,9 @@ pattern = "^npm.install$"
 ### 4. Treat Path Alias Names as Trusted Policy
 
 Only configure variables whose sole intended meaning is a reusable path. Never use `bash_path_aliases` as a generic
-assignment allow-list; unsupported forms prompt, and the option does not make an assignment or expanded path safe by
-itself.
+assignment allow-list. Unsupported configured-alias forms cap Allow at Ask; the optional
+`bash_path_aliases_deny_unconfigured` instead Denies eligible leading declarations of unconfigured names, even unused
+ones. Neither setting makes an assignment or expanded path safe by itself, and tool rules retain precedence.
 
 ### 5. Place Specific Rules Before General Ones
 

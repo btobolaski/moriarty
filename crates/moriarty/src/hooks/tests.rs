@@ -7,6 +7,7 @@ use tempfile::TempDir;
 
 use super::*;
 use crate::{
+    hooks::bash_rules::{BashRuleEngine, RuleResult},
     project_config::approvals::ProjectApprovals,
     test_helpers::{
         PATH_ALIAS_COMMAND, PATH_ALIAS_READ_RULES, SUBAGENT_EXECUTION_RULES, remove_test_env_var,
@@ -2720,6 +2721,99 @@ async fn configured_path_alias_supports_ordinary_but_not_localized_quotes() {
         } else {
             assert_pretool_ask(&result);
         }
+    }
+}
+
+#[tokio::test]
+async fn unconfigured_alias_policy_denies_without_rules_in_every_mode() {
+    let policy = "bash_path_aliases = [\"ROOT\", \"P\", \"P\"]\nbash_path_aliases_deny_unconfigured = true\n";
+    let input = serde_json::json!({"command": "Q=src; rg x $Q/file"});
+    let reason = "Unconfigured path alias 'Q'. Supported path-alias variable names: P, ROOT.";
+    for (suffix, mode) in [
+        ("", None),
+        ("bash_rules = []\n", None),
+        (
+            "[[bash_rules]]\nname = 'allow'\npattern = '.*'\naction = { type = 'Allow' }\n",
+            None,
+        ),
+        ("", Some(PermissionMode::Default)),
+        ("", Some(PermissionMode::Plan)),
+        ("", Some(PermissionMode::AcceptEdits)),
+        ("", Some(PermissionMode::Auto)),
+        ("", Some(PermissionMode::DontAsk)),
+        ("", Some(PermissionMode::BypassPermissions)),
+    ] {
+        let config = format!("{policy}{suffix}");
+        let live = run_pretool_outcome_mode(&config, "Bash", &input, "/work/project", mode).await;
+        assert_pretool_deny(&live.output, reason);
+        assert_eq!(
+            live.rule.as_deref(),
+            Some("bash_path_aliases_deny_unconfigured")
+        );
+        assert_eq!(live.contributors, ["bash_path_aliases_deny_unconfigured"]);
+        if mode.is_none() {
+            let engine = BashRuleEngine::from_config(toml::from_str(&config).unwrap()).unwrap();
+            let context = bash_rules::EvaluationContext::new("/work/project", mode);
+            let offline = engine.evaluate_sync(
+                input["command"].as_str().unwrap(),
+                &context,
+                bash_rules::EvaluationPurpose::Decision,
+            );
+            assert_eq!(
+                offline.rule_result(),
+                RuleResult::Denied {
+                    rule_name: live.rule.unwrap(),
+                    reason: reason.to_string(),
+                }
+            );
+            assert_eq!(offline.contributors(), live.contributors);
+        }
+    }
+    for (suffix, command) in [
+        ("", "rg x file"),
+        ("bash_rules = []\n", "P=/work/project; rg x $P/file"),
+        ("", "DEBUG=1 rg x file"),
+    ] {
+        let outcome = run_pretool_outcome(
+            &format!("{policy}{suffix}"),
+            "Bash",
+            &serde_json::json!({"command":command}),
+            "/work/project",
+        )
+        .await;
+        assert_pretool_ask(&outcome.output);
+        assert_eq!(outcome.rule, None);
+        assert!(outcome.contributors.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn tool_decisions_still_short_circuit_unconfigured_alias_policy() {
+    for action in ["Allow", "Ask", "Deny"] {
+        let config = format!(
+            r#"
+bash_path_aliases = ["P"]
+bash_path_aliases_deny_unconfigured = true
+[[tool_rules]]
+name = "tool-first"
+tool = "Bash"
+action = {{ type = "{action}", value = "tool denial" }}
+"#
+        );
+        let outcome = run_pretool_outcome(
+            &config,
+            "Bash",
+            &serde_json::json!({"command":"Q=/work; rg x file"}),
+            "/work",
+        )
+        .await;
+        match action {
+            "Allow" => assert_pretool_allow(&outcome.output),
+            "Ask" => assert_pretool_ask(&outcome.output),
+            _ => assert_pretool_deny(&outcome.output, "tool denial"),
+        }
+        assert_eq!(outcome.rule.as_deref(), Some("tool-first"));
+        assert_eq!(outcome.contributors, ["tool-first"]);
     }
 }
 

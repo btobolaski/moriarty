@@ -158,6 +158,7 @@ pub(crate) fn run() -> miette::Result<()> {
                     black_box(command),
                     cwd,
                     &config.bash_path_aliases,
+                    config.bash_path_aliases_deny_unconfigured.into(),
                 )))
             });
         });

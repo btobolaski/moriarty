@@ -18,7 +18,7 @@ use miette::{Context, IntoDiagnostic};
 use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::Value;
 
-use crate::{permission_mode::PermissionMode, persistence::FileType};
+use crate::{hashing::hash_string, permission_mode::PermissionMode, persistence::FileType};
 
 /// Miette's `into_diagnostic()` converts io::Error to miette::Report, losing type information.
 /// We must check the error message for ENOENT (os error 2) which indicates file not found.
@@ -101,6 +101,8 @@ impl<'de> Deserialize<'de> for BashPathAlias {
 ///
 /// ```toml
 /// bash_path_aliases = ["P"]
+/// # Optional; false by default.
+/// bash_path_aliases_deny_unconfigured = true
 ///
 /// [pattern_fragments]
 /// safe_chars = "[^|&;$`]"
@@ -126,6 +128,10 @@ pub struct UserConfig {
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub bash_path_aliases: BTreeSet<BashPathAlias>,
 
+    /// Opt-in denial of unconfigured leading alias names; false by default and omitted when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bash_path_aliases_deny_unconfigured: bool,
+
     #[serde(default)]
     pub bash_rules: Option<Vec<BashRule>>,
 
@@ -134,6 +140,15 @@ pub struct UserConfig {
 }
 
 impl UserConfig {
+    /// Skipping evaluation without Bash rules would bypass the independent alias-denial policy.
+    pub(crate) fn needs_bash_engine(&self) -> bool {
+        self.bash_path_aliases_deny_unconfigured
+            || self
+                .bash_rules
+                .as_ref()
+                .is_some_and(|rules| !rules.is_empty())
+    }
+
     /// Stable hash of the effective rule set, used to stamp each hook decision (`rules_hash`) with
     /// the rules that produced it so `rules replay`/`rules suggest` can scope recorded history to the
     /// rules currently in force.
@@ -149,7 +164,7 @@ impl UserConfig {
         let canonical = serde_json::to_value(self)
             .and_then(|value| serde_json::to_string(&value))
             .expect("UserConfig is always JSON-serializable");
-        crate::hashing::hash_string(&canonical)
+        hash_string(&canonical)
     }
 }
 
@@ -558,6 +573,7 @@ mod tests {
     ) -> UserConfig {
         UserConfig {
             pattern_fragments: None,
+            bash_path_aliases_deny_unconfigured: false,
             bash_path_aliases: BTreeSet::new(),
             bash_rules,
             tool_rules,
@@ -578,6 +594,38 @@ mod tests {
                 .unwrap()
                 .contains("bash_path_aliases")
         );
+    }
+
+    #[test]
+    fn unconfigured_alias_policy_is_opt_in_and_hash_compatible() {
+        let omitted: UserConfig = toml::from_str("").unwrap();
+        let disabled: UserConfig =
+            toml::from_str("bash_path_aliases_deny_unconfigured = false").unwrap();
+        let enabled: UserConfig =
+            toml::from_str("bash_path_aliases_deny_unconfigured = true").unwrap();
+        assert_eq!(omitted, disabled);
+        assert_eq!(omitted.effective_hash(), disabled.effective_hash());
+        let legacy = r#"{"bash_rules":null,"pattern_fragments":null,"tool_rules":null}"#;
+        assert_eq!(omitted.effective_hash(), hash_string(legacy));
+        assert_ne!(enabled.effective_hash(), omitted.effective_hash());
+        assert!(
+            !toml::to_string(&disabled)
+                .unwrap()
+                .contains("deny_unconfigured")
+        );
+        assert_eq!(
+            toml::from_str::<UserConfig>(&toml::to_string(&enabled).unwrap()).unwrap(),
+            enabled
+        );
+        for value in [r#""true""#, "1", "[]", "{}"] {
+            assert!(
+                toml::from_str::<UserConfig>(&format!(
+                    "bash_path_aliases_deny_unconfigured = {value}"
+                ))
+                .is_err(),
+                "{value}"
+            );
+        }
     }
 
     #[test]
@@ -725,12 +773,14 @@ mod tests {
 
         let config_a = UserConfig {
             pattern_fragments: Some(a),
+            bash_path_aliases_deny_unconfigured: false,
             bash_path_aliases: BTreeSet::new(),
             bash_rules: Some(vec![allow("ls", "^ls")]),
             tool_rules: None,
         };
         let config_b = UserConfig {
             pattern_fragments: Some(b),
+            bash_path_aliases_deny_unconfigured: false,
             bash_path_aliases: BTreeSet::new(),
             bash_rules: Some(vec![allow("ls", "^ls")]),
             tool_rules: None,
@@ -790,10 +840,7 @@ action = { type = "Allow" }
         let json = serde_json::to_value(&unrestricted).unwrap();
         assert!(json["bash_rules"][0].get("modes").is_none());
         let expected = r#"{"bash_rules":[{"action":{"type":"Allow"},"name":"ls","pattern":"^ls"}],"pattern_fragments":null,"tool_rules":null}"#;
-        assert_eq!(
-            unrestricted.effective_hash(),
-            crate::hashing::hash_string(expected)
-        );
+        assert_eq!(unrestricted.effective_hash(), hash_string(expected));
     }
 
     #[test]

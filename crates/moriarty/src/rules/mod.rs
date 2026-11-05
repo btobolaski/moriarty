@@ -520,6 +520,8 @@ async fn list_fragments(config_path: Option<PathBuf>, json: bool) -> miette::Res
 /// config types by the `schema_round_trips_through_user_config` test.
 const SCHEMA_TOML: &str = r#"# Trusted shell variables eligible for conservative path-alias analysis.
 bash_path_aliases = ["P"]
+# Opt in to denying other eligible leading alias names (default: false).
+bash_path_aliases_deny_unconfigured = true
 
 # Reusable regex fragments, referenced from patterns as {{name}}.
 [pattern_fragments]
@@ -694,6 +696,7 @@ fn starter(json: bool) -> miette::Result<()> {
 
     let config = UserConfig {
         pattern_fragments: None,
+        bash_path_aliases_deny_unconfigured: false,
         bash_path_aliases: BTreeSet::new(),
         bash_rules: Some(rules),
         tool_rules: None,
@@ -883,6 +886,7 @@ async fn suggest(opts: SuggestOptions) -> miette::Result<()> {
 
     let config = UserConfig {
         pattern_fragments: None,
+        bash_path_aliases_deny_unconfigured: false,
         bash_path_aliases: BTreeSet::new(),
         bash_rules: Some(suggestions.iter().map(|s| s.rule.clone()).collect()),
         tool_rules: None,
@@ -1029,6 +1033,7 @@ fn build_suggestions(
                     )
                 })
                 .collect(),
+            PolicyAnalysis::AliasDeny { .. } => continue,
             PolicyAnalysis::Bail { .. } => BTreeMap::from([(command.to_string(), None)]),
         };
         for (text, filter_command) in texts {
@@ -1333,9 +1338,17 @@ struct ReplayRow {
     permission_mode: Option<PermissionMode>,
     recorded: PreToolResult,
     computed: PreToolResult,
+    #[serde(flatten)]
+    attribution: Option<DenyAttribution>,
     count: u64,
     /// `lost-allow` (regression), `newly-allowed` (intended improvement), or `changed`.
     classification: &'static str,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct DenyAttribution {
+    rule: String,
+    reason: String,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -1423,11 +1436,10 @@ fn build_replay_report(
         total_evaluated += row.count;
 
         let context = EvaluationContext::new(&row.cwd, row.permission_mode);
-        let computed = classify_result(
-            &engine
-                .evaluate_sync(command, &context, EvaluationPurpose::Decision)
-                .rule_result(),
-        );
+        let result = engine
+            .evaluate_sync(command, &context, EvaluationPurpose::Decision)
+            .rule_result();
+        let computed = classify_result(&result);
         if computed == row.result {
             continue;
         }
@@ -1442,11 +1454,19 @@ fn build_replay_report(
             "changed"
         };
 
+        let attribution = match result {
+            RuleResult::Denied { rule_name, reason } => Some(DenyAttribution {
+                rule: rule_name,
+                reason,
+            }),
+            _ => None,
+        };
         divergences.push(ReplayRow {
             command: command.to_string(),
             permission_mode: row.permission_mode,
             recorded: row.result,
             computed,
+            attribution,
             count: row.count,
             classification,
         });
@@ -1542,14 +1562,7 @@ fn print_replay(report: &ReplayReport) {
     } else {
         println!();
         for row in &report.divergences {
-            println!(
-                "  [{}] {} → {} (×{}): {}",
-                row.classification,
-                row.recorded.as_str(),
-                row.computed.as_str(),
-                row.count,
-                replay_command_label(&row.command, row.permission_mode)
-            );
+            println!("{}", replay_divergence_label(row));
         }
     }
 
@@ -1563,6 +1576,21 @@ fn print_replay(report: &ReplayReport) {
         ),
         None => {}
     }
+}
+
+fn replay_divergence_label(row: &ReplayRow) -> String {
+    let mut label = format!(
+        "  [{}] {} → {} (×{}): {}",
+        row.classification,
+        row.recorded.as_str(),
+        row.computed.as_str(),
+        row.count,
+        replay_command_label(&row.command, row.permission_mode)
+    );
+    if let Some(DenyAttribution { rule, reason }) = &row.attribution {
+        label.push_str(&format!("\n    {rule}: {reason}"));
+    }
+    label
 }
 
 fn replay_command_label(command: &str, permission_mode: Option<PermissionMode>) -> String {
@@ -1589,6 +1617,7 @@ mod tests {
     fn config_with_bash(rules: Vec<BashRule>) -> UserConfig {
         UserConfig {
             pattern_fragments: None,
+            bash_path_aliases_deny_unconfigured: false,
             bash_path_aliases: BTreeSet::new(),
             bash_rules: Some(rules),
             tool_rules: None,
@@ -1758,6 +1787,7 @@ mod tests {
         rule.field = Some("path".to_string());
         let config = UserConfig {
             pattern_fragments: None,
+            bash_path_aliases_deny_unconfigured: false,
             bash_path_aliases: BTreeSet::new(),
             bash_rules: None,
             tool_rules: Some(vec![rule]),
@@ -1782,6 +1812,7 @@ mod tests {
         ];
         let config = UserConfig {
             pattern_fragments: None,
+            bash_path_aliases_deny_unconfigured: false,
             bash_path_aliases: BTreeSet::new(),
             bash_rules: None,
             tool_rules: Some(vec![rule]),
@@ -2020,6 +2051,7 @@ mod tests {
         tool.modes = Some(BTreeSet::new());
         let config = UserConfig {
             pattern_fragments: None,
+            bash_path_aliases_deny_unconfigured: false,
             bash_path_aliases: BTreeSet::new(),
             bash_rules: Some(vec![bash]),
             tool_rules: Some(vec![tool]),
@@ -2064,6 +2096,7 @@ mod tests {
         let config = toml::from_str::<UserConfig>(SCHEMA_TOML).expect("schema TOML must parse");
         let report = build_lint_report(&config, true).unwrap();
 
+        assert!(config.bash_path_aliases_deny_unconfigured);
         assert!(report.errors.is_empty());
         assert!(
             report.warnings.is_empty(),
@@ -2076,6 +2109,7 @@ mod tests {
     fn starter_rules_round_trip_through_toml() {
         let config = UserConfig {
             pattern_fragments: None,
+            bash_path_aliases_deny_unconfigured: false,
             bash_path_aliases: BTreeSet::new(),
             bash_rules: Some(starter_rules()),
             tool_rules: None,
@@ -2420,6 +2454,7 @@ mod tests {
         );
         let config = UserConfig {
             pattern_fragments: None,
+            bash_path_aliases_deny_unconfigured: false,
             bash_path_aliases: BTreeSet::new(),
             bash_rules: Some(suggestions.iter().map(|s| s.rule.clone()).collect()),
             tool_rules: None,
@@ -2796,7 +2831,7 @@ mod tests {
         tokio::fs::create_dir_all(&config_dir).await.unwrap();
         tokio::fs::write(
             config_dir.join("tool_rules.toml"),
-            "bash_path_aliases = [\"P\"]\n",
+            "bash_path_aliases = [\"P\"]\nbash_path_aliases_deny_unconfigured = true\n",
         )
         .await
         .unwrap();
@@ -2806,6 +2841,8 @@ mod tests {
             &[
                 (PATH_ALIAS_COMMAND, "/work/project"),
                 ("P='/work/project'; echo $P/file", "/work/project"),
+                ("Q=/work/project; rg x $Q/file", "/work/project"),
+                ("Q=/work/project; echo $(pwd)", "/work/project"),
             ],
         )
         .await;
@@ -2848,6 +2885,76 @@ mod tests {
 
         assert_eq!(suggestions.len(), 1);
         assert_eq!(suggestions[0].rule.pattern, r"^cargo(\s|$)");
+    }
+
+    #[test]
+    fn unconfigured_alias_denials_are_shared_by_replay_and_suggestions() {
+        let config: UserConfig = toml::from_str(
+            r#"
+bash_path_aliases = ["P"]
+bash_path_aliases_deny_unconfigured = true
+[[bash_rules]]
+name = "allow"
+pattern = ".*"
+action = { type = "Allow" }
+"#,
+        )
+        .unwrap();
+        let engine = BashRuleEngine::from_config(config).unwrap();
+        for command in [
+            "Q=/work/project; rg x $Q/file",
+            "Q=/work/project; echo $(pwd)",
+        ] {
+            let rows = [bash_row(command, 2, PreToolResult::Allow)];
+            let replay = build_replay_report(&rows, &engine, None, None, HashSkipStats::default());
+            assert_eq!(replay.total_evaluated, 2);
+            assert_eq!(replay.lost_allow_count, 2);
+            let divergence = &replay.divergences[0];
+            assert_eq!(divergence.computed, PreToolResult::Deny);
+            let attribution = divergence.attribution.as_ref().unwrap();
+            assert_eq!(attribution.rule, "bash_path_aliases_deny_unconfigured");
+            let expected_reason =
+                "Unconfigured path alias 'Q'. Supported path-alias variable names: P.";
+            assert_eq!(attribution.reason, expected_reason);
+            let label = replay_divergence_label(divergence);
+            for expected in [
+                "lost-allow",
+                command,
+                attribution.rule.as_str(),
+                expected_reason,
+            ] {
+                assert!(label.contains(expected), "{label}");
+            }
+            let json = serde_json::to_value(&replay).unwrap();
+            assert_eq!(
+                json["divergences"][0],
+                serde_json::json!({
+                    "command": command,
+                    "recorded": "allow",
+                    "computed": "deny",
+                    "rule": "bash_path_aliases_deny_unconfigured",
+                    "reason": expected_reason,
+                    "count": 2,
+                    "classification": "lost-allow",
+                })
+            );
+            let unchanged = [bash_row(command, 2, PreToolResult::Deny)];
+            assert!(
+                build_replay_report(&unchanged, &engine, None, None, HashSkipStats::default())
+                    .divergences
+                    .is_empty()
+            );
+            for action in [
+                SuggestAction::Allow,
+                SuggestAction::Ask,
+                SuggestAction::Deny,
+            ] {
+                assert!(
+                    build_suggestions(&rows, MatchMode::Exact, action, 1, 10, &engine).is_empty()
+                );
+            }
+            assert!(build_redirect_suggestions(&rows, 1, 10, &engine).is_empty());
+        }
     }
 
     // ===== replay =====
@@ -2897,6 +3004,17 @@ mod tests {
         assert_eq!(computed.len(), cases.len());
         for (command, expected) in cases {
             assert_eq!(computed[command], expected, "case {command:?}");
+        }
+        for row in &report.divergences {
+            let json = serde_json::to_value(row).unwrap();
+            if row.computed == PreToolResult::Deny {
+                assert_eq!(json["rule"], "deny-rm");
+                assert_eq!(json["reason"], "blocked");
+            } else {
+                assert!(json.get("rule").is_none());
+                assert!(json.get("reason").is_none());
+                assert!(!replay_divergence_label(row).contains('\n'));
+            }
         }
     }
 
@@ -3323,6 +3441,7 @@ action = { type = "Allow" }
         // Some(vec![]) (an explicitly-empty list) must not error, unlike a dropped rule.
         let config = UserConfig {
             pattern_fragments: None,
+            bash_path_aliases_deny_unconfigured: false,
             bash_path_aliases: BTreeSet::new(),
             bash_rules: Some(vec![]),
             tool_rules: Some(vec![]),

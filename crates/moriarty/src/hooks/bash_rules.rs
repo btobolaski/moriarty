@@ -5,6 +5,7 @@
 //! commands to add safety flags, or explicitly allow specific patterns.
 
 use std::{
+    borrow::Borrow,
     collections::{BTreeSet, HashMap},
     path::Path,
     sync::{Arc, LazyLock},
@@ -26,8 +27,8 @@ use tracing::debug;
 use super::{
     FILESYSTEM_EVALUATION_TIMEOUT,
     command_split::{
-        AliasBinding, BailReason, FilterCommand, LeafCommand, ParsedRedirectTarget,
-        RedirectEndpoint, SplitOutcome, split_command,
+        AliasBinding, AliasDenyPolicy, BailReason, FilterCommand, LeafCommand,
+        ParsedRedirectTarget, RedirectEndpoint, SplitOutcome, split_command,
     },
     path_resolution::{RedirectResolutionContext, RedirectTargetResolution},
 };
@@ -214,6 +215,7 @@ pub struct BashRuleEngine {
     command_rules: CompiledCommandRules,
     redirect_rules: CompiledRedirectRules,
     path_aliases: BTreeSet<BashPathAlias>,
+    deny_unconfigured_aliases: AliasDenyPolicy,
 }
 
 /// A reason a rule was dropped at compile time. Surfaced by `compile_with_diagnostics` so the
@@ -557,6 +559,11 @@ pub(crate) enum CommandDecision {
         rule: MatchedCommandRule,
         new_command: String,
     },
+    /// A blocked replacement still needs terminal policy checks, but must never become executable.
+    ModifyAttachmentFailed {
+        rule: MatchedCommandRule,
+        new_command: String,
+    },
     Ask {
         rule: MatchedCommandRule,
     },
@@ -687,6 +694,9 @@ pub(crate) enum BailDecision {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PolicyAnalysis {
+    AliasDeny {
+        reason: String,
+    },
     Bail {
         command: String,
         reason: BailReason,
@@ -697,6 +707,9 @@ pub(crate) enum PolicyAnalysis {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RedirectCheckAnalysis {
+    AliasDeny {
+        reason: String,
+    },
     Bail {
         command: String,
         reason: BailReason,
@@ -705,14 +718,14 @@ pub(crate) enum RedirectCheckAnalysis {
     Leaves(Vec<RedirectLeafAnalysis>),
 }
 
-/// `evaluate_sync` constructs this check only when the recheck outcome is `Modify`.
+/// Attachment failure must not bypass a replacement's terminal alias-policy denial.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FilterContinuation {
     None,
     ModifyRedirectCheck(RedirectCheckAnalysis),
 }
 
-/// Each non-`None` variant is valid only beside the original source outcome that names it.
+/// Blocked Modify candidates retain policy checks without authorizing their unsafe rewrites.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum OriginalContinuation {
     None,
@@ -762,8 +775,14 @@ pub(crate) enum LiveEvaluationFailure {
     Join(JoinError),
 }
 
+/// A stable synthetic name preserves log/replay attribution without inventing a matched user rule.
+pub(crate) const UNCONFIGURED_ALIAS_POLICY: &str = "bash_path_aliases_deny_unconfigured";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PolicyOutcome<'a> {
+    AliasDeny {
+        reason: &'a str,
+    },
     Allow {
         rule: &'a MatchedCommandRule,
     },
@@ -937,6 +956,7 @@ impl BashRuleEngine {
             config.pattern_fragments,
         )?;
         engine.path_aliases = config.bash_path_aliases;
+        engine.deny_unconfigured_aliases = config.bash_path_aliases_deny_unconfigured.into();
         Ok((engine, diagnostics))
     }
 
@@ -1063,6 +1083,7 @@ impl BashRuleEngine {
                     rules: redirect_rules,
                 },
                 path_aliases: BTreeSet::new(),
+                deny_unconfigured_aliases: AliasDenyPolicy::Disabled,
             },
             diagnostics,
         ))
@@ -1099,10 +1120,11 @@ impl BashRuleEngine {
                 let replacement = expand_captures(&captures, value);
                 let mut rewritten = replacement.clone();
                 rewritten.push_str(redirect_rewrite.suffix);
-                if !self.redirects_remain_attached(&replacement, &rewritten, redirect_rewrite.count)
-                {
-                    return CommandDecision::Ask { rule: matched };
-                }
+                let redirects_attached = self.redirects_remain_attached(
+                    &replacement,
+                    &rewritten,
+                    redirect_rewrite.count,
+                );
 
                 let prefix = redirect_rewrite
                     .bindings
@@ -1110,6 +1132,12 @@ impl BashRuleEngine {
                     .map(|binding| format!("{}={}; ", binding.name, binding.value))
                     .collect::<String>();
                 let new_command = format!("{prefix}{rewritten}");
+                if !redirects_attached {
+                    return CommandDecision::ModifyAttachmentFailed {
+                        rule: matched,
+                        new_command,
+                    };
+                }
                 CommandDecision::Modify {
                     rule: matched,
                     new_command,
@@ -1154,16 +1182,22 @@ impl BashRuleEngine {
         if redirect_count == 0 {
             return true;
         }
-        // Attachment depends on parse shape and redirect counts, not cwd normalization, so the
-        // structural comparison deliberately reparses without a cwd.
+        // Attachment depends only on parse shape and redirect counts. The continuation owns
+        // cwd-aware alias policy and its terminal denial, so this comparison disables both.
         let (before, after) = match (
-            split_command(replacement, "", &self.path_aliases),
-            split_command(rewritten, "", &self.path_aliases),
+            split_command(
+                replacement,
+                "",
+                &self.path_aliases,
+                AliasDenyPolicy::Disabled,
+            ),
+            split_command(rewritten, "", &self.path_aliases, AliasDenyPolicy::Disabled),
         ) {
             (SplitOutcome::Commands(before), SplitOutcome::Commands(after)) => (before, after),
-            // The continuation reparses the same rewritten command and prompts on this bailout.
-            (_, SplitOutcome::Bail { .. }) => return true,
-            (SplitOutcome::Bail { .. }, SplitOutcome::Commands(_)) => return false,
+            // The continuation owns bailouts; UnconfiguredAlias is exhaustive-only because
+            // both structural splits disable the deny policy.
+            (_, SplitOutcome::Bail { .. } | SplitOutcome::UnconfiguredAlias(_)) => return true,
+            (_, SplitOutcome::Commands(_)) => return false,
         };
         if before.len() != after.len() || before.is_empty() {
             return false;
@@ -1188,30 +1222,40 @@ impl BashRuleEngine {
     ) -> Evaluation {
         let original = self.evaluate_original(command, context, purpose);
         let continuation = match original.outcome() {
-            PolicyOutcome::Modify { new_command, .. } => OriginalContinuation::ModifyRedirectCheck(
-                self.analyze_redirect_check(new_command, context),
-            ),
             PolicyOutcome::ArgumentFilter { new_command, .. } => {
                 let recheck = self.evaluate_original(new_command, context, purpose);
-                let continuation = match recheck.outcome() {
-                    PolicyOutcome::Modify { new_command, .. } => {
-                        FilterContinuation::ModifyRedirectCheck(
-                            self.analyze_redirect_check(new_command, context),
-                        )
-                    }
-                    _ => FilterContinuation::None,
-                };
+                let continuation = self.analyze_redirect_check(&recheck, context).map_or(
+                    FilterContinuation::None,
+                    FilterContinuation::ModifyRedirectCheck,
+                );
                 OriginalContinuation::ArgumentFilterRecheck {
                     recheck,
                     continuation,
                 }
             }
-            _ => OriginalContinuation::None,
+            _ => self.analyze_redirect_check(&original, context).map_or(
+                OriginalContinuation::None,
+                OriginalContinuation::ModifyRedirectCheck,
+            ),
         };
         Evaluation {
             original,
             continuation,
         }
+    }
+
+    fn alias_denial_reason(&self, name: &str) -> String {
+        let names: Vec<&str> = self
+            .path_aliases
+            .iter()
+            .map(|alias| alias.borrow())
+            .collect();
+        let supported = if names.is_empty() {
+            "No path-alias variable names are supported.".to_string()
+        } else {
+            format!("Supported path-alias variable names: {}.", names.join(", "))
+        };
+        format!("Unconfigured path alias '{name}'. {supported}")
     }
 
     pub(crate) fn evaluate_original(
@@ -1220,7 +1264,15 @@ impl BashRuleEngine {
         context: &EvaluationContext,
         purpose: EvaluationPurpose,
     ) -> PolicyAnalysis {
-        match split_command(command, &context.cwd, &self.path_aliases) {
+        match split_command(
+            command,
+            &context.cwd,
+            &self.path_aliases,
+            self.deny_unconfigured_aliases,
+        ) {
+            SplitOutcome::UnconfiguredAlias(name) => PolicyAnalysis::AliasDeny {
+                reason: self.alias_denial_reason(&name),
+            },
             SplitOutcome::Bail { reason, redirects } => {
                 let decision = match self.match_command_decision(
                     command,
@@ -1285,7 +1337,9 @@ impl BashRuleEngine {
                 .any(|endpoint| redirect_denies.contains(&endpoint.direction))
                 && matches!(
                     command,
-                    CommandDecision::NoMatch | CommandDecision::Ask { .. }
+                    CommandDecision::NoMatch
+                        | CommandDecision::Ask { .. }
+                        | CommandDecision::ModifyAttachmentFailed { .. }
                 ));
         let endpoints = if analyze_endpoints {
             EndpointCoverage::Analyzed(
@@ -1319,10 +1373,36 @@ impl BashRuleEngine {
 
     fn analyze_redirect_check(
         &self,
-        command: &str,
+        policy: &PolicyAnalysis,
         context: &EvaluationContext,
-    ) -> RedirectCheckAnalysis {
-        match split_command(command, &context.cwd, &self.path_aliases) {
+    ) -> Option<RedirectCheckAnalysis> {
+        let (command, attachment_failed) = match policy.outcome() {
+            PolicyOutcome::Modify { new_command, .. } => (new_command, false),
+            _ => {
+                if self.deny_unconfigured_aliases == AliasDenyPolicy::Disabled {
+                    return None;
+                }
+                let [leaf] = policy.leaves()? else {
+                    return None;
+                };
+                let CommandDecision::ModifyAttachmentFailed { new_command, .. } = &leaf.command
+                else {
+                    return None;
+                };
+                (new_command.as_str(), true)
+            }
+        };
+        let analysis = match split_command(
+            command,
+            &context.cwd,
+            &self.path_aliases,
+            self.deny_unconfigured_aliases,
+        ) {
+            SplitOutcome::UnconfiguredAlias(name) => RedirectCheckAnalysis::AliasDeny {
+                reason: self.alias_denial_reason(&name),
+            },
+            // Keep the original Ask or redirect Deny without resolving a blocked rewrite's unused endpoints.
+            _ if attachment_failed => return None,
             SplitOutcome::Bail { reason, redirects } => RedirectCheckAnalysis::Bail {
                 command: command.to_string(),
                 reason,
@@ -1343,7 +1423,8 @@ impl BashRuleEngine {
                     })
                     .collect(),
             ),
-        }
+        };
+        Some(analysis)
     }
 
     fn analyze_endpoint(
@@ -1471,7 +1552,9 @@ impl CommandDecision {
             Self::Allow { rule } => PolicyOutcome::Allow { rule },
             Self::Deny { rule, reason } => PolicyOutcome::Deny { rule, reason },
             Self::Modify { rule, new_command } => PolicyOutcome::Modify { rule, new_command },
-            Self::Ask { rule } => PolicyOutcome::Ask { rule },
+            Self::Ask { rule } | Self::ModifyAttachmentFailed { rule, .. } => {
+                PolicyOutcome::Ask { rule }
+            }
             Self::ArgumentFilter {
                 rule,
                 new_command,
@@ -1490,6 +1573,7 @@ impl CommandDecision {
             Self::Allow { rule }
             | Self::Deny { rule, .. }
             | Self::Modify { rule, .. }
+            | Self::ModifyAttachmentFailed { rule, .. }
             | Self::Ask { rule }
             | Self::ArgumentFilter { rule, .. } => Some(rule),
         }
@@ -1703,12 +1787,13 @@ impl PolicyAnalysis {
     pub(crate) fn leaves(&self) -> Option<&[PolicyLeafAnalysis]> {
         match self {
             Self::Leaves(leaves) => Some(leaves),
-            Self::Bail { .. } => None,
+            Self::Bail { .. } | Self::AliasDeny { .. } => None,
         }
     }
 
     fn outcome(&self) -> PolicyOutcome<'_> {
         match self {
+            Self::AliasDeny { reason } => PolicyOutcome::AliasDeny { reason },
             Self::Bail { decision, .. } => match decision {
                 BailDecision::Deny { rule, reason } => PolicyOutcome::Deny { rule, reason },
                 BailDecision::RedirectDeny { rule, reason } => {
@@ -1750,25 +1835,42 @@ impl RedirectLeafAnalysis {
 }
 
 impl RedirectCheckAnalysis {
-    fn denial(&self) -> Option<(&MatchedRedirectRule, &str)> {
+    fn outcome<'a>(&'a self, candidate: PolicyOutcome<'a>) -> PolicyOutcome<'a> {
+        if let Some(denial) = self.denial() {
+            return denial;
+        }
+        match candidate {
+            PolicyOutcome::Modify { rule, .. } if !self.allows_rewrite() => {
+                PolicyOutcome::Ask { rule }
+            }
+            _ => candidate,
+        }
+    }
+
+    fn denial(&self) -> Option<PolicyOutcome<'_>> {
         match self {
+            Self::AliasDeny { reason } => Some(PolicyOutcome::AliasDeny { reason }),
             Self::Bail {
                 denied_endpoint: Some(endpoint),
                 ..
-            } => Some(endpoint.denial()),
+            } => {
+                let (rule, reason) = endpoint.denial();
+                Some(PolicyOutcome::RedirectDeny { rule, reason })
+            }
             Self::Bail {
                 denied_endpoint: None,
                 ..
             } => None,
             Self::Leaves(leaves) => leaves
                 .iter()
-                .find_map(|leaf| leaf.endpoints.iter().find_map(EndpointAnalysis::denial)),
+                .find_map(|leaf| leaf.endpoints.iter().find_map(EndpointAnalysis::denial))
+                .map(|(rule, reason)| PolicyOutcome::RedirectDeny { rule, reason }),
         }
     }
 
     fn allows_rewrite(&self) -> bool {
         match self {
-            Self::Bail { .. } => false,
+            Self::Bail { .. } | Self::AliasDeny { .. } => false,
             Self::Leaves(leaves) => leaves.iter().all(|leaf| {
                 leaf.identity.requires_confirmation.is_none()
                     && leaf.endpoints.iter().all(|endpoint| {
@@ -1799,17 +1901,8 @@ impl Evaluation {
         let original = self.original_outcome();
         match (&self.continuation, original) {
             (OriginalContinuation::None, _) => original,
-            (
-                OriginalContinuation::ModifyRedirectCheck(check),
-                PolicyOutcome::Modify { rule, new_command },
-            ) => {
-                if let Some((rule, reason)) = check.denial() {
-                    PolicyOutcome::RedirectDeny { rule, reason }
-                } else if check.allows_rewrite() {
-                    PolicyOutcome::Modify { rule, new_command }
-                } else {
-                    PolicyOutcome::Ask { rule }
-                }
+            (OriginalContinuation::ModifyRedirectCheck(check), candidate) => {
+                check.outcome(candidate)
             }
             (
                 OriginalContinuation::ArgumentFilterRecheck {
@@ -1820,17 +1913,8 @@ impl Evaluation {
             ) => match (recheck.outcome(), continuation) {
                 (PolicyOutcome::Allow { .. }, _) => original,
                 (PolicyOutcome::ArgumentFilter { rule, .. }, _) => PolicyOutcome::Ask { rule },
-                (
-                    PolicyOutcome::Modify { rule, new_command },
-                    FilterContinuation::ModifyRedirectCheck(check),
-                ) => {
-                    if let Some((rule, reason)) = check.denial() {
-                        PolicyOutcome::RedirectDeny { rule, reason }
-                    } else if check.allows_rewrite() {
-                        PolicyOutcome::Modify { rule, new_command }
-                    } else {
-                        PolicyOutcome::Ask { rule }
-                    }
+                (candidate, FilterContinuation::ModifyRedirectCheck(check)) => {
+                    check.outcome(candidate)
                 }
                 (outcome, _) => outcome,
             },
@@ -1870,6 +1954,10 @@ impl Evaluation {
 impl From<PolicyOutcome<'_>> for RuleResult {
     fn from(outcome: PolicyOutcome<'_>) -> Self {
         match outcome {
+            PolicyOutcome::AliasDeny { reason } => Self::Denied {
+                rule_name: UNCONFIGURED_ALIAS_POLICY.to_string(),
+                reason: reason.to_string(),
+            },
             PolicyOutcome::Allow { rule } => Self::Allowed {
                 rule_name: rule.rule_name().to_string(),
             },
@@ -1904,6 +1992,8 @@ impl From<PolicyOutcome<'_>> for RuleResult {
 
 fn policy_rank(outcome: PolicyOutcome<'_>) -> u8 {
     match outcome {
+        // Exhaustive-only: whole-command AliasDeny returns before the leaf-ranking fold.
+        PolicyOutcome::AliasDeny { .. } => 5,
         PolicyOutcome::Deny { .. } | PolicyOutcome::RedirectDeny { .. } => 4,
         PolicyOutcome::Ask { .. } => 3,
         PolicyOutcome::NoMatch
@@ -1915,6 +2005,7 @@ fn policy_rank(outcome: PolicyOutcome<'_>) -> u8 {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MatchedContributor<'a> {
+    AliasPolicy,
     Command(&'a MatchedCommandRule),
     Redirect(&'a MatchedRedirectRule),
 }
@@ -1922,6 +2013,7 @@ enum MatchedContributor<'a> {
 impl MatchedContributor<'_> {
     fn rule_name(&self) -> &str {
         match self {
+            Self::AliasPolicy => UNCONFIGURED_ALIAS_POLICY,
             Self::Command(rule) => rule.rule_name(),
             Self::Redirect(rule) => rule.rule_name(),
         }
@@ -1942,6 +2034,9 @@ fn collect_policy_contributors<'a>(
     contributors: &mut Vec<MatchedContributor<'a>>,
 ) {
     match policy {
+        PolicyAnalysis::AliasDeny { .. } => {
+            push_matched_contributor(contributors, MatchedContributor::AliasPolicy);
+        }
         PolicyAnalysis::Bail {
             decision: BailDecision::Deny { rule, .. },
             ..
@@ -1982,6 +2077,9 @@ fn collect_redirect_contributors<'a>(
     contributors: &mut Vec<MatchedContributor<'a>>,
 ) {
     match check {
+        RedirectCheckAnalysis::AliasDeny { .. } => {
+            push_matched_contributor(contributors, MatchedContributor::AliasPolicy);
+        }
         RedirectCheckAnalysis::Bail {
             denied_endpoint: Some(endpoint),
             ..

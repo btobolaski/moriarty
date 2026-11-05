@@ -11,7 +11,9 @@ fn matched_redirect(
 }
 
 fn filter_command_for_test(command: &str) -> Option<FilterCommand> {
-    let SplitOutcome::Commands(mut leaves) = split_command(command, "", &BTreeSet::new()) else {
+    let SplitOutcome::Commands(mut leaves) =
+        split_command(command, "", &BTreeSet::new(), AliasDenyPolicy::Disabled)
+    else {
         return None;
     };
     (leaves.len() == 1)
@@ -149,6 +151,7 @@ fn make_engine_with_aliases_and_fragments(
 ) -> BashRuleEngine {
     BashRuleEngine::from_config(UserConfig {
         pattern_fragments,
+        bash_path_aliases_deny_unconfigured: false,
         bash_path_aliases: aliases
             .iter()
             .map(|alias| BashPathAlias::validate((*alias).to_string()).unwrap())
@@ -206,7 +209,12 @@ fn leaf_command_result(
     cwd: &str,
     mode: Option<PermissionMode>,
 ) -> RuleResult {
-    let SplitOutcome::Commands(leaves) = split_command(command, cwd, &engine.path_aliases) else {
+    let SplitOutcome::Commands(leaves) = split_command(
+        command,
+        cwd,
+        &engine.path_aliases,
+        engine.deny_unconfigured_aliases,
+    ) else {
         return command_result(engine, command, mode);
     };
     let [leaf] = leaves.as_slice() else {

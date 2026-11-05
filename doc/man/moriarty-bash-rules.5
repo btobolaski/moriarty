@@ -242,6 +242,8 @@ Selected variables can participate in conservative static expansion through
 the top\-level option:
 .Bd -literal -offset indent
 bash_path_aliases = ["P"]
+# Optional; default false.
+bash_path_aliases_deny_unconfigured = true
 .Ed
 .Pp
 For example:
@@ -278,6 +280,50 @@ including compiler flags, package\-manager settings, credentials, or
 configuration selectors.
 .Nm
 cannot know every program's environment\-variable semantics.
+.Ss Denying Unconfigured Names
+The top\-level boolean
+.Cm bash_path_aliases_deny_unconfigured
+is false by default.
+When true, the first otherwise\-supported leading declaration with an
+unconfigured name is denied, even when unused.
+For example:
+.Bd -literal -offset indent
+Q=/work/project; rg x $Q/file
+# Unconfigured path alias 'Q'. Supported path-alias variable names: P.
+.Ed
+.Pp
+Feedback lists every supported name once in sorted order.
+With an empty alias list, every eligible declaration is denied and the
+reason explicitly says:
+.Ql No path-alias variable names are supported.
+Single\-component relative values also qualify when cwd is recorded:
+.Ql DEBUG=1; rg x file
+is denied unless DEBUG is configured.
+This is not a general variable allow\-list: command\-scoped
+.Ql DEBUG=1 rg x file ,
+ordinary references such as
+.Li rg x \(dq$HOME/file\(dq
+or
+.Ql rg x $Q/file ,
+unsupported declaration forms, and assignments after the leading prefix
+retain their existing treatment.
+.Pp
+A recognized violation takes precedence over Bash\-rule actions and
+survives a later analysis bailout; parse errors preventing recognition
+retain the existing fail\-safe behavior.
+The policy applies in every permission mode and in mode\-less offline
+analysis, including Modify and ArgumentFilter replacement checks.
+It does not add ordinary command\-rule rematching to Modify.
+Tool rules still run first: a matching tool Allow, Ask, or Deny bypasses
+Bash alias analysis.
+The enabled policy runs even without Bash rules; without a violation,
+absent or empty Bash rules still Ask.
+Remove the setting or set it to false to restore previous behavior and
+the previous effective configuration hash.
+False is omitted from serialization; enabling the setting changes the hash.
+Diagnostic attribution uses
+.Ql bash_path_aliases_deny_unconfigured ,
+not a matched configured rule.
 .Ss Supported Form
 A binding is recognized only as a leading, synchronous, assignment\-only
 simple command terminated by a semicolon or newline.
@@ -334,9 +380,11 @@ Other quoting or escaping in an alias\-expanded word is likewise unsupported
 and caps an otherwise allowed leaf at Ask.
 .Pp
 A consumed declaration is analysis metadata rather than an executable leaf.
-An unused declaration, unsupported configured\-alias form, unresolved
-reference, or expansion in command position is still matched normally, but
-any Allow is capped at Ask.
+An unused configured\-alias declaration, unsupported configured\-alias form,
+unresolved configured\-alias reference, or configured\-alias expansion in
+command position is still matched normally, but any Allow is capped at Ask.
+In contrast, the enabled unconfigured\-name policy Denies eligible leading
+declarations of unconfigured names even when unused.
 A Deny remains effective, including a Deny on a later dangerous leaf.
 Command substitution, backticks, arithmetic or process substitution, here
 documents, and uninspectable shell compounds remain fail\-safe and cannot be
@@ -517,7 +565,10 @@ command.
 For an analyzable rewrite, the modification is returned only when parsing
 confirms that the appended redirects remain attached to the same replacement
 leaf; a trailing
-separator or comment that would detach or swallow them prompts instead.
+separator or comment that would detach or swallow them prompts instead,
+unless the enabled
+.Cm bash_path_aliases_deny_unconfigured
+policy denies an eligible unconfigured alias declaration in the replacement.
 Unanalyzable rewrites follow the fail\-closed check below.
 Every endpoint is then checked.
 A rewritten command the splitter cannot analyze prompts when no redirect is

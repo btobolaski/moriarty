@@ -554,14 +554,14 @@ async fn handle_bash_pretool_hook(
         .map(|(output, _rule, _contributors)| output)
 }
 
-/// Apply bash_rules from a pre-loaded config to validate Bash commands.
+/// Apply the configured Bash engine: rules plus the opt-in unconfigured-alias policy.
 ///
 /// `cwd` must be the verbatim value from the hook input — not canonicalized — because rule
 /// normalization strips it as a literal string prefix, and the recorded `cwd` must round-trip
 /// through `rules replay` to reproduce the same normalization.
 ///
-/// The returned rule name is the one whose *action* produced the decision (`None` when no rule
-/// decided), which the completion log records as attribution.
+/// Completion-log attribution is the deciding rule name or the synthetic
+/// `bash_path_aliases_deny_unconfigured` policy name (`None` when neither decided).
 async fn handle_bash_pretool_hook_with_config(
     tool_input: &serde_json::Value,
     config: crate::user_config::UserConfig,
@@ -576,11 +576,7 @@ async fn handle_bash_pretool_hook_with_config(
         .ok_or_else(|| miette::miette!("Missing 'command' field in Bash tool_input"))?;
     info!(command, "Processing Bash PreToolUse hook");
 
-    if config
-        .bash_rules
-        .as_ref()
-        .is_none_or(|rules| rules.is_empty())
-    {
+    if !config.needs_bash_engine() {
         info!("No bash_rules configured, defaulting to Ask");
         return Ok((pretool_ask_hook(), None, Vec::new()));
     }

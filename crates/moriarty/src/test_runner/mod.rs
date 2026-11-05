@@ -311,11 +311,7 @@ async fn test_bash_rules(
     let config = load_user_config_from(config_path.as_deref()).await?;
 
     // Extract bash rules
-    if config
-        .bash_rules
-        .as_ref()
-        .is_none_or(|rules| rules.is_empty())
-    {
+    if !config.needs_bash_engine() {
         if json {
             println!(
                 "{}",
@@ -414,6 +410,7 @@ fn policy_trace_parts(
     analysis: &PolicyAnalysis,
 ) -> (Vec<AliasBinding>, Vec<SubCommandTrace>, Option<BailReason>) {
     match analysis {
+        PolicyAnalysis::AliasDeny { .. } => (Vec::new(), Vec::new(), None),
         PolicyAnalysis::Bail { reason, .. } => (Vec::new(), Vec::new(), Some(*reason)),
         PolicyAnalysis::Leaves(leaves) => {
             let mut bindings = Vec::new();
@@ -442,6 +439,7 @@ fn redirect_trace_parts(
     analysis: &RedirectCheckAnalysis,
 ) -> (Vec<SubCommandTrace>, Option<RewrittenBailTrace>) {
     match analysis {
+        RedirectCheckAnalysis::AliasDeny { .. } => (Vec::new(), None),
         RedirectCheckAnalysis::Bail {
             command,
             reason,
@@ -830,6 +828,7 @@ mod tests {
             dir,
             UserConfig {
                 pattern_fragments: None,
+                bash_path_aliases_deny_unconfigured: false,
                 bash_path_aliases: BTreeSet::new(),
                 bash_rules: Some(rules),
                 tool_rules: None,
@@ -910,6 +909,66 @@ mod tests {
             pattern: pattern.to_string(),
             modes: None,
             action: BashRuleAction::Ask,
+        }
+    }
+
+    #[tokio::test]
+    async fn unconfigured_alias_policy_matches_normal_and_explain_without_bash_rules() {
+        let dir = setup_isolated_xdg_config();
+        let command = "Q=src; rg x $Q/file";
+        let reason = "Unconfigured path alias 'Q'. Supported path-alias variable names: P, ROOT.";
+        for (suffix, clean_result) in [
+            ("", RuleResult::NoMatch),
+            ("bash_rules = []", RuleResult::NoMatch),
+            (
+                r#"
+[[bash_rules]]
+name = "allow"
+pattern = ".*"
+action = { type = "Allow" }
+"#,
+                RuleResult::Allowed {
+                    rule_name: "allow".to_string(),
+                },
+            ),
+        ] {
+            let config: UserConfig = toml::from_str(&format!(
+                r#"
+bash_path_aliases = ["ROOT", "P", "P"]
+bash_path_aliases_deny_unconfigured = true
+{suffix}
+[[tool_rules]]
+name = "tool-allow"
+tool = "Bash"
+action = {{ type = "Allow" }}
+"#
+            ))
+            .unwrap();
+            let path = write_user_config(&dir, config).await;
+            for explain in [false, true] {
+                for (command, expected) in [
+                    (
+                        command,
+                        RuleResult::Denied {
+                            rule_name: "bash_path_aliases_deny_unconfigured".to_string(),
+                            reason: reason.to_string(),
+                        },
+                    ),
+                    ("rg x file", clean_result.clone()),
+                ] {
+                    let result = test_bash_rules(
+                        Some(command.to_string()),
+                        Some(path.clone()),
+                        true,
+                        explain,
+                        Some(PathBuf::from("/work/project")),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(result, expected);
+                }
+            }
         }
     }
 
@@ -1067,6 +1126,7 @@ mod tests {
             &dir,
             UserConfig {
                 pattern_fragments: Some(fragments),
+                bash_path_aliases_deny_unconfigured: false,
                 bash_path_aliases: BTreeSet::new(),
                 bash_rules: Some(vec![allow(
                     "allow-ls-with-fragment",
@@ -1266,6 +1326,7 @@ mod tests {
         let cwd = cwd.path().to_str().unwrap();
         let engine = BashRuleEngine::from_config(UserConfig {
             pattern_fragments: None,
+            bash_path_aliases_deny_unconfigured: false,
             bash_path_aliases: BTreeSet::new(),
             bash_rules: Some(vec![
                 modify("redirecting-echo", r"^rewrite$", "echo > report.txt"),
@@ -1377,6 +1438,26 @@ mod tests {
         assert_eq!(endpoint["decision"], "allowed");
         assert_eq!(endpoint["matched"]["rule_name"], "allow-local");
         assert_eq!(json["contributors"], json!(["allow-echo", "allow-local"]));
+
+        let alias_engine = BashRuleEngine::from_config(UserConfig {
+            bash_path_aliases_deny_unconfigured: true,
+            ..UserConfig::default()
+        })
+        .unwrap();
+        let alias_denied = explain(&alias_engine, "Q=/work; echo hi", cwd, None);
+        let mut alias_output = Vec::new();
+        write_explanation(&mut alias_output, &alias_denied).unwrap();
+        let alias_output = String::from_utf8(alias_output).unwrap();
+        for expected in [
+            "DENIED by rule: bash_path_aliases_deny_unconfigured",
+            "Unconfigured path alias 'Q'. No path-alias variable names are supported.",
+            "Contributing rules: bash_path_aliases_deny_unconfigured",
+        ] {
+            assert!(
+                alias_output.contains(expected),
+                "missing {expected:?} in {alias_output:?}"
+            );
+        }
     }
 
     #[test]

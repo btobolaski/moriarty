@@ -38,11 +38,31 @@ use crate::user_config::{BashPathAlias, RedirectDirection};
 const NON_STATIC_REDIRECT_REASON: &str = "redirect target is not a static path";
 const INVALID_DESCRIPTOR_REASON: &str = "redirect target is not a valid file descriptor";
 
+/// Evaluation rejects eligible unconfigured leading aliases before later bailouts can erase violations.
+/// Structural rewrite checks disable enforcement because cwd-aware continuations own policy decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AliasDenyPolicy {
+    Disabled,
+    Enabled,
+}
+
+impl From<bool> for AliasDenyPolicy {
+    fn from(enabled: bool) -> Self {
+        if enabled {
+            Self::Enabled
+        } else {
+            Self::Disabled
+        }
+    }
+}
+
 /// Result of splitting a command into leaves.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SplitOutcome {
     /// The command parsed into N independently-evaluable simple commands, in execution order.
     Commands(Vec<LeafCommand>),
+    /// Terminal so a later traversal bailout cannot erase a recognized policy violation.
+    UnconfiguredAlias(String),
     /// The command contains a construct we cannot fully analyze; the caller must fail safe.
     Bail {
         reason: BailReason,
@@ -167,6 +187,7 @@ pub(crate) fn split_command(
     command: &str,
     cwd: &str,
     configured_aliases: &BTreeSet<BashPathAlias>,
+    deny_unconfigured_aliases: AliasDenyPolicy,
 ) -> SplitOutcome {
     let options = ParserOptions::default();
 
@@ -192,7 +213,7 @@ pub(crate) fn split_command(
     // `SourcePosition.index` is a character offset, so collect chars once and slice/normalize by
     // char index rather than byte index (keeps multi-byte UTF-8 commands correct).
     let chars: Vec<char> = command.chars().collect();
-    let mut state = AliasState::new(configured_aliases);
+    let mut state = AliasState::new(configured_aliases, deny_unconfigured_aliases);
     let mut leaves = Vec::new();
     let mut bailout = None;
 
@@ -208,6 +229,9 @@ pub(crate) fn split_command(
                 &mut leaves,
             ) {
                 retain_split_bail(&mut bailout, bail);
+            }
+            if let Some(name) = state.rejected_alias.take() {
+                return SplitOutcome::UnconfiguredAlias(name);
             }
         }
     }
@@ -240,6 +264,8 @@ struct ActiveBinding {
 
 struct AliasState<'a> {
     configured: &'a BTreeSet<BashPathAlias>,
+    deny_unconfigured: AliasDenyPolicy,
+    rejected_alias: Option<String>,
     active: BTreeMap<String, ActiveBinding>,
     used_declarations: BTreeSet<usize>,
     next_declaration_id: usize,
@@ -249,9 +275,11 @@ struct AliasState<'a> {
 }
 
 impl<'a> AliasState<'a> {
-    fn new(configured: &'a BTreeSet<BashPathAlias>) -> Self {
+    fn new(configured: &'a BTreeSet<BashPathAlias>, deny_unconfigured: AliasDenyPolicy) -> Self {
         Self {
             configured,
+            deny_unconfigured,
+            rejected_alias: None,
             active: BTreeMap::new(),
             used_declarations: BTreeSet::new(),
             next_declaration_id: 0,
@@ -283,6 +311,12 @@ fn collect_list_item(
 ) -> Result<(), SplitBail> {
     let and_or_list = &item.0;
     if let Some((simple, name, value)) = supported_declaration(item, chars, cwd, state) {
+        if !state.is_configured(&name) {
+            // Admit unknown names only to reuse the declaration grammar. The outer loop
+            // terminalizes this rejection before any later traversal can replace it with a bailout.
+            state.rejected_alias = Some(name);
+            return Ok(());
+        }
         let declaration_id = state.next_declaration_id;
         state.next_declaration_id += 1;
 
@@ -360,7 +394,10 @@ fn supported_declaration<'a>(
     let AssignmentName::VariableName(name) = &assignment.name else {
         return None;
     };
-    if !state.is_configured(name) || state.active.contains_key(name) || assignment.append {
+    if (!state.is_configured(name) && state.deny_unconfigured == AliasDenyPolicy::Disabled)
+        || state.active.contains_key(name)
+        || assignment.append
+    {
         return None;
     }
     let AssignmentValue::Scalar(value) = &assignment.value else {
@@ -1830,8 +1867,9 @@ mod tests {
     }
 
     fn leaves_with_aliases(command: &str, cwd: &str, names: &[&str]) -> Vec<LeafCommand> {
-        match split_command(command, cwd, &aliases(names)) {
+        match split_command(command, cwd, &aliases(names), AliasDenyPolicy::Disabled) {
             SplitOutcome::Commands(leaves) => leaves,
+            SplitOutcome::UnconfiguredAlias(name) => panic!("unexpected alias rejection: {name}"),
             SplitOutcome::Bail { reason, .. } => {
                 panic!("expected Commands for {command:?}, got Bail({reason:?})")
             }
@@ -1892,12 +1930,105 @@ mod tests {
     }
 
     fn bail_with_aliases(command: &str, names: &[&str]) -> BailReason {
-        match split_command(command, "", &aliases(names)) {
+        match split_command(command, "", &aliases(names), AliasDenyPolicy::Disabled) {
             SplitOutcome::Bail { reason, .. } => reason,
+            SplitOutcome::UnconfiguredAlias(name) => panic!("unexpected alias rejection: {name}"),
             SplitOutcome::Commands(leaves) => {
                 panic!("expected Bail for {command:?}, got {leaves:?}")
             }
         }
+    }
+
+    #[test]
+    fn unconfigured_alias_rejection_reuses_the_leading_literal_boundary() {
+        let configured = aliases(&["P"]);
+        for (command, rejected) in [
+            ("Q=/work/project; rg x $Q/file", "Q"),
+            ("Q=src; rg x $Q/file", "Q"),
+            ("DEBUG=1; rg x file", "DEBUG"),
+            ("Q=/work/project\nrg x file", "Q"),
+            ("P=/work/project; Q=/work/other; rg x $P/file $Q/file", "Q"),
+            ("Q=/work/project; rg x file", "Q"),
+            ("Q=/work/project; echo $(pwd)", "Q"),
+            ("Q=/work/project; R=/other; echo hi", "Q"),
+            ("HOME=/work/project; echo hi", "HOME"),
+        ] {
+            assert_eq!(
+                split_command(
+                    command,
+                    "/work/project",
+                    &configured,
+                    AliasDenyPolicy::Enabled
+                ),
+                SplitOutcome::UnconfiguredAlias(rejected.to_string()),
+                "{command}"
+            );
+            assert!(!matches!(
+                split_command(
+                    command,
+                    "/work/project",
+                    &configured,
+                    AliasDenyPolicy::Disabled
+                ),
+                SplitOutcome::UnconfiguredAlias(_)
+            ));
+        }
+        for command in [
+            "DEBUG=1 rg x file",
+            "Q='/work/project'; rg x file",
+            "Q=$OTHER; rg x file",
+            "Q+=/work/project; rg x file",
+            "Q=/work/project R=/other; rg x file",
+            "Q=/work/project > out; rg x file",
+            "Q=/work/project | cat; rg x file",
+            "Q=/work/project && rg x file",
+            "Q=/work/project || rg x file",
+            "Q=/work/project & rg x file",
+            "! Q=/work/project; rg x file",
+            "time Q=/work/project; rg x file",
+            "Q=/work/project",
+            "Q=; rg x file",
+            "Q=../src; rg x file",
+            "Q=dir/../src; rg x file",
+            "Q=(/work/project); rg x file",
+            "Q[0]=/work/project; rg x file",
+            "echo first; Q=/work/project; rg x file",
+            "P='/work/project'; Q=/other; rg x file",
+            "P=/work; P=/other; Q=/unknown; rg x file",
+            "rg x \"$HOME/file\"",
+            "rg x $Q/file",
+            "Q=/work; echo 'unbalanced",
+        ] {
+            assert_eq!(
+                split_command(
+                    command,
+                    "/work/project",
+                    &configured,
+                    AliasDenyPolicy::Enabled
+                ),
+                split_command(
+                    command,
+                    "/work/project",
+                    &configured,
+                    AliasDenyPolicy::Disabled
+                ),
+                "excluded form: {command}"
+            );
+        }
+        assert_eq!(
+            split_command(
+                "Q=src; rg x file",
+                "",
+                &configured,
+                AliasDenyPolicy::Enabled
+            ),
+            split_command(
+                "Q=src; rg x file",
+                "",
+                &configured,
+                AliasDenyPolicy::Disabled
+            )
+        );
     }
 
     #[test]
@@ -1973,9 +2104,12 @@ mod tests {
 
     #[test]
     fn bailout_retains_static_redirect_after_unanalyzable_word() {
-        let SplitOutcome::Bail { reason, redirects } =
-            split_command(r#"echo "$(date)" > protected"#, "", &BTreeSet::new())
-        else {
+        let SplitOutcome::Bail { reason, redirects } = split_command(
+            r#"echo "$(date)" > protected"#,
+            "",
+            &BTreeSet::new(),
+            AliasDenyPolicy::Disabled,
+        ) else {
             panic!("expected bailout");
         };
         assert_eq!(reason, BailReason::CommandSubstitution);
@@ -1995,6 +2129,7 @@ mod tests {
             r#"echo "$(date)" > first; echo ok > second"#,
             "",
             &BTreeSet::new(),
+            AliasDenyPolicy::Disabled,
         ) else {
             panic!("expected bailout");
         };
@@ -2009,9 +2144,12 @@ mod tests {
 
     #[test]
     fn bailout_later_redirect_respects_mutation_barrier() {
-        let SplitOutcome::Bail { redirects, .. } =
-            split_command(r#"cd "$(date)"; echo ok > protected"#, "", &BTreeSet::new())
-        else {
+        let SplitOutcome::Bail { redirects, .. } = split_command(
+            r#"cd "$(date)"; echo ok > protected"#,
+            "",
+            &BTreeSet::new(),
+            AliasDenyPolicy::Disabled,
+        ) else {
             panic!("expected bailout");
         };
         assert!(matches!(
@@ -2026,7 +2164,8 @@ mod tests {
     #[test]
     fn bailout_retains_compound_and_extended_test_redirects() {
         for command in ["(echo hi) > protected", "[[ -n x ]] > protected"] {
-            let SplitOutcome::Bail { redirects, .. } = split_command(command, "", &BTreeSet::new())
+            let SplitOutcome::Bail { redirects, .. } =
+                split_command(command, "", &BTreeSet::new(), AliasDenyPolicy::Disabled)
             else {
                 panic!("expected bailout for {command}");
             };
@@ -2047,6 +2186,7 @@ mod tests {
             "{ cd /tmp; }; echo hi > secret",
             "/work/project",
             &BTreeSet::new(),
+            AliasDenyPolicy::Disabled,
         ) else {
             panic!("expected bailout");
         };
@@ -2065,6 +2205,7 @@ mod tests {
             "(cd /tmp); echo hi > secret",
             "/work/project",
             &BTreeSet::new(),
+            AliasDenyPolicy::Disabled,
         ) else {
             panic!("expected bailout");
         };

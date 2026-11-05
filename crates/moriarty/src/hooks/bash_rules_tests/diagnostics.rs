@@ -131,6 +131,7 @@ fn test_classify_fragment_error_distinguishes_kinds() {
 fn diagnostic_config() -> UserConfig {
     UserConfig {
         pattern_fragments: None,
+        bash_path_aliases_deny_unconfigured: false,
         bash_path_aliases: BTreeSet::from([BashPathAlias::validate("P".to_string()).unwrap()]),
         bash_rules: Some(vec![
             BashRule {

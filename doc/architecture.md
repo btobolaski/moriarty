@@ -11,6 +11,8 @@ binary entry point is `crates/moriarty/src/main.rs`; `my-workspace-hack` is mana
   cancellation, and authorization requirements.
 - [MCP protocol-support specification](../openspec/specs/mcp-protocol-support/spec.md): explicit revisions,
   modern/legacy stdio interoperability, and exclusion of Tasks.
+- [Bash path-alias policy specification](../openspec/specs/bash-path-alias-policy/spec.md): approved alias names, opt-in
+  unconfigured-name denial, and shared hook/offline evaluation.
 - [Supervisor crate rustdoc source](../crates/process_supervisor/src/lib.rs): public API contract and assurance limits.
 - [Project-tools configuration manual](man/moriarty-project-tools.5): command/check configuration and approvals.
 
@@ -349,8 +351,10 @@ Project configuration and security.
 
 ### Security Model
 
-- **Default to Ask for Bash when unconfigured**: If no bash rules configured, Bash defaults to "Ask". Non-Bash tools
-  with no matching tool rules return no decision, deferring to Claude Code's native permission system.
+- **Default to Ask for Bash when unconfigured**: With no Bash rules, Bash defaults to "Ask" unless the opt-in
+  `bash_path_aliases_deny_unconfigured` policy recognizes an unconfigured leading path-alias declaration and Denies it
+  (see [hook internals](hooks.md)). Non-Bash tools with no matching tool rules return no decision, deferring to Claude
+  Code's native permission system.
 - **Fail-closed when configured**: Once security measures are in place, any verification failure blocks execution:
   - ItemNotApproved: a command/check name is configured but has no approved version (e.g. a brand-new name added to
     tools.toml)

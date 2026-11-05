@@ -75,9 +75,15 @@ fn filter_arguments_preserves_quoted_normalized_paths() {
             r"cat /tmp/p/report\ file",
         ),
     ] {
-        let filter_command = match split_command(command, "/tmp/p", &BTreeSet::new()) {
+        let filter_command = match split_command(
+            command,
+            "/tmp/p",
+            &BTreeSet::new(),
+            AliasDenyPolicy::Disabled,
+        ) {
             SplitOutcome::Commands(mut leaves) => leaves.pop().unwrap().filter_command.unwrap(),
             SplitOutcome::Bail { reason, .. } => panic!("unexpected bail: {reason:?}"),
+            SplitOutcome::UnconfiguredAlias(name) => panic!("unexpected alias rejection: {name}"),
         };
         assert_eq!(
             filter_arguments(

@@ -409,10 +409,12 @@ arguments, result, deciding rule, and ordered contributor list with a count per 
 Permission mode is retained internally for replay and suggestions but does not change this public grouping.
 Each row's
 .Ic rule
-field names the rule whose action decided the result, while
+field names the deciding rule or the
+.Cm bash_path_aliases_deny_unconfigured
+policy attribution, while
 .Ic rules
-lists every command, redirect, and filter rule that contributed in evaluation order.
-Both fields are omitted when no rule participated
+lists every rule and policy contributor in evaluation order.
+Both fields are omitted when no rule or policy participated
 .Pq passthrough, an unconfigured Ask, or a compound whose merged leaves matched no rule .
 Historical records without
 .Ic rules
@@ -646,6 +648,12 @@ mines every recorded line regardless of which rules produced it.
 Re\-evaluate recorded Bash decisions against a candidate
 .Fl \-config
 and report divergences.
+Changed Deny rows include the computed
+.Ic rule
+attribution and
+.Ic reason
+in JSON and text, including supported\-name feedback for alias\-policy denials.
+Unchanged decisions remain omitted.
 With
 .Fl \-result Cm allow
 it exits nonzero if any previously auto\-approved command would no longer be allowed,

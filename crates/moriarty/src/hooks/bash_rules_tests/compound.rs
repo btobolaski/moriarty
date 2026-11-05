@@ -508,24 +508,37 @@ fn modify_with_original_redirect_defers_unanalyzable_rewrite() {
 #[test]
 fn modify_rechecks_denied_original_redirects() {
     let cwd = tempfile::tempdir().unwrap();
-    let engine = make_engine(vec![
-        modify_rule("rewrite-echo", r"^echo unsafe$", "echo safe"),
-        deny_redirect_rule(
-            "deny-output",
-            r"^original-output$",
-            "protected output",
-            RedirectDirection::Output,
-        ),
-    ]);
-    assert_eq!(
-        evaluation_result(
-            &engine,
-            "echo unsafe > original-output",
-            cwd.path().to_str().unwrap(),
-            None,
-        ),
-        denied("deny-output", "protected output")
-    );
+    for replacement in ["echo safe", "echo safe;", "echo safe # comment"] {
+        let mut engine = make_engine(vec![
+            filter_rule("filter", r"^echo unsafe --drop$", "--drop", None),
+            modify_rule("rewrite-echo", r"^echo unsafe$", replacement),
+            deny_redirect_rule(
+                "deny-output",
+                r"^original-output$",
+                "protected output",
+                RedirectDirection::Output,
+            ),
+        ]);
+        engine.deny_unconfigured_aliases = AliasDenyPolicy::Enabled;
+        for (command, contributors) in [
+            (
+                "echo unsafe > original-output",
+                vec!["rewrite-echo", "deny-output"],
+            ),
+            (
+                "echo unsafe --drop > original-output",
+                vec!["filter", "rewrite-echo", "deny-output"],
+            ),
+        ] {
+            let evaluation = evaluate(&engine, command, cwd.path().to_str().unwrap(), None);
+            assert_eq!(
+                evaluation.rule_result(),
+                denied("deny-output", "protected output"),
+                "{replacement}: {command}"
+            );
+            assert_eq!(evaluation.contributors(), contributors);
+        }
+    }
 }
 
 #[test]
@@ -598,21 +611,44 @@ fn modify_does_not_retain_bindings_unused_by_redirects() {
 #[test]
 fn modify_rejects_detached_or_swallowed_redirects() {
     let cwd = tempfile::tempdir().unwrap();
-    for replacement in ["echo safe;", "echo safe # keep this comment", "echo safe |"] {
-        let engine = make_engine(vec![
-            modify_rule("rewrite-echo", r"^echo unsafe$", replacement),
-            redirect_rule("allow-output", r"^output$", true),
-        ]);
-        assert_eq!(
-            evaluation_result(
-                &engine,
-                "echo unsafe > output",
-                cwd.path().to_str().unwrap(),
-                None,
-            ),
-            asked("rewrite-echo"),
-            "{replacement}"
+    let cwd = cwd.path().to_str().unwrap();
+    for (replacement, cwd, policy) in [
+        ("echo safe;", cwd, AliasDenyPolicy::Disabled),
+        (
+            "echo safe # keep this comment",
+            cwd,
+            AliasDenyPolicy::Disabled,
+        ),
+        ("echo safe |", cwd, AliasDenyPolicy::Disabled),
+        ("echo safe;", cwd, AliasDenyPolicy::Enabled),
+        // Without cwd, this relative declaration cannot qualify for an alias-policy Deny.
+        ("Q=src; echo hi;", "", AliasDenyPolicy::Enabled),
+        ("Q=/work; echo hi;", cwd, AliasDenyPolicy::Disabled),
+    ] {
+        let mut engine = make_engine_with_aliases(
+            vec![
+                filter_rule("filter", r"^echo unsafe --drop$", "--drop", None),
+                modify_rule("rewrite-echo", r"^echo unsafe$", replacement),
+                redirect_rule("allow-output", r"^output$", true),
+            ],
+            &["P"],
         );
+        engine.deny_unconfigured_aliases = policy;
+        for (command, contributors) in [
+            ("echo unsafe > output", vec!["rewrite-echo"]),
+            (
+                "echo unsafe --drop > output",
+                vec!["filter", "rewrite-echo"],
+            ),
+        ] {
+            let evaluation = evaluate(&engine, command, cwd, None);
+            assert_eq!(
+                evaluation.rule_result(),
+                asked("rewrite-echo"),
+                "{replacement}: {command}"
+            );
+            assert_eq!(evaluation.contributors(), contributors);
+        }
     }
 }
 
@@ -977,6 +1013,192 @@ fn cwd_normalization_accepts_only_safe_dynamic_paths() {
             ("cat /abs/cwd/src/.[.]/.[.]/etc/passwd", RuleResult::NoMatch),
         ],
     );
+}
+
+#[test]
+fn unconfigured_alias_policy_preempts_bash_actions_and_bailouts() {
+    let reason = "Unconfigured path alias 'Q'. Supported path-alias variable names: P, ROOT.";
+    for rule in [
+        allow_rule("competing", ".*"),
+        ask_rule("competing", ".*"),
+        deny_rule("competing", ".*", "other denial"),
+        modify_rule("competing", ".*", "echo safe"),
+        filter_rule("competing", ".*", "--drop", None),
+    ] {
+        let mut engine = make_engine_with_aliases(vec![rule], &["ROOT", "P", "P"]);
+        engine.deny_unconfigured_aliases = AliasDenyPolicy::Enabled;
+        for command in [
+            "Q=/work/project; rg x $Q/file",
+            "Q=/work/project; echo $(pwd)",
+        ] {
+            let evaluation = evaluate(&engine, command, "/work/project", None);
+            assert_eq!(
+                evaluation.rule_result(),
+                denied(UNCONFIGURED_ALIAS_POLICY, reason),
+                "{command}"
+            );
+            assert_eq!(evaluation.contributors(), [UNCONFIGURED_ALIAS_POLICY]);
+            assert!(matches!(
+                evaluation.original_analysis(),
+                PolicyAnalysis::AliasDeny { .. }
+            ));
+        }
+    }
+    let mut empty = make_engine(vec![]);
+    empty.deny_unconfigured_aliases = AliasDenyPolicy::Enabled;
+    let trace = explain(&empty, "Q=/work; echo hi", "", None);
+    assert_eq!(
+        trace.final_result,
+        denied(
+            UNCONFIGURED_ALIAS_POLICY,
+            "Unconfigured path alias 'Q'. No path-alias variable names are supported."
+        )
+    );
+    assert_eq!(trace.contributors, [UNCONFIGURED_ALIAS_POLICY]);
+    assert!(trace.sub_commands.is_empty(), "no fabricated matched rule");
+}
+
+#[test]
+fn enabled_alias_policy_preserves_approved_and_excluded_forms() {
+    let mut engine = make_engine_with_aliases(vec![allow_rule("allow", ".*")], &["P"]);
+    let commands = [
+        "P=/work/project; rg x $P/file",
+        "P='/work/project'; rg x $P/file",
+        "P=/work/project; rg x file",
+        "Q='/work/project'; rg x $Q/file",
+        "rg x \"$HOME/file\"",
+        "rg x $Q/file",
+        "DEBUG=1 rg x file",
+        "rg x file; Q=/work/project; rg x $Q/file",
+    ];
+    for command in commands {
+        let previous = evaluation_result(&engine, command, "/work/project", None);
+        engine.deny_unconfigured_aliases = AliasDenyPolicy::Enabled;
+        assert_eq!(
+            evaluation_result(&engine, command, "/work/project", None),
+            previous,
+            "{command}"
+        );
+        engine.deny_unconfigured_aliases = AliasDenyPolicy::Disabled;
+    }
+    for (label, command, policy, rules, expected) in [
+        (
+            "disabled unknown declaration",
+            "Q=/work/project; rg x file",
+            AliasDenyPolicy::Disabled,
+            vec![allow_rule("allow", ".*")],
+            allowed("allow"),
+        ),
+        (
+            "approved alias expansion",
+            "P=/work/project; rg x $P/file",
+            AliasDenyPolicy::Enabled,
+            vec![allow_rule("allow", ".*")],
+            allowed("allow"),
+        ),
+        (
+            "unused approved declaration",
+            "P=/work/project; rg x file",
+            AliasDenyPolicy::Enabled,
+            vec![allow_rule("allow", ".*")],
+            asked("allow"),
+        ),
+        (
+            "command authorization still required",
+            "P=/work/project; rg x $P/file",
+            AliasDenyPolicy::Enabled,
+            vec![],
+            RuleResult::NoMatch,
+        ),
+    ] {
+        let mut engine = make_engine_with_aliases(rules, &["P"]);
+        engine.deny_unconfigured_aliases = policy;
+        assert_eq!(
+            evaluation_result(&engine, command, "/work/project", None),
+            expected,
+            "{label}"
+        );
+    }
+}
+
+#[test]
+fn replacement_alias_policy_runs_for_modify_and_filter_continuations() {
+    let rejection = denied(
+        UNCONFIGURED_ALIAS_POLICY,
+        "Unconfigured path alias 'Q'. Supported path-alias variable names: P.",
+    );
+    let prompt = asked("rewrite");
+    for (replacement, command, expected_result, expected_contributors) in [
+        (
+            "Q=/work/project; echo $(pwd)",
+            "rewrite",
+            &rejection,
+            vec!["rewrite", UNCONFIGURED_ALIAS_POLICY],
+        ),
+        (
+            "Q=/work/project; echo $(pwd)",
+            "rewrite --drop",
+            &rejection,
+            vec!["filter", "rewrite", UNCONFIGURED_ALIAS_POLICY],
+        ),
+        (
+            "Q=/work/project; echo $(pwd)",
+            "rewrite > /dev/null",
+            &rejection,
+            vec!["rewrite", UNCONFIGURED_ALIAS_POLICY],
+        ),
+        (
+            "Q=/work; echo hi;",
+            "rewrite > /dev/null",
+            &rejection,
+            vec!["rewrite", UNCONFIGURED_ALIAS_POLICY],
+        ),
+        (
+            "Q=/work; echo hi;",
+            "rewrite --drop > /dev/null",
+            &rejection,
+            vec!["filter", "rewrite", UNCONFIGURED_ALIAS_POLICY],
+        ),
+        (
+            "Q=src; echo hi;",
+            "rewrite > /dev/null",
+            &rejection,
+            vec!["rewrite", UNCONFIGURED_ALIAS_POLICY],
+        ),
+        (
+            "Q=src; echo hi;",
+            "rewrite --drop > /dev/null",
+            &rejection,
+            vec!["filter", "rewrite", UNCONFIGURED_ALIAS_POLICY],
+        ),
+        // Multiple leaves make the replacement ineligible, preserving the original Ask.
+        (
+            "Q=/work; echo hi;",
+            "rewrite > /dev/null; echo untouched",
+            &prompt,
+            vec!["rewrite"],
+        ),
+    ] {
+        let mut engine = make_engine_with_aliases(
+            vec![
+                filter_rule("filter", "^rewrite --drop$", "--drop", None),
+                modify_rule("rewrite", "^rewrite$", replacement),
+                redirect_rule("allow-null", "^/dev/null$", false),
+            ],
+            &["P"],
+        );
+        engine.deny_unconfigured_aliases = AliasDenyPolicy::Enabled;
+        let evaluation = evaluate(&engine, command, "/work/project", None);
+        assert_eq!(
+            evaluation.rule_result(),
+            *expected_result,
+            "{replacement}: {command}"
+        );
+        assert_eq!(evaluation.contributors(), expected_contributors);
+        let trace = explain(&engine, command, "/work/project", None);
+        assert_eq!(trace.final_result, evaluation.rule_result());
+        assert_eq!(trace.contributors, evaluation.contributors());
+    }
 }
 
 #[test]

@@ -6,6 +6,9 @@ The [Tool & Bash Rules Configuration Guide](../BASH_RULES.md) owns the user-faci
 boundaries, read the [architecture reference](architecture.md) and the
 [Moriarty process-execution specification](../openspec/specs/moriarty-process-execution/spec.md).
 
+The [Bash path-alias policy specification](../openspec/specs/bash-path-alias-policy/spec.md) defines the alias-name
+contract.
+
 - **PreToolUse hook**: Two-tier permission system from `~/.config/moriarty/tool_rules.toml`:
   - **Permission-mode eligibility**: both rule kinds accept `modes`, an optional set of the six exact hook values
     (`default`, `plan`, `acceptEdits`, `auto`, `dontAsk`, `bypassPermissions`; Manual arrives as `default`). Omitted
@@ -30,17 +33,18 @@ boundaries, read the [architecture reference](architecture.md) and the
     tool_rule matches a Bash call.
   - **Canonical Bash evaluation** (`hooks/bash_rules.rs` + `hooks/command_split.rs`): `evaluate_sync` invokes the
     `brush-parser` splitter and builds one completed `Evaluation` containing source command decisions, resolved endpoint
-    facts, and a closed continuation: none, a Modify redirect check, an ArgumentFilter recheck, or that recheck followed
-    by one Modify redirect check. Leaf, whole-policy, rewrite, and final outcomes plus ordered contributors are derived
-    from those facts rather than stored. Command and redirect rules are compiled into separate first-match domains, and
-    parsed redirect targets are closed descriptor/filesystem/unresolvable states carrying input/output/both direction. A
-    simple `^ls` rule still matches the `ls` leaf of a compound, while merge precedence remains Deny, Ask,
-    NoMatch/Modify/ArgumentFilter, then Allow with first-leaf attribution on ties; multi-leaf rewrites are never
-    stitched together. Replay, normal testing, explain, and the hook consume the same completed evaluation. Suggestions
-    call the same canonical original-policy analyzer but deliberately skip unused Modify and ArgumentFilter
-    continuations. Explain alone requests diagnostic endpoint facts, and `test_runner` projects each endpoint's
-    direction plus whether its matched redirect rule allowed or denied it into the compatibility trace. Compiled rules
-    own shared match metadata so repeated evaluations do not rebuild explanation strings.
+    facts or a terminal alias-policy Deny, and a closed continuation: none, a Modify redirect check, an ArgumentFilter
+    recheck, or that recheck followed by one Modify redirect check. Leaf, whole-policy, rewrite, and final outcomes plus
+    ordered contributors are derived from those facts rather than stored. Command and redirect rules are compiled into
+    separate first-match domains, and parsed redirect targets are closed descriptor/filesystem/unresolvable states
+    carrying input/output/both direction. A simple `^ls` rule still matches the `ls` leaf of a compound, while merge
+    precedence remains Deny, Ask, NoMatch/Modify/ArgumentFilter, then Allow with first-leaf attribution on ties;
+    multi-leaf rewrites are never stitched together. Replay, normal testing, explain, and the hook consume the same
+    completed evaluation. Suggestions call the same canonical original-policy analyzer but deliberately skip unused
+    Modify and ArgumentFilter continuations. Explain alone requests diagnostic endpoint facts, and `test_runner`
+    projects each endpoint's direction plus whether its matched redirect rule allowed or denied it into the
+    compatibility trace. Compiled rules own shared match metadata so repeated evaluations do not rebuild explanation
+    strings.
   - **Configured path-alias preprocessing**: the optional top-level `bash_path_aliases` ordered set names trusted shell
     variables that may be bound by an exact leading absolute or cwd-relative `NAME=literal/path;` declaration or
     newline-terminated equivalent. Relative values must be non-empty, require a recorded cwd, and cannot contain a
@@ -56,8 +60,20 @@ boundaries, read the [architecture reference](architecture.md) and the
     recognized shell-state builtins (including `shopt`, `alias`, and `unalias`) invalidate all active aliases and become
     redirect path-context barriers. This trades extra prompts for a small fail-closed implementation without retaining
     stale bindings. Config deserialization validates shell identifiers and rejects the fixed shell-control names before
-    any tool rule can short-circuit Bash analysis. No aliases is the omitted/hash-compatible default; configured aliases
-    are trusted policy and must not be application/tool behavior variables.
+    any tool rule can short-circuit Bash analysis. The default-false top-level `bash_path_aliases_deny_unconfigured`
+    rejects the first otherwise-supported leading declaration of an unconfigured name, including unused declarations and
+    single-component relative values such as `DEBUG=1;`. It reuses the same declaration predicate except name
+    membership; unsupported items close the prefix, relative values still need cwd, and ordinary references and
+    command-scoped assignments are unchanged. The splitter returns a terminal rejection before later traversal can erase
+    it; tokenization/parse failures that prevent recognition still fail safe. The completed analysis owns this policy
+    Deny separately from confirmation caps and configured matched rules, rendering the rejected name and complete sorted
+    supported-name list (or an explicit empty-list message). Compatibility attribution is
+    `bash_path_aliases_deny_unconfigured`. This Deny precedes competing Bash actions and applies in redirect-only Modify
+    continuations even when retained redirects fail to reattach. It also applies in full ArgumentFilter rechecks and
+    does not add command-rule rematching to Modify. Tool rules still short-circuit first; with the policy enabled, empty
+    Bash rules enter the engine and still Ask unless a violation is recognized. No aliases is the
+    omitted/hash-compatible default; configured aliases are trusted policy and must not be application/tool behavior
+    variables.
   - **Component-scoped redirect policy**: command rules match a cwd-normalized view with every parsed input and output
     redirect removed, with first-match-wins among ordinary actions. Redirect-only leaves retain their full syntax so
     endpoint policy alone cannot authorize shell execution. Every endpoint (`<`, `<&`, `>`, `>>`, `>|`, `&>`, `&>>`,
@@ -73,18 +89,19 @@ boundaries, read the [architecture reference](architecture.md) and the
     path-alias declarations used by redirects, and appends the original redirect operations in source order. Analyzable
     replacements must reparse with those redirects on the same leaf. Direct `Modify` output passes redirect-only
     authorization inside the shared engine evaluation before it is returned; a matching redirect deny still blocks a
-    confidently parsed static endpoint on bailout, while any other unanalyzable or confirmation-bearing rewrite prompts.
-    Synchronous test/replay/explain and the live hook therefore apply the same policy. The live hook runs the entire
-    synchronous evaluation in one blocking task under one two-second deadline; timeout or join failure prompts with no
-    deciding rule or contributors, including for plain commands delayed in the blocking pool. `ArgumentFilter` consumes
-    normalized argument values but rewrites alias-expanded source spans, preserving unchanged quoting, escapes, literal
-    globs, redirect operators, leading `time`/`time -p` and `!` pipeline prefixes, and a trailing background `&` while
-    shell-quoting replacement and added values. The result then passes the full command-plus-endpoint evaluation again
-    in live, replay, and explain paths. A relative or home-relative filesystem redirect in a path-context barrier
-    command, or any later command, asks because changed shell path context is deliberately not modeled. Assignments,
-    dynamic command names, `cd`/`pushd`/`popd`, recognized shell-state builtins, and non-isolated compound constructs
-    such as brace groups and `if`/`for`/`while`/`case` clauses are barriers; absolute paths and descriptors remain
-    evaluable.
+    confidently parsed static endpoint on bailout. An eligible unconfigured alias declaration in a replacement remains a
+    Deny under the enabled `bash_path_aliases_deny_unconfigured` policy; every other unanalyzable or
+    confirmation-bearing rewrite prompts. Synchronous test/replay/explain and the live hook therefore apply the same
+    policy. The live hook runs the entire synchronous evaluation in one blocking task under one two-second deadline;
+    timeout or join failure prompts with no deciding rule or contributors, including for plain commands delayed in the
+    blocking pool. `ArgumentFilter` consumes normalized argument values but rewrites alias-expanded source spans,
+    preserving unchanged quoting, escapes, literal globs, redirect operators, leading `time`/`time -p` and `!` pipeline
+    prefixes, and a trailing background `&` while shell-quoting replacement and added values. The result then passes the
+    full command-plus-endpoint evaluation again in live, replay, and explain paths. A relative or home-relative
+    filesystem redirect in a path-context barrier command, or any later command, asks because changed shell path context
+    is deliberately not modeled. Assignments, dynamic command names, `cd`/`pushd`/`popd`, recognized shell-state
+    builtins, and non-isolated compound constructs such as brace groups and `if`/`for`/`while`/`case` clauses are
+    barriers; absolute paths and descriptors remain evaluable.
   - **Shared hook path resolution** (`hooks/path_resolution.rs`): tool-rule locality and redirect policy share the same
     symlink-safe missing-path implementation, with redirect resolution additionally rejecting non-directory ancestors
     and unsafe virtual paths (`/proc/self`, `/proc/thread-self`, `/dev/fd`, `/dev/std*`, `/dev/tcp`, `/dev/udp`) —
@@ -128,15 +145,17 @@ boundaries, read the [architecture reference](architecture.md) and the
   a clean `result` field (`allow`/`deny`/`ask`/`modify`/`passthrough`) classified from the typed `HookOutput` by
   `hooks::result::pretool_result`, alongside `tool_name`, `tool_args`, `cwd`, `permission_mode`, `rules_hash`, `rule`,
   and `rules`. `rule` remains the primary/deciding compatibility attribution (empty when none); `rules` is a
-  JSON-encoded ordered contributor list covering compound command rules, endpoint rules, and filter revalidation.
-  Contributors are de-duplicated by matched rule identity rather than display name, so distinct command and redirect
-  rules with the same configured name remain visible as repeated names. A bailed command retains a deciding command or
-  redirect Deny contributor and otherwise has none.
+  JSON-encoded ordered contributor list covering compound command rules, endpoint rules, filter revalidation, and the
+  synthetic alias-policy attribution `bash_path_aliases_deny_unconfigured`. Contributors are de-duplicated by matched
+  rule identity rather than display name, so distinct command and redirect rules with the same configured name remain
+  visible as repeated names. A bailed command retains a deciding command or redirect Deny contributor and otherwise has
+  none; a terminal alias-policy Deny instead contributes its policy attribution, even when later syntax would have
+  bailed.
 - **`hooks report` subcommand**: `hooks/report.rs` reads the JSON-lines hook logs, keeps completed PreToolUse records
   that carry the clean `result` field (historical lines lacking it are skipped), and aggregates them by the exact
   `(tool name, arguments, result, rule, ordered contributors)` key into a JSON report with counts; `rule` remains for
   compatibility and `rules` carries complete provenance. Historical lines without `rules` fall back to a non-empty
-  singular `rule`; both are omitted when no rule contributed. Reuses `cost_report::TimeRangeFilter` for
+  singular `rule`; both are omitted when no rule or policy contributed. Reuses `cost_report::TimeRangeFilter` for
   `--start-time`/`--end-time` and supports `--tool` and `--result` filters. `report::aggregate` (used by `hooks report`)
   and `ReportRow` are `pub(crate)`. `report.rs` parses the completion line's `cwd` back into `HookRecord` and folds
   filtered records directly into each caller's accumulator while reading rotated log files concurrently, so no vector
@@ -172,30 +191,31 @@ boundaries, read the [architecture reference](architecture.md) and the
   `suggest` (anchored rules mined from hook logs; each recorded command is split into the leaf simple-commands the hook
   actually evaluates — normalized with the recorded cwd — before pattern generation, so compounds yield per-leaf
   candidates with summed counts, consumed alias declarations omitted, and confirmation-required alias leaves excluded; a
-  bailed command stays whole. `--match exact|prefix|fuzzy` picks the shape, where prefix/fuzzy clustering reuses
-  brush-derived program and argument metadata rather than reparsing leaf text; leaves whose normalized match text does
-  not start with the literal program stay exact-only. Fuzzy generalizes simple-identifier subcommands into a closed
-  alternation like `^cargo (build|check)(\s|$)`, falling back to a program prefix; Allow is emitted only with
-  `--match exact`). Explicit `--action allow-redirect` is also exact-only and switches to target mining: active redirect
-  policy is filtered out; leaves containing dynamic or shell-context-dependent endpoints and command-blocked leaves are
-  omitted; project targets preserve each endpoint's direction and emit `allow_local = true`. Local target patterns are
-  portable across project cwds. Historical tilde targets use the current process HOME and live filesystem because HOME
-  is not recorded. Ordinary Allow suggestions omit leaves already covered by active command policy; Ask and Deny
-  suggestions retain command-allowed leaves when redirect policy still prompts. `replay` re-evaluates the full candidate
-  component policy, including one `ArgumentFilter` recheck; its migration gate fails on lost auto-approvals or when
-  every in-scope row lacks a reproducible cwd. `test bash-rules --explain [--cwd <dir>] [--mode <mode>]` prints consumed
-  bindings, original/alias-expanded/normalized leaf text, command matches, endpoint resolution/locality/rules,
-  contributors, and the merged decision; normal mode uses the same compound path. Omitted `--mode` runs a mode-less
-  evaluation. Alias coverage spans `user_config`, splitter, engine, authoring commands, CLI, and hook tests and must run
-  under Nextest like every XDG-mutating test.
+  bailed command stays whole, while an alias-policy Deny yields no candidate. `--match exact|prefix|fuzzy` picks the
+  shape, where prefix/fuzzy clustering reuses brush-derived program and argument metadata rather than reparsing leaf
+  text; leaves whose normalized match text does not start with the literal program stay exact-only. Fuzzy generalizes
+  simple-identifier subcommands into a closed alternation like `^cargo (build|check)(\s|$)`, falling back to a program
+  prefix; Allow is emitted only with `--match exact`). Explicit `--action allow-redirect` is also exact-only and
+  switches to target mining: active redirect policy is filtered out; leaves containing dynamic or
+  shell-context-dependent endpoints and command-blocked leaves are omitted; project targets preserve each endpoint's
+  direction and emit `allow_local = true`. Local target patterns are portable across project cwds. Historical tilde
+  targets use the current process HOME and live filesystem because HOME is not recorded. Ordinary Allow suggestions omit
+  leaves already covered by active command policy; Ask and Deny suggestions retain command-allowed leaves when redirect
+  policy still prompts. `replay` re-evaluates the full candidate component policy, including one `ArgumentFilter`
+  recheck; its migration gate fails on lost auto-approvals or when every in-scope row lacks a reproducible cwd.
+  `test bash-rules --explain [--cwd <dir>] [--mode <mode>]` prints consumed bindings, original/alias-expanded/normalized
+  leaf text, command matches, endpoint resolution/locality/rules, contributors, and the merged decision; normal mode
+  uses the same compound path. Omitted `--mode` runs a mode-less evaluation. Alias coverage spans `user_config`,
+  splitter, engine, authoring commands, CLI, and hook tests and must run under Nextest like every XDG-mutating test.
 - **Rule-set provenance**: each `PreToolUse hook completed` log line records `rules_hash`, a stable hash of the
   effective config (`UserConfig::effective_hash`, computed once per hook invocation). The hash covers the parsed config
   — tool rules, bash rules, fragments, and the deterministically ordered path-alias policy — re-serialized via
   `serde_json::to_value` so map keys (`pattern_fragments`, an ArgumentFilter `replace` table) sort deterministically
   while rule order (significant for first-match-wins) is preserved; cosmetic edits don't change it but any semantic
-  change does. The empty alias set is omitted so pre-feature hashes remain unchanged. `rules suggest`/`rules replay`
-  default to only the records whose `rules_hash` matches the rule set currently installed at the default config path
-  (for `replay` this is the migration source, independent of the `--config` candidate); `--rules-hash <hash>` pins a
-  specific set and `--all-rules` disables the filter. Both commands report the active hash and how many records the
-  filter excluded (`report::RulesHashFilter`/`HashSkipStats`/`CwdAggregation`); excluded counts are never hidden.
-  `rules report` follows the same disclosure rule under `--current-rules`, but defaults to all recorded history.
+  change does. The hash includes `bash_path_aliases_deny_unconfigured`: false is omitted, preserving pre-feature hashes,
+  while enabling it changes the hash. The empty alias set is also omitted. `rules suggest`/`rules replay` default to
+  only the records whose `rules_hash` matches the rule set currently installed at the default config path (for `replay`
+  this is the migration source, independent of the `--config` candidate); `--rules-hash <hash>` pins a specific set and
+  `--all-rules` disables the filter. Both commands report the active hash and how many records the filter excluded
+  (`report::RulesHashFilter`/`HashSkipStats`/`CwdAggregation`); excluded counts are never hidden. `rules report` follows
+  the same disclosure rule under `--current-rules`, but defaults to all recorded history.
