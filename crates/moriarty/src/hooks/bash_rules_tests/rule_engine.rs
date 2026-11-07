@@ -12,11 +12,11 @@ fn command_and_redirect_first_match_domains_are_independent() {
     let cwd = tempfile::tempdir().unwrap();
     let mut disabled = redirect_rule("disabled", r"^out$", false);
     disabled.modes = Some(BTreeSet::new());
-    let mut plan = redirect_rule("plan-target", r"^out$", false);
-    plan.modes = Some(BTreeSet::from([PermissionMode::Plan]));
+    let mut review = redirect_rule("review-target", r"^out$", false);
+    review.modes = Some(BTreeSet::from(["review-only".parse().unwrap()]));
     let engine = make_engine(vec![
         disabled,
-        plan,
+        review,
         redirect_rule("fallback-target", r"^out$", false),
         allow_rule("allow-echo", r"^echo($|\s)"),
     ]);
@@ -30,7 +30,7 @@ fn command_and_redirect_first_match_domains_are_independent() {
         RuleResult::NoMatch
     );
     for (mode, target) in [
-        (PermissionMode::Plan, "plan-target"),
+        ("review-only".parse().unwrap(), "review-target"),
         (PermissionMode::Default, "fallback-target"),
     ] {
         let evaluation = evaluate(
@@ -47,17 +47,21 @@ fn command_and_redirect_first_match_domains_are_independent() {
 #[test]
 fn endpoint_denial_analysis_uses_mode_eligible_rules() {
     let cwd = tempfile::tempdir().unwrap();
-    let mut plan_deny =
-        deny_redirect_rule("plan-deny", r"^out$", "blocked", RedirectDirection::Output);
-    plan_deny.modes = Some(BTreeSet::from([PermissionMode::Plan]));
-    let engine = make_engine(vec![plan_deny]);
+    let mut review_deny = deny_redirect_rule(
+        "review-deny",
+        r"^out$",
+        "blocked",
+        RedirectDirection::Output,
+    );
+    review_deny.modes = Some(BTreeSet::from(["review-only".parse().unwrap()]));
+    let engine = make_engine(vec![review_deny]);
 
     for (mode, expected_analysis) in [
-        (Some(PermissionMode::Plan), true),
+        (Some("review-only".parse().unwrap()), true),
         (Some(PermissionMode::Default), false),
         (None, false),
     ] {
-        let context = EvaluationContext::new(cwd.path().to_str().unwrap(), mode);
+        let context = EvaluationContext::new(cwd.path().to_str().unwrap(), mode.clone());
         let analysis =
             engine.evaluate_original("unknown > out", &context, EvaluationPurpose::Decision);
         assert_eq!(

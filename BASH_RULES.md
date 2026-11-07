@@ -424,9 +424,12 @@ feedback. Unchanged decisions remain omitted.
 
 ## Permission Modes
 
-Both `tool_rules` and `bash_rules` accept an optional `modes` array with these exact values, matching Claude Code's hook
-wire format: `default`, `plan`, `acceptEdits`, `auto`, `dontAsk`, and `bypassPermissions`. Claude Code's UI label
-**Manual** arrives as `default`; `manual` is not a valid configuration value.
+Both `tool_rules` and `bash_rules` accept an optional `modes` array of exact, case-sensitive names containing at least
+one non-whitespace character. Names are not trimmed, normalized, or aliased: `"review"`, `"Review"`, and `" review "`
+are distinct. No registry is required. The built-in spellings remain `default`, `plan`, `acceptEdits`, `auto`,
+`dontAsk`, and `bypassPermissions`. Claude Code's UI label **Manual** arrives as `default`; the literal `manual` is a
+distinct custom name, not an alias. Non-blank misspellings are accepted rather than diagnosed; use rule regression cases
+to check intended names.
 
 ```toml
 [[bash_rules]]
@@ -445,14 +448,15 @@ action = { type = "Ask" }
 - Omitted `modes` means the rule is unrestricted and participates in every mode. This is a permanent, fully supported
   configuration, not a deprecated compatibility form; omission also preserves existing effective hashes.
 - `modes = []` means the rule never participates and intentionally disables it.
-- Duplicates are removed and values are stored in canonical order.
-- Current hook events require `permission_mode`. A restricted rule cannot match a mode-less historical log row or
-  explicit test evaluation; unrestricted rules still can. Unknown configuration and live-hook values are rejected. An
-  unrecognized historical log value is warned about and treated as mode-less, so replay remains fail-closed for
-  restricted rules.
+- Exact duplicates are removed. Canonical order is the six built-in names in the order above, then custom names
+  lexicographically by UTF-8 bytes; existing valid configurations retain their effective hashes.
+- Current hook events require a non-blank string `permission_mode`. Missing, non-string, empty, or whitespace-only live
+  values are rejected; configured names also reject blank or non-string values. Missing or blank historical modes remain
+  mode-less. A restricted rule cannot match a mode-less historical log row or explicit test evaluation; unrestricted
+  rules still can. Valid custom names retain their exact identity in logs and replay.
 - Ineligible rules remain in place but are skipped. Evaluation falls through to the next eligible rule, preserving
   first-match-wins independently for command rules and redirect rules. Tool-to-Bash fallback, every compound leaf, every
-  endpoint, bail handling, and an `ArgumentFilter` recheck all use the same mode.
+  endpoint, bail handling, Modify redirect validation, and an `ArgumentFilter` recheck all use the same mode.
 - Tool-rule `allow_local` preflight runs only when an eligible local tool rule could apply. Bash filesystem endpoints
   resolve when an Allowed command needs redirect authorization, including for non-local endpoint patterns.
 
@@ -463,15 +467,17 @@ Current completion logs always record the required mode. They retain the compati
 deciding rule or the synthetic `bash_path_aliases_deny_unconfigured` policy attribution, and add `rules`, a JSON-encoded
 ordered contributor list. `hooks report` emits both and groups rows by the exact contributor list; historical records
 with missing or malformed `rules` fall back to their non-empty singular `rule`. `rules replay` evaluates each internal
-row under its recorded mode and includes the mode on divergences. `rules suggest` tags generated rules with the
-canonical union of contributing known modes; if any contributing record is mode-less, the suggestion is unrestricted
-because its original mode cannot be reconstructed. Historical rows without a recorded cwd are excluded from replay and
-suggestion mining, with the excluded count reported, because filesystem policy cannot be reproduced safely without the
-original base directory. Historical logs do not record HOME, so replay and suggestion mining resolve tilde targets
-against the current process HOME and live filesystem. Strict lint warns on `modes = []`, missing mode-overlapping
-redirect policy, and shadowing between same-domain rules whose mode eligibility overlaps. A redirect rule is shadowed
-only when the earlier rule covers every direction and locality class the later rule could match; partial overlap is not
-reported as unreachable.
+row under its recorded mode and includes the mode on divergences. Human-readable mode labels escape control characters;
+JSON retains exact names. `rules suggest` tags generated rules with the canonical union of contributing valid names,
+built-in or custom; if any contributing record is mode-less, the suggestion is unrestricted because its original mode
+cannot be reconstructed. Historical rows without a recorded cwd are excluded from replay and suggestion mining, with the
+excluded count reported, because filesystem policy cannot be reproduced safely without the original base directory.
+Historical logs do not record HOME, so replay and suggestion mining resolve tilde targets against the current process
+HOME and live filesystem. Strict lint warns on `modes = []`, missing mode-overlapping redirect policy, and shadowing
+between same-domain rules whose mode eligibility overlaps. These checks compare exact names, so `review` and `Review`
+are disjoint; valid names need no declaration or prior log observation. A redirect rule is shadowed only when the
+earlier rule covers every direction and locality class the later rule could match; partial overlap is not reported as
+unreachable.
 
 ## Rule Actions
 
@@ -1126,8 +1132,9 @@ reason = "async must be true"
 Unknown suite, case, and request fields are errors. Bash requests require `command`. Tool requests require a nonempty
 non-`Bash` `tool` and `input_json`; the JSON is parsed once as an arbitrary JSON value, preserving nulls and literal
 keys. IDs must be nonempty and unique, names must be nonempty, and suites and supplied mode lists must be nonempty.
-Modes use exactly `default`, `plan`, `acceptEdits`, `auto`, `dontAsk`, or `bypassPermissions` and expand in listed
-order. Omitting `modes` creates one mode-less evaluation in which only unrestricted rules participate.
+Modes use the same exact non-blank names as hooks and rules, including custom names, and expand in listed order. Exact
+duplicates are rejected; differently cased names remain distinct. Names are not trimmed or normalized. Omitting `modes`
+creates one mode-less evaluation in which only unrestricted rules participate.
 
 `expect` is one of `allowed`, `ask`, `denied`, `no_match`, or `not_auto_allowed`. Asked, denied, and unmatched results
 satisfy `not_auto_allowed`; a modified Bash command satisfies no v1 assertion. `reason` is valid only with `denied` and

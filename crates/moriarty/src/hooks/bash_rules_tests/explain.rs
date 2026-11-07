@@ -495,23 +495,23 @@ fn test_explain_shows_original_and_normalized_text() {
 
 #[test]
 fn permission_modes_preserve_order_and_unrestricted_behavior() {
-    let mut plan_deny = deny_rule("plan-deny", r"^ls", "no ls in plan");
-    plan_deny.modes = Some(BTreeSet::from([PermissionMode::Plan]));
+    let mut review_deny = deny_rule("review-deny", r"^ls", "no ls in review");
+    review_deny.modes = Some(BTreeSet::from(["review-only".parse().unwrap()]));
     let mut default_allow = allow_rule("default-allow", r"^ls");
     default_allow.modes = Some(BTreeSet::from([PermissionMode::Default]));
     let fallback = ask_rule("fallback", r"^ls");
-    let engine = make_engine(vec![plan_deny, default_allow, fallback]);
+    let engine = make_engine(vec![review_deny, default_allow, fallback]);
 
     assert!(matches!(
-        command_result(&engine, "ls", Some(PermissionMode::Plan)),
-        RuleResult::Denied { ref rule_name, .. } if rule_name == "plan-deny"
+        command_result(&engine, "ls", Some("review-only".parse().unwrap())),
+        RuleResult::Denied { ref rule_name, .. } if rule_name == "review-deny"
     ));
     assert_eq!(
         command_result(&engine, "ls", Some(PermissionMode::Default)),
         allowed("default-allow")
     );
     assert_eq!(
-        command_result(&engine, "ls", Some(PermissionMode::Auto)),
+        command_result(&engine, "ls", Some("unheard-of".parse().unwrap())),
         asked("fallback")
     );
     assert_eq!(command_result(&engine, "ls", None), asked("fallback"));
@@ -519,7 +519,7 @@ fn permission_modes_preserve_order_and_unrestricted_behavior() {
     let unrestricted = make_engine(vec![allow_rule("all", r"^ls")]);
     assert_eq!(command_result(&unrestricted, "ls", None), allowed("all"));
     assert_eq!(
-        command_result(&unrestricted, "ls", Some(PermissionMode::Plan)),
+        command_result(&unrestricted, "ls", Some("review-only".parse().unwrap())),
         allowed("all")
     );
 }
@@ -527,11 +527,11 @@ fn permission_modes_preserve_order_and_unrestricted_behavior() {
 fn mode_sensitive_engine() -> BashRuleEngine {
     let mut disabled = deny_rule("disabled", r"ls|curl", "disabled");
     disabled.modes = Some(BTreeSet::new());
-    let mut plan_deny = deny_rule("plan-deny", r"ls|curl", "plan only");
-    plan_deny.modes = Some(BTreeSet::from([PermissionMode::Plan]));
+    let mut review_deny = deny_rule("review-deny", r"ls|curl", "review only");
+    review_deny.modes = Some(BTreeSet::from(["review-only".parse().unwrap()]));
     make_engine(vec![
         disabled,
-        plan_deny,
+        review_deny,
         allow_rule("allow-echo", r"^echo"),
     ])
 }
@@ -540,14 +540,15 @@ fn mode_sensitive_engine() -> BashRuleEngine {
 fn empty_mode_set_falls_through_during_compound_evaluation() {
     let engine = mode_sensitive_engine();
     let command = "echo hi && ls";
-    let plan_result = evaluation_result(&engine, command, "", Some(PermissionMode::Plan));
+    let review_result =
+        evaluation_result(&engine, command, "", Some("review-only".parse().unwrap()));
     assert!(matches!(
-        plan_result,
-        RuleResult::Denied { ref rule_name, .. } if rule_name == "plan-deny"
+        review_result,
+        RuleResult::Denied { ref rule_name, .. } if rule_name == "review-deny"
     ));
     assert_eq!(
-        explain(&engine, command, "", Some(PermissionMode::Plan)).final_result,
-        plan_result
+        explain(&engine, command, "", Some("review-only".parse().unwrap())).final_result,
+        review_result
     );
     assert_eq!(
         evaluation_result(&engine, command, "", Some(PermissionMode::Default)),
@@ -560,11 +561,11 @@ fn bailed_command_and_explanation_share_mode() {
     let engine = mode_sensitive_engine();
     let command = "echo $(curl x)";
     for (mode, should_deny) in [
-        (Some(PermissionMode::Plan), true),
+        (Some("review-only".parse().unwrap()), true),
         (Some(PermissionMode::Default), false),
         (None, false),
     ] {
-        let result = evaluation_result(&engine, command, "", mode);
+        let result = evaluation_result(&engine, command, "", mode.clone());
         assert_eq!(explain(&engine, command, "", mode).final_result, result);
         assert_eq!(matches!(result, RuleResult::Denied { .. }), should_deny);
     }

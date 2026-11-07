@@ -13,6 +13,8 @@ binary entry point is `crates/moriarty/src/main.rs`; `my-workspace-hack` is mana
   modern/legacy stdio interoperability, and exclusion of Tasks.
 - [Bash path-alias policy specification](../openspec/specs/bash-path-alias-policy/spec.md): approved alias names, opt-in
   unconfigured-name denial, and shared hook/offline evaluation.
+- [Permission-mode policy specification](../openspec/specs/permission-mode-policy/spec.md): free-form mode identity,
+  rule eligibility, and propagation across hooks, offline evaluation, and recorded workflows.
 - [Supervisor crate rustdoc source](../crates/process_supervisor/src/lib.rs): public API contract and assurance limits.
 - [Project-tools configuration manual](man/moriarty-project-tools.5): command/check configuration and approvals.
 
@@ -112,17 +114,17 @@ Generic cost-analysis library.
   calculated in `cost_analyzer` with local Decimal-based Claude pricing helpers (`ClaudeModelPricing::for_model`) that
   consume `&claude_logs::Model`; the family enum itself lives in `claude_logs` so the parser and pricing layer agree on
   classification without depending on `moriarty::api_pricing` internals. `ModelFamily::Opus` dispatch compares the full
-  parsed version to select OPUS_5_5 for 5.5 and later ($4 input / $20 output / $5 short cache write / $0.20 cache read per
-  million tokens), retaining OPUS_4 for earlier major versions >= 4 and OPUS for older or versionless ids. Claude cache
-  writes split the aggregate creation count into the recorded 1-hour subset
+  parsed version to select OPUS_5_5 for 5.5 and later ($4 input / $20 output / $5 short cache write / $0.20 cache read
+  per million tokens), retaining OPUS_4 for earlier major versions >= 4 and OPUS for older or versionless ids. Claude
+  cache writes split the aggregate creation count into the recorded 1-hour subset
   (`cache_creation.ephemeral_1h_input_tokens`, priced at twice input) and the remainder (5-minute rate); token totals
   still count that subset only once. Claude can retain earlier-iteration duration metadata on fallback and zeroed
-  content records, so the pricing adapter caps the 1-hour count at the authoritative top-level creation count rather than
-  rejecting the record or billing extra tokens. The pricing helper rejects inconsistent programmatically constructed
-  counts; the parser continues to accept these Claude-written records.
-  Rates: [Anthropic pricing](https://platform.claude.com/docs/en/about-claude/pricing). `ModelFamily::Fable`
-  compares the full parsed `ModelVersion` against 5.1 to pick FABLE (Fable 5 and versionless ids) or FABLE_5_1 (5.1 and
-  later, which differs only in its reduced cache-read rate).
+  content records, so the pricing adapter caps the 1-hour count at the authoritative top-level creation count rather
+  than rejecting the record or billing extra tokens. The pricing helper rejects inconsistent programmatically
+  constructed counts; the parser continues to accept these Claude-written records. Rates:
+  [Anthropic pricing](https://platform.claude.com/docs/en/about-claude/pricing). `ModelFamily::Fable` compares the full
+  parsed `ModelVersion` against 5.1 to pick FABLE (Fable 5 and versionless ids) or FABLE_5_1 (5.1 and later, which
+  differs only in its reduced cache-read rate).
 - `moriarty::api_pricing` and `moriarty::pi_cost` both delegate all log loading, deduplication, pricing, and raw token
   extraction to this crate; the backends only bucket the returned billable lines into cost or token report rows
 - `LineWithCost.session_id` is normalized during parsing so backends can group by conversation without re-reading log

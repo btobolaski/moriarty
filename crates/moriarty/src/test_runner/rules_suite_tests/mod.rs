@@ -119,19 +119,26 @@ request = { kind = "bash", command = "echo" }"#,
 [[cases]]
 id = "a"
 name = "a"
-modes = ["future"]
-request = { kind = "bash", command = "echo" }
-expect = "allowed""#,
-        r#"format_version = 1
-[[cases]]
-id = "a"
-name = "a"
 request = { kind = "future", command = "echo" }
 expect = "allowed""#,
     ];
     for source in invalid {
         assert!(parse_suite(source).is_err(), "accepted {source:?}");
     }
+    let custom = parse_suite(
+        r#"format_version = 1
+[[cases]]
+id = "a"
+name = "a"
+modes = ["future"]
+request = { kind = "bash", command = "echo" }
+expect = "allowed""#,
+    )
+    .unwrap();
+    assert_eq!(
+        custom.cases[0].modes.as_ref().unwrap()[0].to_string(),
+        "future"
+    );
 }
 
 #[test]
@@ -239,28 +246,42 @@ fn non_utf8_cwd_is_rejected() {
 fn mode_omission_and_expansion_are_distinct_and_ordered() {
     let cwd = tempfile::tempdir().unwrap();
     let mut expanded = bash_case("expanded", "echo", Expectation::Allowed);
-    expanded.modes = Some(vec![PermissionMode::Plan, PermissionMode::Default]);
+    expanded.modes = Some(vec![
+        PermissionMode::Plan,
+        "review-only".parse().unwrap(),
+        "Review-only".parse().unwrap(),
+    ]);
     let prepared = prepare(
         vec![bash_case("none", "echo", Expectation::Allowed), expanded],
         cwd.path(),
     )
     .unwrap();
     assert_eq!(prepared.source_case_count.get(), 2);
-    assert_eq!(prepared.evaluation_count.get(), 3);
-    assert_eq!(prepared.rows.len(), 3);
+    assert_eq!(prepared.evaluation_count.get(), 4);
+    assert_eq!(prepared.rows.len(), 4);
     assert_eq!(prepared.rows[0].mode, None);
     assert_eq!(
         prepared.rows[1..]
             .iter()
-            .map(|row| row.mode.unwrap())
+            .map(|row| row.mode.clone().unwrap())
             .collect::<Vec<_>>(),
-        [PermissionMode::Plan, PermissionMode::Default]
+        [
+            PermissionMode::Plan,
+            "review-only".parse().unwrap(),
+            "Review-only".parse().unwrap()
+        ]
     );
 
-    for modes in [Vec::new(), vec![PermissionMode::Plan, PermissionMode::Plan]] {
+    let controls: PermissionMode = "review\n\u{1b}[31m".parse().unwrap();
+    for (modes, message) in [
+        (Vec::new(), "modes must not be empty"),
+        (vec![controls.clone(), controls], r"review\n\u{1b}[31m"),
+    ] {
         let mut invalid = bash_case("bad", "echo", Expectation::Allowed);
         invalid.modes = Some(modes);
-        assert!(prepare(vec![invalid], cwd.path()).is_err());
+        let error = prepare(vec![invalid], cwd.path()).unwrap_err().to_string();
+        assert!(error.contains(message), "{error}");
+        assert!(!error.contains('\u{1b}'));
     }
 }
 
@@ -773,9 +794,9 @@ async fn disappearing_cwd_aborts_report_instead_of_satisfying_not_auto_allowed()
 async fn mixed_rows_retain_source_and_mode_order_and_counts() {
     let cwd = tempfile::tempdir().unwrap();
     let mut bash = bash_case("bash", "echo", Expectation::Allowed);
-    bash.modes = Some(vec![PermissionMode::Plan, PermissionMode::Default]);
+    bash.modes = Some(vec![PermissionMode::Plan, "review-only".parse().unwrap()]);
     let mut tool = tool_case("tool", "Read", "{}", Expectation::Ask);
-    tool.modes = Some(vec![PermissionMode::Auto]);
+    tool.modes = Some(vec!["Review-only".parse().unwrap()]);
     let report = evaluate(
         vec![bash, tool, bash_case("last", "other", Expectation::NoMatch)],
         UserConfig {
@@ -798,11 +819,15 @@ async fn mixed_rows_retain_source_and_mode_order_and_counts() {
         ["bash", "bash", "tool", "last"]
     );
     assert_eq!(
-        report.rows.iter().map(|row| row.mode).collect::<Vec<_>>(),
+        report
+            .rows
+            .iter()
+            .map(|row| row.mode.clone())
+            .collect::<Vec<_>>(),
         [
             Some(PermissionMode::Plan),
-            Some(PermissionMode::Default),
-            Some(PermissionMode::Auto),
+            Some("review-only".parse().unwrap()),
+            Some("Review-only".parse().unwrap()),
             None,
         ]
     );
@@ -879,6 +904,7 @@ async fn public_core_returns_serializable_report() {
 [[cases]]
 id = "echo"
 name = "echo denial mismatch"
+modes = ["review-only"]
 request = { kind = "bash", command = "echo {{cwd}}" }
 expect = "denied"
 reason = "expected reason"
@@ -895,7 +921,7 @@ action = { type = "Deny", value = "actual reason" }
 "#,
     )
     .unwrap();
-    let report = run_rules_suite(
+    let mut report = run_rules_suite(
         &suite_path,
         &config_path,
         dir.path(),
@@ -910,7 +936,8 @@ action = { type = "Deny", value = "actual reason" }
     assert_eq!(json["format_version"], 1);
     assert_eq!(json["source_case_count"], 1);
     assert_eq!(json["evaluation_count"], 1);
-    assert_eq!(json["rows"][0]["mode"], Value::Null);
+    assert_eq!(json["rows"][0]["mode"], "review-only");
+    assert!(report.render(false).unwrap().contains("mode: review-only"));
     assert_eq!(
         json["rows"][0]["effective_cwd"],
         effective_cwd.to_str().unwrap()
@@ -922,4 +949,12 @@ action = { type = "Deny", value = "actual reason" }
     assert_eq!(json["rows"][0]["expected_reason"], "expected reason");
     assert_eq!(json["rows"][0]["actual"]["result"], "denied");
     assert_eq!(json["rows"][0]["actual"]["reason"], "actual reason");
+
+    let name = "review\n\u{1b}[31m";
+    report.rows[0].mode = Some(name.parse().unwrap());
+    let text = report.render(false).unwrap();
+    assert!(text.contains(r"mode: review\n\u{1b}[31m"));
+    assert!(!text.contains(name));
+    let json: Value = serde_json::from_str(&report.render(true).unwrap()).unwrap();
+    assert_eq!(json["rows"][0]["mode"], name);
 }

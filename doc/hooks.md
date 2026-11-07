@@ -7,18 +7,14 @@ boundaries, read the [architecture reference](architecture.md) and the
 [Moriarty process-execution specification](../openspec/specs/moriarty-process-execution/spec.md).
 
 The [Bash path-alias policy specification](../openspec/specs/bash-path-alias-policy/spec.md) defines the alias-name
-contract.
+contract. The [Permission-mode policy specification](../openspec/specs/permission-mode-policy/spec.md) defines exact
+mode names, rule eligibility, and mode propagation.
 
 - **PreToolUse hook**: Two-tier permission system from `~/.config/moriarty/tool_rules.toml`:
-  - **Permission-mode eligibility**: both rule kinds accept `modes`, an optional set of the six exact hook values
-    (`default`, `plan`, `acceptEdits`, `auto`, `dontAsk`, `bypassPermissions`; Manual arrives as `default`). Omitted
-    means the rule is permanently unrestricted in all modes and remains omitted from serialization so existing effective
-    hashes stay stable; `[]` means no modes. Hook events require `permission_mode`; a restricted rule cannot match a
-    mode-less replay or test row. Ineligible rules stay in declaration order and are skipped before other gates, so
-    first-match-wins applies among eligible rules; the same mode threads through tool-to-Bash fallback, locality
-    preflight, compound/bail evaluation, ArgumentFilter recheck, explain, replay, and suggestion de-duplication. Public
-    `hooks report` grouping/JSON remains mode-agnostic, but cwd-aware internal rows split by mode; suggestions union
-    known contributing modes and become unrestricted if any contributor is mode-less.
+  - **Permission-mode eligibility**: tool and Bash engines skip ineligible rules in place before other gates, preserving
+    declaration order and first-match-wins among eligible rules. The same mode threads through tool-to-Bash fallback,
+    locality preflight, compound/bail evaluation, Modify redirect validation, and ArgumentFilter rechecks. Offline
+    evaluation and replay reuse those mode-aware paths.
   - `tool_rules`: Permission any tool call (Read, Write, Edit, Bash, etc.) with optional legacy field-level regex
     matching and an optional ANDed `conditions` list over literal top-level input keys: `Present`, `Absent`, typed raw
     JSON `Equals`, and scalar-regex `Matches`. Separate ordered rules provide OR/fallback behavior. Actions: Allow,

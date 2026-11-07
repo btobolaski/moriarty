@@ -811,27 +811,65 @@ mod tests {
 [[bash_rules]]
 name = "allow-ls"
 pattern = "^ls"
-modes = ["plan", "default", "plan"]
+modes = ["dontAsk", "plan", "auto", "default", "bypassPermissions", "acceptEdits", "plan", "default"]
 action = { type = "Allow" }
 "#,
         )
         .unwrap();
 
-        assert_eq!(
-            config.bash_rules.as_ref().unwrap()[0].modes,
-            Some(BTreeSet::from([
-                PermissionMode::Default,
-                PermissionMode::Plan,
-            ]))
-        );
+        let expected = r#"{"bash_rules":[{"action":{"type":"Allow"},"modes":["default","plan","acceptEdits","auto","dontAsk","bypassPermissions"],"name":"allow-ls","pattern":"^ls"}],"pattern_fragments":null,"tool_rules":null}"#;
+        assert_eq!(serde_json::to_value(&config).unwrap().to_string(), expected);
+        assert_eq!(config.effective_hash(), hash_string(expected));
         let serialized = toml::to_string(&config).unwrap();
-        assert!(serialized.contains("modes = [\"default\", \"plan\"]"));
+        assert!(serialized.contains("modes = [\"default\", \"plan\", \"acceptEdits\", \"auto\", \"dontAsk\", \"bypassPermissions\"]"));
         assert_eq!(toml::from_str::<UserConfig>(&serialized).unwrap(), config);
 
         let mut disabled = allow("disabled", "^never");
         disabled.modes = Some(BTreeSet::new());
         let round_tripped: BashRule = toml::from_str(&toml::to_string(&disabled).unwrap()).unwrap();
         assert_eq!(round_tripped.modes, Some(BTreeSet::new()));
+    }
+
+    #[test]
+    fn custom_mode_restrictions_are_canonical_for_both_rule_kinds() {
+        let policy = r#"
+[[bash_rules]]
+name = "ls"
+pattern = "^ls"
+modes = ["zeta", "plan", "alpha", "alpha"]
+action = { type = "Allow" }
+[[tool_rules]]
+name = "read"
+tool = "Read"
+modes = ["zeta", "plan", "alpha", "alpha"]
+action = { type = "Allow" }
+"#;
+        let config: UserConfig = toml::from_str(policy).unwrap();
+        let reordered: UserConfig = toml::from_str(&policy.replace(
+            "[\"zeta\", \"plan\", \"alpha\", \"alpha\"]",
+            "[\"alpha\", \"zeta\", \"plan\"]",
+        ))
+        .unwrap();
+        let json = serde_json::to_value(&config).unwrap();
+        for kind in ["bash_rules", "tool_rules"] {
+            assert_eq!(
+                json[kind][0]["modes"],
+                serde_json::json!(["plan", "alpha", "zeta"])
+            );
+        }
+        assert_eq!(config.effective_hash(), reordered.effective_hash());
+        let serialized = toml::to_string(&config).unwrap();
+        assert_eq!(toml::from_str::<UserConfig>(&serialized).unwrap(), config);
+
+        let mut changed = config.clone();
+        changed.bash_rules.as_mut().unwrap()[0].modes = None;
+        changed.tool_rules.as_mut().unwrap()[0].modes = Some(BTreeSet::new());
+        let round_tripped: UserConfig =
+            toml::from_str(&toml::to_string(&changed).unwrap()).unwrap();
+        assert_eq!(round_tripped, changed);
+        let json = serde_json::to_value(&changed).unwrap();
+        assert!(json["bash_rules"][0].get("modes").is_none());
+        assert_eq!(json["tool_rules"][0]["modes"], serde_json::json!([]));
     }
 
     #[test]
@@ -876,6 +914,10 @@ action = { type = "Allow" }
             Some(BTreeSet::from([PermissionMode::Plan]));
 
         assert_ne!(restricted.effective_hash(), unrestricted.effective_hash());
+        let built_in_hash = restricted.effective_hash();
+        restricted.bash_rules.as_mut().unwrap()[0].modes =
+            Some(BTreeSet::from(["review-only".parse().unwrap()]));
+        assert_ne!(restricted.effective_hash(), built_in_hash);
     }
 
     #[test]

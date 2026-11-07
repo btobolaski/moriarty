@@ -316,7 +316,7 @@ async fn exec_hook_impl<R: AsyncRead + Unpin>(reader: R) -> miette::Result<()> {
             tool_name,
             tool_input,
             &hook_input.cwd,
-            Some(hook_input.permission_mode),
+            Some(hook_input.permission_mode.clone()),
         )
         .await?;
         let hook_output = outcome.output;
@@ -480,7 +480,9 @@ async fn handle_pretool_hook(
             rules.clone(),
             config.pattern_fragments.clone(),
         );
-        let result = engine.apply_rules(tool_name, tool_input, cwd, mode).await;
+        let result = engine
+            .apply_rules(tool_name, tool_input, cwd, mode.as_ref())
+            .await;
 
         match result {
             tool_rules::ToolRuleResult::Allowed { rule_name } => {

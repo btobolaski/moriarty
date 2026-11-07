@@ -45,6 +45,14 @@ or utilize [my fork][1] and then add a similar hook setup in the
 }
 ```
 
+Pi-modal owns mode selection; `pi-permission-system` transports hook requests. Moriarty accepts the exact selected name
+in the existing required top-level `permission_mode` string, including custom non-blank names. Connecting pi-modal's
+selection to that field is separate pi-side work, not implemented by this Moriarty change or guaranteed by the setup
+above. No new hook field or mode registry is needed. Names are case-sensitive and are not trimmed; `manual` is distinct
+from Claude Code's `default`. Older Moriarty binaries reject custom names in live requests, policy, and suites;
+custom-name transport requires a compatible binary. Downgrading to an older binary requires stopping custom-name
+transport and removing custom names from active policy and suites.
+
 [1]: https://github.com/btobolaski/pi-packages/tree/claude-hooks-v26.3.1
 
 Once you have all of that in place it will be working but, it will not do very much. It will start collecting logs of

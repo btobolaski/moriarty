@@ -720,8 +720,8 @@ enum TestCommand {
         #[arg(long)]
         cwd: Option<PathBuf>,
 
-        /// Simulate a permission mode (omit for a mode-less test evaluation)
-        #[arg(long, value_enum)]
+        /// Simulate an exact, non-blank permission mode name (omit for a mode-less evaluation)
+        #[arg(long)]
         mode: Option<permission_mode::PermissionMode>,
     },
 }
@@ -1396,10 +1396,17 @@ mod tests {
             other => panic!("unexpected command: {other:?}"),
         }
 
-        assert!(
-            Cli::try_parse_from(["moriarty", "test", "bash-rules", "ls", "--mode", "manual",])
-                .is_err()
-        );
+        let cli = Cli::try_parse_from(["moriarty", "test", "bash-rules", "ls", "--mode", "manual"])
+            .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Test {
+                subcommand: TestCommand::BashRules {
+                    mode: Some(PermissionMode::Custom(_)),
+                    ..
+                }
+            }
+        ));
     }
 
     #[test]

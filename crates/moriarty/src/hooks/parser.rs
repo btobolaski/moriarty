@@ -393,6 +393,8 @@ mod tests {
         let input = parse_hook_input(json).expect("Failed to parse input");
         assert_eq!(input.session_id, "abc-123");
         assert_eq!(input.permission_mode, PermissionMode::Default);
+        let custom = parse_hook_input(&json.replace("\"default\"", "\"review-only\"")).unwrap();
+        assert_eq!(custom.permission_mode.to_string(), "review-only");
 
         match input.event_data {
             HookEventData::PreToolUse {

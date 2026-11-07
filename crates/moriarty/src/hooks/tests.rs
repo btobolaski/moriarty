@@ -566,9 +566,9 @@ async fn completion_log_attributes_deciding_and_contributing_rules() {
 async fn permission_mode_threads_through_tool_and_bash_fallback_order() {
     let config = r#"
 [[tool_rules]]
-name = "plan-tool-ask"
+name = "review-tool-ask"
 tool = "Bash"
-modes = ["plan"]
+modes = ["review-only"]
 action = { type = "Ask" }
 
 [[bash_rules]]
@@ -585,11 +585,17 @@ action = { type = "Allow" }
 "#;
     let input = serde_json::json!({"command": "echo hi"});
 
-    let plan =
-        run_pretool_outcome_mode(config, "Bash", &input, "", Some(PermissionMode::Plan)).await;
-    assert_pretool_ask(&plan.output);
-    assert_eq!(plan.rule.as_deref(), Some("plan-tool-ask"));
-    assert_eq!(plan.contributors, ["plan-tool-ask"]);
+    let review = run_pretool_outcome_mode(
+        config,
+        "Bash",
+        &input,
+        "",
+        Some("review-only".parse().unwrap()),
+    )
+    .await;
+    assert_pretool_ask(&review.output);
+    assert_eq!(review.rule.as_deref(), Some("review-tool-ask"));
+    assert_eq!(review.contributors, ["review-tool-ask"]);
 
     let default =
         run_pretool_outcome_mode(config, "Bash", &input, "", Some(PermissionMode::Default)).await;
@@ -618,7 +624,7 @@ async fn argument_filter_recheck_uses_the_same_permission_mode() {
 [[bash_rules]]
 name = "strip-open"
 pattern = "^cargo doc.*--open"
-modes = ["plan"]
+modes = ["review-only"]
 action = {{ type = "ArgumentFilter", remove = ["--open"] }}
 
 [[bash_rules]]
@@ -630,9 +636,15 @@ action = {{ type = "Allow" }}
         )
     };
     let input = serde_json::json!({"command": "cargo doc --open"});
-    let same_mode = config(PermissionMode::Plan);
-    let allowed =
-        run_pretool_outcome_mode(&same_mode, "Bash", &input, "", Some(PermissionMode::Plan)).await;
+    let same_mode = config("review-only".parse().unwrap());
+    let allowed = run_pretool_outcome_mode(
+        &same_mode,
+        "Bash",
+        &input,
+        "",
+        Some("review-only".parse().unwrap()),
+    )
+    .await;
     assert_pretool_modified_case(&allowed.output, "cargo doc", "same mode");
     assert_eq!(allowed.rule.as_deref(), Some("strip-open"));
     assert_eq!(allowed.contributors, ["strip-open", "allow-filtered"]);
@@ -643,7 +655,7 @@ action = {{ type = "Allow" }}
         "Bash",
         &input,
         "",
-        Some(PermissionMode::Plan),
+        Some("review-only".parse().unwrap()),
     )
     .await;
     assert_pretool_ask(&asked.output);
@@ -762,16 +774,37 @@ async fn rewritten_outputs_require_redirect_authorization() {
     let cwd = cwd.path().to_str().unwrap();
 
     for (base, command, modified, modify_rule, prior_rules) in cases {
+        let base = base.replace(
+            "[[bash_rules]]",
+            "[[bash_rules]]\nmodes = [\"review-only\"]",
+        );
         let input = serde_json::json!({"command": command});
-        let asked = run_pretool_outcome(&base, "Bash", &input, cwd).await;
+        let asked = run_pretool_outcome_mode(
+            &base,
+            "Bash",
+            &input,
+            cwd,
+            Some("review-only".parse().unwrap()),
+        )
+        .await;
         assert_pretool_ask(&asked.output);
         assert_eq!(asked.rule.as_deref(), Some(modify_rule));
         let mut expected = prior_rules.to_vec();
         expected.push(modify_rule);
         assert_eq!(asked.contributors, expected);
 
-        let with_redirect = with_local_redirect(&base);
-        let allowed = run_pretool_outcome(&with_redirect, "Bash", &input, cwd).await;
+        let with_redirect = with_local_redirect(&base).replace(
+            "name = \"allow-local-redirect\"",
+            "name = \"allow-local-redirect\"\nmodes = [\"review-only\"]",
+        );
+        let allowed = run_pretool_outcome_mode(
+            &with_redirect,
+            "Bash",
+            &input,
+            cwd,
+            Some("review-only".parse().unwrap()),
+        )
+        .await;
         assert_pretool_modified_case(&allowed.output, modified, command);
         expected.push("allow-local-redirect");
         assert_eq!(allowed.contributors, expected);
@@ -779,11 +812,14 @@ async fn rewritten_outputs_require_redirect_authorization() {
 }
 
 #[tokio::test]
-async fn exec_hook_mode_selects_rule_and_logs_canonical_value() {
-    let fields = exec_pretool_with_mode(PLAN_ONLY_ALLOW_RULE, PermissionMode::Plan).await;
+async fn exec_hook_mode_selects_rule_and_logs_exact_value() {
+    let config = PLAN_ONLY_ALLOW_RULE
+        .replace("\"plan\"", "\" review-only \"")
+        .replace("plan-allow", "review-allow");
+    let fields = exec_pretool_with_mode(&config, " review-only ".parse().unwrap()).await;
     assert_eq!(fields["result"], "allow");
-    assert_eq!(fields["rule"], "plan-allow");
-    assert_eq!(fields["permission_mode"], "plan");
+    assert_eq!(fields["rule"], "review-allow");
+    assert_eq!(fields["permission_mode"], " review-only ");
 }
 
 #[tokio::test]
@@ -2742,9 +2778,11 @@ async fn unconfigured_alias_policy_denies_without_rules_in_every_mode() {
         ("", Some(PermissionMode::Auto)),
         ("", Some(PermissionMode::DontAsk)),
         ("", Some(PermissionMode::BypassPermissions)),
+        ("", Some("review-only".parse().unwrap())),
     ] {
         let config = format!("{policy}{suffix}");
-        let live = run_pretool_outcome_mode(&config, "Bash", &input, "/work/project", mode).await;
+        let live =
+            run_pretool_outcome_mode(&config, "Bash", &input, "/work/project", mode.clone()).await;
         assert_pretool_deny(&live.output, reason);
         assert_eq!(
             live.rule.as_deref(),

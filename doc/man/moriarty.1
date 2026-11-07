@@ -86,7 +86,7 @@
 .Op Fl \-json
 .Op Fl \-explain
 .Op Fl \-cwd Ar dir
-.Op Fl \-mode Ar default|plan|acceptEdits|auto|dontAsk|bypassPermissions
+.Op Fl \-mode Ar mode
 .Op Ar command
 .Nm
 .Cm rules lint
@@ -377,12 +377,19 @@ and applying configured tool and bash rules.
 Both rule kinds may use an optional
 .Ic modes
 allow\-list; omitted applies in every mode and an empty list disables the rule.
-Restricted rules require the event's exact
-.Cm default , plan , acceptEdits , auto , dontAsk ,
-or
-.Cm bypassPermissions
-value; Manual arrives as
-.Cm default .
+Restricted rules match the event's exact, case\-sensitive mode name, including
+custom names without a registry, trimming, or aliases.
+The existing top\-level
+.Ic permission_mode
+string is required and must contain a non\-whitespace character.
+Built\-ins remain
+.Cm default , plan , acceptEdits , auto , dontAsk , bypassPermissions ;
+Claude Code's Manual arrives as
+.Cm default ,
+while literal
+.Cm manual
+is distinct.
+Valid misspellings are accepted too.
 Ineligible rules are skipped in place, preserving first\-match order among eligible rules.
 For Bash, ordinary command rules and directional
 .Cm AllowRedirect / DenyRedirect
@@ -487,8 +494,10 @@ Defaults to the process working directory.
 Simulate the hook permission mode for normal and
 .Fl \-explain
 evaluation.
-Accepted values are
-.Cm default , plan , acceptEdits , auto , dontAsk , bypassPermissions .
+Any exact, case\-sensitive name with a non\-whitespace character is accepted,
+including custom names; names are not trimmed or normalized.
+This also applies with
+.Fl \-json .
 Omitting this option runs a mode\-less test evaluation, so only unrestricted rules participate.
 .El
 .El
@@ -515,6 +524,7 @@ A universal local redirect rule is reported separately from an unrestricted rule
 all resolved paths, devices, and descriptors.
 Shadow analysis compares only rules in the same command or redirect domain and requires overlapping
 permission\-mode eligibility.
+Mode overlap uses exact names, including custom names; no registry or prior log observation is required.
 Within the redirect domain it includes both
 .Cm AllowRedirect
 and
@@ -635,7 +645,8 @@ suggestions retain command-allowed leaves that still prompt under redirect polic
 Project\-local targets receive
 .Ic allow_local = true ;
 home, absolute, device, and descriptor targets remain unrestricted and exact.
-Generated rules carry the canonical union of contributing recorded modes; if any contributor is mode\-less,
+Generated rules carry the canonical union of contributing recorded names,
+including custom names; if any contributor is mode\-less,
 the rule is unrestricted because its mode cannot be reconstructed.
 By default only log lines recorded under the rule set currently installed at
 .Pa ~/.config/moriarty/tool_rules.toml
@@ -674,7 +685,10 @@ so the baseline is coherent;
 pins a specific rule\-set hash and
 .Fl \-all\-rules
 replays every recorded line.
-Each recorded row is replayed under its recorded permission mode, and divergence rows include that mode.
+Each recorded row is replayed under its exact recorded permission mode, including
+custom names, and divergence rows include that mode.
+Human mode labels escape control characters; JSON retains exact names.
+Missing or blank historical modes remain mode\-less, enabling only unrestricted rules.
 Lost and newly\-allowed summary counters count the recorded events represented by those rows, not aggregated rows.
 Mode\-less rows enable only unrestricted candidate rules.
 Historical rows without a recorded cwd are excluded from both replay and suggestion mining because their filesystem

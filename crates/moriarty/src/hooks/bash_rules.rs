@@ -877,7 +877,7 @@ impl CompiledCommandRules {
     fn first_match(
         &self,
         text: &str,
-        mode: Option<PermissionMode>,
+        mode: Option<&PermissionMode>,
     ) -> Option<&CompiledCommandRule> {
         self.regex_set.matches(text).iter().find_map(|index| {
             let rule = &self.rules[index];
@@ -891,7 +891,7 @@ impl CompiledCommandRules {
 }
 
 impl CompiledRedirectRules {
-    fn deny_coverage(&self, mode: Option<PermissionMode>) -> BTreeSet<RedirectDirection> {
+    fn deny_coverage(&self, mode: Option<&PermissionMode>) -> BTreeSet<RedirectDirection> {
         let mut coverage = BTreeSet::new();
         for rule in &self.rules {
             if is_mode_eligible(rule.modes.as_ref(), mode)
@@ -910,7 +910,7 @@ impl CompiledRedirectRules {
     fn first_match(
         &self,
         text: &str,
-        mode: Option<PermissionMode>,
+        mode: Option<&PermissionMode>,
         endpoint_direction: RedirectDirection,
         is_filesystem: bool,
         is_local: bool,
@@ -1100,7 +1100,7 @@ impl BashRuleEngine {
         command: &str,
         command_shape: Option<&FilterCommand>,
         redirect_rewrite: RedirectRewrite<'_>,
-        mode: Option<PermissionMode>,
+        mode: Option<&PermissionMode>,
     ) -> CommandDecision {
         let Some(rule) = self.command_rules.first_match(command, mode) else {
             return CommandDecision::NoMatch;
@@ -1278,7 +1278,7 @@ impl BashRuleEngine {
                     command,
                     None,
                     RedirectRewrite::NONE,
-                    context.mode,
+                    context.mode.as_ref(),
                 ) {
                     CommandDecision::Deny { rule, reason } => BailDecision::Deny { rule, reason },
                     _ => self.redirect_denied_endpoint(redirects, context).map_or(
@@ -1300,7 +1300,7 @@ impl BashRuleEngine {
             }
             SplitOutcome::Commands(leaves) => {
                 let redirect_denies = if leaves.iter().any(|leaf| !leaf.redirects.is_empty()) {
-                    self.redirect_rules.deny_coverage(context.mode)
+                    self.redirect_rules.deny_coverage(context.mode.as_ref())
                 } else {
                     BTreeSet::new()
                 };
@@ -1327,7 +1327,7 @@ impl BashRuleEngine {
             &leaf.match_text,
             leaf.filter_command.as_ref(),
             RedirectRewrite::from_leaf(&leaf),
-            context.mode,
+            context.mode.as_ref(),
         );
         let (identity, redirects) = leaf_identity_and_redirects(leaf);
         let analyze_endpoints = matches!(purpose, EvaluationPurpose::Diagnostics)
@@ -1363,7 +1363,7 @@ impl BashRuleEngine {
         redirects: Vec<RedirectEndpoint>,
         context: &EvaluationContext,
     ) -> Option<DeniedRedirectEndpoint> {
-        let coverage = self.redirect_rules.deny_coverage(context.mode);
+        let coverage = self.redirect_rules.deny_coverage(context.mode.as_ref());
         redirects
             .into_iter()
             .filter(|endpoint| coverage.contains(&endpoint.direction))
@@ -1437,7 +1437,7 @@ impl BashRuleEngine {
             ParsedRedirectTarget::Descriptor { match_text } => {
                 let matched_rule = self.match_redirect_rule(
                     &match_text,
-                    context.mode,
+                    context.mode.as_ref(),
                     direction,
                     RedirectEndpointKind::Descriptor,
                     false,
@@ -1474,7 +1474,7 @@ impl BashRuleEngine {
                     };
                     let matched_rule = self.match_redirect_rule(
                         &match_text,
-                        context.mode,
+                        context.mode.as_ref(),
                         direction,
                         kind,
                         is_local,
@@ -1507,7 +1507,7 @@ impl BashRuleEngine {
     fn match_redirect_rule(
         &self,
         match_text: &str,
-        mode: Option<PermissionMode>,
+        mode: Option<&PermissionMode>,
         direction: RedirectDirection,
         kind: RedirectEndpointKind,
         is_local: bool,

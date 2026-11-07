@@ -99,11 +99,15 @@ Required closed assertion:
 or
 .Cm not_auto_allowed .
 .It Ic modes
-Optional nonempty list using exactly
-.Cm default , plan , acceptEdits , auto , dontAsk ,
-or
-.Cm bypassPermissions .
-Duplicates are rejected.
+Optional nonempty list of exact, case\-sensitive names, including custom names
+without prior registration.
+Names must contain a non\-whitespace character and are not trimmed or normalized.
+Built\-ins retain
+.Cm default , plan , acceptEdits , auto , dontAsk , bypassPermissions ;
+.Cm manual
+is distinct from
+.Cm default .
+Exact duplicates are rejected; differently cased names are distinct.
 Rows expand in case and listed-mode order.
 Omission creates one mode-less row,
 in which only unrestricted rules participate.
@@ -187,7 +191,7 @@ rather than the original JSON string.
 Actual results retain applicable rule, reason, and rewrite data.
 .Pp
 Human output prints only failed rows, followed by one line with all four counts.
-IDs, names, cwds, requests, expected reasons, and actual details are escaped
+IDs, names, modes, cwds, requests, expected reasons, and actual details are escaped
 so embedded controls do not create ambiguous row boundaries.
 .Sh EXIT STATUS
 .Bl -tag -width 2

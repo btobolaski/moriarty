@@ -174,8 +174,10 @@ impl RulesSuiteReport {
             line!("FAIL {id} ({name})");
             line!(
                 "  mode: {}",
-                row.mode
-                    .map_or_else(|| "mode-less".to_string(), |mode| mode.to_string())
+                row.mode.as_ref().map_or_else(
+                    || "mode-less".to_string(),
+                    |mode| mode.to_string().escape_debug().to_string()
+                )
             );
             line!("  cwd: {cwd}");
             line!("  request: {request}");
@@ -334,14 +336,15 @@ fn validate_modes(case: &Case) -> miette::Result<Vec<Option<PermissionMode>>> {
     }
     let mut seen = HashSet::new();
     for mode in modes {
-        if !seen.insert(*mode) {
+        if !seen.insert(mode) {
             return Err(miette::miette!(
-                "Rule suite case '{}' repeats mode '{mode}'",
-                case.id
+                "Rule suite case '{}' repeats mode '{}'",
+                case.id,
+                mode.to_string().escape_debug()
             ));
         }
     }
-    Ok(modes.iter().copied().map(Some).collect())
+    Ok(modes.iter().cloned().map(Some).collect())
 }
 
 fn prepare_request(request: Request, case_id: &str) -> miette::Result<PreparedRequest> {
@@ -476,7 +479,7 @@ async fn evaluate_suite(
     for row in prepared.rows {
         let actual = match &row.request {
             PreparedRequest::Bash { command } => {
-                let context = EvaluationContext::new(&row.cwd, row.mode);
+                let context = EvaluationContext::new(&row.cwd, row.mode.clone());
                 engines
                     .bash
                     .evaluate_sync(command, &context, EvaluationPurpose::Decision)
@@ -485,7 +488,7 @@ async fn evaluate_suite(
             }
             PreparedRequest::Tool { tool, input } => engines
                 .tool
-                .apply_rules_checked(tool, input, &row.cwd, row.mode)
+                .apply_rules_checked(tool, input, &row.cwd, row.mode.as_ref())
                 .await?
                 .into(),
         };

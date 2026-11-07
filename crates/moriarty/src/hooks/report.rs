@@ -20,7 +20,6 @@ use futures::{StreamExt, TryStreamExt, stream};
 use miette::{IntoDiagnostic, WrapErr};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tracing::warn;
 
 // local / workspace deps
 use super::result::PreToolResult;
@@ -63,7 +62,8 @@ struct HookRecord {
     result: PreToolResult,
     /// The hook's working directory, used by the rules path to normalize commands as the hook did.
     cwd: Option<String>,
-    /// Missing or unrecognized modes enable only unrestricted rules during replay.
+    /// Missing or blank historical modes enable only unrestricted rules during replay;
+    /// unfamiliar valid names retain their exact identity.
     permission_mode: Option<PermissionMode>,
     /// Hash of the rule set in force when this decision was made (see [`crate::rules`]).
     rules_hash: Option<String>,
@@ -321,14 +321,7 @@ fn parse_rule_contributors(encoded: Option<String>, legacy_rule: Option<&str>) -
 }
 
 fn parse_recorded_permission_mode(mode: Option<String>) -> Option<PermissionMode> {
-    let mode = mode.filter(|mode| !mode.is_empty())?;
-    match serde_json::from_value(Value::String(mode.clone())) {
-        Ok(mode) => Some(mode),
-        Err(error) => {
-            warn!(permission_mode = %mode, %error, "Treating unrecognized recorded permission mode as mode-less");
-            None
-        }
-    }
+    mode.and_then(|mode| PermissionMode::try_from(mode).ok())
 }
 
 struct RecordFilters<'a> {
@@ -857,8 +850,8 @@ mod tests {
             rules: Vec::new(),
         };
         let records = vec![
-            make(Some(PermissionMode::Plan)),
-            make(Some(PermissionMode::Default)),
+            make(Some("review".parse().unwrap())),
+            make(Some("Review".parse().unwrap())),
         ];
         let filter = TimeRangeFilter::new(None, None, DateTimezone::Utc).unwrap();
         let public = build_rows(
@@ -883,18 +876,28 @@ mod tests {
         assert_eq!(
             internal
                 .iter()
-                .map(|row| row.permission_mode)
+                .map(|row| row.permission_mode.clone())
                 .collect::<BTreeSet<_>>(),
-            BTreeSet::from([Some(PermissionMode::Default), Some(PermissionMode::Plan)])
+            BTreeSet::from([
+                Some("review".parse().unwrap()),
+                Some("Review".parse().unwrap())
+            ])
         );
     }
 
     #[test]
-    fn unknown_recorded_mode_is_fail_closed_as_mode_less() {
-        assert_eq!(
-            parse_recorded_permission_mode(Some("futureMode".to_string())),
-            None
-        );
+    fn custom_recorded_modes_keep_exact_names_and_blank_modes_are_mode_less() {
+        for name in ["futureMode", " FutureMode "] {
+            assert_eq!(
+                parse_recorded_permission_mode(Some(name.to_string()))
+                    .unwrap()
+                    .to_string(),
+                name
+            );
+        }
+        for name in [None, Some("".to_string()), Some(" \t".to_string())] {
+            assert_eq!(parse_recorded_permission_mode(name), None);
+        }
     }
 
     #[test]

@@ -198,7 +198,7 @@ fn command_result(
     mode: Option<PermissionMode>,
 ) -> RuleResult {
     engine
-        .match_command_decision(command, None, RedirectRewrite::NONE, mode)
+        .match_command_decision(command, None, RedirectRewrite::NONE, mode.as_ref())
         .outcome()
         .into()
 }
@@ -225,7 +225,7 @@ fn leaf_command_result(
             &leaf.match_text,
             leaf.filter_command.as_ref(),
             RedirectRewrite::from_leaf(leaf),
-            mode,
+            mode.as_ref(),
         )
         .outcome()
         .into()

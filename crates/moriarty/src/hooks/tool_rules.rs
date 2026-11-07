@@ -331,7 +331,11 @@ impl ToolRuleEngine {
         )
     }
 
-    fn has_matching_allow_local_rule(&self, tool_name: &str, mode: Option<PermissionMode>) -> bool {
+    fn has_matching_allow_local_rule(
+        &self,
+        tool_name: &str,
+        mode: Option<&PermissionMode>,
+    ) -> bool {
         self.rules.iter().any(|rule| {
             rule.allow_local
                 && (rule.tool == "*" || rule.tool == tool_name)
@@ -344,7 +348,7 @@ impl ToolRuleEngine {
         tool_name: &str,
         tool_input: &serde_json::Value,
         cwd: &str,
-        mode: Option<PermissionMode>,
+        mode: Option<&PermissionMode>,
         local_evaluation: Option<&LocalPathEvaluation>,
     ) -> ToolRuleResult {
         for rule in &self.rules {
@@ -414,7 +418,7 @@ impl ToolRuleEngine {
         tool_name: &str,
         tool_input: &serde_json::Value,
         cwd: &str,
-        mode: Option<PermissionMode>,
+        mode: Option<&PermissionMode>,
     ) -> ToolRuleResult {
         match self
             .apply_rules_checked(tool_name, tool_input, cwd, mode)
@@ -432,7 +436,7 @@ impl ToolRuleEngine {
         tool_name: &str,
         tool_input: &serde_json::Value,
         cwd: &str,
-        mode: Option<PermissionMode>,
+        mode: Option<&PermissionMode>,
     ) -> miette::Result<ToolRuleResult> {
         let local_evaluation = self
             .local_evaluation(tool_name, tool_input, cwd, mode)
@@ -445,7 +449,7 @@ impl ToolRuleEngine {
         tool_name: &str,
         tool_input: &serde_json::Value,
         cwd: &str,
-        mode: Option<PermissionMode>,
+        mode: Option<&PermissionMode>,
     ) -> miette::Result<Option<LocalPathEvaluation>> {
         if !self.has_matching_allow_local_rule(tool_name, mode) {
             return Ok(None);
@@ -471,7 +475,7 @@ impl ToolRuleEngine {
         tool_name: &str,
         tool_input: &serde_json::Value,
         cwd: &str,
-        mode: Option<PermissionMode>,
+        mode: Option<&PermissionMode>,
     ) -> ToolRuleResult {
         let local_evaluation = self
             .has_matching_allow_local_rule(tool_name, mode)
@@ -1110,14 +1114,14 @@ mod tests {
         let input = serde_json::json!({});
 
         assert_eq!(
-            engine.apply_rules_sync("Read", &input, "", Some(PermissionMode::Plan)),
+            engine.apply_rules_sync("Read", &input, "", Some(&PermissionMode::Plan)),
             ToolRuleResult::Denied {
                 rule_name: "plan-only".to_string(),
                 reason: "plan deny".to_string(),
             }
         );
         assert_eq!(
-            engine.apply_rules_sync("Read", &input, "", Some(PermissionMode::Default)),
+            engine.apply_rules_sync("Read", &input, "", Some(&PermissionMode::Default)),
             ToolRuleResult::Allowed {
                 rule_name: "fallback".to_string(),
             }
@@ -1135,7 +1139,7 @@ mod tests {
         let engine = ToolRuleEngine::from_config(vec![make_rule("all", "Read")], None);
         let input = serde_json::json!({});
         assert!(matches!(
-            engine.apply_rules_sync("Read", &input, "", Some(PermissionMode::Plan)),
+            engine.apply_rules_sync("Read", &input, "", Some(&PermissionMode::Plan)),
             ToolRuleResult::Allowed { .. }
         ));
         assert!(matches!(
@@ -1148,15 +1152,17 @@ mod tests {
     fn locality_preflight_requires_a_mode_eligible_rule() {
         let engine = ToolRuleEngine::from_config(
             vec![
-                make_rule("plan-local", "Read")
+                make_rule("review-local", "Read")
                     .local()
-                    .with_modes([PermissionMode::Plan]),
+                    .with_modes(["review-only".parse().unwrap()]),
             ],
             None,
         );
-        assert!(!engine.has_matching_allow_local_rule("Read", Some(PermissionMode::Default)));
+        assert!(!engine.has_matching_allow_local_rule("Read", Some(&PermissionMode::Default)));
         assert!(!engine.has_matching_allow_local_rule("Read", None));
-        assert!(engine.has_matching_allow_local_rule("Read", Some(PermissionMode::Plan)));
+        assert!(
+            engine.has_matching_allow_local_rule("Read", Some(&"review-only".parse().unwrap()))
+        );
     }
 
     #[test]

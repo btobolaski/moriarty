@@ -958,7 +958,7 @@ impl ObservedGroup {
         match &other.modes {
             Some(other_modes) => {
                 if let Some(modes) = &mut self.modes {
-                    modes.extend(other_modes);
+                    modes.extend(other_modes.iter().cloned());
                 }
             }
             None => self.modes = None,
@@ -1012,8 +1012,8 @@ fn build_suggestions(
         // A leaf repeated within one compound counts once per recorded occurrence, not once per
         // appearance, so the count still reflects how often the user saw a prompt.
         let context = contexts
-            .entry((row.cwd.clone(), row.permission_mode))
-            .or_insert_with(|| EvaluationContext::new(&row.cwd, row.permission_mode));
+            .entry((row.cwd.clone(), row.permission_mode.clone()))
+            .or_insert_with(|| EvaluationContext::new(&row.cwd, row.permission_mode.clone()));
         let analysis = engine.evaluate_original(command, context, EvaluationPurpose::Decision);
         let texts: BTreeMap<String, Option<FilterCommand>> = match &analysis {
             PolicyAnalysis::Leaves(parts) => parts
@@ -1044,7 +1044,7 @@ fn build_suggestions(
                     filter_command,
                 })
                 .group
-                .absorb(row.count, command, row.permission_mode);
+                .absorb(row.count, command, row.permission_mode.clone());
         }
     }
 
@@ -1125,8 +1125,8 @@ fn build_redirect_suggestions(
             continue;
         };
         let context = contexts
-            .entry((row.cwd.clone(), row.permission_mode))
-            .or_insert_with(|| EvaluationContext::new(&row.cwd, row.permission_mode));
+            .entry((row.cwd.clone(), row.permission_mode.clone()))
+            .or_insert_with(|| EvaluationContext::new(&row.cwd, row.permission_mode.clone()));
         let analysis = engine.evaluate_original(command, context, EvaluationPurpose::Decision);
         let Some(leaves) = analysis.leaves() else {
             continue;
@@ -1177,10 +1177,11 @@ fn build_redirect_suggestions(
             }
         }
         for target in observed_targets {
-            targets
-                .entry(target)
-                .or_default()
-                .absorb(row.count, command, row.permission_mode);
+            targets.entry(target).or_default().absorb(
+                row.count,
+                command,
+                row.permission_mode.clone(),
+            );
         }
     }
 
@@ -1435,7 +1436,7 @@ fn build_replay_report(
         }
         total_evaluated += row.count;
 
-        let context = EvaluationContext::new(&row.cwd, row.permission_mode);
+        let context = EvaluationContext::new(&row.cwd, row.permission_mode.clone());
         let result = engine
             .evaluate_sync(command, &context, EvaluationPurpose::Decision)
             .rule_result();
@@ -1463,7 +1464,7 @@ fn build_replay_report(
         };
         divergences.push(ReplayRow {
             command: command.to_string(),
-            permission_mode: row.permission_mode,
+            permission_mode: row.permission_mode.clone(),
             recorded: row.result,
             computed,
             attribution,
@@ -1585,7 +1586,7 @@ fn replay_divergence_label(row: &ReplayRow) -> String {
         row.recorded.as_str(),
         row.computed.as_str(),
         row.count,
-        replay_command_label(&row.command, row.permission_mode)
+        replay_command_label(&row.command, row.permission_mode.as_ref())
     );
     if let Some(DenyAttribution { rule, reason }) = &row.attribution {
         label.push_str(&format!("\n    {rule}: {reason}"));
@@ -1593,9 +1594,9 @@ fn replay_divergence_label(row: &ReplayRow) -> String {
     label
 }
 
-fn replay_command_label(command: &str, permission_mode: Option<PermissionMode>) -> String {
+fn replay_command_label(command: &str, permission_mode: Option<&PermissionMode>) -> String {
     match permission_mode {
-        Some(mode) => format!("{command} [mode={mode}]"),
+        Some(mode) => format!("{command} [mode={}]", mode.to_string().escape_debug()),
         None => command.to_string(),
     }
 }
@@ -1872,18 +1873,23 @@ mod tests {
 
     #[test]
     fn strict_warns_when_redirect_policy_modes_do_not_overlap() {
-        let mut command = allow("default-ls", r"^ls");
-        command.modes = Some(BTreeSet::from([PermissionMode::Default]));
-        let mut redirect = redirect("plan-redirect", r"^out$", true);
-        redirect.modes = Some(BTreeSet::from([PermissionMode::Plan]));
-
-        let report = build_lint_report(&config_with_bash(vec![command, redirect]), true).unwrap();
-        assert!(
-            report
-                .warnings
-                .iter()
-                .any(|warning| warning.kind == "missing-redirect-policy")
-        );
+        let mut command = allow("review-ls", r"^ls");
+        command.modes = Some(BTreeSet::from(["review".parse().unwrap()]));
+        for (name, missing) in [("Review", true), ("review", false)] {
+            let mut redirect = redirect("review-redirect", r"^out$", true);
+            redirect.modes = Some(BTreeSet::from([name.parse().unwrap()]));
+            let report =
+                build_lint_report(&config_with_bash(vec![command.clone(), redirect]), true)
+                    .unwrap();
+            assert!(report.errors.is_empty());
+            assert_eq!(
+                report
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.kind == "missing-redirect-policy"),
+                missing
+            );
+        }
     }
 
     #[test]
@@ -2013,13 +2019,14 @@ mod tests {
 
     #[test]
     fn strict_shadow_warnings_require_overlapping_mode_eligibility() {
-        let mut plan = allow("plan-broad", r"^ls");
-        plan.modes = Some(BTreeSet::from([PermissionMode::Plan]));
-        let mut default = allow("default-specific", r"^ls -la$");
-        default.modes = Some(BTreeSet::from([PermissionMode::Default]));
+        let mut plan = allow("review-broad", r"^ls");
+        plan.modes = Some(BTreeSet::from(["review".parse().unwrap()]));
+        let mut default = allow("case-distinct-specific", r"^ls -la$");
+        default.modes = Some(BTreeSet::from(["Review".parse().unwrap()]));
         let mut disabled = allow("disabled", r"^ls -la$");
         disabled.modes = Some(BTreeSet::new());
-        let unrestricted = allow("unrestricted", r"^ls -la$");
+        let mut same_mode = allow("review-specific", r"^ls -la$");
+        same_mode.modes = Some(BTreeSet::from(["review".parse().unwrap()]));
 
         let disjoint = build_lint_report(
             &config_with_bash(vec![plan.clone(), default, disabled]),
@@ -2034,7 +2041,7 @@ mod tests {
         );
 
         let overlapping =
-            build_lint_report(&config_with_bash(vec![plan, unrestricted]), true).unwrap();
+            build_lint_report(&config_with_bash(vec![plan, same_mode]), true).unwrap();
         assert!(
             overlapping
                 .warnings
@@ -2303,7 +2310,7 @@ mod tests {
     }
 
     #[test]
-    fn suggestions_union_known_modes_and_become_unrestricted_for_mode_less_rows() {
+    fn suggestions_union_valid_modes_and_become_unrestricted_for_mode_less_rows() {
         let known = vec![
             bash_row_mode(
                 "cargo build",
@@ -2317,7 +2324,7 @@ mod tests {
                 3,
                 PreToolResult::Ask,
                 "/",
-                Some(PermissionMode::Default),
+                Some("review-only".parse().unwrap()),
             ),
         ];
         let suggestions = build_suggestions(
@@ -2331,8 +2338,8 @@ mod tests {
         assert_eq!(
             suggestions[0].rule.modes,
             Some(BTreeSet::from([
-                PermissionMode::Default,
                 PermissionMode::Plan,
+                "review-only".parse().unwrap(),
             ]))
         );
 
@@ -2369,7 +2376,7 @@ mod tests {
                 3,
                 PreToolResult::Ask,
                 "/",
-                Some(PermissionMode::Default),
+                Some("review-only".parse().unwrap()),
             ),
         ];
         let suggestions =
@@ -2378,7 +2385,7 @@ mod tests {
         assert_eq!(suggestions[0].count, 3);
         assert_eq!(
             suggestions[0].rule.modes,
-            Some(BTreeSet::from([PermissionMode::Default]))
+            Some(BTreeSet::from(["review-only".parse().unwrap()]))
         );
     }
 
@@ -2478,7 +2485,12 @@ mod tests {
             redirect_row("cat x > safe.txt", 1, cwd, None),
             redirect_row("echo hi > allowed", 3, cwd, None),
             redirect_row("echo hi > mode.txt", 2, cwd, Some(PermissionMode::Plan)),
-            redirect_row("echo hi > mode.txt", 3, cwd, Some(PermissionMode::Default)),
+            redirect_row(
+                "echo hi > mode.txt",
+                3,
+                cwd,
+                Some("review-only".parse().unwrap()),
+            ),
             redirect_row("cd /; echo hi > context.txt", 3, cwd, None),
             redirect_row("cd /; echo hi 2>&1", 4, cwd, None),
             redirect_row("echo $(date) > bailed.txt", 4, cwd, None),
@@ -2519,8 +2531,8 @@ mod tests {
         assert_eq!(
             by_pattern[r"^mode\.txt$"].rule.modes,
             Some(BTreeSet::from([
-                PermissionMode::Default,
                 PermissionMode::Plan,
+                "review-only".parse().unwrap(),
             ]))
         );
     }
@@ -3052,27 +3064,37 @@ action = { type = "Allow" }
     }
 
     #[test]
-    fn replay_human_labels_include_known_modes() {
+    fn replay_human_labels_include_custom_modes() {
         assert_eq!(
-            replay_command_label("ls", Some(PermissionMode::Plan)),
-            "ls [mode=plan]"
+            replay_command_label("ls", Some(&"review-only".parse().unwrap())),
+            "ls [mode=review-only]"
         );
         assert_eq!(replay_command_label("ls", None), "ls");
+        assert_eq!(
+            replay_command_label("ls", Some(&"review\n\u{1b}[31m".parse().unwrap())),
+            r"ls [mode=review\n\u{1b}[31m]"
+        );
     }
 
     #[test]
     fn replay_uses_recorded_mode_and_reports_it_on_divergence() {
-        let mut plan_allow = allow("plan-ls", r"^ls");
-        plan_allow.modes = Some(BTreeSet::from([PermissionMode::Plan]));
-        let engine = engine_with_bash(vec![plan_allow]);
+        let mut review_allow = allow("review-ls", r"^ls");
+        review_allow.modes = Some(BTreeSet::from(["review-only".parse().unwrap()]));
+        let engine = engine_with_bash(vec![review_allow]);
         let rows = vec![
-            bash_row_mode("ls", 1, PreToolResult::Ask, "/", Some(PermissionMode::Plan)),
             bash_row_mode(
                 "ls",
                 1,
                 PreToolResult::Ask,
                 "/",
-                Some(PermissionMode::Default),
+                Some("review-only".parse().unwrap()),
+            ),
+            bash_row_mode(
+                "ls",
+                1,
+                PreToolResult::Ask,
+                "/",
+                Some("Review-only".parse().unwrap()),
             ),
             bash_row("ls", 1, PreToolResult::Ask),
         ];
@@ -3081,9 +3103,10 @@ action = { type = "Allow" }
         assert_eq!(report.total_evaluated, 3);
         assert_eq!(report.newly_allowed_count, 1);
         assert_eq!(report.divergences.len(), 1);
+        assert!(replay_divergence_label(&report.divergences[0]).contains("[mode=review-only]"));
         assert_eq!(
             report.divergences[0].permission_mode,
-            Some(PermissionMode::Plan)
+            Some("review-only".parse().unwrap())
         );
     }
 

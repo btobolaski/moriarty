@@ -1208,32 +1208,32 @@ action = {{ type = "Allow" }}
     #[tokio::test]
     async fn permission_mode_selects_rules_in_normal_and_explain_execution() {
         let dir = setup_isolated_xdg_config();
-        let mut plan_deny = deny("plan-deny", r"^ls", "plan denied");
-        plan_deny.modes = Some(BTreeSet::from([PermissionMode::Plan]));
+        let mut review_deny = deny("review-deny", r"^ls", "review denied");
+        review_deny.modes = Some(BTreeSet::from(["review-only".parse().unwrap()]));
         let cfg =
-            create_test_config(&dir, vec![plan_deny, allow("unrestricted-allow", r"^ls")]).await;
+            create_test_config(&dir, vec![review_deny, allow("unrestricted-allow", r"^ls")]).await;
 
-        for explain in [false, true] {
-            let plan = test_bash_rules(
+        for (json, explain) in [(false, false), (true, false), (false, true), (true, true)] {
+            let review = test_bash_rules(
                 Some("ls".to_string()),
                 Some(cfg.clone()),
-                false,
+                json,
                 explain,
                 None,
-                Some(PermissionMode::Plan),
+                Some("review-only".parse().unwrap()),
             )
             .await
             .unwrap();
             assert!(matches!(
-                plan,
-                RuleResult::Denied { ref rule_name, .. } if rule_name == "plan-deny"
+                review,
+                RuleResult::Denied { ref rule_name, .. } if rule_name == "review-deny"
             ));
 
             assert!(matches!(
                 test_bash_rules(
                     Some("ls".to_string()),
                     Some(cfg.clone()),
-                    false,
+                    json,
                     explain,
                     None,
                     None,
