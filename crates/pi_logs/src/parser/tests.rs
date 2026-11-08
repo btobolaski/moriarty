@@ -2915,6 +2915,68 @@ fn lens_diagnostics_full_accepts_partial_runners_and_analysis_root_validation() 
 }
 
 #[test]
+fn lens_diagnostics_full_preserves_analyzer_failure_reason() {
+    let mut full = lens_full_details(route_fixture("lens-summary"));
+    full["failedAnalyzers"] = json!([
+        {"id": "opengrep", "reason": "no-report", "summary": "Could not start"},
+        {"id": "jscpd", "summary": "analyzer reported an unsuccessful run"}
+    ]);
+
+    let Some(ToolResultDetails::LensDiagnostics(LensDiagnosticsDetails::Full(
+        LensDiagnosticsFull::Findings(details),
+    ))) = tool_result_with_details("lens_diagnostics", full).details
+    else {
+        panic!("expected lens full findings details")
+    };
+
+    assert_eq!(
+        details.failed_analyzers[0].reason,
+        Some(LensAnalyzerFailureReason::NoReport)
+    );
+    assert_eq!(details.failed_analyzers[1].reason, None);
+}
+
+/// The producer's reason vocabulary is closed, so an unrecognized value must
+/// not slip through as an unspecified failure.
+#[test]
+fn lens_diagnostics_full_rejects_unknown_analyzer_failure_reason() {
+    let mut full = lens_full_details(route_fixture("lens-summary"));
+    full["failedAnalyzers"] = json!([{"id": "opengrep", "reason": "melted", "summary": ""}]);
+
+    assert_parse_error_contains_any(
+        "lens full unknown analyzer reason",
+        tool_result_message_json(
+            "lens_diagnostics",
+            vec![json!({"type": "text", "text": "ok"})],
+            false,
+            Some(full),
+        ),
+        &["did not match any variant", "unknown variant"],
+    );
+}
+
+/// `jsonCell` marks a details envelope whose first text block is a
+/// machine-parsed payload; older logs omit it entirely.
+#[test]
+fn report_tools_accept_the_json_cell_marker() {
+    let Some(ToolResultDetails::ModuleReport(module)) =
+        tool_result_with_details("module_report", route_fixture("module-report")).details
+    else {
+        panic!("expected module_report details")
+    };
+    assert!(!module.json_cell);
+
+    let mut module_json = route_fixture("module-report");
+    module_json["jsonCell"] = json!(true);
+    let Some(ToolResultDetails::ModuleReport(module)) =
+        tool_result_with_details("module_report", module_json).details
+    else {
+        panic!("expected module_report details")
+    };
+    assert!(module.json_cell);
+}
+
+#[test]
 fn mcp_tool_result_accepts_call_result() {
     let details = parse_mcp_call_success(
         vec![json!({
@@ -5629,11 +5691,11 @@ fn route_fixture(name: &str) -> Value {
     let raw = match name {
         "lsp-file" => r#"{"mode":"file","filePath":"/tmp/example.rs","severity":"error","serverScope":"primary","primaryDiagnosticsCount":0,"auxiliaryDiagnosticsCount":0,"diagnostics":[],"totalDiagnostics":0,"truncated":false,"unconfirmed":true,"timedOut":true}"#,
         "lsp-directory" => r#"{"mode":"directory","filePath":"/tmp","severity":"error","serverScope":"primary","filesScanned":2,"capped":false,"diagnostics":[],"primaryDiagnosticsCount":0,"auxiliaryDiagnosticsCount":0,"totalDiagnostics":0,"truncated":false,"cleanFiles":2,"unconfirmedFiles":0,"concurrency":8}"#,
-        "module-report" => r#"{"available":false,"staleness":"unavailable","symbols":0,"exports":0,"callbacks":0,"callbackSupport":"tuned","view":"default"}"#,
+        "module-report" => r#"{"available":false,"staleness":"unavailable","symbols":0,"exports":0,"callbacks":0,"callbackSupport":"tuned","view":"default","jsonCell":false}"#,
         "lens-mark" => r#"{"anchor":"ddw:de888769f455","disposition":"suppress","line":11}"#,
         "lens-delta" => r#"{"mode":"delta","warnings":0,"carriedOverFiles":1}"#,
         "lens-all" => r#"{"mode":"all","filesChecked":4,"staleDropped":0}"#,
-        "lens-all-findings" => r#"{"mode":"all","filesWithIssues":1,"totalBlocking":3,"totalErrors":3,"totalWarnings":1,"totalAdvisories":0,"staleDropped":0,"dispositionSuppressed":0,"waitMs":0}"#,
+        "lens-all-findings" => r#"{"mode":"all","filesWithIssues":1,"totalBlocking":3,"totalErrors":3,"totalWarnings":1,"totalAdvisories":0,"staleDropped":0,"dispositionSuppressed":0,"waitMs":0,"validationStatus":"inconclusive","pendingFileCount":1,"staleDiagnosticCount":0,"unverifiedFileCount":0,"remainingRescanPathCount":0,"nextCheck":{"tool":"lens_diagnostics","source":"lsp","scope":"paths","paths":["/tmp/example.rs"]}}"#,
         "lens-directory" => r#"{"mode":"directory","filePath":"/tmp","severity":"error","serverScope":"all","filesScanned":100,"capped":true,"diagnostics":[],"primaryDiagnosticsCount":0,"auxiliaryDiagnosticsCount":0,"totalDiagnostics":0,"truncated":false,"cleanFiles":1,"unconfirmedFiles":99,"concurrency":8,"source":"lsp","scope":"paths"}"#,
         "lens-summary" => r#"{"filesWithIssues":2,"totalBlocking":1,"totalErrors":1,"totalWarnings":3,"staleDropped":0}"#,
         "lens-unavailable" => r#"{"mode":"full","filesChecked":0,"lspUnavailable":true}"#,
@@ -6016,6 +6078,35 @@ fn lens_diagnostics_all_preserves_optional_findings_metadata() {
     assert_eq!(details.total_advisories, Some(0));
     assert_eq!(details.disposition_suppressed, Some(0));
     assert_eq!(details.wait_ms, Some(0));
+    assert_eq!(
+        details.validation_status,
+        Some(LensDiagnosticsValidationStatus::Inconclusive)
+    );
+    assert_eq!(
+        (
+            details.pending_file_count,
+            details.stale_diagnostic_count,
+            details.unverified_file_count,
+            details.remaining_rescan_path_count,
+        ),
+        (Some(1), Some(0), Some(0), Some(0))
+    );
+    let next_check = details.next_check.expect("expected next check");
+    assert_eq!(next_check.tool.as_deref(), Some("lens_diagnostics"));
+    assert_eq!(next_check.paths, vec![PathBuf::from("/tmp/example.rs")]);
+
+    let mut tool_less = route_fixture("lens-all-findings");
+    tool_less["nextCheck"]
+        .as_object_mut()
+        .unwrap()
+        .remove("tool");
+    let Some(ToolResultDetails::LensDiagnostics(LensDiagnosticsDetails::All(
+        LensDiagnosticsSummary::Findings(details),
+    ))) = tool_result_with_details("lens_diagnostics", tool_less).details
+    else {
+        panic!("expected lens all findings details")
+    };
+    assert_eq!(details.next_check.expect("expected next check").tool, None);
 
     let mut legacy = route_fixture("lens-summary");
     legacy["mode"] = json!("all");
@@ -6029,10 +6120,70 @@ fn lens_diagnostics_all_preserves_optional_findings_metadata() {
         (
             details.total_advisories,
             details.disposition_suppressed,
-            details.wait_ms
+            details.wait_ms,
+            details.validation_status,
+            details.pending_file_count,
+            details.next_check
         ),
-        (None, None, None)
+        (None, None, None, None, None, None)
     );
+}
+
+/// The evidence keys are one block on the wire, so half a block must fail
+/// rather than read its missing counts as zero; the full and absent blocks are
+/// covered by the tests above and keep parsing.
+#[test]
+fn lens_session_evidence_rejects_half_blocks() {
+    let mut status_only = route_fixture("lens-all");
+    status_only["validationStatus"] = json!("inconclusive");
+    let mut counts_only = route_fixture("lens-all-findings");
+    counts_only
+        .as_object_mut()
+        .unwrap()
+        .remove("validationStatus");
+
+    for invalid in [status_only, counts_only] {
+        let error = parse_tool_result_details("lens_diagnostics", invalid).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("session-cache evidence keys must occur together"),
+            "{error}"
+        );
+    }
+}
+
+/// A clean session read carries the same evidence block as a findings read,
+/// so both summary branches must accept it.
+#[test]
+fn lens_diagnostics_all_clean_reads_preserve_session_evidence() {
+    let Some(ToolResultDetails::LensDiagnostics(LensDiagnosticsDetails::All(
+        LensDiagnosticsSummary::Clean(details),
+    ))) = tool_result_with_details(
+        "lens_diagnostics",
+        json!({
+            "mode": "all",
+            "filesChecked": 2,
+            "staleDropped": 0,
+            "dispositionSuppressed": 2,
+            "validationStatus": "no-matching-findings",
+            "pendingFileCount": 0,
+            "staleDiagnosticCount": 0,
+            "unverifiedFileCount": 0,
+            "remainingRescanPathCount": 3,
+        }),
+    )
+    .details
+    else {
+        panic!("expected lens all clean details")
+    };
+    assert_eq!(details.disposition_suppressed, Some(2));
+    assert_eq!(
+        details.validation_status,
+        Some(LensDiagnosticsValidationStatus::NoMatchingFindings)
+    );
+    assert_eq!(details.remaining_rescan_path_count, Some(3));
+    assert!(details.next_check.is_none());
 }
 
 #[test]
@@ -8500,7 +8651,8 @@ fn project_report_tool_result_accepts_available_details() {
             "available": true,
             "hubs": 6,
             "entryPoints": 5,
-            "view": "default"
+            "view": "default",
+            "jsonCell": false
         })),
     ));
     let Some(ToolResultDetails::ProjectReport(details)) = tool_result.details else {

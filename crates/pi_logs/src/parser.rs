@@ -5771,11 +5771,66 @@ pub struct LensDiagnosticsDeltaFindings {
     pub project_diagnostics: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(untagged)]
 pub enum LensDiagnosticsSummary {
     Clean(LensDiagnosticsClean),
     Findings(LensDiagnosticsSummaryFindings),
+}
+
+/// The wire shapes are tried in order by `LensDiagnosticsSummary`'s manual
+/// `Deserialize`, which also enforces the evidence block's all-or-none
+/// contract that an untagged derive cannot express.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum LensDiagnosticsSummaryWire {
+    Clean(LensDiagnosticsClean),
+    Findings(LensDiagnosticsSummaryFindings),
+}
+
+impl<'de> Deserialize<'de> for LensDiagnosticsSummary {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(
+            match LensDiagnosticsSummaryWire::deserialize(deserializer)? {
+                LensDiagnosticsSummaryWire::Clean(details) => {
+                    validate_session_evidence([
+                        details.validation_status.is_some(),
+                        details.pending_file_count.is_some(),
+                        details.stale_diagnostic_count.is_some(),
+                        details.unverified_file_count.is_some(),
+                        details.remaining_rescan_path_count.is_some(),
+                    ])
+                    .map_err(de::Error::custom)?;
+                    Self::Clean(details)
+                }
+                LensDiagnosticsSummaryWire::Findings(details) => {
+                    validate_session_evidence([
+                        details.validation_status.is_some(),
+                        details.pending_file_count.is_some(),
+                        details.stale_diagnostic_count.is_some(),
+                        details.unverified_file_count.is_some(),
+                        details.remaining_rescan_path_count.is_some(),
+                    ])
+                    .map_err(de::Error::custom)?;
+                    Self::Findings(details)
+                }
+            },
+        )
+    }
+}
+
+/// Session-cache evidence is one block on the wire: the producer stamps
+/// `validationStatus` with its four counts on every non-full read, so a partial
+/// block must fail instead of reading its missing counts as zero.
+fn validate_session_evidence(present: [bool; 5]) -> Result<(), &'static str> {
+    let count = present.iter().filter(|present| **present).count();
+    if count == 0 || count == present.len() {
+        return Ok(());
+    }
+    Err("session-cache evidence keys must occur together")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -5792,13 +5847,69 @@ pub struct LensDiagnosticsSummaryFindings {
     pub disposition_suppressed: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait_ms: Option<u64>,
+    /// Only a final snapshot with nothing matching reads clean, so the producer
+    /// names the verdict instead of implying one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation_status: Option<LensDiagnosticsValidationStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_file_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_diagnostic_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unverified_file_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_rescan_path_count: Option<u32>,
+    /// Independent of the evidence block: the producer emits it only when it
+    /// has paths worth rescanning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_check: Option<LensDiagnosticsNextCheck>,
 }
 
+/// Both branches of the producer's summary renderer stamp the same evidence
+/// block, so the clean read accepts it too.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LensDiagnosticsClean {
     pub files_checked: u32,
     pub stale_dropped: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disposition_suppressed: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation_status: Option<LensDiagnosticsValidationStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_file_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_diagnostic_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unverified_file_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_rescan_path_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_check: Option<LensDiagnosticsNextCheck>,
+}
+
+/// Closed session-cache verdict vocabulary; a new verdict must surface as a
+/// parse error rather than read as an unspecified state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LensDiagnosticsValidationStatus {
+    Inconclusive,
+    Unverified,
+    Findings,
+    NoMatchingFindings,
+}
+
+/// The producer's named follow-up: which tool, source, and scope would turn an
+/// inconclusive cached read into an active validation.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LensDiagnosticsNextCheck {
+    /// Absent when the producer cannot resolve a host-specific tool name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    pub source: LensDiagnosticsSource,
+    pub scope: LensDiagnosticsScope,
+    pub paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -5910,6 +6021,22 @@ pub struct LensProjectDiagnosticsDelta {
 pub struct LensAnalyzerFailure {
     pub id: String,
     pub summary: String,
+    /// Why the lane produced no trustworthy result; newer pi-lens builds name
+    /// it, older ones emit only the id and summary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<LensAnalyzerFailureReason>,
+}
+
+/// Closed analyzer-refusal vocabulary that upstream pi-lens' project-diagnostics
+/// extractors introduce; an unknown reason must surface as a parse error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LensAnalyzerFailureReason {
+    NotInstalled,
+    SpawnFailed,
+    NoReport,
+    Refused,
+    Crashed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -6051,6 +6178,11 @@ pub struct ModuleReportDetails {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub callback_support: Option<CallbackSupport>,
     pub view: String,
+    /// The producer marks details envelopes whose first text block is a
+    /// machine-parsed payload; the marker describes the wire shape, not the
+    /// report, and older builds omit it.
+    #[serde(default)]
+    pub json_cell: bool,
 }
 
 /// Results from `pi_lens_activate_tools` carry which tools matched the
@@ -6179,6 +6311,10 @@ pub struct ProjectReportDetails {
     pub entry_points: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub view: Option<String>,
+    /// The producer marks details envelopes whose first text block is a
+    /// machine-parsed payload; older builds omit it.
+    #[serde(default)]
+    pub json_cell: bool,
 }
 
 /// Results from `read_enclosing` carry the matched symbol plus partial/
