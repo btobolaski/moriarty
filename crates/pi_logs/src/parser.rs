@@ -6234,9 +6234,9 @@ pub struct WebEnableErrorDetails {
 
 /// Results from `ast_grep_replace` come in two success shapes (the
 /// structural-intent path reports only `{matchCount, applied}` while the
-/// pattern path adds `totalMatches`/`truncated`), plus `{stalePreview: true}`
-/// when a dry-run preview went stale. Error paths emit an empty `details`
-/// object; that empty error sentinel is dropped to `None` by
+/// pattern path adds `totalMatches`/`truncated` and may report `appliedFiles`),
+/// plus `{stalePreview: true}` when a dry-run preview went stale. Error paths
+/// emit an empty `details` object; that empty error sentinel is dropped to `None` by
 /// `resolve_tool_result_details` because the tool is not in
 /// `preserves_empty_error_details`, while a (never-observed) empty
 /// success payload would route to `ToolResultDetails::Empty`.
@@ -6251,6 +6251,8 @@ pub struct AstGrepReplaceDetails {
     pub truncated: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub applied: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_files: Option<Vec<PathBuf>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stale_preview: Option<bool>,
 }

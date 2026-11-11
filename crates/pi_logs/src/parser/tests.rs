@@ -5699,7 +5699,7 @@ fn route_fixture(name: &str) -> Value {
         "lens-directory" => r#"{"mode":"directory","filePath":"/tmp","severity":"error","serverScope":"all","filesScanned":100,"capped":true,"diagnostics":[],"primaryDiagnosticsCount":0,"auxiliaryDiagnosticsCount":0,"totalDiagnostics":0,"truncated":false,"cleanFiles":1,"unconfirmedFiles":99,"concurrency":8,"source":"lsp","scope":"paths"}"#,
         "lens-summary" => r#"{"filesWithIssues":2,"totalBlocking":1,"totalErrors":1,"totalWarnings":3,"staleDropped":0}"#,
         "lens-unavailable" => r#"{"mode":"full","filesChecked":0,"lspUnavailable":true}"#,
-        "ast-replace" => r#"{"matchCount":8,"totalMatches":8,"truncated":false,"applied":true}"#,
+        "ast-replace" => r#"{"matchCount":24,"totalMatches":24,"truncated":false,"applied":true,"appliedFiles":["/tmp/responses_tokens.go","/tmp/responses_decode.go"]}"#,
         "ast-structural" => r#"{"matchCount":2,"applied":true}"#,
         "ast-empty" => r#"{}"#,
         "ast-search" => r#"{"matchCount":0,"totalMatches":0,"truncated":false,"hasMore":false,"skip":0,"groupByFile":false,"searchReads":[],"matchLocations":[],"suggestedDump":{"tool":"ast_grep_dump"}}"#,
@@ -5724,7 +5724,7 @@ macro_rules! route_pattern {
     (LensDirectory) => { ToolResultDetails::LensDiagnostics(LensDiagnosticsDetails::Directory(LensDiagnosticsDirectory { clean_files: 1, unconfirmed_files: 99, .. })) };
     (LensFindings) => { ToolResultDetails::LensDiagnostics(LensDiagnosticsDetails::Full(LensDiagnosticsFull::Findings(_))) };
     (LensUnavailable) => { ToolResultDetails::LensDiagnostics(LensDiagnosticsDetails::Full(LensDiagnosticsFull::Unavailable(_))) };
-    (AstReplace) => { ToolResultDetails::AstGrepReplace(AstGrepReplaceDetails { total_matches: Some(8), .. }) };
+    (AstReplace) => { ToolResultDetails::AstGrepReplace(AstGrepReplaceDetails { total_matches: Some(24), applied_files: Some(_), .. }) };
     (AstStructural) => { ToolResultDetails::AstGrepReplace(AstGrepReplaceDetails { match_count: Some(2), .. }) };
     (AstEmpty) => { ToolResultDetails::Empty(_) };
     (AstSearch) => { ToolResultDetails::AstGrepSearch(AstGrepSearchDetails { total_matches: Some(0), .. }) };
@@ -5741,6 +5741,17 @@ macro_rules! assert_routes {
 fn ast_grep_outline_tool_result_preserves_details() {
     let expected = json!({"files": 1, "items": 0, "syntaxOnly": true});
     let result = tool_result_with_details("ast_grep_outline", expected.clone());
+
+    assert_eq!(
+        serde_json::to_value(result.details.unwrap()).unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn ast_grep_replace_tool_result_preserves_applied_files() {
+    let expected = route_fixture("ast-replace");
+    let result = tool_result_with_details("ast_grep_replace", expected.clone());
 
     assert_eq!(
         serde_json::to_value(result.details.unwrap()).unwrap(),
