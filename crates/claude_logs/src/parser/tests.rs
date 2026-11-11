@@ -9780,13 +9780,13 @@ fn test_parse_attachment_model() {
     assert_eq!(model.text, "You are powered by the model named Opus 5.");
 }
 
+const SESSION_CONTEXT_EMAIL: &str = "The user's email address is brendan@syllable.ai.";
+
 fn session_context_json(
     git_status: Option<&str>,
     reload: Option<(bool, &str)>,
 ) -> serde_json::Value {
-    let mut context = serde_json::json!({
-        "userEmail": "The user's email address is brendan@syllable.ai."
-    });
+    let mut context = serde_json::json!({ "userEmail": SESSION_CONTEXT_EMAIL });
     if let Some(git_status) = git_status {
         context
             .as_object_mut()
@@ -9828,7 +9828,7 @@ fn test_parse_attachment_session_context() {
         parse_attachment(session_context_json(Some("Current branch: HEAD"), None)),
         AttachmentData::SessionContext(SessionContext {
             context: SessionContextEntries {
-                user_email: "The user's email address is brendan@syllable.ai.".to_string(),
+                user_email: Some(SESSION_CONTEXT_EMAIL.to_string()),
                 git_status: Some("Current branch: HEAD".to_string()),
             },
             reload: None,
@@ -9843,7 +9843,27 @@ fn test_parse_attachment_session_context_without_git_status() {
         parse_attachment(session_context_json(None, None)),
         AttachmentData::SessionContext(SessionContext {
             context: SessionContextEntries {
-                user_email: "The user's email address is brendan@syllable.ai.".to_string(),
+                user_email: Some(SESSION_CONTEXT_EMAIL.to_string()),
+                git_status: None,
+            },
+            reload: None,
+        })
+    );
+}
+
+// Claude Code 2.1.322 workflow subagents omit `userEmail` from the session context.
+#[test]
+fn test_parse_attachment_session_context_without_user_email() {
+    let mut json = session_context_json(None, None);
+    json["attachment"]["context"]
+        .as_object_mut()
+        .expect("fixture is a JSON object")
+        .remove("userEmail");
+    assert_eq!(
+        parse_attachment(json),
+        AttachmentData::SessionContext(SessionContext {
+            context: SessionContextEntries {
+                user_email: None,
                 git_status: None,
             },
             reload: None,
@@ -9858,7 +9878,7 @@ fn test_parse_attachment_session_context_with_reload() {
         parse_attachment(session_context_json(None, Some((true, "session_start")))),
         AttachmentData::SessionContext(SessionContext {
             context: SessionContextEntries {
-                user_email: "The user's email address is brendan@syllable.ai.".to_string(),
+                user_email: Some(SESSION_CONTEXT_EMAIL.to_string()),
                 git_status: None,
             },
             reload: Some(ContextReload {
@@ -10968,6 +10988,32 @@ fn test_parse_attachment_edited_text_file_with_display_path() {
     assert_eq!(edited.display_path.as_deref(), Some(".specs/foundation.md"));
 }
 
+// Claude Code 2.1.322 fingerprints the content it re-read after the edit.
+#[test]
+fn test_parse_attachment_edited_text_file_with_reread_entry() {
+    let attachment = serde_json::json!({
+        "type": "edited_text_file",
+        "filename": "/Users/brendan/.flk/README.md",
+        "snippet": "",
+        "rereadEntry": {
+            "timestamp": 1794424874361_u64,
+            "contentHash": "27ty5ma5vhag8",
+            "contentLength": 4466
+        }
+    });
+    let AttachmentData::EditedTextFile(edited) = serde_json::from_value(attachment).unwrap() else {
+        panic!("Expected EditedTextFile");
+    };
+    assert_eq!(
+        edited.reread_entry,
+        Some(RereadEntry {
+            timestamp: 1794424874361,
+            content_hash: "27ty5ma5vhag8".to_string(),
+            content_length: 4466,
+        })
+    );
+}
+
 // `rename_all = "camelCase"` and `deny_unknown_fields` interact: a serialize-side rename bug would
 // make a serialized record fail to parse back, so assert the wire keys explicitly via round-trip.
 #[test]
@@ -11530,6 +11576,24 @@ fn test_parse_user_log_line_permission_decision_with_grant_scope() {
     assert_eq!(decision.reason_code.as_deref(), Some("unknown"));
 }
 
+// Claude Code 2.1.322 names the settings scope that supplied the rule behind a rule decision.
+#[test]
+fn test_parse_user_log_line_permission_decision_with_rule_source() {
+    let json = user_log_line_json(serde_json::json!({"permissionDecision": {
+        "decision": "accept",
+        "source": "config",
+        "reasonType": "rule",
+        "ruleSource": "localSettings"
+    }}));
+    let line: UserLogLine = serde_json::from_value(json).unwrap();
+    assert_eq!(
+        line.permission_decision
+            .expect("permissionDecision present")
+            .rule_source,
+        Some(RuleSource::LocalSettings)
+    );
+}
+
 #[test]
 fn test_parse_user_log_line_with_scheduled_task_ids() {
     let json = user_log_line_json(serde_json::json!({
@@ -11880,6 +11944,9 @@ fn test_parse_cost_state() {
                 "thinkingTokens": 0,
                 "cacheReadInputTokens": 13,
                 "cacheCreationInputTokens": 17,
+                // Claude Code 2.1.322+ splits cache creation by TTL; the other entry predates it.
+                "cacheCreationEphemeral5mInputTokens": 7,
+                "cacheCreationEphemeral1hInputTokens": 10,
                 "webSearchRequests": 0,
                 "costUSD": 0.5
             }
@@ -11901,13 +11968,19 @@ fn test_parse_cost_state() {
                 .expect("per-model usage is keyed by the raw model id");
             assert_eq!(usage.thinking_tokens, 6719);
             assert_eq!(usage.cost_usd, 1.1621572500000004);
+            assert_eq!(usage.cache_creation_ephemeral_5m_input_tokens, None);
+            let undecorated = state
+                .model_usage
+                .get("claude-opus-5")
+                .expect("the undecorated id is a separate entry");
+            assert_eq!(undecorated.cost_usd, 0.5);
             assert_eq!(
-                state
-                    .model_usage
-                    .get("claude-opus-5")
-                    .expect("the undecorated id is a separate entry")
-                    .cost_usd,
-                0.5
+                undecorated.cache_creation_ephemeral_5m_input_tokens,
+                Some(7)
+            );
+            assert_eq!(
+                undecorated.cache_creation_ephemeral_1h_input_tokens,
+                Some(10)
             );
         }
         _ => panic!("Expected CostState variant"),
@@ -12167,4 +12240,15 @@ fn test_parse_assistant_thinking_and_requested_model() {
         line.requested_model.as_ref().map(Model::raw),
         Some("claude-opus-5-5[1m]")
     );
+}
+
+// Claude Code 2.1.322+ records the requested prompt-cache TTL and how long tool inputs streamed.
+#[test]
+fn test_parse_assistant_prompt_cache_requested_and_tool_input_stream_ms() {
+    let line = parse_assistant_log_line(assistant_log_line_json(serde_json::json!({
+        "promptCacheRequested": "5m",
+        "toolInputStreamMs": 872
+    })));
+    assert_eq!(line.prompt_cache_requested, Some(CacheTtl::FiveMinutes));
+    assert_eq!(line.tool_input_stream_ms, Some(872));
 }

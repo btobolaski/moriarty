@@ -525,6 +525,8 @@ impl AnalyzableLog for ClaudeLogLine {
             ClaudeLogLine::ApiRequestShape(line) => line.timestamp,
             ClaudeLogLine::ApiRequestBlob(_) => claude_timestamp_sentinel(),
             ClaudeLogLine::ApiRequest(line) => line.timestamp,
+            ClaudeLogLine::SessionOwner(_) => claude_timestamp_sentinel(),
+            ClaudeLogLine::ToolsUsed(_) => claude_timestamp_sentinel(),
         }
     }
 
@@ -594,6 +596,10 @@ impl AnalyzableLog for ClaudeLogLine {
                 format!("api-request-blob:{}:{}", line.session_id, line.hash)
             }
             ClaudeLogLine::ApiRequest(line) => format!("api-request:{}", line.id),
+            ClaudeLogLine::SessionOwner(line) => format!("session-owner:{}", line.session_id),
+            // Each record repeats the session's cumulative tool list, so the session alone
+            // identifies it and the snapshots collapse onto one entry.
+            ClaudeLogLine::ToolsUsed(line) => format!("tools-used:{}", line.session_id),
         }
     }
 
@@ -1111,6 +1117,23 @@ mod tests {
         json!({
             "type": "atis-latch",
             "atis": "",
+            "sessionId": CLAUDE_SESSION_ID,
+        })
+    }
+
+    fn claude_session_owner_json() -> serde_json::Value {
+        json!({
+            "type": "session-owner",
+            "accountUuid": "ef6692be-04e0-43f8-a5a2-3212d362e10b",
+            "organizationUuid": "53b79fff-9628-4879-adba-b68e8d80e9eb",
+            "sessionId": CLAUDE_SESSION_ID,
+        })
+    }
+
+    fn claude_tools_used_json() -> serde_json::Value {
+        json!({
+            "type": "tools-used",
+            "tools": ["Bash", "Grep"],
             "sessionId": CLAUDE_SESSION_ID,
         })
     }
@@ -2480,6 +2503,18 @@ mod tests {
                 // response is.
                 expected_timestamp: ExpectedClaudeTimestamp::Real,
                 expected_id: "api-request:99694e12-7b7f-46d6-a2db-3b07ffc352e6".to_string(),
+            },
+            ClaudeNonBillableCase {
+                name: "session owner",
+                value: claude_session_owner_json,
+                expected_timestamp: ExpectedClaudeTimestamp::Sentinel,
+                expected_id: claude_metadata_identifier("session-owner"),
+            },
+            ClaudeNonBillableCase {
+                name: "tools used",
+                value: claude_tools_used_json,
+                expected_timestamp: ExpectedClaudeTimestamp::Sentinel,
+                expected_id: claude_metadata_identifier("tools-used"),
             },
         ];
 

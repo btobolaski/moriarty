@@ -266,6 +266,29 @@ pub enum LogLine {
     ApiRequestBlob(ApiRequestBlob),
     #[serde(rename = "api-request")]
     ApiRequest(Box<ApiRequest>),
+    #[serde(rename = "session-owner")]
+    SessionOwner(SessionOwner),
+    #[serde(rename = "tools-used")]
+    ToolsUsed(ToolsUsed),
+}
+
+/// Names of the tools the session has called. Added in Claude Code 2.1.322+.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct ToolsUsed {
+    pub tools: Vec<String>,
+    pub session_id: Uuid,
+}
+
+/// Names the account and organization that own the session. Added in Claude Code 2.1.322+.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct SessionOwner {
+    pub account_uuid: Uuid,
+    pub organization_uuid: Uuid,
+    pub session_id: Uuid,
 }
 
 /// Session-scoped bookkeeping for the comment threads Claude Code has already reacted to on each
@@ -438,6 +461,11 @@ pub struct CostStateModelUsage {
     pub thinking_tokens: u64,
     pub cache_read_input_tokens: u64,
     pub cache_creation_input_tokens: u64,
+    /// Split of `cache_creation_input_tokens` by cache TTL. Added in Claude Code 2.1.322+.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_ephemeral_5m_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_ephemeral_1h_input_tokens: Option<u64>,
     pub web_search_requests: u64,
     #[serde(rename = "costUSD")]
     pub cost_usd: f64,
@@ -727,9 +755,11 @@ pub enum CacheControlType {
     Ephemeral,
 }
 
-/// Strict so a new TTL surfaces as a parse error; only `1h` has been observed.
+/// Strict so a new TTL surfaces as a parse error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum CacheTtl {
+    #[serde(rename = "5m")]
+    FiveMinutes,
     #[serde(rename = "1h")]
     OneHour,
 }
@@ -1608,7 +1638,9 @@ fn context_reload_from_wire(
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct SessionContextEntries {
-    pub user_email: String,
+    /// Absent from Claude Code 2.1.322 workflow subagent transcripts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_email: Option<String>,
     /// Absent when Claude Code injects the session context without a git blurb, which it does even
     /// inside a git working copy, so its presence cannot be inferred from the record's `gitBranch`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1634,6 +1666,20 @@ pub struct EditedTextFile {
     pub snippet: String,
     /// Added in Claude Code 2.1.201+, hence `Option` so older records still parse.
     pub display_path: Option<String>,
+    /// Added in Claude Code 2.1.322+.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reread_entry: Option<RereadEntry>,
+}
+
+/// Fingerprint of the file content Claude Code re-read after detecting the edit.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct RereadEntry {
+    /// Unix epoch milliseconds.
+    pub timestamp: u64,
+    pub content_hash: String,
+    pub content_length: u64,
 }
 
 /// The environment description Claude Code injects into a turn (working directory, platform, shell,
@@ -3065,8 +3111,8 @@ pub struct UserLogLine {
     pub permission_decision: Option<PermissionDecision>,
 }
 
-/// Fields stay `String` rather than strict enums because their vocabularies are undocumented and
-/// nothing downstream reads them.
+/// The string fields stay `String` rather than strict enums because their vocabularies are
+/// undocumented and nothing downstream reads them; see [`RuleSource`] for the exception.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
@@ -3079,6 +3125,18 @@ pub struct PermissionDecision {
     pub grant_scope: Option<String>,
     /// Observed only as `unknown`. Added in Claude Code 2.1.310+.
     pub reason_code: Option<String>,
+    /// Settings scope that supplied the matching rule. Added in Claude Code 2.1.322+.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_source: Option<RuleSource>,
+}
+
+/// Strict, unlike its sibling [`PermissionDecision`] fields, so an unseen settings scope surfaces
+/// as a parse error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RuleSource {
+    LocalSettings,
+    CliArg,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3579,6 +3637,13 @@ pub struct AssistantLogLine {
     /// decoration such as `[1m]`. Pricing keeps reading `message.model`, the model that actually
     /// served the turn. Added in Claude Code 2.1.296+.
     pub requested_model: Option<Model>,
+    /// The prompt-cache TTL Claude Code requested for this turn. Added in Claude Code 2.1.322+.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_requested: Option<CacheTtl>,
+    /// Milliseconds spent streaming this turn's tool inputs; absent on turns without tool calls.
+    /// Added in Claude Code 2.1.322+.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_input_stream_ms: Option<u64>,
 }
 
 /// How thinking blocks were returned to the client. A strict enum because the API documents a
