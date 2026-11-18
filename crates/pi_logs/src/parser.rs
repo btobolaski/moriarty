@@ -456,6 +456,26 @@ pub enum CustomPayload {
     /// the payload is the same shape the `todo` tool's result details use.
     #[serde(rename = "rpiv-todo-snapshot")]
     RpivTodoSnapshot(TodoDetails),
+    /// Mode marker emitted by the pi-modal extension. The extension owns its
+    /// mode namespace, so the announced mode stays an opaque string.
+    #[serde(rename = "pi-modal:mode")]
+    PiModalMode(PiModalModeData),
+    /// Intensity marker emitted by the ponytail extension. The extension owns
+    /// its mode namespace, so the announced mode stays an opaque string.
+    #[serde(rename = "ponytail-mode")]
+    PonytailMode(PonytailModeData),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PiModalModeData {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PonytailModeData {
+    pub mode: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -589,6 +609,11 @@ pub enum CustomMessagePayload {
     /// progress records) and nothing downstream inspects it.
     #[serde(rename = "shepard.notification")]
     ShepardNotification(JsonBlob),
+    /// Reminder listing delegated task records; the rendered roster lives in
+    /// the outer `content` field and no structured `details` payload is
+    /// attached.
+    #[serde(rename = "shepard.reminder")]
+    ShepardReminder,
 }
 
 // ---------------------------------------------------------------------------
@@ -2798,6 +2823,8 @@ fn parse_tool_result_details(
         "shepard_wait" => serde_json::from_value(details).map(ToolResultDetails::ShepardWait),
         "shepard_reply" => serde_json::from_value(details).map(ToolResultDetails::ShepardReply),
         "shepard_send" => serde_json::from_value(details).map(ToolResultDetails::ShepardSend),
+        "shepard_catalog" => serde_json::from_value(details).map(ToolResultDetails::ShepardCatalog),
+        "shepard_list" => serde_json::from_value(details).map(ToolResultDetails::ShepardTaskList),
         "shepard_inspect" => serde_json::from_value(details).map(ToolResultDetails::ShepardInspect),
         "shepard_interrupt" | "shepard_stop" => {
             serde_json::from_value(details).map(ToolResultDetails::ShepardInterrupt)
@@ -2960,6 +2987,13 @@ pub enum ToolResultDetails {
     ShepardSend(ShepardSendDetails),
     ShepardInspect(ShepardInspectDetails),
     ShepardInterrupt(ShepardInterruptDetails),
+    // Shepard owns the agent/workflow catalog envelope (`agents`, `workflows`,
+    // `diagnostics`) and the task-list envelope (`tasks`); both evolve with
+    // the extension and cost analysis does not inspect them.
+    #[serde(skip_deserializing)]
+    ShepardCatalog(JsonBlob),
+    #[serde(skip_deserializing)]
+    ShepardTaskList(JsonBlob),
     WebSearch(WebSearchDetails),
     // Grep precedes Read for direct `ToolResultDetails` shape matching
     // because both accept `{matchLimitReached, linesTruncated}` and

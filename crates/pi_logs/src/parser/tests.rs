@@ -7524,6 +7524,25 @@ fn shepard_contact_tool_results_parse() {
 }
 
 #[test]
+fn shepard_opaque_listing_tool_results_parse() {
+    let catalog = json!({"agents": [], "workflows": [], "diagnostics": []});
+    let Some(ToolResultDetails::ShepardCatalog(blob)) =
+        tool_result_with_details("shepard_catalog", catalog.clone()).details
+    else {
+        panic!("expected ShepardCatalog details")
+    };
+    assert_eq!(blob.0, catalog);
+
+    let tasks = json!({"tasks": [{"taskId": "t1"}]});
+    let Some(ToolResultDetails::ShepardTaskList(blob)) =
+        tool_result_with_details("shepard_list", tasks.clone()).details
+    else {
+        panic!("expected ShepardTaskList details")
+    };
+    assert_eq!(blob.0, tasks);
+}
+
+#[test]
 fn custom_shepard_seen_parses() {
     assert!(matches!(
         parse_custom_payload("shepard-seen", json!({"id": SHEPARD_EVENT_ID})),
@@ -7548,6 +7567,31 @@ fn custom_rpiv_todo_snapshot_parses() {
     assert_eq!(details.action, "create");
     assert_eq!(details.next_id, 2);
     assert_eq!(details.tasks.len(), 1);
+}
+
+#[test]
+fn custom_mode_markers_parse() {
+    let CustomPayload::PiModalMode(pi_modal) =
+        parse_custom_payload("pi-modal:mode", json!({"id": "oversight"}))
+    else {
+        panic!("expected PiModalMode")
+    };
+    assert_eq!(pi_modal.id, "oversight");
+
+    let CustomPayload::PonytailMode(ponytail) =
+        parse_custom_payload("ponytail-mode", json!({"mode": "off"}))
+    else {
+        panic!("expected PonytailMode")
+    };
+    assert_eq!(ponytail.mode, "off");
+}
+
+#[test]
+fn custom_message_shepard_reminder_has_no_details() {
+    assert!(matches!(
+        parse_custom_message_payload("Delegated tasks: 6.", "shepard.reminder", None),
+        CustomMessagePayload::ShepardReminder
+    ));
 }
 
 #[test]
