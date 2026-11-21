@@ -313,6 +313,31 @@ async fn real_scope_shutdown_surfaces_first_job_settlement_failure() {
 }
 
 #[tokio::test]
+async fn lost_job_receiver_does_not_hide_startup_uncertainty() {
+    let scope = Scope::new();
+    let mut state = PartialState::default();
+    state.launch_unconfirmed = true;
+    let error = ProcessError::StartupInterrupted {
+        state: Box::new(state),
+    };
+    let expected = error.to_string();
+    drop(queued_failure(&scope, error.into()));
+    assert_eq!(scope.shutdown().await.unwrap_err().to_string(), expected);
+}
+
+#[tokio::test]
+async fn delivered_start_failure_does_not_fail_direct_drain() {
+    let scope = Scope::new();
+    let error = ProcessError::StartFailed {
+        state: Box::default(),
+    };
+    let expected = error.to_string();
+    let receiver = queued_failure(&scope, error.into());
+    assert_eq!(receiver.await.unwrap().unwrap_err().to_string(), expected);
+    scope.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn lost_job_receiver_preserves_even_an_ordinary_start_failure() {
     let scope = Scope::new();
     let error = ProcessError::StartFailed {
@@ -569,6 +594,7 @@ async fn dropped_unstarted_operation_has_clean_shutdown() {
             })
         }),
         None,
+        DrainEvidence::Direct,
     );
     drop(scope.submit(spec("must-not-start")).unwrap());
     tokio::time::timeout(Duration::from_secs(2), completed.notified())
@@ -621,10 +647,11 @@ async fn pending_startup_is_dropped_without_waiting_for_a_launcher() {
     let mut startup = Box::pin(own_process::<Ready<_>>(work, cancellation.clone()));
     poll_once(startup.as_mut()).await;
     cancellation.cancel();
-    assert_error(
-        startup.await,
-        &["creation and late cleanup may be uncertain"],
-    );
+    let error = startup.await.unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<ExecutionError>(),
+        Some(ExecutionError::StartupUncertain)
+    ));
     assert_sender_dropped(dropped.await);
 }
 

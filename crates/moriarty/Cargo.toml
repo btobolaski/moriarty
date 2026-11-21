@@ -46,6 +46,7 @@ tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tui-scrollview = "0.6.4"
 unicode-width = "0.2"
+uuid = { workspace = true }
 which = "7.0"
 xdg = "3.0.0"
 

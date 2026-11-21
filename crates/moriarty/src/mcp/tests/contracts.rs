@@ -1,6 +1,11 @@
 use super::*;
+use crate::test_helpers::task_meta;
 
-async fn assert_discovery_contract<S: ServerHandler + Clone>(server: S, prompts: bool) {
+async fn assert_discovery_contract<S: Service<RoleServer> + Clone>(
+    server: S,
+    prompts: bool,
+    tasks: bool,
+) {
     let mut legacy_tools = None;
     for modern in [false, true] {
         let mut client = TestClient::connect(server.clone(), modern).await;
@@ -18,10 +23,11 @@ async fn assert_discovery_contract<S: ServerHandler + Clone>(server: S, prompts:
                 prompts,
                 "{discovery}"
             );
-            assert!(
+            assert_eq!(
                 capabilities["extensions"]
                     .get("io.modelcontextprotocol/tasks")
-                    .is_none(),
+                    .is_some(),
+                tasks,
                 "{discovery}"
             );
         }
@@ -38,9 +44,9 @@ async fn assert_discovery_contract<S: ServerHandler + Clone>(server: S, prompts:
 
 #[tokio::test]
 async fn discovery_capabilities_and_tool_schemas_match_both_lifecycles() {
-    assert_discovery_contract(GitReadOnly, true).await;
-    assert_discovery_contract(JjReadOnly, false).await;
-    assert_discovery_contract(ToolRunner, false).await;
+    assert_discovery_contract(GitReadOnly, true, false).await;
+    assert_discovery_contract(JjReadOnly, false, false).await;
+    assert_discovery_contract(ProjectTools, false, true).await;
 }
 
 fn find_tool<'a>(response: &'a Value, name: &str) -> &'a Value {
@@ -127,6 +133,33 @@ async fn unknown_older_protocol_falls_back_to_legacy() {
     assert_git_contract("1999-01-01", "2025-11-25").await;
 }
 
+async fn assert_status_result_variants(
+    client: &mut TestClient,
+    call: &Value,
+    modern: bool,
+    marker: &str,
+) {
+    for declares_tasks in [false, true].into_iter().filter(|&tasks| modern || !tasks) {
+        let mut call = call.clone();
+        if declares_tasks {
+            call["params"]["_meta"] = task_meta();
+        }
+        let status = client.request(call).await;
+        assert_result_shape(&status, modern, false);
+        assert_eq!(
+            status["result"]["structuredContent"]["exit_code"], 0,
+            "{status}"
+        );
+        assert!(
+            status["result"]["structuredContent"]["stdout"]
+                .as_str()
+                .unwrap()
+                .contains(marker),
+            "{status}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn git_prompt_and_tool_responses_keep_names_content_and_roles() {
     for modern in [false, true] {
@@ -173,16 +206,13 @@ async fn git_prompt_and_tool_responses_keep_names_content_and_roles() {
         // Nextest isolates each test process, so changing cwd cannot affect sibling tests.
         let original_dir = current_dir().unwrap();
         set_current_dir(project.path()).unwrap();
-        let status = client
-            .request(json!({
-                "jsonrpc": "2.0",
-                "id": 5,
-                "method": "tools/call",
-                "params": { "name": "status", "arguments": { "args": [] } }
-            }))
+        let call = json!({
+            "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+            "params": { "name": "status", "arguments": { "args": [] } }
+        });
+        assert_status_result_variants(&mut client, &call, modern, "git-default-cwd-marker.txt")
             .await;
         set_current_dir(original_dir).unwrap();
-        assert_result_shape(&status, modern, false);
         let assistant = prompt["result"]["messages"][0]["content"]["text"]
             .as_str()
             .unwrap();
@@ -192,17 +222,6 @@ async fn git_prompt_and_tool_responses_keep_names_content_and_roles() {
         assert!(assistant.contains("status"), "{prompt}");
         assert!(user.contains("status"), "{prompt}");
         assert!(user.contains(project.path().to_str().unwrap()), "{prompt}");
-        assert_eq!(
-            status["result"]["structuredContent"]["exit_code"], 0,
-            "{status}"
-        );
-        assert!(
-            status["result"]["structuredContent"]["stdout"]
-                .as_str()
-                .unwrap()
-                .contains("git-default-cwd-marker.txt"),
-            "{status}"
-        );
         assert_eq!(
             prompt["result"]["messages"]
                 .as_array()
@@ -263,30 +282,13 @@ async fn jj_transport_preserves_protocol_and_tool_contracts() {
         assert!(snapshot.status.success(), "{snapshot:?}");
         let original_dir = current_dir().unwrap();
         set_current_dir(project.path()).unwrap();
-        let status = client
-            .request(json!({
-                "jsonrpc": "2.0",
-                "id": 3,
-                "method": "tools/call",
-                "params": {
-                    "name": "run",
-                    "arguments": { "command": "status", "args": [] }
-                }
-            }))
+        let call = json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": { "name": "run", "arguments": { "command": "status", "args": [] } }
+        });
+        assert_status_result_variants(&mut client, &call, modern, "jj-default-cwd-marker.txt")
             .await;
         set_current_dir(original_dir).unwrap();
-        assert_result_shape(&status, modern, false);
-        assert_eq!(
-            status["result"]["structuredContent"]["exit_code"], 0,
-            "{status}"
-        );
-        assert!(
-            status["result"]["structuredContent"]["stdout"]
-                .as_str()
-                .unwrap()
-                .contains("jj-default-cwd-marker.txt"),
-            "{status}"
-        );
         client.close().await;
     }
 }
@@ -294,7 +296,7 @@ async fn jj_transport_preserves_protocol_and_tool_contracts() {
 #[tokio::test]
 async fn tool_runner_transport_preserves_protocol_and_tool_contracts() {
     for modern in [false, true] {
-        let mut client = TestClient::connect(ToolRunner, modern).await;
+        let mut client = TestClient::connect(ProjectTools, modern).await;
 
         let tools = list_tools(&mut client).await;
         assert_result_shape(&tools, modern, true);
@@ -325,7 +327,7 @@ lint = ["sh", "-c", "printf failure-out; printf failure-err >&2; exit 7"]
         .unwrap();
     let project_dir = project.path().to_string_lossy();
     for modern in [false, true] {
-        let mut client = TestClient::connect(ToolRunner, modern).await;
+        let mut client = TestClient::connect(ProjectTools, modern).await;
 
         let success = client
             .request(json!({

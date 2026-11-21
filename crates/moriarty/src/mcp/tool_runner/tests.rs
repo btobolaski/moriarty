@@ -6,13 +6,15 @@ use std::{
     process::{Command, ExitStatus},
 };
 
-use serde_json::to_value;
+use futures::future::BoxFuture;
+use serde_json::{Value, json, to_value};
 use tempfile::TempDir;
+use tokio::sync::{Notify, oneshot};
 
 use super::*;
 use crate::{
     checks::{self, CheckRunOutcome},
-    execution,
+    execution::{self, ExecutionError},
     mcp::tests::EXPECTED_PROTOCOL_VERSIONS,
     project_config::approvals,
     repository::{detect_repository_root, detect_workspace_root},
@@ -25,6 +27,304 @@ use crate::{
 use process_supervisor::{
     Completion, PartialState, ProcessError, ProcessOptions, ProcessSpec, RunningProcess,
 };
+
+#[tokio::test]
+async fn returned_tool_result_survives_racing_cancellation_only_with_clean_settlement() {
+    for (is_error, cleanup_fails) in [(false, false), (true, false), (false, true), (true, true)] {
+        let tool = if is_error {
+            CallToolResult::error
+        } else {
+            CallToolResult::success
+        };
+        let result = tool(vec![ContentBlock::text("original")]);
+        match (
+            cleanup_fails,
+            settle_racing_return(Ok(result), cleanup_fails).await,
+        ) {
+            (false, TaskPayload::Completed { result }) => {
+                assert_eq!(result["isError"], is_error);
+                assert_eq!(result["content"][0]["text"], "original");
+            }
+            (true, TaskPayload::Failed { error }) => {
+                let message = error["message"].as_str().unwrap();
+                assert!(
+                    message
+                        .contains("Settlement: process cleanup or capture settlement unconfirmed"),
+                    "{message}"
+                );
+                assert!(!message.contains("original"));
+                if is_error {
+                    assert_eq!(
+                        error["data"]["toolResult"]["content"][0]["text"],
+                        "original"
+                    );
+                } else {
+                    assert!(error.get("data").is_none());
+                }
+            }
+            (_, payload) => panic!("unexpected payload after racing cancellation: {payload:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn returned_request_error_survives_racing_cancellation_and_cleanup_failure() {
+    for cleanup_fails in [false, true] {
+        let primary = McpError::invalid_request("initiating detail", Some(json!({"key":"data"})));
+        let TaskPayload::Failed { error } =
+            settle_racing_return(Err(primary.clone()), cleanup_fails).await
+        else {
+            panic!("returned error must survive a racing cancellation");
+        };
+        if cleanup_fails {
+            assert_eq!(error["code"], -32603);
+            assert_eq!(error["data"]["key"], "data");
+            let message = error["message"].as_str().unwrap();
+            assert!(
+                message.contains("initiating detail") && message.contains("settlement unconfirmed"),
+                "{message}"
+            );
+        } else {
+            assert_eq!(Value::Object(error), to_value(primary).unwrap());
+        }
+    }
+}
+
+async fn settle_racing_return(
+    result: Result<CallToolResult, McpError>,
+    cleanup_fails: bool,
+) -> TaskPayload {
+    let scope = task_outcome_scope(cleanup_fails);
+    let token = CancellationToken::new();
+    let payload = observe_task(&scope, token.clone(), async move {
+        settle_task_fixture().await;
+        token.cancel();
+        result
+    })
+    .await;
+    if cleanup_fails {
+        assert!(
+            scope
+                .shutdown()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("settlement unconfirmed")
+        );
+    } else {
+        scope.shutdown().await.unwrap();
+    }
+    payload
+}
+
+async fn observe_task(
+    scope: &Scope,
+    token: CancellationToken,
+    work: impl Future<Output = Result<CallToolResult, McpError>> + Send + 'static,
+) -> TaskPayload {
+    let (send, receive) = oneshot::channel();
+    scope
+        .start_task(&CancellationToken::new(), token, work, || {
+            ((), move |outcome| send.send(task_payload(outcome)).unwrap())
+        })
+        .unwrap();
+    receive.await.unwrap()
+}
+
+fn reaped_child() -> PartialState {
+    let mut state = PartialState::default();
+    state.child_id = Some(1);
+    state.status = Some(ExitStatus::from_raw(0));
+    state.group_absent = true;
+    state
+}
+
+fn settled_supervision_failure() -> miette::Report {
+    // The supervisor can finish reaping and settling readers even if one reader failed.
+    ProcessError::SupervisionFailed {
+        state: Box::new(reaped_child()),
+    }
+    .into()
+}
+
+#[tokio::test]
+async fn settled_supervision_failure_keeps_original_rpc_error() {
+    let scope = execution::test_seams::scope_with_operations(|_, _| {
+        ready(Err(settled_supervision_failure()))
+    });
+    let primary = McpError::internal_error("capture read failed", Some(json!({"stream":"stdout"})));
+    let expected = to_value(&primary).unwrap();
+    let payload = observe_task(&scope, CancellationToken::new(), async move {
+        settle_task_fixture().await;
+        Err(primary)
+    })
+    .await;
+    assert_eq!(
+        payload,
+        TaskPayload::Failed {
+            error: expected.as_object().unwrap().clone()
+        }
+    );
+    scope.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn nested_checks_return_an_error_result_with_confirmed_cleanup() {
+    let _xdg = setup_isolated_xdg_config();
+    let config = "[commands]\n[[checks]]\nname = 'fixture'\ncommand = ['echo', 'check']\n";
+    let project = setup_project_dir_with_config(config);
+    fs::create_dir_all(project.path().join(".jj/repo")).unwrap();
+    approvals::approve_project_config(project.path(), config)
+        .await
+        .unwrap();
+    let scope = execution::test_seams::scope_with_operations(|spec, _| {
+        assert_eq!(spec.args, ["check"]);
+        ready(Err(settled_supervision_failure()))
+    });
+    let payload = observe_task(
+        &scope,
+        CancellationToken::new(),
+        ToolRunner::run_checks_impl(run_args(project.path())),
+    )
+    .await;
+    let TaskPayload::Completed { result } = payload else {
+        panic!("expected the check tool result, got {payload:?}");
+    };
+    assert_eq!(result["isError"], true);
+    let text = result["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("Check 'fixture' failed to execute"), "{text}");
+    assert!(
+        text.contains(&settled_supervision_failure().to_string()),
+        "{text}"
+    );
+    assert!(!text.contains("Settlement:"), "{text}");
+    scope.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn interrupted_task_distinguishes_startup_errors_from_uncertain_launch() {
+    #[derive(Clone, Copy)]
+    enum Startup {
+        SetupFailed,
+        SupervisorInterrupted { launch_unconfirmed: bool },
+        AbandonedPending,
+    }
+
+    for (startup, expected_diagnostic) in [
+        (Startup::SetupFailed, None),
+        (
+            Startup::SupervisorInterrupted {
+                launch_unconfirmed: false,
+            },
+            None,
+        ),
+        (
+            Startup::SupervisorInterrupted {
+                launch_unconfirmed: true,
+            },
+            Some("launch_unconfirmed=true"),
+        ),
+        (
+            Startup::AbandonedPending,
+            Some("creation and late cleanup may be uncertain"),
+        ),
+    ] {
+        let started = Arc::new(Notify::new());
+        let scope = execution::test_seams::scope_with_operations({
+            let started = started.clone();
+            move |_, operation| {
+                let started = started.clone();
+                async move {
+                    started.notify_one();
+                    operation.cancelled().await;
+                    Err(match startup {
+                        Startup::SetupFailed => ProcessError::StartFailed {
+                            state: Box::new(reaped_child()),
+                        }
+                        .into(),
+                        Startup::SupervisorInterrupted { launch_unconfirmed } => {
+                            let mut state = PartialState::default();
+                            state.launch_unconfirmed = launch_unconfirmed;
+                            ProcessError::StartupInterrupted {
+                                state: Box::new(state),
+                            }
+                            .into()
+                        }
+                        Startup::AbandonedPending => ExecutionError::StartupUncertain.into(),
+                    })
+                }
+            }
+        });
+        let token = CancellationToken::new();
+        let (payload, ()) = tokio::join!(
+            observe_task(&scope, token.clone(), async {
+                settle_task_fixture().await;
+                unreachable!("the owner must interrupt work during startup")
+            }),
+            async {
+                started.notified().await;
+                token.cancel();
+            }
+        );
+        if let Some(expected_diagnostic) = expected_diagnostic {
+            let TaskPayload::Failed { error } = payload else {
+                panic!("uncertain launch must fail, got {payload:?}");
+            };
+            let message = error["message"].as_str().unwrap();
+            assert!(message.contains("Operation cancelled"), "{message}");
+            assert!(message.contains(expected_diagnostic), "{message}");
+            assert!(scope.shutdown().await.is_err());
+        } else {
+            assert_eq!(payload, TaskPayload::Cancelled);
+            scope.shutdown().await.unwrap();
+        }
+    }
+}
+
+fn task_outcome_scope(cleanup_fails: bool) -> Arc<Scope> {
+    execution::test_seams::scope_with_operations(move |_, _| {
+        ready(if cleanup_fails {
+            Err(ProcessError::CleanupUnconfirmed {
+                state: Box::default(),
+            }
+            .into())
+        } else {
+            Ok(test_report(Completion::Exited(ExitStatus::from_raw(0))))
+        })
+    })
+}
+
+async fn settle_task_fixture() {
+    let _ = execution::execute(ProcessSpec {
+        program: "fixture".into(),
+        args: vec![],
+        cwd: None,
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn cancelled_creation_request_is_rejected_before_work_starts() {
+    let server = ToolRunner::default();
+    let host = Scope::new();
+    let request = CancellationToken::new();
+    request.cancel();
+    let mut extensions = Extensions::default();
+    let tasks = ConnectionTasks::default();
+    extensions.insert(TaskAdmission {
+        host: host.clone(),
+        request,
+        tasks: tasks.clone(),
+    });
+    let error = server
+        .execute_tool(extensions, async { panic!("work was not admitted") })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::INTERNAL_ERROR);
+    assert!(error.message.contains("cancelled before admission"));
+    host.shutdown().await.unwrap();
+    assert!(tasks.lock().unwrap().is_empty());
+}
 
 async fn setup_project_dir_with_approvals(config_content: &str) -> (TempDir, TempDir) {
     let xdg_dir = setup_isolated_xdg_config();
@@ -602,33 +902,35 @@ async fn test_run_handler_matrix() {
     type Handler = for<'a> fn(
         &'a ToolRunner,
         Parameters<RunArgs>,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = std::result::Result<rmcp::model::CallToolResult, rmcp::ErrorData>,
-                > + Send
-                + 'a,
-        >,
-    >;
+    ) -> BoxFuture<'a, Result<CallToolResponse, McpError>>;
     let cases: &[(&str, &str, Handler)] = &[
-        ("lint", "Running lint", |s, a| Box::pin(s.run_lint(a))),
-        ("build", "Building project", |s, a| Box::pin(s.run_build(a))),
-        ("format", "Formatting code", |s, a| {
-            Box::pin(s.run_formatter(a))
+        ("lint", "Running lint", |s, a| {
+            Box::pin(s.run_lint(a, Extensions::default()))
         }),
-        ("test", "Running tests", |s, a| Box::pin(s.run_tests(a))),
+        ("build", "Building project", |s, a| {
+            Box::pin(s.run_build(a, Extensions::default()))
+        }),
+        ("format", "Formatting code", |s, a| {
+            Box::pin(s.run_formatter(a, Extensions::default()))
+        }),
+        ("test", "Running tests", |s, a| {
+            Box::pin(s.run_tests(a, Extensions::default()))
+        }),
     ];
 
     for (key, label, handler) in cases {
         let toml = format!("[commands]\n{key} = [\"echo\", \"{label}\"]\n");
         let (temp_dir, _xdg_dir) = setup_project_dir_with_approvals(&toml).await;
-        let server = ToolRunner;
+        let server = ToolRunner::default();
         let args = RunArgs {
             project_dir: temp_dir.path().to_path_buf(),
         };
         let tool_result = handler(&server, Parameters(args))
             .await
             .unwrap_or_else(|e| panic!("{key}: handler returned Err: {e:?}"));
+        let CallToolResponse::Complete(tool_result) = tool_result else {
+            panic!("{key}: expected a direct tool result");
+        };
         assert_eq!(tool_result.is_error, Some(false), "{key}");
         assert_eq!(tool_result.content.len(), 2, "{key}");
     }
@@ -915,13 +1217,12 @@ async fn test_approval_lifecycle_with_binary_modification() {
 
 #[test]
 fn test_get_info_metadata() {
-    let server = ToolRunner;
-    let info = server.get_info();
+    let server = ToolRunner::default();
+    let info = ServerHandler::get_info(&server);
 
     assert_eq!(info.protocol_version.as_str(), "2025-11-25");
     assert_eq!(
-        server
-            .supported_protocol_versions()
+        ServerHandler::supported_protocol_versions(&server)
             .iter()
             .map(ProtocolVersion::as_str)
             .collect::<Vec<_>>(),

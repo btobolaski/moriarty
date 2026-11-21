@@ -4,7 +4,8 @@
 //!
 //! - [`git_read_only`]: Read-only git operations (status, diff, log, show)
 //! - [`jj_read_only`]: Read-only jj operations (status, diff, log, show, op log, file show, file list)
-//! - [`tool_runner`]: Project-configured tool execution (lint, test, build, format, checks)
+//! - [`tool_runner`]: Project-configured tool execution (lint, test, build, format, checks),
+//!   with opt-in Tasks under MCP `2026-07-28`
 //!
 //! # Usage
 //!
@@ -32,7 +33,7 @@ use clap::Subcommand;
 use futures::poll;
 use miette::{IntoDiagnostic, WrapErr};
 use rmcp::{
-    ErrorData as McpError, RoleServer, ServerHandler, Service, ServiceExt,
+    ErrorData as McpError, RoleServer, Service, ServiceExt,
     model::{
         ClientJsonRpcMessage, ClientNotification, ClientRequest, ContentBlock, GetMeta,
         PingRequestMethod, ProtocolVersion, RequestMetaObject, ServerConfig, ServerJsonRpcMessage,
@@ -51,7 +52,7 @@ use tokio_util::{
     task::TaskTracker,
 };
 
-use self::{git_read_only::GitReadOnly, jj_read_only::JjReadOnly, tool_runner::ToolRunner};
+use self::{git_read_only::GitReadOnly, jj_read_only::JjReadOnly, tool_runner::ProjectTools};
 use crate::execution::{self, Scope, ShutdownSignals};
 
 // Dependency upgrades must not expand Moriarty's supported MCP revisions.
@@ -68,6 +69,7 @@ const MCP_SUPPORTED_PROTOCOL_VERSIONS: &[ProtocolVersion] = &[
 pub mod git_read_only;
 pub mod jj_read_only;
 pub mod read_only;
+mod tasks;
 pub mod tool_runner;
 
 const MAX_PENDING_REJECTIONS: usize = 64;
@@ -270,7 +272,7 @@ impl McpServers {
         match self {
             Self::GitReadOnly => serve_owned(GitReadOnly, stdio()).await,
             Self::JjReadOnly => serve_owned(JjReadOnly, stdio()).await,
-            Self::ProjectTools => serve_owned(ToolRunner, stdio()).await,
+            Self::ProjectTools => serve_owned(ProjectTools, stdio()).await,
             Self::Install => install_mcp_server().await,
         }
     }
@@ -280,17 +282,28 @@ impl McpServers {
 struct OwnedService<S> {
     server: S,
     execution: Arc<Scope>,
+    tasks: tasks::ConnectionTasks,
 }
 
-impl<S: ServerHandler + Clone> Service<RoleServer> for OwnedService<S> {
+impl<S: Service<RoleServer> + Clone> Service<RoleServer> for OwnedService<S> {
     async fn handle_request(
         &self,
         request: ClientRequest,
-        context: RequestContext<RoleServer>,
+        mut context: RequestContext<RoleServer>,
     ) -> Result<ServerResult, McpError> {
+        if matches!(
+            request,
+            ClientRequest::CallToolRequest(_)
+                | ClientRequest::GetTaskRequest(_)
+                | ClientRequest::UpdateTaskRequest(_)
+                | ClientRequest::CancelTaskRequest(_)
+        ) {
+            context.extensions.insert(self.tasks.clone());
+        }
         if !matches!(request, ClientRequest::CallToolRequest(_)) {
             return self.server.handle_request(request, context).await;
         }
+        context.extensions.insert(self.execution.clone());
         let server = self.server.clone();
         let outcome = self
             .execution
@@ -343,7 +356,7 @@ fn settle_tool_response(
 
 async fn serve_owned<S, R, W>(server: S, transport: (R, W)) -> miette::Result<()>
 where
-    S: ServerHandler + Clone,
+    S: Service<RoleServer> + Clone,
     R: AsyncRead + Send + Unpin + 'static,
     W: AsyncWrite + Send + Unpin + 'static,
 {
@@ -358,7 +371,7 @@ async fn serve_until<S, R, W>(
     execution: Arc<Scope>,
 ) -> miette::Result<()>
 where
-    S: ServerHandler + Clone,
+    S: Service<RoleServer> + Clone,
     R: AsyncRead + Send + Unpin + 'static,
     W: AsyncWrite + Send + Unpin + 'static,
 {
@@ -378,7 +391,11 @@ where
     // Early returns and `?` must exit only this block so admission close, cancellation
     // and awaited drain below still run.
     let outcome = async {
-        let server = OwnedService { server, execution: execution.clone() };
+        let server = OwnedService {
+            server,
+            execution: execution.clone(),
+            tasks: Default::default(),
+        };
         let service = tokio::select! {
             biased;
             reason = &mut stop => {

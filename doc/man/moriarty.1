@@ -275,7 +275,7 @@ See
 for the configuration format, examples, execution directories,
 and approval requirements.
 .Pp
-For supported MCP revisions, lifecycle compatibility, and Tasks exclusion, see
+For supported MCP revisions, lifecycle compatibility, and Tasks, see
 .Sx "Process Execution" .
 .Ss Process Execution
 Moriarty requires Linux or macOS; the entire binary depends on the platform-specific
@@ -343,9 +343,15 @@ requests allow later legacy initialization or modern requests on the same connec
 Modern complete results carry resultType; discovery and tool/prompt lists also carry
 result-level ttlMs and cacheScope hints. Legacy tool/prompt wire shapes remain unchanged.
 Only git-read-only advertises prompts. Modern ping is unavailable; legacy ping remains supported.
-Tasks (io.modelcontextprotocol/tasks) is neither advertised nor implemented, even for
-clients advertising it. Tools remain ordinary request/response operations without background
-task identifiers; tasks/get, tasks/update, and tasks/cancel return method-not-found.
+Only project-tools advertises io.modelcontextprotocol/tasks in 2026-07-28 discovery.
+Declare the extension in a tool call's client capabilities to receive a task handle without
+waiting for completion. Fast work can settle before the handle arrives.
+Legacy clients, git-read-only, jj-read-only, and modern calls omitting the extension keep direct results.
+Use tasks/get to poll, tasks/cancel to request cancellation, and tasks/update to acknowledge inputs
+(which project-tools ignores). Declare the extension on each management request.
+Cancellation acknowledges intent, not completion. Tasks outlive their creating request but not
+stdio host shutdown, which awaits cleanup. At most 20 terminal results are kept, for at most one hour
+after settlement. Active tasks do not expire; wire ttlMs is measured from creation.
 .Cm mcp install
 is excluded from supervision and retains inherited terminal streams and behavior.
 .Ss Project Approval

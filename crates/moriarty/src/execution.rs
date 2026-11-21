@@ -42,6 +42,7 @@ pub(crate) const OUTPUT_TRUNCATED_NOTICE: &str = "[output truncated]";
 #[derive(Debug, miette::Diagnostic)]
 pub(crate) enum ExecutionError {
     CancelledBeforeLaunch,
+    StartupUncertain,
     Interrupted(String),
 }
 
@@ -49,6 +50,8 @@ impl Display for ExecutionError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::CancelledBeforeLaunch => formatter.write_str("Startup cancelled before launch"),
+            Self::StartupUncertain => formatter
+                .write_str("Startup cancelled; child creation and late cleanup may be uncertain"),
             Self::Interrupted(message) => message.fmt(formatter),
         }
     }
@@ -157,6 +160,20 @@ pub(crate) struct ScopedOutcome<T> {
     pub(crate) cleanup: miette::Result<()>,
 }
 
+/// A return is authoritative even if the cancellation flag races it.
+pub(crate) enum TaskObservation<T> {
+    Returned(T),
+    Interrupted(miette::Report),
+}
+
+// A task's work outcome is separate from its cleanup evidence; direct drain also
+// preserves diagnostics that otherwise disappear when the caller is gone.
+#[derive(Clone, Copy)]
+enum DrainEvidence {
+    Direct,
+    TaskCleanup,
+}
+
 /// Retains completion owners after caller loss. Drop requests cancellation; awaited shutdown
 /// reports settlement, requiring a live runtime and retaining the supervisor's late-launch limits.
 pub(crate) struct Scope {
@@ -165,18 +182,25 @@ pub(crate) struct Scope {
     cancellation: CancellationToken,
     process: Arc<StartProcess>,
     request_cancellation: Option<CancellationToken>,
+    drain_evidence: DrainEvidence,
     failures: Arc<Mutex<Option<String>>>,
 }
 
 impl Scope {
     pub(crate) fn new() -> Arc<Self> {
-        Self::with_process(CancellationToken::new(), Arc::new(start_process), None)
+        Self::with_process(
+            CancellationToken::new(),
+            Arc::new(start_process),
+            None,
+            DrainEvidence::Direct,
+        )
     }
 
     fn with_process(
         cancellation: CancellationToken,
         process: Arc<StartProcess>,
         request_cancellation: Option<CancellationToken>,
+        drain_evidence: DrainEvidence,
     ) -> Arc<Self> {
         Arc::new(Self {
             open: Mutex::new(true),
@@ -184,6 +208,7 @@ impl Scope {
             cancellation,
             process,
             request_cancellation,
+            drain_evidence,
             failures: Arc::new(Mutex::new(None)),
         })
     }
@@ -194,6 +219,71 @@ impl Scope {
                 .request_cancellation
                 .as_ref()
                 .is_some_and(CancellationToken::is_cancelled)
+    }
+
+    fn admit<R, F>(
+        &self,
+        request: &CancellationToken,
+        cancellation: CancellationToken,
+        drain_evidence: DrainEvidence,
+        prepare: impl FnOnce(Arc<Self>) -> (R, F),
+    ) -> miette::Result<R>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let open = self.open.lock().unwrap();
+        if !*open || request.is_cancelled() || self.is_cancelled() {
+            return Err(interrupted("Operation cancelled before admission"));
+        }
+        let child = Self::with_process(
+            self.cancellation.child_token(),
+            self.process.clone(),
+            Some(cancellation),
+            drain_evidence,
+        );
+        let (response, owner) = prepare(child);
+        self.tracker.spawn(owner);
+        Ok(response)
+    }
+
+    /// The host owns both cleanup and publication after admission, not the creating request.
+    /// A returned value is evidence, even if the cancellation flag changed during its poll.
+    pub(crate) fn start_task<F, T, R, P>(
+        &self,
+        request: &CancellationToken,
+        cancellation: CancellationToken,
+        work: F,
+        prepare: impl FnOnce() -> (R, P),
+    ) -> miette::Result<R>
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+        P: FnOnce(ScopedOutcome<TaskObservation<T>>) + Send + 'static,
+    {
+        let failures = self.failures.clone();
+        self.admit(request, cancellation.clone(), DrainEvidence::TaskCleanup, |child| {
+            let (response, publish) = prepare();
+            (response, async move {
+                let work = SUBMISSION.scope(child.clone(), work);
+                let value = tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => TaskObservation::Interrupted(interrupted("Operation cancelled")),
+                    () = child.cancellation.cancelled() => TaskObservation::Interrupted(interrupted("Execution scope cancelled")),
+                    value = work => TaskObservation::Returned(value),
+                };
+                let cleanup = child.shutdown().await;
+                if let Err(error) = &cleanup {
+                    match &value {
+                        TaskObservation::Interrupted(primary) => record_failure(
+                            &failures,
+                            &interrupted(format!("{primary:#}\nSettlement: {error:#}")),
+                        ),
+                        TaskObservation::Returned(_) => record_failure(&failures, error),
+                    }
+                }
+                publish(ScopedOutcome { value, cleanup });
+            })
+        })
     }
 
     /// Admission/startup inspect the actual request flag even inside a work poll; the outer select
@@ -209,18 +299,11 @@ impl Scope {
         T: Send + 'static,
     {
         let (mut sender, receiver) = oneshot::channel();
-        {
-            let open = self.open.lock().unwrap();
-            if !*open || cancellation.is_cancelled() || self.is_cancelled() {
-                return Err(interrupted("Operation cancelled before admission"));
-            }
-            let child = Self::with_process(
-                self.cancellation.child_token(),
-                self.process.clone(),
-                Some(cancellation.clone()),
-            );
-            let failures = self.failures.clone();
-            self.tracker.spawn(async move {
+        let failures = self.failures.clone();
+        let request = cancellation.clone();
+        // Nested check batches keep their task owner's cleanup policy.
+        self.admit(&request, cancellation.clone(), self.drain_evidence, |child| {
+            ((), async move {
                 // Contain work unwinds so the owner still reaches child drain; never render the panic payload.
                 let outcome = AssertUnwindSafe(async {
                     let work = SUBMISSION.scope(child.clone(), work);
@@ -251,8 +334,8 @@ impl Scope {
                 } else if let Some(error) = cleanup_failure {
                     record_failure(&failures, &error);
                 }
-            });
-        }
+            })
+        })?;
         receiver
             .await
             .map_err(|_| interrupted("Operation owner lost; cleanup unconfirmed"))?
@@ -320,6 +403,29 @@ fn deliver_job(
     }
 }
 
+fn deliver_task_job(
+    outcome: miette::Result<ProcessReport>,
+    result: oneshot::Sender<miette::Result<ProcessReport>>,
+    failures: &Mutex<Option<String>>,
+) {
+    if let Err(error) = &outcome {
+        // The supervisor can report unsuccessful work after confirmed cleanup. An
+        // undeliverable execution error cannot by itself invalidate that evidence.
+        let cleanup_unconfirmed = match error.downcast_ref::<ProcessError>() {
+            Some(ProcessError::CleanupUnconfirmed { .. }) => true,
+            Some(ProcessError::StartupInterrupted { state }) => state.launch_unconfirmed,
+            _ => matches!(
+                error.downcast_ref::<ExecutionError>(),
+                Some(ExecutionError::StartupUncertain)
+            ),
+        };
+        if cleanup_unconfirmed {
+            record_failure(failures, error);
+        }
+    }
+    let _ = result.send(outcome);
+}
+
 pub(crate) fn interrupted(message: impl Into<String>) -> miette::Report {
     ExecutionError::Interrupted(message.into()).into()
 }
@@ -338,6 +444,7 @@ impl Scope {
             let request = self.request_cancellation.clone();
             let operation = cancellation.clone();
             let failures = self.failures.clone();
+            let drain_evidence = self.drain_evidence;
             self.tracker.spawn(async move {
                 // Startup has not been polled, so either rejection has no launch to settle.
                 if scope.is_cancelled() {
@@ -364,7 +471,10 @@ impl Scope {
                     _ = requested => { operation.cancel(); outcome.await },
                     outcome = &mut outcome => outcome,
                 };
-                deliver_job(outcome, result, &failures);
+                match drain_evidence {
+                    DrainEvidence::Direct => deliver_job(outcome, result, &failures),
+                    DrainEvidence::TaskCleanup => deliver_task_job(outcome, result, &failures),
+                }
             });
             receiver
         };
@@ -510,13 +620,21 @@ async fn own_process<W: Future<Output = miette::Result<ProcessReport>>>(
     startup: impl Future<Output = miette::Result<(CancellationToken, W)>>,
     cancellation: CancellationToken,
 ) -> miette::Result<ProcessReport> {
-    if cancellation.is_cancelled() {
-        return Err(ExecutionError::CancelledBeforeLaunch.into());
-    }
+    let mut startup_polled = false;
     let (running, wait) = tokio::select! {
         biased;
-        _ = cancellation.cancelled() => return Err(interrupted("Startup cancelled; child creation and late cleanup may be uncertain")),
-        result = startup => result?,
+        _ = cancellation.cancelled() => {
+            return Err(if startup_polled {
+                ExecutionError::StartupUncertain
+            } else {
+                ExecutionError::CancelledBeforeLaunch
+            }.into());
+        },
+        result = async {
+            // Use the actual startup poll, not a token check that can race it.
+            startup_polled = true;
+            startup.await
+        } => result?,
     };
     tokio::pin!(wait);
     tokio::select! {

@@ -26,7 +26,7 @@ fn assert_newer_protocol_rejected(response: &Value) {
     assert!(response.get("result").is_none());
 }
 
-async fn assert_server_rejects_newer_protocol<S: ServerHandler + Clone>(server: S) {
+async fn assert_server_rejects_newer_protocol<S: Service<RoleServer> + Clone>(server: S) {
     let (mut initialized, response) = initialize(server.clone(), "2025-11-25").await;
     assert_eq!(response["result"]["protocolVersion"], "2025-11-25");
     assert_newer_protocol_rejected(&request_with_newer_protocol(&mut initialized).await);
@@ -39,7 +39,7 @@ async fn assert_server_rejects_newer_protocol<S: ServerHandler + Clone>(server: 
     fresh.close().await;
 }
 
-async fn assert_discover_fallback<S: ServerHandler + Clone>(server: S) {
+async fn assert_discover_fallback<S: Service<RoleServer> + Clone>(server: S) {
     let mut client = TestClient::start(server).await;
     let discovery = client
         .request(json!({
@@ -67,7 +67,7 @@ async fn assert_discover_fallback<S: ServerHandler + Clone>(server: S) {
     client.close().await;
 }
 
-async fn assert_modern_discovery_recovers<S: ServerHandler + Clone>(server: S) {
+async fn assert_modern_discovery_recovers<S: Service<RoleServer> + Clone>(server: S) {
     for version in ["2026-07-28", "2099-01-01"] {
         let mut client = TestClient::connect(server.clone(), true).await;
         let discovery = client
@@ -91,10 +91,12 @@ async fn assert_modern_discovery_recovers<S: ServerHandler + Clone>(server: S) {
 async fn discovery_then_modern_work_on_all_servers() {
     assert_modern_discovery_recovers(GitReadOnly).await;
     assert_modern_discovery_recovers(JjReadOnly).await;
-    assert_modern_discovery_recovers(ToolRunner).await;
+    assert_modern_discovery_recovers(ProjectTools).await;
 }
 
-async fn assert_incomplete_unsupported_discovery_recovers<S: ServerHandler + Clone>(server: S) {
+async fn assert_incomplete_unsupported_discovery_recovers<S: Service<RoleServer> + Clone>(
+    server: S,
+) {
     for modern in [false, true] {
         let mut client =
             TestClient::start_in_scope(server.clone(), pending(), Scope::new(), modern).await;
@@ -128,7 +130,7 @@ async fn assert_incomplete_unsupported_discovery_recovers<S: ServerHandler + Clo
 async fn incomplete_unsupported_discovery_recovers_on_all_servers() {
     assert_incomplete_unsupported_discovery_recovers(GitReadOnly).await;
     assert_incomplete_unsupported_discovery_recovers(JjReadOnly).await;
-    assert_incomplete_unsupported_discovery_recovers(ToolRunner).await;
+    assert_incomplete_unsupported_discovery_recovers(ProjectTools).await;
 }
 
 #[tokio::test]
@@ -204,7 +206,7 @@ async fn modern_metadata_is_validated_before_tool_admission_on_every_request() {
     }
 }
 
-async fn assert_bootstrap_ping_policy<S: ServerHandler + Clone>(server: S) {
+async fn assert_bootstrap_ping_policy<S: Service<RoleServer> + Clone>(server: S) {
     let mut missing_capabilities = protocol_meta("2026-07-28");
     missing_capabilities
         .as_object_mut()
@@ -334,10 +336,10 @@ async fn guarded_ping_optional_context_errors_match_sdk() {
 async fn bootstrap_ping_obeys_metadata_and_preserves_lifecycle_recovery_on_all_servers() {
     assert_bootstrap_ping_policy(GitReadOnly).await;
     assert_bootstrap_ping_policy(JjReadOnly).await;
-    assert_bootstrap_ping_policy(ToolRunner).await;
+    assert_bootstrap_ping_policy(ProjectTools).await;
 }
 
-async fn assert_task_methods_disabled<S: ServerHandler + Clone>(server: S) {
+async fn assert_task_methods_disabled<S: Service<RoleServer> + Clone>(server: S) {
     let mut client = TestClient::connect(server, true).await;
     let capabilities = json!({ "extensions": { "io.modelcontextprotocol/tasks": {} } });
     assert!(
@@ -387,10 +389,9 @@ async fn assert_task_methods_disabled<S: ServerHandler + Clone>(server: S) {
 }
 
 #[tokio::test]
-async fn tasks_stay_disabled_for_both_lifecycles() {
+async fn tasks_stay_disabled_for_other_servers() {
     assert_task_methods_disabled(GitReadOnly).await;
     assert_task_methods_disabled(JjReadOnly).await;
-    assert_task_methods_disabled(ToolRunner).await;
     for modern in [false, true] {
         let server = PendingTools::default();
         let mut client = TestClient::connect(server.clone(), modern).await;
@@ -415,7 +416,7 @@ async fn tasks_stay_disabled_for_both_lifecycles() {
     }
 }
 
-async fn assert_version_policy<S: ServerHandler + Clone>(server: S) {
+async fn assert_version_policy<S: Service<RoleServer> + Clone>(server: S) {
     for (requested, expected) in [
         ("2024-11-05", "2024-11-05"),
         ("2025-03-26", "2025-03-26"),
@@ -454,7 +455,7 @@ async fn assert_version_policy<S: ServerHandler + Clone>(server: S) {
 async fn all_servers_have_explicit_versions_and_legacy_fallback() {
     assert_version_policy(GitReadOnly).await;
     assert_version_policy(JjReadOnly).await;
-    assert_version_policy(ToolRunner).await;
+    assert_version_policy(ProjectTools).await;
 }
 
 #[tokio::test]
@@ -469,10 +470,10 @@ async fn jj_rejects_newer_request_protocol() {
 
 #[tokio::test]
 async fn tool_runner_rejects_newer_request_protocol() {
-    assert_server_rejects_newer_protocol(ToolRunner).await;
+    assert_server_rejects_newer_protocol(ProjectTools).await;
 }
 
-async fn assert_malformed_bootstrap_recovers<S: ServerHandler + Clone>(server: S) {
+async fn assert_malformed_bootstrap_recovers<S: Service<RoleServer> + Clone>(server: S) {
     for meta in [
         json!({}),
         json!({
@@ -499,7 +500,7 @@ async fn assert_malformed_bootstrap_recovers<S: ServerHandler + Clone>(server: S
 async fn malformed_bootstrap_recovers_on_all_servers() {
     assert_malformed_bootstrap_recovers(GitReadOnly).await;
     assert_malformed_bootstrap_recovers(JjReadOnly).await;
-    assert_malformed_bootstrap_recovers(ToolRunner).await;
+    assert_malformed_bootstrap_recovers(ProjectTools).await;
 }
 
 // Each handler has its own tool contract; keep a fallback regression per server
@@ -516,5 +517,5 @@ async fn jj_discover_fallback_preserves_legacy_tools() {
 
 #[tokio::test]
 async fn tool_runner_discover_fallback_preserves_legacy_tools() {
-    assert_discover_fallback(ToolRunner).await;
+    assert_discover_fallback(ProjectTools).await;
 }

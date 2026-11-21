@@ -52,7 +52,8 @@ program spelling and each entry point's existing cwd policy are preserved. This 
   TERM / 1 s post-KILL cleanup budgets. Stop-hook/MCP checks keep four-way concurrency, a five-minute whole-batch
   deadline including queueing/startup after verification, and a 10 MiB aggregate formatted-output gate. Rejection stops
   queued work and cancels/awaits active work; cleanup may extend past the five-minute execution allowance.
-- **Cancellation:** existing MCP `notifications/cancelled` affects only its request. Admission and startup inspect
+- **Cancellation:** MCP `notifications/cancelled` affects only its request; cancelling the creating request or a poll
+  does not stop an admitted task. Use `tasks/cancel` to request that. Admission and startup inspect
   cancellation even inside a work poll; already-started work retains its awaited owner. Disconnect, transport failure,
   and graceful SIGINT/SIGTERM close admission, cancel affected work, and await settlement before normal runtime exit,
   subject to the blocked-stdout limitation below. MCP/hook hosts exit after that drain even with stdin held open; hook
@@ -60,10 +61,11 @@ program spelling and each entry point's existing cwd policy are preserved. This 
   input reads. MCP stalled response writes, flushes, and transport closure wake on cancellation without resumed peer
   reads; owned work still drains and partial delivery is a host failure. Approval-lock waiting is cancellable; admitted
   load-modify-save transactions retain their lock and actual I/O through caller loss and host drain (not rollback). With
-  a live runtime, contained work-future panics still cancel and await admitted work. Retained failures keep safe write
-  context and available I/O causes; combined initiating/cleanup errors preserve their contextual sources without
-  exposing captured child output. Only genuine approval-file absence initializes an empty store; malformed/unreadable
-  stores remain errors and are not overwritten by an update. Approval initialization restores the terminal on errors or
+  a live runtime, request-owned work can still be drained after a contained panic. A task panic guarantees neither
+  awaited cleanup nor a terminal record or response. Retained failures keep safe write context and available I/O
+  causes; combined initiating/cleanup errors preserve their contextual sources without exposing captured child output.
+  Only genuine approval-file absence initializes an empty store; malformed/unreadable stores remain errors and are not
+  overwritten by an update. Approval initialization restores the terminal on errors or
   interruption. Startup creation/late cleanup can remain uncertain; SIGKILL/crash containment is not guaranteed.
   Git/root-resolution failures after the canonical-input snapshot fail closed, never becoming an alternate approval key
   or successful no-checks result; initial missing-input setup keeps its existing no-checks behavior. Git PATH entries
@@ -81,9 +83,15 @@ program spelling and each entry point's existing cwd policy are preserved. This 
 - **Compatibility:** All three stdio MCP servers support exactly 2024-11-05, 2025-03-26, 2025-06-18, 2025-11-25, and
   2026-07-28. Modern requests need no handshake: each carries `_meta` entries `io.modelcontextprotocol/protocolVersion`
   and `io.modelcontextprotocol/clientCapabilities`; client info and discovery are optional. Legacy clients retain
-  `initialize`/`notifications/initialized`; modern or unknown initialization revisions fall back to 2025-11-25. Tasks is
-  neither advertised nor implemented, even for task-capable clients; tools remain ordinary request/response operations.
+  `initialize`/`notifications/initialized`; modern or unknown initialization revisions fall back to 2025-11-25.
   `moriarty mcp install` is excluded from supervision and retains inherited terminal streams and behavior.
+- **MCP Tasks:** Only project-tools advertises `io.modelcontextprotocol/tasks` in `2026-07-28` discovery. Declare it on a
+  `tools/call` to get a task handle without waiting for completion; fast work may settle before the handle arrives.
+  Omit it for a direct result. Poll with `tasks/get` or request cancellation with `tasks/cancel` (an acknowledgement,
+  not confirmation that cleanup finished). `tasks/update` acknowledges unsolicited input without changing the task.
+  Declare the extension on management requests too. Tasks outlive their creating request, not the stdio connection.
+  The 20 most recently settled results are kept for up to one hour after settlement; working tasks do not expire. Git,
+  jj, and legacy clients retain direct behavior.
 
 ## Requirements
 

@@ -10,7 +10,7 @@ binary entry point is `crates/moriarty/src/main.rs`; `my-workspace-hack` is mana
 - [Moriarty process-execution specification](../openspec/specs/moriarty-process-execution/spec.md): integration,
   cancellation, and authorization requirements.
 - [MCP protocol-support specification](../openspec/specs/mcp-protocol-support/spec.md): explicit revisions,
-  modern/legacy stdio interoperability, and exclusion of Tasks.
+  modern/legacy stdio interoperability. The [MCP server overview](#mcp) below describes negotiated project-tools Tasks.
 - [Bash path-alias policy specification](../openspec/specs/bash-path-alias-policy/spec.md): approved alias names, opt-in
   unconfigured-name denial, and shared hook/offline evaluation.
 - [Permission-mode policy specification](../openspec/specs/permission-mode-policy/spec.md): free-form mode identity,
@@ -199,17 +199,19 @@ Private Moriarty execution ownership.
   Operation tokens are children of the host-linked scope token. Request scopes also retain the actual request token:
   admission/startup inspect it directly, even during work polling, and nested batch scopes inherit it. Each process
   owner bridges that request cancellation to its operation token while retaining startup/awaited wait ownership;
-  cancellation wins before re-polling startup. No relay task or token is threaded through ordinary helper chains. Typed
-  cancellation before startup is polled proves no launch and cannot become a settlement failure, even when result
-  delivery is lost; it remains an execution failure for the caller. After polling, retain the supervisor's uncertainty
-  and cancel-and-await contract.
+  cancellation wins before re-polling startup. No relay task or token is threaded through ordinary helper chains.
+  Cancellation before the first startup poll proves no launch was attempted; abandoning a pending startup may leave
+  late creation uncertain. Direct-request drain preserves the first retained diagnostic, including a startup error
+  whose receiver closed, but excludes confirmed no-launch cancellation. Tasks and their nested check batches only
+  retain process errors for drain when cleanup failed or is unconfirmed. With confirmed cleanup, a returned work
+  error stays a work error; if the task owner observed interruption instead, the task publishes cancellation.
 - Tracked scope/request/process owners survive dropped callers. Close admission, broadcast cancellation, then await
   concurrent settlement before normal runtime exit; do not abort completion owners. Request cancellation stays local.
-  With a live runtime, request owners contain work-future panics and still await child drain before delivery; synthetic
-  panic/cleanup diagnostics omit the payload and survive caller loss. Completed work and cleanup evidence stay separate
-  until the CLI/MCP boundary combines them; cleanup failure must not replace the initiating failure or blocked
-  tool-result content. Shared settlement composition uses alternate Display to preserve available source causes for both
-  errors without Debug-printing captures. Keep transport causes separate from execution's first cleanup error so both
+  With a live runtime, the existing `Scope::run` path for CLI and direct requests contains work-future panics and awaits
+  child drain before delivery; its diagnostics omit the panic payload and survive caller loss. Completed work and
+  cleanup evidence stay separate until the CLI/MCP boundary combines them; cleanup failure must not replace the
+  initiating failure or blocked tool-result content. Shared settlement composition uses alternate Display to preserve
+  available source causes for both errors without Debug-printing captures. Keep transport causes separate from execution's first cleanup error so both
   survive. The MCP `Service` wrapper consumes pinned rmcp `RequestContext.ct`; observed EOF/errors close the scope
   before rmcp drains pending handlers. Pending MCP write/flush/shutdown polls also register the service-cancellation
   waker: stalled output fails instead of retaining rmcp's writer mutex, without a new timeout or aborting execution
@@ -244,8 +246,16 @@ Private Moriarty execution ownership.
   Moriarty's dev dependencies. Keep these tests at the integration boundary, not supervisor OS fault seams.
 - Keep OS cleanup assurance in the supervisor crate. Moriarty tests cover authorization, output policy, cancellation
   routing, and awaited ownership. Graceful drain needs a live runtime; SIGKILL/crashes and stalled creation's
-  late-cleanup uncertainty retain the supervisor contract's limits. Both legacy and modern MCP tool calls, including a
-  first-message modern call, use the same request-token bridge and awaited ownership; Tasks remains disabled.
+  late-cleanup uncertainty retain the supervisor contract's limits. Direct MCP calls use the same request-token bridge
+  in both lifecycles, including first-message modern calls.
+- After project-tools validates a task-capable call through its normal tool router, the host scope registers the task ID,
+  independent cancellation token, and tracked work owner before returning the handle. The owner runs the same tool body
+  in a child submission scope and stays tracked through cleanup and terminal publication. Creating-request and poll
+  cancellations do not reach the task. Shutdown closes admission, broadcasts cancellation, and drains task owners
+  without needing a poll or successful response write. A result returned by the owner is not relabelled by a racing
+  cancellation. With confirmed cleanup, interruption is cancelled; a supervisor-reported cleanup failure or uncertainty
+  fails the task. The task owner does not catch unwinds: a panic guarantees neither terminal publication nor awaited
+  child cleanup.
 
 ### `tui/`
 
@@ -275,9 +285,16 @@ Model Context Protocol servers.
   discovery, tool lists, and Git prompt lists also carry result-level `ttlMs` and `cacheScope` (SDK defaults suffice; no
   application cache). Legacy tool/prompt wire shapes stay unchanged. Only Git advertises prompts; jj and project-tools
   remain tools-only.
-- Tasks (`io.modelcontextprotocol/tasks`) is neither advertised nor implemented, even for clients advertising it.
-  `tasks/get`, `tasks/update`, and `tasks/cancel` return `-32601`; tools remain ordinary request/response operations,
-  not background task results. No HTTP/SSE, subscriptions, or new server-to-client interactions are introduced.
+- Only project-tools advertises `io.modelcontextprotocol/tasks` in `2026-07-28` discovery. All five tools return a task
+  handle only when the validated call declares the extension in its own metadata. Legacy initialization omits Tasks.
+  Legacy and VCS task management are unavailable (`-32601`); valid modern project-tools management without the extension
+  returns `-32021` before lookup. A request-specific capability view lets rmcp keep protocol validation and gating.
+- The private `tasks` module stores connection-local handles. `tasks/get` polls by an unguessable ID;
+  `tasks/cancel` requests cancellation and `tasks/update`
+  ignores unsolicited input. Both return an empty acknowledgement, not an outcome. Stores keep working tasks separate
+  from the 20 most recently settled records; terminal records expire one hour after settlement and are pruned lazily.
+  Wire `ttlMs` is creation-relative and `null` while working; capacity eviction may remove terminal records sooner.
+  No HTTP/SSE, subscriptions, or new server-to-client interactions are introduced.
 - `ProtocolGuardTransport` rejects unsupported-version or modern-context ping before rmcp's unconditional bootstrap fast
   path. Supported legacy-version ping passes through even with context keys, as does context-free ping (including
   empty/extension-only metadata). Modern ping returns `-32601`; missing/malformed modern context returns `-32602`.

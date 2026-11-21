@@ -11,12 +11,28 @@ use std::{
     time::Duration,
 };
 
+use serde_json::{Value, json};
 use tempfile::TempDir;
 #[cfg(unix)]
 use which::which;
 
 use crate::user_config::{BashRule, BashRuleAction, RedirectDirection};
 use process_supervisor::{Capture, Completion, ProcessReport};
+
+pub(crate) fn protocol_meta(version: &str) -> Value {
+    json!({
+        "io.modelcontextprotocol/protocolVersion": version,
+        "io.modelcontextprotocol/clientCapabilities": {}
+    })
+}
+
+pub(crate) fn task_meta() -> Value {
+    let mut meta = protocol_meta("2026-07-28");
+    meta["io.modelcontextprotocol/clientCapabilities"] = json!({
+        "extensions": { "io.modelcontextprotocol/tasks": {} }
+    });
+    meta
+}
 
 /// Report fixtures represent settled streams; uncertain cleanup uses PartialState instead.
 pub(crate) fn test_report(completion: Completion) -> ProcessReport {

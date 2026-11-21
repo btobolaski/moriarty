@@ -17,7 +17,7 @@ use std::{
 
 use futures::poll;
 use rmcp::{
-    ErrorData as McpError, RoleServer, ServerHandler,
+    ErrorData as McpError, RoleServer, ServerHandler, Service,
     model::{
         CallToolRequestParams, CallToolResponse, CallToolResult, CancelTaskParams,
         ClientCapabilities, ContentBlock, GetTaskParams, Implementation, RequestMetaObject,
@@ -40,9 +40,9 @@ use tokio::{
 use tokio_util::sync::WaitForCancellationFutureOwned;
 
 use super::{
-    GitReadOnly, JjReadOnly, MAX_PENDING_REJECTIONS, ObservedIo, ProtocolGuardTransport,
-    ToolRunner, git_read_only::StatusArgs, jj_read_only::JjArgs, serve_until, service_exit,
-    settle_tool_response, tool_runner::RunArgs,
+    GitReadOnly, JjReadOnly, MAX_PENDING_REJECTIONS, ObservedIo, ProjectTools,
+    ProtocolGuardTransport, git_read_only::StatusArgs, jj_read_only::JjArgs, serve_until,
+    service_exit, settle_tool_response, tool_runner::RunArgs,
 };
 use crate::{
     execution::{
@@ -51,8 +51,8 @@ use crate::{
     },
     project_config::approvals,
     test_helpers::{
-        setup_git_repo_with_commit, setup_isolated_xdg_config, setup_project_dir_with_config,
-        test_report,
+        protocol_meta, setup_git_repo_with_commit, setup_isolated_xdg_config,
+        setup_project_dir_with_config, test_report,
     },
 };
 use process_supervisor::{CancellationToken, Completion, PartialState, ProcessError, ProcessSpec};
@@ -60,6 +60,7 @@ use process_supervisor::{CancellationToken, Completion, PartialState, ProcessErr
 mod contracts;
 mod lifecycle;
 mod settlement;
+mod tasks;
 mod transport;
 
 // Independent expectations catch accidental changes to the production revision policy.
@@ -81,18 +82,18 @@ struct TestClient {
 }
 
 impl TestClient {
-    async fn start<S: ServerHandler + Clone>(server: S) -> Self {
+    async fn start<S: Service<RoleServer> + Clone>(server: S) -> Self {
         Self::start_until(server, pending()).await
     }
 
-    async fn start_until<S: ServerHandler + Clone>(
+    async fn start_until<S: Service<RoleServer> + Clone>(
         server: S,
         stop: impl Future<Output = miette::Result<&'static str>> + Send + 'static,
     ) -> Self {
         Self::start_in_scope(server, stop, Scope::new(), false).await
     }
 
-    async fn start_in_scope<S: ServerHandler + Clone>(
+    async fn start_in_scope<S: Service<RoleServer> + Clone>(
         server: S,
         stop: impl Future<Output = miette::Result<&'static str>> + Send + 'static,
         scope: Arc<Scope>,
@@ -110,7 +111,7 @@ impl TestClient {
         }
     }
 
-    async fn connect<S: ServerHandler + Clone>(server: S, modern: bool) -> Self {
+    async fn connect<S: Service<RoleServer> + Clone>(server: S, modern: bool) -> Self {
         let mut client = Self::start_in_scope(server, pending(), Scope::new(), modern).await;
         if !modern {
             let initialized = initialize_client(&mut client, "2025-11-25").await;
@@ -181,7 +182,7 @@ impl TestClient {
     }
 }
 
-async fn initialize<S: ServerHandler + Clone>(
+async fn initialize<S: Service<RoleServer> + Clone>(
     server: S,
     requested_version: &str,
 ) -> (TestClient, Value) {
@@ -191,6 +192,14 @@ async fn initialize<S: ServerHandler + Clone>(
 }
 
 async fn initialize_client(client: &mut TestClient, requested_version: &str) -> Value {
+    initialize_client_with_capabilities(client, requested_version, json!({})).await
+}
+
+async fn initialize_client_with_capabilities(
+    client: &mut TestClient,
+    requested_version: &str,
+    capabilities: Value,
+) -> Value {
     let response = client
         .request(json!({
             "jsonrpc": "2.0",
@@ -198,7 +207,7 @@ async fn initialize_client(client: &mut TestClient, requested_version: &str) -> 
             "method": "initialize",
             "params": {
                 "protocolVersion": requested_version,
-                "capabilities": {},
+                "capabilities": capabilities,
                 "clientInfo": {
                     "name": "moriarty-protocol-test",
                     "version": "0"
@@ -382,13 +391,6 @@ async fn list_tools(client: &mut TestClient) -> Value {
             "params": {}
         }))
         .await
-}
-
-fn protocol_meta(version: &str) -> Value {
-    json!({
-        "io.modelcontextprotocol/protocolVersion": version,
-        "io.modelcontextprotocol/clientCapabilities": {}
-    })
 }
 
 fn assert_legacy_result_shape(response: &Value) {
